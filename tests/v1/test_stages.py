@@ -31,19 +31,20 @@ class StageTests(unittest.TestCase):
 
     def test_stage_contract_declares_the_execution_host_per_stage(self):
         expected = {
-            "freeze": "native",
-            "discover": "native+portable",
-            "capture": "native",
-            "generate": "portable",
-            "verify": "portable",
-            "publish": "portable",
+            "freeze": ("linux",),
+            "discover": ("windows", "linux"),
+            "capture": ("windows", "linux"),
+            "generate": ("linux",),
+            "verify": ("linux",),
+            "publish": ("linux",),
         }
-        self.assertEqual(HOST_IDS, ("native", "portable", "native+portable"))
-        self.assertEqual({stage["id"]: stage["host"] for stage in CONTRACT["stages"]}, expected)
+        self.assertEqual(HOST_IDS, ("linux", "windows"))
+        self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in CONTRACT["stages"]}, expected)
         view = stage_view()
-        self.assertEqual({stage["id"]: stage["host"] for stage in view["stages"]}, expected)
-        self.assertEqual({stage["id"]: stage["host"] for stage in compact_view(view)["stages"]}, expected)
-        self.assertEqual(stage_host("generate"), "portable")
+        self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in view["stages"]}, expected)
+        self.assertEqual({stage["id"]: tuple(stage["hosts"]) for stage in compact_view(view)["stages"]}, expected)
+        self.assertEqual(stage_host("generate"), ("linux",))
+        self.assertEqual(stage_host("discover"), ("windows", "linux"))
         with self.assertRaises(PipelineError):
             stage_host("wait_for_job")
 
@@ -115,7 +116,9 @@ class StageTests(unittest.TestCase):
                     "verify",
                     "output",
                     "verification.gates",
-                    lambda report=report: require_qualified_report(report),
+                    lambda report=report: require_qualified_report(
+                        report, {"checks": {}, "source": {"bodies": [], "joints": [], "frames": []}}
+                    ),
                 )
             self.assertEqual(self.stage(stage_view({"events": events}), "verify")["output_qc"][0]["state"], "failed")
 
@@ -169,14 +172,34 @@ class StageTests(unittest.TestCase):
         ]
         self.assertCountEqual(producers, expected)
 
-    def test_architecture_table_and_mechanical_responsibilities_match_the_contract(self):
+    def test_stage_table_and_mechanical_responsibilities_match_the_contract(self):
         docs = Path(__file__).resolve().parents[2] / "docs"
-        design = (docs / "design.md").read_text()
-        table = design.split("<!-- stage-contract:start -->\n", 1)[1].split("\n<!-- stage-contract:end -->", 1)[0]
+        contracts = (docs / "contracts.md").read_text()
+        section = contracts.split("## 六阶段契约", 1)[1].split("\n## ", 1)[0]
+        table = "\n".join(line for line in section.splitlines() if line.startswith("|")).rstrip()
+        # The documentation table and the rendering from the machine contract the
+        # runtime consumes must be equal cell-for-cell - no re-typed shadow table.
         self.assertEqual(table, contract_markdown())
         spec = (docs / "mechanical-handoff-spec.md").read_text()
+        responsibilities = {}
+        for line in spec.splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) == 2 and cells[0] in {
+                "结构负责人",
+                "机械安全责任人",
+                "参数责任人",
+                "物理参数责任人",
+                "预算责任人",
+            }:
+                responsibilities[cells[0]] = cells[1]
+        self.assertEqual(len(responsibilities), 5)
+        self.assertEqual(len(CONTRACT["confirmations"]), 5)
         for item in CONTRACT["confirmations"]:
-            self.assertIn(f"| {item['label']} |", spec)
+            self.assertEqual(item["reference"], "docs/mechanical-handoff-spec.md#review")
+            self.assertIn(item["label"], responsibilities)
+            self.assertEqual(item["scope"], responsibilities[item["label"]])
             self.assertIn(item["review_stage"], STAGE_IDS)
         view = stage_view()
         self.assertEqual({row["stage"] for row in view["unsupported"]}, {"discover", "verify"})
@@ -230,10 +253,10 @@ class StageTests(unittest.TestCase):
         self.assertEqual(job, before)
         self.assertLess(len(json.dumps(compact_view(view))), 7000)
         table = contract_markdown()
-        self.assertIn("Input QC", table)
-        self.assertIn("Output QC", table)
+        self.assertEqual(len(table.splitlines()), 8)
+        self.assertIn("| 阶段 | 执行 | 输入与输入检查 | 封存输出与输出检查 |", table)
         for definition in CONTRACT["stages"]:
-            self.assertIn(f"`{definition['id']}`", table)
+            self.assertIn(f"`{definition['id']}` {definition['name_zh']}", table)
 
 
 if __name__ == "__main__":

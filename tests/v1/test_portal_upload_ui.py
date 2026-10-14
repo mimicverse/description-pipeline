@@ -482,13 +482,17 @@ class RunHistoryUiContractTests(unittest.TestCase):
 
 
 class RunHistoryJsLogicTests(unittest.TestCase):
-    """Focused Node regression for the pure run-history list helpers."""
+    """Focused Node regression for the pure run-history list helpers (pinned toolchain)."""
 
-    @unittest.skipUnless(shutil.which("node"), "node is required to run the JS logic regression")
     def test_run_history_logic_regression(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to run the JS logic regression; install the pinned runtime (.nvmrc)",
+        )
         script = ROOT / "tests" / "js" / "run_history_logic_test.mjs"
         result = subprocess.run(
-            [shutil.which("node"), str(script)],
+            [node, str(script)],
             capture_output=True,
             text=True,
             check=False,
@@ -551,13 +555,17 @@ class ActivityUiContractTests(unittest.TestCase):
 
 
 class ActivityJsLogicTests(unittest.TestCase):
-    """Focused Node regression for the pure live-activity view helpers."""
+    """Focused Node regression for the pure live-activity view helpers (pinned toolchain)."""
 
-    @unittest.skipUnless(shutil.which("node"), "node is required to run the JS logic regression")
     def test_activity_logic_regression(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to run the JS logic regression; install the pinned runtime (.nvmrc)",
+        )
         script = ROOT / "tests" / "js" / "activity_logic_test.mjs"
         result = subprocess.run(
-            [shutil.which("node"), str(script)],
+            [node, str(script)],
             capture_output=True,
             text=True,
             check=False,

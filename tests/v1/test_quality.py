@@ -14,11 +14,12 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
+from description_pipeline.interface_records import CHECK_POLICY_V1, validate_qualification
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks import verify as oracle
-from description_pipeline.sources.solidworks.scene import closure_delta
 from description_pipeline.verification import solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
+from tests.sources import support
 
 
 class PhysicsTests(unittest.TestCase):
@@ -44,8 +45,9 @@ class PhysicsTests(unittest.TestCase):
                 }
             ],
         }
-        # The capture session seals its own assembly identity (absolute native
-        # path); the archived definition keeps the package-relative name.
+        # The record quotes the capture session's assembly path (an environment
+        # fact, kept verbatim); the frozen collection identity names the same
+        # document package-relative and binds the record by normalized suffix.
         self.captured_identity = {
             "assembly": "C:\\endpoint\\prepared\\robot.SLDASM",
             "configuration": "Default",
@@ -214,22 +216,56 @@ class PhysicsTests(unittest.TestCase):
 
     def write(self):
         self.raw["mass_properties"] = copy.deepcopy(self.masses)
-        write_json(self.root / "raw/scene_raw.json", self.raw)
-        write_json(self.root / "raw/mass_properties.json", self.masses)
-        write_json(self.root / "raw/coordinate_systems.json", self.raw["coordinate_systems"])
-        write_json(self.root / "raw/link_group_mass_properties.json", self.link_direct)
-        write_json(self.root / "raw/declared_masses.json", {"items": {}, "evidence": None})
         native = self._native_closure()
-        write_json(self.root / "raw/mass_closure.json", native)
-        write_json(
-            self.bundle / "reports/mass-closure.json",
-            {
-                "schema_version": "solidworks-to-urdf.mass-closure-report/v1",
-                "native": native,
-                "derived": self._derived_closure(),
-            },
+        source = support.default_source_record(
+            main_assembly="robot.SLDASM",
+            configuration=self.captured_identity["configuration"],
+            revision=None,
         )
-        write_json(self.root / "manifest.json", {"identity": copy.deepcopy(self.captured_identity)})
+        capture = {
+            "scene": copy.deepcopy(self.raw),
+            "components": [
+                {"name": name, "mass_properties": copy.deepcopy(reading)}
+                for name, reading in self.masses.items()
+            ],
+            "datums": [
+                {"name": name, "matrix": copy.deepcopy(matrix)}
+                for name, matrix in self.raw["coordinate_systems"].items()
+            ],
+            "link_group_mass_properties": copy.deepcopy(self.link_direct),
+            "declared_masses": {"items": {}, "evidence": None},
+            "mass_closure": native,
+            "collection": {
+                "kind": "solidworks",
+                "evidence_class": "cad",
+                "identity": copy.deepcopy(source["identity"]),
+                "limits": {"native_cad": True},
+                "environment": {"solidworks": {"revision": "34.0"}},
+            },
+        }
+        capture.update(getattr(self, "extra_capture_blocks", {}))
+        previous_path = support.capture_file_for(self.root)
+        if previous_path.is_file():
+            # The recording helpers seal material/effective blocks directly into
+            # the capture file; a later write refreshes the derived blocks but
+            # must not drop those recorded records.
+            previous = json.loads(previous_path.read_text(encoding="utf-8"))
+            for name, value in previous.items():
+                capture.setdefault(name, value)
+        support.write_target_delivery(
+            self.bundle,
+            capture=capture,
+            source=source,
+        )
+
+    def block(self, name):
+        return support.load_capture_block(self.root, name)
+
+    def store_block(self, name, value) -> None:
+        support.store_capture_block(self.root, name, value)
+
+    def delete_block(self, name) -> None:
+        support.delete_capture_block(self.root, name)
 
     def _native_closure(self):
         """The split native record: observations only, no derived math."""
@@ -254,107 +290,6 @@ class PhysicsTests(unittest.TestCase):
         for key in ("leaf_total", "leaf_components", "delta", "effective_total", "blockers"):
             native.pop(key, None)
         return native
-
-    def _derived_closure(self):
-        """The Linux-side derived diagnostics the report must carry."""
-
-        context = self.closure["component_context"]
-        rows = [row for row in context.get("instances") or [] if isinstance(row, dict)]
-        leaves = [row["name"] for row in self.raw["components"]]
-        masses_by_name = {name: float(row["mass"]) for name, row in self.masses.items()}
-        basis = {
-            row["name"]: sum(
-                mass
-                for leaf, mass in masses_by_name.items()
-                if leaf == row["name"] or leaf.startswith(row["name"] + "/")
-            )
-            for row in rows
-        }
-        top_rows = [row for row in rows if row.get("depth") == 0]
-        context_kg = sum(float(row["context_mass_kg"]) for row in top_rows)
-        document_kg = sum(basis[row["name"]] for row in top_rows)
-        assembly_kg = context.get("assembly_mass_kg")
-        part_rows = {row["name"] for row in rows if row.get("document_type") == "part"}
-        covered = {leaf for leaf in leaves if leaf in part_rows}
-        effective = copy.deepcopy(self.closure.get("effective_total"))
-        if effective is None:
-            effective = {**copy.deepcopy(self.closure["leaf_total"]), "substituted": []}
-        effective.setdefault("substituted", [])
-        body_members = {
-            str(component)
-            for body in self.source.get("bodies") or []
-            for component in body.get("components") or []
-        }
-        by_instance = {
-            str(row.get("name")): row
-            for row in ((self.closure.get("component_context") or {}).get("instances") or [])
-            if isinstance(row, dict)
-        }
-        unassigned = []
-        for name in sorted(set(leaves) - body_members):
-            row = by_instance[name]
-            unassigned.append(
-                {
-                    "component": name,
-                    "document": row.get("document"),
-                    "configuration": ((self.masses.get(name) or {}).get("reference") or {}).get("configuration"),
-                    "parent": row.get("parent"),
-                    "mass_kg": float(row["context_mass_kg"]),
-                }
-            )
-        unassigned_mass = float(sum(item["mass_kg"] for item in unassigned))
-        whole_mass = float(self.closure["top_level"]["mass"])
-        effective_mass = float(effective["mass"])
-        selection = {
-            "native_mass_kg": whole_mass,
-            "selected_mass_kg": effective_mass - unassigned_mass,
-            "unassigned_mass_kg": unassigned_mass,
-            "unassigned": unassigned,
-            "accounting_delta_kg": whole_mass - effective_mass,
-            "whole_mass_qualified": not unassigned and abs(whole_mass - effective_mass) <= 1e-12,
-        }
-        return {
-            "leaf_total": copy.deepcopy(self.closure["leaf_total"]),
-            "effective_total": effective,
-            "blockers": copy.deepcopy(self.closure.get("blockers") or []),
-            "delta": closure_delta(self.closure["top_level"], self.closure["leaf_total"]),
-            "totals": {
-                "context_kg": context_kg,
-                "document_kg": document_kg,
-                "assembly_kg": assembly_kg,
-                "context_minus_document_kg": context_kg - document_kg,
-                "context_minus_assembly_kg": None if assembly_kg is None else context_kg - assembly_kg,
-            },
-            "overridden": {
-                "top_level_instances": len(top_rows),
-                "mass": sum(1 for row in rows if (row.get("overrides") or {}).get("OverrideMass")),
-                "com": sum(1 for row in rows if (row.get("overrides") or {}).get("OverrideCenterOfMass")),
-                "inertia": sum(
-                    1 for row in rows if (row.get("overrides") or {}).get("OverrideMomentsOfInertia")
-                ),
-                "any": sum(1 for row in rows if any((row.get("overrides") or {}).values())),
-                "top_level_overridden": sum(
-                    1 for row in top_rows if any((row.get("overrides") or {}).values())
-                ),
-                "examples": [
-                    row["name"] for row in rows if (row.get("overrides") or {}).get("OverrideMass")
-                ][:50],
-            },
-            "coverage": {
-                "leaf_documents": len(leaves),
-                "leaf_documents_covered": len(covered),
-                "leaf_documents_uncovered": sorted(set(leaves) - covered)[:50],
-            },
-            "instances": {
-                row["name"]: {
-                    "name": row["name"],
-                    "document_basis_mass_kg": basis[row["name"]],
-                    "delta_kg": float(row["context_mass_kg"]) - basis[row["name"]],
-                }
-                for row in rows
-            },
-            "selection": selection,
-        }
 
     def failures(self):
         self.write()
@@ -471,9 +406,8 @@ class PhysicsTests(unittest.TestCase):
 
     def test_link_direct_record_is_required_and_schema_bound(self):
         self._record_clean_provenance()
-        path = self.root / "raw/link_group_mass_properties.json"
         original = copy.deepcopy(self.link_direct)
-        path.unlink()
+        self.delete_block("link_group_mass_properties")
         checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
         self.assertFalse(checks["physics.link_direct_record"]["passed"])
         self.assertFalse(checks["physics.link.base_link"]["passed"])
@@ -545,8 +479,8 @@ class PhysicsTests(unittest.TestCase):
     def _record_clean_provenance(self) -> None:
         """The canonical records a current CAD capture seals with every material verified."""
 
-        write_json(
-            self.root / "raw/material_provenance.json",
+        self.store_block(
+            "material_provenance",
             {
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -556,8 +490,8 @@ class PhysicsTests(unittest.TestCase):
                 "warnings": [],
             },
         )
-        write_json(
-            self.root / "raw/effective_instances.json",
+        self.store_block(
+            "effective_instances",
             {
                 "schema_version": "solidworks-to-urdf.effective-instances/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -597,8 +531,8 @@ class PhysicsTests(unittest.TestCase):
         self._mark_unverified_material()
         reference = self.masses["a"]["reference"]
         assignment = reference["material_assignment"]
-        write_json(
-            self.root / "raw/material_provenance.json",
+        self.store_block(
+            "material_provenance",
             {
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -643,15 +577,15 @@ class PhysicsTests(unittest.TestCase):
 
     def test_material_provenance_record_is_required_even_without_warnings(self):
         self._record_clean_provenance()
-        (self.root / "raw/material_provenance.json").unlink()
+        self.delete_block("material_provenance")
         self.assertIn("physics.material_provenance", self.failures())
 
     def test_material_provenance_record_is_required_and_bound_to_the_readings(self):
         def load() -> dict:
-            return json.loads((self.root / "raw/material_provenance.json").read_text())
+            return self.block("material_provenance")
 
         def store(payload: dict) -> None:
-            write_json(self.root / "raw/material_provenance.json", payload)
+            self.store_block("material_provenance", payload)
 
         def warning(payload: dict) -> dict:
             return payload["warnings"][0]
@@ -661,7 +595,7 @@ class PhysicsTests(unittest.TestCase):
 
         def deletion_after_sealing() -> None:
             self._record_unverified_material()
-            (self.root / "raw/material_provenance.json").unlink()
+            self.delete_block("material_provenance")
 
         def empty_warnings() -> None:
             self._record_unverified_material()
@@ -794,9 +728,11 @@ class PhysicsTests(unittest.TestCase):
             store(payload)
 
         def changed_captured_assembly() -> None:
-            self._record_unverified_material()
+            # The record seals the capture-session path it was read under; the
+            # frozen source identity names another document, so the suffix
+            # binding must refuse.
             self.captured_identity["assembly"] = "C:\\endpoint\\prepared\\other.SLDASM"
-            self.write()
+            self._record_unverified_material()
 
         def changed_record_configuration() -> None:
             self._record_unverified_material()
@@ -931,8 +867,8 @@ class PhysicsTests(unittest.TestCase):
                                "measurement_basis": sealed_reference["measurement_basis"]},
             },
         ]
-        write_json(
-            self.root / "raw/effective_instances.json",
+        self.store_block(
+            "effective_instances",
             {
                 "schema_version": "solidworks-to-urdf.effective-instances/v1",
                 "assembly": self.captured_identity["assembly"],
@@ -1015,13 +951,13 @@ class PhysicsTests(unittest.TestCase):
 
     def test_effective_instance_evidence_is_required_and_bound(self):
         def load() -> dict:
-            return json.loads((self.root / "raw/effective_instances.json").read_text())
+            return self.block("effective_instances")
 
         def store(payload: dict) -> None:
-            write_json(self.root / "raw/effective_instances.json", payload)
+            self.store_block("effective_instances", payload)
 
         def removed_record() -> None:
-            (self.root / "raw/effective_instances.json").unlink()
+            self.delete_block("effective_instances")
 
         def changed_flags() -> None:
             payload = load()
@@ -1221,8 +1157,7 @@ class PhysicsTests(unittest.TestCase):
         }
         self.link_direct = self._link_direct_payload()
         self._record_clean_provenance()
-        record_path = self.root / "raw/effective_instances.json"
-        payload = json.loads(record_path.read_text())
+        payload = self.block("effective_instances")
         payload["readings"]["a"] = copy.deepcopy(singleton)
         payload["warnings"] = [
             {
@@ -1256,7 +1191,7 @@ class PhysicsTests(unittest.TestCase):
                 "part_measurement": copy.deepcopy(singleton["part_measurement"]),
             }
         ]
-        write_json(record_path, payload)
+        self.store_block("effective_instances", payload)
         self.write()
 
     def test_instance_measurement_is_accepted_and_bound(self):
@@ -1267,10 +1202,10 @@ class PhysicsTests(unittest.TestCase):
 
     def test_instance_measurement_evidence_is_required_and_bound(self):
         def load() -> dict:
-            return json.loads((self.root / "raw/effective_instances.json").read_text())
+            return self.block("effective_instances")
 
         def store(payload: dict) -> None:
-            write_json(self.root / "raw/effective_instances.json", payload)
+            self.store_block("effective_instances", payload)
 
         def removed_entry() -> None:
             payload = load()
@@ -1343,12 +1278,171 @@ class PhysicsTests(unittest.TestCase):
         self.assertIn("physics.closure", self.failures())
 
 
+class UnassignedLedgerTests(unittest.TestCase):
+    """The complete unassigned group closes the common-frame closure ledger (W2).
+
+    Analytic control: two 1 kg occurrences at x=0 and x=1, each with tensor
+    diag(0.01, 0.02, 0.03) about its COM; the whole assembly is mass 2 kg,
+    COM (0.5, 0, 0), tensor diag(0.02, 0.54, 0.56).
+    """
+
+    def setUp(self):
+        self.fixture = PhysicsTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+
+    def __getattr__(self, name):
+        if name == "fixture":
+            raise AttributeError(name)
+        return getattr(self.fixture, name)
+
+    def _two_cube_fixture(self, selected, *, sealed_unassigned):
+        individual = [[0.01, 0.0, 0.0], [0.0, 0.02, 0.0], [0.0, 0.0, 0.03]]
+        whole = [[0.02, 0.0, 0.0], [0.0, 0.54, 0.0], [0.0, 0.0, 0.56]]
+        for name in ("a", "b"):
+            self.masses[name]["mass"] = 1.0
+            self.masses[name]["com"] = [0.0, 0.0, 0.0]
+            self.masses[name]["inertia"] = copy.deepcopy(individual)
+        for row, x in zip(self.raw["components"], (0.0, 1.0), strict=True):
+            transform = np.eye(4)
+            transform[0, 3] = x
+            row["transform"] = transform.ravel().tolist()
+        self.raw["coordinate_systems"]["base_datum"] = np.eye(4).ravel().tolist()
+        self.source["bodies"][0]["components"] = list(selected)
+        remaining = sorted({"a", "b"} - set(selected))
+        mass, center, tensor = (
+            (2.0, [0.5, 0.0, 0.0], copy.deepcopy(whole))
+            if not remaining
+            else (1.0, [0.0, 0.0, 0.0], copy.deepcopy(individual))
+        )
+        self.model["links"][0]["inertial"] = {
+            "mass": mass,
+            "xyz": center,
+            "rpy": [0.0, 0.0, 0.0],
+            "inertia": [float(tensor[0][0]), 0.0, 0.0, float(tensor[1][1]), 0.0, float(tensor[2][2])],
+        }
+        top = self.closure["top_level"]
+        top["mass"], top["com"], top["inertia"] = 2.0, [0.5, 0.0, 0.0], copy.deepcopy(whole)
+        self.closure["component_context"]["assembly_mass_kg"] = 2.0
+        for row in self.closure["component_context"]["instances"]:
+            row["context_mass_kg"] = 1.0
+        self.fixture.link_direct = self._link_direct_payload()
+        direct = self.fixture.link_direct["links"]["base_link"]
+        direct["selection"] = list(selected)
+        for read in direct["reads"]:
+            read["mass_kg"] = mass
+            read["com_m"] = list(center)
+            read["inertia_tensor_about_com"] = copy.deepcopy(tensor)
+        self.closure["unassigned"] = (
+            [
+                {
+                    "name": name,
+                    "mass": 1.0,
+                    "com": [0.0, 0.0, 0.0],
+                    "inertia": copy.deepcopy(individual),
+                    "basis": "part_document",
+                    "partition": "unassigned",
+                }
+                for name in remaining
+            ]
+            if sealed_unassigned
+            else []
+        )
+        self._record_clean_provenance()
+        self.write()
+
+    def test_all_selected_partition_passes_without_unassigned_readings(self):
+        self._two_cube_fixture(["a", "b"], sealed_unassigned=True)
+        self.assertEqual([], self.failures())
+
+    def test_complete_unassigned_measurement_closes_the_full_ledger(self):
+        """Selecting only 'a' still closes: the sealed 'b' reading is combined."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        self.assertEqual([], self.failures())
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        reconciliation = checks["physics.closure"]["details"]["reconciliation"]
+        self.assertEqual(reconciliation["direct_sum"]["unassigned_readings"], 1)
+        self.assertAlmostEqual(reconciliation["direct_sum"]["com_delta_norm_m"], 0.0, places=12)
+        self.assertAlmostEqual(reconciliation["direct_sum"]["tensor_delta_max_abs_kg_m2"], 0.0, places=12)
+
+    def test_missing_unassigned_measurement_fails_closed(self):
+        """No sealed reading: no residual or recomputed substitute may close it."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=False)
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("independent measured reading", checks["physics.closure"]["details"]["error"])
+
+    def test_invented_unassigned_reading_is_refused(self):
+        """A reading that disagrees with the sealed component measurement is refused."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        self.closure["unassigned"][0]["com"] = [0.5, 0.0, 0.0]
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("recorded authoritative measurement", checks["physics.closure"]["details"]["error"])
+
+    def test_unknown_basis_is_refused(self):
+        """An unqualified basis string never stands in for the recorded reading."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        self.closure["unassigned"][0]["basis"] = "review.part_value_recombination"
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("differs from the recorded reading", checks["physics.closure"]["details"]["error"])
+
+    def test_rotated_offdiagonal_unassigned_tensor_closes(self):
+        """Rz(90) placement and an off-diagonal tensor combine with rotation terms."""
+
+        self._two_cube_fixture(["a"], sealed_unassigned=True)
+        tensor = [[0.02, 0.001, 0.002], [0.001, 0.025, 0.003], [0.002, 0.003, 0.03]]
+        whole = [[0.045, 0.0, -0.001], [0.0, 0.545, 0.005], [-0.001, 0.005, 0.56]]
+        placement = np.array([[0.0, -1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+        self.raw["components"][1]["transform"] = placement.ravel().tolist()
+        for name in ("a", "b"):
+            self.masses[name]["inertia"] = copy.deepcopy(tensor)
+        self.closure["unassigned"][0]["inertia"] = copy.deepcopy(tensor)
+        self.closure["top_level"]["inertia"] = copy.deepcopy(whole)
+        self.model["links"][0]["inertial"]["inertia"] = [0.02, 0.001, 0.002, 0.025, 0.003, 0.03]
+        for read in self.fixture.link_direct["links"]["base_link"]["reads"]:
+            read["inertia_tensor_about_com"] = copy.deepcopy(tensor)
+        self.write()
+        self.assertEqual([], self.failures())
+
+    def test_effective_shadowed_unassigned_part_diagnostic_is_refused(self):
+        """A part diagnostic can never shadow the recorded assembly singleton."""
+
+        self.fixture._mark_instance_measurement()
+        # a's recorded effective singleton is 1.5 kg; its part diagnostic is 1 kg.
+        self.source["bodies"][0]["components"] = ["b"]
+        part = self.masses["a"]
+        self.closure["unassigned"] = [
+            {
+                "name": "a",
+                "mass": part["mass"],
+                "com": copy.deepcopy(part["com"]),
+                "inertia": copy.deepcopy(part["inertia"]),
+                "basis": "cad_assembly_instance_measurement",
+                "partition": "unassigned",
+            }
+        ]
+        self.write()
+        failed = self.failures()
+        self.assertIn("physics.closure", failed)
+        checks = {check["id"]: check for check in verify_physics(self.root, self.source, self.model)}
+        self.assertIn("recorded authoritative measurement", checks["physics.closure"]["details"]["error"])
+
+
 class StructuralQualityTests(unittest.TestCase):
     def test_windows_pywin32_integer_version_is_a_valid_runtime_version(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_json(
-                root / "reports/tool.json",
+                root / "tool.json",
                 {
                     "schema_version": "solidworks-to-urdf.tool/v1",
                     "pipeline_id": "solidworks-to-urdf",
@@ -1480,10 +1574,15 @@ class UrdfMassEqualityTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        (self.root / "urdf").mkdir()
-        (self.root / "evidence/raw").mkdir(parents=True)
+        support.write_target_delivery(self.root, capture={})
         self.masses = [1.0, 2.0]
         self.write()
+
+    def store_block(self, name, value) -> None:
+        support.store_capture_block(self.root, name, value)
+
+    def delete_block(self, name) -> None:
+        support.delete_capture_block(self.root, name)
 
     def write(self, whole=3.0, status="recorded", mode="full", top=True, write_closure=True):
         body = "".join(
@@ -1494,14 +1593,13 @@ class UrdfMassEqualityTests(unittest.TestCase):
             for index, mass in enumerate(self.masses)
         )
         (self.root / "urdf/robot.urdf").write_text(f'<robot name="unit">{body}</robot>', encoding="utf-8")
-        closure = self.root / "evidence/raw/mass_closure.json"
         if write_closure:
             payload = {"status": status, "mode": mode}
             if top:
                 payload["top_level"] = {"mass": whole}
-            write_json(closure, payload)
-        elif closure.exists():
-            closure.unlink()
+            self.store_block("mass_closure", payload)
+        else:
+            self.delete_block("mass_closure")
 
     def test_exact_whole_cad_mass_passes(self):
         details = verify_urdf_mass_equality(self.root)
@@ -1561,9 +1659,9 @@ class UrdfMassEqualityTests(unittest.TestCase):
     def _accounting(self, urdf_masses, whole, context, scene_names, bodies):
         self.masses = list(urdf_masses)
         self.write(whole=whole)
-        write_json(self.root / "evidence/raw/scene_raw.json", {"components": [{"name": name} for name in scene_names]})
-        write_json(
-            self.root / "evidence/raw/mass_closure.json",
+        self.store_block("scene", {"components": [{"name": name} for name in scene_names]})
+        self.store_block(
+            "mass_closure",
             {
                 "status": "recorded",
                 "mode": "full",
@@ -1869,9 +1967,166 @@ class EntityPartitionTests(unittest.TestCase):
             quality._entities(source, duplicate, model)
 
 
+class QualifiedReportInventoryTests(unittest.TestCase):
+    """R18: the report inventory binds the independently rebuilt object set."""
+
+    @staticmethod
+    def _qualifications(definition) -> list:
+        return [
+            {
+                "schema_version": quality.QUALIFICATION_SCHEMA,
+                "fact_id": fact["fact_id"],
+                "scope": fact["scope"],
+                "object_id": fact["object_id"],
+                "status": "established",
+                "evidence": [{"record": "input/handoff.json", "sha256": "0" * 64}],
+            }
+            for fact in quality.qualification_facts(definition)
+        ]
+
+    @staticmethod
+    def _definition() -> dict:
+        return {
+            "checks": {},
+            "source": {
+                "bodies": [{"name": "base"}, {"name": "tool"}],
+                "joints": [{"name": "hinge", "type": "revolute"}],
+                "frames": [{"name": "tool_tcp"}],
+            },
+        }
+
+    @staticmethod
+    def _report(names, definition) -> dict:
+        required = sorted(names)
+        return {
+            "passed": True,
+            "required_checks": required,
+            "checks": [{"id": name, "state": "passed", "passed": True} for name in required],
+            "qualifications": QualifiedReportInventoryTests._qualifications(definition),
+        }
+
+    def test_complete_rebuilt_inventory_passes(self):
+        definition = self._definition()
+        quality.require_qualified_report(self._report(set(quality.required_checks(definition)), definition), definition)
+
+    def test_fixed_only_report_is_refused(self):
+        definition = self._definition()
+        required = set(quality.required_checks(definition))
+        fixed = set(CHECK_POLICY_V1["fixed_checks"])
+        dynamic = required - fixed
+        self.assertTrue(dynamic, "the rebuilt objects must expand dynamic gates")
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(self._report(fixed & required, definition), definition)
+
+    def test_unknown_object_gate_is_refused(self):
+        definition = self._definition()
+        report = self._report(set(quality.required_checks(definition)) | {"inertia.nonexistent_body"}, definition)
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition)
+
+    def test_inventory_mismatch_against_rebuilt_objects_is_refused(self):
+        definition = self._definition()
+        other = self._definition()
+        other["source"]["frames"] = []
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(self._report(set(quality.required_checks(other)), other), definition)
+
+
+class QualificationItemTests(unittest.TestCase):
+    """IF-14: the report's qualification items beside the checks."""
+
+    def _root(self) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "input").mkdir()
+        (root / "model").mkdir()
+        (root / "urdf").mkdir()
+        write_json(root / "input/handoff.json", {"probe": "sealed input"})
+        write_json(root / "model/robot.json", {"probe": "model"})
+        (root / "urdf/robot.urdf").write_text("<robot/>", encoding="utf-8")
+        return root
+
+    @staticmethod
+    def _definition() -> dict:
+        return {
+            "checks": {},
+            "source": {
+                "bodies": [{"name": "base"}, {"name": "tool"}],
+                "joints": [{"name": "hinge", "type": "revolute"}],
+                "frames": [],
+            },
+        }
+
+    @staticmethod
+    def _checks(definition) -> list:
+        return [
+            {"id": name, "state": "passed", "passed": True} for name in quality.required_checks(definition)
+        ]
+
+    def test_items_carry_one_identity_per_object_and_out_of_scope_budgets(self):
+        root = self._root()
+        definition = self._definition()
+        items = quality.qualifications(root, definition, self._checks(definition))
+        keys = [(item["fact_id"], item["scope"], item["object_id"]) for item in items]
+        self.assertEqual(len(keys), len(set(keys)), "the same fact never duplicates")
+        self.assertIn(("inertia", "", "base"), keys)
+        self.assertIn(("inertia", "", "tool"), keys)
+        statuses = {(item["fact_id"], item["object_id"]): item["status"] for item in items}
+        self.assertEqual(statuses[("physics.expected_mass", "")], "out_of_scope")
+        self.assertEqual(statuses[("geometry.expected_extent", "")], "out_of_scope")
+        self.assertEqual(statuses[("inertia", "base")], "established")
+        self.assertEqual(items, quality.qualifications(root, definition, self._checks(definition)))
+
+    def test_a_gate_that_did_not_establish_leaves_an_unqualified_fact(self):
+        root = self._root()
+        definition = self._definition()
+        items = quality.qualifications(root, definition, [])
+        statuses = {(item["fact_id"], item["object_id"]): item["status"] for item in items}
+        self.assertEqual(statuses[("inertia", "base")], "unqualified")
+        self.assertEqual(statuses[("physics.expected_mass", "")], "out_of_scope")
+
+    def test_missing_records_refuse_the_ungrounded_item(self):
+        root = self._root()
+        definition = self._definition()
+        (root / "model/robot.json").unlink()
+        items = quality.qualifications(root, definition, self._checks(definition))
+        inertia = next(item for item in items if item["fact_id"] == "inertia")
+        self.assertEqual(inertia["evidence"], [], "a missing record leaves no evidence")
+        with self.assertRaises(PipelineError):
+            validate_qualification(inertia)
+        report = {
+            "passed": True,
+            "required_checks": quality.required_checks(definition),
+            "checks": self._checks(definition),
+            "qualifications": items,
+        }
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition)
+
+    def test_tampered_evidence_digest_is_refused_at_the_boundary(self):
+        root = self._root()
+        definition = self._definition()
+        items = quality.qualifications(root, definition, self._checks(definition))
+        report = {
+            "passed": True,
+            "required_checks": quality.required_checks(definition),
+            "checks": self._checks(definition),
+            "qualifications": items,
+        }
+        quality.require_qualified_report(report, definition, root=root)
+        (root / "input/handoff.json").write_bytes(b"tampered input")
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition, root=root)
+        write_json(root / "input/handoff.json", {"probe": "sealed input"})
+        items[0]["evidence"] = [{"record": "input/handoff.json", "sha256": "0" * 64}]
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition, root=root)
+
+
 class OptionalDesignExpectationTests(unittest.TestCase):
     def test_absent_expectations_do_not_execute_or_require_a_passing_placeholder(self):
-        definition = {"checks": {}}
+        definition = {"checks": {}, "source": {"bodies": [], "joints": [], "frames": []}}
         gates = quality._Gates()
         quality._author_expectations(gates, definition, {}, [])
         self.assertEqual(gates.checks, [])
@@ -1891,13 +2146,14 @@ class OptionalDesignExpectationTests(unittest.TestCase):
             "passed": True,
             "required_checks": required,
             "checks": [{"id": key, "state": "passed", "passed": True} for key in required],
+            "qualifications": QualifiedReportInventoryTests._qualifications(definition),
         }
-        quality.require_qualified_report(report)
+        quality.require_qualified_report(report, definition)
         removed = copy.deepcopy(report)
         removed["checks"] = [row for row in removed["checks"] if row["id"] != "physics.mass_closure_equality"]
         removed["required_checks"].remove("physics.mass_closure_equality")
         with self.assertRaises(PipelineError):
-            quality.require_qualified_report(removed)
+            quality.require_qualified_report(removed, definition)
 
     def test_supplied_expectations_are_required_evaluated_and_not_defaulted(self):
         model = {"links": [{"inertial": {"mass": 2.0}}]}
@@ -1928,7 +2184,6 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
 
     def _delivery(self, tmp, *, qualified=True):
         root = Path(tmp)
-        (root / "evidence/raw").mkdir(parents=True, exist_ok=True)
         occurrence = "pcb-1"
         record = {
             "schema_version": "solidworks-to-urdf.effective-instances/v1",
@@ -1952,15 +2207,20 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
                 else []
             ),
         }
-        write_json(root / "evidence/raw/effective_instances.json", record)
-        write_json(
-            root / "evidence/raw/mass_properties.json",
-            {
-                occurrence: {
-                    "mode": "effective_instance",
-                    "state": "effective_instance",
-                    "reference": {"solid_bodies": 0, "sheet_bodies": 2350},
-                }
+        support.write_target_delivery(
+            root,
+            capture={
+                "effective_instances": record,
+                "components": [
+                    {
+                        "name": occurrence,
+                        "mass_properties": {
+                            "mode": "effective_instance",
+                            "state": "effective_instance",
+                            "reference": {"solid_bodies": 0, "sheet_bodies": 2350},
+                        },
+                    }
+                ],
             },
         )
         return root
@@ -1970,17 +2230,17 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
             root = self._delivery(tmp)
             self.assertTrue(quality._qualified_surface_only(root, "pcb-1"))
             self.assertFalse(quality._qualified_surface_only(root, "other-1"))
-            record = json.loads((root / "evidence/raw/effective_instances.json").read_text(encoding="utf-8"))
+            record = support.load_capture_block(root, "effective_instances")
             record["warnings"][0]["solid_bodies"] = False
-            write_json(root / "evidence/raw/effective_instances.json", record)
+            support.store_capture_block(root, "effective_instances", record)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
-            mass = json.loads((root / "evidence/raw/mass_properties.json").read_text(encoding="utf-8"))
-            mass["pcb-1"]["reference"]["solid_bodies"] = False
-            write_json(root / "evidence/raw/mass_properties.json", mass)
+            rows = support.load_capture_block(root, "components")
+            rows[0]["mass_properties"]["reference"]["solid_bodies"] = False
+            support.store_capture_block(root, "components", rows)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
-            mass["pcb-1"]["reference"]["solid_bodies"] = 0
-            mass["pcb-1"]["mode"] = "document"
-            write_json(root / "evidence/raw/mass_properties.json", mass)
+            rows[0]["mass_properties"]["reference"]["solid_bodies"] = 0
+            rows[0]["mass_properties"]["mode"] = "document"
+            support.store_capture_block(root, "components", rows)
             self.assertFalse(quality._qualified_surface_only(root, "pcb-1"))
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

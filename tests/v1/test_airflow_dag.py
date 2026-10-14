@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover - exercised only without Airflow installed
 
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
 class DagTests(unittest.TestCase):
-    def test_submission_identity_rejects_an_unconfigured_target(self) -> None:
+    def test_submission_frame_requires_a_configured_target_and_summary(self) -> None:
         bag = DagBag(str(DAG_DIR))
         resolve = bag.dags["solidworks_to_urdf"].task_dict["resolve_handoff"].python_callable
         module = sys.modules[resolve.__module__]
@@ -68,15 +68,51 @@ class DagTests(unittest.TestCase):
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
         )
-        context = {
-            "dag_run": SimpleNamespace(conf={"target_hardware": "m4.0"}, triggering_user_name="ops"),
-            "params": {},
-        }
+
+        def context(conf):
+            return {"dag_run": SimpleNamespace(conf=conf, triggering_user_name="ops"), "params": {}}
+
+        with patch.object(module, "config_from_airflow_connection", return_value=config):
+            for conf in (
+                {"target_hardware": "m4.0", "change_summary": "x"},
+                {"change_summary": "x"},
+                {"target_hardware": "   ", "change_summary": "x"},
+                {"target_hardware": "m3.0"},
+                {"target_hardware": "m3.0", "change_summary": "  "},
+            ):
+                with self.subTest(conf=str(conf)), self.assertRaises(module.AirflowFailException):
+                    module._submission_frame(context(conf))
+            identity, routing = module._submission_frame(
+                context({"target_hardware": "m3.0", "change_summary": "rebind"})
+            )
+        self.assertEqual(routing, {"repository_slug": "mimicverse/description", "base": "main"})
+        self.assertEqual(identity["hardware_id"], "m3.0")
+        self.assertEqual(identity["change_summary"], "rebind")
+        self.assertIsNone(identity["parent_revision"])
+
+    def test_resolve_handoff_fails_before_any_endpoint_contact(self) -> None:
+        from types import SimpleNamespace
+
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+        dag = module.dag
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+
+        def context(conf):
+            return {"dag_run": SimpleNamespace(conf=conf, run_id="portal-child-9"), "params": {}}
+
         with (
             patch.object(module, "config_from_airflow_connection", return_value=config),
-            self.assertRaises(module.AirflowFailException),
+            patch.object(module, "_endpoint", side_effect=AssertionError("endpoint contacted")),
         ):
-            module._submission_identity(context)
+            for conf in ({}, {"target_hardware": "m3.0"}, {"change_summary": "x"}):
+                with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
+                    dag.task_dict["resolve_handoff"].python_callable(**context(conf))
 
     def test_dag_parses(self) -> None:
         bag = DagBag(str(DAG_DIR))
@@ -88,22 +124,18 @@ class DagTests(unittest.TestCase):
             {
                 "resolve_handoff",
                 "start_job",
-                "wait_for_job",
                 "fetch_capture",
                 "run_generate",
                 "run_verify",
                 "run_publish",
-                "confirm_job",
             },
         )
         edges = {task_id: set(task.upstream_task_ids) for task_id, task in dag.task_dict.items()}
         self.assertEqual(edges["start_job"], {"resolve_handoff"})
-        self.assertEqual(edges["wait_for_job"], {"start_job"})
-        self.assertEqual(edges["fetch_capture"], {"start_job", "wait_for_job"})
+        self.assertEqual(edges["fetch_capture"], {"resolve_handoff", "start_job"})
         self.assertEqual(edges["run_generate"], {"fetch_capture"})
         self.assertEqual(edges["run_verify"], {"run_generate"})
         self.assertEqual(edges["run_publish"], {"run_verify"})
-        self.assertEqual(edges["confirm_job"], {"run_publish"})
         self.assertEqual(
             set(dag.params), {"handoff_path", "main_assembly", "target_hardware", "change_summary"}
         )
@@ -224,17 +256,17 @@ class DagTests(unittest.TestCase):
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
                 started = dag.task_dict["start_job"].python_callable(request)
-                self.assertIn(started["status"], {"queued", "running"})
+                self.assertFalse(started)  # first poke submits; the reschedule poll continues
                 polled = False
                 for _ in range(8):
-                    if module._poke(started):
+                    if module._poke(request):
                         polled = True
                         break
                 self.assertTrue(polled)
                 with self.assertRaises(AirflowFailException):
                     # The portable half only starts from the native_complete boundary;
                     # the full split is covered by test_split_workflow/test_linux_split.
-                    dag.task_dict["fetch_capture"].python_callable(started)
+                    dag.task_dict["fetch_capture"].python_callable(request)
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(
@@ -312,7 +344,7 @@ class DagTests(unittest.TestCase):
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
                 started = dag.task_dict["start_job"].python_callable(request)
-                self.assertIn(started["status"], {"queued", "running"})
+                self.assertFalse(started)  # first poke submits; the reschedule poll continues
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(
@@ -349,7 +381,10 @@ class DagTests(unittest.TestCase):
 
         class Stub:
             def get_job(self, run_id):
-                return parent_job
+                if run_id == parent_run_id:
+                    # resolve_handoff reads the retained parent selection first.
+                    return parent_job
+                raise module.EndpointNotFound("child job is not created yet")
 
             def start_staging_job(self, **kwargs):
                 submitted.update(kwargs)
@@ -357,19 +392,32 @@ class DagTests(unittest.TestCase):
 
         context = {
             "dag_run": SimpleNamespace(
-                conf={"parent_dag_run_id": parent_dag_run_id, "resume_from": "capture"},
+                conf={
+                    "parent_dag_run_id": parent_dag_run_id,
+                    "resume_from": "capture",
+                    "target_hardware": "m3.0",
+                    "change_summary": "linked capture rerun",
+                },
                 run_id="portal-child-1",
             ),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
-        with patch.object(module, "_endpoint", return_value=Stub()):
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+        with (
+            patch.object(module, "_endpoint", return_value=Stub()),
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+        ):
             request = dag.task_dict["resolve_handoff"].python_callable(**context)
             self.assertEqual(request["upload_files"], upload)
             self.assertEqual(request["upload_sha256"], digest(upload))
             self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
             started = dag.task_dict["start_job"].python_callable(request)
-        self.assertEqual(started["status"], "queued")
+        self.assertFalse(started)  # submission happened; the reschedule poll continues
         self.assertEqual(
             submitted,
             {
@@ -379,7 +427,11 @@ class DagTests(unittest.TestCase):
                 "resume": {"parent_run": parent_run_id, "from_stage": "capture"},
             },
         )
-        with patch.object(module, "_endpoint", return_value=Stub()), self.assertRaises(AirflowFailException):
+        with (
+            patch.object(module, "_endpoint", return_value=Stub()),
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            self.assertRaises(AirflowFailException),
+        ):
             dag.task_dict["resolve_handoff"].python_callable(
                 **{**context, "params": {"handoff_path": "", "main_assembly": "other.SLDASM"}}
             )
@@ -388,8 +440,61 @@ class DagTests(unittest.TestCase):
             def get_job(self, run_id):
                 return {"request": {"run_id": parent_run_id, "package": "handoff/m3.0"}}
 
-        with patch.object(module, "_endpoint", return_value=LegacyStub()), self.assertRaises(AirflowFailException):
+        with (
+            patch.object(module, "_endpoint", return_value=LegacyStub()),
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            self.assertRaises(AirflowFailException),
+        ):
             dag.task_dict["resolve_handoff"].python_callable(**context)
+
+    def test_linked_publish_rebinds_routing_from_conf_over_null_parent_meta(self) -> None:
+        from types import SimpleNamespace
+
+        module = self._module()
+        dag = module.dag
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+        parent_meta = {
+            "handoff_sha256": "d" * 64,
+            "main_assembly": "assembly.SLDASM",
+            "repository_slug": None,
+            "repository_base": None,
+        }
+
+        class Store:
+            def meta(self, run_id):
+                return dict(parent_meta)
+
+        context = {
+            "dag_run": SimpleNamespace(
+                conf={
+                    "parent_dag_run_id": "portal-parent-2",
+                    "resume_from": "publish",
+                    "target_hardware": "m3.0",
+                    "change_summary": "rebound publish",
+                },
+                run_id="portal-child-2",
+            ),
+            "params": {},
+        }
+        with (
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.object(module, "_linux_store", return_value=Store()),
+            patch.object(module, "_root_capture", return_value=Path("/srv/capture")),
+            patch.object(module, "_root_identity", return_value=("m3.0", "r1")),
+        ):
+            request = dag.task_dict["resolve_handoff"].python_callable(**context)
+            self.assertTrue(request["linux_owned"])
+            self.assertEqual(request["repository_slug"], "mimicverse/description")
+            self.assertEqual(request["repository_base"], "main")
+            binding = dag.task_dict["fetch_capture"].python_callable(request)
+        self.assertEqual(binding["repository_slug"], "mimicverse/description")
+        self.assertEqual(binding["repository_base"], "main")
+        self.assertEqual(binding["handoff_sha256"], "d" * 64)
+        self.assertEqual(binding["state"], "linked")
 
 
 if __name__ == "__main__":

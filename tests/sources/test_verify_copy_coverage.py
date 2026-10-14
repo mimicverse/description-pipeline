@@ -9,8 +9,10 @@ import unittest
 from pathlib import Path
 from typing import ClassVar
 
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification.solidworks_urdf import _dependencies
+
+from . import support
 
 MAIN, SHANK, NP = b"MAIN", b"SHANK-ORIG", b"NP-STEP-BYTES"
 
@@ -30,21 +32,58 @@ class CopyCoverageTests(unittest.TestCase):
         self.root = Path(temporary.name)
 
     def _build(self, mutate=None) -> None:
+        """The target tree: the archived input carries the closure copies.
+
+        Originals stay in the platform's frozen upload storage; their identity
+        is the handoff upload index, never an equality with the (possibly
+        engine-rewritten) copy bytes.
+        """
+
         root = self.root
-        (root / "input/discovery").mkdir(parents=True)
-        (root / "evidence/raw").mkdir(parents=True)
-        (root / "evidence/evidence").mkdir(parents=True)
-        (root / "evidence/source").mkdir(parents=True)
-        (root / "input/robot.SLDASM").write_bytes(MAIN)
-        (root / "input/shank.SLDPRT").write_bytes(SHANK)
-        (root / "input/NP-F550.step").write_bytes(NP)
-        native = {"robot.SLDASM": _sha(MAIN), "shank.SLDPRT": _sha(SHANK), "NP-F550.step": _sha(NP)}
+        prepared = "C:\\prepared"
+        rewritten_main, rewritten_shank = b"MAIN-REWRITTEN", b"SHANK-REWRITTEN"
+        copies = {"robot.SLDASM": rewritten_main, "shank.SLDPRT": rewritten_shank, "imported_part.step": NP}
+        originals = {"robot.SLDASM": MAIN, "shank.SLDPRT": SHANK, "imported_part.step": NP}
+        closure = {
+            "declared_unresolved": [],
+            "configuration": "Default",
+            "original_files": {prepared + "\\" + name: _sha(data) for name, data in originals.items()},
+            "mapping": [
+                {
+                    "source": prepared + "\\" + name,
+                    "source_sha256": _sha(originals[name]),
+                    "copy": "source/" + name,
+                    "copy_sha256": _sha(copies[name]),
+                    "instance": instance,
+                }
+                for name, instance in (
+                    ("robot.SLDASM", "top_level"),
+                    ("shank.SLDPRT", "shank-1"),
+                    ("imported_part.step", "import_source"),
+                )
+            ],
+            "copy_files": {"source/" + name: _sha(data) for name, data in copies.items()},
+            "suppressed_instances": 0,
+            "stale_stored_references": [],
+            "seeded_required_leaves": [prepared + "\\imported_part.step"],
+        }
+        if mutate is not None:
+            mutate(root, closure, copies)
+        native = {name: _sha(data) for name, data in copies.items()}
+        files_rows = [{"path": name, "sha256": checksum} for name, checksum in sorted(native.items())]
         discovery = {
-            "native_files": native,
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "run_id": "copy-coverage",
+            "contract": "native-discovery/v1",
+            "namespace": "dp",
+            "robot_name": "robot",
+            "files": files_rows,
+            "native_inventory_sha256": digest(files_rows),
+            "derived": {},
             "raw": {
                 "files": dict(native),
                 "source_selection": {
-                    "files": dict(native),
+                    "files": {name: _sha(data) for name, data in originals.items()},
                     "closure": {
                         "stage_root": "C:\\stage",
                         "documents": {"shank.SLDPRT": {"stored_references": [], "resolved_edges": []}},
@@ -53,87 +92,104 @@ class CopyCoverageTests(unittest.TestCase):
                 "selection": {"main_assembly": "robot.SLDASM"},
             },
         }
-        write_json(root / "input/discovery/native-discovery.json", discovery)
-        record_bytes = (root / "input/discovery/native-discovery.json").read_bytes()
-        canonical = hashlib.sha256(
-            (json.dumps(native, sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
-        ).hexdigest()
-        (root / "input/robot.yaml").write_text(
-            json.dumps({"provenance": {"native_inventory_sha256": canonical, "discovery_sha256": _sha(record_bytes)}})
-        )
-        prepared = str(root / "prepared")
-        rewritten_main, rewritten_shank = b"MAIN-REWRITTEN", b"SHANK-REWRITTEN"
-        (root / "evidence/source/robot.SLDASM").write_bytes(rewritten_main)
-        (root / "evidence/source/shank.SLDPRT").write_bytes(rewritten_shank)
-        closure = {
-            "declared_unresolved": [],
+        handoff = {
+            "package_files": {name: _sha(data) for name, data in originals.items()},
+            "input_receipt": {"inventory": {}},
+            "main_assembly": "robot.SLDASM",
             "configuration": "Default",
-            "original_files": {
-                prepared + "\\robot.SLDASM": _sha(MAIN),
-                prepared + "\\shank.SLDPRT": _sha(SHANK),
-                prepared + "\\NP-F550.step": _sha(NP),
-            },
-            "mapping": [
-                {
-                    "source": prepared + "\\robot.SLDASM",
-                    "source_sha256": _sha(MAIN),
-                    "copy": "source/robot.SLDASM",
-                    "copy_sha256": _sha(rewritten_main),
-                    "instance": "top_level",
-                },
-                {
-                    "source": prepared + "\\shank.SLDPRT",
-                    "source_sha256": _sha(SHANK),
-                    "copy": "source/shank.SLDPRT",
-                    "copy_sha256": _sha(rewritten_shank),
-                    "instance": "shank-1",
-                },
-                {
-                    "source": prepared + "\\NP-F550.step",
-                    "source_sha256": _sha(NP),
-                    "copy": "source/NP-F550.step",
-                    "copy_sha256": _sha(NP),
-                    "instance": "import_source",
-                },
-            ],
-            "copy_files": {
-                "source/robot.SLDASM": _sha(rewritten_main),
-                "source/shank.SLDPRT": _sha(rewritten_shank),
-                "source/NP-F550.step": _sha(NP),
-            },
-            "suppressed_instances": 0,
-            "stale_stored_references": [],
-            "seeded_required_leaves": [prepared + "\\NP-F550.step"],
         }
-        (root / "evidence/source/NP-F550.step").write_bytes(NP)
-        if mutate is not None:
-            mutate(root, closure)
-        write_json(root / "evidence/raw/dependency_closure.json", closure)
-        write_json(
-            root / "evidence/evidence/collection.json",
-            {
+        support.write_target_delivery(
+            root,
+            capture={
                 "dependency_closure": closure,
-                "capture": {"originals_unchanged": {"files_checked": len(closure["original_files"])}},
+                "originals_unchanged": {
+                    "files_checked": len(closure["original_files"]),
+                    "states_recorded": len(closure["original_files"]),
+                    "state_scope": "initial_source_observation",
+                },
             },
+            discovery=discovery,
+            handoff=handoff,
+            originals={name: data.decode("utf-8") for name, data in copies.items()},
         )
 
-    def _drop_np_everywhere(self, root: Path, closure: dict) -> None:
-        (root / "evidence/source/NP-F550.step").unlink()
-        closure["original_files"].pop(next(key for key in closure["original_files"] if key.endswith("NP-F550.step")))
-        closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("NP-F550.step")]
-        closure["copy_files"].pop("source/NP-F550.step")
+    def _drop_np_everywhere(self, root: Path, closure: dict, copies: dict) -> None:
+        copies.pop("imported_part.step")
+        closure["original_files"].pop(
+            next(key for key in closure["original_files"] if key.endswith("imported_part.step"))
+        )
+        closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("imported_part.step")]
+        closure["copy_files"].pop("source/imported_part.step")
 
     def test_full_coverage_passes_with_rewritten_native_bytes(self) -> None:
         self._build()
         _dependencies(self.root, self.definition)
 
+    def _root_with_package_files(self, package_files: dict) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="copy-coverage-main-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self._build()
+        path = self.root / "input/handoff.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["package_files"] = package_files
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_unreferenced_similar_basename_never_shadows_the_real_main(self) -> None:
+        """notrobot.SLDASM in the upload index must not stand in for robot.SLDASM."""
+
+        decoy = _sha(b"UNREFERENCED-OTHER-ASSEMBLY")
+        real = {
+            "robot.SLDASM": _sha(MAIN),
+            "shank.SLDPRT": _sha(SHANK),
+            "imported_part.step": _sha(NP),
+        }
+        for label, package_files in (
+            ("before", {"notrobot.SLDASM": decoy, **real}),
+            ("after", {**real, "notrobot.SLDASM": decoy}),
+        ):
+            with self.subTest(position=label):
+                self._root_with_package_files(package_files)
+                _dependencies(self.root, self.definition)
+
+    def test_main_key_binds_by_the_exact_frozen_relative_path(self) -> None:
+        real = {
+            "robot.SLDASM": _sha(MAIN),
+            "shank.SLDPRT": _sha(SHANK),
+            "imported_part.step": _sha(NP),
+        }
+        # The exact request key wins even beside a boundary twin.
+        self._root_with_package_files({**real, "sub/robot.SLDASM": _sha(b"TWIN")})
+        _dependencies(self.root, self.definition)
+        # A nested key never substitutes the frozen path, even with the same
+        # bytes (no suffix fallback may rewrite the frozen main-assembly key).
+        self._root_with_package_files(
+            {"sub/robot.SLDASM": _sha(MAIN), "shank.SLDPRT": _sha(SHANK), "imported_part.step": _sha(NP)}
+        )
+        with self.assertRaises(PipelineError):
+            _dependencies(self.root, self.definition)
+        # A nested key with different bytes is refused as well.
+        self._root_with_package_files(
+            {
+                "sub/robot.SLDASM": _sha(b"DECOY"),
+                "shank.SLDPRT": _sha(SHANK),
+                "imported_part.step": _sha(NP),
+            }
+        )
+        with self.assertRaises(PipelineError):
+            _dependencies(self.root, self.definition)
+        # A missing main-assembly entry is refused outright.
+        self._root_with_package_files({"shank.SLDPRT": _sha(SHANK), "imported_part.step": _sha(NP)})
+        with self.assertRaises(PipelineError):
+            _dependencies(self.root, self.definition)
+
     def test_seeded_leaves_must_be_covered_and_selected(self) -> None:
-        def uncovered_seed(root: Path, closure: dict) -> None:
+        def uncovered_seed(root: Path, closure: dict, copies: dict) -> None:
             closure["seeded_required_leaves"].append(str(root / "prepared" / "ghost.SLDASM"))
 
-        def unselected_seed(root: Path, closure: dict) -> None:
+        def unselected_seed(root: Path, closure: dict, copies: dict) -> None:
             decoy = b"DECOY"
-            (root / "evidence/source/decoy.SLDASM").write_bytes(decoy)
+            copies["decoy.SLDASM"] = decoy
             path = str(root / "prepared" / "decoy.SLDASM")
             closure["original_files"][path] = _sha(decoy)
             closure["mapping"].append(
@@ -148,7 +204,7 @@ class CopyCoverageTests(unittest.TestCase):
             closure["copy_files"]["source/decoy.SLDASM"] = _sha(decoy)
             closure["seeded_required_leaves"].append(path)
 
-        def malformed_seed(root: Path, closure: dict) -> None:
+        def malformed_seed(root: Path, closure: dict, copies: dict) -> None:
             closure["seeded_required_leaves"] = [""]
 
         for label, mutate in (
@@ -165,7 +221,7 @@ class CopyCoverageTests(unittest.TestCase):
                     _dependencies(self.root, self.definition)
 
     def test_falsy_or_absent_seeded_field_policy(self) -> None:
-        def absent(root: Path, closure: dict) -> None:
+        def absent(root: Path, closure: dict, copies: dict) -> None:
             closure.pop("seeded_required_leaves")
 
         self._build(absent)
@@ -175,12 +231,12 @@ class CopyCoverageTests(unittest.TestCase):
                 temporary = tempfile.TemporaryDirectory(prefix="copy-coverage-falsy-")
                 self.addCleanup(temporary.cleanup)
                 self.root = Path(temporary.name)
-                self._build(lambda root, closure, value=value: closure.update(seeded_required_leaves=value))
+                self._build(lambda root, closure, copies, value=value: closure.update(seeded_required_leaves=value))
                 with self.assertRaises(PipelineError):
                     _dependencies(self.root, self.definition)
 
     def test_swapped_native_original_hashes_are_refused(self) -> None:
-        def mutate(root: Path, closure: dict) -> None:
+        def mutate(root: Path, closure: dict, copies: dict) -> None:
             main_key = next(key for key in closure["original_files"] if key.endswith("robot.SLDASM"))
             shank_key = next(key for key in closure["original_files"] if key.endswith("shank.SLDPRT"))
             closure["original_files"][main_key] = _sha(SHANK)
@@ -201,29 +257,29 @@ class CopyCoverageTests(unittest.TestCase):
             _dependencies(self.root, self.definition)
 
     def test_mapping_missing_the_retained_source_is_refused(self) -> None:
-        def mutate(root: Path, closure: dict) -> None:
-            closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("NP-F550.step")]
+        def mutate(root: Path, closure: dict, copies: dict) -> None:
+            closure["mapping"] = [row for row in closure["mapping"] if not row["copy"].endswith("imported_part.step")]
 
         self._build(mutate)
         with self.assertRaises(PipelineError):
             _dependencies(self.root, self.definition)
 
     def test_changed_retained_non_native_bytes_are_refused(self) -> None:
-        def mutate(root: Path, closure: dict) -> None:
+        def mutate(root: Path, closure: dict, copies: dict) -> None:
             changed = b"NP-STEP-CHANGED"
-            (root / "evidence/source/NP-F550.step").write_bytes(changed)
+            copies["imported_part.step"] = changed
             for row in closure["mapping"]:
-                if row["copy"].endswith("NP-F550.step"):
+                if row["copy"].endswith("imported_part.step"):
                     row["copy_sha256"] = _sha(changed)
-            closure["copy_files"]["source/NP-F550.step"] = _sha(changed)
+            closure["copy_files"]["source/imported_part.step"] = _sha(changed)
 
         self._build(mutate)
         with self.assertRaises(PipelineError):
             _dependencies(self.root, self.definition)
 
     def test_selected_native_omitted_consistently_is_refused(self) -> None:
-        def mutate(root: Path, closure: dict) -> None:
-            (root / "evidence/source/shank.SLDPRT").unlink()
+        def mutate(root: Path, closure: dict, copies: dict) -> None:
+            copies.pop("shank.SLDPRT")
             closure["original_files"].pop(
                 next(key for key in closure["original_files"] if key.endswith("shank.SLDPRT"))
             )

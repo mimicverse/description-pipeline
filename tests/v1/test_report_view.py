@@ -312,17 +312,17 @@ class ReportViewTests(unittest.TestCase):
             "errors": 2,
             "warnings": 0,
             "unresolved_dependencies": [
-                {"name": "NP-F550.SLDPRT", "path": "C:\\author\\NP-F550.SLDPRT"},
-                {"name": "HD-1910-C001-20260902.stp.SLDASM", "path": "C:\\temp\\swx\\HD-1910.stp.SLDASM"},
+                {"name": "imported_part.SLDPRT", "path": "C:\\author\\imported_part.SLDPRT"},
+                {"name": "bracket_a.stp.SLDASM", "path": "C:\\temp\\swx\\bracket_a.stp.SLDASM"},
             ],
         }
         failure = build_report(job)["failure"]
         self.assertEqual(failure["object"], "lowerbody.SLDASM")
         self.assertEqual(
             [item["name"] for item in failure["unresolved_dependencies"]],
-            ["NP-F550.SLDPRT", "HD-1910-C001-20260902.stp.SLDASM"],
+            ["imported_part.SLDPRT", "bracket_a.stp.SLDASM"],
         )
-        self.assertIn("NP-F550.SLDPRT", failure["meaning_zh"])
+        self.assertIn("imported_part.SLDPRT", failure["meaning_zh"])
         self.assertIn("无法定位", failure["meaning_zh"])
         self.assertIn("尚未证明", failure["meaning_zh"])
         self.assertEqual(failure["applicability"], "unproven")

@@ -39,18 +39,22 @@ class LinuxLineageTests(TestCase):
         self.set_parent_checkpoints()
         observed = []
 
-        def driver(package, output, **kw):
-            stage, seed = kw["stop_after"], Path(kw["seed_dir"])
-            observed.append((stage, seed))
-            if stage != "generate":
-                self.assertEqual((seed / "marker").read_text(), "new-child")
-            Path(output).mkdir(parents=True)
-            (Path(output) / "marker").write_text("new-child")
-            return {"state": stage + "d", "subject_sha256": "b" * 64}
+        def driver(stage):
+            def call(seed_dir, output, **kw):
+                observed.append((stage, Path(seed_dir)))
+                if stage != "generate":
+                    self.assertEqual((Path(seed_dir) / "marker").read_text(), "new-child")
+                Path(output).mkdir(parents=True)
+                (Path(output) / "marker").write_text("new-child")
+                return {"state": stage + "d", "subject_sha256": "b" * 64}
+
+            return call
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=driver),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=driver("generate")),
+            mock.patch.object(linux_runner.solidworks, "verify", side_effect=driver("verify")),
+            mock.patch.object(linux_runner.solidworks, "publish", side_effect=driver("publish")),
         ):
             for stage in ("generate", "verify", "publish"):
                 self.run_stage(CHILD, stage, self.run_id)
@@ -62,15 +66,14 @@ class LinuxLineageTests(TestCase):
     def test_verification_rerun_can_itself_be_rerun_without_native_capture(self):
         self.set_parent_checkpoints()
 
-        def driver(package, output, **kw):
-            self.assertEqual(Path(package), self.store.capture_dir(self.run_id))
-            self.assertEqual(Path(kw["seed_dir"]), self.store.stage_dir(self.run_id, "generate"))
+        def driver(seed_dir, output, **kw):
+            self.assertEqual(Path(seed_dir), self.store.stage_dir(self.run_id, "generate"))
             Path(output).mkdir(parents=True)
             return {"state": "verified", "passed": True, "subject_sha256": "a" * 64}
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_record(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=driver),
+            mock.patch.object(linux_runner.solidworks, "verify", side_effect=driver),
         ):
             self.run_stage(CHILD, "verify", self.run_id, "a" * 64)
             self.run_stage(GRANDCHILD, "verify", CHILD, "a" * 64)

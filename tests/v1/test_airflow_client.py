@@ -959,7 +959,7 @@ class ClientTests(unittest.TestCase):
                 "schema": "solidworks-to-urdf.failure-diagnostics/v1",
                 "run_id": RUN_ID,
                 "receipt": {"path": "receipt.json", "sha256": hashlib.sha256(receipt).hexdigest()},
-                "files": {"input/discovery/findings.json": hashlib.sha256(evidence).hexdigest()},
+                "files": {"evidence/discovery.json": hashlib.sha256(evidence).hexdigest()},
                 "partial": True,
                 "partial_files": ["evidence/raw/material_provenance.json"],
             }
@@ -967,13 +967,13 @@ class ClientTests(unittest.TestCase):
         with MockEndpoint() as server:
             server.artifacts["diagnostic.json"] = manifest
             server.artifacts["receipt.json"] = receipt
-            server.artifacts["evidence/input/discovery/findings.json"] = evidence
+            server.artifacts["evidence/evidence/discovery.json"] = evidence
             endpoint = self.endpoint(server)
             job = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": hashlib.sha256(manifest).hexdigest()}}
             with tempfile.TemporaryDirectory() as tmp:
                 written = endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp))
                 self.assertEqual(Path(written["receipt.json"]).read_bytes(), receipt)
-                self.assertEqual(Path(written["evidence/input/discovery/findings.json"]).read_bytes(), evidence)
+                self.assertEqual(Path(written["evidence/evidence/discovery.json"]).read_bytes(), evidence)
                 self.assertEqual(Path(written["diagnostic.json"]).read_bytes(), manifest)
                 tampered = {"failure_diagnostics": {"path": "diagnostic.json", "sha256": "0" * 64}}
                 with self.assertRaises(EndpointProtocolError):

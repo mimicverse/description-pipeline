@@ -89,7 +89,7 @@ class FreezeTests(unittest.TestCase):
             "graph": {"robot.SLDASM": {"sha256": "0" * 64, "references": ["arm.SLDPRT"]}},
             "imports": [
                 {
-                    "instance": "HD-1910-C001-20260902.stp-2",
+                    "instance": "bracket_a.stp-2",
                     "state": "cached_materialization",
                     "materialization": r"C:\Temp\swx1\IC~~\HD.stp.SLDASM",
                 }

@@ -192,8 +192,8 @@ class DiscoveryTransferTests(unittest.TestCase):
         self.assertEqual(prepared.prepared_sha256, reference.prepared_sha256)
         self.assertEqual(inventory(prepared.package), inventory(reference.package))
         self.assertEqual(
-            (prepared.package / "robot.yaml").read_bytes(),
-            (reference.package / "robot.yaml").read_bytes(),
+            (prepared.package / "source.json").read_bytes(),
+            (reference.package / "source.json").read_bytes(),
         )
 
         request = self._seal_capture_request(prepared)
@@ -205,7 +205,7 @@ class DiscoveryTransferTests(unittest.TestCase):
             set(request["manifest"]["files"]),
             set(inventory(prepared.package)) - set(self.selection["files"]),
         )
-        self.assertIn("robot.yaml", request["manifest"]["files"])
+        self.assertIn("source.json", request["manifest"]["files"])
         for name in request["manifest"]["files"]:
             self.assertFalse(name.lower().endswith((".sldasm", ".sldprt", ".step", ".stp")))
             self.assertNotIn(name, self.selection["files"])
@@ -493,7 +493,7 @@ class DiscoveryTransferTests(unittest.TestCase):
             "expected_native_tool": self.tool,
             "expected_prepared_sha256": prepared.prepared_sha256,
         }
-        tampered = self._rewrite_zip(archive, replacements={"robot.yaml": b"changed: true\n"})
+        tampered = self._rewrite_zip(archive, replacements={"source.json": b'{"changed": true}\n'})
         with self.assertRaisesRegex(PipelineError, "differs from its digest"):
             transfer.stage_capture_request(tampered, shutil.copytree(self.source, self._path("stage")), **good)
         with zipfile.ZipFile(archive) as source:
@@ -510,12 +510,16 @@ class DiscoveryTransferTests(unittest.TestCase):
             transfer.stage_capture_request(
                 self._build_zip(polluted, polluted_manifest), shutil.copytree(self.source, self._path("stage")), **good
             )
-        dropped = self._rewrite_zip(archive, drop=("robot.yaml",))
+        dropped = self._rewrite_zip(archive, drop=("discovery/native-discovery.json",))
         with self.assertRaisesRegex(PipelineError, "member set differs from its manifest"):
             transfer.stage_capture_request(dropped, shutil.copytree(self.source, self._path("stage")), **good)
-        without = {name: data for name, data in items.items() if name != "robot.yaml"}
+        without = {name: data for name, data in items.items() if name != "discovery/native-discovery.json"}
         manifest = dict(sealed["manifest"])
-        manifest["files"] = {name: value for name, value in manifest["files"].items() if name != "robot.yaml"}
+        manifest["files"] = {
+            name: value
+            for name, value in manifest["files"].items()
+            if name != "discovery/native-discovery.json"
+        }
         manifest["file_count"] = len(manifest["files"])
         manifest["total_bytes"] = sum(len(without[name]) for name in manifest["files"])
         required_missing = self._build_zip(without, manifest)
@@ -553,7 +557,7 @@ class DiscoveryTransferTests(unittest.TestCase):
             self._seal_capture_request(refused)
         partial = self._path("partial-package")
         shutil.copytree(prepared.package, partial)
-        (partial / "robot.yaml").unlink()
+        (partial / "discovery" / "native-discovery.json").unlink()
         without_robot = replace(prepared, package=partial, prepared_sha256=digest(inventory(partial)))
         with self.assertRaisesRegex(PipelineError, "lacks required generated members"):
             self._seal_capture_request(without_robot)

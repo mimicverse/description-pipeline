@@ -126,8 +126,8 @@ class ClosureAdmissionTests(unittest.TestCase):
     def test_resolution_closure_seals_the_graph(self) -> None:
         stored = {
             "robot.SLDASM": [
-                {"name": "arm", "location": r"C:\Users\Mi\Desktop\M3.0\arm.SLDPRT"},
-                {"name": "base", "location": r"C:\Users\Mi\Desktop\M3.0\base.SLDPRT"},
+                {"name": "arm", "location": r"C:\Users\operator\Desktop\M3.0\arm.SLDPRT"},
+                {"name": "base", "location": r"C:\Users\operator\Desktop\M3.0\base.SLDPRT"},
             ]
         }
         payload = self.observe(
@@ -166,7 +166,7 @@ class ClosureAdmissionTests(unittest.TestCase):
 
     def test_outside_resolution_refused_with_verbatim_paths(self) -> None:
         with self.assertRaises(SelectionError) as caught:
-            self.observe([occurrence("arm-1", r"C:\Users\Mi\Desktop\M3.0\arm.SLDPRT")])
+            self.observe([occurrence("arm-1", r"C:\Users\operator\Desktop\M3.0\arm.SLDPRT")])
         error = caught.exception
         self.assertEqual(error.code, "selection_resolved_outside_stage")
         item = error.detail["problems"][0]
@@ -175,7 +175,7 @@ class ClosureAdmissionTests(unittest.TestCase):
             ["code", "document", "instance", "message", "resolved", "stored_location"],
         )
         self.assertEqual(item["instance"], "arm-1")
-        self.assertEqual(item["resolved"], r"C:\Users\Mi\Desktop\M3.0\arm.SLDPRT")
+        self.assertEqual(item["resolved"], r"C:\Users\operator\Desktop\M3.0\arm.SLDPRT")
         self.assertIsNone(item["stored_location"])
         self.assertEqual(error.detail["count"], 1)
 
@@ -196,13 +196,13 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail["problems"][0]["instance"], "arm-1")
 
     def test_materialized_import_is_a_recorded_warning_not_a_binding(self) -> None:
-        temp = session_temp("swx39388", "IC~~", "NP-F550.step.SLDPRT")
+        temp = session_temp("swx39388", "IC~~", "imported_part.step.SLDPRT")
         payload = self.observe(
             [
                 occurrence(
-                    "NP-F550.step-1",
+                    "imported_part.step-1",
                     temp,
-                    imported=r"C:\Users\Mi\Desktop\NP-F550.step",
+                    imported=r"C:\Users\operator\Desktop\imported_part.step",
                 )
             ]
         )
@@ -210,7 +210,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         entry = payload["imports"][0]
         self.assertEqual(entry["state"], "cached_materialization")
         self.assertEqual(entry["binding"], "author_metadata_only")
-        self.assertEqual(entry["author_imported_path"], r"C:\Users\Mi\Desktop\NP-F550.step")
+        self.assertEqual(entry["author_imported_path"], r"C:\Users\operator\Desktop\imported_part.step")
         self.assertEqual(entry["materialization"], temp)
         self.assertEqual(entry["session_temp_root"], str(Path(tempfile.gettempdir()) / "swx39388"))
         self.assertEqual(entry["owner"], "robot.SLDASM")
@@ -222,15 +222,15 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(warning["owner_sha256"], self.files["robot.SLDASM"])
 
     def test_in_stage_author_metadata_is_flagged_but_not_a_binding(self) -> None:
-        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        extra = write_stage(self.stage, {"imported_part.step": b"np-bytes"})
         files = {**self.files, **extra}
-        temp = session_temp("swx28528", "IC~~", "NP-F550.step.SLDPRT")
+        temp = session_temp("swx28528", "IC~~", "imported_part.step.SLDPRT")
         payload = self.observe(
             [
                 occurrence(
-                    "NP-F550.step-1",
+                    "imported_part.step-1",
                     temp,
-                    imported=str(self.stage / "NP-F550.step"),
+                    imported=str(self.stage / "imported_part.step"),
                 )
             ],
             files=files,
@@ -240,24 +240,24 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(entry["state"], "cached_materialization")
         # The in-stage author source is the actual delivered source: it stays
         # in the sealed graph so the frozen folder retains it for the collector.
-        self.assertEqual(entry["bound_source"], "NP-F550.step")
-        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["NP-F550.step"])
+        self.assertEqual(entry["bound_source"], "imported_part.step")
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["imported_part.step"])
         edge = payload["documents"]["robot.SLDASM"]["resolved_edges"][0]
         self.assertEqual(edge["kind"], "native_imported_document")
-        self.assertEqual(edge["resolved"], "NP-F550.step")
+        self.assertEqual(edge["resolved"], "imported_part.step")
 
     def test_np_real_shape_selection_and_raw_agree_on_the_cached_class(self) -> None:
         from description_pipeline.sources.solidworks.native import _component_source_document
 
-        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        extra = write_stage(self.stage, {"imported_part.step": b"np-bytes"})
         files = {**self.files, **extra}
-        temp = session_temp("swx28528", "IC~~", "NP-F550.step.SLDPRT")
+        temp = session_temp("swx28528", "IC~~", "imported_part.step.SLDPRT")
         payload = self.observe(
             [
                 occurrence(
-                    "NP-F550.step-1",
+                    "imported_part.step-1",
                     temp,
-                    imported=str(self.stage / "NP-F550.step"),
+                    imported=str(self.stage / "imported_part.step"),
                     native_owner="robot.SLDASM",
                 )
             ],
@@ -265,10 +265,10 @@ class ClosureAdmissionTests(unittest.TestCase):
         )
         slot = payload["imports"][0]
         self.assertEqual(slot["state"], "cached_materialization")
-        self.assertEqual(slot["bound_source"], "NP-F550.step")
+        self.assertEqual(slot["bound_source"], "imported_part.step")
         self.assertEqual(slot["owner"], "robot.SLDASM")
         self.assertEqual(slot["owner_sha256"], files["robot.SLDASM"])
-        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["NP-F550.step"])
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["imported_part.step"])
 
         class RawComponent:
             def __init__(self, path, imported):
@@ -280,24 +280,24 @@ class ClosureAdmissionTests(unittest.TestCase):
                 return self._path
 
         raw = _component_source_document(
-            RawComponent(temp, str(self.stage / "NP-F550.step")), self.stage
+            RawComponent(temp, str(self.stage / "imported_part.step")), self.stage
         )
         self.assertEqual(raw["source_provenance"]["state"], "cached_materialization")
         # Two-sided class parity: the raw occurrence and the carrier slot agree
         # on the cached class for the same occurrence, so the independent gate
         # matches exactly one raw occurrence per cached slot.
-        self.assertEqual(slot["instance"], "NP-F550.step-1")
+        self.assertEqual(slot["instance"], "imported_part.step-1")
         self.assertTrue(raw["source_provenance"]["author_imported_in_source_root"])
 
     def test_import_marker_outside_session_temp_is_not_a_cache(self) -> None:
-        fake_temp = r"C:\Users\Mi\Documents\IC~~\NP-F550.step.SLDPRT"
+        fake_temp = r"C:\Users\operator\Documents\IC~~\imported_part.step.SLDPRT"
         with self.assertRaises(SelectionError) as caught:
             self.observe(
                 [
                     occurrence(
-                        "NP-F550.step-1",
+                        "imported_part.step-1",
                         fake_temp,
-                        imported=r"C:\Users\Mi\Desktop\NP-F550.step",
+                        imported=r"C:\Users\operator\Desktop\imported_part.step",
                     )
                 ]
             )
@@ -306,18 +306,18 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(item["resolved"], fake_temp)
 
     def test_cached_import_subtree_is_recorded_without_refusal(self) -> None:
-        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        parent = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
         child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
         payload = self.observe(
             [
                 occurrence(
-                    "HD-1910-C001-20260902.stp-2",
+                    "bracket_a.stp-2",
                     parent,
                     imported=r"D:\M2.2\change11\HD.stp",
                     native_owner="robot.SLDASM",
                 ),
                 occurrence(
-                    "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                    "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1",
                     child,
                     defining=parent,
                     imported=r"D:\M2.2\change11\HD.stp",
@@ -335,9 +335,9 @@ class ClosureAdmissionTests(unittest.TestCase):
         by_instance = {entry["instance"]: entry for entry in payload["imports"]}
         # document stays verbatim raw evidence: canonical for the top-level
         # import, the temp parent materialization for the nested descendant.
-        self.assertEqual(by_instance["HD-1910-C001-20260902.stp-2"]["document"], "robot.SLDASM")
+        self.assertEqual(by_instance["bracket_a.stp-2"]["document"], "robot.SLDASM")
         self.assertEqual(
-            by_instance["HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1"]["document"], parent
+            by_instance["bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1"]["document"], parent
         )
         # The seal resolves graph membership from the validated ultimate owner.
         manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
@@ -346,18 +346,18 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(sorted(manifest["files"]), ["robot.SLDASM"])
 
     def _nested_payload(self):
-        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        parent = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
         child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
         payload = self.observe(
             [
                 occurrence(
-                    "HD-1910-C001-20260902.stp-2",
+                    "bracket_a.stp-2",
                     parent,
                     imported=r"D:\M2.2\change11\HD.stp",
                     native_owner="robot.SLDASM",
                 ),
                 occurrence(
-                    "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                    "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1",
                     child,
                     defining=parent,
                     imported=r"D:\M2.2\change11\HD.stp",
@@ -371,7 +371,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         import copy
 
         _, _, payload = self._nested_payload()
-        child_instance = "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1"
+        child_instance = "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1"
 
         def drop_owner(entry):
             entry.pop("owner")
@@ -394,23 +394,23 @@ class ClosureAdmissionTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "selection_closure_invalid")
 
     def test_nested_bound_source_is_retained_under_the_ultimate_owner(self) -> None:
-        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        extra = write_stage(self.stage, {"imported_part.step": b"np-bytes"})
         files = {**self.files, **extra}
-        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        parent = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
         child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
         payload = self.observe(
             [
                 occurrence(
-                    "HD-1910-C001-20260902.stp-2",
+                    "bracket_a.stp-2",
                     parent,
                     imported=r"D:\M2.2\change11\HD.stp",
                     native_owner="robot.SLDASM",
                 ),
                 occurrence(
-                    "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                    "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1",
                     child,
                     defining=parent,
-                    imported=str(self.stage / "NP-F550.step"),
+                    imported=str(self.stage / "imported_part.step"),
                     native_owner="robot.SLDASM",
                 ),
             ],
@@ -421,33 +421,33 @@ class ClosureAdmissionTests(unittest.TestCase):
             for entry in payload["imports"]
             if entry["instance"].endswith("HL-3608_ASM_52_ASM.stp-1")
         )
-        self.assertEqual(child_entry["bound_source"], "NP-F550.step")
+        self.assertEqual(child_entry["bound_source"], "imported_part.step")
         self.assertEqual(child_entry["document"], parent)  # verbatim raw evidence
         self.assertEqual(child_entry["owner"], "robot.SLDASM")
         # The retained edge hangs off the ultimate owner (never the temp parent).
-        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["NP-F550.step"])
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["imported_part.step"])
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
-        self.assertIn("NP-F550.step", manifest["files"])
+        self.assertIn("imported_part.step", manifest["files"])
 
     def test_bound_source_without_valid_ultimate_owner_refuses_before_mutation(self) -> None:
-        extra = write_stage(self.stage, {"NP-F550.step": b"np-bytes"})
+        extra = write_stage(self.stage, {"imported_part.step": b"np-bytes"})
         files = {**self.files, **extra}
-        parent = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        parent = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
         child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
         with self.assertRaises(SelectionError) as caught:
             self.observe(
                 [
                     occurrence(
-                        "HD-1910-C001-20260902.stp-2",
+                        "bracket_a.stp-2",
                         parent,
                         imported=r"D:\M2.2\change11\HD.stp",
                         native_owner="ghost.SLDASM",
                     ),
                     occurrence(
-                        "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1",
+                        "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1",
                         child,
                         defining=parent,
-                        imported=str(self.stage / "NP-F550.step"),
+                        imported=str(self.stage / "imported_part.step"),
                         native_owner="ghost.SLDASM",
                     ),
                 ],
@@ -455,40 +455,40 @@ class ClosureAdmissionTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "selection_closure_invalid")
         item = caught.exception.detail["problems"][0]
-        self.assertEqual(item["instance"], "HD-1910-C001-20260902.stp-2/HL-3608_ASM_52_ASM.stp-1")
-        self.assertEqual(item["resolved"], "NP-F550.step")
+        self.assertEqual(item["instance"], "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1")
+        self.assertEqual(item["resolved"], "imported_part.step")
 
     def test_import_without_materialization_refused(self) -> None:
         with self.assertRaises(SelectionError) as caught:
             self.observe(
                 [
                     occurrence(
-                        "NP-F550.step-1",
+                        "imported_part.step-1",
                         "",
-                        imported=r"C:\Users\Mi\Desktop\NP-F550.step",
+                        imported=r"C:\Users\operator\Desktop\imported_part.step",
                     )
                 ]
             )
         error = caught.exception
         self.assertEqual(error.code, "selection_import_unresolved")
         item = error.detail["problems"][0]
-        self.assertEqual(item["imported_path"], r"C:\Users\Mi\Desktop\NP-F550.step")
+        self.assertEqual(item["imported_path"], r"C:\Users\operator\Desktop\imported_part.step")
 
     def test_in_stage_import_suffixed_document_is_a_native_delivery(self) -> None:
-        extra = write_stage(self.stage, {"HD-1910-C001-20260902.step.SLDPRT": b"cached-brep"})
+        extra = write_stage(self.stage, {"bracket_a.step.SLDPRT": b"cached-brep"})
         files = {**self.files, **extra}
         payload = self.observe(
             [
                 occurrence(
-                    "HD-1910-C001-20260902.stp-2",
-                    self.resolved("HD-1910-C001-20260902.step.SLDPRT"),
-                    imported=r"D:\author\HD-1910-C001-20260902.stp",
+                    "bracket_a.stp-2",
+                    self.resolved("bracket_a.step.SLDPRT"),
+                    imported=r"D:\author\bracket_a.stp",
                 )
             ],
             files=files,
         )
         self.assertEqual(
-            payload["graph"]["robot.SLDASM"]["references"], ["HD-1910-C001-20260902.step.SLDPRT"]
+            payload["graph"]["robot.SLDASM"]["references"], ["bracket_a.step.SLDPRT"]
         )
         self.assertEqual(payload["imports"], [])
 
@@ -744,11 +744,11 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         stage = Path(tmp.name).resolve()
         files = write_stage(stage, {"robot.SLDASM": b"robot", "arm.SLDPRT": b"arm"})
-        parent_doc = session_temp("swx25524", "IC~~", "HD-1910-C001-20260902.stp.SLDASM")
+        parent_doc = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
         child_doc = session_temp("swx25524", "IC~~", "3915_ASM_2_ASM.stp.SLDASM")
         child = _Component("3915_ASM_2_ASM.stp-1", child_doc, doc=_Doc(child_doc))
         parent = _Component(
-            "HD-1910-C001-20260902.stp-2", parent_doc, doc=_Doc(parent_doc), children=(child,)
+            "bracket_a.stp-2", parent_doc, doc=_Doc(parent_doc), children=(child,)
         )
         arm = _Component("arm-1", str(stage / "arm.SLDPRT"), doc=_Doc(str(stage / "arm.SLDPRT")))
         robot = _Doc(str(stage / "robot.SLDASM"), children=(arm, parent), configuration="默认")
@@ -821,17 +821,17 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         # document stays verbatim evidence; owner is the validated ultimate
         # owner on every cached slot (the real failure mode: the seal must
         # resolve via owner, not via the temp parent label).
-        self.assertEqual(by_instance["HD-1910-C001-20260902.stp-2"]["document"], "robot.SLDASM")
+        self.assertEqual(by_instance["bracket_a.stp-2"]["document"], "robot.SLDASM")
         self.assertEqual(
-            by_instance["HD-1910-C001-20260902.stp-2/3915_ASM_2_ASM.stp-1"]["document"], parent_doc
+            by_instance["bracket_a.stp-2/3915_ASM_2_ASM.stp-1"]["document"], parent_doc
         )
         for entry in entries:
             self.assertEqual(entry["owner"], "robot.SLDASM")
             self.assertIn(entry["owner"], payload["graph"])
-        self.assertIsNone(by_instance["HD-1910-C001-20260902.stp-2"]["owner_anchor"])
+        self.assertIsNone(by_instance["bracket_a.stp-2"]["owner_anchor"])
         self.assertEqual(
-            by_instance["HD-1910-C001-20260902.stp-2/3915_ASM_2_ASM.stp-1"]["owner_anchor"],
-            "HD-1910-C001-20260902.stp-2",
+            by_instance["bracket_a.stp-2/3915_ASM_2_ASM.stp-1"]["owner_anchor"],
+            "bracket_a.stp-2",
         )
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")

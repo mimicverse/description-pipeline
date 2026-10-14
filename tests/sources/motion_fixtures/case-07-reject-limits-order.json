@@ -1,0 +1,315 @@
+{
+  "schema": "d.motion-fixture/v1",
+  "purpose": "neutral synthetic raw parse for the future motion.{joint} gate; data only, not an acceptor",
+  "units": {
+    "length": "m",
+    "angle": "rad"
+  },
+  "bodies": [
+    {
+      "id": "b0",
+      "rigid_group": "G0",
+      "frame": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "leaves": [
+        {
+          "id": "L0a",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.5
+        }
+      ]
+    },
+    {
+      "id": "b1",
+      "rigid_group": "G1",
+      "frame": [
+        1.0,
+        0.0,
+        0.0,
+        0.01,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.03,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "leaves": [
+        {
+          "id": "L1a",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.01,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.03,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.12
+        },
+        {
+          "id": "L1b",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.01,
+            0.0,
+            1.0,
+            0.0,
+            0.015,
+            0.0,
+            0.0,
+            1.0,
+            0.03,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.08
+        }
+      ]
+    },
+    {
+      "id": "b2",
+      "rigid_group": "G2",
+      "frame": [
+        1.0,
+        0.0,
+        0.0,
+        0.025,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        -0.01,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "leaves": [
+        {
+          "id": "L2a",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.025,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            -0.01,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.09
+        },
+        {
+          "id": "L2b",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.025,
+            0.0,
+            1.0,
+            0.0,
+            0.012,
+            0.0,
+            0.0,
+            1.0,
+            -0.01,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.06
+        }
+      ]
+    }
+  ],
+  "joints": [
+    {
+      "id": "J1",
+      "type": "revolute",
+      "parent": "b0",
+      "child": "b1",
+      "axis_point": [
+        0.0,
+        0.0,
+        0.03
+      ],
+      "axis_dir": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "stored_direction": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limits": {
+        "lower": -1.2,
+        "upper": 0.8
+      },
+      "drive": {
+        "effort": 4.0,
+        "velocity": 3.0
+      },
+      "origin_parent_child": [
+        1.0,
+        0.0,
+        0.0,
+        0.01,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.03,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "id": "J2",
+      "type": "revolute",
+      "parent": "b1",
+      "child": "b2",
+      "axis_point": [
+        0.01,
+        0.0,
+        -0.01
+      ],
+      "axis_dir": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "stored_direction": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limits": {
+        "lower": 1.0,
+        "upper": -0.5
+      },
+      "drive": {
+        "effort": 2.0,
+        "velocity": 2.0
+      },
+      "origin_parent_child": [
+        1.0,
+        0.0,
+        0.0,
+        0.015,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        -0.04,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  ],
+  "interface": {
+    "name": "IF-J2",
+    "on_parent": "b1",
+    "on_child": "b2",
+    "axis_point": [
+      0.01,
+      0.0,
+      -0.01
+    ],
+    "axis_dir": [
+      0.0,
+      1.0,
+      0.0
+    ]
+  },
+  "tolerance": {
+    "position_m": 1e-09,
+    "rotation_rad": 1e-09,
+    "interface_line_m": 1e-09,
+    "parallelism_1m": 1e-06
+  },
+  "case": {
+    "poses": {},
+    "verdict": "reject",
+    "reason": "J2 limits inverted (lower>upper); limits fact must be rejected",
+    "suggested_test_id": "tests.sources.test_motion_fixtures.MotionFixtureTests.test_case07_inverted_limits_rejected"
+  }
+}

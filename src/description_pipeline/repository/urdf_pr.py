@@ -25,48 +25,39 @@ import tempfile
 import time
 from pathlib import Path
 
-from ..delivery import MASS_CLOSURE_REPORT, SUBJECT_FILES, subject_digest
-from ..io import PipelineError, acquire_process_lock, confined, file_digest, read_data
-from ..sources.solidworks import revision as cad_revision
+from ..delivery import check_layout, read_delivery_manifest, read_source_record, subject_digest
+from ..interface_records import validate_source_record
+from ..io import PipelineError, acquire_process_lock, confined, file_digest
 from ..stages import record_check
 
-#: ``transfer-manifest.json`` is the sealed native provenance sidecar; it is copied whenever the
-#: bundle carries it (neutral local fixtures may not).
-DELIVERY_PATHS = ("README.md", "transfer-manifest.json", "input", "evidence", "model", "urdf", "meshes", "reports")
+#: The target delivery tree (contracts §交付格式与摘要): manifest.json is the
+#: subject manifest, tool.json carries the tool identity, reports/ holds only the
+#: quality report; all other files travel inside their subject directories.
+DELIVERY_PATHS = ("manifest.json", "input", "evidence", "model", "urdf", "meshes", "tool.json", "reports")
 GOVERNED_PATHS = (*DELIVERY_PATHS, ".gitattributes")
 BYTE_ATTRIBUTES = ("text", "filter", "working-tree-encoding")
+_DIRECTORY_PATHS = {"input", "evidence", "model", "urdf", "meshes", "reports"}
 GIT_ATTRIBUTES = (
     "# Preserve verified delivery bytes in Git and on checkout.\n"
     + "".join(
-        f"/{name}{'/**' if name not in {'README.md', '.gitattributes', 'transfer-manifest.json'} else ''} "
-        "-text -filter -working-tree-encoding\n"
+        f"/{name}{'/**' if name in _DIRECTORY_PATHS else ''} -text -filter -working-tree-encoding\n"
         for name in GOVERNED_PATHS
     )
 ).encode("ascii")
-#: Immutable native provenance reports travel with the delivery whenever present.
-#: ``mass-closure.json`` is bound by ``delivery.subject_inventory`` whenever it
-#: exists, so it must travel too; dropping it here changed the staged subject
-#: and failed publish reverification (native19, 1.3.12).
-#: Reports copied into a publication branch.  Subject-bound report files derive
-#: from ``delivery`` so the two lists cannot drift (VER-11, native19 incident).
-REPORTS_FILES = (
-    *(Path(name).name for name in SUBJECT_FILES if name.startswith("reports/")),
-    "quality.json",
-    "native-tool.json",
-    "native-stages.json",
-    Path(MASS_CLOSURE_REPORT).name,
-    "structural-team.md",
-    "structural-team.json",
-)
+#: Reports copied into a publication branch: only the deterministic quality
+#: report stays outside the subject; every other receipt lives in platform run
+#: storage (contracts §交付格式与摘要).
+REPORTS_FILES = ("quality.json",)
 REQUIRED_FILES = (
-    "README.md",
-    "input/robot.yaml",
+    "manifest.json",
+    "input/handoff.json",
+    "input/source.json",
     "model/robot.json",
     "urdf/robot.urdf",
-    "reports/input.json",
-    "reports/tool.json",
+    "tool.json",
+    "reports/quality.json",
 )
-REQUIRED_DIRS = ("evidence", "meshes")
+REQUIRED_DIRS = ("input", "evidence", "model", "urdf", "meshes")
 REVIEW_BRANCH = "work/solidworks/{hardware}"
 PUBLISHER_MARKER = "Urdf-Publisher: description-pipeline"
 log = logging.getLogger(__name__)
@@ -113,6 +104,45 @@ def _remote_branch(repository: Path, branch: str) -> tuple[str, str]:
     return sha, message
 
 
+def _remote_ref(repository: Path, ref: str) -> str:
+    """One remote ref exactly as the remote currently answers (empty when absent)."""
+
+    listing = _git(repository, "ls-remote", "origin", ref).stdout.strip()
+    return listing.split()[0] if listing else ""
+
+
+def _observe_remote_ref(repository: Path, ref: str) -> str | None:
+    """One remote ref, or None when the observation itself is unavailable."""
+
+    try:
+        return _remote_ref(repository, ref)
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _unresolved(code: str, detail, *, commit: str, branch: str, subject: str, base: str, url: str = "") -> dict:
+    """A side-effect-unknown or baseline-changed receipt that blocks on reconciliation."""
+
+    return {
+        "state": "unresolved",
+        "error": code,
+        "detail": detail,
+        "commit": commit,
+        "branch": branch,
+        "subject": subject,
+        "base": base,
+        "url": url,
+        "retry": {
+            "command": f"git ls-remote origin refs/heads/{base} refs/heads/{branch}",
+            "note": (
+                "re-read both remote refs; nothing was written"
+                if not commit
+                else "reconcile the retained candidate write against the remote state"
+            ),
+        },
+    }
+
+
 def _serialize(report: dict) -> str:
     return json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
@@ -126,6 +156,29 @@ def _load_verifier():
 def _gh(repository: Path, *args: str) -> str:
     result = subprocess.run(["gh", *args], cwd=repository, check=True, capture_output=True, text=True, encoding="utf-8")
     return result.stdout
+
+
+def _identity_of(source: dict) -> dict:
+    """Publication identity adapter over the frozen ``input/source.json`` record."""
+
+    return {
+        "hardware_id": source["selection"]["hardware_id"],
+        "revision": source["metadata"]["revision"],
+        "source_revision_id": source["source_revision_id"],
+    }
+
+
+def _check_successor(previous: dict, current: dict) -> None:
+    """Platform successor semantics for the review branch.
+
+    The CAD label is raw engineering metadata, not a content identity, so a new
+    content identity under the same label is allowed; lost-update protection is
+    the request's fixed base/head, the published subject chain and CAS/ff.  This
+    guard only refuses a changed hardware target.
+    """
+
+    if previous["hardware_id"] != current["hardware_id"]:
+        raise PrError("cad_revision_conflict", "CAD hardware identity changed across the review branch")
 
 
 def _validate(bundle: Path) -> tuple[str, dict, dict]:
@@ -145,40 +198,49 @@ def _validate(bundle: Path) -> tuple[str, dict, dict]:
             if key in seen and seen[key] != rel:
                 raise PrError("duplicate_path", {"first": seen[key], "second": rel})
             seen[key] = rel
-    manifest = read_data(bundle / "input/robot.yaml")
-    if not isinstance(manifest, dict) or not manifest.get("hardware_id"):
-        raise PrError("robot_yaml_invalid", "hardware_id is required")
-    hardware = _slug_hardware(str(manifest["hardware_id"]))
     try:
-        current = cad_revision.read_revision(bundle / "input", hardware_id=manifest["hardware_id"])
+        check_layout(bundle)
     except PipelineError as error:
-        raise PrError("cad_revision_invalid", str(error)) from error
+        raise PrError("bundle_layout", str(error)) from error
+    try:
+        manifest = read_delivery_manifest(bundle)
+        source = read_source_record(bundle)
+    except PipelineError as error:
+        raise PrError("bundle_records_invalid", str(error)) from error
+    hardware = _slug_hardware(str(source["selection"]["hardware_id"]))
+    current = _identity_of(source)
+    # The CAD/PDM revision label is optional engineering metadata: a missing
+    # value stays missing and is never a publication rejection reason.
     return hardware, manifest, current
 
 
 def _previous_revision(worktree: Path, hardware: str) -> dict | None:
-    if not (worktree / "input/cad-revision.json").exists():
+    if not (worktree / "input/source.json").is_file():
         return None
     try:
-        return cad_revision.read_revision(worktree / "input")
+        source = read_source_record(worktree)
     except PipelineError as error:
-        raise PrError("previous_cad_revision_invalid", str(error)) from error
+        raise PrError("previous_source_invalid", str(error)) from error
+    # Content identity exists even when the CAD revision label is absent; the
+    # published subject chain is the platform-level successor evidence.
+    return _identity_of(source)
 
 
 def published_revision(repository: Path, hardware: str) -> dict | None:
-    """Read the published cad-revision.json of one hardware review branch (read-only).
+    """Read the published input/source.json of one hardware review branch (read-only).
 
     Best-effort identity resolution for the submission lane: it fetches the
-    deterministic review branch and reads the manifest from the fetched commit,
-    never creating a worktree.  Any unavailability returns ``None`` so the
-    caller keeps ``parent_revision`` absent; publication's own
-    ``check_successor`` remains the deciding gate.
+    deterministic review branch and reads the identity from the fetched commit
+    (``FETCH_HEAD``, so a local refspec never changes the baseline), never
+    creating a worktree.  Any unavailability returns ``None`` so the caller
+    keeps ``parent_revision`` absent; publication's own guard remains the
+    deciding gate.
     """
 
     branch = REVIEW_BRANCH.format(hardware=hardware)
     _validate_ref(repository, branch, branch=True)
     try:
-        subprocess.run(
+        fetched = subprocess.run(
             ["git", "-C", str(repository), "fetch", "--quiet", "origin", branch],
             check=False,
             capture_output=True,
@@ -187,23 +249,34 @@ def published_revision(repository: Path, hardware: str) -> dict | None:
             timeout=PUBLISHED_REVISION_FETCH_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        log.warning("published revision fetch timed out for %s; continuing without a parent revision", branch)
-        return None
-    show = _git(repository, "show", f"refs/remotes/origin/{branch}:input/cad-revision.json", check=False)
-    if show.returncode != 0 or not show.stdout.strip():
-        return None
+        raise PrError("published_revision_unknown", f"fetch timed out for {branch}") from None
+    if fetched.returncode != 0:
+        stderr = (fetched.stderr or "").strip()
+        if "couldn't find remote ref" in stderr:
+            # The remote answered: this branch provably does not exist yet.
+            return None
+        raise PrError("published_revision_unknown", stderr[-200:] or "fetch failed")
+    show = _git(repository, "show", "FETCH_HEAD:input/source.json", check=False)
+    if show.returncode != 0:
+        stderr = (show.stderr or "").strip()
+        if "does not exist" in stderr or "but not in" in stderr:
+            # The branch was fetched: the file is provably absent there.
+            return None
+        raise PrError("published_revision_unknown", stderr[-200:] or "source record unreadable")
+    if not show.stdout.strip():
+        raise PrError("published_revision_unknown", "empty source record")
     try:
         payload = json.loads(show.stdout)
     except json.JSONDecodeError:
-        return None
-    if (
-        not isinstance(payload, dict)
-        or payload.get("hardware_id") != hardware
-        or not isinstance(payload.get("revision"), str)
-        or not payload["revision"].strip()
-    ):
-        return None
-    return payload
+        raise PrError("published_revision_unknown", "source record is not JSON") from None
+    try:
+        payload = validate_source_record(payload)
+    except PipelineError as error:
+        raise PrError("published_revision_unknown", str(error)) from error
+    identity = _identity_of(payload)
+    if identity["hardware_id"] != hardware:
+        raise PrError("published_revision_mismatch", {"expected": hardware, "observed": identity["hardware_id"]})
+    return identity
 
 
 def _validate_ref(repository: Path, name: str, *, branch: bool) -> None:
@@ -556,10 +629,7 @@ def submit_bundle(
             _prepare_worktree(repository, worktree, base_sha, head_sha)
             previous = _previous_revision(worktree, hardware)
             if previous is not None:
-                try:
-                    cad_revision.check_successor(previous, current_revision)
-                except PipelineError as error:
-                    raise PrError("cad_revision_conflict", str(error)) from error
+                _check_successor(previous, current_revision)
             commit, noop = _stage_commit(
                 bundle, worktree, subject, message or f"feat({hardware}): publish SolidWorks-to-URDF bundle"
             )
@@ -573,19 +643,129 @@ def submit_bundle(
                     "commit": commit,
                     "copied_staged_committed": "reverified",
                     "git_attributes_sha256": file_digest(worktree / ".gitattributes"),
+                    # Published subject chain evidence: the previous content
+                    # identity (CAD label optional, kept raw) and the new one.
+                    **({} if previous is None else {"previous_source_revision_id": previous["source_revision_id"]}),
+                    "source_revision_id": current_revision["source_revision_id"],
                 },
             )
             phase = "publication.receipt"
+            # IF-12: re-check the baseline immediately before the write.  A base
+            # that moved since planning refuses this stale merge without any
+            # write; the receipt is unresolved for reconciliation.
+            observed_base = _remote_ref(repository, f"refs/heads/{base}")
+            if observed_base != base_sha:
+                observed(
+                    "publication.receipt",
+                    "failed",
+                    {"error": "base_moved_before_write", "planned_base": base_sha, "observed_base": observed_base},
+                )
+                return _unresolved(
+                    "base_moved_before_write",
+                    {"planned_base": base_sha, "observed_base": observed_base},
+                    commit="",
+                    branch=branch,
+                    subject=subject,
+                    base=base,
+                )
             if not noop or commit != head_sha:
-                _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
+                # Conditional write: the candidate branch may only move from the
+                # exact head this plan read (an empty expectation means the
+                # branch must still not exist).  A rewound or re-created head
+                # must never be overwritten.
+                try:
+                    _git(
+                        worktree,
+                        "push",
+                        f"--force-with-lease=refs/heads/{branch}:{head_sha}",
+                        "origin",
+                        f"HEAD:refs/heads/{branch}",
+                    )
+                except subprocess.CalledProcessError as error:
+                    # The response was lost.  Compare the actual remote head
+                    # against the candidate fixed before the write first: a
+                    # confirmed candidate write is retained for reconciliation,
+                    # and an unobservable side effect stays unresolved - the
+                    # base alone may never assert "nothing was written".
+                    observed_head = _observe_remote_ref(repository, f"refs/heads/{branch}")
+                    observed_base = _observe_remote_ref(repository, f"refs/heads/{base}")
+                    detail = {
+                        "candidate": commit,
+                        "expected_head": head_sha,
+                        "observed_head": observed_head,
+                        "planned_base": base_sha,
+                        "observed_base": observed_base,
+                        "stderr": (error.stderr or "")[-300:],
+                    }
+                    if observed_head == commit:
+                        observed("publication.receipt", "failed", {"error": "push_response_lost", **detail})
+                        return _unresolved(
+                            "push_response_lost",
+                            detail,
+                            commit=commit,
+                            branch=branch,
+                            subject=subject,
+                            base=base,
+                        )
+                    if observed_head is None or observed_base is None:
+                        observed("publication.receipt", "failed", {"error": "push_unverified", **detail})
+                        return _unresolved(
+                            "push_unverified",
+                            detail,
+                            commit=commit,
+                            branch=branch,
+                            subject=subject,
+                            base=base,
+                        )
+                    if observed_base != base_sha:
+                        observed("publication.receipt", "failed", {"error": "base_moved_before_write", **detail})
+                        return _unresolved(
+                            "base_moved_before_write",
+                            detail,
+                            commit="",
+                            branch=branch,
+                            subject=subject,
+                            base=base,
+                        )
+                    if observed_head != head_sha:
+                        observed("publication.receipt", "failed", {"error": "candidate_head_changed", **detail})
+                        return _unresolved(
+                            "candidate_head_changed",
+                            detail,
+                            commit="",
+                            branch=branch,
+                            subject=subject,
+                            base=base,
+                        )
+                    raise
             pushed = commit
         finally:
             _git(repository, "worktree", "remove", "--force", str(worktree), check=False)
             _git(repository, "worktree", "prune", check=False)
             shutil.rmtree(staging, ignore_errors=True)
-        if _git(repository, "ls-remote", "origin", f"refs/heads/{branch}").stdout.split()[:1] != [pushed]:
+        if _remote_ref(repository, f"refs/heads/{branch}") != pushed:
             raise PrError("remote_head_mismatch", {"expected": pushed})
         state, url = _pr(repository, slug, base, branch, subject, pushed, report, message)
+        # Final confirmation: the baseline must still be the one this candidate
+        # was planned and merged against.  When it moved after the candidate
+        # write, the write is retained and the receipt stays unresolved for
+        # reconciliation - never a success.
+        confirmed_base = _remote_ref(repository, f"refs/heads/{base}")
+        if confirmed_base != base_sha:
+            observed(
+                "publication.receipt",
+                "failed",
+                {"error": "base_moved_after_push", "planned_base": base_sha, "observed_base": confirmed_base},
+            )
+            return _unresolved(
+                "base_moved_after_push",
+                {"planned_base": base_sha, "observed_base": confirmed_base, "commit": pushed},
+                commit=pushed,
+                branch=branch,
+                subject=subject,
+                base=base,
+                url=url,
+            )
         content_noop = noop and pushed == head_sha
         result = {
             "state": "noop" if content_noop else state,

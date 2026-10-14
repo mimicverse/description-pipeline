@@ -18,11 +18,15 @@ from tests.v1.test_portal import (
     FEISHU_NAME,
     MockAirflow,
     PortalClient,
+    TEST_SUMMARY,
+    TEST_TARGET,
+    TEST_TARGETS,
     VIEWER_TOKEN,
     _actor_envelope,
     _QuietHandler,
     _ThreadingWSGIServer,
 )
+from tests.v1.test_platform_store import NOW, FakeWorld
 
 from description_pipeline.orchestration.airflow_client import (
     EndpointConfig,
@@ -30,6 +34,7 @@ from description_pipeline.orchestration.airflow_client import (
     native_run_id,
 )
 from description_pipeline.orchestration.portal import AirflowApi, PortalApp, PortalConfig
+from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 
 
 class RunMetadataTests(unittest.TestCase):
@@ -37,6 +42,8 @@ class RunMetadataTests(unittest.TestCase):
         self.airflow = MockAirflow()
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
+        self.world = FakeWorld()
+        self.platform = PlatformStore(self.world.connect)
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
         self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
         self.endpoint_server = MockEndpoint()
@@ -49,12 +56,14 @@ class RunMetadataTests(unittest.TestCase):
         self.client.login()
 
     # ------------------------------------------------------------------ helpers
-    def _serve(self, *, endpoint=None):
+    def _serve(self, *, endpoint=None, store=None):
         config = PortalConfig(
             airflow=AirflowApi(self.airflow.url),
             endpoint=endpoint or (lambda: self.endpoint),
             static_dir=self.static_dir,
             upload_root=self.upload_root,
+            platform_store=store if store is not None else self.platform,
+            pipeline_targets=TEST_TARGETS,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -96,6 +105,7 @@ class RunMetadataTests(unittest.TestCase):
         self.airflow.task_states[dag_run_id] = [
             {"task_id": f"task-{index}", "state": value} for index, value in enumerate(tasks)
         ]
+        self.world.run_display_rows[dag_run_id] = [None, None, None, NOW]
         return dag_run_id
 
     @staticmethod
@@ -332,25 +342,39 @@ class RunMetadataTests(unittest.TestCase):
         status, _, body = client.request("POST", f"/api/runs/{run_id}/restore")
         self.assertEqual(status, 200, body)
 
-    def test_corrupt_ledger_fails_closed_everywhere(self) -> None:
+    def test_an_unavailable_platform_fails_the_run_surfaces_closed(self) -> None:
         run_id = self._seed(self._uuid())
-        ledger = self.upload_root / ".run-metadata.json"
-        ledger.write_text("{ not json", encoding="utf-8")
-        status, _, body = self.client.request("GET", "/api/runs")
+
+        def refusing_connect():
+            raise PlatformStoreError("platform store unavailable")
+
+        restarted = self._serve(store=PlatformStore(refusing_connect))
+        client = PortalClient(f"http://127.0.0.1:{restarted.server_address[1]}")
+        client.login()
+        status, _, body = client.request("GET", "/api/runs")
         self.assertEqual(status, 503, body)
+        status, _, body = client.request("GET", f"/api/runs/{run_id}")
+        self.assertEqual(status, 503, body)
+        status, _, body = client.request("PATCH", f"/api/runs/{run_id}", {"title": "x"})
+        self.assertEqual(status, 503, body)
+        status, _, body = client.request("DELETE", f"/api/runs/{run_id}")
+        self.assertEqual(status, 503, body)
+
+    def test_runs_without_a_platform_row_refuse_display_writes(self) -> None:
+        run_id = self._seed(self._uuid())
+        self.world.run_display_rows.pop(run_id)
+        for method, path, payload in (
+            ("PATCH", f"/api/runs/{run_id}", {"title": "x"}),
+            ("DELETE", f"/api/runs/{run_id}", None),
+            ("POST", f"/api/runs/{run_id}/restore", None),
+        ):
+            with self.subTest(case=method):
+                status, _, body = self.client.request(method, path, payload)
+                self.assertEqual(status, 404, body)
+                self.assertIn("平台登记", json.loads(body)["error"])
         status, _, body = self.client.request("GET", f"/api/runs/{run_id}")
-        self.assertEqual(status, 503, body)
-        status, _, body = self.client.request("PATCH", f"/api/runs/{run_id}", {"title": "x"})
-        self.assertEqual(status, 503, body)
-        status, _, body = self.client.request("DELETE", f"/api/runs/{run_id}")
-        self.assertEqual(status, 503, body)
-        # Valid JSON with an invalid entry is refused just as strictly.
-        ledger.write_text(
-            json.dumps({"schema_version": "solidworks-to-urdf.run-metadata/v1", "runs": {run_id: {"deleted": "yes"}}}),
-            encoding="utf-8",
-        )
-        status, _, body = self.client.request("GET", "/api/runs")
-        self.assertEqual(status, 503, body)
+        self.assertEqual(status, 200, body)
+        self.assertFalse(json.loads(body)["deleted"])
 
     def test_unknown_native_status_refuses_and_list_failure_is_503(self) -> None:
         run_id = self._seed(self._uuid())
@@ -378,6 +402,8 @@ class RunMetadataTests(unittest.TestCase):
                 "handoff_path": "/srv/robot-cell",
                 "parent_dag_run_id": parent,
                 "resume_from": "verify",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
             },
         )
         status, _, body = self.client.request("DELETE", f"/api/runs/{parent}")

@@ -4,9 +4,14 @@
   "stages": [
     {
       "id": "freeze",
-      "host": "native",
+      "hosts": ["linux"],
+      "host_text": "Linux",
       "name": "Freeze inputs",
       "name_zh": "冻结输入",
+      "doc": {
+        "input": "已完成上传、认证主体、主装配及配置目标；路径、文件类型、大小和选择有效",
+        "output": "不可变请求、上传清单与原件；清单闭合、字节及摘要一致"
+      },
       "inputs": [
         {
           "label": "Saved SolidWorks folder",
@@ -22,8 +27,8 @@
       ],
       "outputs": [
         {
-          "label": "Frozen handoff, file inventory and digest",
-          "path": "handoff/",
+          "label": "Frozen handoff, upload inventory and originals",
+          "path": "input/handoff.json + input/cad/",
           "class": "frozen"
         }
       ],
@@ -35,18 +40,24 @@
       ],
       "evidence": [
         "handoff_sha256",
-        "package_files"
+        "package_files",
+        "input/handoff.json"
       ]
     },
     {
       "id": "discover",
-      "host": "native+portable",
+      "hosts": ["windows", "linux"],
+      "host_text": "Windows 原生观察 + Linux 推导",
       "name": "Discover structure",
       "name_zh": "解析结构",
+      "doc": {
+        "input": "冻结工程及同版工具；原生解析状态和来源绑定有效",
+        "output": "原始发现、规格快照、工程内容身份和采集计划；模式明确、结构可解、对象引用唯一且计划绑定原始观察"
+      },
       "inputs": [
         {
           "label": "Frozen handoff and explicitly referenced component records",
-          "path": "handoff/",
+          "path": "input/handoff.json + input/cad/",
           "class": "frozen"
         }
       ],
@@ -58,13 +69,23 @@
       ],
       "outputs": [
         {
-          "label": "Native observations and findings",
-          "path": "input/discovery/",
+          "label": "Raw discovery",
+          "path": "evidence/discovery.json",
           "class": "frozen"
         },
         {
-          "label": "Derived definition; structural revision when metadata is complete",
-          "path": "input/robot.yaml + input/cad-revision.json",
+          "label": "Controlled specification snapshot",
+          "path": "input/records/",
+          "class": "frozen"
+        },
+        {
+          "label": "Engineering content identity",
+          "path": "input/source.json",
+          "class": "derived"
+        },
+        {
+          "label": "Capture plan",
+          "path": "evidence/capture-plan.json",
           "class": "derived"
         }
       ],
@@ -79,20 +100,26 @@
         }
       ],
       "evidence": [
-        "input/discovery/native-discovery.json",
-        "input/robot.yaml",
-        "input/cad-revision.json"
+        "evidence/discovery.json",
+        "input/records/",
+        "input/source.json",
+        "evidence/capture-plan.json"
       ]
     },
     {
       "id": "capture",
-      "host": "native",
+      "hosts": ["windows", "linux"],
+      "host_text": "Windows 原生读取 + Linux 传输核验",
       "name": "Capture evidence",
       "name_zh": "采集证据",
+      "doc": {
+        "input": "封存计划及同一工程副本；工具、计划摘要、配置和实例身份一致",
+        "output": "完整原生证据；重建、原生状态读取、临时选择/配置恢复、几何覆盖和源文件稳定检查通过，传输闭合"
+      },
       "inputs": [
         {
-          "label": "Prepared definition, saved CAD and native runtime",
-          "path": "input/",
+          "label": "Sealed plan and the same unchanged project copy",
+          "path": "evidence/capture-plan.json + input/cad/",
           "class": "prepared"
         }
       ],
@@ -108,8 +135,18 @@
       ],
       "outputs": [
         {
-          "label": "Collected CAD, raw measurements, native meshes and manifest",
-          "path": "evidence/",
+          "label": "Captured instances, states and raw measurements",
+          "path": "evidence/capture.json",
+          "class": "frozen"
+        },
+        {
+          "label": "Native meshes",
+          "path": "evidence/native-meshes/",
+          "class": "frozen"
+        },
+        {
+          "label": "Native API, environment and session identity",
+          "path": "evidence/native-runtime.json",
           "class": "frozen"
         }
       ],
@@ -124,17 +161,21 @@
         }
       ],
       "evidence": [
-        "reports/input.json",
-        "evidence/manifest.json",
-        "evidence/raw/",
-        "evidence/source/"
+        "evidence/capture.json",
+        "evidence/native-meshes/",
+        "evidence/native-runtime.json"
       ]
     },
     {
       "id": "generate",
-      "host": "portable",
+      "hosts": ["linux"],
+      "host_text": "Linux",
       "name": "Generate URDF",
       "name_zh": "生成 URDF",
+      "doc": {
+        "input": "完整封存证据；清单、schema、来源与工具身份有效",
+        "output": "规范化模型、URDF、网格及交付主体；模型合法、文件完整并绑定来源"
+      },
       "inputs": [
         {
           "label": "Frozen native evidence",
@@ -160,8 +201,8 @@
           "class": "derived"
         },
         {
-          "label": "Tool identity and file subject",
-          "path": "reports/tool.json",
+          "label": "Tool identity and delivery subject",
+          "path": "tool.json + manifest.json",
           "class": "derived"
         }
       ],
@@ -175,18 +216,24 @@
         "model/robot.json",
         "urdf/robot.urdf",
         "meshes/",
-        "reports/tool.json"
+        "tool.json",
+        "manifest.json"
       ]
     },
     {
       "id": "verify",
-      "host": "portable",
+      "hosts": ["linux"],
+      "host_text": "Linux",
       "name": "Independent verification",
       "name_zh": "独立验证",
+      "doc": {
+        "input": "原始证据和实际产物；交付主体未变",
+        "output": "确定性质量报告；所有必需且适用的检查通过，报告绑定主体与策略"
+      },
       "inputs": [
         {
           "label": "Original evidence and actual generated files",
-          "path": "input/ + evidence/ + model/ + urdf/ + meshes/",
+          "path": "input/ + evidence/ + model/ + urdf/ + meshes/ + tool.json",
           "class": "bound"
         }
       ],
@@ -220,13 +267,18 @@
     },
     {
       "id": "publish",
-      "host": "portable",
+      "hosts": ["linux"],
+      "host_text": "Linux",
       "name": "Publish review PR",
       "name_zh": "提交评审 PR",
+      "doc": {
+        "input": "完整重验、配置目标、发布前置基线和干净工作区有效",
+        "output": "候选 commit 与 PR 收据；复制、Git blobs、远端 head/base 与验证主体一致"
+      },
       "inputs": [
         {
           "label": "Verified delivery and configured model repository",
-          "path": "urdf/ + meshes/ + reports/quality.json",
+          "path": "manifest.json + input/ + evidence/ + model/ + urdf/ + meshes/ + tool.json + reports/quality.json",
           "class": "verified"
         }
       ],
@@ -239,7 +291,7 @@
       "outputs": [
         {
           "label": "Candidate commit and PR receipt",
-          "path": "reports/pr.json",
+          "path": "平台运行存储/PR 收据",
           "class": "receipt"
         }
       ],
@@ -254,7 +306,7 @@
         }
       ],
       "evidence": [
-        "reports/pr.json",
+        "平台运行存储/PR 收据",
         "commit",
         "url"
       ]
@@ -263,42 +315,42 @@
   "confirmations": [
     {
       "id": "design_fidelity",
-      "label": "设计与实物对应",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "label": "结构负责人",
+      "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "discover",
-      "scope": "确认本版 CAD 的配置、附件和机构符合预期实物；确认接口名称与实物身份、跨版本改名对应关系、轴线原点与偏置、机械零位和正向；确认设计表、方程及上下文引用表达正确设计意图。",
+      "scope": "CAD 与预期实物、配置、刚性/自由度、接口身份、零位、正向及工程变更对应",
       "automatic_exclusion": "不重复检查主装配唯一性、实例覆盖、刚体唯一归属、树拓扑、坐标变换或导出一致性。"
     },
     {
       "id": "motion_safety",
-      "label": "全行程与装配安全",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "label": "机械安全责任人",
+      "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "verify",
-      "scope": "确认全行程及关键组合姿态的干涉、间隙、公差、止挡、安全余量和线缆约束；保留设计接触等例外依据。",
+      "scope": "全行程、关键组合、干涉、间隙、公差、安全余量与线缆约束",
       "automatic_exclusion": "不重复检查限位数值合法性、原生限位与输出限位的一致性。"
     },
     {
       "id": "drive_applicability",
-      "label": "驱动工况适用性",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "label": "参数责任人",
+      "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "discover",
-      "scope": "确认受控驱动规格适用于实际型号、传动、输出侧、负载及持续／峰值工况。",
+      "scope": "输出侧规格、传动、持续/峰值工况及适用条件",
       "automatic_exclusion": "不重复抄录或核算流水线已验证的规格引用、版本、数值和派生一致性。"
     },
     {
       "id": "physical_fidelity",
-      "label": "物理参数真实性",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "label": "物理参数责任人",
+      "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "capture",
-      "scope": "确认实际材料、密度、质量边界和简化假设符合实物，覆盖值或实测参数具有可信来源。",
+      "scope": "真实材料、密度、物理范围、覆盖与简化来源",
       "automatic_exclusion": "不重复验算 CAD 与 URDF 总质量、质心、惯量组合、单位和变换。"
     },
     {
       "id": "acceptance_basis",
-      "label": "独立验收依据",
-      "reference": "docs/mechanical-handoff-spec.md#111-自动检查与工程师确认",
+      "label": "预算责任人",
+      "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "verify",
-      "scope": "确认质量及外形验收区间来自独立设计预算、受控规格或实测，并适用于本版配置和不确定度。",
+      "scope": "已提供预算的独立性、范围和不确定度",
       "automatic_exclusion": "不重复比较产物是否落在已声明区间内。"
     }
   ],

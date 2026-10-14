@@ -13,9 +13,8 @@ from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
 from description_pipeline.cli import main
-from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
-from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
-from description_pipeline.sources.solidworks.revision import package_inventory, seal_revision
+from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data, write_json
+from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.stages import stage_view
 
 
@@ -68,29 +67,59 @@ class WorkflowTests(unittest.TestCase):
         self.output = self.root / "delivery"
 
     def seal(self):
-        seal_revision(
-            self.package,
-            hardware_id="arm",
-            revision="r1",
-            owner="mechanical",
-            system="handoff",
-            reference="fixture/arm/r1",
-            summary="Control test",
+        from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+
+        identity = {
+            "kind": "source-revision",
+            "handoff_digest": digest({"fixture": "assembly.SLDASM"}),
+            "main_assembly": "assembly.SLDASM",
+            "configuration": "Default",
+            "hardware_id": "arm",
+            "records": [],
+        }
+        write_json(
+            self.package / "source.json",
+            {
+                "schema_version": SOURCE_RECORD_SCHEMA,
+                "source_revision_id": digest(identity),
+                "identity": identity,
+                "selection": {
+                    "main_assembly": "assembly.SLDASM",
+                    "configuration": "Default",
+                    "hardware_id": "arm",
+                    "hardware_source": "cad",
+                },
+                "metadata": {
+                    "revision": "r1",
+                    "owner": "mechanical",
+                    "control": {"system": "handoff", "reference": "fixture/arm/r1"},
+                    "change_summary": "Control test",
+                    "change_summary_source": "submission",
+                },
+            },
         )
 
-    def test_inspection_requires_mechanical_revision(self):
+    def test_inspection_defers_until_the_content_identity_record_exists(self):
         report = steps.inspect_prepared_input(self.package)
-        self.assertFalse(report["passed"])
-        self.assertIn("input.cad_revision", [e["code"] for e in report["errors"]])
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertIn("input.source_identity_pending", [row["code"] for row in report["warnings"]])
         self.seal()
-        self.assertTrue(steps.inspect_prepared_input(self.package)["passed"])
+        report = steps.inspect_prepared_input(self.package)
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertNotIn("input.source_identity_pending", [row["code"] for row in report["warnings"]])
+        self.assertEqual(report["cad_revision"]["hardware_id"], "arm")
+        self.assertEqual(report["cad_revision"]["revision"], "r1")
 
     def acquisition_without_admin(self):
         """Byte-binding control only; these placeholders do not qualify CAD."""
         author = read_data(self.package / "robot.yaml")
         author["hardware_id"] = None
         author["source"]["robot_name"] = "robot"
-        files = {name: checksum for name, checksum in package_inventory(self.package).items() if name != "robot.yaml"}
+        files = {
+            name: checksum
+            for name, checksum in package_inventory(self.package).items()
+            if name not in ("robot.yaml", "source.json")
+        }
         identity = {
             "hardware_id": None, "revision": None, "owner": None, "change_summary": None,
             "control": None, "robot_name": None, "main_assembly": "assembly.SLDASM",
@@ -114,10 +143,9 @@ class WorkflowTests(unittest.TestCase):
         self.acquisition_without_admin()
         report = steps.inspect_prepared_input(self.package)
         self.assertTrue(report["passed"], report["errors"])
-        self.assertIsNone(report["input"]["hardware_id"])
+        self.assertIsNone(report["input"])
         self.assertIsNone(report["cad_revision"])
-        self.assertFalse((self.package / "cad-revision.json").exists())
-        self.assertIn("input.cad_revision_pending", [row["code"] for row in report["warnings"]])
+        self.assertIn("input.source_identity_pending", [row["code"] for row in report["warnings"]])
         bundle = self.root / "unpublished"
         bundle.mkdir()
         shutil.copytree(self.package, bundle / "input")
@@ -126,83 +154,75 @@ class WorkflowTests(unittest.TestCase):
                 steps, "tool_record", return_value={"release": {"schema_version": "solidworks-to-urdf.release/v1"}}
             ),
             patch("description_pipeline.repository.urdf_pr.submit_bundle") as publish,
-            self.assertRaisesRegex(PipelineError, "authored CAD hardware"),
+            self.assertRaisesRegex(PipelineError, "input/source.json"),
         ):
             steps.publish_model(bundle, self.root / "repository")
         publish.assert_not_called()
 
-    def test_absent_admin_does_not_waive_binding_or_malformed_revision(self):
-        self.acquisition_without_admin()
-        (self.package / "part.SLDPRT").write_bytes(b"changed after acquisition")
-        self.assertFalse(steps.inspect_prepared_input(self.package)["passed"])
-        # Rebind the intentionally changed fixture, then supply an invalid revision.
-        (self.package / "discovery/native-discovery.json").unlink()
-        self.acquisition_without_admin()
-        write_json(self.package / "cad-revision.json", {"hardware_id": None})
+    def test_malformed_content_identity_is_refused(self):
+        write_json(self.package / "source.json", {"schema_version": "x"})
         report = steps.inspect_prepared_input(self.package)
         self.assertFalse(report["passed"])
-        self.assertIn("input.cad_revision", [row["code"] for row in report["errors"]])
-
-    def test_complete_admin_cannot_hide_a_deleted_revision(self):
-        author, record = self.acquisition_without_admin()
-        author["hardware_id"] = "arm"
-        record["identity"].update(
-            hardware_id="arm", revision="r1", owner="mechanical", change_summary="fixture",
-            control={"system": "handoff", "reference": "fixture/r1"},
-        )
-        path = self.package / "discovery/native-discovery.json"
-        write_json(path, record)
-        author["provenance"]["discovery_sha256"] = file_digest(path)
-        write_json(self.package / "robot.yaml", author)
-        report = steps.inspect_prepared_input(self.package)
-        self.assertFalse(report["passed"])
-        self.assertIn("requires its generated", report["errors"][-1]["message"])
+        self.assertIn("input.source_identity", [row["code"] for row in report["errors"]])
+        # Changed engineering bytes stay bound at the gates that own the frozen
+        # package (steps.bind_discovery) and the delivery subject (verify_discovery),
+        # not in the identity inspection.
 
     def test_linux_never_opens_native_cad_and_keeps_failure_evidence(self):
         self.seal()
+        self.acquisition_without_admin()
         events = []
         with (
             patch.object(solidworks.sys, "platform", "linux"),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
         ):
-            result = solidworks.run(self.package, self.output, on_event=events.append)
+            result = solidworks.capture(self.package, self.output, on_event=events.append)
         native.assert_not_called()
         self.assertFalse(result["passed"])
         self.assertIn("Windows", result["error"])
         self.assertTrue(result["run_id"])
         self.assertEqual("failed", events[-1]["state"])
         self.assertFalse(self.output.exists())
-        self.assertTrue((Path(result["diagnostic_path"]) / "reports/input.json").is_file())
+        diagnostic = Path(result["diagnostic_path"])
+        listing = sorted(path.relative_to(diagnostic).as_posix() for path in diagnostic.rglob("*"))
+        self.assertTrue((diagnostic / "input/handoff.json").is_file(), listing)
 
-    def test_failed_input_does_not_replace_existing_owned_output(self):
+    def test_a_non_empty_output_is_never_replaced(self):
         self.output.mkdir()
         marker = self.output / "README.md"
         marker.write_text("Existing output bytes")
-        solidworks._stamp(self.output, {"schema_version": BUNDLE_SCHEMA, "pipeline_id": PIPELINE_ID})
-        result = solidworks.run(self.package, self.output)
-        self.assertFalse(result["passed"])
+        with self.assertRaisesRegex(PipelineError, "absent or empty"):
+            solidworks.capture(self.package, self.output)
         self.assertEqual("Existing output bytes", marker.read_text())
-        self.assertTrue(solidworks._owned_output(self.output))
 
     def test_native_preflight_failure_blocks_capture_and_retains_diagnostics(self):
         self.seal()
+        self.acquisition_without_admin()
         error = PipelineError("Native readiness failed")
         error.details = {"reason": "SolidWorks registration unavailable"}
         with (
             patch.object(solidworks.sys, "platform", "win32"),
             patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as capture,
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
         ):
-            result = solidworks.run(self.package, self.output)
+            result = solidworks.capture(self.package, self.output)
         capture.assert_not_called()
         self.assertFalse(result["passed"])
         self.assertEqual(result["stage"], "capture")
         self.assertEqual(result["error"], "Native readiness failed")
         self.assertEqual(result["detail"], error.details)
-        self.assertTrue((Path(result["diagnostic_path"]) / "reports/run.json").is_file())
         root = Path(result["diagnostic_path"])
-        receipt = read_data(root / "reports/run.json")
-        self.assertEqual(receipt["stage_report"]["sha256"], file_digest(root / "reports/stages.json"))
+        self.assertEqual(result["stage_report"]["sha256"], file_digest(root / "reports/stages.json"))
         view = read_data(root / "reports/stages.json")
         capture = next(stage for stage in view["stages"] if stage["id"] == "capture")
         self.assertEqual(capture["state"], "failed")
@@ -214,7 +234,7 @@ class WorkflowTests(unittest.TestCase):
         expected = package_inventory(self.package)
         (self.package / "assembly.SLDASM").write_bytes(b"Changed after discovery")
         with patch("description_pipeline.sources.solidworks.freeze.freeze") as native:
-            result = solidworks.run(self.package, self.output, expected_inputs=expected)
+            result = solidworks.capture(self.package, self.output, expected_inputs=expected)
         native.assert_not_called()
         self.assertFalse(result["passed"])
         self.assertIn("changed after discovery", result["error"])
@@ -222,31 +242,37 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(check["state"], "failed")
 
     def test_static_inspection_is_consumed_once_and_changed_inspected_bytes_are_rejected(self):
-        from description_pipeline.sources.solidworks.input import inspect_package
-
         self.seal()
+        self.acquisition_without_admin()
         inspect_prepared = steps.inspect_prepared_input
+        calls: list = []
 
         def change_after_inspection(package):
             report = inspect_prepared(package)
+            calls.append(package)
             (package / "part.SLDPRT").write_bytes(b"Changed after inspection")
             return report
 
         with (
-            patch("description_pipeline.sources.solidworks.input.inspect_package", wraps=inspect_package) as inspect,
             patch.object(steps, "inspect_prepared_input", side_effect=change_after_inspection),
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
         ):
-            result = solidworks.run(self.package, self.output)
-        inspect.assert_called_once()
+            result = solidworks.capture(self.package, self.output)
+        self.assertEqual(len(calls), 1)
         native.assert_not_called()
-        self.assertIn("static validation", result["error"])
+        self.assertIn("Archived CAD originals differ from the frozen inventory", result["error"])
         self.assertFalse(result["passed"])
 
     def test_capture_input_qc_records_handoff_and_frozen_file_binding(self):
         from description_pipeline.verification.consumer import ConsumerError
 
         self.seal()
+        self.acquisition_without_admin()
         expected = package_inventory(self.package)
         handoff = "c" * 64
         error = ConsumerError("Consumer loading failed", stderr="ImportError: control")
@@ -254,8 +280,13 @@ class WorkflowTests(unittest.TestCase):
             patch.object(solidworks.sys, "platform", "win32"),
             patch("description_pipeline.runtime.native_readiness", side_effect=error),
             patch("description_pipeline.sources.solidworks.freeze.freeze") as native,
+            patch(
+                "description_pipeline.sources.solidworks.discovery.source_definition",
+                return_value={"provider": "solidworks", "assembly": "assembly.SLDASM"},
+            ),
+            patch("description_pipeline.sources.solidworks.input.native_source_closure", return_value={}),
         ):
-            result = solidworks.run(self.package, self.output, expected_inputs=expected, handoff_sha256=handoff)
+            result = solidworks.capture(self.package, self.output, expected_inputs=expected, handoff_sha256=handoff)
         native.assert_not_called()
         self.assertFalse(result["passed"])
         check = next(stage for stage in stage_view(result)["stages"] if stage["id"] == "capture")["input_qc"][0]
@@ -263,8 +294,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(check["state"], "passed")
         self.assertTrue(check["details"]["passed"])
         self.assertEqual(check["details"]["handoff_sha256"], handoff)
-        self.assertEqual(check["details"]["files_sha256"], digest(expected))
-        self.assertEqual(check["details"]["files"], {"input/" + path: value for path, value in expected.items()})
+        delivered = {
+            "cad/assembly.SLDASM": file_digest(self.package / "assembly.SLDASM"),
+            "cad/part.SLDPRT": file_digest(self.package / "part.SLDPRT"),
+            "source.json": file_digest(self.package / "source.json"),
+        }
+        self.assertEqual(check["details"]["files_sha256"], digest(delivered))
+        self.assertEqual(check["details"]["files"], {"input/" + path: value for path, value in delivered.items()})
 
     def test_snapshot_details_rejects_a_manifest_changed_after_verification(self):
         from description_pipeline import steps
@@ -302,22 +338,41 @@ class WorkflowTests(unittest.TestCase):
 
     def test_rebuild_records_only_executed_steps_without_claiming_native_replay(self):
         from .protocol_support import protocol_events
-        from description_pipeline.delivery import subject_digest
+        from description_pipeline.delivery import stamped_output, subject_digest
 
         self.seal()
         bundle = self.root / "frozen"
         (bundle / "reports").mkdir(parents=True)
-        write_json(bundle / "reports/input.json", {"synthetic": True})
-        write_json(bundle / "reports/run.json", {"run_id": "source-run"})
         import shutil
 
         shutil.copytree(self.package, bundle / "input")
+        (bundle / "input" / "discovery").mkdir()
+        write_json(
+            bundle / "input" / "discovery" / "native-discovery.json",
+            {"identity": {"hardware_id": "arm"}, "handoff_sha256": "d" * 64},
+        )
+        input_files = inventory(bundle / "input")
+        write_json(
+            bundle / "input" / "handoff.json",
+            {
+                "passed": True,
+                "input": None,
+                "cad_revision": {"revision": "r1"},
+                "input_receipt": None,
+                "package_files": input_files,
+            },
+        )
         (bundle / "evidence").mkdir()
         (bundle / "evidence/raw.json").write_text('"Synthetic driver fixture"')
+        write_json(
+            bundle / "evidence" / "discovery.json",
+            {"identity": {"hardware_id": "arm"}, "handoff_sha256": "d" * 64},
+        )
         for name in ("model", "urdf", "meshes"):
             (bundle / name).mkdir()
         (bundle / "README.md").write_text("Synthetic driver fixture")
         write_json(bundle / "reports/tool.json", {})
+        write_json(bundle / "tool.json", {})
         source_subject = subject_digest(bundle)
 
         def generate(staging, definition, report, *, on_event):
@@ -334,16 +389,27 @@ class WorkflowTests(unittest.TestCase):
             patch.object(solidworks, "_check", return_value={"passed": True, "subject_sha256": source_subject}),
             patch.object(steps, "generate_model", side_effect=generate),
             patch.object(steps, "verify_delivery", side_effect=verify),
+            patch.object(
+                steps,
+                "inspect_prepared_input",
+                return_value={
+                    "passed": True,
+                    "input": None,
+                    "cad_revision": {"revision": "r1"},
+                    "input_receipt": None,
+                },
+            ),
         ):
             result = solidworks.rebuild(bundle, self.output)
-        self.assertTrue(result["passed"])
-        self.assertEqual(result["rebuild_from"]["run_id"], "source-run")
+        self.assertTrue(result["passed"], result)
         self.assertEqual(result["rebuild_from"]["subject_sha256"], source_subject)
+        self.assertEqual(result["rebuild_from"]["handoff_sha256"], "d" * 64)
+        self.assertEqual(result["handoff_sha256"], "d" * 64)
         view = read_data(self.output / "reports/stages.json")
         self.assertEqual(view["execution_scope"], ["generate", "verify"])
         self.assertEqual([row["id"] for row in view["stages"] if row["state"] == "completed"], ["generate", "verify"])
         self.assertTrue(all(row["state"] == "not_run" for row in view["stages"] if not row["in_scope"]))
-        self.assertTrue(solidworks._owned_output(self.output))
+        self.assertTrue(stamped_output(self.output))
 
     def test_rebuild_refuses_a_frozen_delivery_that_changed_after_verification(self):
         bundle = self.root / "frozen"
@@ -356,6 +422,7 @@ class WorkflowTests(unittest.TestCase):
         (bundle / "README.md").write_text("Synthetic driver fixture")
         write_json(bundle / "reports/input.json", {"synthetic": True})
         write_json(bundle / "reports/tool.json", {})
+        write_json(bundle / "tool.json", {})
         with (
             patch.object(solidworks, "_check", return_value={"passed": True, "subject_sha256": "0" * 64}),
             self.assertRaisesRegex(PipelineError, "changed after verification"),
@@ -363,7 +430,7 @@ class WorkflowTests(unittest.TestCase):
             solidworks.rebuild(bundle, self.output)
         self.assertFalse(self.output.exists())
 
-    def test_rebuild_refuses_frozen_evidence_changed_during_preparation_and_records_handoff(self):
+    def test_rebuild_refuses_frozen_evidence_changed_during_preparation(self):
         import shutil
 
         from description_pipeline.delivery import subject_digest
@@ -371,7 +438,6 @@ class WorkflowTests(unittest.TestCase):
         self.seal()
         bundle = self.root / "frozen"
         (bundle / "reports").mkdir(parents=True)
-        write_json(bundle / "reports/run.json", {"run_id": "source-run"})
         shutil.copytree(self.package, bundle / "input")
         definition = read_data(bundle / "input/robot.yaml")
         definition["provenance"] = {"native_inventory_sha256": "d" * 64}
@@ -381,8 +447,8 @@ class WorkflowTests(unittest.TestCase):
         for name in ("model", "urdf", "meshes"):
             (bundle / name).mkdir()
         (bundle / "README.md").write_text("Synthetic driver fixture")
-        write_json(bundle / "reports/input.json", {"synthetic": True})
         write_json(bundle / "reports/tool.json", {})
+        write_json(bundle / "tool.json", {})
         source_subject = subject_digest(bundle)
         real_copytree = shutil.copytree
         copies = []
@@ -401,101 +467,21 @@ class WorkflowTests(unittest.TestCase):
             result = solidworks.rebuild(bundle, self.output)
         self.assertFalse(result["passed"])
         self.assertIn("Frozen evidence changed during rebuild preparation", result["error"])
-        self.assertEqual(result["rebuild_from"]["run_id"], "source-run")
-        self.assertEqual(result["rebuild_from"]["handoff_sha256"], "d" * 64)
-        self.assertEqual(result["handoff_sha256"], "d" * 64)
         self.assertFalse(self.output.exists())
 
-    def test_publication_retry_retains_prior_attempts_and_resets_scope_to_publish(self):
-        from .protocol_support import protocol_events
-
-        self.output.mkdir()
-        prior = {
-            "passed": True,
-            "state": "published",
-            "subject_sha256": "a" * 64,
-            "url": "https://github.com/example/control/pull/1",
-        }
-        receipt = {
-            "schema_version": BUNDLE_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "run_id": "retry-run",
-            "execution_scope": ["generate", "verify", "publish"],
-            "submission": prior,
-            "events": protocol_events(stages=("generate", "verify", "publish"), subject="a" * 64),
-        }
-        solidworks._stamp(self.output, receipt)
-        previous = list(receipt["events"])
-
-        def recover(bundle, repository, *, base, message, on_event):
-            for event in protocol_events(stages=("publish",), subject="a" * 64):
-                on_event(event)
-            return {
-                "passed": True,
-                "state": "noop",
-                "subject_sha256": "a" * 64,
-                "url": "https://github.com/example/control/pull/1",
-                "scope": "Synthetic publication retry",
-            }
-
-        with patch.object(steps, "publish_model", side_effect=recover):
-            result = solidworks.submit(self.output, self.root / "repository")
-        self.assertTrue(result["passed"])
-        after = read_data(self.output / "reports/run.json")
-        self.assertEqual(after["execution_scope"], ["publish"])
-        self.assertEqual(after["publication_attempts"], [prior, result])
-        self.assertEqual(after["events"][: len(previous)], previous)
-        self.assertEqual(after["submission"], result)
-        self.assertEqual(after["stage_report"]["sha256"], file_digest(self.output / "reports/stages.json"))
-        self.assertTrue(solidworks._owned_output(self.output))
-
-    def test_publication_retry_keeps_history_and_updates_the_hashed_receipt(self):
-        from .protocol_support import protocol_events
-
-        self.output.mkdir()
-        receipt = {
-            "schema_version": BUNDLE_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "run_id": "retry-run",
-            "execution_scope": ["publish"],
-            "events": protocol_events(stages=("publish",), failed_stage="publish"),
-        }
-        solidworks._stamp(self.output, receipt)
-        previous = list(receipt["events"])
-
-        def recover(bundle, repository, *, base, message, on_event):
-            for event in protocol_events(stages=("publish",), subject="a" * 64):
-                on_event(event)
-            return {
-                "passed": True,
-                "state": "published",
-                "subject_sha256": "a" * 64,
-                "url": "https://github.com/example/control/pull/1",
-                "scope": "Synthetic publication retry",
-            }
-
-        with patch.object(steps, "publish_model", side_effect=recover):
-            result = solidworks.submit(self.output, self.root / "repository")
-        self.assertTrue(result["passed"])
-        after = read_data(self.output / "reports/run.json")
-        self.assertEqual(after["events"][: len(previous)], previous)
-        self.assertEqual(after["publication_attempts"], [result])
-        self.assertEqual(after["stage_report"]["sha256"], file_digest(self.output / "reports/stages.json"))
-        self.assertTrue(solidworks._owned_output(self.output))
-
     def test_annotated_diagnostic_is_preserved_on_retry(self):
-        first = solidworks.run(self.package, self.output)
+        first = solidworks.capture(self.package, self.output)
         old = Path(first["diagnostic_path"])
         note = old / "operator-note.txt"
         note.write_text("Do not erase this review")
-        second = solidworks.run(self.package, self.output)
+        second = solidworks.capture(self.package, self.output)
         self.assertNotEqual(first["diagnostic_path"], second["diagnostic_path"])
         self.assertEqual("Do not erase this review", note.read_text())
 
     def test_output_and_input_cannot_overlap(self):
         before = (self.package / "robot.yaml").read_bytes()
         with self.assertRaises(PipelineError):
-            solidworks.run(self.package, self.package / "output")
+            solidworks.capture(self.package, self.package / "output")
         self.assertEqual(before, (self.package / "robot.yaml").read_bytes())
 
     def test_report_option_cannot_overwrite_delivery_input(self):
@@ -507,13 +493,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_original_cad_is_archived_without_editing(self):
         self.seal()
+        self.acquisition_without_admin()
         target = self.root / "staging"
         target.mkdir()
         original = (self.package / "assembly.SLDASM").read_bytes()
         steps._archive_input(self.package, target)
-        self.assertEqual(original, (target / "input/assembly.SLDASM").read_bytes())
+        self.assertEqual(original, (target / "input/cad/assembly.SLDASM").read_bytes())
         self.assertEqual(original, (self.package / "assembly.SLDASM").read_bytes())
-        self.assertTrue((target / "input/cad-revision.json").is_file())
+        self.assertTrue((target / "input/source.json").is_file())
 
     def test_concurrent_output_writer_is_refused(self):
         with solidworks.output_lock(self.output), self.assertRaises(PipelineError), solidworks.output_lock(self.output):

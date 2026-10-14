@@ -1,0 +1,643 @@
+{
+  "schema": "d.motion-fixture/v1",
+  "purpose": "neutral synthetic raw parse for the future motion.{joint} gate; data only, not an acceptor",
+  "units": {
+    "length": "m",
+    "angle": "rad"
+  },
+  "bodies": [
+    {
+      "id": "b0",
+      "rigid_group": "G0",
+      "frame": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "leaves": [
+        {
+          "id": "L0a",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.5
+        }
+      ]
+    },
+    {
+      "id": "b1",
+      "rigid_group": "G1",
+      "frame": [
+        1.0,
+        0.0,
+        0.0,
+        0.01,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.03,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "leaves": [
+        {
+          "id": "L1a",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.01,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.03,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.12
+        },
+        {
+          "id": "L1b",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.01,
+            0.0,
+            1.0,
+            0.0,
+            0.015,
+            0.0,
+            0.0,
+            1.0,
+            0.03,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.08
+        }
+      ]
+    },
+    {
+      "id": "b2",
+      "rigid_group": "G2",
+      "frame": [
+        1.0,
+        0.0,
+        0.0,
+        0.025,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        -0.01,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "leaves": [
+        {
+          "id": "L2a",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.025,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            -0.01,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.09
+        },
+        {
+          "id": "L2b",
+          "world": [
+            1.0,
+            0.0,
+            0.0,
+            0.025,
+            0.0,
+            1.0,
+            0.0,
+            0.012,
+            0.0,
+            0.0,
+            1.0,
+            -0.01,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "mass_kg": 0.06
+        }
+      ]
+    }
+  ],
+  "joints": [
+    {
+      "id": "J1",
+      "type": "revolute",
+      "parent": "b0",
+      "child": "b1",
+      "axis_point": [
+        0.0,
+        0.0,
+        0.03
+      ],
+      "axis_dir": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "stored_direction": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limits": {
+        "lower": -1.2,
+        "upper": 0.8
+      },
+      "drive": {
+        "effort": 4.0,
+        "velocity": 3.0
+      },
+      "origin_parent_child": [
+        1.0,
+        0.0,
+        0.0,
+        0.01,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.03,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "id": "J2",
+      "type": "revolute",
+      "parent": "b1",
+      "child": "b2",
+      "axis_point": [
+        0.01,
+        0.0,
+        -0.01
+      ],
+      "axis_dir": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "stored_direction": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limits": {
+        "lower": -0.5,
+        "upper": 1.0
+      },
+      "drive": {
+        "effort": 2.0,
+        "velocity": 2.0
+      },
+      "origin_parent_child": [
+        1.0,
+        0.0,
+        0.0,
+        0.015,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        -0.04,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  ],
+  "interface": {
+    "name": "IF-J2",
+    "on_parent": "b1",
+    "on_child": "b2",
+    "axis_point": [
+      0.01,
+      0.0,
+      -0.01
+    ],
+    "axis_dir": [
+      0.0,
+      1.0,
+      0.0
+    ]
+  },
+  "tolerance": {
+    "position_m": 1e-09,
+    "rotation_rad": 1e-09,
+    "interface_line_m": 1e-09,
+    "parallelism_1m": 1e-06
+  },
+  "candidate_carrier": {
+    "parent_edges": {
+      "J1": {
+        "parent": "b2",
+        "child": "b1"
+      },
+      "J2": {
+        "parent": "b0",
+        "child": "b2"
+      }
+    },
+    "origin_parent_child": {
+      "J1": [
+        1.0,
+        0.0,
+        0.0,
+        -0.015,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.04,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "J2": [
+        1.0,
+        0.0,
+        0.0,
+        0.025,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        -0.01,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  },
+  "case": {
+    "poses": {
+      "J1": 0.5235987755982988
+    },
+    "verdict": "reject",
+    "static_green_scope": {
+      "zero_pose_leaf_world_equal": true,
+      "mass_sum_equal": true,
+      "note": "bounded invariants only: this fixture models zero-pose leaf worlds and mass sum; it does NOT claim complete static physics. The product static gates must be run on the real carrier, and every motion assertion below must actually execute."
+    },
+    "expected_world": {
+      "L0a": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L1a": [
+        0.866025403784439,
+        0.0,
+        0.5,
+        0.008660254037844,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        -0.5,
+        0.0,
+        0.866025403784439,
+        0.025,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L1b": [
+        0.866025403784439,
+        0.0,
+        0.5,
+        0.008660254037844,
+        0.0,
+        1.0,
+        0.0,
+        0.015,
+        -0.5,
+        0.0,
+        0.866025403784439,
+        0.025,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L2a": [
+        0.866025403784439,
+        0.0,
+        0.5,
+        0.001650635094611,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        -0.5,
+        0.0,
+        0.866025403784439,
+        -0.017141016151378,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L2b": [
+        0.866025403784439,
+        0.0,
+        0.5,
+        0.001650635094611,
+        0.0,
+        1.0,
+        0.0,
+        0.012,
+        -0.5,
+        0.0,
+        0.866025403784439,
+        -0.017141016151378,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "candidate_world": {
+      "L0a": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L1a": [
+        0.866025403784439,
+        0.0,
+        0.5,
+        0.008660254037844,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        -0.5,
+        0.0,
+        0.866025403784439,
+        0.025,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L1b": [
+        0.866025403784439,
+        0.0,
+        0.5,
+        0.008660254037844,
+        0.0,
+        1.0,
+        0.0,
+        0.015,
+        -0.5,
+        0.0,
+        0.866025403784439,
+        0.025,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L2a": [
+        1.0,
+        0.0,
+        0.0,
+        0.025,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        -0.01,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "L2b": [
+        1.0,
+        0.0,
+        0.0,
+        0.025,
+        0.0,
+        1.0,
+        0.0,
+        0.012,
+        0.0,
+        0.0,
+        1.0,
+        -0.01,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "intra_group_relative": {
+      "G1": {
+        "pair": [
+          "L1a",
+          "L1b"
+        ],
+        "relative": [
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.015,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "G2": {
+        "pair": [
+          "L2a",
+          "L2b"
+        ],
+        "relative": [
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.012,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    "interface": {
+      "line_distance_m": 3.878959614448864e-18,
+      "parallelism": 1.0
+    },
+    "interface_candidate": {
+      "line_distance_m": 0.02134276521758388,
+      "parallelism": 1.0
+    },
+    "assertions": [
+      {
+        "id": "follow.J1.L1a",
+        "expected": "matches_expected_world"
+      },
+      {
+        "id": "follow.J1.L1b",
+        "expected": "matches_expected_world"
+      },
+      {
+        "id": "follow.J1.L2a",
+        "expected": "candidate_mismatch (stays at zero pose, diff 0.024417 m)"
+      },
+      {
+        "id": "follow.J1.L2b",
+        "expected": "candidate_mismatch (stays at zero pose, diff 0.024417 m)"
+      },
+      {
+        "id": "intra_relative.G1",
+        "expected": "invariant_within_tolerance"
+      },
+      {
+        "id": "intra_relative.G2",
+        "expected": "invariant_within_tolerance"
+      },
+      {
+        "id": "interface.IF-J2",
+        "expected": "candidate line distance 0.021343 m >> tolerance"
+      }
+    ],
+    "suggested_test_id": "tests.sources.test_motion_fixtures.MotionFixtureTests.test_case09_static_green_wrong_parent_rejected"
+  }
+}

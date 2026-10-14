@@ -1,17 +1,21 @@
 """Small JSON/hash helpers shared by the SolidWorks adapter modules.
 
-Deliberately local: the *snapshot format* is owned by
-``description_pipeline.sources.snapshot``; these helpers only keep the adapter
-from re-implementing the same four lines in every module.
+The canonical encoding, numeric format and hashes are owned by
+``description_pipeline.io``; these helpers delegate to it and keep only the
+Windows sharing-violation retry that the adapter state files need.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import time
 from pathlib import Path
+
+from ...io import (
+    digest as _canonical_digest,
+    file_digest as _file_digest,
+    read_data as _strict_read,
+    write_json as _canonical_write,
+)
 
 JsonValue = dict | list | str | int | float | bool | None
 
@@ -23,35 +27,29 @@ _SHARING_ATTEMPTS = 5
 _SHARING_DELAY_SECONDS = 0.05
 
 
-def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(chunk), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def sha256_file(path: Path) -> str:
+    """The streamed sha256 of one file (``io.file_digest``)."""
+
+    return _file_digest(path)
 
 
 def digest_json(payload: object) -> str:
-    """Stable digest of a JSON-compatible payload (sorted keys, no spaces)."""
+    """The canonical digest of a JSON-compatible payload (``io.digest``)."""
 
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return _canonical_digest(payload)
 
 
 def write_json(path: Path, payload: object) -> None:
-    """Write JSON atomically: a reader never sees a half-written file.
+    """Canonical, atomic JSON with the Windows sharing-violation retry.
 
-    The watchdog and the job runner both persist state, so a plain ``open(w)``
-    would let a reader parse a truncated document.
+    The bytes and the atomic replace come from ``io.write_json``; only the
+    transient ``PermissionError`` retry (a reader holding the record open)
+    lives here.
     """
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(text + "\n", encoding="utf-8", newline="\n")
     for attempt in range(_SHARING_ATTEMPTS):
         try:
-            os.replace(temporary, path)
+            _canonical_write(path, payload)
             return
         except PermissionError:
             if attempt == _SHARING_ATTEMPTS - 1:
@@ -60,10 +58,11 @@ def write_json(path: Path, payload: object) -> None:
 
 
 def read_json(path: Path) -> JsonValue | None:
+    """The strict foundation parse with the Windows sharing-violation retry."""
+
     for attempt in range(_SHARING_ATTEMPTS):
         try:
-            with open(path, encoding="utf-8") as handle:
-                return json.load(handle)
+            return _strict_read(path)
         except PermissionError:
             if attempt == _SHARING_ATTEMPTS - 1:
                 raise

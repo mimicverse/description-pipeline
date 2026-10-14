@@ -7,6 +7,9 @@ The portal is a dependency-free WSGI application:
   value is kept in a portal session, never echoed to the browser;
 * the portal triggers the ``solidworks_to_urdf`` DAG with ``handoff_path`` and ``main_assembly``,
   and reports the Airflow stage progress, native findings and the published pull request;
+* every submission is admitted in the platform store first (request, run and the initial
+  dispatch intent in one short transaction) and is refused while the admission window is
+  closed or the platform store is unreachable;
 * the Windows endpoint bearer token also stays server-side; the portal proxies the delivery
   preview and only serves URDF/mesh artifacts whose bytes match the digest-bound preview;
 * the bundled viewer renders the actual verified URDF with joint and limit controls.
@@ -25,6 +28,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -53,7 +57,8 @@ from .airflow_client import (
     validate_artifact_name,
     verified_result,
 )
-from ..io import PipelineError
+from ..io import PipelineError, digest
+from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
 from .linux_store import LinuxStore
 from .stage_transfer import TEAM_REPORTS
@@ -71,7 +76,6 @@ from .run_ownership import (
     classify_transport_retry,
     recorded_actor_principal,
 )
-from .run_metadata import RunMetadataError, RunMetadataStore, TitleError
 from .report_view import build_report
 from .uploads import (
     MAX_FILE_BYTES,
@@ -79,6 +83,7 @@ from .uploads import (
     MAX_TOTAL_BYTES,
     UploadGate,
     UploadRejected,
+    drop_received_folder,
     receive_folder,
 )
 
@@ -97,8 +102,44 @@ _STAGE_NAMES_ZH = {stage["id"]: stage.get("name_zh") or stage["id"] for stage in
 _RERUN_PAGE = 100
 _RERUN_PAGE_CAP = 10
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-#: Row overlay when a run has no ledger entry (treated read-only).
+#: Row overlay when a run has no platform display row (treated read-only).
 _EMPTY_OVERLAY = {"title": None, "deleted": False, "deleted_at": None, "deleted_by": None}
+
+MAX_TITLE = 120
+
+
+class TitleError(ValueError):
+    """One rejected display title."""
+
+
+def normalise_title(value: object) -> str | None:
+    """One display title: printable text up to ``MAX_TITLE``; ``None`` clears it."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TitleError("运行名称必须是文本")
+    text = value.strip()
+    if not text:
+        raise TitleError("运行名称不能为空；如需恢复默认名称请传入 null")
+    if len(text) > MAX_TITLE:
+        raise TitleError(f"运行名称最多 {MAX_TITLE} 个字符")
+    if any(unicodedata.category(character).startswith("C") for character in text):
+        raise TitleError("运行名称包含不可见的控制字符")
+    return text
+
+
+def _display_overlay(display: object) -> dict:
+    """One platform run-display row as the portal's overlay surface.
+
+    The platform owns the display state - the name and the reversible
+    ``hidden_at``/``hidden_reason`` tombstone; the portal only shapes it.
+    """
+    return {
+        "title": display.display_name,
+        "deleted": display.hidden_at is not None,
+        "deleted_at": display.hidden_at.isoformat() if display.hidden_at is not None else None,
+        "deleted_by": display.hidden_reason,
+    }
 #: Task states that still own execution; an unknown (None) state stays a refusal too.
 _ACTIVE_TASK_STATES = {"running", "queued", "scheduled", "up_for_retry", "up_for_reschedule", "deferred"}
 #: Task states that are terminal; anything else (including new Airflow states) fails closed.
@@ -377,6 +418,10 @@ class PortalConfig:
     pipeline_repositories: dict[str, Path] | None = None
     #: Configured publication targets used by the upload selector and conf validation.
     pipeline_targets: dict[str, dict] | None = None
+    #: The platform admission store; injected in tests, derived from the deploy
+    #: environment (``PLATFORM_SERVICE_DSN``) otherwise.  Submissions are refused
+    #: while the store cannot be reached - never silently ungated.
+    platform_store: PlatformStore | None = None
 
 
 _CONFIG_KEYS = {
@@ -769,9 +814,20 @@ class PortalApp:
         self._store_cache: LinuxStore | None = None
         self._upload_gate = UploadGate(config.upload_concurrency)
         self._rerun_lock = threading.Lock()
-        self.run_metadata = RunMetadataStore(
-            config.upload_root / ".run-metadata.json" if config.upload_root is not None else None
-        )
+        self._platform_store = config.platform_store
+        self._platform_lock = threading.Lock()
+
+    def _platform(self) -> PlatformStore:
+        """The admission store: the injected one, or the deploy-environment store.
+
+        Built lazily so a portal process without the deploy environment still
+        starts; its first submission then refuses instead of running ungated.
+        """
+
+        with self._platform_lock:
+            if self._platform_store is None:
+                self._platform_store = PlatformStore.from_environment(os.environ)
+            return self._platform_store
 
     # ------------------------------------------------------------------ WSGI
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
@@ -1092,6 +1148,22 @@ class PortalApp:
                 {"error": "Airflow 暂时不可用，请稍后重试"},
                 self.config,
             )
+        try:
+            admission = self._platform().admission()
+        except PlatformStoreError:
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台服务暂不可用，请稍后重试"},
+                self.config,
+            )
+        if admission.state != "open":
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台准入窗口已关闭，暂不接待新的运行提交"},
+                self.config,
+            )
         dag_run_id = f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
         try:
             receipt = receive_folder(
@@ -1111,9 +1183,52 @@ class PortalApp:
                     [("Retry-After", "5")],
                 )
             raise PortalError(error.status, error.message) from error
-        if receipt.target_hardware is not None and receipt.target_hardware not in (self.config.pipeline_targets or {}):
+        target_hardware = receipt.target_hardware.strip() if isinstance(receipt.target_hardware, str) else ""
+        if not target_hardware:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请选择发布目标后重试")
+        if target_hardware not in (self.config.pipeline_targets or {}):
             raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再提交")
+        change_summary = receipt.change_summary.strip() if isinstance(receipt.change_summary, str) else ""
+        if not change_summary:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请填写后重试")
         handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
+        try:
+            self._platform().admit_run(
+                request_id=f"portal-{dag_run_id}",
+                run_id=dag_run_id,
+                principal=session.principal or session.user or "",
+                target_hardware=receipt.target_hardware or "",
+                main_assembly=receipt.main_assembly or "",
+                dispatch={
+                    "stage": "capture",
+                    "operation_key": f"portal-{dag_run_id}/capture:0",
+                    "params_digest": digest(
+                        {
+                            "handoff_path": handoff_path,
+                            "main_assembly": receipt.main_assembly,
+                            "target_hardware": receipt.target_hardware,
+                        }
+                    ),
+                    "dag_id": self.config.dag_id,
+                    "dag_run_id": dag_run_id,
+                },
+            )
+        except AdmissionClosedError:
+            drop_received_folder(self.config.upload_root / dag_run_id)
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台准入窗口已关闭，本次提交未接纳", "dag_run_id": dag_run_id},
+                self.config,
+            )
+        except PlatformStoreError:
+            drop_received_folder(self.config.upload_root / dag_run_id)
+            return _json_response(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "平台服务暂不可用，本次提交未接纳", "dag_run_id": dag_run_id},
+                self.config,
+            )
         with self._lock:
             self._runs[dag_run_id] = PortalRun(
                 dag_run_id=dag_run_id,
@@ -1125,9 +1240,9 @@ class PortalApp:
             session,
             dag_run_id,
             handoff_path,
+            target_hardware,
+            change_summary,
             receipt.main_assembly,
-            receipt.target_hardware,
-            receipt.change_summary,
         )
         if outcome == "auth":
             return _json_response(
@@ -1162,11 +1277,11 @@ class PortalApp:
             "folder": receipt.folder,
             "files": receipt.files,
             "bytes": receipt.bytes,
+            "target_hardware": target_hardware,
+            "change_summary": change_summary,
         }
         if receipt.main_assembly is not None:
             payload["main_assembly"] = receipt.main_assembly
-        if receipt.target_hardware is not None:
-            payload["target_hardware"] = receipt.target_hardware
         return _json_response(start_response, 201, payload, self.config)
 
     def _trigger_uploaded_run(
@@ -1174,20 +1289,19 @@ class PortalApp:
         session: PortalSession,
         dag_run_id: str,
         handoff_path: str,
+        target_hardware: str,
+        change_summary: str,
         main_assembly: str | None = None,
-        target_hardware: str | None = None,
-        change_summary: str | None = None,
     ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
-        conf = {"handoff_path": handoff_path}
+        conf = {
+            "handoff_path": handoff_path,
+            "target_hardware": target_hardware,
+            "change_summary": change_summary,
+            "submission_principal": session.principal,
+        }
         if main_assembly is not None:
             conf["main_assembly"] = main_assembly
-        if target_hardware is not None:
-            conf["target_hardware"] = target_hardware
-        if change_summary is not None:
-            conf["change_summary"] = change_summary
-        if target_hardware is not None and session.principal:
-            conf["submission_principal"] = session.principal
         try:
             self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
             return "created"
@@ -1214,23 +1328,25 @@ class PortalApp:
 
     # ------------------------------------------------------- run metadata
     def _metadata_snapshot(self) -> dict[str, dict]:
-        """All overlays with one ledger read; an unreadable ledger fails closed."""
+        """Every display overlay with one platform read; failures fail closed."""
         try:
-            return self.run_metadata.snapshot()
-        except RunMetadataError as error:
-            log.error("run metadata unavailable: %s", error)
+            displays = self._platform().run_displays()
+        except PlatformStoreError as error:
+            log.error("run display state unavailable: %s", error)
             raise PortalError(
                 HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
             ) from error
+        return {run_id: _display_overlay(display) for run_id, display in displays.items()}
 
     def _metadata_overlay(self, dag_run_id: str) -> dict:
         try:
-            return self.run_metadata.overlay(dag_run_id)
-        except RunMetadataError as error:
-            log.error("run metadata unavailable: %s", error)
+            display = self._platform().run_display(dag_run_id)
+        except PlatformStoreError as error:
+            log.error("run display state unavailable: %s", error)
             raise PortalError(
                 HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
             ) from error
+        return _display_overlay(display) if display is not None else dict(_EMPTY_OVERLAY)
 
     def _require_run(self, session: PortalSession, dag_run_id: str) -> dict:
         """One authoritative Airflow run, or the existing 401/404/502 mapping."""
@@ -1260,15 +1376,22 @@ class PortalApp:
         if not self._can_manage(session, run):
             raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重命名此运行")
         try:
-            overlay = self.run_metadata.rename(
-                dag_run_id, body["title"], actor=self._actor_label(session, dag_run_id, run)
-            )
+            title = normalise_title(body["title"])
         except TitleError as error:
             raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
-        except RunMetadataError as error:
-            log.error("run metadata rename failed: %s", error)
+        try:
+            display = self._platform().set_run_display(dag_run_id, title)
+        except RunNotAdmittedError as error:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法重命名") from error
+        except PlatformStoreError as error:
+            log.error("run display rename failed: %s", error)
             raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
-        return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
+        return _json_response(
+            start_response,
+            200,
+            {"dag_run_id": dag_run_id, **_display_overlay(display), "updated_at": display.updated_at.isoformat()},
+            self.config,
+        )
 
     def _delete_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         """Reversible tombstone: the record moves to the shared Deleted view, nothing else changes."""
@@ -1291,10 +1414,13 @@ class PortalApp:
                     start_response, HTTPStatus.CONFLICT, {"error": message, "reason": reason}, self.config
                 )
             try:
-                overlay = self.run_metadata.delete(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
-            except RunMetadataError as error:
-                log.error("run metadata delete failed: %s", error)
+                display = self._platform().hide_run(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
+            except RunNotAdmittedError as error:
+                raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法删除") from error
+            except PlatformStoreError as error:
+                log.error("run display hide failed: %s", error)
                 raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+            overlay = _display_overlay(display)
         log.info("portal deleted dag_run_id=%s principal=%s", dag_run_id, session.principal)
         return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
 
@@ -1341,9 +1467,11 @@ class PortalApp:
         if not self._can_manage(session, run):
             raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可恢复此运行")
         try:
-            overlay = self.run_metadata.restore(dag_run_id)
-        except RunMetadataError as error:
-            log.error("run metadata restore failed: %s", error)
+            overlay = _display_overlay(self._platform().restore_run(dag_run_id))
+        except RunNotAdmittedError as error:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法恢复") from error
+        except PlatformStoreError as error:
+            log.error("run display restore failed: %s", error)
             raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
         log.info("portal restored dag_run_id=%s principal=%s", dag_run_id, session.principal)
         return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
@@ -1756,8 +1884,15 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
         body = self._body(environ)
         stage = body.get("stage")
-        if set(body) != {"stage"} or not isinstance(stage, str) or stage not in _STAGE_IDS:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 参数")
+        keys = {"stage", "target_hardware", "change_summary"}
+        if set(body) - keys or not isinstance(stage, str) or stage not in _STAGE_IDS:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 与发布目标参数")
+        overrides: dict[str, str] = {}
+        for key in ("target_hardware", "change_summary"):
+            if key in body:
+                if not isinstance(body[key], str):
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 与发布目标参数")
+                overrides[key] = body[key].strip()
         try:
             airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, airflow_run):
@@ -1848,10 +1983,36 @@ class PortalApp:
                         str((row or {}).get("reason_zh") or "当前无法从此步骤重新运行"),
                         _optional_str(prerequisites.get("earliest_required")),
                     )
+                target_hardware = (
+                    overrides["target_hardware"]
+                    if "target_hardware" in overrides
+                    else _optional_str(parent_conf.get("target_hardware"))
+                )
+                if not target_hardware:
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请在重新运行时选择发布目标")
+                if target_hardware not in (self.config.pipeline_targets or {}):
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再重新运行")
+                change_summary = (
+                    overrides["change_summary"]
+                    if "change_summary" in overrides
+                    else _optional_str(parent_conf.get("change_summary"))
+                )
+                if not change_summary:
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
+                principal = _optional_str(parent_conf.get("submission_principal"))
+                if principal is None or not principal.strip():
+                    principal = session.principal
                 new_run_id = reserved_id or f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
                 if reserved_id is None:
                     self._write_rerun_journal(dag_run_id, new_run_id, stage)
-                conf = {"handoff_path": handoff_path, "parent_dag_run_id": dag_run_id, "resume_from": stage}
+                conf = {
+                    "handoff_path": handoff_path,
+                    "parent_dag_run_id": dag_run_id,
+                    "resume_from": stage,
+                    "target_hardware": target_hardware,
+                    "change_summary": change_summary,
+                    "submission_principal": principal,
+                }
                 parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 if parent_assembly is not None:
                     conf["main_assembly"] = parent_assembly

@@ -1,11 +1,10 @@
-# Contributing
+# 开发指南
 
-Tool development uses Python 3.12 and the repository's pinned runtime and build
-dependencies. Run the following from the repository root in a dedicated environment.
+开发以[架构设计](docs/design.md)、[系统契约](docs/contracts.md)、[机械规范](docs/mechanical-handoff-spec.md)和[质量规范](docs/quality.md)为共同依据。实现只提供一套完整工作流，领域逻辑、契约和展示不得重复定义同一规则。
 
-## Environment
+## 环境
 
-Linux:
+使用发行支持的 CPython 3.12 和仓库锁定依赖。Linux 开发环境包含生成、验证与构建依赖：
 
 ```sh
 python3.12 -m venv .venv
@@ -14,54 +13,84 @@ python -m pip install -r requirements/linux-py312.lock -r requirements/build-py3
 python -m pip install --no-deps --no-build-isolation -e .
 ```
 
-Windows PowerShell:
+Windows 使用[工具构建流程](RELEASING.md#构建身份)在 Linux 产生且已核对源码身份的 wheel，只安装原生角色依赖并运行原生适配测试：
 
 ```powershell
 py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements/windows-py312.lock -r requirements/build-py312.lock
-.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e .
+.venv\Scripts\python.exe -m pip install -r requirements/windows-py312.lock
+.venv\Scripts\python.exe -m pip install --no-deps /path/to/mimicverse_description-<version>-py3-none-any.whl
 ```
 
-The source locks pin versions. Release archives additionally hash the downloaded
-wheels; see [RELEASING.md](RELEASING.md). Airflow uses a separate deployment environment.
+锁文件记录完整角色依赖。开发工具链机器记录固定 CPython、Node.js 与构建器的精确版本（`.python-version`、`.nvmrc`、`requirements/build-py312.lock`）；Linux 开发与 CI 显式安装并校验该 Node.js 以运行浏览器逻辑回归；缺少必需测试运行时须失败，不能以静默跳过减少覆盖。
 
-## Verification
+## 代码边界
 
-In the activated Linux environment:
+领域入口接受类型化不可变输入，返回结果或带稳定错误码、对象和证据引用的失败。编排负责副作用与收据，适配器负责协议，页面只提交命令和读取投影。禁止隐藏的模块全局运行状态、跨运行缓存和依赖调用顺序的机械结果。
+
+原生 API 调用、会话、document selection 与句柄生命周期显式管理，所有退出路径核验并释放自有资源；未知身份拒绝操作。纯计算和机械判断放在 Linux。Windows 依赖与 import 边界在 CI 中静态检查。
+
+验证器不导入推导、生成或编排领域，不共享机械期望值。通用数学、格式和契约原语保持纯粹；领域解释独立实现。发布统一调用完整验证，不创建第二套绿色判据。
+
+schema、阶段、必需检查、适用条件、数值常量和文件清单各有一个机器定义属主。页面、收据与帮助从这些定义生成；机器定义、命令、资源限制和展示行为由“契约与文档”门测试；工程责任及原生行为由对应验收覆盖。重复定义和未使用的入口随变更移除。
+
+<a id="verification"></a>
+## 验证
+
+在 Linux 开发环境执行：
 
 ```sh
 python -B -m unittest discover -s tests -t .
 python -m ruff check src tests tools deploy
 ```
 
-GitHub Actions runs these two commands on every pull request and on pushes to
-`main`; the `verify` check gates merges into `main`.
+PR 与 `main` 的 CI 还须执行以下门：
 
-Windows uses the native capture dependency lock; its runtime does not include
-MuJoCo. Run native adapter regressions there with `.venv\Scripts\python.exe`.
-Run the full suite and consumer checks in the Linux verification environment.
-For changes to Airflow deployment, also follow its
-[deployment checks](docs/deployment.md#maintenance).
+| 范围 | 必需证据 |
+|---|---|
+| 契约与文档 | schema 正反例、阶段/判据/资源限制与展示一致、资格身份、预览只读边界、链接有效、命令帮助与安装示例一致 |
+| 机械与数值 | 解析解、非对角惯量、旋转/平行轴、重复实例/配置、树与轴线的独立反例 |
+| 独立性 | 导入边界、生成语义错误及重新封存后仍被验证捕获的对抗测试 |
+| 编排与存储 | CAS/事务、重复与冲突请求、断连、每个封存/登记边界崩溃、重启与复用 |
+| CAD 所有权 | 未知/不可读会话、活属主、死亡属主残留、PID 重用、并发账本与所有释放入口 |
+| 发布 | 远端基线变化、陌生分支、Git 过滤、部分推送/PR 响应及幂等对账 |
+| 构建与角色 | 干净源码双构建字节一致、安装身份、完整角色锁及 Windows 最小依赖 |
 
-Keep source inputs, raw native evidence, generation and independent verification
-separate. A verifier must not obtain its expected answer from the generator.
-Semantic changes need analytic or adversarial regressions. COM/API changes need
-actual native rehearsal evidence; mocks cannot establish native behavior.
+只模拟输出形状不能证明原生行为；SolidWorks/COM 或支持矩阵变化需实际 Windows 验收。确定性门不得依赖本机恰好安装的其他 checkout 或 ambient 包。
 
-## Documentation and repository boundaries
+测试按行为维护一套权威回归，不复制整套同义测试。失败必须定位原因；不稳定用例需修复或以明确隔离和责任处理，不能无声重跑直至通过。所需测试运行时与声明跳过范围由 CI 明确核验。
 
-Keep examples consistent with command help, schemas and measured behavior.
-Keep `main` within the [Release 1.0 design](docs/design.md): one current workflow,
-no compatibility layers or transitional documentation. Merge implementation and
-instructions together after the required acceptance passes.
-The [design](docs/design.md) owns architecture, [operations](docs/operations.md)
-owns the end-to-end workflow, [deployment](docs/deployment.md) owns availability
-and configuration, and [quality](docs/quality.md) owns verification claims.
+<a id="mechanical-regression"></a>
+### 机械一致性回归
 
-The six-stage contract is `src/description_pipeline/stage-contract.json`; the
-generated table in the design document must match `contract_markdown()`.
+以下场景落实[机械规范](docs/mechanical-handoff-spec.md)和[质量规范](docs/quality.md)，不另建一套检查策略。使用可公开的中性夹具；期望值来自独立解析解或原始原生见证，不能调用生成器取得答案。两种机械解释分别覆盖适用场景，拒绝结果须定位稳定错误码、完整实例、配置及原生依据。
 
-Do not commit real robot/CAD data, credentials, workstation state or build
-outputs to this public repository. Neutral fixtures are synthetic and cannot
-grant hardware qualification. Tool publication follows the
-[release procedure](RELEASING.md).
+| 场景 | 正例 | 反例与必需结果 |
+|---|---|---|
+| 来源与副本 | 原件不变，工作副本及引擎物化文件分别绑定原件、所有者和实例 | 原件变化、错配置、包外依赖或用副本摘要冒充原件：拒绝，不重写输入 |
+| 实例身份 | 同一文件的重复、镜像及不同引用配置按完整实例分别解析；虚拟件完成规定工程准备 | 按文件名合并、借用其他实例或文档当前配置、未绑定虚拟件：拒绝 |
+| 约束解释 | 非固定锚点由有效配合证明连接；局部剩余自由度符合工程定义 | 将 `IsFixed=false` 判为松脱、将未知枚举套成合格或忽略实际多余自由度：拒绝错误解释，保留原生状态 |
+| 刚性与柔性 | 嵌套刚性组保持内部姿态；柔性组按其自由度与顶层跨装配配合求解 | 把柔性组冻结、遗漏跨装配配合或把保存位姿当永久刚性：拒绝 |
+| 关节端点 | 多个同轴对象由完整原生端点唯一映射到两侧刚体 | 换成同轴的错误对象、删除或抑制必要见证、配合错误或端点冲突：拒绝并指出具体依据 |
+| 模型表达 | 有据的固定、有限转动、连续转动和直线运动形成唯一根树 | 闭环、多自由度或耦合机构通过删边、焊接或固定改成树：报告不支持，不生成伪等效模型 |
+| 声明存在性 | 有效声明独立解码；成功原生查询确证不存在后采用配合推导 | 损坏、不可读、未知或缺查询记录时回退；声明与当前原生端点冲突：拒绝 |
+| 共同错误假设 | 当前证据导出的连接与独立重建一致 | 原始证据不变，计划、模型、XML、报告采用同一错误连接并重新封存：仍由语义门拒绝 |
+| 静态仍绿的错误拓扑 | 正确连接通过零位几何、网格、完整物理与非零运动检查 | 把支撑叶置于驱动关节上游并重算相对原点，保持归属、零位世界几何及物理闭合：先确认静态对照通过，再确认端点或逐叶运动门拒绝 |
+| 单关节与组合运动 | 有据范围内的适用正反非零姿态及关联组合，逐叶随动、其余实例关系、组内相对变换与接口连续性均成立 | 单叶漏随动、额外随动、组内漂移、接口断开或只检查 link 原点：不能通过完整运动门 |
+| 坐标与有向轴 | 更换局部基准后正确变换原点、轴和完整惯量，在共同工程参考系中保持物理结果 | 局部轴分量相同但物理方向反转，或只改 parent 未重算相对原点：拒绝 |
+| 范围与驱动 | 单侧范围只采允许方向；明确作者零值保留警告和资格边界 | 以预览范围代替机械范围、缺失填零、任意补默认值或将零范围当可用运动：拒绝缺项或错误资格 |
+| 物理与覆盖 | 第一直接读数权威，非对角张量正确旋转，未分配集合独立测量并闭合 | 质量差额补配、张量缩放、重复计入、漏件或缺未分配 COM/张量：拒绝；不能以数值闭合证明连接正确 |
+| 责任与反馈 | 来源一致的导出错误保留 CAD；有工程依据的 CAD 错误修正新版本；不足或冲突保留未决诊断 | 仅凭欠约束宣判 CAD 错误、要求修改正确 CAD、无据全固定或反馈缺少具体实例/姿态/操作：不能形成合格反馈 |
+| 复现与发布绑定 | 修复后适用静态与运动门通过，可重复重建；检查、预览、候选 Git blobs 绑定同一来源和主体 | 使用旧报告、旧预览、不同来源或发布时变更有效载荷：拒绝；失败候选不能获得通过标志 |
+| 资格边界 | 局部约束或解析运动结果只建立其实际覆盖的结论 | 从局部秩、静态闭合、离散采样或消费者加载授予整机自由度、驱动、无碰撞、控制或训练资格：拒绝错误资格 |
+
+静态仍绿的反例须保存“正确候选、错误候选、未变原始证据、静态对照、预期拒绝”的最小配方。篡改样本须通过格式与完整性检查后到达语义门，不能把摘要失败算作该反例通过。数值边界遵循唯一质量规范，不为夹具调整容差。
+
+Linux 执行独立重解、运动、物理及对抗回归。Windows 只为真实 API、配合状态、刚性/柔性、配置、读取恢复和来源不变性提供原生见证；版本枚举、局部约束秩及 mock 不能替代该见证。每个场景记录模式、断言、来源/策略/候选摘要及证据层级，原生验收按[发行流程](RELEASING.md)完成。
+
+## 文档与评审
+
+文档只描述目标行为，写清责任、来源、前置条件和结果。架构拥有职责，契约拥有协议，机械规范拥有工程要求，质量规范拥有判据；操作与部署引用它们。新增文件必须有独立读者和职责，不能复制已有规则。
+
+行为变化先明确规范与可验收条件，再对齐代码、schema、帮助、示例与测试。合并要求规范和实现一致，工具发行还须完成[发布验收](RELEASING.md)。不能以文档声明代替实现证据。
+
+公开仓库只保留工具、规范、合成中性夹具与测试；真实 CAD、硬件数据、凭据、工作站状态、诊断和构建输出留在相应私有存储。法律声明与第三方许可证按其要求随发行保留。

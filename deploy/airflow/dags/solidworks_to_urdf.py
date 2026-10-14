@@ -44,7 +44,7 @@ from description_pipeline.orchestration.linux_runner import fetch_capture as fet
 from description_pipeline.orchestration.linux_runner import run_portable_stage
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.stages import (
-    PORTABLE_STAGES,
+    DELIVERY_STAGES,
     STAGE_IDS,
     compact_view,
     contract_markdown,
@@ -61,6 +61,9 @@ CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")
 SENSOR_MODE = os.environ.get("SOLIDWORKS_SENSOR_MODE", "reschedule")
 POLL_INTERVAL = float(os.environ.get("SOLIDWORKS_POLL_INTERVAL", "10"))
 POLL_TIMEOUT = float(os.environ.get("SOLIDWORKS_TIMEOUT", "3600"))
+#: One native job at a time: the shared Windows CAD resource domain is serial
+#: (contracts §资源所有权; the deploy installs this pool with capacity 1).
+NATIVE_POOL = os.environ.get("SOLIDWORKS_NATIVE_POOL", "windows_native")
 log = logging.getLogger(__name__)
 
 
@@ -152,16 +155,18 @@ def _root_capture(store: LinuxStore, run_id: str):
 
 
 def _root_identity(store: LinuxStore, run_id: str) -> tuple[str | None, str | None]:
-    """Hardware and revision of the admitted delivery, read from its JSON revision record."""
+    """Hardware and revision of the admitted delivery, read from its content identity record."""
     capture = _root_capture(store, run_id)
     if capture is None:
         return None, None
-    path = capture / "input/cad-revision.json"
+    path = capture / "input/source.json"
     if not path.is_file():
         return None, None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    hardware = payload.get("hardware_id")
-    revision = payload.get("revision")
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    hardware = identity.get("hardware_id")
+    revision = metadata.get("revision")
     return (
         hardware if isinstance(hardware, str) and hardware else None,
         revision if isinstance(revision, str) and revision else None,
@@ -185,31 +190,38 @@ def _linked_conf(context) -> dict | None:
     return {"parent_run": native_run_id(parent.strip()), "from_stage": stage}
 
 
-def _submission_identity(context) -> dict | None:
-    """The portal submission identity carried beside the endpoint request.
+def _submission_frame(context) -> tuple[dict, dict]:
+    """The submission identity and configured target routing of one trigger.
 
-    ``None`` keeps today's deferred release-blocking behavior when no configured
-    target was selected.  A selected target that is not configured on the Linux
-    side fails closed; the parent revision is read best-effort from the model
-    checkout so the derived revision keeps its successor linkage.
+    The publish target and the change summary are required (conf first, then
+    params): a missing or blank field and an unconfigured target fail the run
+    here - never a deferred publish.  The parent revision is read best-effort
+    from the model checkout so the derived revision keeps its successor
+    linkage; ``routing`` is the same config resolution a linked publish
+    rebinds ``repository_slug``/``repository_base`` from.
     """
 
     conf = getattr(context["dag_run"], "conf", None)
     conf = conf if isinstance(conf, dict) else {}
     target = str(conf.get("target_hardware") or context["params"].get("target_hardware") or "").strip()
     summary = str(conf.get("change_summary") or context["params"].get("change_summary") or "").strip()
+    if not target:
+        raise AirflowFailException(
+            "target_hardware is required: the run carries no configured publication target to publish to"
+        )
+    if not summary:
+        raise AirflowFailException("change_summary is required: the run carries no nonempty change summary")
     principal = conf.get("submission_principal")
     if not isinstance(principal, str) or not principal.strip():
         principal = str(getattr(context["dag_run"], "triggering_user_name", "") or "").strip()
-    if not target:
-        if summary:
-            log.info("submission change summary ignored without a configured target identity")
-        return None
     config = config_from_airflow_connection(CONN_ID)
+    routing = config.targets.get(target)
+    if routing is None:
+        raise AirflowFailException(f"target_hardware {target!r} is not a configured publication target")
     from description_pipeline.repository.urdf_pr import published_revision
 
     try:
-        return submission_identity(
+        identity = submission_identity(
             target_hardware=target,
             change_summary=summary,
             principal=principal,
@@ -220,6 +232,9 @@ def _submission_identity(context) -> dict | None:
         )
     except EndpointProtocolError as error:
         raise AirflowFailException(str(error)) from error
+    if identity is None:
+        raise AirflowFailException(f"target_hardware {target!r} produced no publication identity")
+    return identity, routing
 
 
 def _param_selection(context) -> str | None:
@@ -551,7 +566,7 @@ def _poke(request: dict, **context) -> bool:
     stages = stage_view(job)
     ti = context.get("ti")
     progress = digest(compact_view(stages))
-    if ti is None or ti.xcom_pull(task_ids="wait_for_job", key="engineering_progress") != progress:
+    if ti is None or ti.xcom_pull(task_ids="start_job", key="engineering_progress") != progress:
         for stage in stages["stages"]:
             log.info(
                 "engineering stage=%s state=%s input_qc=%s output_qc=%s",
@@ -585,6 +600,71 @@ def _same_request(job: dict, request: dict) -> None:
         raise AirflowFailException("Endpoint job differs from the requested mechanical handoff")
 
 
+def _confirm_delivery(published: dict) -> dict:
+    """Confirm the six-stage receipt and report the delivery (PR, commit, subject)."""
+
+    request = published["request"]
+    run_id = request["run_id"]
+    native = None
+    if not request.get("linux_owned"):
+        native = _endpoint(request["conn_id"]).get_job(run_id)
+        _same_request(native, request)
+        if native["status"] == "failed":
+            raise AirflowFailException(f"native job {run_id} failed: {native.get('error')}")
+    store = _linux_store(request["conn_id"])
+    snapshot = store.merged_job(run_id, native)
+    for key in ("hardware_id", "revision", "repository_slug", "repository_base"):
+        if not isinstance(snapshot.get(key), str) or not snapshot.get(key):
+            value = published.get(key)
+            if isinstance(value, str) and value:
+                snapshot[key] = value
+    view = stage_view(snapshot)
+    require_complete(view)
+    routing = resolved_routing(snapshot)
+    if request.get("linux_owned"):
+        source = {"package": request["package"], "handoff_sha256": request["handoff_sha256"]}
+    else:
+        selected = native.get("handoff_sha256")
+        if not isinstance(selected, str) or not selected:
+            raise AirflowFailException(f"native job {run_id} carries no sealed handoff digest")
+        source = {"upload_sha256": request.get("upload_sha256"), "handoff_sha256": selected}
+    handoff = {
+        **source,
+        "hardware_id": routing["hardware_id"],
+        "revision": routing["revision"],
+        "repository_slug": routing["repository_slug"],
+        "base": routing["repository_base"],
+    }
+    result = check_result(
+        snapshot.get("result"),
+        expected_slug=routing["repository_slug"],
+        expected_base=routing["repository_base"],
+    )
+    submission = result.get("submission") or {}
+    log.info(
+        "delivered run_id=%s hardware=%s revision=%s subject=%s state=%s",
+        run_id,
+        routing["hardware_id"],
+        routing["revision"],
+        result["quality"].get("subject_sha256"),
+        submission.get("state"),
+    )
+    log.info(
+        "delivered pr=%s commit=%s base=%s",
+        submission.get("url"),
+        submission.get("commit"),
+        submission.get("base"),
+    )
+    return {
+        "run_id": run_id,
+        "pipeline_id": result["pipeline_id"],
+        "handoff": handoff,
+        "stages": compact_view(view),
+        "quality": {key: result["quality"].get(key) for key in ("passed", "subject_sha256")},
+        "submission": result["submission"],
+    }
+
+
 @dag(
     dag_id=DAG_ID,
     schedule=None,
@@ -603,16 +683,15 @@ def _same_request(job: dict, request: dict) -> None:
         "| Task | Stage | What it means |\n"
         "|---|---|---|\n"
         "| `resolve_handoff` | freeze | Admitted folder, file inventory and handoff digest |\n"
-        "| `start_job`, `wait_for_job` | discover, capture | Windows native half: reference resolution, "
-        "definition exchange and capture; native stage checks appear in these logs |\n"
+        "| `start_job` | discover | Windows native half: submission, reference resolution, definition "
+        "exchange and capture; native stage checks appear in these logs |\n"
         "| `fetch_capture` | capture | Sealed native capture imported into the Linux attempt store |\n"
         "| `run_generate`, `run_verify`, `run_publish` | generate, verify, publish | Linux URDF generation, "
-        "independent verification and review PR |\n"
-        "| `confirm_job` | — | Final six-stage receipt and the delivery summary (PR, commit, subject) |\n\n"
+        "independent verification, review PR and the final six-stage delivery receipt |\n\n"
         "## Stage contract\n\n" + contract_markdown() + "\n\n## Where results live\n\n"
-        "- Task logs: native stage checks in `wait_for_job`; Linux results "
+        "- Task logs: native stage checks in `start_job`; Linux results "
         "(`portable stage=... state=... checks=n/m`) in `run_generate` / `run_verify` / `run_publish`; "
-        "the delivery summary in `confirm_job`.\n"
+        "the delivery summary in `run_publish`.\n"
         "- Per-run XCom `engineering_stages`; detailed receipt at `reports/stages.json`; delivered or "
         "failed native runs also retain the structural-team report at `reports/structural-team.md` and "
         "`reports/structural-team.json`.\n"
@@ -645,15 +724,15 @@ def _same_request(job: dict, request: dict) -> None:
             type="string",
             title="Publication target hardware identity",
             description=(
-                "Optional configured hardware identity used to derive the publication identity when the "
-                "CAD records do not carry dp.hardware_id; must name a configured target"
+                "Required configured hardware identity used to derive the publication identity; "
+                "must name a configured target or the run fails before any handoff resolution"
             ),
         ),
         "change_summary": Param(
             "",
             type="string",
             title="Change summary",
-            description="Optional one-line change summary used when the CAD records do not carry one",
+            description="Required nonempty one-line change summary carried into the release submission",
         ),
     },
 )
@@ -664,9 +743,10 @@ def solidworks_to_urdf():
         )
     )
     def resolve_handoff(**context) -> dict:
+        identity, routing = _submission_frame(context)
         linked = _linked_conf(context)
         if linked is not None:
-            if linked["from_stage"] in PORTABLE_STAGES:
+            if linked["from_stage"] in DELIVERY_STAGES:
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
                 # contacts Windows: the parent store already holds the admitted capture.
                 store = _linux_store(CONN_ID)
@@ -683,6 +763,8 @@ def solidworks_to_urdf():
                     "conn_id": CONN_ID,
                     "resume": linked,
                     "linux_owned": True,
+                    "repository_slug": routing["repository_slug"],
+                    "repository_base": routing["base"],
                 }
                 selection = _linked_selection(parent_meta.get("main_assembly"), context["params"].get("main_assembly"))
                 if selection is not None:
@@ -722,9 +804,7 @@ def solidworks_to_urdf():
                 if validate_file_index(package_inventory(intake)) != upload_files:
                     raise AirflowFailException("The linked intake no longer matches the parent's retained selection")
                 request["intake_dir"] = str(intake)
-            identity = _submission_identity(context)
-            if identity is not None:
-                request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+            request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
             return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
@@ -750,28 +830,41 @@ def solidworks_to_urdf():
             "intake_dir": str(intake),
             "conn_id": CONN_ID,
         }
-        identity = _submission_identity(context)
-        if identity is not None:
-            request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+        request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
         return request
 
-    @task(doc_md="Submit the same UUID and frozen handoff to the serial Windows queue; retries never replay CAD.")
-    def start_job(request: dict) -> dict:
+    @task.sensor(
+        mode=SENSOR_MODE,
+        poke_interval=POLL_INTERVAL,
+        timeout=POLL_TIMEOUT,
+        pool=NATIVE_POOL,
+        doc_md=(
+            "Discover stage: submit the same UUID and frozen handoff to the serial Windows queue, "
+            "then drive the transport/definition exchange until the native job is terminal; retries "
+            "never replay CAD."
+        ),
+    )
+    def start_job(request: dict, **context) -> bool:
         if request.get("linux_owned"):
             log.info(
                 "linked attempt run_id=%s from_stage=%s is linux-owned; no Windows job",
                 request["run_id"],
                 (request.get("resume") or {}).get("from_stage"),
             )
-            return {**request, "status": "linux_owned"}
-        job = _endpoint(request["conn_id"]).start_staging_job(
-            run_id=request["run_id"],
-            upload_files=request["upload_files"],
-            main_assembly=request["main_assembly"],
-            resume=request.get("resume"),
-        )
-        log.info("started run_id=%s status=%s", job["run_id"], job["status"])
-        return {**request, "status": job["status"]}
+            return True
+        endpoint = _endpoint(request["conn_id"])
+        try:
+            endpoint.get_job(request["run_id"])
+        except EndpointNotFound:
+            job = endpoint.start_staging_job(
+                run_id=request["run_id"],
+                upload_files=request["upload_files"],
+                main_assembly=request["main_assembly"],
+                resume=request.get("resume"),
+            )
+            log.info("started run_id=%s status=%s", job["run_id"], job["status"])
+            return False  # the reschedule poll continues on the next poke
+        return _poke(request, **context)
 
     @task(
         doc_md=("Capture stage: import the sealed native capture into the Linux store and bind routing for generation.")
@@ -790,8 +883,10 @@ def solidworks_to_urdf():
                 "from_stage": resume.get("from_stage"),
                 "handoff_sha256": parent_meta.get("handoff_sha256"),
                 "main_assembly": parent_meta.get("main_assembly"),
-                "repository_slug": parent_meta.get("repository_slug"),
-                "repository_base": parent_meta.get("repository_base"),
+                # The trigger's conf target and its configured routing are the authority for a
+                # linked publish; the parent's stored meta may carry nulls.
+                "repository_slug": request.get("repository_slug"),
+                "repository_base": request.get("repository_base"),
                 "hardware_id": hardware,
                 "revision": revision,
                 "state": "linked",
@@ -873,97 +968,19 @@ def solidworks_to_urdf():
             source_run_id=verified.get("source_run_id"),
         )
         _portable_report(receipt, stage="publish", context=context)
-        return {**verified, "publish": _portable_summary(receipt, stage="publish")}
-
-    @task(doc_md="Confirm the six-stage receipt and report the delivery (PR, commit, subject).")
-    def confirm_job(published: dict) -> dict:
-        request = published["request"]
-        run_id = request["run_id"]
-        native = None
-        if not request.get("linux_owned"):
-            native = _endpoint(request["conn_id"]).get_job(run_id)
-            _same_request(native, request)
-            if native["status"] == "failed":
-                raise AirflowFailException(f"native job {run_id} failed: {native.get('error')}")
-        store = _linux_store(request["conn_id"])
-        snapshot = store.merged_job(run_id, native)
-        for key in ("hardware_id", "revision", "repository_slug", "repository_base"):
-            if not isinstance(snapshot.get(key), str) or not snapshot.get(key):
-                value = published.get(key)
-                if isinstance(value, str) and value:
-                    snapshot[key] = value
-        view = stage_view(snapshot)
-        require_complete(view)
-        routing = resolved_routing(snapshot)
-        if request.get("linux_owned"):
-            source = {"package": request["package"], "handoff_sha256": request["handoff_sha256"]}
-        else:
-            selected = native.get("handoff_sha256")
-            if not isinstance(selected, str) or not selected:
-                raise AirflowFailException(f"native job {run_id} carries no sealed handoff digest")
-            source = {"upload_sha256": request.get("upload_sha256"), "handoff_sha256": selected}
-        handoff = {
-            **source,
-            "hardware_id": routing["hardware_id"],
-            "revision": routing["revision"],
-            "repository_slug": routing["repository_slug"],
-            "base": routing["repository_base"],
-        }
-        result = check_result(
-            snapshot.get("result"),
-            expected_slug=routing["repository_slug"],
-            expected_base=routing["repository_base"],
-        )
-        submission = result.get("submission") or {}
-        log.info(
-            "delivered run_id=%s hardware=%s revision=%s subject=%s state=%s",
-            run_id,
-            routing["hardware_id"],
-            routing["revision"],
-            result["quality"].get("subject_sha256"),
-            submission.get("state"),
-        )
-        log.info(
-            "delivered pr=%s commit=%s base=%s",
-            submission.get("url"),
-            submission.get("commit"),
-            submission.get("base"),
-        )
-        return {
-            "run_id": run_id,
-            "pipeline_id": result["pipeline_id"],
-            "handoff": handoff,
-            "stages": compact_view(view),
-            "quality": {key: result["quality"].get(key) for key in ("passed", "subject_sha256")},
-            "submission": result["submission"],
-        }
+        published = {**verified, "publish": _portable_summary(receipt, stage="publish")}
+        return _confirm_delivery(published)
 
     request = resolve_handoff()
     started = start_job(request)
-
-    @task.sensor(
-        mode=SENSOR_MODE,
-        poke_interval=POLL_INTERVAL,
-        timeout=POLL_TIMEOUT,
-        doc_md=(
-            "Transport polling and the definition exchange (folder staging, raw-record derivation, "
-            "capture-request submission). Engineering stage/QC results are in these logs and the "
-            "engineering_stages XCom."
-        ),
-    )
-    def wait_for_job(request: dict, **context) -> bool:
-        return _poke(request, **context)
-
-    waited = wait_for_job(started)
     # The poll follows the submission even where op_kwargs XCom resolution is not
     # inferred as a dependency edge.
-    fetched = fetch_capture(started)
+    fetched = fetch_capture(request)
     generated = run_generate(fetched)
     verified = run_verify(generated)
     published = run_publish(verified)
-    confirm = confirm_job(published)
-    waited >> fetched
-    fetched >> generated >> verified >> published >> confirm
+    started >> fetched
+    fetched >> generated >> verified >> published
 
 
 dag = solidworks_to_urdf()

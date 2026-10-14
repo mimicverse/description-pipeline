@@ -19,11 +19,11 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 from . import __version__
-from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory
+from .delivery import BUNDLE_SCHEMA, PIPELINE_ID, subject_inventory, writable_output
 from .io import PipelineError, acquire_process_lock, digest, file_digest, inventory, read_data, write_json
 
 from .runtime import RUNTIME_VERSIONS, native_readiness, required_packages, runtime_role
-from .stages import PORTABLE_STAGES, STAGE_IDS, stage_view
+from .stages import DELIVERY_STAGES, STAGE_IDS, stage_view
 
 
 @contextmanager
@@ -45,47 +45,32 @@ def output_lock(output: Path):
         os.close(handle)
 
 
-def _owned_output(path: Path) -> bool:
-    if not path.exists():
-        return True
-    if path.is_symlink() or path.is_junction() or not path.is_dir():
-        return False
-    if not any(path.iterdir()):
-        return True
-    marker = path / "reports/run.json"
-    if not marker.is_file():
-        return False
-    try:
-        receipt = read_data(marker)
-        return (
-            isinstance(receipt, dict)
-            and receipt.get("schema_version") == BUNDLE_SCHEMA
-            and receipt.get("owned_files") == inventory(path, exclude=("reports/run.json",))
-        )
-    except (ValueError, OSError):
-        return False
+#: The checkpoint parts each portable stage seeds from its predecessor.  A stage
+#: only consumes the boundary recorded here; the caller names the stage and its
+#: checkpoint explicitly instead of switching behaviour inside a runner.
+_SEED_PARTS = {
+    "generate": ("input", "evidence"),
+    "verify": ("input", "evidence", "model", "urdf", "meshes", "tool.json", "manifest.json"),
+    "publish": (
+        "input",
+        "evidence",
+        "model",
+        "urdf",
+        "meshes",
+        "tool.json",
+        "manifest.json",
+        "reports/quality.json",
+    ),
+}
 
 
-def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None:
-    """Copy reusable upstream checkpoints from a prior owned delivery (read-only)."""
+def _seed_checkpoint(staging: Path, seed_dir: Path | None, boundary: str) -> None:
+    """Copy the recorded boundary checkpoint of a prior owned stage (read-only)."""
+
     if seed_dir is None or not Path(seed_dir).is_dir():
-        raise PipelineError("Resume checkpoints are unavailable")
+        raise PipelineError("Stage checkpoints are unavailable")
     seed = Path(seed_dir)
-    parts = {
-        "generate": ("input", "evidence", "reports/input.json"),
-        "verify": (
-            "README.md",
-            "input",
-            "evidence",
-            "model",
-            "urdf",
-            "meshes",
-            "reports/input.json",
-            "reports/tool.json",
-        ),
-        "publish": ("README.md", "input", "evidence", "model", "urdf", "meshes", "reports"),
-    }[resume_from]
-    for part in parts:
+    for part in _SEED_PARTS[boundary]:
         source = seed / part
         target = staging / part
         if source.is_dir():
@@ -94,24 +79,105 @@ def _seed_resume(staging: Path, seed_dir: Path | None, resume_from: str) -> None
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
         else:
-            raise PipelineError(f"Resume checkpoint is missing: {part}")
+            raise PipelineError(f"Stage checkpoint is missing: {part}")
     for name in ("reports/native-tool.json", "reports/native-stages.json", "transfer-manifest.json"):
         source = seed / name
         if source.is_file():
             target = staging / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-    if resume_from == "verify" and (seed / "reports/mass-closure.json").is_file():
-        target = staging / "reports/mass-closure.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(seed / "reports/mass-closure.json", target)
+
+
+def _replay_seeded_inputs(staging: Path) -> tuple[dict, dict]:
+    """Rebind a seeded checkpoint to its frozen native inputs.
+
+    Reuse only stands after the retained inputs still pass their static
+    inspection and match the recorded report row for row.
+    """
+
+    input_report = read_data(staging / "input/handoff.json")
+    from .steps import inspect_prepared_input
+
+    replayed = inspect_prepared_input(staging / "input")
+    if replayed.get("passed") is not True:
+        raise PipelineError("Retained native inputs no longer pass static validation")
+    retained_files = {
+        path: checksum for path, checksum in inventory(staging / "input").items() if path != "handoff.json"
+    }
+    if retained_files != input_report.get("package_files"):
+        raise PipelineError("Retained input bytes do not match the recorded inspection receipt")
+    for key in ("input", "cad_revision"):
+        if replayed.get(key) != input_report.get(key):
+            raise PipelineError("Retained input report does not match its archived native inputs")
+    receipt_rows = (input_report.get("input_receipt") or {}).get("inventory")
+    replayed_rows = (replayed.get("input_receipt") or {}).get("inventory")
+    if isinstance(replayed_rows, list):
+        # The frozen handoff record lives inside input/ but is not part of the
+        # archived native package inventory.
+        replayed_rows = [row for row in replayed_rows if row.get("path") != "handoff.json"]
+    if receipt_rows and replayed_rows != receipt_rows:
+        raise PipelineError("Retained input inspection receipt does not match its archived native inputs")
+    # Resolve from the fresh inspection of the archived input: its receipt root is
+    # this host's local package directory, while the frozen report records the
+    # producing host's absolute root (a Windows path on a portable continuation).
+    # The equality checks above already bound the replay to the frozen report and
+    # its inventory rows, so no inventory check is skipped.
+    frozen = read_data(staging / "evidence" / "discovery.json")
+    identity = frozen.get("identity") if isinstance(frozen.get("identity"), dict) else {}
+    return {
+        "source": {
+            "robot_name": frozen.get("robot_name")
+            or identity.get("robot_name")
+            or identity.get("robot_name_technical")
+            or "robot"
+        },
+        "hardware_id": identity.get("hardware_id"),
+        "provenance": {
+            "native_inventory_sha256": frozen.get("native_inventory_sha256") or frozen.get("handoff_sha256")
+        },
+    }, input_report
+
+
+def _require_subject(staging: Path, expected_subject: str | None) -> str:
+    """The stage stays bound to the recorded subject of its seeded checkpoint."""
+
+    if not expected_subject:
+        raise PipelineError("The stage requires the recorded subject of the previous checkpoint")
+    generated_subject = digest(subject_inventory(staging))
+    if generated_subject != expected_subject:
+        raise PipelineError("Generated subject does not match the recorded delivery")
+    return generated_subject
+
+
+def _scope(prior_events, stage: str) -> list[str]:
+    """The executed scope of one stage call: the prior stages plus the stage itself."""
+
+    events = [event for event in (prior_events or []) if isinstance(event, dict)]
+    return [item for item in STAGE_IDS if any(event.get("stage") == item for event in events)] + [stage]
+
+
+def _stage_receipt(stage: str, run_id, prior_events, *, resume, handoff_sha256) -> dict:
+    """The receipt one stage call starts from; the run store keeps the recorded copy."""
+
+    receipt = {
+        "schema_version": BUNDLE_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "run_id": run_id or str(uuid.uuid4()),
+        "handoff_sha256": handoff_sha256,
+        "state": "failed",
+        "events": [event for event in (prior_events or []) if isinstance(event, dict)],
+        "execution_scope": _scope(prior_events, stage),
+    }
+    if isinstance(resume, dict) and resume:
+        receipt["resume"] = {"parent_run": resume.get("parent_run"), "from_stage": resume.get("from_stage")}
+    return receipt
 
 
 def _install(staging: Path, target: Path) -> None:
     """Replace only a marked pipeline output; roll back a failed directory swap."""
 
-    if not _owned_output(target):
-        raise PipelineError(f"Refusing to replace a directory not owned by this pipeline: {target}")
+    if not writable_output(target):
+        raise PipelineError(f"Output must be absent or empty: {target}")
     backup = Path(tempfile.mkdtemp(prefix=f".{target.name}-previous-", dir=target.parent))
     backup.rmdir()
     moved = False
@@ -129,10 +195,10 @@ def _install(staging: Path, target: Path) -> None:
             shutil.rmtree(backup)
 
 
-#: The portable stage set; a receipt renders a report only when its executed
-#: scope declares at least one of these stages (the Windows capture boundary
-#: receipts carry no portable scope, so the native host renders nothing).
-_PORTABLE_SCOPE = frozenset(PORTABLE_STAGES)
+#: The delivery stage set; a receipt renders a report only when its executed
+#: scope declares at least one of these stages (the native boundary receipts
+#: carry no delivery scope, so the native host renders nothing).
+_PORTABLE_SCOPE = frozenset(DELIVERY_STAGES)
 
 
 def _stamp(root: Path, receipt: dict) -> None:
@@ -145,11 +211,9 @@ def _stamp(root: Path, receipt: dict) -> None:
         from .structural_report import write_structural_report
 
         receipt["structural_report"] = write_structural_report(root, receipt, evidence_root=root)
-    receipt["artifacts"] = inventory(root, exclude=("reports/run.json", "reports/stages.json"))
+    receipt["artifacts"] = inventory(root, exclude=("reports/stages.json",))
     write_json(root / "reports/stages.json", stage_view(receipt))
     receipt["stage_report"] = {"path": "reports/stages.json", "sha256": file_digest(root / "reports/stages.json")}
-    receipt["owned_files"] = inventory(root, exclude=("reports/run.json",))
-    write_json(root / "reports/run.json", receipt)
 
 
 def _check(root: Path) -> dict:
@@ -161,7 +225,7 @@ def _check(root: Path) -> dict:
 def _keep_diagnostic(staging: Path, output: Path, receipt: dict) -> Path:
     _stamp(staging, receipt)
     failed = output.with_name(output.name + ".failed")
-    if not _owned_output(failed):
+    if not writable_output(failed):
         failed = Path(tempfile.mkdtemp(prefix=output.name + ".failed-", dir=output.parent))
         failed.rmdir()
     _install(staging, failed)
@@ -174,19 +238,6 @@ def _native_tool_record() -> dict:
     from .runtime import tool_record
 
     return tool_record(role="native")
-
-
-def _executed_stages(restart: int, stop_after: str | None, repository) -> list[str]:
-    """The stages this run executes: restart..stop; publish only when it can run."""
-
-    stop = STAGE_IDS.index(stop_after) if stop_after is not None else len(STAGE_IDS) - 1
-    return [
-        stage
-        for stage in ("capture", "generate", "verify", "publish")
-        if STAGE_IDS.index(stage) >= restart
-        and STAGE_IDS.index(stage) <= stop
-        and (stage != "publish" or repository is not None)
-    ]
 
 
 def _finish_native_capture(staging, output, receipt, *, run_id, handoff_sha256, main_assembly):
@@ -257,13 +308,10 @@ def _failed_run(staging, output, receipt, event, error):
     return receipt
 
 
-def run(
+def capture(
     package: Path,
     output: Path,
     *,
-    repository: Path | None = None,
-    base: str | None = None,
-    message: str | None = None,
     backend=None,
     run_id: str | None = None,
     on_event=None,
@@ -271,28 +319,18 @@ def run(
     prior_events=None,
     expected_inputs=None,
     handoff_sha256=None,
-    resume_from: str | None = None,
-    seed_dir: Path | None = None,
-    expected_subject: str | None = None,
-    resume: dict | None = None,
-    stop_after: str | None = None,
     main_assembly: str | None = None,
+    resume: dict | None = None,
 ) -> dict:
-    """Continue a prepared native job through capture, generation, verification and publication.
+    """The native boundary entry: freeze, discover and capture one prepared package.
 
-    ``stop_after`` bounds one run to a single stage boundary for per-stage hosts: the
-    Windows endpoint stops at ``capture`` with a sealed ``native-evidence.zip`` transfer
-    (``native_complete``, never ``passed``); the Linux tasks stop at ``generate``
-    (``generated``, unverified checkpoint), ``verify`` (``verified``, no submission) or
-    ``publish`` (full qualification).  ``resume_from`` >= ``generate`` with a seeded
-    staging directory is the portable continuation contract.
-
-    ``backend`` is an internal dependency-injection seam for native regressions;
-    the endpoint always uses the native SolidWorks backend. Capture or quality
-    failure preserves a previous delivery. Submission failure keeps the new
-    verified delivery and any publication receipt for retry without CAD.
-    ``on_activity`` optionally observes best-effort capture progress records for
-    the live-activity view; progress can never change a run.
+    The stage seals the native transfer archive and closes at ``native_complete``
+    (never ``passed``): generation, independent verification and publication are
+    separate portable stages on Linux.  ``backend`` is an internal
+    dependency-injection seam for native regressions; the endpoint always uses
+    the native SolidWorks backend.  ``on_activity`` optionally observes
+    best-effort capture progress for the live-activity view; progress can never
+    change a run.
     """
 
     package = Path(package)
@@ -302,126 +340,199 @@ def run(
     output = Path(output)
     if output.resolve().is_relative_to(package) or package.is_relative_to(output.resolve()):
         raise PipelineError("Input and output directories must be separate")
-    if repository is not None:
-        repo = Path(repository).resolve()
-        if output.resolve().is_relative_to(repo) or repo.is_relative_to(output.resolve()):
-            raise PipelineError("Build output and the model repository must be separate directories")
-    if stop_after is not None and stop_after not in STAGE_IDS:
-        raise PipelineError(f"Unknown stop_after stage: {stop_after!r}")
-    restart_stage = resume_from if resume_from in STAGE_IDS else "capture"
-    if stop_after is not None and STAGE_IDS.index(stop_after) < STAGE_IDS.index(restart_stage):
-        raise PipelineError("stop_after must not precede the resume stage")
-    if stop_after in ("capture", "generate", "verify") and repository is not None:
-        raise PipelineError(f"stop_after={stop_after!r} runs cannot publish; omit the repository")
-    if stop_after == "publish" and repository is None:
-        raise PipelineError("stop_after='publish' requires a model repository")
     with output_lock(output) as output:
-        if not _owned_output(output):
-            raise PipelineError(f"Output contains unrelated files: {output}")
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
-        prior = [event for event in (prior_events or []) if isinstance(event, dict)]
-        restart = STAGE_IDS.index(resume_from) if resume_from in STAGE_IDS else STAGE_IDS.index("capture")
-        receipt = {
-            "schema_version": BUNDLE_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "run_id": run_id or str(uuid.uuid4()),
-            "handoff_sha256": handoff_sha256,
-            "state": "failed",
-            "events": prior,
-            "execution_scope": [stage for stage in STAGE_IDS if any(event.get("stage") == stage for event in prior)]
-            + _executed_stages(restart, stop_after, repository),
-        }
-        if isinstance(resume, dict) and resume:
-            receipt["resume"] = {"parent_run": resume.get("parent_run"), "from_stage": resume.get("from_stage")}
+        receipt = _stage_receipt("capture", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
         event = _event_sink(receipt, on_event)
-
         try:
-            from .sources.solidworks.input import resolve_package
-            from .steps import capture_evidence, generate_model, publish_model, verify_delivery
+            from .steps import capture_evidence
 
-            if resume_from is not None and resume_from not in {"capture", "generate", "verify", "publish"}:
-                raise PipelineError(f"Resume is not supported from {resume_from!r}")
-            if resume_from in (None, "capture"):
-                definition, input_report = capture_evidence(
-                    package,
-                    staging,
-                    backend=backend,
-                    on_event=event,
-                    on_activity=on_activity,
-                    expected_inputs=expected_inputs,
-                    handoff_sha256=handoff_sha256,
-                )
-                receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
-                if stop_after == "capture":
-                    return _finish_native_capture(
-                        staging,
-                        output,
-                        receipt,
-                        run_id=receipt["run_id"],
-                        handoff_sha256=handoff_sha256,
-                        main_assembly=main_assembly,
-                    )
-            else:
-                _seed_resume(staging, seed_dir, resume_from)
-                input_report = read_data(staging / "reports/input.json")
-                from .steps import inspect_prepared_input
+            _, input_report = capture_evidence(
+                package,
+                staging,
+                backend=backend,
+                on_event=event,
+                on_activity=on_activity,
+                expected_inputs=expected_inputs,
+                handoff_sha256=handoff_sha256,
+            )
+            receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
+            return _finish_native_capture(
+                staging,
+                output,
+                receipt,
+                run_id=receipt["run_id"],
+                handoff_sha256=handoff_sha256,
+                main_assembly=main_assembly,
+            )
+        except Exception as error:
+            return _failed_run(staging, output, receipt, event, error)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
 
-                replayed = inspect_prepared_input(staging / "input")
-                if replayed.get("passed") is not True:
-                    raise PipelineError("Retained native inputs no longer pass static validation")
-                if inventory(staging / "input") != input_report.get("package_files"):
-                    raise PipelineError("Retained input bytes do not match the recorded inspection receipt")
-                for key in ("input", "cad_revision"):
-                    if replayed.get(key) != input_report.get(key):
-                        raise PipelineError("Retained input report does not match its archived native inputs")
-                receipt_rows = (input_report.get("input_receipt") or {}).get("inventory")
-                if receipt_rows and (replayed.get("input_receipt") or {}).get("inventory") != receipt_rows:
-                    raise PipelineError("Retained input inspection receipt does not match its archived native inputs")
-                # Resolve from the fresh inspection of the archived input: its receipt root is
-                # this host's local package directory, while the frozen report records the
-                # producing host's absolute root (a Windows path on a portable continuation).
-                # The equality checks above already bound the replay to the frozen report and
-                # its inventory rows, so no inventory check is skipped.
-                definition = resolve_package(replayed)
-                receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
-            if resume_from in (None, "capture", "generate"):
-                generated_subject = generate_model(staging, definition, input_report, on_event=event)
-            else:
-                if not expected_subject:
-                    raise PipelineError("Resumed verification requires the recorded subject")
-                generated_subject = digest(subject_inventory(staging))
-                if generated_subject != expected_subject:
-                    raise PipelineError("Generated subject does not match the recorded delivery")
-            if stop_after == "generate":
-                receipt.update(
-                    state="generated",
-                    passed=False,
-                    subject_sha256=generated_subject,
-                    hardware_id=definition["hardware_id"],
-                )
-                _stamp(staging, receipt)
-                _install(staging, output)
-                return {**receipt, "output": str(output)}
-            if resume_from in (None, "capture", "generate", "verify"):
-                report = verify_delivery(staging, generated_subject, on_event=event)
-            else:
-                from .verification.solidworks_urdf import check_bundle, require_qualified_report
 
-                report = require_qualified_report(check_bundle(staging))
-                if expected_subject and report.get("subject_sha256") != expected_subject:
-                    raise PipelineError("Verified report is bound to a different subject")
+def generate(
+    seed_dir: Path,
+    output: Path,
+    *,
+    run_id: str | None = None,
+    prior_events=None,
+    resume: dict | None = None,
+    handoff_sha256=None,
+    on_event=None,
+) -> dict:
+    """The generation stage: seed the capture checkpoint and build the delivery.
+
+    The result is the unverified ``generated`` checkpoint; independent
+    verification is always a separate stage bound to its recorded subject.
+    """
+
+    seed_dir = Path(seed_dir)
+    output = Path(output)
+    if output.resolve().is_relative_to(seed_dir.resolve()) or seed_dir.resolve().is_relative_to(output.resolve()):
+        raise PipelineError("Stage checkpoints and output must be separate")
+    with output_lock(output) as output:
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-generate-", dir=output.parent))
+        receipt = _stage_receipt("generate", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
+        event = _event_sink(receipt, on_event)
+        try:
+            _seed_checkpoint(staging, seed_dir, "generate")
+            definition, input_report = _replay_seeded_inputs(staging)
+            receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
+            from .steps import generate_model
+
+            generated_subject = generate_model(staging, definition, input_report, on_event=event)
             receipt.update(
-                hardware_id=definition["hardware_id"], subject_sha256=report.get("subject_sha256"), quality=report
+                state="generated",
+                passed=False,
+                subject_sha256=generated_subject,
+                hardware_id=definition["hardware_id"],
+            )
+            _stamp(staging, receipt)
+            _install(staging, output)
+            return {**receipt, "output": str(output)}
+        except Exception as error:
+            return _failed_run(staging, output, receipt, event, error)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+
+
+def verify(
+    seed_dir: Path,
+    output: Path,
+    *,
+    run_id: str | None = None,
+    expected_subject: str,
+    prior_events=None,
+    resume: dict | None = None,
+    handoff_sha256=None,
+    on_event=None,
+) -> dict:
+    """The independent-verification stage: recheck a seeded generated checkpoint."""
+
+    seed_dir = Path(seed_dir)
+    output = Path(output)
+    if output.resolve().is_relative_to(seed_dir.resolve()) or seed_dir.resolve().is_relative_to(output.resolve()):
+        raise PipelineError("Stage checkpoints and output must be separate")
+    with output_lock(output) as output:
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-verify-", dir=output.parent))
+        receipt = _stage_receipt("verify", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
+        event = _event_sink(receipt, on_event)
+        try:
+            _seed_checkpoint(staging, seed_dir, "verify")
+            definition, input_report = _replay_seeded_inputs(staging)
+            receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
+            generated_subject = _require_subject(staging, expected_subject)
+            from .steps import verify_delivery
+
+            report = verify_delivery(staging, generated_subject, on_event=event)
+            receipt.update(
+                hardware_id=definition["hardware_id"],
+                subject_sha256=report.get("subject_sha256"),
+                quality=report,
             )
             if report.get("passed") is not True:
                 raise PipelineError("URDF verification failed; see reports/quality.json")
             receipt.update(state="verified", passed=True)
             _stamp(staging, receipt)
             _install(staging, output)
-            if repository is not None:
-                submitted = publish_model(output, Path(repository), base=base, message=message, on_event=event)
-                receipt.update(submission=submitted, state=submitted.get("state", "failed"), passed=submitted["passed"])
-                _stamp(output, receipt)
+            return {**receipt, "output": str(output)}
+        except Exception as error:
+            return _failed_run(staging, output, receipt, event, error)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+
+
+def publish(
+    seed_dir: Path,
+    output: Path,
+    *,
+    run_id: str | None = None,
+    expected_subject: str,
+    repository: Path,
+    base: str | None = None,
+    message: str | None = None,
+    prior_events=None,
+    resume: dict | None = None,
+    handoff_sha256=None,
+    on_event=None,
+) -> dict:
+    """The publication stage: seed the verified checkpoint and push its candidate PR.
+
+    Publication is always a separate stage bound to the verified subject; a
+    failed submission keeps the new verified delivery and its receipt so a
+    linked attempt can reconcile without CAD.
+    """
+
+    seed_dir = Path(seed_dir)
+    output = Path(output)
+    if repository is None:
+        raise PipelineError("Publication requires the configured model repository checkout")
+    repository = Path(repository)
+    if output.resolve().is_relative_to(seed_dir.resolve()) or seed_dir.resolve().is_relative_to(output.resolve()):
+        raise PipelineError("Stage checkpoints and output must be separate")
+    if output.resolve().is_relative_to(repository.resolve()) or repository.resolve().is_relative_to(output.resolve()):
+        raise PipelineError("Build output and the model repository must be separate directories")
+    with output_lock(output) as output:
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-publish-", dir=output.parent))
+        receipt = _stage_receipt("publish", run_id, prior_events, resume=resume, handoff_sha256=handoff_sha256)
+        event = _event_sink(receipt, on_event)
+        try:
+            _seed_checkpoint(staging, seed_dir, "publish")
+            definition, input_report = _replay_seeded_inputs(staging)
+            receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
+            _require_subject(staging, expected_subject)
+            from .verification.solidworks_urdf import check_bundle, rebuilt_definition, require_qualified_report
+
+            report = require_qualified_report(check_bundle(staging), rebuilt_definition(staging), root=staging)
+            if expected_subject and report.get("subject_sha256") != expected_subject:
+                raise PipelineError("Verified report is bound to a different subject")
+            receipt.update(
+                hardware_id=definition["hardware_id"],
+                subject_sha256=report.get("subject_sha256"),
+                quality=report,
+            )
+            if report.get("passed") is not True:
+                raise PipelineError("URDF verification failed; see reports/quality.json")
+            receipt.update(state="verified", passed=True)
+            _stamp(staging, receipt)
+            _install(staging, output)
+            from .steps import publish_model
+
+            submitted = publish_model(output, repository, base=base, message=message, on_event=event)
+            receipt.update(submission=submitted, state=submitted.get("state", "failed"), passed=submitted["passed"])
+            _stamp(output, receipt)
             return {**receipt, "output": str(output)}
         except Exception as error:
             return _failed_run(staging, output, receipt, event, error)
@@ -433,33 +544,27 @@ def run(
 def rebuild(
     bundle: Path,
     output: Path,
-    *,
-    repository: Path | None = None,
-    base: str | None = None,
-    message: str | None = None,
 ) -> dict:
-    """Rebuild a verified frozen capture without Windows or a CAD session."""
+    """Rebuild a verified frozen capture without Windows or a CAD session.
+
+    Maintenance only: generation and independent verification run again, the
+    native evidence stays untouched and nothing is published - the output is
+    never registered as a platform checkpoint.
+    """
 
     bundle = Path(bundle).resolve()
     output = Path(output)
     if output.resolve().is_relative_to(bundle) or bundle.is_relative_to(output.resolve()):
         raise PipelineError("Rebuild input and output must be separate")
-    if repository is not None:
-        repo = Path(repository).resolve()
-        if output.resolve().is_relative_to(repo) or repo.is_relative_to(output.resolve()):
-            raise PipelineError("Build output and the model repository must be separate directories")
     previous = _check(bundle)
     if previous.get("passed") is not True:
         raise PipelineError("The frozen bundle failed verification; repair its author inputs and recapture")
     source_files = subject_inventory(bundle)
     if digest(source_files) != previous["subject_sha256"]:
         raise PipelineError("Frozen delivery changed after verification")
-    definition = read_data(bundle / "input/robot.yaml")
-    source_receipt = read_data(bundle / "reports/run.json") if (bundle / "reports/run.json").is_file() else {}
-    handoff_sha256 = (definition.get("provenance") or {}).get("native_inventory_sha256")
     with output_lock(output) as output:
-        if not _owned_output(output):
-            raise PipelineError(f"Output contains unrelated files: {output}")
+        if not writable_output(output):
+            raise PipelineError(f"Output must be absent or empty: {output}")
         staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-rebuild-", dir=output.parent))
         receipt = {
             "schema_version": BUNDLE_SCHEMA,
@@ -467,13 +572,8 @@ def rebuild(
             "run_id": str(uuid.uuid4()),
             "state": "failed",
             "passed": False,
-            "rebuild_from": {
-                "subject_sha256": previous.get("subject_sha256"),
-                "run_id": source_receipt.get("run_id"),
-                "handoff_sha256": handoff_sha256,
-            },
-            "handoff_sha256": handoff_sha256,
-            "execution_scope": ["generate", "verify"] + (["publish"] if repository else []),
+            "rebuild_from": {"subject_sha256": previous.get("subject_sha256")},
+            "execution_scope": ["generate", "verify"],
         }
         event = _event_sink(receipt)
         try:
@@ -494,11 +594,13 @@ def rebuild(
                 or subject_inventory(bundle) != source_files
             ):
                 raise PipelineError("Frozen evidence changed during rebuild preparation")
-            from .steps import generate_model, publish_model, verify_delivery
+            definition, input_report = _replay_seeded_inputs(staging)
+            handoff_sha256 = (definition.get("provenance") or {}).get("native_inventory_sha256")
+            receipt["handoff_sha256"] = handoff_sha256
+            receipt["rebuild_from"]["handoff_sha256"] = handoff_sha256
+            from .steps import generate_model, verify_delivery
 
-            generated_subject = generate_model(
-                staging, definition, read_data(bundle / "reports/input.json"), on_event=event
-            )
+            generated_subject = generate_model(staging, definition, input_report, on_event=event)
             report = verify_delivery(staging, generated_subject, on_event=event)
             receipt.update(
                 state="verified" if report.get("passed") is True else "failed",
@@ -511,53 +613,12 @@ def rebuild(
                 failed = _keep_diagnostic(staging, output, receipt)
                 return {**receipt, "diagnostic_path": str(failed)}
             _install(staging, output)
-            if repository is not None:
-                submitted = publish_model(output, repository, base=base, message=message, on_event=event)
-                receipt.update(submission=submitted, state=submitted["state"], passed=submitted["passed"])
-                _stamp(output, receipt)
             return {**receipt, "output": str(output)}
         except Exception as error:
             return _failed_run(staging, output, receipt, event, error)
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
-
-
-def submit(bundle: Path, repository: Path, *, base=None, message=None):
-    """Recover publication without repeating native work or losing the run history."""
-    from .steps import publish_model
-
-    with output_lock(Path(bundle)) as bundle:
-        marker = bundle / "reports/run.json"
-        receipt = (
-            read_data(marker)
-            if marker.is_file()
-            else {
-                "schema_version": BUNDLE_SCHEMA,
-                "pipeline_id": PIPELINE_ID,
-                "run_id": str(uuid.uuid4()),
-                "execution_scope": ["publish"],
-                "events": [],
-            }
-        )
-        receipt["execution_scope"] = ["publish"]
-        receipt.setdefault("publication_attempts", [receipt["submission"]] if receipt.get("submission") else [])
-        event = _event_sink(receipt)
-        try:
-            result = publish_model(bundle, repository, base=base, message=message, on_event=event)
-        except Exception as error:
-            return _failed_run(None, bundle, receipt, event, error)
-        receipt["publication_attempts"].append(result)
-        receipt.update(
-            submission=result,
-            state=result["state"],
-            passed=result["passed"],
-            subject_sha256=result.get("subject_sha256"),
-            error=result.get("error"),
-            detail=result.get("detail"),
-        )
-        _stamp(bundle, receipt)
-        return result
 
 
 def doctor() -> dict:

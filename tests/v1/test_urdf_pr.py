@@ -10,9 +10,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.delivery import subject_digest, subject_inventory
+from description_pipeline.delivery import read_source_record, subject_digest, write_delivery_manifest
+from description_pipeline.interface_records import check_policy_digest
+from description_pipeline.io import digest
 from description_pipeline.repository import urdf_pr
-from description_pipeline.sources.solidworks import revision as cad_revision
+from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
+from description_pipeline.stages import CONTRACT
 
 BRANCH = "work/solidworks/m3.0"
 
@@ -45,39 +48,69 @@ class Fixture:
         self.write_bundle("one\n")
         self.seal("r1", None, cad="part-1\n")
 
-    def seal(self, revision_id: str, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:
+    def write_manifest(self) -> None:
+        write_delivery_manifest(
+            self.bundle,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": "a" * 64},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+
+    def seal(self, revision_id: str | None, parent: str | None, *, cad: str = "part-1\n", fresh: bool = False) -> None:
+        """Write the frozen input/source.json content identity for one revision."""
+
         inputs = self.bundle / "input"
         inputs.mkdir(parents=True, exist_ok=True)
         (inputs / "M3.0.SLDASM").write_text(cad, encoding="utf-8")
         if fresh:
-            (inputs / "cad-revision.json").unlink(missing_ok=True)
-        cad_revision.seal_revision(
-            inputs,
-            hardware_id="m3.0",
-            revision=revision_id,
-            owner="t",
-            system="handoff",
-            reference="local-handoff",
-            summary="t",
-            parent_revision=parent,
+            (inputs / "source.json").unlink(missing_ok=True)
+        identity = {
+            "kind": "source-revision",
+            "handoff_digest": digest(cad),
+            "main_assembly": "M3.0.SLDASM",
+            "configuration": "Default",
+            "hardware_id": "m3.0",
+            "records": [],
+        }
+        source = {
+            "schema_version": SOURCE_RECORD_SCHEMA,
+            "source_revision_id": digest(identity),
+            "identity": identity,
+            "selection": {
+                "main_assembly": "M3.0.SLDASM",
+                "configuration": "Default",
+                "hardware_id": "m3.0",
+                "hardware_source": "cad",
+            },
+            "metadata": {
+                "revision": revision_id,
+                "owner": "t",
+                "control": {"system": "handoff", "reference": "local-handoff"},
+                "change_summary": "t",
+                "change_summary_source": "submission",
+            },
+        }
+        (inputs / "source.json").write_text(
+            json.dumps(source, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
         )
+        self.write_manifest()
 
     def write_bundle(self, evidence: str, extra: dict[str, str] | None = None) -> None:
         files = {
-            "README.md": "# m3.0\n",
-            "input/robot.yaml": "hardware_id: m3.0\n",
-            "evidence/raw.json": evidence,
+            "input/handoff.json": "{}\n",
+            "evidence/discovery.json": evidence,
             "model/robot.json": "{}\n",
             "urdf/robot.urdf": "<robot name='m3.0'/>\n",
             "meshes/part.stl": "solid\n",
-            "reports/input.json": "{}\n",
-            "reports/tool.json": "{}\n",
+            "tool.json": "{}\n",
+            "reports/quality.json": "{}\n",
         }
         files.update(extra or {})
         for rel, text in files.items():
             path = self.bundle / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
+        if (self.bundle / "input/source.json").is_file():
+            self.write_manifest()
 
     def remote_head(self, branch: str = BRANCH) -> str:
         out = run("git", "ls-remote", str(self.remote), f"refs/heads/{branch}").strip()
@@ -180,6 +213,145 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(result["commit"], self.fx.remote_head())
 
+    def _advance_base(self) -> None:
+        (self.fx.seed / "README.md").write_text("independent remote base update\n", encoding="utf-8")
+        run("git", "add", "README.md", cwd=self.fx.seed)
+        run("git", "commit", "-m", "review external base advance", cwd=self.fx.seed)
+        run("git", "push", "origin", "feature/m3.0", cwd=self.fx.seed)
+
+    def test_candidate_head_rewind_is_refused_without_overwriting(self):
+        """A rewound candidate head must be a CAS conflict, never an overwrite."""
+
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        fixed_base = self.fx.remote_head("feature/m3.0")
+        fixed_head = self.fx.remote_head()
+        self.fx.write_bundle("rewind race evidence\n")
+        real_git = urdf_pr._git
+        injected = False
+
+        def git_with_race(repository, *args, **kwargs):
+            nonlocal injected
+            if not injected and args[:1] == ("push",):
+                injected = True
+                run(
+                    "git",
+                    "--git-dir",
+                    str(self.fx.remote),
+                    "update-ref",
+                    f"refs/heads/{BRANCH}",
+                    fixed_base,
+                    fixed_head,
+                )
+            return real_git(repository, *args, **kwargs)
+
+        with mock.patch.object(urdf_pr, "_git", side_effect=git_with_race):
+            result = self.submit()
+        self.assertTrue(injected)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "candidate_head_changed")
+        self.assertIn("retry", result)
+        # The rewound remote head stays exactly where the race left it.
+        self.assertEqual(self.fx.remote_head(), fixed_base)
+
+    def test_base_advance_after_planning_ends_unresolved_not_updated(self):
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        self.fx.write_bundle("base race evidence\n")
+        real_git = urdf_pr._git
+        injected = False
+
+        def git_with_race(repository, *args, **kwargs):
+            nonlocal injected
+            if not injected and args[:1] == ("push",):
+                injected = True
+                self._advance_base()
+            return real_git(repository, *args, **kwargs)
+
+        with mock.patch.object(urdf_pr, "_git", side_effect=git_with_race):
+            result = self.submit()
+        self.assertTrue(injected)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "base_moved_after_push")
+        self.assertIn("retry", result)
+        # The candidate write is retained for reconciliation, never a success.
+        self.assertEqual(result["commit"], self.fx.remote_head())
+
+    def test_base_advance_before_final_confirmation_ends_unresolved(self):
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        self.fx.write_bundle("final confirmation race evidence\n")
+        real_gh = urdf_pr._gh
+        injected = False
+
+        def gh_with_race(repository, *args):
+            nonlocal injected
+            if not injected and args[:2] == ("pr", "view"):
+                injected = True
+                self._advance_base()
+            return real_gh(repository, *args)
+
+        with mock.patch.object(urdf_pr, "_gh", side_effect=gh_with_race):
+            result = self.submit()
+        self.assertTrue(injected)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "base_moved_after_push")
+        self.assertIn("retry", result)
+        self.assertEqual(result["url"], "https://github.com/example/m3.0/pull/1")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+
+    def _lost_push_case(self, *, advance_base=False, break_queries=False):
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        fixed_head = self.fx.remote_head()
+        self.fx.write_bundle("lost push response evidence\n")
+        real_git = urdf_pr._git
+        state = {"injected": False}
+
+        def git_with_race(repository, *args, **kwargs):
+            if state["injected"] and break_queries and args[:1] == ("ls-remote",):
+                raise subprocess.CalledProcessError(128, ["git", *args], stderr="injected unavailable observation")
+            if not state["injected"] and args[:1] == ("push",):
+                state["injected"] = True
+                accepted = real_git(repository, *args, **kwargs)
+                self.assertEqual(accepted.returncode, 0)
+                if advance_base:
+                    self._advance_base()
+                raise subprocess.CalledProcessError(
+                    128, ["git", *args], stderr="injected response loss after accepted write"
+                )
+            return real_git(repository, *args, **kwargs)
+
+        with mock.patch.object(urdf_pr, "_git", side_effect=git_with_race):
+            result = self.submit()
+        self.assertTrue(state["injected"])
+        return result, fixed_head
+
+    def test_lost_push_response_retains_the_written_candidate(self):
+        result, fixed_head = self._lost_push_case()
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "push_response_lost")
+        remote = self.fx.remote_head()
+        self.assertNotEqual(remote, fixed_head)
+        self.assertEqual(result["commit"], remote)
+        self.assertIn("retained", result["retry"]["note"])
+
+    def test_lost_push_response_with_base_advance_retains_the_candidate(self):
+        result, fixed_head = self._lost_push_case(advance_base=True)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "push_response_lost")
+        remote = self.fx.remote_head()
+        self.assertNotEqual(remote, fixed_head)
+        self.assertEqual(result["commit"], remote)
+        self.assertEqual(result["detail"]["observed_base"], self.fx.remote_head("feature/m3.0"))
+
+    def test_lost_push_with_unobservable_refs_keeps_the_candidate_unresolved(self):
+        result, fixed_head = self._lost_push_case(break_queries=True)
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "push_unverified")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+        self.assertNotEqual(result["commit"], fixed_head)
+
     def submit(self, **kwargs):
         return urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0", branch=BRANCH, **kwargs)
 
@@ -201,41 +373,34 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(len([c for c in self.gh_calls if c[:2] == ("pr", "create")]), 1)
         self.assertGreaterEqual(len(self.rest_payloads), 2)
 
-    def test_mass_closure_receipt_travels_into_the_worktree_and_publishes(self) -> None:
+    def test_extra_reports_receipts_are_refused(self) -> None:
+        """Only reports/quality.json may sit outside the subject; old receipts move to run storage."""
         self.fx.write_bundle("one\n", extra={"reports/mass-closure.json": "{}\n"})
         result = self.submit()
-        self.assertIn(result["state"], {"published", "updated"})
-        self.assertEqual(result["subject"], subject_digest(self.fx.bundle))
-        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
-        tree = run("git", "ls-tree", "-r", "--name-only", "FETCH_HEAD", cwd=self.fx.repo).splitlines()
-        self.assertIn("reports/mass-closure.json", tree)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
-    def test_every_subject_bound_reports_receipt_is_copied_into_the_worktree(self) -> None:
-        self.fx.write_bundle(
-            "one\n",
-            extra={
-                "reports/mass-closure.json": "{}\n",
-                "reports/native-tool.json": "{}\n",
-                "reports/native-stages.json": "{}\n",
-                "transfer-manifest.json": "{}\n",
-            },
+    def test_only_the_quality_report_travels_outside_the_subject(self) -> None:
+        self.fx.write_bundle("one\n")
+        result = self.submit()
+        self.assertIn(result["state"], {"published", "updated"})
+        self.assertEqual(
+            sorted(path for path in self.fx.remote_tree() if path.startswith("reports/")), ["reports/quality.json"]
         )
-        bundle_subject = subject_digest(self.fx.bundle)
-        bound = sorted(name for name in subject_inventory(self.fx.bundle) if name.startswith("reports/"))
-        self.assertIn("reports/mass-closure.json", bound)
         worktree = Path(tempfile.mkdtemp(dir=self.fx.tmp))
         urdf_pr._copy_governed(self.fx.bundle, worktree)
-        for name in bound:
-            self.assertTrue((worktree / name).is_file(), name)
-        self.assertEqual(subject_digest(worktree), bundle_subject)
+        copied = sorted(
+            path.relative_to(worktree).as_posix() for path in (worktree / "reports").rglob("*") if path.is_file()
+        )
+        self.assertEqual(copied, ["reports/quality.json"])
+        self.assertEqual(subject_digest(worktree), subject_digest(self.fx.bundle))
 
-    def test_a_dropped_subject_bound_receipt_breaks_reverification(self) -> None:
-        self.fx.write_bundle("one\n", extra={"reports/mass-closure.json": "{}\n"})
-        legacy = tuple(name for name in urdf_pr.REPORTS_FILES if name != "mass-closure.json")
-        with mock.patch.object(urdf_pr, "REPORTS_FILES", legacy):
-            result = self.submit()
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["error"], "reverification_failed")
+    def test_missing_quality_report_is_refused(self) -> None:
+        (self.fx.bundle / "reports/quality.json").unlink()
+        result = self.submit()
+        self.assertEqual(result["error"], "bundle_incomplete")
+        self.assertEqual(self.fx.remote_head(), "")
 
     def test_original_record_bytes_survive_git_and_fresh_checkout(self):
         name = "input/records/specification.txt"
@@ -243,6 +408,7 @@ class PublishTests(unittest.TestCase):
         path = self.fx.bundle / name
         path.parent.mkdir(parents=True)
         path.write_bytes(payload)
+        self.fx.write_manifest()
         for setting in ("true", "false", "input"):
             with self.subTest(core_autocrlf=setting):
                 run("git", "config", "core.autocrlf", setting, cwd=self.fx.repo)
@@ -291,23 +457,21 @@ class PublishTests(unittest.TestCase):
         attributes = self.fx.repo / ".git/info/attributes"
         for rule in ("text=auto", "filter=external", "working-tree-encoding=UTF-16"):
             with self.subTest(attribute=rule):
-                attributes.write_text(f"README.md {rule}\n", encoding="ascii")
+                attributes.write_text(f"tool.json {rule}\n", encoding="ascii")
                 result = self.submit()
                 self.assertEqual(result["error"], "git_attributes_conflict")
-                self.assertEqual(result["detail"]["file"], "README.md")
+                self.assertEqual(result["detail"]["file"], "tool.json")
                 self.assertEqual(result["detail"]["attribute"], rule.split("=", 1)[0])
                 self.assertEqual(self.fx.remote_head(), "")
 
-    def test_bundle_cannot_replace_generated_git_policy(self):
+    def test_bundle_cannot_carry_its_own_git_policy(self):
         self.fx.write_bundle("one\n", extra={".gitattributes": "* text\n"})
-        events = []
-        result = self.submit(on_event=events.append)
-        self.assertEqual(result["state"], "published")
-        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
-        actual = subprocess.check_output(["git", "show", "FETCH_HEAD:.gitattributes"], cwd=self.fx.repo)
-        self.assertEqual(actual, urdf_pr.GIT_ATTRIBUTES)
-        boundary = next(event["check"] for event in events if event.get("check", {}).get("id") == "publication.git")
-        self.assertEqual(len(boundary["details"]["git_attributes_sha256"]), 64)
+        result = self.submit()
+        # The generated policy is publisher-owned metadata: the bundle can neither
+        # carry nor replace it, and unregistered files are refused outright.
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
     def test_native_filenames_with_unicode_and_spaces_publish_unchanged(self):
         name = "input/结构 零件.SLDPRT"
@@ -415,27 +579,19 @@ class PublishTests(unittest.TestCase):
         self.assertTrue(result["subject"])
         self.assertIn("retry", result)
 
-    def test_ungoverned_files_never_reach_the_branch(self) -> None:
-        self.fx.write_bundle("four\n", extra={"secret.txt": "shh\n", "config/extra.json": "{}\n"})
+    def test_unregistered_files_are_refused_not_smuggled(self) -> None:
+        self.fx.write_bundle("four\n", extra={"secret.txt": "shh\n"})
         result = self.submit()
-        self.assertIn(result["state"], {"published", "updated"})
-        tree = self.fx.remote_tree()
-        self.assertNotIn("secret.txt", tree)
-        self.assertNotIn("config/extra.json", tree)
-        self.assertIn("urdf/robot.urdf", tree)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
-    def test_local_receipts_ignored_and_do_not_cause_commits(self) -> None:
-        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 1}\n', "reports/pr.json": '{"pr": 1}\n'})
-        first = self.submit()
-        tree = self.fx.remote_tree()
-        self.assertIn("reports/quality.json", tree)
-        self.assertNotIn("reports/run.json", tree)
-        self.assertNotIn("reports/pr.json", tree)
-        self.fx.write_bundle("one\n", extra={"reports/run.json": '{"run": 2}\n', "reports/pr.json": '{"pr": 2}\n'})
-        second = self.submit()
-        self.assertEqual(second["state"], "noop")
-        self.assertEqual(second["commit"], first["commit"])
-        self.assertEqual(self.fx.remote_head(), first["commit"])
+    def test_local_receipts_are_refused_under_reports(self) -> None:
+        self.fx.write_bundle("one\n", extra={"reports/rogue.json": '{"run": 1}\n'})
+        result = self.submit()
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_layout")
+        self.assertEqual(self.fx.remote_head(), "")
 
     def test_base_advance_with_identical_bundle_pushes_merge(self) -> None:
         first = self.submit()
@@ -458,8 +614,8 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(), "")
 
     def test_case_duplicate_paths_rejected(self) -> None:
-        (self.fx.bundle / "readme.md").write_text("dup\n", encoding="utf-8")
-        if (self.fx.bundle / "readme.md").samefile(self.fx.bundle / "README.md"):
+        (self.fx.bundle / "Tool.json").write_text("dup\n", encoding="utf-8")
+        if (self.fx.bundle / "Tool.json").samefile(self.fx.bundle / "tool.json"):
             self.skipTest("Case-distinct files require a case-sensitive filesystem")
         self.assertEqual(self.submit()["error"], "duplicate_path")
         self.assertEqual(self.fx.remote_head(), "")
@@ -478,7 +634,7 @@ class PublishTests(unittest.TestCase):
         result = self.submit()
         self.assertIn(result["state"], {"published", "updated"})
         self.assertTrue((outside / "keep.txt").is_file())
-        self.assertIn("input/robot.yaml", self.fx.remote_tree())
+        self.assertIn("input/source.json", self.fx.remote_tree())
 
     def test_commit_hook_tamper_blocks_push(self) -> None:
         hook = self.fx.repo / ".git" / "hooks" / "pre-commit"
@@ -508,35 +664,120 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(), second["commit"])
         self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
 
-    def test_resealed_changed_cad_same_id_rejected(self) -> None:
+    def test_same_label_changed_content_is_not_a_rejection(self) -> None:
+        # Platform semantics: the CAD label is raw engineering metadata, never a
+        # content identity; protection comes from the fixed base/head, the
+        # published subject chain and CAS/ff, so a re-sealed label is allowed.
         first = self.submit()
         self.fx.seal("r1", None, cad="part-1-changed\n", fresh=True)
         self.fx.write_bundle("two\n")
-        result = self.submit()
-        self.assertEqual(result["error"], "cad_revision_conflict")
-        self.assertEqual(self.fx.remote_head(), first["commit"])
+        second = self.submit()
+        self.assertEqual(second["state"], "updated")
+        self.assertEqual(self.fx.remote_head(), second["commit"])
+        self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
 
-    def test_new_revision_with_correct_parent_allowed(self) -> None:
+    def test_new_revision_label_is_allowed(self) -> None:
         first = self.submit()
         self.fx.seal("r2", "r1", cad="part-2\n", fresh=True)
         self.fx.write_bundle("two\n")
         second = self.submit()
         self.assertEqual(second["state"], "updated")
         run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
-        manifest = json.loads(run("git", "show", "FETCH_HEAD:input/cad-revision.json", cwd=self.fx.repo))
-        self.assertEqual(manifest["revision"], "r2")
-        self.assertEqual(manifest["parent_revision"], "r1")
+        source = json.loads(run("git", "show", "FETCH_HEAD:input/source.json", cwd=self.fx.repo))
+        self.assertEqual(source["metadata"]["revision"], "r2")
         self.assertTrue(self.fx.is_ancestor(first["commit"], second["commit"]))
 
-    def test_missing_or_wrong_parent_rejected(self) -> None:
-        first = self.submit()
-        self.fx.seal("r2", None, cad="part-2-missing\n", fresh=True)
+    def test_missing_revision_label_publishes_with_content_identity(self) -> None:
+        self.submit()
+        self.fx.seal(None, None, cad="part-2\n", fresh=True)
         self.fx.write_bundle("two\n")
-        self.assertEqual(self.submit()["error"], "cad_revision_conflict")
-        self.assertEqual(self.fx.remote_head(), first["commit"])
-        self.fx.seal("r2", "r0", cad="part-2-wrong\n", fresh=True)
-        self.assertEqual(self.submit()["error"], "cad_revision_conflict")
-        self.assertEqual(self.fx.remote_head(), first["commit"])
+        second = self.submit()
+        self.assertEqual(second["state"], "updated")
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        source = json.loads(run("git", "show", "FETCH_HEAD:input/source.json", cwd=self.fx.repo))
+        self.assertIsNone(source["metadata"]["revision"])
+        previous = urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertIsNone(previous["revision"])
+        self.assertTrue(previous["source_revision_id"])
+
+    def test_published_revision_unknown_is_not_absent(self) -> None:
+        # A remote that answers "no such ref" is proven-absent; a transport or
+        # read failure is unknown and must not masquerade as absence.
+        self.assertIsNone(urdf_pr.published_revision(self.fx.repo, "m3.0"))
+        failure = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="network is unreachable")
+        real_run = subprocess.run
+
+        def fake_run(*args, **kwargs):
+            if "fetch" in args[0]:
+                return failure
+            return real_run(*args, **kwargs)
+
+        with (
+            mock.patch.object(urdf_pr.subprocess, "run", side_effect=fake_run),
+            self.assertRaises(urdf_pr.PrError) as raised,
+        ):
+            urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertEqual(raised.exception.code, "published_revision_unknown")
+
+    def test_w12_probe_1_publisher_accepts_missing_revision(self) -> None:
+        """W12-1: a legal source with revision=null plus a re-sealed manifest is accepted."""
+        source = read_source_record(self.fx.bundle)
+        source["metadata"]["revision"] = None
+        (self.fx.bundle / "input/source.json").write_text(json.dumps(source), encoding="utf-8")
+        self.fx.write_manifest()
+        hardware, _, current = urdf_pr._validate(self.fx.bundle)
+        self.assertEqual(hardware, "m3.0")
+        self.assertIsNone(current["revision"])
+        self.assertIn(self.submit()["state"], {"published", "updated"})
+
+    def test_w12_probe_2_previous_revision_keeps_content_identity_without_label(self) -> None:
+        """W12-2: the platform content identity survives a missing CAD label."""
+        source = read_source_record(self.fx.bundle)
+        source["metadata"]["revision"] = None
+        (self.fx.bundle / "input/source.json").write_text(json.dumps(source), encoding="utf-8")
+        self.fx.write_manifest()
+        previous = urdf_pr._previous_revision(self.fx.bundle, "m3.0")
+        self.assertIsNotNone(previous)
+        self.assertIsNone(previous["revision"])
+        self.assertEqual(previous["source_revision_id"], source["source_revision_id"])
+
+    def test_w12_probe_3_same_label_new_content_is_allowed(self) -> None:
+        """W12-3: successor judgement is platform-level, not label-vs-content."""
+        before = urdf_pr._identity_of(read_source_record(self.fx.bundle))
+        after = dict(before, source_revision_id="d" * 64)
+        urdf_pr._check_successor(before, before)
+        urdf_pr._check_successor(before, after)
+        with self.assertRaises(urdf_pr.PrError):
+            urdf_pr._check_successor(before, dict(after, hardware_id="other"))
+
+    def test_w12_probe_4_transport_failure_never_reads_old_fetch_head(self) -> None:
+        """W12-4: a failed fetch must not surface a stale FETCH_HEAD identity."""
+        self.submit()
+        stale = urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertIsNotNone(stale)
+        failure = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="", stderr="review injected transport failure"
+        )
+        real_run = subprocess.run
+
+        def fail_fetch_only(args, *positional, **kwargs):
+            if isinstance(args, list) and args[:2] == ["git", "-C"] and "fetch" in args:
+                return failure
+            return real_run(args, *positional, **kwargs)
+
+        with (
+            mock.patch.object(urdf_pr.subprocess, "run", side_effect=fail_fetch_only),
+            self.assertRaises(urdf_pr.PrError) as raised,
+        ):
+            urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertEqual(raised.exception.code, "published_revision_unknown")
+
+    def test_w12_probe_5_unavailable_remote_is_not_absent(self) -> None:
+        """W12-5: an unreachable origin is unresolved, never a proven absence."""
+        run("git", "remote", "set-url", "origin", str(self.fx.tmp / "unavailable.git"), cwd=self.fx.repo)
+        with self.assertRaises(urdf_pr.PrError) as raised:
+            urdf_pr.published_revision(self.fx.repo, "m3.0")
+        self.assertEqual(raised.exception.code, "published_revision_unknown")
 
 
 if __name__ == "__main__":

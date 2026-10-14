@@ -62,5 +62,5 @@ chmod 600 "$CONF" "$HBA"
 # Provision only: this script never starts, restarts or stops a server, and it never creates the
 # database. The managed description-postgres unit owns the only long-running server; operatorctl
 # starts that unit, waits for readiness, then creates airflow_meta before Airflow migration.
-echo "AIRFLOW_DB_URL=postgresql+psycopg2://solidworks@/airflow_meta?host=$SOCKET&port=$POSTGRES_PORT"
+echo "AIRFLOW_DB_URL=postgresql+psycopg2://airflow_migrate@/airflow_meta?host=$SOCKET&port=$POSTGRES_PORT"
 echo "POSTGRES_MAJOR=$MAJOR"

@@ -45,7 +45,12 @@ class BrowserAssetHealthTests(unittest.TestCase):
                 return subprocess.run(
                     [sys.executable, "-", str(server.server_port)],
                     input=PROBE,
-                    env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+                    env={
+                        **os.environ,
+                        "PYTHONPATH": str(ROOT / "src"),
+                        "NO_PROXY": "127.0.0.1,localhost",
+                        "no_proxy": "127.0.0.1,localhost",
+                    },
                     capture_output=True,
                     text=True,
                     timeout=15,

@@ -60,9 +60,9 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         finished = self.await_terminal(child_jobs, request["run_id"])
         self.assertEqual(finished["status"], "native_complete", finished.get("error"))
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["resume_from"], "capture")
-        self.assertIsNone(calls[0]["seed_dir"])
         self.assertEqual(calls[0]["resume"], request["resume"])
+        self.assertNotIn("resume_from", calls[0])
+        self.assertNotIn("seed_dir", calls[0])
         self.assertEqual(calls[0]["package"], Path(parent["prepared_dir"]))
         self.assertEqual({event["stage"] for event in inherited}, {"freeze", "discover"})
 

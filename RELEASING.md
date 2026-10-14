@@ -1,69 +1,54 @@
-# Release procedure
+# 工具发布
 
-A release contains one complete operator workflow, its specifications and
-source-bound distributions. Native robot and CAD history stays in the private
-model repository. Retain local acceptance evidence; GitHub CI runs the
-deterministic checks on every pull request and does not replace accepted local
-evidence.
+发行物交付一套完整的操作流程、规范和可核验工具。发布资格绑定最终源码提交、双端安装身份、支持矩阵及验收证据；版本号或 CI 通过本身不建立原生资格。
 
-## Acceptance
+## 构建身份
 
-1. Run the regression suite and static checks in the
-   [pinned development environment](CONTRIBUTING.md). Test semantic mutations
-   after resealing evidence, as well as malformed inputs and digest changes.
-2. Capture the neutral moving-joint analytic fixture on licensed Windows
-   SolidWorks. Verify native discovery, occurrence transforms, shaft identity,
-   off-diagonal inertia and full assembly closure. Retain the native API/build
-   and independent verification report. Include repeated part occurrences with
-   distinct saved configurations and a nested rigid assembly to verify context,
-   geometry and mass coverage.
-3. Verify capture transfer rejects missing, extra, changed and foreign-run files.
-   Confirm native capture works without MuJoCo installed, and Linux refuses
-   publication when consumer verification fails.
-   Build twice from one clean committed checkout. Compare distribution hashes
-   and verify installation outside that checkout on Linux and Windows.
-4. Accept the deployed workflow: HTTPS login → native folder → Airflow run →
-   detailed checks → actual verified URDF and joint limits → review PR.
-   Exercise retry, changed input, quality failure, service restart and
-   publication failure under the [deployment criteria](docs/deployment.md#acceptance).
-5. Review code, command help, schemas and all documentation together. Keep
-   `main` the smallest complete current system. Remove intermediate workflows,
-   compatibility paths, duplicate entry points and transitional instructions.
-   Regenerate contract-derived tables from `contract_markdown()` and confirm the
-   six-stage contract still matches the code before merging.
-6. Merge the reviewed result into public `main`, create the release tag as
-   `v<package version>` from the distribution's `__version__` and publish
-   distributions, their SHA-256 manifest and acceptance
-   evidence. Never reuse or rewrite a published tag or asset. Verify the remote
-   commit, tag, downloaded bytes and installed identity.
+从干净、已提交 checkout 构建。构建器显式从该 checkout 加载版本和构建逻辑，校验实际导入来源，使用锁定构建依赖与规范归档；ambient 安装不能影响输入。
 
-All steps are required. Mocks do not qualify native behavior, and a passing
-neutral fixture does not qualify a hardware model. Each model needs reviewed
-inputs and evidence for its intended use.
-
-## Distribution
-
-Activate the environment in [CONTRIBUTING.md](CONTRIBUTING.md), then build
-into two empty directories outside the clean checkout:
+在[开发环境](CONTRIBUTING.md)中构建到两个新的外部目录：
 
 ```sh
-python tools/build_release.py --output /path/to/release-a --offline
-python tools/build_release.py --output /path/to/release-b --offline
-diff /path/to/release-a/SHA256SUMS.json /path/to/release-b/SHA256SUMS.json
+python tools/build_release.py --output /path/to/release-a
+python tools/build_release.py --output /path/to/release-b
+diff /path/to/release-a/release.json /path/to/release-b/release.json
 ```
 
-Verify the resulting wheel with its complete passing native delivery. Replace
-`<version>` with the version embedded in that wheel:
+归档成员按相对 UTF-8 路径排序，固定权限、UID/GID 和空用户名，移除绝对路径及本机元数据；ZIP 使用固定 1980 epoch，tar/gzip 使用 epoch 0，压缩算法和版本锁定。模型与发行 JSON 使用[统一规范序列化](docs/contracts.md#delivery)。不同路径、时间和 ambient 安装下的独立构建必须得到相同字节，核对清单及每项资产摘要。
 
-```sh
-python tools/verify_distribution.py /path/to/release-a/mimicverse_description-<version>-py3-none-any.whl --runtime-lock requirements/linux-py312.lock --bundle /path/to/native-passing-delivery --report /path/to/installed-linux.json
-```
+`release.json` 是唯一且必需的发行清单，包含源码 commit、源码/包文件摘要、版本、实际 schema 定义/阶段/策略摘要、完整支持矩阵及各资产摘要。schema 摘要覆盖结构与字段规则。支持矩阵明确两端操作系统、架构、CPython、角色依赖及原生 API 前提。
 
-The builder binds the source commit and package files, normalizes distribution
-metadata, and emits the wheel, source, deployment and Linux/Windows offline
-runtime archives. Each offline archive contains exact runtime wheels and a
-hash-locked installation file. Installed code checks its embedded inventory.
-Exercise both runtime archives and deploy the same tool identity on both hosts.
+每次构建交付同一完整集合：wheel、源码、部署档案、Linux 离线运行档案与最小 Windows 离线运行档案。校验入口要求清单和全部资产存在，核对部署成员、角色工具与依赖锁来自同一源码发行；缺项或重新封存后来源不一致均拒绝。
 
-Published tags and assets are immutable. A changed implementation uses a new
-version; release status comes from retained acceptance evidence.
+运行档案只包含对应角色的全部精确依赖及 hash-locked 安装文件。Linux 支持生成、独立验证和平台；Windows 只支持原生执行及必要传输/资源管理。两端安装同一源码发行身份，原生资格记录精确 Windows、SolidWorks 版本/build 与 API 环境。
+
+## 必需验收
+
+| 门 | 最终候选上的要求 |
+|---|---|
+| 静态与回归 | [开发门](CONTRIBUTING.md#verification)全部通过，必需运行时无遗漏；领域、schema、帮助和文档一致 |
+| 发行完整性 | 两次构建字节一致；完整清单、包文件和工具身份相符；在 checkout 之外隔离安装并核对期望 commit/版本 |
+| 原生声明模式 | 真实 SolidWorks 保存声明，覆盖持久组件身份、基准/轴、作者限位与声明独立重解码 |
+| 原生配合模式 | 原生证据确证无声明，覆盖刚性与单自由度推导；未知/损坏声明不能回退 |
+| 连接与运动 | 两模式均从当前原生端点独立重建，覆盖适用非零逐叶运动、刚性/柔性及接口连续性；静态仍绿的错误拓扑须被拒绝 |
+| 物理与几何 | 中性 moving-joint 解析解夹具，覆盖非对角惯量、旋转、整机闭包、重复实例不同配置、嵌套刚性组及原生网格 |
+| 资源安全 | 所有启动/取消/退出/恢复路径拒绝未知 CAD，只操作自有会话；同句柄身份复核和并发账本成立 |
+| 交换与恢复 | 缺失、多余、篡改及跨运行文件拒绝；重复提交、断连、崩溃、重启与终态封存正确 |
+| 消费者与发布 | 实际 URDF/MuJoCo 验证，失败不发布；Git blobs 与报告一致，远端基线冲突和部分外部结果可安全恢复 |
+| 部署 | 真实 HTTPS/飞书、原生文件夹、六阶段、检查、预览和 PR；双端身份一致，重跑和升级/回滚符合部署契约 |
+
+验收矩阵逐项绑定中性夹具、断言、模式、原生记录和独立结果：声明模式覆盖有效、损坏/不可读、几何/限位冲突与未知存在性；配合模式覆盖确证无声明、六自由度刚性约束、单自由度及不支持拓扑；资格路径覆盖未分配、材料缺失、有效覆盖/实例差异、零范围/驱动、曲面无 facets，以及可选预算存在/缺失。原生资源覆盖活属主、未知会话、PID 重用、阻塞取消和封存边界崩溃；发布覆盖基线竞态、Git 字节变化和部分外部结果。
+
+每种机械解释都须有本候选上的真实原生证据，不能由另一种解释代替。[机械一致性场景](CONTRIBUTING.md#mechanical-regression)逐项绑定适用模式、独立预期、结果与证据层级；合成回归通过不能代替实际原生见证。原生测试只使用专用闲置 CAD 资源，未知或工程师会话存在时拒绝。mock 不能建立 COM、保存行为或原生数值资格。
+
+中性夹具验收工具能力，硬件工程另行验收。具体产品验收只在私有资料上执行，不能将产品路径、实验代号或临时运行记录写入公开操作规范。
+
+验收报告引用期望源码、实际安装身份、原件/证据摘要、检查策略、模式及通过结果。失败证据保留；代码、锁、资产或支持矩阵变化后，受影响验收须重新完成。
+
+## 发行与部署
+
+规范和实现评审通过后，将同一结果合入 `main`。从该提交构建最终发行并验收；源码 tag 为 `v<package version>`，tag、发行清单与全部资产必须指向同一提交。已发布 tag 和资产不可重写。
+
+发布 wheel、源码、部署与角色运行档案、`release.json` 和可公开验收摘要。下载远端资产后再次核对字节、源码身份及隔离安装结果；公开摘要不包含原生产品资料或秘密。
+
+候选部署与晋升使用[统一部署生命周期](docs/deployment.md#lifecycle)，保持上一发行可恢复。双端身份不一致、验收未完成或状态未知时准入关闭。发行成功不能代替某个硬件模型的工程批准。

@@ -23,10 +23,14 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from description_pipeline.io import digest, file_digest, write_json
-from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
+from description_pipeline import interface_records as ir
+from description_pipeline.io import digest, file_digest, read_data, write_json
+from description_pipeline.orchestration import windows as windows_module
+from description_pipeline.orchestration.windows import Jobs, RequestError, handler, provision_install_id, read_config
+from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.sources.solidworks.selection import SelectionError
 from tests.sources.selection_support import closure_evidence
+from tests.v1.test_interface_records import install_record, release as release_identity
 
 MAIN = "assembly.SLDASM"
 FRAME = "parts/frame.SLDASM"
@@ -122,6 +126,7 @@ class SelectionEndpointTests(unittest.TestCase):
                 "targets": {"arm": {"repository_slug": "a/b", "base": "feature/arm"}},
             },
         )
+        self.config_path = config_path
         self.config = read_config(config_path)
         identity = patch(
             "description_pipeline.orchestration.windows._native_tool_record",
@@ -521,6 +526,115 @@ class SelectionEndpointTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
 
+    def test_the_install_id_is_written_once_and_survives_restarts(self) -> None:
+        first = provision_install_id(self.root / "state")
+        self.assertTrue(first.startswith("win-"))
+        self.assertEqual(provision_install_id(self.root / "state"), first)
+
+    def test_the_documented_minimal_config_needs_no_targets(self) -> None:
+        minimal = self.root / "minimal-endpoint.json"
+        write_json(
+            minimal,
+            {
+                "schema_version": "solidworks-to-urdf.endpoint/v1",
+                "package_root": str(self.packages),
+                "output_root": str(self.root / "outputs"),
+                "state_root": str(self.root / "state"),
+                "token_file": str(self.root / "token"),
+            },
+        )
+        config = read_config(minimal)
+        self.assertEqual(config["targets"], {})
+        self.assertEqual(config["config_digest"], digest(read_data(minimal)))
+
+    def test_the_health_producer_satisfies_the_real_consumer(self) -> None:
+        triple = release_identity()
+        installed = {
+            "schema_version": TOOL_SCHEMA,
+            "pipeline_id": "solidworks-to-urdf",
+            "version": triple["version"],
+            "source_sha256": triple["source_sha256"],
+            "release": {
+                "schema_version": "solidworks-to-urdf.release/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                **triple,
+            },
+        }
+        token = self.jobs.config["token"]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.jobs, token))
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        from description_pipeline.sources.solidworks import isolation
+
+        quiet = {
+            "owned_sessions": 0,
+            "lease_held": False,
+            "external_session_detected": False,
+            "problems": [],
+        }
+        # Real normal-OS observation doubles: win32 platform, quiet CAD facts
+        # and a passing native readiness probe.
+        with (
+            patch.object(windows_module, "tool_record", return_value=installed),
+            patch("sys.platform", "win32"),
+            patch("description_pipeline.runtime.native_readiness", return_value={"role": "native"}),
+            patch.object(isolation, "registered_executable", return_value="C:/SW/SLDWORKS.exe"),
+            patch.object(isolation, "cad_session_facts", return_value=quiet),
+        ):
+            status, body = self.http_call(base, "GET", "/health", headers={"Authorization": "Bearer " + token})
+        self.assertEqual(status, 200, body)
+        validated = ir.validate_health(body)  # the real consumer accepts the real producer document
+        self.assertEqual(set(body), set(ir.HEALTH_KEYS))
+        self.assertNotIn("targets", body)
+        self.assertTrue(validated["ready"], body)
+        self.assertEqual(body["release"]["role"], "native")
+        self.assertEqual(body["install"]["config_digest"], digest(read_data(self.config_path)))
+        self.assertEqual(body["install"]["install_id"], self.jobs.install_id)
+        self.assertEqual(body["endpoint"]["port"], self.jobs.config["port"])
+        record = install_record()
+        record["ends"]["windows"]["install_id"] = body["install"]["install_id"]
+        record["ends"]["windows"]["config_digest"] = body["install"]["config_digest"]
+        ir.require_endpoint_matches_install_record(body, record)
+        zeroed = {**body, "install": {**body["install"], "config_digest": "0" * 64}}
+        with self.assertRaises(ir.InterfaceRecordError):
+            ir.require_endpoint_matches_install_record(zeroed, record)
+        # The owner gate refuses a readable-but-not-ready document; the ready
+        # gate itself is never weakened for the unsupported platform.
+        with patch.object(windows_module, "tool_record", return_value=installed):
+            unready = windows_module.health_payload(self.jobs)
+        self.assertFalse(unready["ready"])
+        with self.assertRaises(ir.InterfaceRecordError) as raised:
+            ir.require_endpoint_matches_install_record(unready, record)
+        self.assertEqual(raised.exception.code, "endpoint_not_ready")
+
+    def test_a_queue_without_its_thread_is_never_ready(self) -> None:
+        triple = release_identity()
+        installed = {
+            "schema_version": TOOL_SCHEMA,
+            "pipeline_id": "solidworks-to-urdf",
+            "version": triple["version"],
+            "source_sha256": triple["source_sha256"],
+            "release": {
+                "schema_version": "solidworks-to-urdf.release/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                **triple,
+            },
+        }
+
+        class _DeadThread:
+            def is_alive(self):
+                return False
+
+        with (
+            patch.object(windows_module, "tool_record", return_value=installed),
+            patch.object(self.jobs, "thread", _DeadThread()),
+        ):
+            payload = windows_module.health_payload(self.jobs)
+        self.assertIn("queue_thread_unavailable", payload["readiness"]["native"]["problems"])
+        self.assertFalse(payload["ready"])
+
     def test_default_selection_reader_shares_the_endpoint_cad_ledger(self) -> None:
         jobs = self.jobs
         probe = {"native_tool": {"source_sha256": "0" * 64}}
@@ -545,8 +659,9 @@ class SelectionEndpointTests(unittest.TestCase):
         json_headers = {**auth, "Content-Type": "application/json"}
 
         status, body = self.http_call(base, "GET", "/health", headers=auth)
-        self.assertEqual(status, 200)
-        self.assertTrue(body["ready"])
+        # Dev trees carry no installed release identity: the stable 500 code.
+        self.assertEqual(status, 500, body)
+        self.assertEqual(body["error_code"], "health_identity_unavailable")
 
         anonymous = json.dumps(self.request(str(uuid.uuid4()))).encode()
         status, _body = self.http_call(base, "POST", "/v1/jobs", anonymous, {"Content-Type": "application/json"})

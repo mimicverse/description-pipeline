@@ -19,9 +19,9 @@ from .. import solidworks
 from ..io import PipelineError, digest, file_digest, read_data
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..sources.solidworks.selection import validate_file_index, verify_selection
-from ..stages import STAGE_IDS
+from ..stages import DELIVERY_STAGES, STAGE_IDS
 from .airflow_client import capture_archive_metadata, validate_run_id
-from .linux_store import PORTABLE_STAGES, LinuxStore
+from .linux_store import LinuxStore
 from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, MAX_MANIFEST_BYTES, verify_transfer
 
 
@@ -108,8 +108,16 @@ def run_portable_stage(
 ) -> dict:
     """Run one portable stage to its boundary and record the receipt in the store."""
     run_id = validate_run_id(run_id)
-    if stage not in PORTABLE_STAGES:
-        raise PipelineError(f"stage must be one of {PORTABLE_STAGES}: {stage!r}")
+    if stage not in DELIVERY_STAGES:
+        raise PipelineError(f"stage must be one of {DELIVERY_STAGES}: {stage!r}")
+    registered = store.confirmed_stage_checkpoint(run_id, stage)
+    if registered is not None:
+        # A registered checkpoint is reused only after the store rebound its
+        # sealed artifacts; the same environment gates as a normal run apply.
+        capture_owner = store.checkpoint_owner(run_id, "capture")
+        _revalidate_capture(store, capture_owner)
+        _portable_identity_gate(store, capture_owner)
+        return registered
     owner = validate_run_id(source_run_id or parent_run) if source_run_id or parent_run else run_id
     outputs = {
         "generate": store.stage_dir(run_id, "generate"),
@@ -158,28 +166,32 @@ def run_portable_stage(
             if stage == "publish" and repository is None:
                 raise PipelineError("publish requires the configured model repository checkout")
             capture_owner = store.checkpoint_owner(run_id, "capture")
-            capture = store.capture_dir(capture_owner)
             _revalidate_capture(store, capture_owner)
             _portable_identity_gate(store, capture_owner)
             seed_stage = {"generate": "capture", "verify": "generate", "publish": "verify"}[stage]
             seed = store.checkpoint_dir(run_id, seed_stage)
             if owner != run_id and boundary == stage:
                 _seed_reuse(store, run_id, owner, stage)
-            receipt = solidworks.run(
-                capture,
-                outputs[stage],
-                repository=Path(repository) if stage == "publish" else None,
-                base=base,
-                run_id=run_id,
-                resume_from=stage,
-                stop_after=stage,
-                seed_dir=seed,
-                expected_subject=expected_subject,
-                handoff_sha256=meta.get("handoff_sha256"),
-                prior_events=store.events(run_id),
-                resume=resume,
-                on_event=sink,
-            )
+            common = {
+                "run_id": run_id,
+                "prior_events": store.events(run_id),
+                "resume": resume,
+                "handoff_sha256": meta.get("handoff_sha256"),
+                "on_event": sink,
+            }
+            if stage == "generate":
+                receipt = solidworks.generate(seed, outputs[stage], **common)
+            elif stage == "verify":
+                receipt = solidworks.verify(seed, outputs[stage], expected_subject=expected_subject, **common)
+            else:
+                receipt = solidworks.publish(
+                    seed,
+                    outputs[stage],
+                    expected_subject=expected_subject,
+                    repository=Path(repository),
+                    base=base,
+                    **common,
+                )
         except Exception as error:
             store.record_stage(run_id, stage, _failure_receipt(store, run_id, stage, error))
             raise
@@ -249,11 +261,11 @@ def _capture_selection(job: dict, run_id: str, native_tool: dict) -> dict:
 def _check_selected_capture(store: LinuxStore, run_id: str, selection: dict) -> None:
     """Require the archived native files to be the selected bytes."""
     capture = store.capture_dir(run_id)
-    record = read_data(capture / "input/discovery/native-discovery.json")
+    record = read_data(capture / "evidence/discovery.json")
     if record.get("native_files") != selection["files"]:
         raise PipelineError("The capture native inventory differs from the sealed selection")
     for name, checksum in selection["files"].items():
-        if file_digest(capture / "input" / name) != checksum:
+        if file_digest(capture / "input/cad" / name) != checksum:
             raise PipelineError(f"The captured source differs from the selected bytes: {name}")
 
 
@@ -322,12 +334,14 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     slug = job.get("repository_slug")
     base = job.get("repository_base")
     hardware = revision = None
-    revision_path = store.capture_dir(run_id) / "input/cad-revision.json"
-    if revision_path.is_file():
-        payload = read_data(revision_path)
+    source_path = store.capture_dir(run_id) / "input/source.json"
+    if source_path.is_file():
+        payload = read_data(source_path)
         if isinstance(payload, dict):
-            hardware = payload.get("hardware_id")
-            revision = payload.get("revision")
+            identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            hardware = identity.get("hardware_id")
+            revision = metadata.get("revision")
     store.update_meta(
         run_id,
         repository_slug=slug,

@@ -5,5 +5,5 @@ recursive-include docs *.md
 recursive-include requirements *.lock
 recursive-include tools *.py
 recursive-include tests *.py *.json *.stl
-recursive-include deploy *.py *.sh *.txt *.lock *.source *.template *.service *.example
+recursive-include deploy *.py *.sh *.ps1 *.sql *.txt *.lock *.source *.template *.service *.example *.json .gitignore
 global-exclude *.pyc

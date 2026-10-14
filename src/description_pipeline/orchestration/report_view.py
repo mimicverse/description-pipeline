@@ -100,8 +100,6 @@ _DIAGNOSTIC_CODE_LABELS_ZH = {
 #: Chinese descriptions for the contract's declared input/output records (by path string).
 _FILE_PATH_LABELS_ZH = {
     "handoff/": "已保存的 SolidWorks 工程文件夹",
-    "input/discovery/": "原生观察与发现记录",
-    "input/robot.yaml + input/cad-revision.json": "派生定义与结构修订",
     "input/": "准备后的输入定义与保存的 CAD",
     "evidence/": "采集的 CAD 证据、原始测量与清单",
     "model/robot.json": "规范化模型",

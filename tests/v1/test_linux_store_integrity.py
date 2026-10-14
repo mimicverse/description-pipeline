@@ -103,7 +103,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         drifted = portable_twin(self.tool, source_sha256="0" * 64)
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "verify", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "verify", expected_subject="a" * 64)
@@ -112,7 +112,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         drifted = portable_twin(self.tool, source_sha256="0" * 64)
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -125,7 +125,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         (self.store.capture_dir(RUN) / "input/robot.yaml").write_text('{"hardware_id": "tampered"}\n', encoding="utf-8")
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -137,7 +137,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=PipelineError("boom")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=PipelineError("boom")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -158,7 +158,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         }
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", return_value=failed),
+            mock.patch.object(linux_runner.solidworks, "generate", return_value=failed),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
         meta = self.store.meta(RUN) or {}
@@ -242,17 +242,14 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
 
     def test_fetch_refuses_a_resealed_capture_with_another_native_inventory(self) -> None:
         source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
-        record_path = source / "input/discovery/native-discovery.json"
+        record_path = source / "evidence/discovery.json"
         record = json.loads(record_path.read_text())
         record["native_files"]["stray.SLDPRT"] = "0" * 64
         write_json(record_path, record)
-        report_path = source / "reports/input.json"
-        report = json.loads(report_path.read_text())
-        report["package_files"]["discovery/native-discovery.json"] = file_digest(record_path)
-        report["input_receipt"]["inventory"] = [
-            {"path": name, "sha256": checksum} for name, checksum in sorted(report["package_files"].items())
-        ]
-        write_json(report_path, report)
+        manifest_path = source / "evidence" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"]["discovery.json"] = file_digest(record_path)
+        write_json(manifest_path, manifest)
         archive = self.tmp / "foreign-inventory.zip"
         seal_capture(
             source,
@@ -285,7 +282,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         with (
             solidworks.output_lock(self.store.run_dir(RUN)),
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -376,24 +373,25 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         """Bind the entire admitted digest map even when the replacement manifest is internally consistent."""
 
         capture = self.store.capture_dir(RUN)
-        report_path = capture / "reports/input.json"
-        target = capture / "input/robot.yaml"
-        tampered = b'{"hardware_id": "tampered"}\n'
+        report_path = capture / "input/handoff.json"
+        target = capture / "input/cad" / MAIN_ASSEMBLY
+        tampered = b"CAD-TAMPERED-AFTER-ADMISSION\n"
         target.write_bytes(tampered)
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        report["package_files"]["robot.yaml"] = hashlib.sha256(tampered).hexdigest()
+        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
+        report["package_files"]["cad/" + MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
         write_json(report_path, report)
         manifest_path = capture / CAPTURE_MANIFEST
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["files"]["input/robot.yaml"] = hashlib.sha256(tampered).hexdigest()
-        manifest["files"]["reports/input.json"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        manifest["files"]["input/cad/" + MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
+        manifest["files"]["input/handoff.json"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
         manifest["file_count"] = len(manifest["files"])
         manifest["total_bytes"] = sum((capture / name).stat().st_size for name in manifest["files"])
         manifest_path.write_bytes(canonical(manifest))
 
         with (
             mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "run", side_effect=AssertionError("must not run")),
+            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
             self.assertRaises(PipelineError),
         ):
             linux_runner.run_portable_stage(self.store, RUN, "generate")
@@ -406,6 +404,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         for name in ("model", "meshes", "urdf"):
             (verify / name).mkdir(exist_ok=True)
         (verify / "reports/tool.json").write_text("{}\n", encoding="utf-8")
+        (verify / "tool.json").write_text("{}\n", encoding="utf-8")
         (verify / "README.md").write_text("fixture\n", encoding="utf-8")
         (verify / "urdf/robot.urdf").write_text('<robot name="probe"/>\n', encoding="utf-8")
         return verify
@@ -429,10 +428,11 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         write_json(quality, {"passed": True, "subject_sha256": subject_digest(delivery)})
         with (
             mock.patch.object(store_module, "check_bundle", side_effect=check_bundle),
+            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
             mock.patch.object(
                 store_module,
                 "require_qualified_report",
-                side_effect=lambda report: report,
+                side_effect=lambda report, definition, root=None: report,
             ),
         ):
             first = self.store.preview(RUN)
@@ -453,6 +453,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         report = {"passed": True, "subject_sha256": subject_digest(delivery)}
         with (
             mock.patch.object(store_module, "check_bundle", return_value=report),
+            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
             mock.patch.object(store_module, "require_qualified_report", return_value=report),
         ):
             preview = self.store.preview(RUN)

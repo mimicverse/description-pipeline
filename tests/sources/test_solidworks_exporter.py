@@ -18,7 +18,6 @@ from description_pipeline.sources.solidworks.discovery import (
     _exporter_joint_facts,
     _exporter_memberships,
     _exporter_native_pairs,
-    _robot_document,
     prepare_native_package,
 )
 from description_pipeline.sources.solidworks.exporter import (
@@ -673,15 +672,13 @@ class ExporterDiscoveryTests(unittest.TestCase):
             prepared = Path(directory) / "prepared"
             result = prepare_native_package(source, prepared, "wire-run", backend=FakeBackend(raw))
             self.assertTrue(result.passed, result.findings)
-            self.assertEqual(result.revision_sha256, "")
             self.assertFalse((prepared / "cad-revision.json").exists())
-            self.assertTrue((prepared / "robot.yaml").is_file())
+            self.assertFalse((prepared / "robot.yaml").exists())
             payload = json.loads(result.discovery_path.read_text())
-            self.assertEqual(result.source["hardware_id"], "wire_test")
+            record = json.loads((prepared / "source.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["identity"]["hardware_id"], "wire_test")
         self.assertEqual(payload["identity"]["delivery_configuration"], "Default")
         self.assertEqual(payload["raw"]["identity"].get("delivery_configuration"), None)
-        self.assertEqual(payload["derived"]["joints"][0]["limits"]["upper"], 0.0)
-        self.assertEqual(payload["derived"]["bodies"][0]["frame"], {"coordinate_system": "c_arm"})
         self.assertEqual(payload["raw"]["exporter"]["raw_xml"], raw["exporter"]["raw_xml"])
         self.assertNotIn("discovery.joint_name_missing", {item["code"] for item in result.findings})
         budget = next(item for item in result.findings if item["code"] == "discovery.design_budget_unspecified")
@@ -702,37 +699,26 @@ class ExporterDiscoveryTests(unittest.TestCase):
         raw["exporter"].update(raw_xml=xml, raw_xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
         bodies, joints, findings = self.derive(raw)
         self.assertFalse(findings)
-        identity = {**raw["identity"], "delivery_configuration": raw["saved_configuration"]}
-        document = _robot_document(identity, bodies, joints, raw, None, [], None, [], "wire-run", "a" * 64, "b" * 64)
-        self.assertEqual(document["source"]["joints"][0]["limits"], limits)
-        self.assertEqual(document["source"]["joints"][0]["axis"], [0.0, 0.0, 1.0])
-        # One clear schema shape: a legitimate no-interface-frame delivery binds as [].
-        self.assertEqual(document["source"]["frames"], [])
-        self.assertEqual(document["source"]["joints"][0]["axis_reference"]["kind"], "reference_axis")
-        self.assertEqual(document["source"]["material_source"], "cad")
-        self.assertNotIn("old/manual.stl", str(document))
+        self.assertEqual(joints[0]["limits"], limits)
+        self.assertEqual(joints[0]["axis"]["direction"], [0.0, 0.0, 1.0])
+        # One clear schema shape: a delivery without interface datums has no interface frames.
+        self.assertEqual(
+            [datum["name"] for datum in raw["datums"] if str(datum.get("name", "")).startswith(("TCP_", "SCS_"))],
+            [],
+        )
+        self.assertEqual(joints[0]["axis_reference"]["kind"], "reference_axis")
+        self.assertNotIn("old/manual.stl", str((bodies, joints)))
 
     def test_authored_axis_is_emitted_exactly_instead_of_the_reprojected_native_line(self):
         raw = raw_record()
         raw["reference_axes"][0]["axis_direction"] = [1e-9, 0.0, 1.0]
         raw["reference_axes"][0]["raw_endpoints_m"] = [0, 0, 0, 1e-9, 0, 1]
-        bodies, joints, findings = self.derive(raw)
+        _bodies, joints, findings = self.derive(raw)
         self.assertFalse([item for item in findings if item["blocking"]])
         self.assertEqual(joints[0]["declared_axis"], [0.0, 0.0, 1.0])
-        identity = {**raw["identity"], "delivery_configuration": raw["saved_configuration"]}
-        document = _robot_document(identity, bodies, joints, raw, None, [], None, [], "wire-run", "a" * 64, "b" * 64)
-        # The independent declaration check compares exactly, so the source
-        # claim is the authored vector, not the reprojected native line.
-        self.assertEqual(document["source"]["joints"][0]["axis"], [0.0, 0.0, 1.0])
-        self.assertEqual(document["source"]["joints"][0]["axis_reference"], joints[0]["axis_reference"])
-        self.assertEqual(
-            document["source"]["joints"][0]["limit_evidence"],
-            {
-                "file": "discovery/native-discovery.json",
-                "sha256": "a" * 64,
-                "anchor": raw["exporter"]["raw_xml_sha256"],
-            },
-        )
+        # The independent declaration check compares exactly, so the emitted
+        # direction is the authored vector, not the reprojected native line.
+        self.assertEqual(joints[0]["axis"]["direction"], [0.0, 0.0, 1.0])
 
 
 if __name__ == "__main__":

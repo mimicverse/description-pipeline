@@ -58,7 +58,7 @@ class ActivityObjectTests(unittest.TestCase):
         self.assertIsNone(obj(".."))
         self.assertIsNone(obj("../escape"))
         self.assertIsNone(obj("upper/../../etc"))
-        self.assertEqual(obj(r"C:\Users\33985\AppData\Local\Temp\IC~~\part.step.SLDPRT"), "part.step.SLDPRT")
+        self.assertEqual(obj(r"C:\Users\operator\AppData\Local\Temp\IC~~\part.step.SLDPRT"), "part.step.SLDPRT")
         self.assertEqual(obj("/var/tmp/secret/part.step.SLDPRT"), "part.step.SLDPRT")
         self.assertEqual(obj("sub dir/child-1"), "sub dir/child-1")
         long_name = "a" * 200

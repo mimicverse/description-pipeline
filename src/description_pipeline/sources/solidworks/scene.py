@@ -19,14 +19,12 @@ from .jsonio import read_json
 from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 SCENE_SCHEMA = "solidworks-to-urdf.scene/v1"
-#: Sealed derivations may still carry the retired id; reads accept both (XC-01).
-LEGACY_SCENE_SCHEMAS = ("description.scene/v1",)
 
 
 def scene_schema_supported(value: object) -> bool:
-    """Whether a scene declares the current or a retained schema id."""
+    """Whether a scene declares the one current schema id."""
 
-    return value in {SCENE_SCHEMA, *LEGACY_SCENE_SCHEMAS}
+    return value == SCENE_SCHEMA
 
 
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
@@ -722,11 +720,6 @@ def build_scene(
         "links": links,
         "joints": joint_entries,
         "frames": frames,
-        "actuators": list(cfg.get("actuators") or []),
-        "sensors": list(cfg.get("sensors") or []),
-        "constraints": list(cfg.get("constraints") or []),
-        "control": dict(cfg.get("control") or {}),
-        "contact_excludes": list(cfg.get("contact_excludes") or []),
         "provenance": scene_provenance,
     }
 

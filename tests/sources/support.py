@@ -140,19 +140,16 @@ def compose_fixture_link_reads(
         rows = [list(transform[index : index + 3]) for index in (0, 4, 8)]
         translation = [transform[3], transform[7], transform[11]]
         return [
-            sum(rows[row][column] * float(com[column]) for column in range(3)) + translation[row]
-            for row in range(3)
+            sum(rows[row][column] * float(com[column]) for column in range(3)) + translation[row] for row in range(3)
         ]
 
     def rotated(transform: Sequence[float], inertia: Sequence[Sequence[float]]) -> list[list[float]]:
         rows = [list(transform[index : index + 3]) for index in (0, 4, 8)]
         rotated_rows = [
-            [sum(rows[row][k] * float(inertia[k][column]) for k in range(3)) for column in range(3)]
-            for row in range(3)
+            [sum(rows[row][k] * float(inertia[k][column]) for k in range(3)) for column in range(3)] for row in range(3)
         ]
         return [
-            [sum(rotated_rows[row][k] * rows[column][k] for k in range(3)) for column in range(3)]
-            for row in range(3)
+            [sum(rotated_rows[row][k] * rows[column][k] for k in range(3)) for column in range(3)] for row in range(3)
         ]
 
     def entry_for(name: str, payload: dict[str, Any], transform: Sequence[float]) -> dict[str, Any]:
@@ -565,9 +562,7 @@ class FixtureCadBackend(CadBackend):
         if order is None:
             order = self.order = []
         order.append("link_group_read")
-        links = compose_fixture_link_reads(
-            self.components, getattr(self, "effective_readings", None) or {}, selections
-        )
+        links = compose_fixture_link_reads(self.components, getattr(self, "effective_readings", None) or {}, selections)
         override = getattr(self, "link_group_selection_override", None) or {}
         for body, names in override.items():
             if str(body) in links:
@@ -728,9 +723,7 @@ def write_link_group_mass_record_from_recombination(bundle: Path, source: dict) 
             "volume_m3": None,
             "density_kg_m3": None,
             "com_m": [float(value) for value in world["com"]],
-            "inertia_tensor_about_com": [
-                [float(value) for value in row] for row in world["inertia"]
-            ],
+            "inertia_tensor_about_com": [[float(value) for value in row] for row in world["inertia"]],
             "inertia_values_about_origin_api": {"error": "fixture"},
             "overrides": {
                 "OverrideMass": False,
@@ -758,3 +751,241 @@ def read_scene(snapshot: Path) -> dict:
     from description_pipeline.sources.snapshot import load_scene
 
     return load_scene(Path(snapshot))
+
+
+# ---------------------------------------------------------------------------
+# Target-tree fixtures (IF-13): delivery roots with capture blocks and a bound
+# manifest.  Shared by the migrated verification tests; block writes re-seal the
+# manifest so semantic checks - not byte rebinding - are what the tests exercise.
+# ---------------------------------------------------------------------------
+
+CONTRACT_SCHEMA_VERSION = "solidworks-to-urdf.stage-contract/v1"
+
+
+def default_source_record(
+    *,
+    hardware_id: str = "m3.0",
+    configuration: str = "Default",
+    main_assembly: str = "M3.0.SLDASM",
+    revision: str | None = "r1",
+) -> dict:
+    from description_pipeline.io import digest as canonical_digest
+    from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+
+    identity = {
+        "kind": "source-revision",
+        "handoff_digest": canonical_digest({"fixture": main_assembly}),
+        "main_assembly": main_assembly,
+        "configuration": configuration,
+        "hardware_id": hardware_id,
+        "records": [],
+    }
+    return {
+        "schema_version": SOURCE_RECORD_SCHEMA,
+        "source_revision_id": canonical_digest(identity),
+        "identity": identity,
+        "selection": {
+            "main_assembly": main_assembly,
+            "configuration": configuration,
+            "hardware_id": hardware_id,
+            "hardware_source": "cad",
+        },
+        "metadata": {
+            "revision": revision,
+            "owner": "fixture",
+            "control": {"system": "handoff", "reference": "fixture"},
+            "change_summary": "fixture",
+            "change_summary_source": "submission",
+        },
+    }
+
+
+def seal_delivery(root: Path) -> dict:
+    from description_pipeline.delivery import write_delivery_manifest
+    from description_pipeline.interface_records import check_policy_digest
+    from description_pipeline.schemas import CHECK_POLICY_SCHEMA
+
+    return write_delivery_manifest(
+        Path(root),
+        contract={"schema_version": CONTRACT_SCHEMA_VERSION, "digest": "0" * 64},
+        policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+    )
+
+
+def write_target_delivery(
+    root: Path,
+    *,
+    capture: dict,
+    discovery: dict | None = None,
+    source: dict | None = None,
+    handoff: dict | None = None,
+    runtime: dict | None = None,
+    tool: dict | None = None,
+    originals: dict[str, str] | None = None,
+    records: dict[str, str] | None = None,
+) -> Path:
+    """Create a minimal target-tree delivery holding the given capture blocks."""
+
+    from description_pipeline.io import write_json
+    from description_pipeline.schemas import TOOL_SCHEMA
+
+    root = Path(root)
+    for name in ("input", "input/cad", "input/records", "evidence", "model", "urdf", "meshes", "reports"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    source = source or default_source_record()
+    selection = source["selection"]
+    if handoff is None:
+        handoff = {
+            "package_files": {},
+            "input_receipt": {"inventory": {}},
+            "main_assembly": selection["main_assembly"],
+            "configuration": selection["configuration"],
+        }
+    write_json(root / "input/handoff.json", handoff)
+    write_json(root / "input/source.json", source)
+    for name, text in (originals or {}).items():
+        target = root / "input/cad" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    for name, text in (records or {}).items():
+        target = root / "input/records" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    write_json(root / "evidence/discovery.json", discovery or {})
+    write_json(root / "evidence/capture.json", capture)
+    write_json(root / "evidence/native-runtime.json", runtime or {})
+    write_json(root / "model/robot.json", {})
+    (root / "urdf/robot.urdf").write_text("<robot name='m3.0'/>\n", encoding="utf-8")
+    (root / "meshes/part.stl").write_text("solid\n", encoding="utf-8")
+    write_json(root / "tool.json", tool or {"schema_version": TOOL_SCHEMA})
+    write_json(root / "reports/quality.json", {})
+    seal_delivery(root)
+    return root
+
+
+def capture_file_for(root: Path) -> Path:
+    root = Path(root)
+    return (root.parent if root.name == "evidence" else root) / "evidence/capture.json"
+
+
+def load_capture_block(root: Path, name: str):
+    from description_pipeline.io import read_data
+
+    return read_data(capture_file_for(root))[name]
+
+
+def store_capture_block(root: Path, name: str, value) -> None:
+    """Rewrite one capture block and re-seal the manifest so bytes stay bound."""
+
+    from description_pipeline.io import read_data, write_json
+
+    path = capture_file_for(root)
+    capture = read_data(path)
+    capture[name] = value
+    write_json(path, capture)
+    seal_delivery(path.parent.parent)
+
+
+def delete_capture_block(root: Path, name: str) -> None:
+    """Remove one capture block and re-seal the manifest."""
+
+    from description_pipeline.io import read_data, write_json
+
+    path = capture_file_for(root)
+    capture = read_data(path)
+    capture.pop(name, None)
+    write_json(path, capture)
+    seal_delivery(path.parent.parent)
+
+
+# ---------------------------------------------------------------------------
+# Native discovery fixtures (IF-13): fold a prepared native package into one
+# target-tree delivery.  This is the test-side preview of the producer-side
+# conversion (worker A's a2): the record gains the frozen file inventory and
+# robot carrier, the originals move under ``input/cad`` and the embedded
+# records under ``input/records``.
+# ---------------------------------------------------------------------------
+
+
+def frozen_discovery_payload(
+    record: dict,
+    *,
+    files: dict[str, str],
+) -> dict:
+    """The IF-13 discovery record: the native payload plus the frozen additions.
+
+    ``files`` maps frozen-source-relative native paths to their digests; the
+    record carries them as ``files[]`` plus the canonical
+    ``native_inventory_sha256`` and the top-level ``robot_name`` resolved from
+    the recorded identity (authored name, then its technical label).
+    """
+
+    from description_pipeline.io import digest
+
+    payload = copy.deepcopy(record)
+    rows = [{"path": path, "sha256": checksum} for path, checksum in sorted(files.items())]
+    payload["files"] = rows
+    payload["native_inventory_sha256"] = digest(rows)
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    payload["robot_name"] = identity.get("robot_name") or identity.get("robot_name_technical") or "robot"
+    return payload
+
+
+def native_discovery_delivery(root: Path, prepared: Path, *, record: dict | None = None) -> Path:
+    """Materialize one target-tree delivery from a prepared native package.
+
+    The CAD originals move to ``input/cad`` at their frozen-source-relative
+    paths; the record becomes ``evidence/discovery.json`` (frozen additions
+    applied); the embedded records move under ``input/records`` keeping their
+    recorded ``package_file`` names; ``input/source.json`` carries the archived
+    content identity rebuilt from the recorded identity.  Returns the delivery
+    root.
+    """
+
+    import hashlib
+
+    from description_pipeline.io import read_data
+
+    prepared = Path(prepared)
+    if record is None:
+        record = read_data(prepared / "discovery/native-discovery.json")
+    raw = record.get("raw") or {}
+    raw_files = raw.get("files") if isinstance(raw.get("files"), dict) else {}
+    originals: dict[str, str] = {}
+    files: dict[str, str] = {}
+    for relative in sorted(raw_files):
+        data = (prepared / str(relative)).read_bytes()
+        files[str(relative)] = hashlib.sha256(data).hexdigest()
+        originals[str(relative)] = data.decode("utf-8")
+    records: dict[str, str] = {}
+    references = list(record.get("records") or []) + ([record["budget"]] if record.get("budget") else [])
+    for entry in references:
+        if not isinstance(entry, dict):
+            continue
+        package_file = str(entry.get("package_file") or "")
+        source = prepared / package_file
+        if package_file and source.is_file():
+            records[package_file] = source.read_text(encoding="utf-8")
+    payload = frozen_discovery_payload(record, files=files)
+    source_record = source_record_for_robot(record)
+    return write_target_delivery(
+        root,
+        capture={},
+        discovery=payload,
+        source=source_record,
+        originals=originals,
+        records=records,
+    )
+
+
+def source_record_for_robot(record: dict) -> dict:
+    """The archived input/source.json identity for one prepared native package."""
+
+    identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    revision = identity.get("revision")
+    return default_source_record(
+        hardware_id=str(identity.get("hardware_id") or "fixture"),
+        configuration=str(identity.get("delivery_configuration") or "Default"),
+        main_assembly=str(identity.get("main_assembly") or "robot.SLDASM"),
+        revision=revision if isinstance(revision, str) and revision else None,
+    )

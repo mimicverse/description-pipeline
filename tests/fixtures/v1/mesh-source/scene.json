@@ -1,8 +1,4 @@
 {
-  "actuators": [],
-  "constraints": [],
-  "contact_excludes": [],
-  "control": {},
   "frames": [
     {
       "id": "tool",
@@ -240,6 +236,5 @@
     "note": "hand-written mesh fixture (binary STL), not CAD evidence"
   },
   "schema_version": "solidworks-to-urdf.scene/v1",
-  "sensors": [],
   "units": "SI"
 }
