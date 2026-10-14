@@ -3,8 +3,11 @@
 # nothing here defaults to a personal path, a production task name or a Git credential.
 #   stage   verifies the transferred archive, installs the generation runtime, renders the
 #           generation's own minimal endpoint.json and records its expected config digest
-#   promote stops the old endpoint, switches the task to the generation runtime + config,
-#           starts it and gates on the running endpoint's own IF-09 /health
+#   promote stops the old endpoint (no listener AND no writer residue under the generation or
+#           state root), switches the task to the generation runtime + config, starts it and
+#           settles it for >=180s (task Running + listener PID constant + token-authenticated
+#           /health ready); a start refused by the ownership lock is recorded, waited out for
+#           >=60s and retried exactly once, and a second refusal stops with lock_refused
 #   rollback restores exactly the previous generation directory the caller bounds
 #   health  relays the running endpoint's own /health payload
 # Each invocation prints one JSON object; receipts stay under the instance state root.
@@ -74,15 +77,99 @@ function Health-Probe([string]$configPath, [object]$binding) {
   }
   return $health
 }
+function Get-ListenerProcess([int]$port) {
+  $connection = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if ($connection) { return [int]$connection.OwningProcess }
+  return $null
+}
+function Wait-Settled([string]$configPath, [object]$binding) {
+  # The settle window the deployment contract promises: for at least 180 seconds the task is
+  # Running, the listener PID on the bound port never changes, and the token-authenticated
+  # /health stays ready.  A flapping endpoint can no longer be declared switched inside a
+  # 30-second peek: any sample that breaks one of the three conditions fails the promotion.
+  $config = Read-Json $configPath
+  $token = (Get-Content -LiteralPath $config.token_file -Raw).Trim()
+  # Startup grace: the endpoint may need a moment to bind; the sustained window starts at the
+  # first all-three-healthy sample and then may not break once.
+  $startupDeadline = (Get-Date).AddSeconds(30)
+  $listenerPid = $null
+  while ($true) {
+    $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+    if (-not $taskNow -or [string]$taskNow.State -ne 'Running') {
+      throw ('the settle window observed task state ' + $(if ($taskNow) { [string]$taskNow.State } else { 'missing' }))
+    }
+    $pidNow = Get-ListenerProcess $config.port
+    $ready = $false
+    if ($null -ne $pidNow) {
+      try {
+        $probe = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
+          -Headers @{Authorization=('Bearer ' + $token)} -TimeoutSec 3
+        $ready = ($probe.ready -eq $true) -and ($probe.native_platform -eq $true) -and `
+          $probe.schema_version -eq 'solidworks-to-urdf.health/v1'
+      } catch { $ready = $false }
+    }
+    if ($ready) { $listenerPid = $pidNow; break }
+    if ((Get-Date) -ge $startupDeadline) { throw 'the endpoint did not answer /health within the startup window' }
+    Start-Sleep -Milliseconds 500
+  }
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  $settleDeadline = (Get-Date).AddSeconds(180)
+  while ((Get-Date) -lt $settleDeadline) {
+    $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+    if (-not $taskNow -or [string]$taskNow.State -ne 'Running') {
+      throw ('the settle window observed task state ' + $(if ($taskNow) { [string]$taskNow.State } else { 'missing' }))
+    }
+    $pidNow = Get-ListenerProcess $config.port
+    if ($null -eq $pidNow -or $pidNow -ne $listenerPid) {
+      throw 'the settle window observed the listener PID change or disappear'
+    }
+    try {
+      $probe = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
+        -Headers @{Authorization=('Bearer ' + $token)} -TimeoutSec 3
+    } catch { throw ('the settle window observed /health not ready: ' + $_.Exception.Message) }
+    if (-not $probe.ready -or -not $probe.native_platform -or $probe.schema_version -ne 'solidworks-to-urdf.health/v1') {
+      throw 'the settle window observed /health without the ready IF-09 identity'
+    }
+    Start-Sleep -Seconds 10
+  }
+  $health = Health-Probe $configPath $binding
+  return @{health=$health; settled_seconds=[int][math]::Round($timer.Elapsed.TotalSeconds); listener_pid=$listenerPid}
+}
+function Test-OwnershipLockRefusal([string]$generation, [object]$binding) {
+  # The scheduler does not capture the launcher's stderr, so the documented refusal is proven by
+  # the condition its message describes: the launcher exited without answering /health while the
+  # endpoint ownership lock under the instance state root is held elsewhere.  The probe acquires
+  # the same lock through the staged runtime's own owner function (released on probe exit).
+  $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+  if ($taskNow -and [string]$taskNow.State -eq 'Running') { return $false }
+  $config = Read-Json (Config-Path $generation)
+  $lock = Join-Path ([string]$config.state_root) '.endpoint.lock'
+  if (-not (Test-Path -LiteralPath $lock)) { return $false }
+  & (Runtime-Python $generation) -I -c "import sys;from description_pipeline.io import acquire_process_lock;acquire_process_lock(sys.argv[1])" $lock 2>$null | Out-Null
+  return ($LASTEXITCODE -ne 0)
+}
+function Get-WriterResidue([object]$binding) {
+  # The endpoint's own writers keep their image under the generation or the instance state root;
+  # the sweep loop ends only with no listener AND no such process left (deployment.md settle).
+  $prefixState = ([string]$binding.state_root).TrimEnd('\').ToLower()
+  $prefixGeneration = ([string]$binding.generation).TrimEnd('\').ToLower()
+  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $image = if ($_.ExecutablePath) { ([string]$_.ExecutablePath).ToLower() } else { '' }
+    ($image.StartsWith($prefixState + '\')) -or ($image.StartsWith($prefixGeneration + '\'))
+  }
+}
 function Stop-Endpoint([object]$binding) {
   Stop-ScheduledTask -TaskName $binding.task_name
   $deadline = (Get-Date).AddSeconds(30)
-  while ((Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+  while ($true) {
+    $listening = Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue
+    $residual = @(Get-WriterResidue $binding)
+    if (-not $listening -and $residual.Count -eq 0) { return }
+    if ((Get-Date) -ge $deadline) { break }
     Start-Sleep -Milliseconds 500
   }
-  if (Get-NetTCPConnection -LocalPort $binding.port -State Listen -ErrorAction SilentlyContinue) {
-    Die 'stop_failed' 'the old endpoint is still listening; refusing to switch'
-  }
+  Die 'stop_failed' 'the old endpoint still listens or leaves a writing process under the generation/state root; refusing to switch'
 }
 
 $binding = Read-Json $Binding
@@ -186,24 +273,59 @@ if ($Verb -eq 'promote') {
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
     -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
+  $lockRefusal = $null
+  $retriedAfter = $null
   try {
     Start-ScheduledTask -TaskName $binding.task_name
-    $health = Health-Probe (Config-Path $StageDir) $binding
+    try {
+      $settled = Wait-Settled (Config-Path $StageDir) $binding
+    } catch {
+      if (-not (Test-OwnershipLockRefusal $StageDir $binding)) { throw }
+      # Documented transient refusal (deployment.md settle): record it durably, wait at least
+      # 60 seconds and retry exactly once.
+      $lockRefusal = @{
+        message='Another endpoint owns the state root or its ownership lock is unavailable';
+        at=(Get-Date).ToUniversalTime().ToString('o')}
+      Write-Receipt (Join-Path $promotions 'lock-refusal.json') @{
+        verb='promote'; at=$lockRefusal.at; generation=$StageDir; message=$lockRefusal.message; retry_after_s=60}
+      Start-Sleep -Seconds 60
+      $retriedAfter = 60
+      Start-ScheduledTask -TaskName $binding.task_name
+      try {
+        $settled = Wait-Settled (Config-Path $StageDir) $binding
+      } catch {
+        if (-not (Test-OwnershipLockRefusal $StageDir $binding)) { throw }
+        # A second refusal is stop-and-diagnose, never a third attempt.
+        Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
+        Start-ScheduledTask -TaskName $binding.task_name
+        Write-Receipt (Join-Path $previous 'failed-promotion.json') @{
+          passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
+          lock_refusal=$lockRefusal; retried=@{after_s=$retriedAfter};
+          second_refusal_at=(Get-Date).ToUniversalTime().ToString('o'); message=$_.Exception.Message}
+        Die 'lock_refused' ('the ownership lock was refused twice; stopping for diagnosis: ' + $_.Exception.Message)
+      }
+    }
+    $health = $settled.health
     $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
     if ($health.install.config_digest -ne $candidate.config_digest) {
       throw 'the running endpoint config digest differs from the staged generation configuration'
     }
-    Write-Receipt (Join-Path $promotions 'last-promotion.json') @{
+    $receipt = @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-      previous=$previous; source_launcher=$sourceExecute; source_config=$sourceConfig; health=$health}
+      previous=$previous; source_launcher=$sourceExecute; source_config=$sourceConfig; health=$health;
+      settled_seconds=$settled.settled_seconds; listener_pid=$settled.listener_pid}
+    if ($lockRefusal) { $receipt['lock_refusal']=$lockRefusal; $receipt['retried']=@{after_s=$retriedAfter} }
+    Write-Receipt (Join-Path $promotions 'last-promotion.json') $receipt
     Emit @{passed=$true; verb='promote'; generation=$StageDir; previous=$previous}
     exit 0
   } catch {
     Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
     Start-ScheduledTask -TaskName $binding.task_name
-    Write-Receipt (Join-Path $previous 'failed-promotion.json') @{
+    $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       message=$_.Exception.Message}
+    if ($lockRefusal) { $failed['lock_refusal']=$lockRefusal; $failed['retried']=@{after_s=$retriedAfter} }
+    Write-Receipt (Join-Path $previous 'failed-promotion.json') $failed
     Die 'promote_failed' ('the promotion failed and the previous task was restored: ' + $_.Exception.Message)
   }
 }
