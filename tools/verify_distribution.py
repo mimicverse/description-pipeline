@@ -16,6 +16,8 @@ import stat
 import zipfile
 from pathlib import Path
 
+from packaging.utils import canonicalize_name, parse_wheel_filename
+
 from description_pipeline.io import (
     PipelineError,
     artifact_path_parts,
@@ -35,6 +37,19 @@ def safe_members(names):
         keys.append(name.rstrip("/").casefold())
     if len(keys) != len(set(keys)):
         raise PipelineError("Duplicate or case-colliding archive member")
+
+
+def _locked_pins(data: bytes) -> dict:
+    pins = {}
+    for line in data.decode("utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, _, version = line.partition("==")
+        if not version:
+            raise PipelineError(f"Unparsable dependency lock line: {line}")
+        pins[canonicalize_name(name)] = version.strip()
+    return pins
 
 
 def verify_release(directory, identity):
@@ -66,6 +81,25 @@ def verify_release(directory, identity):
     for name in complete:
         if name not in artifacts:
             raise PipelineError(f"Release is incomplete: {name} is missing")
+    deployment_name = f"description-{version}-deployment.zip"
+    with zipfile.ZipFile(directory / deployment_name) as archive:
+        safe_members(archive.namelist())
+        if any(stat.S_ISLNK(info.external_attr >> 16) for info in archive.infolist()):
+            raise PipelineError("Release ZIP contains a symlink")
+        members = {member: hashlib.sha256(archive.read(member)).hexdigest() for member in archive.namelist()}
+        if members != identity.get("deployment_files"):
+            raise PipelineError("Deployment members do not come from this source release")
+        source_locks = {}
+        for platform in ("linux", "windows"):
+            lock = f"requirements/{platform}-py312.lock"
+            if (identity.get("runtime_locks") or {}).get(platform) != members.get(lock):
+                raise PipelineError(f"Deployment lock {lock} is not this release's lock")
+            source_locks[platform] = archive.read(lock)
+    product = canonicalize_name("mimicverse-description")
+    roles = {
+        f"description-{version}-linux-cp312-x86_64.zip": "linux",
+        f"description-{version}-windows-cp312-x86_64.zip": "windows",
+    }
     for name in artifacts:
         path = directory / name
         if name.endswith(".tar.gz"):
@@ -85,32 +119,62 @@ def verify_release(directory, identity):
                 stream = archive.extractfile(prefix + "tool-release.json")
                 if stream is None or json.load(stream) != identity or files != identity["package_files"]:
                     raise PipelineError("Source archive does not contain the wheel's exact package identity")
+                relative = {
+                    member.name.removeprefix(name.removesuffix(".tar.gz") + "/"): hashlib.sha256(
+                        archive.extractfile(member).read()
+                    ).hexdigest()
+                    for member in members
+                    if member.isfile()
+                }
+                deployment = {
+                    member: checksum
+                    for member, checksum in relative.items()
+                    if member.split("/", 1)[0] in {"deploy", "docs", "requirements"}
+                    or member in {"README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md"}
+                }
+                if deployment != identity.get("deployment_files"):
+                    raise PipelineError("Deployment inputs in the source archive differ from the manifest")
         elif name.endswith(".zip"):
+            if name == deployment_name:
+                continue
             with zipfile.ZipFile(path) as archive:
                 safe_members(archive.namelist())
                 if any(stat.S_ISLNK(info.external_attr >> 16) for info in archive.infolist()):
                     raise PipelineError("Release ZIP contains a symlink")
-                if name == f"description-{version}-deployment.zip":
-                    members = {
-                        member: hashlib.sha256(archive.read(member)).hexdigest()
+                if name in roles:
+                    expected = {**_locked_pins(source_locks[roles[name]]), product: version}
+                    wheel_members = [
+                        member
                         for member in archive.namelist()
-                    }
-                    if members != identity.get("deployment_files"):
-                        raise PipelineError("Deployment members do not come from this source release")
-                    locks = identity.get("runtime_locks") or {}
-                    for platform in ("linux", "windows"):
-                        lock = f"requirements/{platform}-py312.lock"
-                        if locks.get(platform) != members.get(lock):
-                            raise PipelineError(f"Deployment lock {lock} is not this release's lock")
-                if name in {
-                    f"description-{version}-linux-cp312-x86_64.zip",
-                    f"description-{version}-windows-cp312-x86_64.zip",
-                }:
+                        if member.startswith("wheels/") and member.endswith(".whl")
+                    ]
+                    wheels = {}
+                    for wheel_member in wheel_members:
+                        parsed, wheel_version, _, _ = parse_wheel_filename(Path(wheel_member).name)
+                        wheels[canonicalize_name(parsed)] = (str(wheel_version), wheel_member)
+                    if (
+                        {key: value[0] for key, value in wheels.items()} != expected
+                        or len(wheel_members) != len(expected)
+                    ):
+                        raise PipelineError(f"Role archive {name} does not carry exactly its locked wheel set")
                     member = f"wheels/{wheel_name}"
                     if archive.namelist().count(member) != 1:
                         raise PipelineError(f"Role archive {name} does not carry the release wheel")
                     if hashlib.sha256(archive.read(member)).hexdigest() != artifacts[wheel_name]:
                         raise PipelineError(f"Role archive {name} carries another wheel than this release")
+                    pins = {}
+                    for line in archive.read("requirements.lock").decode("utf-8").splitlines():
+                        line = line.split("#", 1)[0].strip()
+                        if not line:
+                            continue
+                        spec, separator, checksum = line.partition(" --hash=sha256:")
+                        pin_name, _, pin_version = spec.partition("==")
+                        pins[canonicalize_name(pin_name)] = (pin_version.strip(), checksum.strip() if separator else "")
+                    if {key: value[0] for key, value in pins.items()} != expected or len(pins) != len(expected):
+                        raise PipelineError(f"Role archive {name} lock does not pin exactly its locked wheel set")
+                    for key, (_, checksum) in pins.items():
+                        if checksum != hashlib.sha256(archive.read(wheels[key][1])).hexdigest():
+                            raise PipelineError(f"Role archive {name} lock hash differs for {key}")
                 if "files.json" in archive.namelist():
                     expected = json.loads(archive.read("files.json"))
                     actual = {

@@ -194,15 +194,33 @@ class RuntimeRoleTests(unittest.TestCase):
         from description_pipeline.io import file_digest
 
         root = Path(__file__).resolve().parents[2]
-        definition = root / "src/description_pipeline/model/schema.json"
+        package = root / "src/description_pipeline"
         baseline = interface_records.schema_definition_digest()
         self.assertEqual(baseline, interface_records.SCHEMA_DEFINITION_DIGEST)
-        self.assertEqual(baseline, interface_records.digest({"model/schema.json": file_digest(definition)}))
-        flipped = definition.read_text().replace('"additionalProperties": false', '"additionalProperties": true', 1)
-        self.assertNotEqual(flipped, definition.read_text(), "the model schema pins additionalProperties")
+        self.assertEqual(
+            baseline,
+            interface_records.digest(
+                {
+                    "model/schema.json": file_digest(package / "model/schema.json"),
+                    "schemas.py": file_digest(package / "schemas.py"),
+                    "interface_records.py": file_digest(package / "interface_records.py"),
+                }
+            ),
+        )
         with tempfile.TemporaryDirectory() as directory:
-            (Path(directory) / "model").mkdir()
-            (Path(directory) / "model/schema.json").write_text(flipped, encoding="utf-8")
+            copy = Path(directory)
+            (copy / "model").mkdir()
+            model = (package / "model/schema.json").read_text()
+            flipped = model.replace('"additionalProperties": false', '"additionalProperties": true', 1)
+            self.assertNotEqual(flipped, model, "the model schema pins additionalProperties")
+            (copy / "model/schema.json").write_text(flipped, encoding="utf-8")
+            (copy / "schemas.py").write_bytes((package / "schemas.py").read_bytes())
+            (copy / "interface_records.py").write_bytes((package / "interface_records.py").read_bytes())
+            self.assertNotEqual(interface_records.schema_definition_digest(Path(directory)), baseline)
+            records = (package / "interface_records.py").read_text()
+            renamed = records.replace('"ready"', '"readiness_flag"', 1)
+            self.assertNotEqual(renamed, records, "the health key set lives in the owner module")
+            (copy / "interface_records.py").write_text(renamed, encoding="utf-8")
             self.assertNotEqual(interface_records.schema_definition_digest(Path(directory)), baseline)
 
 

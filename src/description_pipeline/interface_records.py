@@ -52,10 +52,12 @@ SCHEMA_VERSIONS = frozenset(
 #: quotes one (call bindings, manifests, ...).
 KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
 
-#: The shipped schema definition files the schema digest covers: the model
-#: document schema carries the structure and field rules of the produced
-#: documents (IF-15: the digest is over the definitions, never the id strings).
-SCHEMA_DEFINITION_FILES = ("model/schema.json",)
+#: The shipped schema definition sources the schema digest covers: the model
+#: document schema (structure and field rules of produced documents) and the two
+#: owner modules whose machine key sets and field rules define every boundary
+#: record (health, policies, snapshots, receipts, ...).  The digest is over these
+#: definitions, never over the id strings.
+SCHEMA_DEFINITION_FILES = ("model/schema.json", "schemas.py", "interface_records.py")
 
 
 def schema_definition_digest(definition_root=None) -> str:

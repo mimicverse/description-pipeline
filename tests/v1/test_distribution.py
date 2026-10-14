@@ -22,7 +22,12 @@ VERSION = "1.4.0"
 
 
 def complete_release(root: Path, *, identity: dict | None = None) -> dict:
-    """A minimal complete release: the five canonical assets plus release.json."""
+    """A minimal complete release: the five canonical assets plus release.json.
+
+    The assets are shaped like the real ones: the source archive carries every
+    deployment input, and each role archive carries exactly its locked wheel set
+    with a hash-locked requirements.lock.
+    """
 
     identity = dict(identity or {"source_commit": "a" * 40, **release_domain_identity()})
     identity.setdefault("version", VERSION)
@@ -32,9 +37,10 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
     identity.setdefault("source_sha256", hashlib.sha256(b"wheel bytes").hexdigest())
     wheel = root / f"mimicverse_description-{VERSION}-py3-none-any.whl"
     wheel.write_bytes(b"wheel bytes")
+    demo_wheel = b"demo wheel bytes"
     deployment_members = {
-        "requirements/linux-py312.lock": b"linux lock",
-        "requirements/windows-py312.lock": b"windows lock",
+        "requirements/linux-py312.lock": b"demo==1.0\n",
+        "requirements/windows-py312.lock": b"demo==1.0\n",
         "deploy/operator/operatorctl.sh": b"operator tool",
     }
     identity["deployment_files"] = {
@@ -45,16 +51,34 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
         "windows": identity["deployment_files"]["requirements/windows-py312.lock"],
     }
     with tarfile.open(root / f"mimicverse_description-{VERSION}.tar.gz", "w:gz") as archive:
-        payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-        member = tarfile.TarInfo(f"mimicverse_description-{VERSION}/src/description_pipeline/tool-release.json")
-        member.size = len(payload)
-        archive.addfile(member, io.BytesIO(payload))
+        def add(member_name: str, payload: bytes) -> None:
+            member = tarfile.TarInfo(member_name)
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+
+        add(
+            f"mimicverse_description-{VERSION}/src/description_pipeline/tool-release.json",
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(),
+        )
+        for member_name, payload in deployment_members.items():
+            add(f"mimicverse_description-{VERSION}/{member_name}", payload)
     with zipfile.ZipFile(root / f"description-{VERSION}-deployment.zip", "w") as archive:
         for name, payload in deployment_members.items():
             archive.writestr(name, payload)
+    product_line = f"mimicverse-description=={VERSION} --hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}"
+    demo_line = f"demo==1.0 --hash=sha256:{hashlib.sha256(demo_wheel).hexdigest()}"
     for platform in ("linux", "windows"):
+        members = {
+            f"wheels/{wheel.name}": wheel.read_bytes(),
+            "wheels/demo-1.0-py3-none-any.whl": demo_wheel,
+            "requirements.lock": f"{product_line}\n{demo_line}\n".encode(),
+        }
+        members["files.json"] = json.dumps(
+            {name: hashlib.sha256(payload).hexdigest() for name, payload in members.items()}, sort_keys=True
+        ).encode()
         with zipfile.ZipFile(root / f"description-{VERSION}-{platform}-cp312-x86_64.zip", "w") as archive:
-            archive.writestr(f"wheels/{wheel.name}", wheel.read_bytes())
+            for name, payload in members.items():
+                archive.writestr(name, payload)
     write_json(root / "release.json", {**identity, "artifacts": inventory(root)})
     return identity
 
@@ -145,14 +169,74 @@ class DistributionTests(unittest.TestCase):
                 root = Path(directory)
                 identity = complete_release(root)
                 archive_path = root / f"description-{VERSION}-{platform}-cp312-x86_64.zip"
+                with zipfile.ZipFile(archive_path) as source:
+                    members = {name: source.read(name) for name in source.namelist()}
+                members[f"wheels/mimicverse_description-{VERSION}-py3-none-any.whl"] = b"another wheel"
                 with zipfile.ZipFile(archive_path, "w") as archive:
-                    archive.writestr(f"wheels/mimicverse_description-{VERSION}-py3-none-any.whl", b"another wheel")
+                    for name, payload in members.items():
+                        archive.writestr(name, payload)
                 write_json(
                     root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
                 )
                 with self.assertRaises(PipelineError) as raised:
                     verify_release(root, identity)
                 self.assertIn("another wheel", str(raised.exception))
+
+    def test_role_locks_must_pin_exactly_their_wheel_set(self):
+        for platform in ("linux", "windows"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(platform=platform):
+                root = Path(directory)
+                identity = complete_release(root)
+                archive_path = root / f"description-{VERSION}-{platform}-cp312-x86_64.zip"
+                with zipfile.ZipFile(archive_path) as source:
+                    members = {name: source.read(name) for name in source.namelist()}
+                product = f"wheels/mimicverse_description-{VERSION}-py3-none-any.whl"
+                wheel_digest = hashlib.sha256(members[product]).hexdigest()
+                members["requirements.lock"] = (
+                    f"mimicverse-description=={VERSION} --hash=sha256:{wheel_digest}\n".encode()
+                )
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for name, payload in members.items():
+                        archive.writestr(name, payload)
+                write_json(
+                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
+                )
+                with self.assertRaises(PipelineError) as raised:
+                    verify_release(root, identity)
+                self.assertIn("lock does not pin exactly", str(raised.exception))
+
+    def test_deployment_inputs_must_match_the_source_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = complete_release(root)
+            archive_path = root / f"description-{VERSION}-deployment.zip"
+            with zipfile.ZipFile(archive_path) as source:
+                members = {name: source.read(name) for name in source.namelist()}
+            members["deploy/operator/operatorctl.sh"] = b"sneaky source note\n"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name, payload in members.items():
+                    archive.writestr(name, payload)
+            identity = {**identity, "deployment_files": {
+                name: hashlib.sha256(payload).hexdigest() for name, payload in members.items()
+            }}
+            # The private copy reseals the embedded identities too; the deployment
+            # copies inside the source archive stay untouched.
+            sdist = root / f"mimicverse_description-{VERSION}.tar.gz"
+            with tarfile.open(sdist) as source:
+                entries = [
+                    (member, source.extractfile(member).read() if member.isfile() else None)
+                    for member in source.getmembers()
+                ]
+            with tarfile.open(sdist, "w:gz") as target:
+                for member, payload in entries:
+                    if member.name.endswith("src/description_pipeline/tool-release.json"):
+                        payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+                        member.size = len(payload)
+                    target.addfile(member, io.BytesIO(payload) if payload is not None else None)
+            write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
+            with self.assertRaises(PipelineError) as raised:
+                verify_release(root, identity)
+            self.assertIn("source archive differ", str(raised.exception))
 
     def test_the_manifest_binds_the_live_contract_and_support_identity(self):
         with tempfile.TemporaryDirectory() as directory:
