@@ -334,12 +334,14 @@ def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     slug = job.get("repository_slug")
     base = job.get("repository_base")
     hardware = revision = None
-    revision_path = store.capture_dir(run_id) / "input/cad-revision.json"
-    if revision_path.is_file():
-        payload = read_data(revision_path)
+    source_path = store.capture_dir(run_id) / "input/source.json"
+    if source_path.is_file():
+        payload = read_data(source_path)
         if isinstance(payload, dict):
-            hardware = payload.get("hardware_id")
-            revision = payload.get("revision")
+            identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            hardware = identity.get("hardware_id")
+            revision = metadata.get("revision")
     store.update_meta(
         run_id,
         repository_slug=slug,

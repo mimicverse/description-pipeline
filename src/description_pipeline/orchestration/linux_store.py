@@ -415,8 +415,8 @@ class LinuxStore:
             capture = self.checkpoint_dir(run_id, "capture")
         except PipelineError:
             capture = None
-        hardware = _capture_value(capture, "input/robot.yaml", "hardware_id") if capture else None
-        revision = _capture_value(capture, "input/cad-revision.json", "revision") if capture else None
+        hardware = _capture_value(capture, "input/source.json", ("identity", "hardware_id")) if capture else None
+        revision = _capture_value(capture, "input/source.json", ("metadata", "revision")) if capture else None
         if submission is not None:
             result["submission"] = submission
         if (native_job or {}).get("status") == "failed":
@@ -680,7 +680,7 @@ class _BoundArtifact:
         return getattr(self._handle, item)
 
 
-def _capture_value(capture: Path, relative: str, key: str) -> str | None:
+def _capture_value(capture: Path, relative: str, key) -> str | None:
     """One scalar from the admitted native input, or ``None`` when it is absent."""
     path = Path(capture) / relative
     if not path.is_file():
@@ -689,7 +689,9 @@ def _capture_value(capture: Path, relative: str, key: str) -> str | None:
         payload = read_data(path)
     except (PipelineError, OSError, ValueError, TypeError):
         return None
-    value = payload.get(key) if isinstance(payload, dict) else None
+    for part in key if isinstance(key, tuple) else (key,):
+        payload = payload.get(part) if isinstance(payload, dict) else None
+    value = payload
     return value if isinstance(value, str) and value else None
 
 

@@ -155,16 +155,18 @@ def _root_capture(store: LinuxStore, run_id: str):
 
 
 def _root_identity(store: LinuxStore, run_id: str) -> tuple[str | None, str | None]:
-    """Hardware and revision of the admitted delivery, read from its JSON revision record."""
+    """Hardware and revision of the admitted delivery, read from its content identity record."""
     capture = _root_capture(store, run_id)
     if capture is None:
         return None, None
-    path = capture / "input/cad-revision.json"
+    path = capture / "input/source.json"
     if not path.is_file():
         return None, None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    hardware = payload.get("hardware_id")
-    revision = payload.get("revision")
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    hardware = identity.get("hardware_id")
+    revision = metadata.get("revision")
     return (
         hardware if isinstance(hardware, str) and hardware else None,
         revision if isinstance(revision, str) and revision else None,

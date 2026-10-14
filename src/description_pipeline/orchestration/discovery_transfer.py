@@ -39,14 +39,12 @@ from ..sources.solidworks.discovery import (
     NAMESPACE,
     PREPARED_SCHEMA,
     RECORD_DIR,
-    REVISION_FILE,
-    ROBOT_FILE,
+    SOURCE_FILE,
     DiscoverySettings,
     PreparedPackage,
     SubmissionIdentity,
     derive_native_package,
 )
-from ..sources.solidworks.input import load_package
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import SELECTION_SCHEMA, validate_file_index, verify_selection
 
@@ -87,8 +85,11 @@ MAX_REQUEST_BYTES = 512 * 1024 * 1024
 #: A capture request only carries the actual derive outputs: the generated
 #: contract files plus the embedded controlled records (``records/<sha8>_<stem>.txt``).
 _EMBEDDED_RECORD_MEMBER = re.compile(rf"{re.escape(RECORD_DIR)}/[0-9a-f]{{8}}_[0-9A-Za-z._-]{{1,48}}\.txt")
-_GENERATED_MEMBERS = frozenset({ROBOT_FILE, REVISION_FILE, DISCOVERY_FILE, FINDINGS_FILE, IDENTITY_FILE})
-_REQUIRED_GENERATED = frozenset({ROBOT_FILE, DISCOVERY_FILE, FINDINGS_FILE})
+_GENERATED_MEMBERS = frozenset({SOURCE_FILE, DISCOVERY_FILE, FINDINGS_FILE, IDENTITY_FILE})
+#: The content identity (source.json) and the identity resolution are written
+#: only once the administrative identity is nameable; the raw discovery and
+#: its findings always travel, so only those are required members.
+_REQUIRED_GENERATED = frozenset({DISCOVERY_FILE, FINDINGS_FILE})
 
 _RECORD_MANIFEST_KEYS = frozenset(
     {
@@ -758,18 +759,14 @@ def _build_prepared(destination: Path, manifest: dict, expected_record: Mapping[
     )
     _require(payload.get("findings") == findings, "prepared findings disagree with the discovery evidence")
     _require(not any(item.get("blocking", True) for item in findings), "prepared discovery contains blocking findings")
-    revision_path = destination / REVISION_FILE
-    revision_sha256 = hashlib.sha256(revision_path.read_bytes()).hexdigest() if revision_path.is_file() else ""
     return PreparedPackage(
         schema_version=PREPARED_SCHEMA,
         run_id=manifest["run_id"],
         package=destination,
         handoff_sha256=manifest["handoff_sha256"],
         prepared_sha256=manifest["prepared_sha256"],
-        revision_sha256=revision_sha256,
         hardware_id=identity.get("hardware_id"),
         revision=identity.get("revision"),
-        source=load_package(destination),
         discovery_path=discovery_path,
         discovery_sha256=hashlib.sha256(discovery_path.read_bytes()).hexdigest(),
         findings=tuple(findings),
