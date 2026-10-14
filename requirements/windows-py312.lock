@@ -1,4 +1,3 @@
 # Windows native capture, x86_64, CPython 3.12 runtime closure.
 packaging==26.3
 pywin32==311
-pyyaml==6.0.3

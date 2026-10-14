@@ -26,7 +26,6 @@ dependencies = [
     # The native (Windows) endpoint closure: the COM capture, transport and tool
     # records.  The offline Windows archive resolves against exactly this base set
     # (plus its hash-pinned lock), so portable-only packages never enter it.
-    "PyYAML==6.0.3",
     "packaging==26.3",
     "pywin32==311; sys_platform == 'win32'",
 ]
@@ -41,7 +40,7 @@ Documentation = "https://github.com/mimicverse/description-pipeline/tree/main/do
 # The portable (Linux) surface closure - model derivation, verification pages and
 # uploads - plus the independent MuJoCo consumer behind the verify extra.  Together
 # with the base they are exactly runtime.required_packages(role) for both roles.
-portable = ["numpy==2.5.3", "jsonschema==4.26.0", "python-multipart==0.0.32"]
+portable = ["PyYAML==6.0.3", "numpy==2.5.3", "jsonschema==4.26.0", "python-multipart==0.0.32"]
 verify = ["mujoco==3.13.0"]
 dev = ["ruff==0.16.8", "build==1.6.1"]
 
