@@ -911,16 +911,13 @@ def frozen_discovery_payload(
     record: dict,
     *,
     files: dict[str, str],
-    robot: dict | None = None,
 ) -> dict:
     """The IF-13 discovery record: the native payload plus the frozen additions.
 
     ``files`` maps frozen-source-relative native paths to their digests; the
     record carries them as ``files[]`` plus the canonical
-    ``native_inventory_sha256`` and the top-level ``robot_name``.  When the
-    prepared ``robot.yaml`` document is supplied, its robot carrier
-    (bodies/joints/frames/checks) folds into ``derived`` - the frozen home of
-    the definition the verifier rebuilds the W1 robot from.
+    ``native_inventory_sha256`` and the top-level ``robot_name`` resolved from
+    the recorded identity (authored name, then its technical label).
     """
 
     from description_pipeline.io import digest
@@ -929,18 +926,8 @@ def frozen_discovery_payload(
     rows = [{"path": path, "sha256": checksum} for path, checksum in sorted(files.items())]
     payload["files"] = rows
     payload["native_inventory_sha256"] = digest(rows)
-    source = (robot or {}).get("source") or {}
     identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
-    payload["robot_name"] = source.get("robot_name") or identity.get("robot_name")
-    if robot:
-        derived = dict(payload.get("derived") or {})
-        if source.get("bodies") is not None:
-            derived["bodies"] = copy.deepcopy(source["bodies"])
-        if source.get("joints") is not None:
-            derived["joints"] = copy.deepcopy(source["joints"])
-        derived["frames"] = copy.deepcopy(source.get("frames") or [])
-        derived["checks"] = copy.deepcopy(robot.get("checks") or {})
-        payload["derived"] = derived
+    payload["robot_name"] = identity.get("robot_name") or identity.get("robot_name_technical") or "robot"
     return payload
 
 
@@ -951,23 +938,17 @@ def native_discovery_delivery(root: Path, prepared: Path, *, record: dict | None
     paths; the record becomes ``evidence/discovery.json`` (frozen additions
     applied); the embedded records move under ``input/records`` keeping their
     recorded ``package_file`` names; ``input/source.json`` carries the archived
-    definition identity.  Returns the delivery root.
+    content identity rebuilt from the recorded identity.  Returns the delivery
+    root.
     """
 
     import hashlib
-
-    import yaml
 
     from description_pipeline.io import read_data
 
     prepared = Path(prepared)
     if record is None:
         record = read_data(prepared / "discovery/native-discovery.json")
-    robot = (
-        yaml.safe_load((prepared / "robot.yaml").read_text(encoding="utf-8"))
-        if (prepared / "robot.yaml").is_file()
-        else None
-    )
     raw = record.get("raw") or {}
     raw_files = raw.get("files") if isinstance(raw.get("files"), dict) else {}
     originals: dict[str, str] = {}
@@ -985,8 +966,8 @@ def native_discovery_delivery(root: Path, prepared: Path, *, record: dict | None
         source = prepared / package_file
         if package_file and source.is_file():
             records[package_file] = source.read_text(encoding="utf-8")
-    payload = frozen_discovery_payload(record, files=files, robot=robot)
-    source_record = source_record_for_robot(robot or {}, record)
+    payload = frozen_discovery_payload(record, files=files)
+    source_record = source_record_for_robot(record)
     return write_target_delivery(
         root,
         capture={},
@@ -997,15 +978,14 @@ def native_discovery_delivery(root: Path, prepared: Path, *, record: dict | None
     )
 
 
-def source_record_for_robot(robot: dict, record: dict) -> dict:
+def source_record_for_robot(record: dict) -> dict:
     """The archived input/source.json identity for one prepared native package."""
 
-    source = robot.get("source") or {}
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
     revision = identity.get("revision")
     return default_source_record(
-        hardware_id=str(robot.get("hardware_id") or identity.get("hardware_id") or "fixture"),
-        configuration=str(source.get("configuration") or identity.get("delivery_configuration") or "Default"),
-        main_assembly=str(source.get("assembly") or identity.get("main_assembly") or "robot.SLDASM"),
+        hardware_id=str(identity.get("hardware_id") or "fixture"),
+        configuration=str(identity.get("delivery_configuration") or "Default"),
+        main_assembly=str(identity.get("main_assembly") or "robot.SLDASM"),
         revision=revision if isinstance(revision, str) and revision else None,
     )

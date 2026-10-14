@@ -79,11 +79,6 @@ class InputSealReadinessTests(unittest.TestCase):
                 "identity": raw_identity,
             },
             files={"robot.SLDASM": hashlib.sha256(content).hexdigest()},
-            robot={
-                "hardware_id": "fixture",
-                "source": {"robot_name": "fixture", "bodies": [], "joints": [], "frames": []},
-                "checks": {},
-            },
         )
         source = support.default_source_record(
             main_assembly="robot.SLDASM",
@@ -178,7 +173,6 @@ class HandoffHashBindingTests(unittest.TestCase):
         payload = support.frozen_discovery_payload(
             {"namespace": "dp", "raw": {"files": dict(raw_files or {})}, "identity": {}},
             files=native,
-            robot={"hardware_id": None, "source": {"robot_name": "robot"}, "checks": {}},
         )
         if inventory_digest is not None:
             payload["native_inventory_sha256"] = inventory_digest

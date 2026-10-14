@@ -188,7 +188,6 @@ class ImportedSourceTests(unittest.TestCase):
         payload = support.frozen_discovery_payload(
             payload,
             files=native,
-            robot={"hardware_id": None, "source": {"robot_name": "robot"}, "checks": {}},
         )
         return support.write_target_delivery(
             package,

@@ -484,7 +484,6 @@ class DeclarationConsumerTests(unittest.TestCase):
                 "identity": copy.deepcopy(raw["identity"]),
             },
             files=native_files,
-            robot=robot,
         )
         source = support.default_source_record(
             main_assembly="robot.SLDASM",
@@ -1117,7 +1116,6 @@ class NativeDeclarationsTests(unittest.TestCase):
                     "identity": copy.deepcopy(raw["identity"]),
                 },
                 files=native_files,
-                robot=robot,
             )
             source = support.default_source_record(
                 main_assembly="robot.SLDASM",

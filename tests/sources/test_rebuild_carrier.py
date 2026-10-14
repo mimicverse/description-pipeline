@@ -13,8 +13,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
-
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings, prepare_native_package
 from description_pipeline.verification.native_discovery import (
     _Failure,
@@ -59,8 +57,7 @@ class RebuildCarrierTests(unittest.TestCase):
         )
         self.assertTrue(result.passed, result.findings)
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
-        robot = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        return payload, robot["source"], output
+        return payload, output
 
     @staticmethod
     def _normalized(bodies: list[dict]) -> list[dict]:
@@ -77,26 +74,67 @@ class RebuildCarrierTests(unittest.TestCase):
             key=lambda body: body["name"],
         )
 
-    def test_oracle_fixture_rebuild_matches_the_saved_carrier(self) -> None:
-        payload, source, _output = self._prepared(oracle_fixtures.native_record())
-        self.assertEqual(self._normalized(source["bodies"]), self._normalized(rebuild_rigid_bodies(payload["raw"])))
+    def test_oracle_fixture_rebuild_matches_the_frozen_expectation(self) -> None:
+        payload, _output = self._prepared(oracle_fixtures.native_record())
+        self.assertEqual(
+            self._normalized(rebuild_rigid_bodies(payload["raw"])),
+            [
+                {
+                    "id": "arm_link",
+                    "name": "arm_link",
+                    "components": ["arm-1"],
+                    "frame": {"coordinate_system": "CS_arm_link"},
+                },
+                {
+                    "id": "base_link",
+                    "name": "base_link",
+                    "components": ["base-1"],
+                    "frame": {"coordinate_system": "CS_base_link"},
+                },
+            ],
+        )
 
-    def test_lock_fixture_rebuild_matches_the_saved_carrier(self) -> None:
-        payload, source, _output = self._prepared(oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True))
-        self.assertEqual(self._normalized(source["bodies"]), self._normalized(rebuild_rigid_bodies(payload["raw"])))
+    def test_lock_fixture_rebuild_matches_the_frozen_expectation(self) -> None:
+        payload, _output = self._prepared(oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True))
+        self.assertEqual(
+            self._normalized(rebuild_rigid_bodies(payload["raw"])),
+            [
+                {
+                    "id": "base_link",
+                    "name": "base_link",
+                    "components": ["arm-1", "base-1"],
+                    "frame": {"coordinate_system": "CS_base_link"},
+                },
+            ],
+        )
 
-    def test_joint_rebuild_matches_the_saved_carrier(self) -> None:
+    def test_joint_rebuild_matches_the_frozen_expectation(self) -> None:
         cases = (
             ("oracle", oracle_fixtures.native_record()),
             ("lock", oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True)),
         )
         for label, record in cases:
             with self.subTest(case=label):
-                payload, source, output = self._prepared(record)
-                rebuilt = rebuild_joint_facts(payload, output)
-                expected = sorted(source["joints"], key=lambda joint: joint["name"])
-                actual = sorted(rebuilt, key=lambda joint: joint["name"])
-                self.assertEqual(expected, actual)
+                payload, output = self._prepared(record)
+                actual = sorted(
+                    (joint["name"], joint["type"], joint["parent"], joint["child"], joint["axis"], joint["limits"])
+                    for joint in rebuild_joint_facts(payload, output)
+                )
+                expected = (
+                    [
+                        (
+                            "shoulder_pitch_joint",
+                            "revolute",
+                            "base_link",
+                            "arm_link",
+                            [0.0, 0.0, 1.0],
+                            {"lower": -1.5, "upper": 1.5, "effort": 6.0, "velocity": 2.0},
+                        )
+                    ]
+                    if label == "oracle"
+                    else []
+                )
+                self.assertEqual(actual, expected)
 
     @staticmethod
     def _interface_record() -> dict:
@@ -107,10 +145,10 @@ class RebuildCarrierTests(unittest.TestCase):
         record["datums"].append(twin)
         return record
 
-    def test_interface_frame_rebuild_matches_the_saved_carrier(self) -> None:
-        payload, source, _output = self._prepared(self._interface_record())
+    def test_interface_frame_rebuild_matches_the_frozen_expectation(self) -> None:
+        payload, _output = self._prepared(self._interface_record())
         self.assertEqual(
-            source["frames"],
+            rebuild_interface_frames(payload),
             [
                 {
                     "id": "tool_mount",
@@ -120,13 +158,11 @@ class RebuildCarrierTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(source["frames"], rebuild_interface_frames(payload))
         for record in (
             oracle_fixtures.native_record(),
             oracle_fixtures.OracleSemanticsTests._lock_record(with_point=True),
         ):
-            payload, source, _output = self._prepared(record)
-            self.assertEqual([], source["frames"])
+            payload, _output = self._prepared(record)
             self.assertEqual([], rebuild_interface_frames(payload))
 
     def test_interface_frame_rebuild_fails_closed(self) -> None:
@@ -154,7 +190,7 @@ class RebuildCarrierTests(unittest.TestCase):
                 rebuild_interface_frames(record)
 
     def test_missing_or_ambiguous_frame_datum_fails_closed(self) -> None:
-        payload, _source, _output = self._prepared(oracle_fixtures.native_record())
+        payload, _output = self._prepared(oracle_fixtures.native_record())
         raw = payload["raw"]
         missing = copy.deepcopy(raw)
         missing["datums"] = [datum for datum in missing["datums"] if datum.get("name") != "CS_arm_link"]

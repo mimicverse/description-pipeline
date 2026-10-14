@@ -1420,9 +1420,6 @@ def _physics(root, source, model, verifier):
 
 def _policy(source, model):
     _require(model["name"] == source["robot_name"], "Canonical robot name differs from the author definition")
-    for key in ("actuators", "sensors", "constraints", "contact_excludes"):
-        _require(not model[key], f"v1 does not support {key}")
-    _require(not model.get("control") and not model.get("mechanical_drives"), "Unspecified canonical control extension")
     for key in ("joints", "frames"):
         actual = {(row["id"], row["name"]) for row in model[key]}
         expected = {(row["id"], row["name"]) for row in source.get(key, [])}

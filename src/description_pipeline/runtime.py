@@ -15,11 +15,10 @@ from .schemas import TOOL_SCHEMA
 
 #: The exact runtime dependency closure per role.  The native (Windows) endpoint runs the
 #: staged capture/conversion pipeline: it imports packaging (stage transfer and tool records)
-#: and the pywin32 COM bindings.  numpy, jsonschema and python-multipart belong to the
-#: portable (Linux) surfaces (model derivation, pages, uploads).  PyYAML leaves the native
-#: set together with the robot.yaml write side of the native discovery reshape.
+#: and the pywin32 COM bindings.  numpy, PyYAML, jsonschema and python-multipart belong to
+#: the portable (Linux) surfaces (model derivation, pages, uploads, authored YAML inputs).
 RUNTIME_PACKAGES = {
-    "native": ("PyYAML", "packaging", "pywin32"),
+    "native": ("packaging", "pywin32"),
     "portable": ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart", "mujoco"),
 }
 RUNTIME_VERSIONS = {

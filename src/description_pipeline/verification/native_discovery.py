@@ -7,10 +7,9 @@ It runs without Windows or SolidWorks: everything it needs (the raw record, the
 embedded controlled records and the generated contract files) is inside the
 package.
 
-Only three facts are taken from the package as *claims*: ``robot.yaml``, a supplied
-``cad-revision.json`` seal and the discovery payload itself.  The payload is
-bound by digest to the package's provenance block; every derived value is
-recomputed here before it is accepted.
+Only two facts are taken from the package as *claims*: ``input/source.json``
+and the discovery payload itself.  The payload is bound by digest to the
+package's subject; every derived value is recomputed here before it is accepted.
 
 Two verification regimes are supported by design, selected by the same shared
 predicate as the producer (``schemas.exporter_declaration_present`` — the helper
@@ -88,12 +87,6 @@ class _Failure(Exception):
 def _require(condition: bool, code: str, message: str, detail=None) -> None:
     if not condition:
         raise _Failure(code, message, detail)
-
-
-def _read_yaml(path: Path) -> dict:
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    _require(isinstance(data, dict), "discovery.file", f"{path.name} must be a mapping", {"path": path.name})
-    return data
 
 
 def _read_json(path: Path) -> dict:
@@ -2390,11 +2383,11 @@ def verify_discovery(package: Path) -> dict:
         )
         source = read_source_record(package)
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
-        robot = {
+        definition = {
             "schema_version": payload.get("schema_version"),
-            # The carrier must reflect the authored claim the identity gate
-            # compares it against; a missing value stays missing (readiness),
-            # never silently substituted from the selection.
+            # The definition identity must reflect the authored claim the
+            # identity gate compares it against; a missing value stays missing
+            # (readiness), never silently substituted from the selection.
             "hardware_id": identity.get("hardware_id"),
             "robot_name": payload.get("robot_name"),
             "source": {
@@ -2403,7 +2396,7 @@ def verify_discovery(package: Path) -> dict:
                 "robot_name": payload.get("robot_name"),
             },
         }
-        state["robot"] = robot
+        state["definition"] = definition
         state["payload"] = payload
         return {
             "discovery_sha256": hashlib.sha256(payload_bytes).hexdigest(),
@@ -2611,7 +2604,7 @@ def verify_discovery(package: Path) -> dict:
         return {"imported_occurrences": observed, "cached_materializations": len(cached_used)}
 
     def identity():
-        payload, robot = state["payload"], state["robot"]
+        payload, definition = state["payload"], state["definition"]
         authored = _authored_identity(payload.get("raw") or {}, str(payload.get("namespace") or "dp"))
         state["authored_identity"] = authored
         claimed = payload.get("identity")
@@ -2624,9 +2617,9 @@ def verify_discovery(package: Path) -> dict:
                 {"field": key},
             )
         _require(
-            robot.get("hardware_id") == authored["hardware_id"],
+            definition.get("hardware_id") == authored["hardware_id"],
             "discovery.identity",
-            "robot.yaml hardware_id differs from authored native metadata",
+            "the definition hardware_id differs from authored native metadata",
         )
         technical_name = authored["robot_name"]
         label_source = "authored_robot_name"
@@ -2634,7 +2627,7 @@ def verify_discovery(package: Path) -> dict:
             label_source = "hardware_id" if authored["hardware_id"] is not None else "technical_default"
             technical_name = re.sub(r"[^0-9A-Za-z]+", "_", authored["hardware_id"] or "robot").strip("_").lower()
         _require(
-            (robot.get("source") or {}).get("robot_name") == technical_name,
+            (definition.get("source") or {}).get("robot_name") == technical_name,
             "discovery.identity",
             "generated robot label differs from its recorded naming source",
         )
@@ -2916,7 +2909,11 @@ def verify_discovery(package: Path) -> dict:
         attached = _frame_attached_members(raw)
         by_name = _components_by_name(raw)
         source_bodies = _carrier()["bodies"]
-        _require(isinstance(source_bodies, list) and source_bodies, "discovery.bodies", "robot.yaml declares no bodies")
+        _require(
+            isinstance(source_bodies, list) and source_bodies,
+            "discovery.bodies",
+            "the rebuilt source definition declares no bodies",
+        )
         # A body is a set of physical parts.  Assembly-document occurrences stay in the mate
         # graph as connectors but are never material members, so a rigid sub-assembly cannot
         # become a body of its own or double the material of its parts.
@@ -3039,7 +3036,7 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 body is not None,
                 "discovery.names",
-                "a rigid body has no robot.yaml body",
+                "a rigid body has no source definition body",
                 {"components": sorted(group)},
             )
             name = str(body.get("name"))
@@ -3163,7 +3160,7 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 body is not None,
                 "discovery.joints",
-                "a rigid body has no robot.yaml body",
+                "a rigid body has no source definition body",
                 {"components": sorted(material)},
             )
             name = str(body.get("name"))
@@ -3434,7 +3431,7 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 pair in seen,
                 "discovery.joints",
-                "robot.yaml contains a joint with no movable mate pair",
+                "the source definition contains a joint with no movable mate pair",
                 {"joint": joint.get("name")},
             )
         return {"joints": derived}

@@ -1,9 +1,9 @@
 """Independent-oracle semantics: resealed adversarial records must fail on meaning.
 
 Each test builds one genuinely valid package with the generator, then mutates the bound native
-record and *reseals* it: the record's own digest and the native inventory digest in ``robot.yaml``
-are recomputed, so ``discovery.binding`` passes and the only possible failure is the semantic rule
-under test.  Nothing here touches SolidWorks; the verification module itself imports no generator.
+record and *reseals* it: the record's own digest and the delivery binding are recomputed, so
+``discovery.binding`` passes and the only possible failure is the semantic rule under test.
+Nothing here touches SolidWorks; the verification module itself imports no generator.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from description_pipeline.sources.solidworks.discovery import (
     DiscoverySettings,
     prepare_native_package,
 )
-from description_pipeline.verification.native_discovery import verify_discovery
+from description_pipeline.verification.native_discovery import rebuild_rigid_bodies, verify_discovery
 
 from . import support
 from .selection_support import sealed_selection
@@ -418,7 +418,7 @@ class OracleSemanticsTests(unittest.TestCase):
         package = self.baseline()
         self._native(package, lambda raw, payload: raw["mates"][1].update({"suppressed": True}))
         _passed, errors, checks = self.check(package)
-        # The graph check itself must pass; later checks may disagree with the stale robot.yaml.
+        # The graph check itself must pass; later checks may disagree with the stale carrier.
         self.assertTrue(checks["discovery.graph"]["passed"], checks["discovery.graph"])
         self.assertNotIn("discovery.graph", [error["code"] for error in errors])
 
@@ -908,7 +908,7 @@ class OracleSemanticsTests(unittest.TestCase):
         passed, errors, _checks = self.check(package)
         self.assertTrue(passed, errors)
         record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
-        bodies = [(body["name"], sorted(body["components"])) for body in record["derived"]["bodies"]]
+        bodies = [(body["name"], sorted(body["components"])) for body in rebuild_rigid_bodies(record)]
         self.assertEqual(bodies, [("base_link", ["arm-1", "base-1"])])
 
     def test_lock_with_a_missing_occurrence_frame_blocks(self) -> None:
@@ -1224,9 +1224,11 @@ class OracleSemanticsTests(unittest.TestCase):
 
     def test_top_owned_interface_datum_binds_the_proven_base(self) -> None:
         def publish_frame(package: Path, parent: str) -> None:
+            # A planted legacy second-model carrier must never steer the rebuild.
             record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
-            record["derived"].setdefault("frames", [])
-            record["derived"]["frames"].append({"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"})
+            record.setdefault("derived", {}).setdefault("frames", []).append(
+                {"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"}
+            )
             OracleSemanticsTests._seal(package, record)
 
         def add_tool_datum(raw, payload):

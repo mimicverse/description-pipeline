@@ -14,11 +14,11 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .delivery import PIPELINE_ID, subject_digest, subject_inventory
+from .delivery import PIPELINE_ID, read_source_record, subject_digest, subject_inventory
 from .io import PipelineError, confined, digest, file_digest, read_data, write_json
 from .runtime import tool_record
 from .sources.snapshot import verify_snapshot
-from .sources.solidworks.revision import package_inventory, read_revision
+from .sources.solidworks.revision import package_inventory
 from .stages import checked
 
 
@@ -184,16 +184,13 @@ def discover_structure(
         _require(package_inventory(frozen) == expected_files, "Frozen engineering changed during discovery")
         for name, checksum in expected_files.items():
             _require(file_digest(confined(package, name)) == checksum, "Native preparation changed engineering files")
-        if (package / "cad-revision.json").exists():
-            revision = read_revision(package)
-        else:
-            inspected = inspect_prepared_input(package)
-            _require(inspected["passed"], "Generated native inputs are invalid")
-            revision = inspected["cad_revision"]
-        if revision is not None:
+        inspected = inspect_prepared_input(package)
+        _require(inspected["passed"], "Generated native inputs are invalid")
+        identity = inspected["cad_revision"]
+        if identity is not None:
             _require(
-                revision["hardware_id"] == prepared.hardware_id and revision["revision"] == prepared.revision,
-                "Generated revision differs from native discovery",
+                identity["hardware_id"] == prepared.hardware_id and identity["revision"] == prepared.revision,
+                "Generated content identity differs from native discovery",
             )
         files = package_inventory(package)
         _require(digest(files) == prepared.prepared_sha256, "Prepared files differ from native discovery")
@@ -220,39 +217,57 @@ def discover_structure(
 
 
 def inspect_prepared_input(package: Path) -> dict:
-    """Check acquisition inputs; missing administrative facts defer publication."""
+    """Check the prepared native package's archived content identity.
 
-    from .sources.solidworks.input import inspect_package, native_metadata
+    The package carries its identity in ``source.json`` (IF-06).  A missing
+    record defers publication only: acquisition evidence stays inspectable and
+    the deferral is recorded.  An unreadable or inconsistent record fails.
+    """
 
-    report = inspect_package(package)
+    from .interface_records import validate_source_record
+
+    package = Path(package)
+    report = {
+        "passed": True,
+        "errors": [],
+        "warnings": [],
+        "input": None,
+        "resolved": None,
+        "input_receipt": None,
+        "cad_revision": None,
+    }
+    path = package / "source.json"
+    if not path.is_file():
+        report["warnings"].append(
+            {
+                "code": "input.source_identity_pending",
+                "message": "CAD administrative identity is incomplete; publication is unavailable",
+                "detail": {"publication_blocker": "source_identity"},
+            }
+        )
+        return report
     try:
-        author = report.get("input")
-        hardware = author.get("hardware_id") if isinstance(author, dict) else None
-        report["cad_revision"] = None
-        if (package / "cad-revision.json").exists():
-            report["cad_revision"] = read_revision(package, hardware_id=hardware)
-            _require(
-                report["cad_revision"]["hardware_id"] == hardware,
-                "Revision claims an absent CAD hardware identity",
-            )
-        else:
-            identity = native_metadata(package, author or {})
-            missing = [
-                key
-                for key in ("hardware_id", "revision", "owner", "change_summary", "control")
-                if identity.get(key) is None
-            ]
-            _require(bool(missing), "Complete CAD identity requires its generated cad-revision.json")
-            report["warnings"].append(
-                {
-                    "code": "input.cad_revision_pending",
-                    "message": "CAD administrative identity is incomplete; publication is unavailable",
-                    "detail": {"publication_blocker": "cad_revision", "missing": missing},
-                }
-            )
+        files = package_inventory(package)
+        source = validate_source_record(read_data(path))
     except (PipelineError, OSError, ValueError) as error:
-        report["errors"].append({"code": "input.cad_revision", "message": str(error), "detail": None})
         report["passed"] = False
+        report["errors"].append({"code": "input.source_identity", "message": str(error), "detail": None})
+        return report
+    identity, metadata = source["identity"], source["metadata"]
+    report["input"] = {
+        "hardware_id": identity["hardware_id"],
+        "source": {"assembly": identity["main_assembly"], "configuration": identity["configuration"]},
+    }
+    report["cad_revision"] = {
+        "hardware_id": identity["hardware_id"],
+        "revision": metadata["revision"],
+        "owner": metadata["owner"],
+        "control": metadata["control"],
+        "change_summary": metadata["change_summary"],
+    }
+    report["input_receipt"] = {
+        "inventory": [{"path": name, "sha256": checksum} for name, checksum in sorted(files.items())],
+    }
     return report
 
 
@@ -489,10 +504,8 @@ def publish_model(
         "Refusing to publish: this runtime carries no embedded release identity "
         "(tool-release.json is absent); install the released distribution",
     )
-    author = read_data(Path(bundle) / "input/robot.yaml")
-    hardware = author["hardware_id"]
-    _require(isinstance(hardware, str) and bool(hardware), "Publication requires an authored CAD hardware identity")
-    read_revision(Path(bundle) / "input", hardware_id=hardware)
+    source = read_source_record(bundle)
+    hardware = source["identity"]["hardware_id"]
     result = submit_bundle(
         bundle,
         repository,

@@ -720,11 +720,6 @@ def build_scene(
         "links": links,
         "joints": joint_entries,
         "frames": frames,
-        "actuators": list(cfg.get("actuators") or []),
-        "sensors": list(cfg.get("sensors") or []),
-        "constraints": list(cfg.get("constraints") or []),
-        "control": dict(cfg.get("control") or {}),
-        "contact_excludes": list(cfg.get("contact_excludes") or []),
         "provenance": scene_provenance,
     }
 

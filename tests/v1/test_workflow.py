@@ -14,7 +14,7 @@ from unittest.mock import patch
 from description_pipeline import solidworks, steps
 from description_pipeline.cli import main
 from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data, write_json
-from description_pipeline.sources.solidworks.revision import package_inventory, seal_revision
+from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.stages import stage_view
 
 
@@ -67,22 +67,48 @@ class WorkflowTests(unittest.TestCase):
         self.output = self.root / "delivery"
 
     def seal(self):
-        seal_revision(
-            self.package,
-            hardware_id="arm",
-            revision="r1",
-            owner="mechanical",
-            system="handoff",
-            reference="fixture/arm/r1",
-            summary="Control test",
+        from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+
+        identity = {
+            "kind": "source-revision",
+            "handoff_digest": digest({"fixture": "assembly.SLDASM"}),
+            "main_assembly": "assembly.SLDASM",
+            "configuration": "Default",
+            "hardware_id": "arm",
+            "records": [],
+        }
+        write_json(
+            self.package / "source.json",
+            {
+                "schema_version": SOURCE_RECORD_SCHEMA,
+                "source_revision_id": digest(identity),
+                "identity": identity,
+                "selection": {
+                    "main_assembly": "assembly.SLDASM",
+                    "configuration": "Default",
+                    "hardware_id": "arm",
+                    "hardware_source": "cad",
+                },
+                "metadata": {
+                    "revision": "r1",
+                    "owner": "mechanical",
+                    "control": {"system": "handoff", "reference": "fixture/arm/r1"},
+                    "change_summary": "Control test",
+                    "change_summary_source": "submission",
+                },
+            },
         )
 
-    def test_inspection_requires_mechanical_revision(self):
+    def test_inspection_defers_until_the_content_identity_record_exists(self):
         report = steps.inspect_prepared_input(self.package)
-        self.assertFalse(report["passed"])
-        self.assertIn("input.cad_revision", [e["code"] for e in report["errors"]])
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertIn("input.source_identity_pending", [row["code"] for row in report["warnings"]])
         self.seal()
-        self.assertTrue(steps.inspect_prepared_input(self.package)["passed"])
+        report = steps.inspect_prepared_input(self.package)
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertNotIn("input.source_identity_pending", [row["code"] for row in report["warnings"]])
+        self.assertEqual(report["cad_revision"]["hardware_id"], "arm")
+        self.assertEqual(report["cad_revision"]["revision"], "r1")
 
     def acquisition_without_admin(self):
         """Byte-binding control only; these placeholders do not qualify CAD."""
@@ -113,10 +139,9 @@ class WorkflowTests(unittest.TestCase):
         self.acquisition_without_admin()
         report = steps.inspect_prepared_input(self.package)
         self.assertTrue(report["passed"], report["errors"])
-        self.assertIsNone(report["input"]["hardware_id"])
+        self.assertIsNone(report["input"])
         self.assertIsNone(report["cad_revision"])
-        self.assertFalse((self.package / "cad-revision.json").exists())
-        self.assertIn("input.cad_revision_pending", [row["code"] for row in report["warnings"]])
+        self.assertIn("input.source_identity_pending", [row["code"] for row in report["warnings"]])
         bundle = self.root / "unpublished"
         bundle.mkdir()
         shutil.copytree(self.package, bundle / "input")
@@ -125,37 +150,19 @@ class WorkflowTests(unittest.TestCase):
                 steps, "tool_record", return_value={"release": {"schema_version": "solidworks-to-urdf.release/v1"}}
             ),
             patch("description_pipeline.repository.urdf_pr.submit_bundle") as publish,
-            self.assertRaisesRegex(PipelineError, "authored CAD hardware"),
+            self.assertRaisesRegex(PipelineError, "input/source.json"),
         ):
             steps.publish_model(bundle, self.root / "repository")
         publish.assert_not_called()
 
-    def test_absent_admin_does_not_waive_binding_or_malformed_revision(self):
-        self.acquisition_without_admin()
-        (self.package / "part.SLDPRT").write_bytes(b"changed after acquisition")
-        self.assertFalse(steps.inspect_prepared_input(self.package)["passed"])
-        # Rebind the intentionally changed fixture, then supply an invalid revision.
-        (self.package / "discovery/native-discovery.json").unlink()
-        self.acquisition_without_admin()
-        write_json(self.package / "cad-revision.json", {"hardware_id": None})
+    def test_malformed_content_identity_is_refused(self):
+        write_json(self.package / "source.json", {"schema_version": "x"})
         report = steps.inspect_prepared_input(self.package)
         self.assertFalse(report["passed"])
-        self.assertIn("input.cad_revision", [row["code"] for row in report["errors"]])
-
-    def test_complete_admin_cannot_hide_a_deleted_revision(self):
-        author, record = self.acquisition_without_admin()
-        author["hardware_id"] = "arm"
-        record["identity"].update(
-            hardware_id="arm", revision="r1", owner="mechanical", change_summary="fixture",
-            control={"system": "handoff", "reference": "fixture/r1"},
-        )
-        path = self.package / "discovery/native-discovery.json"
-        write_json(path, record)
-        author["provenance"]["discovery_sha256"] = file_digest(path)
-        write_json(self.package / "robot.yaml", author)
-        report = steps.inspect_prepared_input(self.package)
-        self.assertFalse(report["passed"])
-        self.assertIn("requires its generated", report["errors"][-1]["message"])
+        self.assertIn("input.source_identity", [row["code"] for row in report["errors"]])
+        # Changed engineering bytes stay bound at the gates that own the frozen
+        # package (steps.bind_discovery) and the delivery subject (verify_discovery),
+        # not in the identity inspection.
 
     def test_linux_never_opens_native_cad_and_keeps_failure_evidence(self):
         self.seal()
@@ -459,7 +466,7 @@ class WorkflowTests(unittest.TestCase):
         steps._archive_input(self.package, target)
         self.assertEqual(original, (target / "input/assembly.SLDASM").read_bytes())
         self.assertEqual(original, (self.package / "assembly.SLDASM").read_bytes())
-        self.assertTrue((target / "input/cad-revision.json").is_file())
+        self.assertTrue((target / "input/source.json").is_file())
 
     def test_concurrent_output_writer_is_refused(self):
         with solidworks.output_lock(self.output), self.assertRaises(PipelineError), solidworks.output_lock(self.output):

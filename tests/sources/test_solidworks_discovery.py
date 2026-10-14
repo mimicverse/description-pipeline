@@ -1,9 +1,9 @@
 """Native CAD-only discovery: generation, blocking findings and independent replay.
 
 A fake native backend replays a recorded raw record; nothing here touches
-SolidWorks.  The tests pin the generated package (robot.yaml + revision +
-discovery record), the mandatory findings for missing native facts, and the
-independent verifier that re-derives every claim from the bound record.
+SolidWorks.  The tests pin the generated package (source.json + discovery
+record), the mandatory findings for missing native facts, and the independent
+verifier that re-derives every claim from the bound record.
 """
 
 from __future__ import annotations
@@ -16,8 +16,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
-
-import yaml
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
@@ -37,8 +35,11 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
+from description_pipeline.schemas import SOURCE_RECORD_SCHEMA  # noqa: E402
 from description_pipeline.verification.native_discovery import (  # noqa: E402
     rebuild_interface_frames,
+    rebuild_joint_facts,
+    rebuild_rigid_bodies,
     verify_discovery,
 )
 
@@ -417,24 +418,31 @@ class DiscoveryTests(unittest.TestCase):
         self.assertRegex(result.handoff_sha256, r"^[0-9a-f]{64}$")
         self.assertNotEqual(result.handoff_sha256, result.prepared_sha256)
         self.assertEqual(result.prepared_sha256, digest(inventory(output)))
-        self.assertTrue((output / "robot.yaml").is_file())
-        self.assertTrue((output / "cad-revision.json").is_file())
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        provenance = document["provenance"]
-        self.assertEqual(provenance["generator"], "native-discovery")
-        self.assertEqual(provenance["contract"], CONTRACT)
-        self.assertEqual(provenance["native_inventory_sha256"], result.handoff_sha256)
-        self.assertEqual(provenance["discovery_sha256"], result.discovery_sha256)
+        self.assertTrue((output / "source.json").is_file())
+        self.assertFalse((output / "robot.yaml").exists())
+        self.assertFalse((output / "cad-revision.json").exists())
+        record = json.loads((output / "source.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["schema_version"], SOURCE_RECORD_SCHEMA)
+        self.assertEqual(record["identity"]["kind"], "source-revision")
+        self.assertEqual(record["identity"]["hardware_id"], "nd_fixture")
+        self.assertEqual(record["identity"]["handoff_digest"], result.handoff_sha256)
+        self.assertEqual(record["metadata"]["revision"], "r1")
+        self.assertEqual(record["selection"]["hardware_source"], "cad")
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["generator"], "native-discovery")
+        self.assertEqual(payload["contract"], CONTRACT)
+        self.assertEqual(payload["handoff_sha256"], result.handoff_sha256)
+        self.assertEqual(result.discovery_sha256, file_digest(output / "discovery/native-discovery.json"))
         # The native engineering files are copied through unmodified.
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
             self.assertEqual((output / name).read_bytes(), (source / name).read_bytes())
-        source_block = document["source"]
-        self.assertEqual([body["name"] for body in source_block["bodies"]], ["arm_link", "base_link"])
+        bodies = rebuild_rigid_bodies(payload)
+        self.assertEqual([body["name"] for body in bodies], ["arm_link", "base_link"])
         self.assertEqual(
-            {body["name"]: body["frame"]["coordinate_system"] for body in source_block["bodies"]},
+            {body["name"]: body["frame"]["coordinate_system"] for body in bodies},
             {"arm_link": "CS_arm_link", "base_link": "CS_base_link"},
         )
-        joint = source_block["joints"][0]
+        joint = rebuild_joint_facts(payload, output)[0]
         self.assertEqual(joint["name"], "shoulder_pitch_joint")
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual((joint["parent"], joint["child"]), ("base_link", "arm_link"))
@@ -446,18 +454,9 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(evidence["file"].startswith("records/"))
         self.assertIn("limits", (output / evidence["file"]).read_text(encoding="utf-8"))
         self.assertEqual(evidence["anchor"], '"limits"')
-        revision = json.loads((output / "cad-revision.json").read_text(encoding="utf-8"))
-        self.assertEqual(revision["hardware_id"], "nd_fixture")
-        self.assertEqual(document["checks"]["expected_mass_kg"], [0.28, 0.32])
-        self.assertEqual(document["checks"]["expected_extent_m"], [0.35, 0.5])
-        self.assertEqual(
-            revision["cad_files"],
-            {
-                name: value
-                for name, value in inventory(output).items()
-                if Path(name).suffix.lower() in {".sldasm", ".sldprt"}
-            },
-        )
+        budget = json.loads((output / payload["budget"]["package_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(budget["robot"]["expected_mass_kg"], [0.28, 0.32])
+        self.assertEqual(budget["robot"]["expected_extent_m"], [0.35, 0.5])
         report = self._verify(output)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["joints"], 1)
@@ -466,10 +465,9 @@ class DiscoveryTests(unittest.TestCase):
         settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "arm_link"})
         result, _source, output = self._prepare(settings=settings)
         self.assertTrue(result.passed, result.findings)
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        names = [body["name"] for body in document["source"]["bodies"]]
-        self.assertIn("arm_link", names)
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        names = [body["name"] for body in rebuild_rigid_bodies(payload)]
+        self.assertIn("arm_link", names)
         self.assertEqual(payload["frozen_names"].get("arm-1"), "arm_link")
         self.assertTrue(self._verify(output)["passed"])
 
@@ -481,9 +479,8 @@ class DiscoveryTests(unittest.TestCase):
             (other / "budget.json").write_bytes(content)
             for roots in ((records, other), (other, records)):
                 with self.subTest(content=content, roots=roots):
-                    result, _source, output = self._prepare(settings=DiscoverySettings(record_roots=roots))
+                    result, _source, _output = self._prepare(settings=DiscoverySettings(record_roots=roots))
                     self.assertIn("discovery.record_ambiguous", self._codes(result))
-                    self.assertFalse((output / "robot.yaml").exists())
                     finding = next(f for f in result.findings if f["code"] == "discovery.record_ambiguous")
                     self.assertEqual(
                         finding["detail"],
@@ -568,9 +565,9 @@ class DiscoveryTests(unittest.TestCase):
                     mutate=mutate, settings=DiscoverySettings(record_roots=(records,))
                 )
                 self.assertTrue(result.passed, result.findings)
-                self.assertEqual(
-                    yaml.safe_load((output / "robot.yaml").read_text())["checks"]["expected_mass_kg"], bounds
-                )
+                payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+                budget = json.loads((output / payload["budget"]["package_file"]).read_text(encoding="utf-8"))
+                self.assertEqual(budget["robot"]["expected_mass_kg"], bounds)
                 self.assertTrue(self._verify(output)["passed"])
 
     def test_record_bytes_are_parsed_hashed_and_embedded_from_one_read(self):
@@ -601,9 +598,8 @@ class DiscoveryTests(unittest.TestCase):
         budget = next(item for item in payload["records"] if item["reference"] == "budget.json#robot")
         self.assertEqual((output / budget["package_file"]).read_bytes(), original)
         self.assertEqual(budget["sha256"], file_digest(output / budget["package_file"]))
-        self.assertEqual(
-            yaml.safe_load((output / "robot.yaml").read_text())["checks"]["expected_mass_kg"], [0.28, 0.32]
-        )
+        budget_entry = json.loads((output / payload["budget"]["package_file"]).read_text(encoding="utf-8-sig"))
+        self.assertEqual(budget_entry["robot"]["expected_mass_kg"], [0.28, 0.32])
         self.assertEqual((records / "budget.json").read_bytes(), replacement)
         self.assertTrue(self._verify(output)["passed"])
 
@@ -642,10 +638,10 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        base = next(body for body in document["source"]["bodies"] if body["name"] == "base_link")
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        base = next(body for body in rebuild_rigid_bodies(payload) if body["name"] == "base_link")
         self.assertEqual(base["components"], ["a_mount-1", "base-1"])
-        self.assertEqual(document["source"]["joints"][0]["parent"], "base_link")
+        self.assertEqual(rebuild_joint_facts(payload, output)[0]["parent"], "base_link")
         report = self._verify(output)
         self.assertTrue(report["passed"], report["errors"])
 
@@ -767,12 +763,12 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        bodies = {body["name"]: body for body in document["source"]["bodies"]}
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        bodies = {body["name"]: body for body in rebuild_rigid_bodies(payload)}
         self.assertEqual(bodies["base_link"]["components"], ["base-1"])
         self.assertEqual(bodies["base_link"]["frame"]["coordinate_system"], "CS_base_link")
         self.assertEqual(bodies["arm_link"]["components"], ["arm-1"])
-        frames = {frame["name"]: frame for frame in document["source"]["frames"]}
+        frames = {frame["name"]: frame for frame in rebuild_interface_frames(payload)}
         self.assertEqual(
             frames["tool_flange"],
             {
@@ -782,7 +778,7 @@ class DiscoveryTests(unittest.TestCase):
                 "coordinate_system": "SCS_tool_flange",
             },
         )
-        joints = document["source"]["joints"]
+        joints = rebuild_joint_facts(payload, output)
         self.assertEqual(len(joints), 1)
         self.assertEqual((joints[0]["parent"], joints[0]["child"]), ("base_link", "arm_link"))
         # The grounding mates add no joint and never rewrite the raw evidence.
@@ -995,9 +991,9 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("must become the CS_base_link body", must_become["message"])
         self.assertEqual(must_become["detail"]["datum"], "CS_torso")
         self.assertFalse(any("full rank" in item["message"] for item in result.findings))
-        derived = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))["derived"]
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
         self.assertEqual(
-            {tuple(body["components"]): body["name"] for body in derived["bodies"]},
+            {tuple(body["components"]): body["name"] for body in rebuild_rigid_bodies(payload)},
             {("arm-1",): "base_link", ("base-1",): "torso"},
         )
 
@@ -1041,11 +1037,10 @@ class DiscoveryTests(unittest.TestCase):
                 result, _source, output = self._prepare(mutate=mutate)
                 if not connected:
                     self.assertIn("discovery.root_missing", self._codes(result))
-                    self.assertFalse((output / "robot.yaml").exists())
                     continue
                 self.assertTrue(result.passed, result.findings)
-                document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-                base = next(body for body in document["source"]["bodies"] if body["name"] == "base_link")
+                payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+                base = next(body for body in rebuild_rigid_bodies(payload) if body["name"] == "base_link")
                 self.assertEqual(base["components"], ["base-1"])
                 self.assertEqual(base["frame"]["coordinate_system"], "CS_base_link")
                 report = self._verify(output)
@@ -1059,14 +1054,12 @@ class DiscoveryTests(unittest.TestCase):
         finding = next(item for item in result.findings if item["code"] == "discovery.identity_missing")
         self.assertFalse(finding["blocking"])
         self.assertEqual(finding["detail"]["publication_blocker"], "hardware_id")
-        self.assertEqual(result.revision_sha256, "")
         self.assertFalse((output / "cad-revision.json").exists())
-        self.assertTrue((output / "robot.yaml").is_file())
+        self.assertFalse((output / "source.json").exists())
         self.assertTrue((output / "discovery/native-discovery.json").is_file())
         self.assertTrue((output / "discovery/findings.json").is_file())
         payload = json.loads(result.discovery_path.read_text())
         self.assertIsNone(payload["identity"]["hardware_id"])
-        self.assertIsNone(result.source["hardware_id"])
 
     def test_each_absent_administrative_field_defers_publication(self):
         complete = {
@@ -1203,7 +1196,7 @@ class DiscoveryTests(unittest.TestCase):
         codes = self._codes(result)
         self.assertIn("discovery.mate_unsupported", codes)
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
-        for body in payload["derived"]["bodies"]:
+        for body in rebuild_rigid_bodies(payload):
             self.assertNotEqual(set(body["components"]), {"base-1", "arm-1"})
 
     def test_unsupported_freedom_pattern_blocks(self):
@@ -1288,7 +1281,6 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertIn("discovery.record_unreadable", self._codes(result))
-        self.assertFalse((output / "robot.yaml").exists())
         payload = json.loads((output / "discovery/findings.json").read_text(encoding="utf-8"))
         json.dumps(payload, allow_nan=False)
 
@@ -1337,8 +1329,8 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        joint = document["source"]["joints"][0]
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        joint = rebuild_joint_facts(payload, output)[0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 1.0, 0.0])
         self.assertEqual(self._verify(output)["passed"], True)
@@ -1425,7 +1417,7 @@ class DiscoveryTests(unittest.TestCase):
         codes = self._codes(result)
         self.assertIn("discovery.joint_unsupported_pattern", codes)
         payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
-        for body in payload["derived"]["bodies"]:
+        for body in rebuild_rigid_bodies(payload):
             self.assertNotEqual(set(body["components"]), {"base-1", "arm-1"})
 
     def test_bounded_travel_mates_keep_their_freedom(self):
@@ -1438,7 +1430,7 @@ class DiscoveryTests(unittest.TestCase):
             codes = self._codes(result)
             self.assertIn("discovery.joint_unsupported_pattern", codes, (mate_type, codes))
             payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
-            for body in payload["derived"]["bodies"]:
+            for body in rebuild_rigid_bodies(payload):
                 self.assertNotEqual(set(body["components"]), {"base-1", "arm-1"}, mate_type)
 
     def test_conflicting_joint_scalar_sources_block(self):
@@ -1481,8 +1473,8 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        frames = document["source"]["frames"]
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        frames = rebuild_interface_frames(payload)
         self.assertEqual(
             {frame["name"]: (frame["parent"], frame["coordinate_system"]) for frame in frames},
             {
@@ -1490,7 +1482,7 @@ class DiscoveryTests(unittest.TestCase):
                 "pinch": ("arm_link", "TCP_pinch"),
             },
         )
-        names = [body["name"] for body in document["source"]["bodies"]]
+        names = [body["name"] for body in rebuild_rigid_bodies(payload)]
         self.assertEqual(names, ["arm_link", "base_link"])
         self.assertTrue(self._verify(output)["passed"])
 
@@ -1509,16 +1501,11 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
         destination = self._deliver(output)
-        path = destination / "evidence/discovery.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["derived"].pop("frames")
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        support.seal_delivery(destination)
         report = verify_discovery(destination)
-        # The frozen derived copy is no longer a verification input (IF-17): the carrier is
-        # rebuilt from raw, so dropping the saved frame changes nothing; the engineered
-        # interface is still derived from the raw datum.
+        # The engineered interface is derived from the raw datum alone; no saved carrier
+        # exists that dropping a frame could suppress.
         self.assertTrue(report["passed"], report["errors"])
+        payload = json.loads((destination / "evidence/discovery.json").read_text(encoding="utf-8"))
         self.assertIn("pinch", [frame["name"] for frame in rebuild_interface_frames(payload)])
 
     def test_jcs_must_alias_the_child_datum(self):
@@ -1567,20 +1554,18 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("discovery.body_datum_owner_mismatch", self._codes(result))
 
     def test_duplicate_occurrence_cannot_overwrite_a_native_identity(self):
-        result, _source, output = self._prepare(
+        result, _source, _output = self._prepare(
             mutate=lambda payload: payload["components"].append(copy.deepcopy(payload["components"][0]))
         )
         self.assertIn("discovery.component_identity_invalid", self._codes(result))
-        self.assertFalse((output / "robot.yaml").exists())
 
     def test_duplicate_owned_datum_blocks_even_with_explicit_body_datum(self):
         def mutate(payload):
             payload["datums"].append(copy.deepcopy(payload["datums"][1]))
             payload["properties"]["components"] = {"arm-1": {"dp.body_datum": "CS_arm_link"}}
 
-        result, _source, output = self._prepare(mutate=mutate)
+        result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.datum_identity_duplicate", self._codes(result))
-        self.assertFalse((output / "robot.yaml").exists())
 
     def test_interface_suffix_must_already_be_snake_case(self):
         def mutate(payload):
@@ -1638,9 +1623,8 @@ class DiscoveryTests(unittest.TestCase):
             values["limits"]["lower"] = float("nan")
             path.write_text(json.dumps(values), encoding="utf-8")
 
-        result, _source, output = self._prepare(mutate=mutate)
+        result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.record_unreadable", self._codes(result))
-        self.assertFalse((output / "robot.yaml").exists())
         json.dumps(list(result.findings), allow_nan=False)
 
     def test_frozen_names_do_not_mask_a_native_datum_rename_after_resealing(self):
@@ -1651,13 +1635,6 @@ class DiscoveryTests(unittest.TestCase):
         payload = json.loads(path.read_text(encoding="utf-8"))
         next(datum for datum in payload["raw"]["datums"] if datum["name"] == "CS_arm_link")["name"] = "CS_renamed_link"
         path.write_text(json.dumps(payload), encoding="utf-8")
-        robot_path = output / "robot.yaml"
-        document = yaml.safe_load(robot_path.read_text(encoding="utf-8"))
-        next(body for body in document["source"]["bodies"] if body["name"] == "arm_link")["frame"][
-            "coordinate_system"
-        ] = "CS_renamed_link"
-        document["provenance"]["discovery_sha256"] = file_digest(path)
-        robot_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
         report = self._verify(output)
         self.assertTrue(next(check for check in report["checks"] if check["id"] == "discovery.binding")["passed"])
         self.assertIn("discovery.names", [item["code"] for item in report["errors"]])
@@ -1678,8 +1655,8 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        joint = document["source"]["joints"][0]
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        joint = rebuild_joint_facts(payload, output)[0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
         self.assertTrue(self._verify(output)["passed"])
@@ -1913,8 +1890,8 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
-        document = yaml.safe_load((output / "robot.yaml").read_text(encoding="utf-8"))
-        joint = document["source"]["joints"][0]
+        payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
+        joint = rebuild_joint_facts(payload, output)[0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
         self.assertEqual((joint["parent"], joint["child"]), ("base_link", "arm_link"))
@@ -1982,16 +1959,10 @@ class DiscoveryTests(unittest.TestCase):
         report = verify_discovery(without_record)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.file", [item["code"] for item in report["errors"]])
-        without_derived = self._deliver(output)
-        record_path = without_derived / "evidence" / "discovery.json"
-        payload = json.loads(record_path.read_text(encoding="utf-8"))
-        payload.pop("derived")
-        record_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        support.seal_delivery(without_derived)
-        report = verify_discovery(without_derived)
-        # The frozen derived copy is no longer a verification input (IF-17): the carrier is
-        # rebuilt from raw, so stripping it cannot weaken or fail the gate.
-        self.assertTrue(report["passed"], report["errors"])
+        frozen = self._deliver(output)
+        frozen_record = json.loads((frozen / "evidence" / "discovery.json").read_text(encoding="utf-8"))
+        # One current model: nothing is sealed beside the record the verifier rebuilds from.
+        self.assertNotIn("derived", frozen_record)
 
     def test_gate_is_mandatory_and_has_no_legacy_mode(self):
         result, _source, output = self._prepare()
@@ -1999,7 +1970,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(_native_discovery(self._deliver(output))["bodies"], 2)
         authored = self.tmp / "authored"
         authored.mkdir()
-        (authored / "robot.yaml").write_text("schema_version: x\n", encoding="utf-8")
+        (authored / "source.json").write_text("schema_version: x\n", encoding="utf-8")
         with self.assertRaises(PipelineError):
             _native_discovery(authored)
 
@@ -2204,8 +2175,8 @@ class DerivationSplitTests(unittest.TestCase):
         self.assertEqual([f["code"] for f in prepared.findings], [f["code"] for f in derived.findings])
         self.assertEqual(prepared.passed, derived.passed)
         self.assertEqual(
-            (self.tmp / "prepared" / "robot.yaml").read_bytes(),
-            (self.tmp / "derived" / "robot.yaml").read_bytes(),
+            (self.tmp / "prepared" / "source.json").read_bytes(),
+            (self.tmp / "derived" / "source.json").read_bytes(),
         )
 
     def test_derivation_refuses_a_selected_main_outside_the_record(self) -> None:
@@ -2318,7 +2289,7 @@ class DerivationSplitTests(unittest.TestCase):
 
     def test_preparation_refuses_authored_files_before_any_native_read(self) -> None:
         source, records = self._scene()
-        (source / "robot.yaml").write_text("schema_version: x\n", encoding="utf-8")
+        (source / "source.json").write_text("schema_version: x\n", encoding="utf-8")
 
         class ExplodingBackend:
             def discover_native(self, *args, **kwargs):  # pragma: no cover - must never run

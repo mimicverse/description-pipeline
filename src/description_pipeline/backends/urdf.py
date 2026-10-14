@@ -77,10 +77,6 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
     """
 
     data = robot.to_dict()
-    if data["constraints"]:
-        raise PipelineError("URDF v1 does not support closed-loop constraints")
-    if data.get("actuators") or data.get("sensors"):
-        raise PipelineError("URDF v1 requires explicit extensions for actuator or sensor definitions")
     document = ET.Element("robot", name=name)
     for link in data["links"]:
         node = ET.SubElement(document, "link", name=link["name"])
