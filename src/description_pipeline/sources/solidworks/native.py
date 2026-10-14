@@ -2704,11 +2704,13 @@ class SolidWorksBackend(CadBackend):
                 "reference_point": "center_of_mass",
                 "axes": "part_document_axes",
                 "use_system_units": True,
-                # Measured on the analytic fixture 2026-10-06 (SolidWorks
-                # 34.0.0): GetMomentOfInertia(0) equals the analytic standard
-                # tensor to 4e-20 for a rotated box, so the part document is
-                # read as-is; solidworks_standard is the only supported
-                # product convention.
+                # Recorded exactly as the API returned it.  The capture proves
+                # the live product convention from its own sealed dual reads
+                # and normalizes every recorded tensor to solidworks_standard
+                # before sealing (inertia_convention, 2026-10-15); the analytic
+                # fixture of 2026-10-06 stays the semantic anchor for what
+                # "standard" means.  Consumers refuse any record that bypassed
+                # the capture-side throat.
                 "product_convention": "solidworks_standard",
                 "volume_m3": float(_member(mp, "Volume")),
                 "density_kg_m3": float(_member(mp, "Density")),

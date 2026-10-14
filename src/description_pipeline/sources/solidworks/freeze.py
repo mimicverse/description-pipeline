@@ -21,9 +21,10 @@ from typing import Any
 from collections.abc import Callable, Sequence
 
 from .errors import BridgeError, ConfigError
+from .inertia_convention import normalize_capture_inertia
 from .native import session_materialization_path
 from .evidence import build_evidence, capture_environment
-from .jsonio import digest_json, sha256_file, write_json
+from .jsonio import digest_json, read_json, sha256_file, write_json
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
 from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
@@ -2340,6 +2341,13 @@ def _freeze_local(
         # Linux derives the scene without rewriting this native snapshot.
         write_json(staging / "raw" / "source_config.json", cfg)
 
+        # Product-convention proof and normalization, once, at the single
+        # throat where the raw native evidence is final: the sealed dual reads
+        # decide the family, a positive-products capture is rewritten to the
+        # standard convention, and the proof is sealed beside the documents
+        # before the evidence block and the manifest bind their digests.
+        _seal_inertia_convention(staging)
+
         source_inputs = _source_inputs(cfg, closure)
         identity = {
             "provider": SOURCE_KIND,
@@ -2421,6 +2429,42 @@ def _freeze_local(
         raise
     finally:
         activity.stop_keepalive()
+
+
+#: Every raw native document that records an inertia tensor, in write order.
+_CONVENTION_DOCUMENTS = (
+    "mass_properties.json",
+    "scene_raw.json",
+    "effective_instances.json",
+    "mass_closure.json",
+    "material_provenance.json",
+    "link_group_mass_properties.json",
+)
+
+
+def _seal_inertia_convention(staging: Path) -> None:
+    """The one throat: prove the product convention, normalize, seal the proof.
+
+    SolidWorks releases disagree on the sign of the products of inertia (see
+    ``inertia_convention``).  The family is proven from the capture's own sealed
+    dual reads; a positive-products capture has every recorded tensor's
+    products negated exactly once here, before the evidence block and the
+    manifest bind the raw bytes.  A capture that cannot prove exactly one
+    family refuses instead of sealing unqualified tensors.
+    """
+
+    raw = staging / "raw"
+    documents: dict[str, Any] = {}
+    for name in _CONVENTION_DOCUMENTS:
+        path = raw / name
+        if path.is_file():
+            documents[name] = read_json(path)
+    report = normalize_capture_inertia(documents)
+    if report["capture_transform"]["applied"]:
+        for name in _CONVENTION_DOCUMENTS:
+            if name in documents:
+                write_json(raw / name, documents[name])
+    write_json(raw / "inertia_convention.json", report)
 
 
 def freeze(

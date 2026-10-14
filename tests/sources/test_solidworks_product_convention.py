@@ -195,7 +195,7 @@ class ProductConventionTests(unittest.TestCase):
         self.assertIn("product_convention", str(raised.exception))
 
     def test_fixture_readings_also_require_an_explicit_convention(self) -> None:
-        payload = support.mass_payload(1.2, inertia=BENCHMARK["base-1"]["tensor"].tolist())
+        payload = support.mass_payload(1.2, (0.01, 0.02, 0.0), BENCHMARK["base-1"]["tensor"].tolist())
         payload["reference"].pop("product_convention")
         self.backend.components[0]["mass"] = payload
         snapshot = self._freeze("no-convention")
