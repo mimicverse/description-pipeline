@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,6 +11,7 @@ from unittest import mock
 from description_pipeline.sources.solidworks import isolation
 
 EXE = "/fixture/SLDWORKS.exe"
+_DEFAULT = object()
 
 
 class CadSessionFactsTests(unittest.TestCase):
@@ -26,9 +28,11 @@ class CadSessionFactsTests(unittest.TestCase):
         boot: float = 1000.0,
         owner: str | None = None,
         executable: str | None = None,
-        owner_pid: int | None = 99,
-        owner_creation: int | None = 555,
+        owner_pid: int | None = _DEFAULT,
+        owner_creation: int | None = _DEFAULT,
     ) -> None:
+        owner_pid = os.getpid() if owner_pid is _DEFAULT else owner_pid
+        owner_creation = 100 if owner_creation is _DEFAULT else owner_creation
         payload = {
             "pid": pid,
             "creation_time": creation,
@@ -43,7 +47,7 @@ class CadSessionFactsTests(unittest.TestCase):
         isolation.OwnershipStore(self.ledger).add(payload)
 
     def _facts(self, *, table, creation=None, boot: float = 1000.0):
-        reader = creation if creation is not None else (lambda pid: 555 if pid == 99 else 100)
+        reader = creation if creation is not None else (lambda pid: 100)
         return isolation.cad_session_facts(
             EXE,
             process_table=table,
@@ -132,6 +136,17 @@ class CadSessionFactsTests(unittest.TestCase):
         self._record(7, executable="/fixture/OTHER.exe")
         facts = self._facts(table=[(7, EXE)])
         self.assertEqual(facts["owned_sessions"], 0)
+        self.assertTrue(facts["external_session_detected"])
+        self.assertIn("cad_identity_unverified", facts["problems"])
+
+    def test_another_live_owner_pid_with_a_matching_creation_is_never_owned(self) -> None:
+        # The fake reader reports creation 100 for every pid, so the recorded
+        # owner identity (pid 999, creation 100) is internally consistent and
+        # its process is "live" - yet it is not THIS endpoint process.
+        self._record(7, owner_pid=999, owner_creation=100)
+        facts = self._facts(table=[(7, EXE)])
+        self.assertEqual(facts["owned_sessions"], 0)
+        self.assertFalse(facts["lease_held"])
         self.assertTrue(facts["external_session_detected"])
         self.assertIn("cad_identity_unverified", facts["problems"])
 

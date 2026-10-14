@@ -499,8 +499,9 @@ def cad_session_facts(
     read_creation = creation_time if creation_time is not None else _windows_creation_time
     current_boot = boot_epoch() if boot_epoch is not None else _windows_boot_epoch()
     tracked = _tracked_pids()
-    present = {row[0] for row in table}
     wanted = os.path.normcase(os.path.abspath(str(executable)))
+    endpoint_pid = os.getpid()
+    endpoint_creation = read_creation(endpoint_pid)
     owned = 0
     external = 0
     problems: list[str] = []
@@ -533,8 +534,17 @@ def cad_session_facts(
             owned += 1
             continue
         if record.get("owner") == _OWNER_TOKEN:
-            # This process's own launch counts only with its complete owner identity.
-            if _record_owner_status(record, present=present, read_creation=read_creation) == "live":
+            # This process's own launch counts only when the recorded owner is
+            # this very endpoint process: the writer stores its own pid and
+            # live creation moment, and neither may point at another process.
+            recorded_owner_pid = record.get("owner_pid")
+            recorded_owner_creation = record.get("owner_creation_time")
+            if (
+                recorded_owner_pid == endpoint_pid
+                and type(recorded_owner_creation) is int
+                and endpoint_creation is not None
+                and recorded_owner_creation == endpoint_creation
+            ):
                 owned += 1
             else:
                 problems.append("cad_identity_unverified")
