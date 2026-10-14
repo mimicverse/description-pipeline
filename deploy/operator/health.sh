@@ -135,7 +135,7 @@ PY
   then
     report PASS "connection solidworks_windows is an active IF-11 config-identity reference"
   else
-    report FAIL "connection solidworks_windows is missing, legacy-shaped, or not the active config identity"
+    report FAIL "connection solidworks_windows is missing, route-copied, or not the active config identity"
   fi
 else
   report FAIL "connection config identity cannot be verified: AIRFLOW_VENV is not executable"
