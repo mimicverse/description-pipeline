@@ -1783,6 +1783,10 @@ class InstallOrderingTests(unittest.TestCase):
             state = Path(tmp) / "state"
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
             self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "handoffs" / "frozen-original.dat").write_bytes(b"frozen")
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications" / "spec.json").write_bytes(b"spec")
             staged = self._maintenance(release, control_env, "stage", "gen-2")
             self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
             self._clone_generation_stubs(state)
@@ -1846,6 +1850,15 @@ class InstallOrderingTests(unittest.TestCase):
                 {},
             )
             self.assertEqual(opened.returncode, 0, opened.stderr)
+            closure = json.loads((scratch / "closure.json").read_text(encoding="utf-8"))
+            self.assertIn("handoff_root", closure["captured_roots"])
+            self.assertIn("record_root_0", closure["captured_roots"])
+            self.assertTrue((scratch / "handoff" / "frozen-original.dat").is_file())
+            self.assertTrue((scratch / "specifications" / "root-0" / "spec.json").is_file())
+            self.assertTrue(
+                {"certificate", "private_key", "database_dsn", "feishu_secret", "endpoint_token"}
+                <= set(closure["captured_secrets"])
+            )
             tampered = Path(tmp) / "tampered.enc"
             forged = bytearray(sealed.read_bytes())
             forged[-1] ^= 1

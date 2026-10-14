@@ -758,6 +758,16 @@ for name, target in (("handoff_root", "handoff"), ("artifact_root", "artifacts")
             shutil.rmtree(destination)
         shutil.copytree(source, destination, symlinks=False)
         copied[name] = str(destination)
+# The specification library the snapshot references travels with its files too; the diagnostic
+# and delivery evidence live under the artifact root captured above.
+for index, root in enumerate(resolved.get("specifications", {}).get("record_roots") or []):
+    source = Path(root)
+    if source.is_dir():
+        destination = backup / "specifications" / f"root-{index}"
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination, symlinks=False)
+        copied[f"record_root_{index}"] = str(destination)
 captured_secrets = {}
 secrets_dir = backup / "secrets"
 for key, value in (
