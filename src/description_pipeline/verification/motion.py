@@ -33,16 +33,22 @@ def _pose(value) -> np.ndarray:
     return matrix
 
 
-def _line_rotation(point, direction, angle: float) -> np.ndarray:
-    """Rotation by ``angle`` about the line through ``point`` along ``direction``."""
+def axis_rotation(axis, angle: float) -> np.ndarray:
+    """The 3x3 rotation by ``angle`` about a unit ``axis`` through the origin."""
 
-    axis = np.asarray(direction, dtype=float)
-    norm = float(np.linalg.norm(axis))
+    unit = np.asarray(axis, dtype=float)
+    norm = float(np.linalg.norm(unit))
     if norm == 0 or not math.isfinite(norm):
         raise PipelineError("A joint axis direction is not a finite vector")
-    axis = axis / norm
-    skew = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
-    rotation = np.eye(3) + math.sin(angle) * skew + (1 - math.cos(angle)) * (skew @ skew)
+    unit = unit / norm
+    skew = np.array([[0.0, -unit[2], unit[1]], [unit[2], 0.0, -unit[0]], [-unit[1], unit[0], 0.0]])
+    return np.eye(3) + math.sin(angle) * skew + (1 - math.cos(angle)) * (skew @ skew)
+
+
+def line_rotation(point, direction, angle: float) -> np.ndarray:
+    """Rotation by ``angle`` about the line through ``point`` along ``direction``."""
+
+    rotation = axis_rotation(direction, angle)
     anchor = np.asarray(point, dtype=float)
     matrix = np.eye(4)
     matrix[:3, :3] = rotation
@@ -124,7 +130,7 @@ def evaluate_motion(*, bodies, joints, interface, poses, tolerance=None) -> dict
             parent, child = groups.get(joint["parent"]), groups.get(joint["child"])
             if parent is None or child is None or parent not in group_world:
                 continue
-            group_world[child] = group_world[parent] @ _line_rotation(
+            group_world[child] = group_world[parent] @ line_rotation(
                 joint["axis_point"], joint["axis_dir"], float(poses.get(joint["id"], 0.0))
             )
             pending.remove(joint)

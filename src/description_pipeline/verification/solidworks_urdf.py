@@ -877,10 +877,7 @@ def _axis(authored, record, components, child_datum):
     reference = authored["axis_reference"]
     _require(isinstance(reference, dict), "Moving joints require a structured native shaft reference")
     _require(record["component"] == reference["component"], "Shaft evidence names another occurrence")
-    if reference.get("kind") == "reference_axis":
-        point, direction = _reference_axis_line(reference, record, components)
-    else:
-        point, direction = _cylinder_axis_line(reference, record, components)
+    point, direction = _axis_line(authored, record, components)
     authored_axis = _vector(authored["axis"])
     _require(abs(float(np.linalg.norm(authored_axis)) - 1) < 1e-8, "Authored joint axis is not a unit vector")
     axis = child_datum[:3, :3] @ authored_axis
@@ -892,6 +889,15 @@ def _axis(authored, record, components, child_datum):
         f"Joint origin/axis misses the native shaft by {offset:.9g} m / {math.degrees(angle):.9g} deg",
     )
     return {"offset_m": offset, "angle_deg": math.degrees(angle), "positive_direction": "author_axis_in_child_datum"}
+
+
+def _axis_line(authored, record, components):
+    """The native shaft line of one moving joint in zero-pose world coordinates."""
+
+    reference = authored["axis_reference"]
+    if reference.get("kind") == "reference_axis":
+        return _reference_axis_line(reference, record, components)
+    return _cylinder_axis_line(reference, record, components)
 
 
 def _reference_axis_line(reference, record, components):
@@ -950,6 +956,99 @@ def _cylinder_axis_line(reference, record, components):
     else:
         _require(record["coordinate_frame"] == "assembly", "Unknown shaft coordinate frame")
     return point, direction
+
+
+def _motion(authored, joints, components, body_datums, bodies, record):
+    """The motion.{joint} gate: non-zero follow re-derived from the native shaft line.
+
+    The motion owner re-derives, from the shaft evidence alone, where every
+    driven occurrence must be under positive and negative poses inside the
+    authored limits; the delivered graph is forward-kinematicked from its own
+    datums and signed axes.  A statically green delivery whose parent chain,
+    axis binding or frame relations are wrong diverges as soon as a pose is
+    non-zero.
+    """
+
+    from .motion import axis_rotation, evaluate_motion
+
+    name, child = authored["name"], authored["child"]
+    point, direction = _axis_line(authored, record, components)
+    limits = authored["limits"]
+    if authored["type"] == "continuous":
+        samples = (0.3, -0.4)
+    else:
+        middle = (float(limits["lower"]) + float(limits["upper"])) / 2
+        quarter = (float(limits["upper"]) - float(limits["lower"])) / 4
+        samples = (middle + quarter, middle - quarter)
+    parents = {joint["child"]: joint for joint in joints}
+    doc_bodies = [
+        {
+            "id": body["name"],
+            "group": body["name"],
+            "frame": body_datums[body["name"]].tolist(),
+            "leaves": [
+                {"id": component, "world": components[component].tolist()}
+                for component in body["components"]
+            ],
+        }
+        for body in bodies
+    ]
+    doc_joint = {
+        "id": name,
+        "type": authored["type"],
+        "parent": authored["parent"],
+        "child": child,
+        "axis_point": point.tolist(),
+        "axis_dir": direction.tolist(),
+        "stored_direction": direction.tolist(),
+        "limits": dict(limits),
+        "drive": {"effort": float(limits["effort"]), "velocity": float(limits["velocity"])},
+        "origin_parent_child": np.eye(4).ravel().tolist(),
+    }
+    interface = {
+        "name": "IF-" + name,
+        "on_parent": authored["parent"],
+        "on_child": child,
+        "axis_point": point.tolist(),
+        "axis_dir": direction.tolist(),
+    }
+
+    def model_transform(body_name, pose, memo):
+        if body_name in memo:
+            return memo[body_name]
+        if body_name not in parents:
+            value = body_datums[body_name]
+        else:
+            joint = parents[body_name]
+            offset = np.linalg.inv(body_datums[joint["parent"]]) @ body_datums[body_name]
+            if joint["name"] == name:
+                offset = offset.copy()
+                offset[:3, :3] = offset[:3, :3] @ axis_rotation(_vector(joint["axis"]), pose)
+            value = model_transform(joint["parent"], pose, memo) @ offset
+        memo[body_name] = value
+        return value
+
+    worst = 0.0
+    for pose in samples:
+        result = evaluate_motion(
+            bodies=doc_bodies, joints=[doc_joint], interface=interface, poses={name: pose}
+        )
+        _require(
+            result["interface"]["line_distance_m"] <= 1e-9 and result["interface"]["parallelism"] >= 1 - 1e-6,
+            f"{name}: the re-derived interface loses continuity at {pose:g}",
+        )
+        memo = {}
+        for body in bodies:
+            transform = model_transform(body["name"], pose, memo)
+            for component in body["components"]:
+                candidate = transform @ np.linalg.inv(body_datums[body["name"]]) @ components[component]
+                expected = np.asarray(result["world"][component], float)
+                worst = max(worst, float(np.max(np.abs(candidate - expected))))
+    _require(
+        worst <= POSITION_TOL_M,
+        f"{name}: the delivered graph diverges from the re-derived motion by {worst:.9g} m",
+    )
+    return {"samples": list(samples), "worst_m": worst}
 
 
 def _tree(document, base_pose):
@@ -1361,6 +1460,12 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
         if authored["type"] != "fixed":
             gates.add(
                 "shafts." + name, lambda a=authored: _axis(a, axis_map[a["name"]], components, body_datums[a["child"]])
+            )
+            gates.add(
+                "motion." + name,
+                lambda a=authored: _motion(
+                    a, source["joints"], components, body_datums, source["bodies"], axis_map[a["name"]]
+                ),
             )
     for frame in source.get("frames", []):
         gates.add("frames." + frame["name"], lambda f=frame: _frame(f, model, joints, links, datums, body_datums))

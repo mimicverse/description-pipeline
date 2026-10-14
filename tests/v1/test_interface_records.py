@@ -614,7 +614,11 @@ class InterfaceRecordTests(unittest.TestCase):
         self.assertEqual(ir.CHECK_POLICY_V1["fixed_checks"], sorted(FIXED_REQUIRED_CHECKS))
         self.assertEqual(set(required_checks()), set(FIXED_REQUIRED_CHECKS))
         # Pinned digest: generation, verification and the manifest consume this object.
-        self.assertEqual(ir.check_policy_digest(), "f475fb5acc8df5bc0edfd12e1431387decd40ab9865e3eb545744d1928453b66")
+        self.assertEqual(
+            ir.check_policy_digest(),
+            "5216a033fd838ce592df2f70d29cf74fd9aa1eb63c96daf2681a4f6e35d1207d",
+            "the motion.{joint} family changed the check policy; the digest is re-registered",
+        )
         bad = copy.deepcopy(ir.CHECK_POLICY_V1)
         bad.pop("fixed_checks")
         self.reject("check_policy_invalid", lambda: ir.validate_check_policy(bad))

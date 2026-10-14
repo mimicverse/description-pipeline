@@ -342,6 +342,7 @@ CHECK_POLICY_EXPANSIONS = (
     {"family": "geometry.{body}", "selector": "source.bodies[*].name"},
     {"family": "joints.{joint}", "selector": "source.joints[*].name"},
     {"family": "shafts.{joint}", "selector": "source.joints[*].name", "when": "type != fixed"},
+    {"family": "motion.{joint}", "selector": "source.joints[*].name", "when": "type != fixed"},
     {"family": "frames.{frame}", "selector": "source.frames[*].name"},
 )
 CHECK_POLICY_V1 = {

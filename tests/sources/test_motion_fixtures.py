@@ -155,6 +155,52 @@ class MotionFixtureTests(unittest.TestCase):
             "the candidate group relative must differ from the recorded invariant",
         )
 
+    def test_product_gate_compares_the_delivered_graph_under_motion(self):
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        base = np.eye(4)
+        tool = np.eye(4)
+        tool[:3, 3] = (0.0, 0.0, 0.5)
+        datums = {"base": base, "tool": tool}
+        components = {"base_part": base.copy(), "tool_part": tool.copy()}
+        bodies = [
+            {"name": "base", "components": ["base_part"]},
+            {"name": "tool", "components": ["tool_part"]},
+        ]
+        joints = [
+            {
+                "name": "hinge",
+                "type": "revolute",
+                "parent": "base",
+                "child": "tool",
+                "axis": [0.0, 0.0, 1.0],
+            }
+        ]
+        authored = {
+            "name": "hinge",
+            "type": "revolute",
+            "parent": "base",
+            "child": "tool",
+            "axis": [0.0, 0.0, 1.0],
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+            "axis_reference": {"component": "base_part", "feature_name": "Cyl1"},
+        }
+        record = {
+            "component": "base_part",
+            "surface": "cylinder",
+            "selector": {"feature_name": "Cyl1", "component": "base_part", "body_type": "solid"},
+            "body_type": "solid",
+            "radius_m": 0.01,
+            "coordinate_frame": "assembly",
+            "axis_point_m": [0.0, 0.0, 0.5],
+            "axis_direction": [0.0, 0.0, 1.0],
+        }
+        details = _motion(authored, joints, components, datums, bodies, record)
+        self.assertLessEqual(details["worst_m"], 5e-5)
+        flipped = {**record, "axis_direction": [0.0, 0.0, -1.0]}
+        with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
+            _motion(authored, joints, components, datums, bodies, flipped)
+
 
 if __name__ == "__main__":
     unittest.main()
