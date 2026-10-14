@@ -55,6 +55,7 @@ DAG_ID = "solidworks_to_urdf"
 PIPELINE_ID = "solidworks-to-urdf"
 #: One relative operator path inside the connection's intake allowlist.
 HANDOFF_PATH = "handoff/m3.0"
+TARGET_HARDWARE = "m3.0"
 REPOSITORY_SLUG = "example/m3.0"
 REPOSITORY_BASE = "feature/m3.0"
 
@@ -456,6 +457,7 @@ def main() -> int:
             "extra": {
                 "store_root": str(store_root),
                 "repositories": {REPOSITORY_SLUG: str(args.airflow_home / "smoke-repository")},
+                "targets": {TARGET_HARDWARE: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
                 "handoff_roots": [str(intake_root)],
                 "discovery": {"record_roots": [str(fixture_root / "records")]},
             },
@@ -545,7 +547,16 @@ def main() -> int:
         airflow = AirflowApi(f"http://127.0.0.1:{api_port}")
         token = _operator_jwt(args.venv, env)
         try:
-            airflow.trigger_dag_run(token, DAG_ID, run_id, {"handoff_path": str(intake)})
+            airflow.trigger_dag_run(
+                token,
+                DAG_ID,
+                run_id,
+                {
+                    "handoff_path": str(intake),
+                    "target_hardware": TARGET_HARDWARE,
+                    "change_summary": "scheduled control-fixture smoke",
+                },
+            )
         except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
             print(json.dumps({"ok": False, "stage": "portal_trigger", "error": str(error)}))
             return 1
