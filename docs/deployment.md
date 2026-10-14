@@ -437,3 +437,23 @@ Preserve every frozen input, delivery, diagnostic, signing key, job and ledger
 row created during the upgrade. Do not restore an older database or state snapshot;
 code rollback requires compatible persisted schemas. Published tags and assets
 remain immutable.
+
+## Endpoint stop and restart (settle protocol and lock refusal)
+
+Stopping the Windows endpoint for an upgrade follows one settle protocol: stop
+the endpoint task and wait until the port shows no listener and no writer
+processes remain (the stop scripts' sweep loop enforces exactly this and fails
+the stop on timeout); then start the task and verify liveness for at least three
+minutes - task Running, the 8765 listener PID continuous, authenticated
+`/health` ready. A start that refuses with `Another endpoint owns the state root
+or its ownership lock is unavailable` is transient: wait at least 60 seconds,
+retry once, and record both the refusal and the retry in the receipt; a second
+refusal stops the operator for inspection. While the interactive CAD machine is
+offline the solidworks tunnel unit may report activating/retrying: that is an
+external-state condition, recorded as such and never a deployment failure.
+
+Deployment installs place `inspect-release.py` from the release tree into the
+operator working directory; a generation switch observed without it (an old
+release tree) is a case for reinstalling the file, not a code change. There is
+no remaining `feature/<hardware>` PR-base rule on either line; the live rule is
+the well-formed branch name check.
