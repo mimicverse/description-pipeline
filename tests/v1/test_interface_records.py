@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from description_pipeline import interface_records as ir
-from description_pipeline.io import digest
+from description_pipeline.io import PipelineError, digest
 from description_pipeline.schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
@@ -1034,6 +1034,96 @@ class InterfaceRecordTests(unittest.TestCase):
         bad = copy.deepcopy(record)
         bad["metadata"]["change_summary_source"] = "guess"
         self.reject("source_record_invalid", lambda: ir.validate_source_record(bad))
+
+
+class QualificationKeyTests(unittest.TestCase):
+    """IF-14: the machine key is strictly (fact_id, scope, object_id)."""
+
+    def _item(self, **overrides) -> dict:
+        item = {
+            "schema_version": ir.QUALIFICATION_SCHEMA,
+            "fact_id": "inertia",
+            "scope": "",
+            "object_id": "base",
+            "status": "established",
+            "evidence": [{"record": "reports/input.json", "sha256": HEX}],
+        }
+        item.update(overrides)
+        return item
+
+    def test_identity_is_the_key_only(self):
+        item = self._item()
+        same_key = self._item(status="unqualified", evidence=[{"record": "model/robot.json", "sha256": HEX}])
+        self.assertEqual(ir.qualification_identity(item), ir.qualification_identity(same_key))
+        for mutation in (
+            {"fact_id": "geometry"},
+            {"object_id": "tool"},
+            {"scope": "instance:1"},
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(
+                    ir.qualification_identity(item),
+                    ir.qualification_identity(self._item(**mutation)),
+                )
+
+    def test_validator_refuses_unknown_shape_and_ungrounded_records(self):
+        self.assertEqual(self._item(), ir.validate_qualification(self._item()))
+        cases = (
+            {"status": "qualified"},
+            {"evidence": []},
+            {"evidence": [{"record": "reports/input.json"}]},
+            {"evidence": [{"record": "reports/input.json", "sha256": "0"}]},
+            {"fact_id": ""},
+            {"display": "可用运动"},
+        )
+        for mutation in cases:
+            with self.subTest(mutation=mutation), self.assertRaises(PipelineError) as raised:
+                ir.validate_qualification(self._item(**mutation))
+            self.assertEqual("qualification_invalid", str(raised.exception))
+
+    def test_resolver_refuses_missing_records_and_digest_mismatches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "reports").mkdir()
+            record = root / "reports/input.json"
+            record.write_bytes(b"sealed input")
+            item = self._item(
+                evidence=[
+                    {"record": "reports/input.json", "sha256": hashlib.sha256(b"sealed input").hexdigest()}
+                ]
+            )
+            ir.validate_qualification(item, resolve=root)
+            record.write_bytes(b"tampered input")
+            with self.assertRaises(PipelineError):
+                ir.validate_qualification(item, resolve=root)
+            record.unlink()
+            with self.assertRaises(PipelineError):
+                ir.validate_qualification(item, resolve=root)
+
+    def test_expansion_keeps_two_objects_apart_and_never_duplicates(self):
+        definition = {
+            "checks": {},
+            "source": {
+                "bodies": [{"name": "base"}, {"name": "tool"}],
+                "joints": [{"name": "hinge", "type": "revolute"}, {"name": "weld", "type": "fixed"}],
+                "frames": [{"name": "tool_tcp"}],
+            },
+        }
+        facts = ir.qualification_facts(definition)
+        keys = [(fact["fact_id"], fact["scope"], fact["object_id"]) for fact in facts]
+        self.assertEqual(len(keys), len(set(keys)), "the key never repeats")
+        self.assertIn(("inertia", "", "base"), keys)
+        self.assertIn(("inertia", "", "tool"), keys)
+        self.assertNotEqual(
+            ir.qualification_identity({"fact_id": "inertia", "scope": "", "object_id": "base"}),
+            ir.qualification_identity({"fact_id": "inertia", "scope": "", "object_id": "tool"}),
+        )
+        self.assertNotIn(("shafts", "", "weld"), keys, "a fixed joint has no shaft fact")
+        self.assertIn(("physics.expected_mass", "", ""), keys)
+        self.assertIn(("geometry.expected_extent", "", ""), keys)
+        for identifier in ir.CHECK_POLICY_V1["fixed_checks"]:
+            self.assertIn((identifier, "", ""), keys)
+        self.assertEqual(facts, ir.qualification_facts(definition), "recomputation is stable")
 
 
 if __name__ == "__main__":

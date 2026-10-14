@@ -504,7 +504,7 @@ def publish(
             _require_subject(staging, expected_subject)
             from .verification.solidworks_urdf import check_bundle, rebuilt_definition, require_qualified_report
 
-            report = require_qualified_report(check_bundle(staging), rebuilt_definition(staging))
+            report = require_qualified_report(check_bundle(staging), rebuilt_definition(staging), root=staging)
             if expected_subject and report.get("subject_sha256") != expected_subject:
                 raise PipelineError("Verified report is bound to a different subject")
             receipt.update(

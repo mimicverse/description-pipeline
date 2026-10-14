@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-from description_pipeline.interface_records import CHECK_POLICY_V1
+from description_pipeline.interface_records import CHECK_POLICY_V1, validate_qualification
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks import verify as oracle
 from description_pipeline.verification import solidworks_urdf as quality
@@ -1971,6 +1971,20 @@ class QualifiedReportInventoryTests(unittest.TestCase):
     """R18: the report inventory binds the independently rebuilt object set."""
 
     @staticmethod
+    def _qualifications(definition) -> list:
+        return [
+            {
+                "schema_version": quality.QUALIFICATION_SCHEMA,
+                "fact_id": fact["fact_id"],
+                "scope": fact["scope"],
+                "object_id": fact["object_id"],
+                "status": "established",
+                "evidence": [{"record": "reports/input.json", "sha256": "0" * 64}],
+            }
+            for fact in quality.qualification_facts(definition)
+        ]
+
+    @staticmethod
     def _definition() -> dict:
         return {
             "checks": {},
@@ -1982,17 +1996,18 @@ class QualifiedReportInventoryTests(unittest.TestCase):
         }
 
     @staticmethod
-    def _report(names) -> dict:
+    def _report(names, definition) -> dict:
         required = sorted(names)
         return {
             "passed": True,
             "required_checks": required,
             "checks": [{"id": name, "state": "passed", "passed": True} for name in required],
+            "qualifications": QualifiedReportInventoryTests._qualifications(definition),
         }
 
     def test_complete_rebuilt_inventory_passes(self):
         definition = self._definition()
-        quality.require_qualified_report(self._report(set(quality.required_checks(definition))), definition)
+        quality.require_qualified_report(self._report(set(quality.required_checks(definition)), definition), definition)
 
     def test_fixed_only_report_is_refused(self):
         definition = self._definition()
@@ -2001,11 +2016,11 @@ class QualifiedReportInventoryTests(unittest.TestCase):
         dynamic = required - fixed
         self.assertTrue(dynamic, "the rebuilt objects must expand dynamic gates")
         with self.assertRaises(PipelineError):
-            quality.require_qualified_report(self._report(fixed & required), definition)
+            quality.require_qualified_report(self._report(fixed & required, definition), definition)
 
     def test_unknown_object_gate_is_refused(self):
         definition = self._definition()
-        report = self._report(set(quality.required_checks(definition)) | {"inertia.nonexistent_body"})
+        report = self._report(set(quality.required_checks(definition)) | {"inertia.nonexistent_body"}, definition)
         with self.assertRaises(PipelineError):
             quality.require_qualified_report(report, definition)
 
@@ -2014,7 +2029,99 @@ class QualifiedReportInventoryTests(unittest.TestCase):
         other = self._definition()
         other["source"]["frames"] = []
         with self.assertRaises(PipelineError):
-            quality.require_qualified_report(self._report(set(quality.required_checks(other))), definition)
+            quality.require_qualified_report(self._report(set(quality.required_checks(other)), other), definition)
+
+
+class QualificationItemTests(unittest.TestCase):
+    """IF-14: the report's qualification items beside the checks."""
+
+    def _root(self) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "reports").mkdir()
+        (root / "model").mkdir()
+        (root / "urdf").mkdir()
+        write_json(root / "reports/input.json", {"probe": "sealed input"})
+        write_json(root / "model/robot.json", {"probe": "model"})
+        (root / "urdf/robot.urdf").write_text("<robot/>", encoding="utf-8")
+        return root
+
+    @staticmethod
+    def _definition() -> dict:
+        return {
+            "checks": {},
+            "source": {
+                "bodies": [{"name": "base"}, {"name": "tool"}],
+                "joints": [{"name": "hinge", "type": "revolute"}],
+                "frames": [],
+            },
+        }
+
+    @staticmethod
+    def _checks(definition) -> list:
+        return [
+            {"id": name, "state": "passed", "passed": True} for name in quality.required_checks(definition)
+        ]
+
+    def test_items_carry_one_identity_per_object_and_out_of_scope_budgets(self):
+        root = self._root()
+        definition = self._definition()
+        items = quality.qualifications(root, definition, self._checks(definition))
+        keys = [(item["fact_id"], item["scope"], item["object_id"]) for item in items]
+        self.assertEqual(len(keys), len(set(keys)), "the same fact never duplicates")
+        self.assertIn(("inertia", "", "base"), keys)
+        self.assertIn(("inertia", "", "tool"), keys)
+        statuses = {(item["fact_id"], item["object_id"]): item["status"] for item in items}
+        self.assertEqual(statuses[("physics.expected_mass", "")], "out_of_scope")
+        self.assertEqual(statuses[("geometry.expected_extent", "")], "out_of_scope")
+        self.assertEqual(statuses[("inertia", "base")], "established")
+        self.assertEqual(items, quality.qualifications(root, definition, self._checks(definition)))
+
+    def test_a_gate_that_did_not_establish_leaves_an_unqualified_fact(self):
+        root = self._root()
+        definition = self._definition()
+        items = quality.qualifications(root, definition, [])
+        statuses = {(item["fact_id"], item["object_id"]): item["status"] for item in items}
+        self.assertEqual(statuses[("inertia", "base")], "unqualified")
+        self.assertEqual(statuses[("physics.expected_mass", "")], "out_of_scope")
+
+    def test_missing_records_refuse_the_ungrounded_item(self):
+        root = self._root()
+        definition = self._definition()
+        (root / "model/robot.json").unlink()
+        items = quality.qualifications(root, definition, self._checks(definition))
+        inertia = next(item for item in items if item["fact_id"] == "inertia")
+        self.assertEqual(inertia["evidence"], [], "a missing record leaves no evidence")
+        with self.assertRaises(PipelineError):
+            validate_qualification(inertia)
+        report = {
+            "passed": True,
+            "required_checks": quality.required_checks(definition),
+            "checks": self._checks(definition),
+            "qualifications": items,
+        }
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition)
+
+    def test_tampered_evidence_digest_is_refused_at_the_boundary(self):
+        root = self._root()
+        definition = self._definition()
+        items = quality.qualifications(root, definition, self._checks(definition))
+        report = {
+            "passed": True,
+            "required_checks": quality.required_checks(definition),
+            "checks": self._checks(definition),
+            "qualifications": items,
+        }
+        quality.require_qualified_report(report, definition, root=root)
+        (root / "reports/input.json").write_bytes(b"tampered input")
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition, root=root)
+        write_json(root / "reports/input.json", {"probe": "sealed input"})
+        items[0]["evidence"] = [{"record": "reports/input.json", "sha256": "0" * 64}]
+        with self.assertRaises(PipelineError):
+            quality.require_qualified_report(report, definition, root=root)
 
 
 class OptionalDesignExpectationTests(unittest.TestCase):
@@ -2039,6 +2146,7 @@ class OptionalDesignExpectationTests(unittest.TestCase):
             "passed": True,
             "required_checks": required,
             "checks": [{"id": key, "state": "passed", "passed": True} for key in required],
+            "qualifications": QualifiedReportInventoryTests._qualifications(definition),
         }
         quality.require_qualified_report(report, definition)
         removed = copy.deepcopy(report)

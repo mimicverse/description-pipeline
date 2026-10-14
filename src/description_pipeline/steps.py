@@ -453,14 +453,14 @@ def verify_delivery(staging: Path, generated_subject: str, *, on_event=None) -> 
         "verify",
         "output",
         "verification.gates",
-        lambda: require_qualified_report(report, rebuilt_definition(staging)),
+        lambda: require_qualified_report(report, rebuilt_definition(staging), root=staging),
     )
     report = checked(
         on_event,
         "verify",
         "output",
         "verification.report_binding",
-        lambda: require_qualified_report(check_bundle(staging), rebuilt_definition(staging)),
+        lambda: require_qualified_report(check_bundle(staging), rebuilt_definition(staging), root=staging),
         describe=lambda value: {
             "passed": value.get("passed"),
             "subject_sha256": value.get("subject_sha256"),

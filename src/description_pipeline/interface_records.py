@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 
 from . import schemas as _schemas
 from .delivery import PIPELINE_ID
-from .io import PipelineError, artifact_path_parts, digest, file_digest, parse_data
+from .io import PipelineError, artifact_path_parts, confined, digest, file_digest, parse_data
 from .runtime import LINUX_GLIBC_BASELINE, RUNTIME_HOSTS, RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
 from .schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
@@ -36,6 +36,7 @@ from .schemas import (
     HEALTH_SCHEMA,
     INSTALL_RECORD_SCHEMA,
     PLATFORM_CONFIG_SCHEMA,
+    QUALIFICATION_SCHEMA,
     RESOURCE_POLICY_SCHEMA,
     SOURCE_RECORD_SCHEMA,
 )
@@ -384,6 +385,111 @@ def check_policy_digest() -> str:
     """Stable digest of the canonical check policy (manifests and reports bind it)."""
 
     return digest(validate_check_policy(CHECK_POLICY_V1))
+
+
+# --- IF-14 qualification machine keys --------------------------------------------
+
+QUALIFICATION_STATES = ("established", "unqualified", "out_of_scope")
+
+
+def qualification_key(item) -> tuple:
+    """The unique machine key of a qualification: strictly (fact_id, scope, object_id)."""
+
+    return (item["fact_id"], item["scope"], item["object_id"])
+
+
+def qualification_identity(item) -> str:
+    """Canonical identity of a qualification record.
+
+    Computed over the machine key only: status, evidence references and any
+    display text never enter it, so a changed conclusion or new evidence keeps
+    the qualification identity while a changed fact, subject or object does not.
+    """
+
+    fact_id, scope, object_id = qualification_key(item)
+    return digest({"fact_id": fact_id, "scope": scope, "object_id": object_id})
+
+
+def validate_qualification(item, *, resolve=None) -> dict:
+    """One qualification record: policy fact, three-state conclusion, evidence.
+
+    Evidence references must be delivered records with their exact digest; with
+    a ``resolve`` root, a missing record or digest mismatch refuses the record -
+    an ungrounded qualification is never downgraded to an unqualified one.
+    """
+
+    code = "qualification_invalid"
+    _exact_keys(item, {"schema_version", "fact_id", "scope", "object_id", "status", "evidence"}, code, "qualification")
+    _require(item["schema_version"] == QUALIFICATION_SCHEMA, code, {"where": "schema_version"})
+    _require(isinstance(item["fact_id"], str) and item["fact_id"], code, {"where": "fact_id"})
+    _require(isinstance(item["scope"], str), code, {"where": "scope"})
+    _require(isinstance(item["object_id"], str), code, {"where": "object_id"})
+    _require(item["status"] in QUALIFICATION_STATES, code, {"where": "status"})
+    evidence = item["evidence"]
+    _require(isinstance(evidence, list) and evidence, code, {"where": "evidence"})
+    for index, reference in enumerate(evidence):
+        where = f"evidence[{index}]"
+        _exact_keys(reference, {"record", "sha256"}, code, where)
+        _text(reference["record"], code, f"{where}.record")
+        _hex64(reference["sha256"], code, f"{where}.sha256")
+    if resolve is not None:
+        for reference in evidence:
+            path = confined(Path(resolve), reference["record"])
+            _require(path.is_file(), code, {"evidence": reference["record"], "reason": "missing"})
+            _require(
+                file_digest(path) == reference["sha256"],
+                code,
+                {"evidence": reference["record"], "reason": "digest mismatch"},
+            )
+    return item
+
+
+def qualification_facts(definition) -> list:
+    """The policy-defined qualification facts of a rebuilt definition (IF-14).
+
+    One entry per (fact, object) pair expanded from ``CHECK_POLICY_V1``: two
+    objects of one fact stay two identities and never merge, identical keys are
+    dropped so a fact is never recorded twice, and the policy's object filters
+    (a fixed joint has no shaft fact) apply exactly as they do to the required
+    checks.  The expectation facts are always present - an absent optional
+    budget is representable as ``out_of_scope``.  ``check`` is the expanded gate
+    whose outcome feeds the fact's conclusion; ``scope`` stays the model scope
+    until a fact applies to a narrower instance scope.
+    """
+
+    facts: list = []
+    seen = set()
+
+    def add(fact_id, check, object_id=""):
+        key = (fact_id, "", object_id)
+        if key in seen:
+            return
+        seen.add(key)
+        facts.append({"fact_id": fact_id, "scope": "", "object_id": object_id, "check": check})
+
+    for identifier in CHECK_POLICY_V1["fixed_checks"]:
+        add(identifier, identifier)
+    source = definition.get("source") or {}
+    for rule in CHECK_POLICY_V1["dynamic_expansions"]:
+        family, selector = rule["family"], rule["selector"]
+        if selector == "expectation:expected_mass_kg":
+            add("physics.expected_mass", family)
+        elif selector == "expectation:expected_extent_m":
+            add("geometry.expected_extent", family)
+        elif selector == "source.bodies[*].name":
+            for body in source.get("bodies", []):
+                add(family.split(".", 1)[0], family.format(body=body["name"]), body["name"])
+        elif selector == "source.joints[*].name":
+            for joint in source.get("joints", []):
+                if rule.get("when") == "type != fixed" and joint["type"] == "fixed":
+                    continue
+                add(family.split(".", 1)[0], family.format(joint=joint["name"]), joint["name"])
+        elif selector == "source.frames[*].name":
+            for frame in source.get("frames", []):
+                add(family.split(".", 1)[0], family.format(frame=frame["name"]), frame["name"])
+        else:
+            raise PipelineError(f"Unknown check-policy selector: {selector}")
+    return facts
 
 
 def validate_health(payload) -> dict:

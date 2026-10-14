@@ -24,7 +24,7 @@ from ..geometry import stl
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
-from ..interface_records import CHECK_POLICY_V1
+from ..interface_records import CHECK_POLICY_V1, QUALIFICATION_SCHEMA, qualification_facts, validate_qualification
 from ..stages import required_rows_complete
 from . import native_discovery as evidence
 from .consumer import load as load_consumer
@@ -161,7 +161,7 @@ def required_checks(definition=None):
     return sorted(identifiers)
 
 
-def require_qualified_report(report, definition):
+def require_qualified_report(report, definition, root=None):
     """Reject an incomplete/forged green flag before it can become a boundary pass.
 
     The executed gates must be exactly the required set expanded from the
@@ -170,6 +170,11 @@ def require_qualified_report(report, definition):
     A self-reported subset (for example fixed gates only) or a policy-shaped gate
     for an object that does not exist in the rebuilt inventory cannot pass: the
     required set is never taken from the report and never from author-side lists.
+
+    The report's qualification items must carry exactly the facts the rebuilt
+    definition expands, with their three-state conclusions and resolvable
+    evidence references: with a ``root``, a missing record or digest mismatch
+    refuses the ungrounded qualification instead of passing or downgrading it.
     """
 
     try:
@@ -197,6 +202,18 @@ def require_qualified_report(report, definition):
             and required_rows_complete(expected, rows),
             "URDF verification failed or required checks were not executed; see reports/quality.json",
         )
+        qualifications = report.get("qualifications")
+        facts = qualification_facts(definition)
+        _require(
+            isinstance(qualifications, list)
+            and sorted(
+                (item["fact_id"], item["scope"], item["object_id"]) for item in qualifications
+            )
+            == sorted((fact["fact_id"], fact["scope"], fact["object_id"]) for fact in facts),
+            "Quality report does not carry exactly the rebuilt definition's qualification facts",
+        )
+        for item in qualifications:
+            validate_qualification(item, resolve=root)
     except PipelineError as error:
         error.details = report
         raise
@@ -1215,6 +1232,7 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
         "passed": bool(gates.checks) and all(check["passed"] for check in gates.checks),
         "checks": gates.checks,
         "required_checks": required,
+        "qualifications": qualifications(root, definition, gates.checks) if isinstance(definition, dict) else [],
         "diagnostics": diagnostics,
     }
 
@@ -1236,6 +1254,61 @@ def _model(root):
     from ..model import Robot
 
     return Robot.from_dict(read_data(confined(root, "model/robot.json"))).to_dict()
+
+
+#: The sealed records each qualification fact's conclusion is read from
+#: (relative to the delivery root): every fact binds the sealed input report and
+#: the delivered object record it was decided over.
+_QUALIFICATION_EVIDENCE = {
+    "physics.expected_mass": ("reports/input.json", "model/robot.json"),
+    "geometry.expected_extent": ("reports/input.json", "model/robot.json"),
+    "inertia": ("reports/input.json", "model/robot.json"),
+    "geometry": ("reports/input.json", "model/robot.json"),
+    "joints": ("reports/input.json", "urdf/robot.urdf"),
+    "shafts": ("reports/input.json", "urdf/robot.urdf"),
+    "frames": ("reports/input.json", "model/robot.json"),
+}
+
+
+def qualifications(root, definition, checks):
+    """The qualification items of the quality report (IF-14).
+
+    Two objects of one fact stay two identities; an absent optional budget is
+    ``out_of_scope``; a fact whose gate did not establish its conclusion is
+    ``unqualified``.  Evidence references bind the sealed records the conclusion
+    is read from; when a required record is absent the item carries no evidence,
+    and the check boundary refuses it as ungrounded rather than downgrading it.
+    """
+
+    rows = {check["id"]: check for check in checks}
+    expectations = definition.get("checks") or {}
+    items = []
+    for fact in qualification_facts(definition):
+        fact_id = fact["fact_id"]
+        budget = {
+            "physics.expected_mass": "expected_mass_kg",
+            "geometry.expected_extent": "expected_extent_m",
+        }.get(fact_id)
+        if budget is not None and budget not in expectations:
+            status = "out_of_scope"
+        else:
+            row = rows.get(fact["check"])
+            status = "established" if row is not None and row["passed"] else "unqualified"
+        records = _QUALIFICATION_EVIDENCE.get(fact_id, ("reports/input.json",))
+        evidence = []
+        if all((root / record).is_file() for record in records):
+            evidence = [{"record": record, "sha256": file_digest(root / record)} for record in records]
+        items.append(
+            {
+                "schema_version": QUALIFICATION_SCHEMA,
+                "fact_id": fact_id,
+                "scope": fact["scope"],
+                "object_id": fact["object_id"],
+                "status": status,
+                "evidence": evidence,
+            }
+        )
+    return items
 
 
 def _mass_closure_equality(root, definition=None):

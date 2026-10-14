@@ -464,7 +464,9 @@ class LinuxStore:
             if cached is not None:
                 return cached
             try:
-                report = require_qualified_report(check_bundle(delivery), rebuilt_definition(delivery))
+                report = require_qualified_report(
+                    check_bundle(delivery), rebuilt_definition(delivery), root=delivery
+                )
             except PipelineError as error:
                 verified_error = error
             else:

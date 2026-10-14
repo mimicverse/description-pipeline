@@ -43,6 +43,10 @@ PLATFORM_CONFIG_SCHEMA = "solidworks-to-urdf.platform/v1"
 #: instead of quoting an arbitrary policy string.
 CHECK_POLICY_SCHEMA = "solidworks-to-urdf.check-policy/v1"
 
+#: Qualification record machine schema (quality §警告与资格, IF-14): a policy
+#: fact plus its three-state conclusion and its evidence references.
+QUALIFICATION_SCHEMA = "solidworks-to-urdf.qualification/v1"
+
 
 def exporter_declaration_present(record: object) -> bool:
     """The shared producer/verifier predicate over the raw record's exporter block.
