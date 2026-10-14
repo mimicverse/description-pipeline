@@ -245,12 +245,12 @@ async function loadTargets(pick) {
       `/api/targets?folder=${encodeURIComponent(pick.top)}&main_assembly=${encodeURIComponent(main)}`
     );
   } catch {
-    // Selector stays empty; the run keeps today's deferred release-blocking behavior.
+    // The selector stays empty; without a configured target the submission is blocked.
   }
   const targets = payload.targets || [];
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = targets.length ? "不指定（发布保持待办）" : "平台未配置发布目标";
+  placeholder.textContent = targets.length ? "请选择发布目标" : "平台未配置发布目标";
   select.append(placeholder);
   for (const item of targets) {
     const option = document.createElement("option");
@@ -266,10 +266,24 @@ async function loadTargets(pick) {
     note.hidden = true;
     note.textContent = "";
   }
+  select.onchange = updateStartEnabled;
+  if (summary) summary.oninput = updateStartEnabled;
+  updateStartEnabled();
 }
 
 function updateStartEnabled() {
-  $("start-button").disabled = !(state.folderPick && !state.blockedPick && !state.uploading && state.assemblyChoice);
+  const target = $("target-select");
+  const summary = $("change-summary");
+  $("start-button").disabled = !(
+    state.folderPick &&
+    !state.blockedPick &&
+    !state.uploading &&
+    state.assemblyChoice &&
+    target &&
+    target.value &&
+    summary &&
+    summary.value.trim()
+  );
 }
 
 function submitRun(pick, { onProgress } = {}) {
@@ -278,9 +292,17 @@ function submitRun(pick, { onProgress } = {}) {
     for (const item of pick.records) form.append("files", item.file, item.path);
     if (state.assemblyChoice) form.append("main_assembly", state.assemblyChoice);
     const targetSelect = $("target-select");
-    if (targetSelect && targetSelect.value) form.append("target_hardware", targetSelect.value);
+    if (!targetSelect || !targetSelect.value) {
+      reject(new Error("发布目标为必填：请选择发布目标后重试"));
+      return;
+    }
+    form.append("target_hardware", targetSelect.value);
     const summaryInput = $("change-summary");
-    if (summaryInput && summaryInput.value.trim()) form.append("change_summary", summaryInput.value.trim());
+    if (!summaryInput || !summaryInput.value.trim()) {
+      reject(new Error("变更说明为必填：请填写后重试"));
+      return;
+    }
+    form.append("change_summary", summaryInput.value.trim());
     const request = new XMLHttpRequest();
     request.open("POST", "/api/runs");
     request.withCredentials = true;
