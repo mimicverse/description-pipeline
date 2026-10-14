@@ -16,7 +16,9 @@
 #       [-Previous DIR]
 param(
   [Parameter(Mandatory=$true)][ValidateSet('stage','promote','rollback','health','status')][string]$Verb,
-  [Parameter(Mandatory=$true)][string]$Binding,
+  # Untyped on purpose: PowerShell names are case-insensitive and L175 assigns the parsed
+  # binding object back into this variable; a [string] constraint would stringify it.
+  [Parameter(Mandatory=$true)]$Binding,
   [string]$StageDir = '',
   [string]$Previous = ''
 )
