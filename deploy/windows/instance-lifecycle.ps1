@@ -148,7 +148,8 @@ function Test-OwnershipLockRefusal([string]$generation, [object]$binding) {
   $config = Read-Json (Config-Path $generation)
   $lock = Join-Path ([string]$config.state_root) '.endpoint.lock'
   if (-not (Test-Path -LiteralPath $lock)) { return $false }
-  & (Runtime-Python $generation) -I -c "import sys;from description_pipeline.io import acquire_process_lock;acquire_process_lock(sys.argv[1])" $lock 2>$null | Out-Null
+  $probe = 'import sys;from pathlib import Path;from description_pipeline.io import acquire_process_lock;acquire_process_lock(Path(sys.argv[1]))'
+  cmd /c "`"$(Runtime-Python $generation)`" -I -c `"$probe`" `"$lock`" 2>nul" | Out-Null
   return ($LASTEXITCODE -ne 0)
 }
 function Get-WriterResidue([object]$binding) {
