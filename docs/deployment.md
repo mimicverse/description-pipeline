@@ -160,3 +160,9 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 端点令牌轮换在排空后更新两端受控副本，验证认证与配置身份再开启准入；飞书和 Git 凭据轮换同样使用受控配置切换与实测登录/访问。秘密值不进入日志、命令行或发行档案。
 
 显示记录删除不回收存储。Linux 封存证据默认不自动删除，显式保留策略只作用于无引用证据；Windows 已确认导入缓存的释放遵循[交换契约](contracts.md#exchange)。已被运行、发布或工程批准引用的文件不得自动清除。日志提供稳定错误码、操作身份、对象与证据位置；日志轮换不删除封存证据。
+
+## 端点停止与重启（settle 规程与锁拒绝）
+
+升级时停止 Windows 端点遵循统一 settle 规程：停止端点任务后等待端口无监听且无写入进程残留（停止脚本的清扫循环以此为准，超时即判停止失败）；随后启动任务并做 **≥3 分钟存活校验**——任务 Running、8765 监听 PID 连续、经令牌认证的 `/health` ready。启动若被拒绝并报 `Another endpoint owns the state root or its ownership lock is unavailable`：属瞬时状态，等待 **≥60 秒后仅重试一次**，并在回执中记录拒绝与重试；再次拒绝即停机排查。交互 CAD 机器离线期间，solidworks 隧道单元可能显示 activating/重试——这是**外部状态**，如实记录，绝不判为部署失败。
+
+部署安装会把发行树内的 `inspect-release.py` 装到操作员工作目录；若某代切换时缺少该件（旧发行树），按重装该文件处理，不是代码变更。两线均不存在 `feature/<hardware>` 的 PR base 规则；现役唯一规则=well-formed branch name 校验。
