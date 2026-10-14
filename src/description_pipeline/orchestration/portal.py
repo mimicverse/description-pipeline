@@ -1876,6 +1876,9 @@ class PortalApp:
                 )
                 if not change_summary:
                     raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
+                principal = _optional_str(parent_conf.get("submission_principal"))
+                if principal is None or not principal.strip():
+                    principal = session.principal
                 new_run_id = reserved_id or f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
                 if reserved_id is None:
                     self._write_rerun_journal(dag_run_id, new_run_id, stage)
@@ -1885,6 +1888,7 @@ class PortalApp:
                     "resume_from": stage,
                     "target_hardware": target_hardware,
                     "change_summary": change_summary,
+                    "submission_principal": principal,
                 }
                 parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 if parent_assembly is not None:

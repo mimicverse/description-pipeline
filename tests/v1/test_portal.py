@@ -2037,7 +2037,12 @@ class PortalTests(unittest.TestCase):
         status, _, _ = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
         self.assertEqual(status, 403)
         self.client.login()
-        for body in ({"stage": "bogus"}, {}, {"stage": "generate", "handoff_path": "/elsewhere"}):
+        for body in (
+            {"stage": "bogus"},
+            {},
+            {"stage": "generate", "handoff_path": "/elsewhere"},
+            {"stage": "generate", "submission_principal": "cli_forged:tenant-a:ou_attacker"},
+        ):
             with self.subTest(body=body):
                 status, _, _ = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", body)
                 self.assertEqual(status, 400)
@@ -2068,6 +2073,7 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
+                "submission_principal": FEISHU_PRINCIPAL,
                 "main_assembly": "parts/arm.SLDASM",
             },
         )
@@ -2078,11 +2084,13 @@ class PortalTests(unittest.TestCase):
 
     def test_rerun_attempt_carries_the_parent_publish_choices(self) -> None:
         self._seed_retryable_run()
+        self.airflow.dag_runs[DAG_RUN_ID]["conf"]["submission_principal"] = VIEWER_PRINCIPAL
         self.client.login()
         rows = self._rerun_rows()
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
             status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
         self.assertEqual(status, 202, body)
+        # The child keeps the original submission identity, not the acting operator's.
         self.assertEqual(
             self.airflow.trigger_payloads[-1]["conf"],
             {
@@ -2091,6 +2099,7 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
+                "submission_principal": VIEWER_PRINCIPAL,
             },
         )
 
@@ -2113,6 +2122,7 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": "m3.1",
                 "change_summary": "rebound summary",
+                "submission_principal": FEISHU_PRINCIPAL,
             },
         )
 
