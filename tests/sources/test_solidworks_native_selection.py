@@ -15,6 +15,7 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
     read_search_folders,
 )
 from description_pipeline.sources.solidworks.native_selection import (  # noqa: E402
+    REQUIRED_DECLARATIONS,
     NativeSelectionReader,
 )
 from description_pipeline.sources.solidworks.selection import (  # noqa: E402
@@ -23,6 +24,18 @@ from description_pipeline.sources.solidworks.selection import (  # noqa: E402
 )
 
 READER = "a" * 64
+
+#: A complete declared delivery identity (W6 pre-verification).  The closure
+#: reader refuses fail-closed when any of these is missing from the staged main.
+DECLARED = {
+    "dp.hardware_id": "m3.0",
+    "dp.revision": "M3.0.3_20261013",
+    "dp.owner": "structures",
+    "dp.change_summary": "fixture declaration set",
+    "dp.control.system": "git",
+    "dp.control.reference": "mimicverse/description@main",
+    "dp.delivery_configuration": "3.0 总装",
+}
 
 
 def sha256(data: bytes) -> str:
@@ -78,6 +91,7 @@ def readings(stage: Path, occurrences: list[dict], *, stored=None, **extra) -> d
         "stage_root": str(stage),
         "occurrences": occurrences,
         "stored_references": stored or {},
+        "identity_properties": dict(DECLARED),
         "search": {
             "folder_type": 0,
             "apis": ["ISldWorks.GetSearchFolders", "ISldWorks.SetSearchFolders"],
@@ -650,7 +664,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
     """The policy consumes what the real backend walk produces, not a payload."""
 
     def test_backend_closure_readings_feed_policy_and_seal(self) -> None:
-        from .test_solidworks_native_reader import _Component, _Doc
+        from .test_solidworks_native_reader import _Component, _Doc, _com_stubs
         from description_pipeline.sources.solidworks.native import SolidWorksBackend
 
         tmp = tempfile.TemporaryDirectory()
@@ -658,7 +672,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         stage = Path(tmp.name).resolve()
         files = write_stage(stage, {"robot.SLDASM": b"robot", "arm.SLDPRT": b"arm"})
         arm = _Component("arm-1", str(stage / "arm.SLDPRT"), doc=_Doc(str(stage / "arm.SLDPRT")))
-        robot = _Doc(str(stage / "robot.SLDASM"), children=(arm,), configuration="默认")
+        robot = _Doc(
+            str(stage / "robot.SLDASM"), children=(arm,), configuration="默认", properties=dict(DECLARED)
+        )
 
         class FakeApp:
             RevisionNumber = "34.0.0"
@@ -717,7 +733,8 @@ class BackendShapeIntegrationTests(unittest.TestCase):
             "open_exception": None,
             "already_open": False,
         }
-        readings = backend.closure_readings(stage, "robot.SLDASM", files)
+        with _com_stubs():
+            readings = backend.closure_readings(stage, "robot.SLDASM", files)
 
         for key in ("before", "pinned", "observed_after_pin", "restored", "restore_error", "apis"):
             self.assertIn(key, readings["search"])
@@ -737,7 +754,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
 
     def test_real_walk_nested_materialization_seals_with_ultimate_owner(self) -> None:
-        from .test_solidworks_native_reader import _Component, _Doc
+        from .test_solidworks_native_reader import _Component, _Doc, _com_stubs
         from description_pipeline.sources.solidworks.native import SolidWorksBackend
 
         tmp = tempfile.TemporaryDirectory()
@@ -751,7 +768,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
             "bracket_a.stp-2", parent_doc, doc=_Doc(parent_doc), children=(child,)
         )
         arm = _Component("arm-1", str(stage / "arm.SLDPRT"), doc=_Doc(str(stage / "arm.SLDPRT")))
-        robot = _Doc(str(stage / "robot.SLDASM"), children=(arm, parent), configuration="默认")
+        robot = _Doc(
+            str(stage / "robot.SLDASM"), children=(arm, parent), configuration="默认", properties=dict(DECLARED)
+        )
 
         class FakeApp:
             RevisionNumber = "34.0.0"
@@ -810,7 +829,8 @@ class BackendShapeIntegrationTests(unittest.TestCase):
             "open_exception": None,
             "already_open": False,
         }
-        readings = backend.closure_readings(stage, "robot.SLDASM", files)
+        with _com_stubs():
+            readings = backend.closure_readings(stage, "robot.SLDASM", files)
         payload = NativeSelectionReader(
             walker=lambda stage_root, main, index: readings, reader_sha256=READER
         ).observe(stage, "robot.SLDASM", files)
@@ -836,6 +856,60 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
         self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
+
+
+class CuPreverifyTests(unittest.TestCase):
+    """W6: the CU pre-verification (probe-v4 check set) refuses before native work."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.stage = Path(self._tmp.name).resolve()
+        self.files = write_stage(
+            self.stage,
+            {"robot.SLDASM": b"robot-bytes", "arm.SLDPRT": b"arm-bytes"},
+        )
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def observe(self, **extra) -> dict:
+        occurrence_rows = [occurrence("arm-1", str(self.stage / "arm.SLDPRT"))]
+        raw = readings(self.stage, occurrence_rows, **extra)
+        reader = NativeSelectionReader(walker=lambda stage, main, files_: raw, reader_sha256=READER)
+        return reader.observe(self.stage, "robot.SLDASM", self.files)
+
+    def test_complete_declarations_seal_a_preverify_pass_receipt(self) -> None:
+        payload = self.observe()
+        preverify = payload["preverify"]
+        self.assertEqual(preverify["verdict"], "pass")
+        self.assertTrue(preverify["closure_ok"])
+        self.assertEqual(preverify["open_errors"], 0)
+        self.assertEqual(preverify["declarations_missing"], [])
+        self.assertEqual(preverify["declarations"]["dp.hardware_id"], "m3.0")
+        self.assertEqual(preverify["declarations"]["dp.delivery_configuration"], "3.0 总装")
+
+    def test_missing_declarations_refuse_before_native_work(self) -> None:
+        with self.assertRaises(SelectionError) as raised:
+            self.observe(identity_properties={"dp.hardware_id": "m3.0"})
+        error = raised.exception
+        self.assertEqual(error.code, "selection_declarations_missing")
+        problems = error.detail["problems"]
+        problem = next(item for item in problems if item["code"] == "selection_declarations_missing")
+        self.assertEqual(set(problem["missing"]), set(REQUIRED_DECLARATIONS) - {"dp.hardware_id"})
+        self.assertEqual(problem["document"], "robot.SLDASM")
+        self.assertEqual(problem["declarations"]["dp.hardware_id"], "m3.0")
+
+    def test_unreadable_declaration_set_refuses_with_the_reason(self) -> None:
+        with self.assertRaises(SelectionError) as raised:
+            self.observe(
+                identity_properties=None,
+                identity_properties_error="CadError: custom properties unreadable",
+            )
+        error = raised.exception
+        self.assertEqual(error.code, "selection_declarations_missing")
+        problem = next(item for item in error.detail["problems"] if item["code"] == "selection_declarations_missing")
+        self.assertEqual(problem["declarations_error"], "CadError: custom properties unreadable")
+        self.assertEqual(set(problem["missing"]), set(REQUIRED_DECLARATIONS))
 
 
 if __name__ == "__main__":
