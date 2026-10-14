@@ -146,8 +146,10 @@ class SplitWorkflowTests(unittest.TestCase):
                 repository_base="feature/robot",
             )
             capture = store.capture_dir(run_id)
-            write_json(capture / "input/robot.yaml", {"hardware_id": "robot"})
-            write_json(capture / "input/cad-revision.json", {"revision": "r1"})
+            write_json(
+                capture / "input/source.json",
+                {"identity": {"hardware_id": "robot"}, "metadata": {"revision": "r1"}},
+            )
             output = store.output_dir(run_id)
             (output / "input").mkdir(parents=True)
             write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": subject})
@@ -272,23 +274,59 @@ class SplitWorkflowTests(unittest.TestCase):
         ti = _RecordingTaskInstance()
         verified = {
             "run_id": RUN_ID,
-            "request": {"run_id": RUN_ID, "conn_id": "test"},
+            "request": {
+                "run_id": RUN_ID,
+                "package": "control",
+                "handoff_sha256": "b" * 64,
+                "conn_id": "test",
+                "linux_owned": True,
+            },
             "verify": {"state": "verified", "passed": True, "subject_sha256": SUBJECT},
             "repository_slug": "example/robot",
             "repository_base": "feature/robot",
             "from_stage": None,
         }
         config = SimpleNamespace(repositories={"example/robot": Path("/tmp/model-repository")})
-        with (
-            patch.object(module, "_linux_store", return_value=object()),
-            patch.object(module, "run_portable_stage", return_value=_passing_publish_receipt()),
-            patch.object(module, "config_from_airflow_connection", return_value=config),
-        ):
-            run_publish = module.dag.get_task("run_publish").python_callable
-            result = run_publish(verified, ti=ti)
-        self.assertEqual(result["publish"]["state"], "published")
-        self.assertTrue(result["publish"]["passed"])
-        self.assertEqual(result["publish"]["submission"]["url"], "https://github.com/example/robot/pull/1")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LinuxStore(Path(tmp))
+            store.update_meta(
+                RUN_ID,
+                state="published",
+                subject_sha256=SUBJECT,
+                repository_slug="example/robot",
+                repository_base="feature/robot",
+            )
+            capture = store.capture_dir(RUN_ID)
+            write_json(
+                capture / "input/source.json",
+                {"identity": {"hardware_id": "robot"}, "metadata": {"revision": "r1"}},
+            )
+            output = store.output_dir(RUN_ID)
+            (output / "input").mkdir(parents=True)
+            write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": SUBJECT})
+            write_json(
+                output / "reports/pr.json",
+                {
+                    "state": "published",
+                    "passed": True,
+                    "subject_sha256": SUBJECT,
+                    "url": "https://github.com/example/robot/pull/1",
+                    "commit": "c" * 40,
+                    "base": "feature/robot",
+                    "repository_slug": "example/robot",
+                    "branch": "work/solidworks/robot",
+                },
+            )
+            store.append_events(RUN_ID, protocol_events(subject=SUBJECT))
+            with (
+                patch.object(module, "_linux_store", return_value=store),
+                patch.object(module, "run_portable_stage", return_value=_passing_publish_receipt()),
+                patch.object(module, "config_from_airflow_connection", return_value=config),
+            ):
+                run_publish = module.dag.get_task("run_publish").python_callable
+                result = run_publish(verified, ti=ti)
+        self.assertEqual(result["submission"]["state"], "published")
+        self.assertEqual(result["submission"]["url"], "https://github.com/example/robot/pull/1")
         pushed = ti.values["engineering_stages"]
         self.assertEqual(next(item for item in pushed["stages"] if item["id"] == "publish")["state"], "completed")
 
