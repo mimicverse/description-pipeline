@@ -1,6 +1,7 @@
 // Actual-URDF viewer: three.js is bundled under /static/vendor and every mesh request goes back
 // through the portal's digest-verified artifact route. No external resources are fetched.
 import * as THREE from "/static/vendor/three.module.min.js";
+import { applyInteraction } from "/static/preview_logic.js";
 
 export function createViewer(container) {
   const scene = new THREE.Scene();
@@ -68,15 +69,21 @@ export function createViewer(container) {
     const dx = event.clientX - orbit.last.x;
     const dy = event.clientY - orbit.last.y;
     orbit.last = { x: event.clientX, y: event.clientY };
+    let next = null;
     if (orbit.dragging === "rotate") {
-      orbit.theta -= dx * 0.008;
-      orbit.phi = Math.min(Math.PI - 0.02, Math.max(0.02, orbit.phi - dy * 0.008));
+      next = applyInteraction(orbit, "orbit", [dx, dy]);
     } else {
       const right = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0);
       const up = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1);
-      const scale = orbit.radius * 0.0016;
-      orbit.target.addScaledVector(right, -dx * scale).addScaledVector(up, dy * scale);
+      next = applyInteraction(orbit, "pan", [dx, dy], {
+        right: [right.x, right.y, right.z],
+        up: [up.x, up.y, up.z],
+      });
     }
+    orbit.theta = next.theta;
+    orbit.phi = next.phi;
+    orbit.radius = next.radius;
+    orbit.target.set(next.target.x, next.target.y, next.target.z);
     updateCamera();
   }
 
@@ -89,7 +96,11 @@ export function createViewer(container) {
 
   function onWheel(event) {
     event.preventDefault();
-    orbit.radius = Math.min(500, Math.max(0.05, orbit.radius * Math.exp(event.deltaY * 0.001)));
+    const next = applyInteraction(orbit, "zoom", event.deltaY);
+    orbit.theta = next.theta;
+    orbit.phi = next.phi;
+    orbit.radius = next.radius;
+    orbit.target.set(next.target.x, next.target.y, next.target.z);
     updateCamera();
   }
 
@@ -321,6 +332,8 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
       axis: axisVector,
       lower: type === "continuous" ? -Math.PI : lower,
       upper: type === "continuous" ? Math.PI : upper,
+      effort: limit ? parseNumber(limit.getAttribute("effort"), 0) : null,
+      velocity: limit ? parseNumber(limit.getAttribute("velocity"), 0) : null,
       value: 0,
       set(value) {
         this.value = value;
@@ -401,7 +414,38 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
   }
   viewer.frame();
   if (onWarning) onWarning(warnings);
-  return { links, joints, warnings };
+  const linkRecords = [];
+  for (const [name, entry] of links) {
+    const inertial = entry.node.querySelector(":scope > inertial");
+    const massNode = inertial ? inertial.querySelector(":scope > mass") : null;
+    const inertiaNode = inertial ? inertial.querySelector(":scope > inertia") : null;
+    const origin = inertial ? originOf(inertial) : null;
+    linkRecords.push({
+      name,
+      mass_kg: massNode ? parseNumber(massNode.getAttribute("value"), 0) : null,
+      com_m: origin ? [origin.position.x, origin.position.y, origin.position.z] : null,
+      inertia_kg_m2: inertiaNode
+        ? {
+            ixx: parseNumber(inertiaNode.getAttribute("ixx"), 0),
+            ixy: parseNumber(inertiaNode.getAttribute("ixy"), 0),
+            ixz: parseNumber(inertiaNode.getAttribute("ixz"), 0),
+            iyy: parseNumber(inertiaNode.getAttribute("iyy"), 0),
+            iyz: parseNumber(inertiaNode.getAttribute("iyz"), 0),
+            izz: parseNumber(inertiaNode.getAttribute("izz"), 0),
+          }
+        : null,
+    });
+  }
+  const jointRecords = joints.map((joint) => ({
+    name: joint.name,
+    type: joint.type,
+    lower: joint.lower,
+    upper: joint.upper,
+    effort: joint.effort,
+    velocity: joint.velocity,
+    axis: [joint.axis.x, joint.axis.y, joint.axis.z],
+  }));
+  return { links, joints, warnings, records: { links: linkRecords, joints: jointRecords } };
 }
 
 export function buildJointControls(container, joints, { onInput } = {}) {

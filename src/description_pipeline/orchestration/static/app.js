@@ -3,6 +3,18 @@
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
 import { menuAction, overlayRun, resolveDeleted, resolveTitle } from "/static/run_history.js";
 import { activityPlacement, activityView } from "/static/activity.js";
+import {
+  closureRows,
+  ensureSingleViewer,
+  frameRows,
+  infoPanelRows,
+  jointRows,
+  linkRows,
+  previewExpansion,
+  stageEntersPreview,
+  stageSummaryRows,
+  summaryIdentity,
+} from "/static/preview_logic.js";
 
 const state = {
   csrf: null,
@@ -11,6 +23,9 @@ const state = {
   previewSubject: null,
   previewRequest: null,
   previewFiles: null,
+  previewData: null,
+  previewCollapsed: false,
+  previewCollapseFor: null,
   lastRun: null,
   folderPick: null,
   assemblyChoice: null,
@@ -425,15 +440,23 @@ function clearPreview() {
   state.previewRequest = null;
   state.previewSubject = null;
   state.previewFiles = null;
+  state.previewData = null;
+  state.previewCollapsed = false;
+  state.previewCollapseFor = null;
   state.controls = null;
   if (state.viewer) disposeRobot(state.viewer);
   $("viewer-card").hidden = true;
   $("viewer-placeholder").hidden = false;
   $("preview-meta").textContent = "";
+  $("preview-info").textContent = "";
   $("preview-diagnostic").hidden = true;
   $("preview-diagnostic").textContent = "";
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
+  $("preview-panels").querySelectorAll(".panel-table").forEach((node) => {
+    node.textContent = "";
+  });
+  $("preview-collapse").hidden = true;
   setError($("preview-note"), "");
   updatePreviewLayout();
 }
@@ -1257,6 +1280,41 @@ function renderStageDetail() {
   }
   root.append(summary);
 
+  // Lightweight per-stage preview: a data-bound summary with its necessity, so a reviewer
+  // reads the stage's outcome without expanding the raw evidence.
+  const run = state.lastRun && state.lastRun.dag_run_id === state.dagRunId ? state.lastRun : null;
+  const quick = stageSummaryRows(stage.id, {
+    files: state.previewFiles,
+    stage,
+    quality: state.previewData ? state.previewData.quality : null,
+    pr: run ? run.pr : null,
+    subjectSha256: state.previewSubject,
+  });
+  if (quick.rows.length) {
+    const block = document.createElement("div");
+    block.className = "stage-quick-summary";
+    const title = document.createElement("h4");
+    title.textContent = "轻量摘要";
+    block.append(title);
+    for (const row of quick.rows) {
+      const line = document.createElement("p");
+      line.className = "muted small";
+      const label = document.createElement("strong");
+      label.textContent = `${row.label}：`;
+      const value = document.createElement("code");
+      value.textContent = row.value;
+      line.append(label, value);
+      block.append(line);
+    }
+    if (quick.necessity) {
+      const note = document.createElement("p");
+      note.className = "muted small";
+      note.textContent = `必要性：${quick.necessity}`;
+      block.append(note);
+    }
+    root.append(block);
+  }
+
   const groups = [
     ["输入检查", stage.boundary.filter((row) => row.boundary === "input")],
     ["输出检查", stage.boundary.filter((row) => row.boundary === "output")],
@@ -1349,6 +1407,148 @@ function updatePreviewLayout() {
   const has = Boolean(state.previewSubject);
   workspace.classList.toggle("has-preview", has);
   workspace.classList.toggle("no-preview", !has);
+}
+
+function previewCollapseKey(runId) {
+  return `preview-collapsed:${runId}`;
+}
+
+// The 1.4.2 default: with a verified delivery the interactive preview is expanded, and the
+// collapse control is the only way back; entering the generate-URDF block re-expands it.
+function applyPreviewExpansion() {
+  const expansion = previewExpansion({
+    preview: state.previewSubject ? { subject_sha256: state.previewSubject } : null,
+    collapsed: state.previewCollapsed,
+  });
+  const card = $("viewer-card");
+  if (card && !card.hidden) card.classList.toggle("preview-collapsed", !expansion.expanded);
+  if (expansion.expanded && state.viewer) {
+    // Re-measuring after a collapse/expand avoids a zero-sized canvas on the next frame.
+    state.viewer.resize?.();
+    state.viewer.frame?.();
+  }
+  const button = $("preview-collapse");
+  button.hidden = !expansion.collapse_control;
+  button.textContent = expansion.expanded ? "收起预览" : "展开预览";
+  button.setAttribute("aria-expanded", expansion.expanded ? "true" : "false");
+}
+
+function togglePreviewCollapse() {
+  const runId = state.dagRunId;
+  state.previewCollapsed = !state.previewCollapsed;
+  try {
+    localStorage.setItem(previewCollapseKey(runId), state.previewCollapsed ? "1" : "0");
+  } catch {
+    // best-effort persistence
+  }
+  applyPreviewExpansion();
+}
+
+async function loadPreviewArtifactJson(artifactUrl, files, name, signal) {
+  if (!files || !Object.prototype.hasOwnProperty.call(files, name)) return null;
+  try {
+    const response = await fetch(artifactUrl(name), { credentials: "same-origin", signal });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return null;
+  }
+}
+
+function fillPanelTable(host, headers, rows) {
+  host.textContent = "";
+  const table = document.createElement("table");
+  table.className = "panel-grid";
+  const head = document.createElement("tr");
+  for (const title of headers) {
+    const cell = document.createElement("th");
+    cell.textContent = title;
+    head.append(cell);
+  }
+  table.append(head);
+  for (const row of rows) {
+    const line = document.createElement("tr");
+    for (const value of row) {
+      const cell = document.createElement("td");
+      cell.textContent = value === null || value === undefined || value === "" ? "—" : String(value);
+      line.append(cell);
+    }
+    table.append(line);
+  }
+  host.append(table);
+}
+
+async function renderPreviewPanels(preview, records, artifactUrl, signal) {
+  const data = {
+    robot: await loadPreviewArtifactJson(artifactUrl, preview.files, "model/robot.json", signal),
+    tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/tool.json", signal),
+    quality: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/quality.json", signal),
+  };
+  state.previewData = data;
+  const identity = summaryIdentity({ runId: state.dagRunId, subjectSha256: preview.subject_sha256 });
+  const info = $("preview-info");
+  info.textContent = "";
+  for (const row of infoPanelRows({
+    runId: identity.run_id,
+    subjectSha256: identity.subject_sha256,
+    tool: data.tool,
+    qualitySchema: data.quality ? data.quality.schema_version : null,
+    qualificationStates: data.quality ? data.quality.qualifications : null,
+  })) {
+    const key = document.createElement("dt");
+    key.textContent = row.key;
+    const value = document.createElement("dd");
+    value.textContent = row.value || "未记录";
+    info.append(key, value);
+  }
+  const limits = jointRows(records ? records.joints : []);
+  fillPanelTable(
+    $("panel-limits"),
+    ["关节", "类型", "下限", "上限", "力矩", "速度", "轴 (xyz)"],
+    limits.map((row) => [
+      row.name,
+      row.type,
+      row.lower === null ? null : row.lower.toFixed(4),
+      row.upper === null ? null : row.upper.toFixed(4),
+      row.effort,
+      row.velocity,
+      row.axis ? row.axis.map((value) => value.toFixed(3)).join(", ") : null,
+    ]),
+  );
+  $("limits-title").textContent = `限位 / 轴读数（${limits.length}）`;
+  const links = linkRows(records ? records.links : []);
+  fillPanelTable(
+    $("panel-links"),
+    ["链接", "质量 kg", "质心 m", "惯量 (kg·m²)"],
+    links.map((row) => [
+      row.name,
+      row.mass_kg === null ? null : row.mass_kg.toFixed(6),
+      row.com_m ? row.com_m.map((value) => value.toFixed(4)).join(", ") : null,
+      row.inertia_kg_m2
+        ? `ixx ${row.inertia_kg_m2.ixx.toFixed(6)} · iyy ${row.inertia_kg_m2.iyy.toFixed(6)} · izz ${row.inertia_kg_m2.izz.toFixed(6)}`
+        : null,
+    ]),
+  );
+  $("links-title").textContent = `链接/刚体质量惯量（${links.length}）`;
+  const frames = frameRows(data.robot ? data.robot.frames : []);
+  const closure = closureRows(data.quality ? data.quality.checks : []);
+  fillPanelTable(
+    $("panel-frames"),
+    ["坐标系 / 接口", "父级", "xyz (m)", "rpy (rad)"],
+    frames.map((row) => [
+      row.name,
+      row.parent,
+      row.xyz ? row.xyz.map((value) => value.toFixed(4)).join(", ") : null,
+      row.rpy ? row.rpy.map((value) => value.toFixed(4)).join(", ") : null,
+    ]),
+  );
+  fillPanelTable(
+    $("panel-closure"),
+    ["检查", "状态"],
+    closure.map((row) => [row.id, row.state]),
+  );
+  $("frames-title").textContent = `坐标系 / 接口位姿与物理闭合（${frames.length} / ${closure.length}）`;
 }
 
 function stopActivityTimer() {
@@ -1502,6 +1702,17 @@ function renderStepper() {
         // Remembering the chosen stage is best-effort only.
       }
       state.selectedStage = index;
+      if (stageEntersPreview(stage.id) && state.previewSubject) {
+        // Entering the generate-URDF block expands the interactive preview again; the
+        // collapse control stays available for every other stage.
+        state.previewCollapsed = false;
+        try {
+          localStorage.setItem(previewCollapseKey(runId), "0");
+        } catch {
+          // best-effort persistence
+        }
+        applyPreviewExpansion();
+      }
       if (state.lastRun) renderRun(state.lastRun);
       selectInspectTab("stage");
     });
@@ -2076,7 +2287,7 @@ async function loadPreview(dagRunId) {
     renderPreviewDiagnostic(preview);
     note.hidden = true;
     setError($("preview-note"), "");
-    if (!state.viewer) state.viewer = createViewer($("viewer"));
+    state.viewer = ensureSingleViewer(state, () => createViewer($("viewer"))).viewer;
     const artifactUrl = (name) =>
       `/api/runs/${encodeURIComponent(dagRunId)}/artifacts/${String(name)
         .split("/")
@@ -2096,11 +2307,23 @@ async function loadPreview(dagRunId) {
     });
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     state.controls = buildJointControls($("joint-controls"), loaded.joints, {});
+    $("joints-title").textContent = `关节滑杆（${loaded.joints.length}）`;
     state.previewSubject = preview.subject_sha256;
     state.previewFiles = preview.files || {};
+    if (state.previewCollapseFor !== dagRunId) {
+      state.previewCollapseFor = dagRunId;
+      try {
+        state.previewCollapsed = localStorage.getItem(previewCollapseKey(dagRunId)) === "1";
+      } catch {
+        state.previewCollapsed = false;
+      }
+    }
+    await renderPreviewPanels(preview, loaded.records, artifactUrl, request.signal);
+    if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.lastRun) renderRun(state.lastRun);
     $("viewer-card").hidden = false;
     $("viewer-placeholder").hidden = true;
+    applyPreviewExpansion();
     state.viewer.frame();
     updatePreviewLayout();
   } catch (error) {
@@ -2109,6 +2332,7 @@ async function loadPreview(dagRunId) {
     state.controls = null;
     state.previewSubject = null;
     state.previewFiles = null;
+    state.previewData = null;
     if (state.lastRun) renderRun(state.lastRun);
     $("joint-controls").textContent = "";
     updatePreviewLayout();
@@ -2375,6 +2599,7 @@ function wire() {
   $("reset-joints").addEventListener("click", () => {
     if (state.controls) state.controls.reset();
   });
+  $("preview-collapse").addEventListener("click", togglePreviewCollapse);
 }
 
 async function boot() {

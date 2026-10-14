@@ -117,13 +117,36 @@
           <div class="run-workspace no-preview">
             <div class="pane pane-preview">
               <div id="viewer-card" hidden>
+                <div class="viewer-head">
+                  <span class="viewer-title">URDF 交互预览</span>
+                  <button id="preview-collapse" type="button" class="ghost" aria-expanded="true" hidden>收起预览</button>
+                </div>
                 <div id="viewer" class="viewer"></div>
                 <p class="muted small" id="preview-meta"></p>
+                <dl class="meta preview-info" id="preview-info"></dl>
                 <p id="preview-diagnostic" class="viewer-note diagnostic-note" hidden></p>
                 <p class="viewer-note" id="viewer-note" hidden></p>
                 <div class="viewer-footer">
-                  <div id="joint-controls" class="joint-controls"></div>
-                  <button id="reset-joints" type="button" class="ghost">回到零位</button>
+                  <div class="panel-block">
+                    <p class="panel-title" id="joints-title">关节滑杆</p>
+                    <div id="joint-controls" class="joint-controls"></div>
+                    <button id="reset-joints" type="button" class="ghost">回到零位</button>
+                  </div>
+                </div>
+                <div id="preview-panels" class="preview-panels">
+                  <details class="preview-panel" open>
+                    <summary id="links-title">链接/刚体质量惯量</summary>
+                    <div class="panel-table" id="panel-links"></div>
+                  </details>
+                  <details class="preview-panel" open>
+                    <summary id="limits-title">限位 / 轴读数</summary>
+                    <div class="panel-table" id="panel-limits"></div>
+                  </details>
+                  <details class="preview-panel" open>
+                    <summary id="frames-title">坐标系 / 接口位姿与物理闭合</summary>
+                    <div class="panel-table" id="panel-frames"></div>
+                    <div class="panel-table" id="panel-closure"></div>
+                  </details>
                 </div>
               </div>
               <p id="viewer-placeholder" class="muted small viewer-placeholder">交付生成后这里显示 URDF 预览；未通过独立校验的交付只会作为诊断预览并明确标注。</p>
