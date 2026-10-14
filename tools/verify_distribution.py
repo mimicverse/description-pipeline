@@ -29,6 +29,7 @@ from description_pipeline.io import (
     write_json,
 )
 from description_pipeline.interface_records import release_domain_identity
+from description_pipeline.runtime import LINUX_PLATFORMS, TARGET_ABI, TARGET_PYTHON, WINDOWS_PLATFORMS
 
 
 def safe_members(names):
@@ -56,27 +57,22 @@ def _locked_pins(data: bytes) -> dict:
     return pins
 
 
-#: The release build's Linux glibc baseline: the offline builder resolves against
-#: manylinux_2_28, so spellings for a newer baseline are never installable here.
-LINUX_GLIBC_BASELINE = 28
-
-
 def _target_tags(system: str) -> set:
     """The installable tag set of the archive's target (CPython 3.12, x86_64).
 
     Built with ``packaging.tags`` so interpreter/ABI/platform combinations stay
     exactly those a real installer accepts - including the older-CPython abi3
     ladder and the generic ``any`` platform for pure wheels - and bound to the
-    same Linux/Windows role targets as the support matrix.
+    single release target rule (interpreter/ABI/glibc baseline) the support
+    matrix and the offline builder consume.
     """
 
-    if system == "windows":
-        platforms = ["win_amd64"]
-    else:
-        platforms = [f"manylinux_2_{minor}_x86_64" for minor in range(5, LINUX_GLIBC_BASELINE + 1)]
-        platforms += ["manylinux2014_x86_64", "manylinux2010_x86_64", "manylinux1_x86_64", "linux_x86_64"]
-    tags = set(cpython_tags(python_version=(3, 12), abis=["cp312", "abi3", "none"], platforms=platforms))
-    tags |= set(compatible_tags(python_version=(3, 12), interpreter="cp312", platforms=platforms))
+    platforms = WINDOWS_PLATFORMS if system == "windows" else LINUX_PLATFORMS
+    python_version = tuple(int(part) for part in TARGET_PYTHON.split("."))
+    tags = set(
+        cpython_tags(python_version=python_version, abis=[TARGET_ABI, "abi3", "none"], platforms=platforms)
+    )
+    tags |= set(compatible_tags(python_version=python_version, interpreter=TARGET_ABI, platforms=platforms))
     return tags
 
 

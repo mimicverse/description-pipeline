@@ -178,6 +178,7 @@ class RuntimeRoleTests(unittest.TestCase):
         self.assertEqual(support["roles"]["native"]["api"], "SolidWorks COM API")
         self.assertEqual(support["roles"]["portable"]["os"], "Linux")
         self.assertEqual(support["roles"]["portable"]["arch"], "x86_64")
+        self.assertEqual(support["roles"]["portable"]["glibc"], "2.28")
         for role, block in support["roles"].items():
             self.assertEqual(
                 block["packages"],
@@ -222,6 +223,39 @@ class RuntimeRoleTests(unittest.TestCase):
             self.assertNotEqual(renamed, records, "the health key set lives in the owner module")
             (copy / "interface_records.py").write_text(renamed, encoding="utf-8")
             self.assertNotEqual(interface_records.schema_definition_digest(Path(directory)), baseline)
+
+    def test_the_release_target_is_one_source_for_all_consumers(self):
+        from types import SimpleNamespace
+
+        from packaging.tags import Tag
+
+        from description_pipeline import runtime
+        from tools.build_release import target_arguments
+        from tools.verify_distribution import _target_tags
+
+        self.assertIn("manylinux_2_28_x86_64", runtime.LINUX_PLATFORMS)
+        self.assertIn("manylinux2014_x86_64", runtime.LINUX_PLATFORMS)
+        self.assertNotIn("manylinux_2_29_x86_64", runtime.LINUX_PLATFORMS)
+        bound = SimpleNamespace(
+            TARGET_PYTHON=runtime.TARGET_PYTHON,
+            TARGET_ABI=runtime.TARGET_ABI,
+            WINDOWS_PLATFORMS=runtime.WINDOWS_PLATFORMS,
+            LINUX_PLATFORMS=runtime.LINUX_PLATFORMS,
+        )
+        windows = target_arguments("windows", bound)
+        self.assertEqual(
+            [windows[index + 1] for index, item in enumerate(windows) if item == "--platform"],
+            ["win_amd64"],
+        )
+        self.assertIn(runtime.TARGET_ABI, windows)
+        linux = target_arguments("linux", bound)
+        self.assertEqual(
+            [linux[index + 1] for index, item in enumerate(linux) if item == "--platform"],
+            list(runtime.LINUX_PLATFORMS),
+        )
+        self.assertIn(Tag(runtime.TARGET_ABI, runtime.TARGET_ABI, "manylinux_2_28_x86_64"), _target_tags("linux"))
+        self.assertNotIn(Tag(runtime.TARGET_ABI, runtime.TARGET_ABI, "manylinux_2_29_x86_64"), _target_tags("linux"))
+        self.assertIn(Tag(runtime.TARGET_ABI, "abi3", "manylinux_2_28_x86_64"), _target_tags("linux"))
 
 
 if __name__ == "__main__":

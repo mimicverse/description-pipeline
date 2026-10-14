@@ -71,6 +71,10 @@ def bind_source_closure(source: Path) -> SimpleNamespace:
             write_zip=build_archive.write_zip,
             release_domain_identity=pipeline_records.release_domain_identity,
             SUPPORTED_PYTHON=pipeline_runtime.SUPPORTED_PYTHON,
+            TARGET_PYTHON=pipeline_runtime.TARGET_PYTHON,
+            TARGET_ABI=pipeline_runtime.TARGET_ABI,
+            WINDOWS_PLATFORMS=pipeline_runtime.WINDOWS_PLATFORMS,
+            LINUX_PLATFORMS=pipeline_runtime.LINUX_PLATFORMS,
         )
     finally:
         sys.path.remove(str(source))
@@ -99,6 +103,28 @@ def git(root, *arguments):
     return subprocess.check_output(["git", *arguments], cwd=root, text=True).strip()
 
 
+def target_arguments(platform: str, bound) -> list[str]:
+    """The pip target flags of one role archive, from the single target rule.
+
+    The Linux archive is built for the declared glibc baseline instead of the
+    building host's tag set; Windows uses the declared platform.  Interpreter
+    and ABI come from the same rule.
+    """
+
+    platforms = bound.WINDOWS_PLATFORMS if platform == "windows" else bound.LINUX_PLATFORMS
+    arguments = [
+        "--python-version",
+        bound.TARGET_PYTHON,
+        "--implementation",
+        "cp",
+        "--abi",
+        bound.TARGET_ABI,
+    ]
+    for name in platforms:
+        arguments += ["--platform", name]
+    return arguments
+
+
 def source_inventory(directory: Path, bound: SimpleNamespace) -> dict[str, str]:
     """The source file inventory with interpreter bytecode caches ignored.
 
@@ -119,17 +145,7 @@ def offline_bundle(source, output, wheel, platform, bound):
         staging = Path(temporary)
         wheels = staging / "wheels"
         arguments = [sys.executable, "-m", "pip", "download", "--only-binary=:all:", "--dest", str(wheels)]
-        if platform == "windows":
-            arguments += [
-                "--platform",
-                "win_amd64",
-                "--python-version",
-                "3.12",
-                "--implementation",
-                "cp",
-                "--abi",
-                "cp312",
-            ]
+        arguments += target_arguments(platform, bound)
         arguments += ["-r", str(source / f"requirements/{platform}-py312.lock")]
         subprocess.run(arguments, check=True)
         shutil.copyfile(wheel, wheels / wheel.name)
@@ -154,8 +170,9 @@ def offline_bundle(source, output, wheel, platform, bound):
 def build(root, output):
     root, output = root.resolve(), output.resolve()
     bound = bind_source_closure(root / "src")
-    if sys.version_info[:2] != (3, 12):
-        raise bound.PipelineError("Release builds require CPython 3.12")
+    target_python = tuple(int(part) for part in bound.TARGET_PYTHON.split("."))
+    if sys.version_info[:2] != target_python:
+        raise bound.PipelineError(f"Release builds require CPython {bound.TARGET_PYTHON}")
     requires_python = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
         "requires-python"
     ]

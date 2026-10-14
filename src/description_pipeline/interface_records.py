@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from . import schemas as _schemas
 from .delivery import PIPELINE_ID
 from .io import PipelineError, artifact_path_parts, digest, file_digest, parse_data
-from .runtime import RUNTIME_HOSTS, RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
+from .runtime import LINUX_GLIBC_BASELINE, RUNTIME_HOSTS, RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
 from .schemas import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CACHE_RELEASE_RECEIPT_SCHEMA,
@@ -1283,6 +1283,7 @@ def release_support() -> dict:
         "roles": {
             role: {
                 **RUNTIME_HOSTS[role],
+                **({"glibc": f"2.{LINUX_GLIBC_BASELINE}"} if role == "portable" else {}),
                 "packages": {name: RUNTIME_VERSIONS[name] for name in required_packages(role)},
             }
             for role in RELEASE_ROLES

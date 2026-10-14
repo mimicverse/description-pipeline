@@ -394,7 +394,9 @@ class DistributionTests(unittest.TestCase):
                 patch.object(
                     build_release,
                     "bind_source_closure",
-                    return_value=SimpleNamespace(PipelineError=PipelineError, SUPPORTED_PYTHON=">=3.12,<3.13"),
+                    return_value=SimpleNamespace(
+                        PipelineError=PipelineError, SUPPORTED_PYTHON=">=3.12,<3.13", TARGET_PYTHON="3.12"
+                    ),
                 ),
                 patch.object(build_release, "sys", SimpleNamespace(version_info=(3, 11, 9))),
                 self.assertRaisesRegex(PipelineError, "CPython 3.12"),
@@ -404,7 +406,9 @@ class DistributionTests(unittest.TestCase):
                 patch.object(
                     build_release,
                     "bind_source_closure",
-                    return_value=SimpleNamespace(PipelineError=PipelineError, SUPPORTED_PYTHON=">=3.12,<3.13"),
+                    return_value=SimpleNamespace(
+                        PipelineError=PipelineError, SUPPORTED_PYTHON=">=3.12,<3.13", TARGET_PYTHON="3.12"
+                    ),
                 ),
                 patch.object(build_release, "git", return_value=""),
                 patch.object(build_release.importlib.metadata, "version", return_value="0.0.0"),
