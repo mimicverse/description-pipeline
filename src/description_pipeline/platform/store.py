@@ -25,8 +25,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..delivery import BUNDLE_SCHEMA, read_delivery_manifest
-from ..io import PipelineError, canonical, digest
+from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
+from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, read_data
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -668,9 +668,50 @@ class PlatformStore:
         received = {record["path"]: (record["bytes"], record["sha256"]) for record in artifacts}
         if received != stamped:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
-        sealed_handoff = stamped.get("input/handoff.json")
-        if sealed_handoff is None or receipt.get("handoff_sha256") != sealed_handoff[1]:
-            raise PlatformStoreError("The receipt's handoff binding does not match the sealed input/handoff.json")
+        # The handoff identity is the sealed admission index's inventory digest
+        # (the same owner as describe_handoff); the index file's own sha stays
+        # an ordinary manifest artifact record, never conflated with it.
+        try:
+            index = read_data(confined(root, "input/handoff.json"))
+        except (PipelineError, OSError) as error:
+            raise PlatformStoreError("The sealed tree carries no readable input/handoff.json index") from error
+        files = index.get("package_files") if isinstance(index, dict) else None
+        if not isinstance(files, dict) or not files:
+            raise PlatformStoreError("The sealed input/handoff.json index has no package_files inventory")
+        for name, checksum in files.items():
+            if not isinstance(name, str) or not name:
+                raise PlatformStoreError("The sealed handoff index carries an invalid original path")
+            try:
+                artifact_path_parts(name)
+            except PipelineError as error:
+                raise PlatformStoreError("The sealed handoff index carries an unsafe original path") from error
+            if not _is_sha256(checksum):
+                raise PlatformStoreError("The sealed handoff index carries an invalid original digest")
+            record = stamped.get("input/" + name)
+            if record is None or record[1] != checksum:
+                raise PlatformStoreError("The receipt's handoff binding does not match the sealed original bytes")
+        if digest(files) != receipt.get("handoff_sha256"):
+            raise PlatformStoreError(
+                "The receipt's handoff binding does not match the sealed input/handoff.json inventory"
+            )
+        if stage == "freeze":
+            try:
+                sealed_tool = read_data(confined(root, "tool.json"))
+            except (PipelineError, OSError) as error:
+                raise PlatformStoreError("The sealed tree carries no readable tool.json") from error
+            if receipt.get("tool") != sealed_tool:
+                raise PlatformStoreError("The frozen receipt's tool identity does not match the sealed tool.json")
+            _machine_tool_identity(sealed_tool, role="portable")
+        if stage in {"discover", "capture"}:
+            try:
+                sealed_native = read_data(confined(root, "reports/native-tool.json"))
+            except (PipelineError, OSError) as error:
+                raise PlatformStoreError("The sealed tree carries no readable native tool record") from error
+            if receipt.get("native_tool") != sealed_native:
+                raise PlatformStoreError(
+                    "The native stage receipt's tool identity does not match the sealed native tool record"
+                )
+            _machine_tool_identity(sealed_native, role="native")
         missing = [
             entry
             for entry in STAGE_EVIDENCE.get(stage, ())
@@ -787,6 +828,23 @@ def _require_open(connection) -> None:
 
 def _is_sha256(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _machine_tool_identity(record, *, role: str) -> None:
+    """The light structural identity of one tool record (owner: schemas.TOOL_SCHEMA)."""
+
+    from ..schemas import TOOL_SCHEMA
+
+    if (
+        not isinstance(record, dict)
+        or record.get("schema_version") != TOOL_SCHEMA
+        or record.get("pipeline_id") != PIPELINE_ID
+        or not isinstance(record.get("version"), str)
+        or not record.get("version")
+        or not _is_sha256(record.get("source_sha256"))
+        or (record.get("runtime") or {}).get("role") != role
+    ):
+        raise PlatformStoreError(f"The sealed tool identity is not a complete {role} tool record")
 
 
 def _evidence_path(entry) -> bool:

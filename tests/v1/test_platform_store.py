@@ -15,9 +15,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
+from description_pipeline.delivery import PIPELINE_ID, read_delivery_manifest, write_delivery_manifest
 from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, CHECK_POLICY_V1, check_policy_digest
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
 from description_pipeline.platform import store as store_module
 from description_pipeline.platform.store import (
     AdmissionClosedError,
@@ -50,9 +50,13 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
     (root / "evidence" / "native-meshes").mkdir()
-    write_json(root / "input" / "handoff.json", {"handoff": "fixture"})
     write_json(root / "input" / "source.json", {"source": "fixture"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
+    package_files = {
+        "source.json": file_digest(root / "input" / "source.json"),
+        "records/arm.json": file_digest(root / "input" / "records" / "arm.json"),
+    }
+    write_json(root / "input" / "handoff.json", {"passed": True, "package_files": package_files})
     write_json(root / "evidence" / "discovery.json", {"discovery": "fixture"})
     write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
     write_json(root / "evidence" / "capture.json", {"capture": "fixture"})
@@ -63,6 +67,16 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
     (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")
     write_json(root / "tool.json", tool_record())
     write_json(root / "reports" / "quality.json", {"quality": "fixture"})
+    write_json(
+        root / "reports" / "native-tool.json",
+        {
+            "schema_version": TOOL_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "version": "1.4.0",
+            "source_sha256": "a" * 64,
+            "runtime": {"role": "native"},
+        },
+    )
     write_delivery_manifest(
         root,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -70,7 +84,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
     )
     manifest = read_delivery_manifest(root)
     artifacts = [dict(record) for record in manifest["subject"]["files"]]
-    handoff = next(record["sha256"] for record in artifacts if record["path"] == "input/handoff.json")
+    handoff = digest(package_files)
     return manifest["subject"]["digest"], artifacts, handoff
 
 
@@ -620,9 +634,9 @@ class PlatformStoreTests(unittest.TestCase):
             "artifacts": [dict(record) for record in self.artifacts],
         }
         if stage == "freeze":
-            payload["tool"] = {"schema_version": TOOL_SCHEMA, "version": "1.4.0"}
+            payload["tool"] = read_data(self.delivery / "tool.json")
         else:
-            payload["native_tool"] = {"name": "native-tool", "source_sha256": "a" * 64}
+            payload["native_tool"] = read_data(self.delivery / "reports" / "native-tool.json")
         payload.update(overrides)
         return payload
 
@@ -677,6 +691,31 @@ class PlatformStoreTests(unittest.TestCase):
                 state="completed",
                 checkpoint_uri=CHECKPOINT,
                 receipt={**base, "state": "bogus-outcome"},
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "tool identity"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**base, "native_tool": {"invented": True}},
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "tool identity"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**self._native_receipt("freeze"), "tool": {"invented": True}},
+            )
+        index_sha = next(record["sha256"] for record in base["artifacts"] if record["path"] == "input/handoff.json")
+        with self.assertRaisesRegex(PlatformStoreError, "handoff"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt={**base, "handoff_sha256": index_sha},
             )
         trimmed = [record for record in base["artifacts"] if not record["path"].startswith("evidence/")]
         with self.assertRaisesRegex(PlatformStoreError, "artifact inventory"):
