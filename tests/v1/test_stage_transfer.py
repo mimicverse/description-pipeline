@@ -623,7 +623,8 @@ class StageTransferTests(unittest.TestCase):
                     {
                         "name": "base-1",
                         "transform": support.placement((0.0, 0.0, 0.0)),
-                        "mass": support.mass_payload(1.0, (0.0, 0.0, 0.0)),
+                        # Off-axis COM: the product signal proves the convention at capture time.
+                        "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
                     },
                     {
                         "name": "arm-1",

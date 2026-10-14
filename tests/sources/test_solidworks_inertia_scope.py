@@ -12,9 +12,17 @@ The standard inertia tensor has ``Ixy = −∫xy dm``::
 
 A native analytic fixture (rotated boxes, SolidWorks 34.0.0, 2026-10-06) showed
 that both the part-document reading and the component-group reading are the
-standard tensor as-is (residuals 4e-20 and 6.5e-19).  The scope label therefore
-names the measured convention and must agree with any explicit convention.
-Positive-product and unqualified readings are rejected.
+standard tensor as-is (residuals 4e-20 and 6.5e-19); it stays the semantic
+anchor for what the standard convention means.
+
+The 2026-10-15 layering is deliberate:
+
+* capture side: the single evidence throat proves the live family from the
+  sealed dual reads and rewrites a positive-products capture to the standard
+  convention before sealing (``inertia_convention``);
+* consumer/verifier side (this file): the scope label must agree with any
+  explicit convention, and positive-product or unqualified readings are still
+  rejected as a fail-closed backstop for anything that bypassed the throat.
 """
 
 from __future__ import annotations

@@ -44,7 +44,12 @@ class EvidenceBindingTests(unittest.TestCase):
         self.backend = support.FixtureCadBackend(
             self.assembly,
             [
-                {"name": "base-1", "transform": support.placement(), "mass": support.mass_payload(1.0)},
+                # Off-axis COM: the product signal proves the convention at capture time.
+                {
+                    "name": "base-1",
+                    "transform": support.placement(),
+                    "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
+                },
                 {"name": "arm-1", "transform": support.placement((0.0, 0.0, 0.2)), "mass": support.mass_payload(0.5)},
             ],
             dependencies=[self.tmp / "cad" / "base.SLDPRT", self.tmp / "cad" / "arm.SLDPRT"],
