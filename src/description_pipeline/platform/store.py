@@ -464,8 +464,9 @@ class PlatformStore:
         if predecessor_row is None or predecessor_row[0] != "completed":
             return None
         definition = None
+        sealed_root = None
         if predecessor in CONFIRMED_STAGE_STATES:
-            definition = self._verify_sealed(predecessor_row[2], predecessor_row[1])
+            definition, sealed_root = self._verify_sealed(predecessor_row[2], predecessor_row[1])
         _sealed_receipt(
             predecessor_row[1],
             run_id=run_id,
@@ -473,6 +474,7 @@ class PlatformStore:
             state="completed",
             checkpoint_uri=predecessor_row[2],
             definition=definition,
+            root=sealed_root,
         )
         return {
             "stage": predecessor,
@@ -550,8 +552,9 @@ class PlatformStore:
         if reconcile is not None and state not in {"completed", "failed", "cancelled"}:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
         definition = None
+        sealed_root = None
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
-            definition = self._verify_sealed(checkpoint_uri, receipt)
+            definition, sealed_root = self._verify_sealed(checkpoint_uri, receipt)
         _sealed_receipt(
             receipt,
             run_id=run_id,
@@ -559,6 +562,7 @@ class PlatformStore:
             state=state,
             checkpoint_uri=checkpoint_uri,
             definition=definition,
+            root=sealed_root,
         )
         with self._transaction() as connection:
             cursor = connection.cursor()
@@ -666,7 +670,7 @@ class PlatformStore:
         sequence = row[0] if row else 1
         cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
 
-    def _verify_sealed(self, checkpoint_uri, receipt) -> dict | None:
+    def _verify_sealed(self, checkpoint_uri, receipt) -> tuple[dict | None, Path]:
         """Rebind the real sealed delivery for any stage before any registration.
 
         One owner for all six stages: the receipt's URI and inventory are
@@ -760,8 +764,8 @@ class PlatformStore:
             definition = rebuilt_definition(root)
             if not isinstance(definition, dict) or not isinstance(definition.get("source"), dict):
                 raise PlatformStoreError("The sealed delivery does not rebuild a definition inventory")
-            return definition
-        return None
+            return definition, root
+        return None, root
 
     def confirmed_stage(self, run_id: str, stage: str) -> dict | None:
         """The platform-authority reuse query: the sealed receipt of a confirmed stage, or refusal.
@@ -782,7 +786,7 @@ class PlatformStore:
         if row is None or row[0] != "completed":
             return None
         receipt = row[1]
-        definition = self._verify_sealed(row[2], receipt)
+        definition, sealed_root = self._verify_sealed(row[2], receipt)
         _sealed_receipt(
             receipt,
             run_id=run_id,
@@ -790,6 +794,7 @@ class PlatformStore:
             state="completed",
             checkpoint_uri=row[2],
             definition=definition,
+            root=sealed_root,
         )
         return receipt
 
@@ -984,7 +989,7 @@ def _covered(root: Path, records: dict, entry: str) -> bool:
     return entry in records or (root / entry).is_file()
 
 
-def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_uri, definition) -> None:
+def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_uri, definition, root=None) -> None:
     """The one sealed-receipt validator shared by the stage write and reuse paths.
 
     A terminal confirmation must bind its receipt completely, and the reuse
@@ -1044,7 +1049,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
         from ..verification.solidworks_urdf import require_qualified_report
 
         try:
-            quality = require_qualified_report(receipt.get("quality"), definition)
+            quality = require_qualified_report(receipt.get("quality"), definition, root=root)
         except PipelineError as error:
             raise PlatformStoreError(str(error)) from error
         if quality.get("subject_sha256") != subject:
