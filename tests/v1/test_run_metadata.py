@@ -18,6 +18,9 @@ from tests.v1.test_portal import (
     FEISHU_NAME,
     MockAirflow,
     PortalClient,
+    TEST_SUMMARY,
+    TEST_TARGET,
+    TEST_TARGETS,
     VIEWER_TOKEN,
     _actor_envelope,
     _QuietHandler,
@@ -60,6 +63,7 @@ class RunMetadataTests(unittest.TestCase):
             static_dir=self.static_dir,
             upload_root=self.upload_root,
             platform_store=store if store is not None else self.platform,
+            pipeline_targets=TEST_TARGETS,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -398,6 +402,8 @@ class RunMetadataTests(unittest.TestCase):
                 "handoff_path": "/srv/robot-cell",
                 "parent_dag_run_id": parent,
                 "resume_from": "verify",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
             },
         )
         status, _, body = self.client.request("DELETE", f"/api/runs/{parent}")

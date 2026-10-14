@@ -1183,8 +1183,14 @@ class PortalApp:
                     [("Retry-After", "5")],
                 )
             raise PortalError(error.status, error.message) from error
-        if receipt.target_hardware is not None and receipt.target_hardware not in (self.config.pipeline_targets or {}):
+        target_hardware = receipt.target_hardware.strip() if isinstance(receipt.target_hardware, str) else ""
+        if not target_hardware:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请选择发布目标后重试")
+        if target_hardware not in (self.config.pipeline_targets or {}):
             raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再提交")
+        change_summary = receipt.change_summary.strip() if isinstance(receipt.change_summary, str) else ""
+        if not change_summary:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请填写后重试")
         handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
         try:
             self._platform().admit_run(
@@ -1234,9 +1240,9 @@ class PortalApp:
             session,
             dag_run_id,
             handoff_path,
+            target_hardware,
+            change_summary,
             receipt.main_assembly,
-            receipt.target_hardware,
-            receipt.change_summary,
         )
         if outcome == "auth":
             return _json_response(
@@ -1271,11 +1277,11 @@ class PortalApp:
             "folder": receipt.folder,
             "files": receipt.files,
             "bytes": receipt.bytes,
+            "target_hardware": target_hardware,
+            "change_summary": change_summary,
         }
         if receipt.main_assembly is not None:
             payload["main_assembly"] = receipt.main_assembly
-        if receipt.target_hardware is not None:
-            payload["target_hardware"] = receipt.target_hardware
         return _json_response(start_response, 201, payload, self.config)
 
     def _trigger_uploaded_run(
@@ -1283,20 +1289,19 @@ class PortalApp:
         session: PortalSession,
         dag_run_id: str,
         handoff_path: str,
+        target_hardware: str,
+        change_summary: str,
         main_assembly: str | None = None,
-        target_hardware: str | None = None,
-        change_summary: str | None = None,
     ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
-        conf = {"handoff_path": handoff_path}
+        conf = {
+            "handoff_path": handoff_path,
+            "target_hardware": target_hardware,
+            "change_summary": change_summary,
+            "submission_principal": session.principal,
+        }
         if main_assembly is not None:
             conf["main_assembly"] = main_assembly
-        if target_hardware is not None:
-            conf["target_hardware"] = target_hardware
-        if change_summary is not None:
-            conf["change_summary"] = change_summary
-        if target_hardware is not None and session.principal:
-            conf["submission_principal"] = session.principal
         try:
             self.config.airflow.trigger_dag_run(session.token, self.config.dag_id, dag_run_id, conf)
             return "created"
@@ -1879,8 +1884,15 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
         body = self._body(environ)
         stage = body.get("stage")
-        if set(body) != {"stage"} or not isinstance(stage, str) or stage not in _STAGE_IDS:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 参数")
+        keys = {"stage", "target_hardware", "change_summary"}
+        if set(body) - keys or not isinstance(stage, str) or stage not in _STAGE_IDS:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 与发布目标参数")
+        overrides: dict[str, str] = {}
+        for key in ("target_hardware", "change_summary"):
+            if key in body:
+                if not isinstance(body[key], str):
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 与发布目标参数")
+                overrides[key] = body[key].strip()
         try:
             airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, airflow_run):
@@ -1971,10 +1983,36 @@ class PortalApp:
                         str((row or {}).get("reason_zh") or "当前无法从此步骤重新运行"),
                         _optional_str(prerequisites.get("earliest_required")),
                     )
+                target_hardware = (
+                    overrides["target_hardware"]
+                    if "target_hardware" in overrides
+                    else _optional_str(parent_conf.get("target_hardware"))
+                )
+                if not target_hardware:
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请在重新运行时选择发布目标")
+                if target_hardware not in (self.config.pipeline_targets or {}):
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再重新运行")
+                change_summary = (
+                    overrides["change_summary"]
+                    if "change_summary" in overrides
+                    else _optional_str(parent_conf.get("change_summary"))
+                )
+                if not change_summary:
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
+                principal = _optional_str(parent_conf.get("submission_principal"))
+                if principal is None or not principal.strip():
+                    principal = session.principal
                 new_run_id = reserved_id or f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
                 if reserved_id is None:
                     self._write_rerun_journal(dag_run_id, new_run_id, stage)
-                conf = {"handoff_path": handoff_path, "parent_dag_run_id": dag_run_id, "resume_from": stage}
+                conf = {
+                    "handoff_path": handoff_path,
+                    "parent_dag_run_id": dag_run_id,
+                    "resume_from": stage,
+                    "target_hardware": target_hardware,
+                    "change_summary": change_summary,
+                    "submission_principal": principal,
+                }
                 parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 if parent_assembly is not None:
                     conf["main_assembly"] = parent_assembly

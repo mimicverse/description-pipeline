@@ -190,31 +190,38 @@ def _linked_conf(context) -> dict | None:
     return {"parent_run": native_run_id(parent.strip()), "from_stage": stage}
 
 
-def _submission_identity(context) -> dict | None:
-    """The portal submission identity carried beside the endpoint request.
+def _submission_frame(context) -> tuple[dict, dict]:
+    """The submission identity and configured target routing of one trigger.
 
-    ``None`` keeps today's deferred release-blocking behavior when no configured
-    target was selected.  A selected target that is not configured on the Linux
-    side fails closed; the parent revision is read best-effort from the model
-    checkout so the derived revision keeps its successor linkage.
+    The publish target and the change summary are required (conf first, then
+    params): a missing or blank field and an unconfigured target fail the run
+    here - never a deferred publish.  The parent revision is read best-effort
+    from the model checkout so the derived revision keeps its successor
+    linkage; ``routing`` is the same config resolution a linked publish
+    rebinds ``repository_slug``/``repository_base`` from.
     """
 
     conf = getattr(context["dag_run"], "conf", None)
     conf = conf if isinstance(conf, dict) else {}
     target = str(conf.get("target_hardware") or context["params"].get("target_hardware") or "").strip()
     summary = str(conf.get("change_summary") or context["params"].get("change_summary") or "").strip()
+    if not target:
+        raise AirflowFailException(
+            "target_hardware is required: the run carries no configured publication target to publish to"
+        )
+    if not summary:
+        raise AirflowFailException("change_summary is required: the run carries no nonempty change summary")
     principal = conf.get("submission_principal")
     if not isinstance(principal, str) or not principal.strip():
         principal = str(getattr(context["dag_run"], "triggering_user_name", "") or "").strip()
-    if not target:
-        if summary:
-            log.info("submission change summary ignored without a configured target identity")
-        return None
     config = config_from_airflow_connection(CONN_ID)
+    routing = config.targets.get(target)
+    if routing is None:
+        raise AirflowFailException(f"target_hardware {target!r} is not a configured publication target")
     from description_pipeline.repository.urdf_pr import published_revision
 
     try:
-        return submission_identity(
+        identity = submission_identity(
             target_hardware=target,
             change_summary=summary,
             principal=principal,
@@ -225,6 +232,9 @@ def _submission_identity(context) -> dict | None:
         )
     except EndpointProtocolError as error:
         raise AirflowFailException(str(error)) from error
+    if identity is None:
+        raise AirflowFailException(f"target_hardware {target!r} produced no publication identity")
+    return identity, routing
 
 
 def _param_selection(context) -> str | None:
@@ -714,15 +724,15 @@ def _confirm_delivery(published: dict) -> dict:
             type="string",
             title="Publication target hardware identity",
             description=(
-                "Optional configured hardware identity used to derive the publication identity when the "
-                "CAD records do not carry dp.hardware_id; must name a configured target"
+                "Required configured hardware identity used to derive the publication identity; "
+                "must name a configured target or the run fails before any handoff resolution"
             ),
         ),
         "change_summary": Param(
             "",
             type="string",
             title="Change summary",
-            description="Optional one-line change summary used when the CAD records do not carry one",
+            description="Required nonempty one-line change summary carried into the release submission",
         ),
     },
 )
@@ -733,6 +743,7 @@ def solidworks_to_urdf():
         )
     )
     def resolve_handoff(**context) -> dict:
+        identity, routing = _submission_frame(context)
         linked = _linked_conf(context)
         if linked is not None:
             if linked["from_stage"] in DELIVERY_STAGES:
@@ -752,6 +763,8 @@ def solidworks_to_urdf():
                     "conn_id": CONN_ID,
                     "resume": linked,
                     "linux_owned": True,
+                    "repository_slug": routing["repository_slug"],
+                    "repository_base": routing["base"],
                 }
                 selection = _linked_selection(parent_meta.get("main_assembly"), context["params"].get("main_assembly"))
                 if selection is not None:
@@ -791,9 +804,7 @@ def solidworks_to_urdf():
                 if validate_file_index(package_inventory(intake)) != upload_files:
                     raise AirflowFailException("The linked intake no longer matches the parent's retained selection")
                 request["intake_dir"] = str(intake)
-            identity = _submission_identity(context)
-            if identity is not None:
-                request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+            request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
             return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
         if not handoff_path:
@@ -819,9 +830,7 @@ def solidworks_to_urdf():
             "intake_dir": str(intake),
             "conn_id": CONN_ID,
         }
-        identity = _submission_identity(context)
-        if identity is not None:
-            request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+        request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
         return request
 
     @task.sensor(
@@ -874,8 +883,10 @@ def solidworks_to_urdf():
                 "from_stage": resume.get("from_stage"),
                 "handoff_sha256": parent_meta.get("handoff_sha256"),
                 "main_assembly": parent_meta.get("main_assembly"),
-                "repository_slug": parent_meta.get("repository_slug"),
-                "repository_base": parent_meta.get("repository_base"),
+                # The trigger's conf target and its configured routing are the authority for a
+                # linked publish; the parent's stored meta may carry nulls.
+                "repository_slug": request.get("repository_slug"),
+                "repository_base": request.get("repository_base"),
                 "hardware_id": hardware,
                 "revision": revision,
                 "state": "linked",
