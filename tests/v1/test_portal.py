@@ -58,6 +58,10 @@ NO_NAME_PRINCIPAL = "cli_app:tenant-a:ou_noname"
 DAG_RUN_ID = "portal-20261007T000000-abcdef01"
 RUN_ID = native_run_id(DAG_RUN_ID)
 _DEFAULT_ACTOR = object()
+TEST_TARGETS = {"m3.0": {"base": "main"}, "m3.1": {"base": "main"}}
+TEST_TARGET = "m3.0"
+TEST_SUMMARY = "control fixture change summary"
+UPLOAD_CHOICES = [("target_hardware", TEST_TARGET), ("change_summary", TEST_SUMMARY)]
 
 
 def _feishu_profile(name: str, principal: str, open_id: str) -> dict:
@@ -640,6 +644,7 @@ class PortalTests(unittest.TestCase):
             static_dir=self.static_dir,
             upload_root=self.upload_root,
             pipeline_store_root=self.store_root,
+            pipeline_targets=TEST_TARGETS,
         )
         self.server = make_server(
             "127.0.0.1",
@@ -665,6 +670,7 @@ class PortalTests(unittest.TestCase):
             static_dir=self.static_dir,
             upload_root=self.upload_root,
             pipeline_store_root=self.store_root,
+            pipeline_targets=TEST_TARGETS,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -778,7 +784,11 @@ class PortalTests(unittest.TestCase):
             "dag_run_id": dag_run_id,
             "dag_id": "solidworks_to_urdf",
             "state": state,
-            "conf": {"handoff_path": "/srv/robot-cell"} if conf is None else conf,
+            "conf": (
+                {"handoff_path": "/srv/robot-cell", "target_hardware": TEST_TARGET, "change_summary": TEST_SUMMARY}
+                if conf is None
+                else conf
+            ),
             "triggering_user_name": (
                 _actor_envelope(FEISHU_NAME, FEISHU_PRINCIPAL)
                 if triggering_user_name is _DEFAULT_ACTOR
@@ -943,7 +953,10 @@ class PortalTests(unittest.TestCase):
         self.client.login()
         files = [("model.SLDASM", b"<assembly/>"), ("parts/p1.SLDPRT", b"<part1/>")]
         status, _, body = self.client.request_raw(
-            "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 201, body)
         payload = json.loads(body)
@@ -952,15 +965,24 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(payload["folder"], "机器人工程")
         self.assertEqual(payload["files"], 2)
         self.assertEqual(payload["bytes"], sum(len(data) for _, data in files))
+        self.assertEqual(payload["target_hardware"], TEST_TARGET)
+        self.assertEqual(payload["change_summary"], TEST_SUMMARY)
         stored = self.upload_root / dag_run_id / "机器人工程"
         self.assertTrue((stored / "model.SLDASM").is_file())
-        self.assertEqual(self.airflow.conf, {"handoff_path": str(stored), "main_assembly": "model.SLDASM"})
+        expected_conf = {
+            "handoff_path": str(stored),
+            "main_assembly": "model.SLDASM",
+            "target_hardware": TEST_TARGET,
+            "change_summary": TEST_SUMMARY,
+            "submission_principal": FEISHU_PRINCIPAL,
+        }
+        self.assertEqual(self.airflow.conf, expected_conf)
         self.assertEqual(
             self.airflow.trigger_payloads[-1],
             {
                 "dag_run_id": dag_run_id,
                 "logical_date": None,
-                "conf": {"handoff_path": str(stored), "main_assembly": "model.SLDASM"},
+                "conf": expected_conf,
             },
         )
         status, _, body = self.client.request("GET", "/api/runs")
@@ -973,6 +995,49 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
         staging = self.upload_root / ".staging"
         self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_submission_requires_a_configured_target_and_a_change_summary(self) -> None:
+        self.client.login()
+        cases = {
+            "missing_both": {},
+            "missing_target": {"change_summary": TEST_SUMMARY},
+            "whitespace_target": {"target_hardware": "   ", "change_summary": TEST_SUMMARY},
+            "unknown_target": {"target_hardware": "ghost", "change_summary": TEST_SUMMARY},
+            "missing_summary": {"target_hardware": TEST_TARGET},
+            "whitespace_summary": {"target_hardware": TEST_TARGET, "change_summary": " \t "},
+        }
+        for label, choices in cases.items():
+            with self.subTest(case=label):
+                status, _, body = self.client.request_raw(
+                    "POST",
+                    "/api/runs",
+                    _upload_body(fields=[(name, value) for name, value in choices.items()]),
+                    "multipart/form-data; boundary=portal-boundary",
+                )
+                self.assertEqual(status, 400, body)
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        self.assertEqual(self.airflow.dag_runs, {})
+
+    def test_submission_conf_always_carries_target_summary_and_principal(self) -> None:
+        self.client.login()
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 201, body)
+        stored = self.upload_root / json.loads(body)["dag_run_id"] / "机器人工程"
+        self.assertEqual(
+            self.airflow.conf,
+            {
+                "handoff_path": str(stored),
+                "main_assembly": "model.SLDASM",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+                "submission_principal": FEISHU_PRINCIPAL,
+            },
+        )
 
     def test_unknown_target_hardware_is_rejected(self) -> None:
         self.client.login()
@@ -996,7 +1061,7 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request_raw(
             "POST",
             "/api/runs",
-            _upload_body(files=files, fields=[("main_assembly", "parts/arm.SLDASM")]),
+            _upload_body(files=files, fields=[("main_assembly", "parts/arm.SLDASM"), *UPLOAD_CHOICES]),
             "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 201, body)
@@ -1006,7 +1071,13 @@ class PortalTests(unittest.TestCase):
         stored = self.upload_root / dag_run_id / "机器人工程"
         self.assertEqual(
             self.airflow.conf,
-            {"handoff_path": str(stored), "main_assembly": "parts/arm.SLDASM"},
+            {
+                "handoff_path": str(stored),
+                "main_assembly": "parts/arm.SLDASM",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+                "submission_principal": FEISHU_PRINCIPAL,
+            },
         )
         status, _, body = self.client.request("GET", f"/api/runs/{dag_run_id}")
         self.assertEqual(status, 200, body)
@@ -1024,13 +1095,13 @@ class PortalTests(unittest.TestCase):
                 status, _, response = self.client.request_raw(
                     "POST",
                     "/api/runs",
-                    _upload_body(files=files, fields=[("main_assembly", value)]),
+                    _upload_body(files=files, fields=[("main_assembly", value), *UPLOAD_CHOICES]),
                     "multipart/form-data; boundary=portal-boundary",
                 )
                 self.assertEqual(status, 400, response)
         duplicated = _upload_body(
             files=files,
-            fields=[("main_assembly", "model.SLDASM"), ("main_assembly", "model.SLDASM")],
+            fields=[("main_assembly", "model.SLDASM"), ("main_assembly", "model.SLDASM"), *UPLOAD_CHOICES],
         )
         status, _, response = self.client.request_raw(
             "POST", "/api/runs", duplicated, "multipart/form-data; boundary=portal-boundary"
@@ -1044,7 +1115,10 @@ class PortalTests(unittest.TestCase):
         self.client.login()
         files = [("left/model.SLDASM", b"left"), ("right/model.SLDASM", b"right")]
         status, _, body = self.client.request_raw(
-            "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
+            "POST",
+            "/api/runs",
+            _upload_body(files=files, fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 400, body)
         self.assertEqual(self.airflow.trigger_payloads, [])
@@ -1058,7 +1132,7 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request_raw(
             "POST",
             "/api/runs",
-            _upload_body(files=files, fields=[("main_assembly", chosen)]),
+            _upload_body(files=files, fields=[("main_assembly", chosen), *UPLOAD_CHOICES]),
             "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 201, body)
@@ -1112,7 +1186,10 @@ class PortalTests(unittest.TestCase):
         self.airflow.trigger_fail_after_create = True
         self.airflow.trigger_fail_times = 1
         status, _, body = self.client.request_raw(
-            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+            "POST",
+            "/api/runs",
+            _upload_body(fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 201, body)
         first = json.loads(body)["dag_run_id"]
@@ -1122,7 +1199,10 @@ class PortalTests(unittest.TestCase):
         self.airflow.trigger_fail_after_create = False
         self.airflow.trigger_fail_times = 1
         status, _, body = self.client.request_raw(
-            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+            "POST",
+            "/api/runs",
+            _upload_body(fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 201, body)
         second = json.loads(body)["dag_run_id"]
@@ -1131,7 +1211,10 @@ class PortalTests(unittest.TestCase):
         # (c) Never confirmed: 502 carries the run id, the upload stays, and no run exists.
         self.airflow.trigger_fail_times = 10
         status, _, body = self.client.request_raw(
-            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+            "POST",
+            "/api/runs",
+            _upload_body(fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 502, body)
         payload = json.loads(body)
@@ -1189,7 +1272,10 @@ class PortalTests(unittest.TestCase):
         """The displayed submitter is the original initiator, never the current viewer."""
         self.client.login()
         status, _, body = self.client.request_raw(
-            "POST", "/api/runs", _upload_body(), "multipart/form-data; boundary=portal-boundary"
+            "POST",
+            "/api/runs",
+            _upload_body(fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 201, body)
         dag_run_id = json.loads(body)["dag_run_id"]
@@ -1980,6 +2066,8 @@ class PortalTests(unittest.TestCase):
                 "handoff_path": "/srv/robot-cell",
                 "parent_dag_run_id": DAG_RUN_ID,
                 "resume_from": "generate",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
                 "main_assembly": "parts/arm.SLDASM",
             },
         )
@@ -1987,6 +2075,65 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], parent_conf)
         self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["state"], "failed")
         self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
+
+    def test_rerun_attempt_carries_the_parent_publish_choices(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(
+            self.airflow.trigger_payloads[-1]["conf"],
+            {
+                "handoff_path": "/srv/robot-cell",
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "generate",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+            },
+        )
+
+    def test_rerun_attempt_rebinds_the_publish_target_and_summary(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request(
+                "POST",
+                f"/api/runs/{DAG_RUN_ID}/attempts",
+                {"stage": "generate", "target_hardware": "m3.1", "change_summary": "rebound summary"},
+            )
+        self.assertEqual(status, 202, body)
+        self.assertEqual(
+            self.airflow.trigger_payloads[-1]["conf"],
+            {
+                "handoff_path": "/srv/robot-cell",
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "generate",
+                "target_hardware": "m3.1",
+                "change_summary": "rebound summary",
+            },
+        )
+
+    def test_rerun_attempt_requires_a_configured_target_and_summary(self) -> None:
+        self._seed_retryable_run()
+        self.airflow.dag_runs[DAG_RUN_ID]["conf"] = {"handoff_path": "/srv/robot-cell"}
+        self.client.login()
+        rows = self._rerun_rows()
+        cases = (
+            {"stage": "generate"},
+            {"stage": "generate", "target_hardware": "ghost", "change_summary": "control fixture"},
+            {"stage": "generate", "target_hardware": TEST_TARGET},
+            {"stage": "generate", "target_hardware": TEST_TARGET, "change_summary": "   "},
+        )
+        for case in cases:
+            with self.subTest(case=sorted(case)):
+                before = len(self.airflow.trigger_payloads)
+                with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+                    status, _, _ = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", case)
+                self.assertEqual(status, 400)
+                self.assertEqual(len(self.airflow.trigger_payloads), before)
 
     def test_rerun_attempt_same_stage_is_idempotent_and_other_stage_conflicts(self) -> None:
         self._seed_retryable_run()
