@@ -140,6 +140,21 @@ _RESTORE_RUN = (
     "UPDATE platform.run SET hidden_at = NULL, hidden_reason = NULL, updated_at = now()"
     " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
+_START_RUN = (
+    "UPDATE platform.run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'queued'"
+    " RETURNING state"
+)
+_SET_RUN_OUTCOME = (
+    "UPDATE platform.run SET state = %s, updated_at = now()"
+    " WHERE run_id = %s AND state NOT IN ('succeeded', 'failed', 'cancelled')"
+)
+_READ_RUN_RECORD = (
+    "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM platform.run WHERE run_id = %s"
+)
+_READ_STAGE_RECORDS = (
+    "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
+    " FROM platform.stage WHERE run_id = %s"
+)
 _CONFIRMED_PUBLISH = (
     "SELECT 1 FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
@@ -604,6 +619,7 @@ class PlatformStore:
                     operation_id=reconcile.get("operation_id") if reconcile is not None else None,
                     payload={"state": state},
                 )
+                self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
                 return
             cursor.execute(
                 _INSERT_STAGE,
@@ -621,6 +637,25 @@ class PlatformStore:
                 operation_id=reconcile.get("operation_id") if reconcile is not None else None,
                 payload={"state": state},
             )
+            self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+
+    def _stage_outcome(self, connection, *, run_id: str, stage: str, state: str) -> None:
+        """The run-terminal transition a stage record concludes, in the same transaction.
+
+        A failed or cancelled stage ends its run; the confirmed publication
+        ends it successfully.  The guarded update keeps the first terminal
+        outcome: a later record never rewrites a succeeded, failed or
+        cancelled run.
+        """
+
+        if state == "completed" and stage == "publish":
+            outcome = "succeeded"
+        elif state in {"failed", "cancelled"}:
+            outcome = state
+        else:
+            return
+        cursor = connection.cursor()
+        cursor.execute(_SET_RUN_OUTCOME, (outcome, run_id))
 
     def _insert_event(self, connection, *, run_id: str, stage: str, kind: str, operation_id, payload) -> None:
         """Append one run event in the same transaction as the state change it describes."""
@@ -759,6 +794,94 @@ class PlatformStore:
         return receipt
 
     # ------------------------------------------------------------- read side
+
+    # ------------------------------------------------ run progression (driver)
+
+    def start_run(self, run_id: str) -> dict:
+        """Move an admitted run from ``queued`` to ``running`` (idempotent).
+
+        The dispatch intent admitted the run; the first driver action claims
+        it.  A terminal or unresolved run is never restarted - a redo is a
+        linked run - and repeating the call while running keeps the first
+        start.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            state = row[0]
+            if state == "running":
+                return {"run_id": run_id, "state": state}
+            if state != "queued":
+                raise PlatformStoreError(f"The run cannot start from state {state!r}; link or reconcile instead")
+            cursor.execute(_START_RUN, (run_id,))
+            started = cursor.fetchone()
+        if started is None:
+            raise PlatformStoreError("The run was started by a concurrent writer")
+        return {"run_id": run_id, "state": "running"}
+
+    def append_event(self, run_id: str, *, stage: str, kind: str, payload: dict | None = None) -> None:
+        """Append one observed run event (live activity) in its own transaction."""
+
+        if stage not in STAGE_IDS:
+            raise PlatformStoreError(f"The event stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+        if not isinstance(kind, str) or not kind:
+            raise PlatformStoreError("The event kind must be a nonempty string")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            self._insert_event(
+                connection, run_id=run_id, stage=stage, kind=kind, operation_id=None, payload=payload or {}
+            )
+
+    def run_record(self, run_id: str) -> dict | None:
+        """One run's identity and lineage (no display fields, no receipts)."""
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_RUN_RECORD, (run_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": run_id,
+            "state": row[0],
+            "request_id": row[1],
+            "parent_run_id": row[2],
+            "from_stage": row[3],
+            "tool_identity": row[4],
+        }
+
+    def stage_records(self, run_id: str) -> dict[str, dict]:
+        """Every recorded stage row of one run, keyed by the engineering stage."""
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_STAGE_RECORDS, (run_id,))
+            rows = cursor.fetchall()
+        return {
+            row[0]: {
+                "stage": row[0],
+                "state": row[1],
+                "receipt": row[2],
+                "checkpoint_uri": row[3],
+                "reused_from_run": row[4],
+                "original_executed_at": row[5],
+            }
+            for row in rows
+        }
+
+    def sealed_path(self, checkpoint_uri: str):
+        """Resolve one registered checkpoint reference through sealed storage."""
+
+        if self._sealed is None:
+            raise PlatformStoreError("Sealed storage is not configured; a checkpoint cannot be resolved")
+        return Path(self._sealed(checkpoint_uri))
 
     # ------------------------------------------------------------ run display
     def run_display(self, run_id: str) -> RunDisplay | None:

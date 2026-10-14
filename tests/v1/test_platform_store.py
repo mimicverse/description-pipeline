@@ -163,6 +163,35 @@ class FakeCursor:
             world.run_states[params[0]] = "queued"
             world.run_from_stage[params[0]] = params[3]
             self._rows = []
+        elif normalized.startswith("UPDATE platform.run SET state = 'running'"):
+            if world.run_states.get(params[0]) == "queued":
+                world.run_states[params[0]] = "running"
+                self._rows = [("running",)]
+            else:
+                self._rows = []
+        elif normalized.startswith("UPDATE platform.run SET state = %s"):
+            outcome, run_id = params
+            if world.run_states.get(run_id) not in {"succeeded", "failed", "cancelled", None}:
+                world.run_states[run_id] = outcome
+            self._rows = []
+        elif normalized.startswith(
+            "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM platform.run WHERE run_id = %s"
+        ):
+            entry = next((row for row in world.runs if row[0] == params[0]), None)
+            if entry is None:
+                self._rows = []
+            else:
+                state = world.run_states.get(entry[0])
+                self._rows = [(state, entry[1], entry[2], entry[3], entry[4])]
+        elif normalized.startswith(
+            "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
+            " FROM platform.stage WHERE run_id = %s"
+        ):
+            self._rows = [
+                (stage, record[0], record[1], record[2], None, None)
+                for (run_id, stage), record in world.stages.items()
+                if run_id == params[0]
+            ]
         elif normalized.startswith("INSERT INTO platform.operation"):
             key = params[4]
             if key in world.operations:
@@ -948,6 +977,74 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(self.world.stages[("r-1", "generate")][0], "blocked")
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
             self._confirm_generate()
+
+    # ------------------------------------------------------- run progression
+
+    def test_start_run_is_idempotent_and_refuses_terminal_or_unknown_runs(self) -> None:
+        with self.assertRaisesRegex(PlatformStoreError, "not admitted"):
+            self.store.start_run("r-1")
+        self.admit()
+        started = self.store.start_run("r-1")
+        self.assertEqual(started, {"run_id": "r-1", "state": "running"})
+        self.assertEqual(self.store.start_run("r-1"), started)
+        self.world.run_states["r-1"] = "failed"
+        with self.assertRaisesRegex(PlatformStoreError, "cannot start"):
+            self.store.start_run("r-1")
+
+    def test_a_failed_stage_ends_its_run_and_the_first_outcome_stands(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1", stage="generate", state="failed", receipt=self.generate_receipt(state="failed")
+        )
+        self.assertEqual(self.world.run_states["r-1"], "failed")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="verify",
+            state="failed",
+            receipt=self.verify_receipt(state="failed", passed=False),
+        )
+        self.assertEqual(self.world.run_states["r-1"], "failed")
+
+    def test_a_confirmed_publication_ends_its_run_successfully(self) -> None:
+        self._running_run()
+        receipt = self.verify_receipt(
+            stage="publish",
+            state="published",
+            passed=True,
+            submission={
+                "passed": True,
+                "state": "published",
+                "url": "https://example.test/repo/pull/1",
+                "subject_sha256": self.subject,
+            },
+        )
+        self.store.confirm_stage(
+            run_id="r-1", stage="publish", state="completed", checkpoint_uri=CHECKPOINT, receipt=receipt
+        )
+        self.assertEqual(self.world.run_states["r-1"], "succeeded")
+
+    def test_append_event_sequences_observed_events_and_refuses_unknown_runs(self) -> None:
+        with self.assertRaisesRegex(PlatformStoreError, "not admitted"):
+            self.store.append_event("r-1", stage="generate", kind="activity")
+        self._running_run()
+        self.store.append_event("r-1", stage="generate", kind="activity", payload={"seq": 1})
+        self.store.append_event("r-1", stage="generate", kind="activity", payload={"seq": 2})
+        sequences = [item[1] for item in self.world.events if item[0] == "r-1"]
+        self.assertEqual(sequences, [1, 2])
+        with self.assertRaisesRegex(PlatformStoreError, "event stage"):
+            self.store.append_event("r-1", stage="nope", kind="activity")
+
+    def test_run_and_stage_records_are_the_driver_reads(self) -> None:
+        self._running_run()
+        self._confirm_generate()
+        record = self.store.run_record("r-1")
+        self.assertEqual(record["state"], "running")
+        self.assertEqual(record["request_id"], "q-1")
+        stages = self.store.stage_records("r-1")
+        self.assertEqual(stages["generate"]["state"], "completed")
+        self.assertEqual(stages["generate"]["checkpoint_uri"], CHECKPOINT)
+        self.assertEqual(stages["generate"]["receipt"]["stage"], "generate")
+        self.assertIsNone(self.store.run_record("absent"))
 
     def test_confirmed_stage_returns_sealed_receipts_or_refuses(self) -> None:
         self._running_run()
