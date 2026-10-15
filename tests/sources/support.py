@@ -1106,3 +1106,73 @@ def capture_requests(config: dict) -> dict:
             if isinstance(joint.get("axis_reference"), dict)
         ]
     return cfg
+
+
+def compose_delivery_inputs(
+    delivery: Path,
+    *,
+    main_assembly: str,
+    configuration: str,
+    record: dict,
+    cad_files: dict[str, Path],
+    material_source: str | None = None,
+) -> None:
+    """Compose the sealed inputs Linux consumers rebuild from (fixture plumbing).
+
+    Copies the genuine CAD bytes into ``input/cad/<relative>``, writes the
+    sealed discovery payload (with its raw native record) at
+    ``evidence/discovery.json`` and, when a material authority is given,
+    merges the canonical provenance block into ``evidence/capture.json``.
+    This only translates fixture inputs before the actual consumers run; no
+    consumer output is injected.
+    """
+
+    import shutil
+
+    from description_pipeline.io import file_digest, read_data, write_json
+
+    delivery = Path(delivery)
+    evidence = delivery / "evidence"
+    evidence.mkdir(parents=True, exist_ok=True)
+    native_files: dict[str, str] = {}
+    for relative, source in cad_files.items():
+        target = delivery / "input" / "cad" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        native_files[str(relative)] = file_digest(target)
+    identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    write_json(
+        evidence / "discovery.json",
+        {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "run_id": str(record.get("run_id") or "fixture-run"),
+            "derivation": {
+                "main_assembly": main_assembly,
+                "configuration": configuration,
+                "frozen_names": {},
+                "record_roots": [],
+            },
+            "identity": {
+                "main_assembly": main_assembly,
+                "delivery_configuration": configuration,
+                "robot_name": str(identity.get("robot_name") or "robot"),
+            },
+            "records": [],
+            "raw": record,
+            "native_files": dict(sorted(native_files.items())),
+        },
+    )
+    if material_source is not None:
+        capture_path = evidence / "capture.json"
+        capture = read_data(capture_path) if capture_path.is_file() else {}
+        if not isinstance(capture, dict):
+            capture = {}
+        capture["material_provenance"] = {
+            "schema_version": "solidworks-to-urdf.material-provenance/v1",
+            "assembly": str((delivery / "input" / "cad" / main_assembly).resolve()),
+            "configuration": configuration,
+            "material_source": material_source,
+            "measured_source": "cad_api",
+            "warnings": [],
+        }
+        write_json(capture_path, capture)
