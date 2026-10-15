@@ -133,15 +133,15 @@ class NativePhaseTests(unittest.TestCase):
         class Reader:
             def observe(self, stage, main, files):
                 raise SelectionError(
-                    "selection_declarations_missing",
-                    "the staged main carries no complete declared delivery identity (dp.*)",
-                    problems=[{"code": "selection_declarations_missing", "missing": ["dp.hardware_id"]}],
+                    "selection_identity_unreadable",
+                    "the staged main's declared delivery identity (dp.*) is unreadable",
+                    problems=[{"code": "selection_identity_unreadable", "declarations_error": "CadError: unreadable"}],
                 )
 
         result = sw_checks(self.folder, "3.0 总装.SLDASM", reader=Reader())
         self.assertEqual(result["verdict"], "attention")
-        self.assertEqual(result["code"], "selection_declarations_missing")
-        self.assertEqual(result["problems"][0]["missing"], ["dp.hardware_id"])
+        self.assertEqual(result["code"], "selection_identity_unreadable")
+        self.assertEqual(result["problems"][0]["declarations_error"], "CadError: unreadable")
 
 
 class CliTests(unittest.TestCase):

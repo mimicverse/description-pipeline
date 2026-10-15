@@ -854,7 +854,14 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 200, body)
                 detail = json.loads(body)
                 self.assertIs(detail["can_manage"], can_manage)
-                self.assertEqual(detail["retry"], {"eligible": True, "reason": "transport_recovery"})
+                self.assertEqual(
+                    detail["retry"],
+                    {
+                        "eligible": True,
+                        "reason": "sealed_evidence_reimport",
+                        "classification": "evidence_corruption",
+                    },
+                )
         self.client.login()
         self.airflow.dag_runs[DAG_RUN_ID]["triggering_user_name"] = f"{FEISHU_PRINCIPAL}|broken"
         self.assertFalse(json.loads(self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")[2])["can_manage"])
@@ -914,12 +921,22 @@ class PortalTests(unittest.TestCase):
         self._fail_job()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "native_terminal_failure"})
+        self.assertEqual(
+            json.loads(body)["retry"],
+            {"eligible": False, "reason": "native_terminal_failure", "classification": "engineering_terminal_failure"},
+        )
         self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
         with patch.object(self.endpoint, "get_job", side_effect=EndpointError("offline")):
             status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
             self.assertEqual(status, 200, body)
-            self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "endpoint_evidence_unavailable"})
+            self.assertEqual(
+                json.loads(body)["retry"],
+                {
+                    "eligible": False,
+                    "reason": "endpoint_evidence_unavailable",
+                    "classification": "temporary_disconnection",
+                },
+            )
             self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
         self.assertEqual(self.airflow.clear_requests, [])
 
@@ -946,7 +963,14 @@ class PortalTests(unittest.TestCase):
         self.endpoint_server.jobs.clear()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "endpoint_evidence_unavailable"})
+        self.assertEqual(
+            json.loads(body)["retry"],
+            {
+                "eligible": False,
+                "reason": "endpoint_evidence_unavailable",
+                "classification": "temporary_disconnection",
+            },
+        )
         self.airflow.task_states[DAG_RUN_ID][1]["state"] = "failed"
         self.airflow.task_states[DAG_RUN_ID][2]["state"] = "upstream_failed"
         status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})
@@ -1010,7 +1034,6 @@ class PortalTests(unittest.TestCase):
             "main_assembly": "model.SLDASM",
             "target_hardware": TEST_TARGET,
             "change_summary": TEST_SUMMARY,
-            "submission_principal": FEISHU_PRINCIPAL,
         }
         self.assertEqual(self.airflow.conf, expected_conf)
         self.assertEqual(
@@ -1160,7 +1183,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(identity["change_summary"], stored)
         self.assertNotIn("discovery.summary_invalid", [finding["code"] for finding in findings])
 
-    def test_submission_conf_always_carries_target_summary_and_principal(self) -> None:
+    def test_submission_conf_always_carries_target_and_summary(self) -> None:
         self.client.login()
         status, _, body = self.client.request_raw(
             "POST",
@@ -1177,9 +1200,10 @@ class PortalTests(unittest.TestCase):
                 "main_assembly": "model.SLDASM",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
-                "submission_principal": FEISHU_PRINCIPAL,
             },
         )
+        # The recorded submitter is the run's stored actor, never a create-body claim.
+        self.assertNotIn("submission_principal", self.airflow.conf)
 
     def test_unknown_target_hardware_is_rejected(self) -> None:
         self.client.login()
@@ -1218,7 +1242,6 @@ class PortalTests(unittest.TestCase):
                 "main_assembly": "parts/arm.SLDASM",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
-                "submission_principal": FEISHU_PRINCIPAL,
             },
         )
         status, _, body = self.client.request("GET", f"/api/runs/{dag_run_id}")

@@ -603,72 +603,67 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertEqual(seen, [True, False])
         self.assertIsNone(request_context.bound_request())
 
-    def test_transport_retry_classification_matrix(self) -> None:
-        classify = run_ownership.classify_transport_retry
+    def test_recovery_classification_matrix(self) -> None:
+        classify = run_ownership.classify_recovery
 
-        eligible = classify(
+        # (2) evidence corruption: the capture is sealed; only the import re-reads.
+        sealed = classify(
+            "failed",
+            {"freeze": "success", "discover": "success", "capture": "failed"},
+            "native_complete",
+        )
+        self.assertTrue(sealed.eligible)
+        self.assertEqual(sealed.classification, run_ownership.RECOVERY_EVIDENCE_CORRUPTION)
+        self.assertEqual(sealed.reason, "sealed_evidence_reimport")
+        self.assertEqual(sealed.cleared_tasks, ("capture",))
+        # (1) temporary disconnection: the same native job is still in flight.
+        in_flight = classify("failed", {"freeze": "success", "discover": "failed"}, "running")
+        self.assertTrue(in_flight.eligible)
+        self.assertEqual(in_flight.classification, run_ownership.RECOVERY_TEMPORARY_DISCONNECTION)
+        self.assertEqual(in_flight.cleared_tasks, ("discover",))
+        for state, tasks, status, reason in (
+            ("running", {"discover": "failed"}, None, "run_active"),
+            ("success", {"discover": "failed"}, None, "run_succeeded"),
+            ("failed", {}, None, "unknown_failed_task"),
+            ("failed", {"other_task": "failed"}, None, "unknown_failed_task"),
+            ("failed", {"discover": run_ownership.AMBIGUOUS_TASK_STATE}, None, "unknown_failed_task"),
+            ("failed", {"discover": "failed"}, "failed", "native_terminal_failure"),
+            ("failed", {"publish": "failed"}, "native_complete", "publication_response_unknown"),
+        ):
+            with self.subTest(state=state, tasks=tasks, status=status):
+                assessment = classify(state, tasks, status)
+                self.assertFalse(assessment.eligible)
+                self.assertEqual(assessment.reason, reason)
+
+    def test_split_recovery_preserves_the_engineering_boundary(self) -> None:
+        classify = run_ownership.classify_recovery
+        portable = classify(
             "failed",
             {
                 "freeze": "success",
                 "discover": "success",
-                "capture": "failed",
-                "publish": "upstream_failed",
+                "capture": "success",
+                "generate": "upstream_failed",
+                "verify": "failed",
             },
+            "native_complete",
         )
-        self.assertTrue(eligible.eligible)
-        self.assertEqual(eligible.reason, "transport_recovery")
-        self.assertEqual(eligible.cleared_tasks, ("capture", "publish"))
-        for state, tasks, reason in (
-            ("running", {"discover": "failed"}, "run_active"),
-            ("success", {"discover": "failed"}, "run_succeeded"),
-            ("failed", {}, "no_failed_transport_task"),
-            ("failed", {"freeze": "failed"}, "resolution_or_capture_failed"),
-            ("failed", {"discover": "failed"}, "resolution_not_success"),
-            (
-                "failed",
-                {"freeze": "success", "publish": "failed"},
-                "publication_failed",
-            ),
-            (
-                "failed",
-                {"freeze": "success", "other_task": "failed"},
-                "unknown_failed_task",
-            ),
-            (
-                "failed",
-                {"freeze": "success", "publish": "upstream_failed"},
-                "no_failed_transport_task",
-            ),
-            (
-                "failed",
-                {
-                    "freeze": "success",
-                    "discover": run_ownership.AMBIGUOUS_TASK_STATE,
-                },
-                "unknown_failed_task",
-            ),
-        ):
-            with self.subTest(state=state, tasks=tasks):
-                assessment = classify(state, tasks)
-                self.assertFalse(assessment.eligible)
-                self.assertEqual(assessment.reason, reason)
-        start_retry = classify(
-            "failed", {"freeze": "success", "discover": "failed", "capture": "upstream_failed"}
+        self.assertTrue(portable.eligible)
+        self.assertEqual(portable.classification, run_ownership.RECOVERY_TEMPORARY_DISCONNECTION)
+        self.assertEqual(portable.cleared_tasks, ("generate", "verify"))
+        # An attempted publication is never retried in place; an unattempted one is untouched.
+        attempted = classify(
+            "failed",
+            {
+                "freeze": "success",
+                "discover": "success",
+                "capture": "success",
+                "publish": "failed",
+            },
+            "native_complete",
         )
-        self.assertTrue(start_retry.eligible)
-        self.assertEqual(start_retry.cleared_tasks, ("capture", "discover"))
-
-    def test_split_transport_retry_preserves_the_engineering_boundary(self) -> None:
-        classify = run_ownership.classify_transport_retry
-        tasks = dict.fromkeys(run_ownership.KNOWN_TASKS, "upstream_failed")
-        tasks.update(freeze="success", discover="failed")
-        self.assertTrue(classify("failed", tasks).eligible)
-        tasks.update(discover="success", capture="failed")
-        self.assertTrue(classify("failed", tasks).eligible)
-        for stage in ("generate", "verify", "publish"):
-            with self.subTest(stage=stage):
-                changed = {**tasks, "capture": "success", stage: "failed"}
-                self.assertFalse(classify("failed", changed).eligible)
+        self.assertFalse(attempted.eligible)
+        self.assertEqual(attempted.classification, run_ownership.RECOVERY_UNKNOWN_PUBLICATION)
 
     def test_clear_body_candidate_matrix_and_replay(self) -> None:
         evaluate = request_context.evaluate_clear_candidate

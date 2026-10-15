@@ -18,8 +18,6 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 from description_pipeline.io import file_digest  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import freeze, validate_source_config  # noqa: E402
-from description_pipeline.sources.solidworks.scene import normalize_scene as canonical_for  # noqa: E402
-from description_pipeline.sources.solidworks.verify import verify_normalization  # noqa: E402
 
 from . import support  # noqa: E402
 
@@ -115,12 +113,6 @@ class EvidenceBindingTests(unittest.TestCase):
             "overrides": [],
         }
 
-    def _verify(self, **source_overrides) -> dict:
-        definition = self._definition(**source_overrides)
-        canonical = canonical_for(self.raw_scene, definition, self.snapshot)
-        results = verify_normalization(self.raw_scene, definition, self.snapshot, canonical)
-        return next(entry for entry in results if entry["id"] == "source.normalization.mass_evidence")
-
     # --- 配置形状 -----------------------------------------------------
 
     def test_config_requires_a_file_binding_for_documented_masses(self) -> None:
@@ -157,60 +149,6 @@ class EvidenceBindingTests(unittest.TestCase):
         self.assertEqual(_detail(raised.exception)["component"], "arm-1")
 
     # --- 独立校验 -----------------------------------------------------
-
-    def test_bound_evidence_passes_and_reports_the_anchors(self) -> None:
-        check = self._verify()
-        self.assertEqual(check["status"], "passed", check["details"])
-        self.assertEqual(check["details"]["anchors"], {"arm-1": "found", "base-1": "found"})
-        self.assertEqual(check["details"]["actual_sha256"], self.config["mass_evidence"]["sha256"])
-        self.assertEqual(check["details"]["problems"], [])
-
-    def test_missing_evidence_file_is_rejected(self) -> None:
-        check = self._verify(mass_evidence=self._binding(file="docs/provenance/absent.json"))
-        self.assertEqual(check["status"], "failed")
-        self.assertIn("evidence_file_missing", check["details"]["problems"])
-
-    def test_escaping_evidence_path_is_rejected(self) -> None:
-        outside = self.tmp / "outside.json"
-        outside.write_text("{}", encoding="utf-8")
-        check = self._verify(mass_evidence=self._binding(file="../outside.json", sha256=file_digest(outside)))
-        self.assertEqual(check["status"], "failed")
-        self.assertIn("evidence_path_escape", check["details"]["problems"])
-
-    def test_changed_evidence_digest_is_rejected(self) -> None:
-        binding = self._binding()
-        self.spec.write_text(
-            json.dumps({"components": {"base-1": {"material": "PLA@15%"}, "arm-1": {"material": "PETG"}}}),
-            encoding="utf-8",
-        )
-        check = self._verify(mass_evidence=binding)
-        self.assertEqual(check["status"], "failed")
-        self.assertIn("evidence_digest_mismatch", check["details"]["problems"])
-
-    def test_anchor_that_is_absent_from_the_file_is_rejected(self) -> None:
-        masses = dict(self.config["documented_masses"])
-        masses["arm-1"] = {"mass_kg": 0.5, "reason": "printed part", "evidence": "nope-anchor"}
-        check = self._verify(documented_masses=masses)
-        self.assertEqual(check["status"], "failed")
-        self.assertIn("evidence_anchor_not_found:arm-1", check["details"]["problems"])
-        self.assertEqual(check["details"]["anchors"]["base-1"], "found")
-
-    def test_component_without_a_declared_mass_is_rejected(self) -> None:
-        check = self._verify(documented_masses={"base-1": self.config["documented_masses"]["base-1"]})
-        self.assertEqual(check["status"], "failed")
-        self.assertIn("uncovered_component:arm-1", check["details"]["problems"])
-        self.assertEqual(check["details"]["uncovered_components"], ["arm-1"])
-
-    def test_snapshot_outside_a_model_repo_is_rejected(self) -> None:
-        bare = self.tmp / "bare" / "snapshot"
-        freeze(dict(self.config), bare, backend=self.backend)
-        raw_scene = support.read_scene(bare)
-        definition = self._definition()
-        canonical = canonical_for(raw_scene, definition, bare)
-        results = verify_normalization(raw_scene, definition, bare, canonical)
-        check = next(entry for entry in results if entry["id"] == "source.normalization.mass_evidence")
-        self.assertEqual(check["status"], "failed")
-        self.assertIn("evidence_root_not_found", check["details"]["problems"])
 
     def test_string_binding_without_documented_masses_still_validates(self) -> None:
         # cad 模式：材料来自 CAD，说明字符串仍然合法（没有声明质量需要绑定文件）

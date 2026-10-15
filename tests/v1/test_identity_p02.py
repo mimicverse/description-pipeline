@@ -166,31 +166,42 @@ class IdentitySynthesisTests(unittest.TestCase):
         self.assertIn("discovery.identity_invalid", findings)
         self.assertTrue(findings["discovery.identity_invalid"].get("blocking", True))
         self.assertEqual(identity["hardware_id"], "1bad id")
-        self.assertEqual(sources["hardware_id"], "submission")
+        self.assertEqual(sources["hardware_id"], "platform_configuration")
         self.assertIsNone(identity["revision"])
 
-    def test_derived_revision_parent_owner_and_control(self) -> None:
+    def test_administrative_values_never_become_engineering_identity(self) -> None:
         submission = discovery.SubmissionIdentity(
             hardware_id="m3.0",
             owner="portal-user",
-            change_summary="修复踝关节零位",
+            change_summary="修复踝关节零位\n第二行",
             parent_revision="m3.0-20261001-deadbeef",
             control_reference=CONTROL,
             as_of="20261013",
             inventory_digest=DIGEST,
         )
         identity, sources, findings = self._identity({}, submission)
-        self.assertEqual(identity["revision"], f"m3.0-20261013-{DIGEST[:8]}")
-        self.assertEqual(identity["parent_revision"], "m3.0-20261001-deadbeef")
-        self.assertEqual(identity["owner"], "portal-user")
-        self.assertEqual(identity["change_summary"], "修复踝关节零位")
-        self.assertEqual(identity["control"], {"system": "handoff", "reference": CONTROL})
-        self.assertIn("discovery.identity_derived", findings)
+        # An absent engineering revision stays absent: never derived from a
+        # date, a digest, the submitter or an administrative parent linkage.
+        self.assertIsNone(identity["revision"])
+        self.assertIsNone(identity["parent_revision"])
+        # The authenticated submitter is not an engineering owner, and a
+        # platform handoff reference is not a CAD control record.
+        self.assertIsNone(identity["owner"])
+        self.assertIsNone(identity["control"])
+        # A confirmed-missing hardware identity adopts the configured target
+        # with an explicit origin; the multi-line submission summary is kept.
+        self.assertEqual(identity["hardware_id"], "m3.0")
+        self.assertEqual(sources["hardware_id"], "platform_configuration")
+        self.assertEqual(identity["change_summary"], "修复踝关节零位\n第二行")
+        self.assertEqual(sources["change_summary"], "submission")
+        for code in ("discovery.revision_missing", "discovery.owner_missing", "discovery.control_missing"):
+            self.assertIn(code, findings)
+            self.assertFalse(findings[code].get("blocking", True))
         self.assertEqual(
             sorted(findings["discovery.identity_derived"]["detail"]["fields"]),
-            ["change_summary", "control", "hardware_id", "owner", "parent_revision", "revision"],
+            ["change_summary", "hardware_id"],
         )
-        self.assertEqual(sources["revision"], "derived")
+        self.assertEqual(sources["revision"], "absent")
 
     def test_absent_identity_stays_deferred(self) -> None:
         identity, sources, findings = self._identity({})
