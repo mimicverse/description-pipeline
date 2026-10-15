@@ -73,6 +73,15 @@ def sealed_resolver_from_environment(environ: Mapping[str, str] | None = None) -
 def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path) -> str:
     """Atomically seal one validated delivery tree and return its locator.
 
+    Normative reference form (settled with step 2): the locator stays
+    ``store://sealed/<run_id>/<stage>`` - **tree-level, no member segment**.
+    A member is addressed as ``(tree locator, relative member path)`` and the
+    unified member table records exactly that pair with its class, byte size
+    and sha256; consumers resolve the tree through :func:`sealed_resolver`
+    and read the member through the existing confined-path rules.  Keeping the
+    tree locator free of member paths avoids opaque escaping rules for member
+    names (Unicode, spaces) and keeps the frozen scope checks untouched.
+
     The source must be a validated delivery tree: ``read_delivery_manifest``
     re-binds every subject record before anything is written.  The tree lands
     at ``<root>/sealed/<run_id>/<stage>`` through a same-filesystem temporary
