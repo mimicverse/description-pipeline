@@ -725,11 +725,17 @@ def _read_optional_json(path: Path) -> object | None:
 
 
 def _failing_checks(report: dict) -> list[dict]:
-    """The exact failed checks as the saved failed-verify report recorded them."""
+    """The exact failed checks as the saved failed-verify report recorded them.
+
+    The one convention both writers share: a row is failed when it carries the
+    boolean ``passed`` false OR the recorded ``state`` is ``"failed"`` - a
+    check-limit report may record only the state, and the preview must still
+    list exactly the failed rows.
+    """
 
     checks: list[dict] = []
     for row in report.get("checks") or []:
-        if not isinstance(row, dict) or row.get("passed") is not False:
+        if not isinstance(row, dict) or not (row.get("passed") is False or row.get("state") == "failed"):
             continue
         details = row.get("details") if isinstance(row.get("details"), dict) else {}
         checks.append(
