@@ -35,7 +35,7 @@ if AIRFLOW_AVAILABLE:
     from fastapi.testclient import TestClient
     from starlette.requests import Request
     from sqlalchemy import create_engine, text
-    from sqlalchemy.exc import ProgrammingError
+    from sqlalchemy.exc import OperationalError, ProgrammingError
     from sqlalchemy.orm import sessionmaker
 
     from airflow.configuration import conf
@@ -63,6 +63,15 @@ if AIRFLOW_AVAILABLE:
     )
 
 JWT_SECRET = "feishu-auth-manager-tests-" + "0" * 40
+
+
+class _Origin(Exception):
+    """A DB-API origin carrying an optional PostgreSQL SQLSTATE for the fake sessions."""
+
+    def __init__(self, message: str, pgcode: str | None = None) -> None:
+        super().__init__(message)
+        if pgcode is not None:
+            self.pgcode = pgcode
 
 
 class _RoutedRequest:
@@ -971,17 +980,24 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(any(item.lstrip().upper().startswith("CREATE") for item in statements))
 
     def test_state_store_refuses_when_the_table_is_missing_and_ddl_is_denied(self) -> None:
-        """A runtime identity without the migrated table fails instead of serving sign-in unready."""
+        """A missing table only falls back to CREATE; a denied CREATE keeps failing closed."""
 
-        class DeniedSession:
-            def __enter__(self) -> DeniedSession:
+        statements: list[str] = []
+
+        class MissingThenDeniedSession:
+            def __enter__(self) -> MissingThenDeniedSession:
                 return self
 
             def __exit__(self, *error: object) -> bool:
                 return False
 
             def execute(self, statement: object, parameters: object = None) -> None:
-                raise ProgrammingError(str(statement), parameters, Exception("permission denied for schema"))
+                statements.append(str(statement))
+                if str(statement).lstrip().upper().startswith("SELECT"):
+                    raise ProgrammingError(
+                        str(statement), parameters, _Origin("relation does not exist", "42P01")
+                    )
+                raise ProgrammingError(str(statement), parameters, _Origin("permission denied for schema", "42501"))
 
             def rollback(self) -> None:
                 return None
@@ -990,7 +1006,90 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 return None
 
         with self.assertRaises(ProgrammingError):
-            auth.MetadataStateStore(session_factory=DeniedSession)
+            auth.MetadataStateStore(session_factory=MissingThenDeniedSession)
+        self.assertTrue(any(item.lstrip().upper().startswith("CREATE") for item in statements))
+
+    def test_state_store_creates_the_table_after_a_missing_relation_probe(self) -> None:
+        """The migration identity sees the missing table and creates it (sqlite wording covered)."""
+
+        statements: list[str] = []
+
+        class MissingSession:
+            def __enter__(self) -> MissingSession:
+                return self
+
+            def __exit__(self, *error: object) -> bool:
+                return False
+
+            def execute(self, statement: object, parameters: object = None) -> None:
+                statements.append(str(statement))
+                if str(statement).lstrip().upper().startswith("SELECT"):
+                    raise OperationalError(
+                        str(statement), parameters, _Origin("no such table: feishu_auth_state")
+                    )
+
+            def rollback(self) -> None:
+                return None
+
+            def commit(self) -> None:
+                return None
+
+        auth.MetadataStateStore(session_factory=MissingSession)
+        self.assertTrue(any(item.lstrip().upper().startswith("CREATE") for item in statements))
+
+    def test_state_store_never_swallows_privilege_failures_into_ddl(self) -> None:
+        """A privilege failure on the probe is a real failure, not a creation trigger."""
+
+        statements: list[str] = []
+
+        class PrivilegeDeniedSession:
+            def __enter__(self) -> PrivilegeDeniedSession:
+                return self
+
+            def __exit__(self, *error: object) -> bool:
+                return False
+
+            def execute(self, statement: object, parameters: object = None) -> None:
+                statements.append(str(statement))
+                raise ProgrammingError(str(statement), parameters, _Origin("permission denied for schema", "42501"))
+
+            def rollback(self) -> None:
+                return None
+
+            def commit(self) -> None:
+                return None
+
+        with self.assertRaises(ProgrammingError):
+            auth.MetadataStateStore(session_factory=PrivilegeDeniedSession)
+        self.assertFalse(any(item.lstrip().upper().startswith("CREATE") for item in statements))
+
+    def test_state_store_never_swallows_connection_failures_into_ddl(self) -> None:
+        """A dropped connection is a real failure, not a creation trigger."""
+
+        statements: list[str] = []
+
+        class UnreachableSession:
+            def __enter__(self) -> UnreachableSession:
+                return self
+
+            def __exit__(self, *error: object) -> bool:
+                return False
+
+            def execute(self, statement: object, parameters: object = None) -> None:
+                statements.append(str(statement))
+                raise OperationalError(
+                    str(statement), parameters, _Origin("could not connect to server: Connection refused")
+                )
+
+            def rollback(self) -> None:
+                return None
+
+            def commit(self) -> None:
+                return None
+
+        with self.assertRaises(OperationalError):
+            auth.MetadataStateStore(session_factory=UnreachableSession)
+        self.assertFalse(any(item.lstrip().upper().startswith("CREATE") for item in statements))
 
 
 if __name__ == "__main__":

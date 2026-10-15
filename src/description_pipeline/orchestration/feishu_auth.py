@@ -125,6 +125,20 @@ class FeishuUser(BaseUser):
         return build_actor_name(self.get_id(), self.name)
 
 
+def _missing_relation(error: Exception) -> bool:
+    """True only when the probe failed because the table does not exist yet.
+
+    PostgreSQL answers ``undefined_table`` (SQLSTATE 42P01); the sqlite development metadata
+    answers ``no such table``.  Every other failure - privileges, a dropped connection, or a
+    malformed statement - must never be swallowed into a DDL attempt.
+    """
+
+    origin = getattr(error, "orig", None)
+    if getattr(origin, "pgcode", None) == "42P01":
+        return True
+    return "no such table" in str(origin or error).lower()
+
+
 class MetadataStateStore:
     """Single-use OAuth state and its PKCE verifier in the Airflow metadata database.
 
@@ -145,9 +159,13 @@ class MetadataStateStore:
             try:
                 # One probe: the table must exist and be readable by this identity already.
                 session.execute(text("SELECT 1 FROM feishu_auth_state WHERE 1 = 0"))
-            except (OperationalError, ProgrammingError):
-                # Only an identity that owns the migration window can create it; a runtime
-                # identity without the table fails here instead of serving sign-in unready.
+            except (OperationalError, ProgrammingError) as error:
+                if not _missing_relation(error):
+                    # A privilege, connection or statement failure is a real failure: it must
+                    # surface here, never trigger a DDL fallback.
+                    raise
+                # Only the missing table falls back to creation; a runtime identity without
+                # the migrated table fails here instead of serving sign-in unready.
                 session.rollback()
                 session.execute(
                     text(
