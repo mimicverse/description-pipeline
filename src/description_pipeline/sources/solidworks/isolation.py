@@ -276,18 +276,97 @@ def _windows_boot_epoch(now: float | None = None, uptime_ms: int | None = None) 
     return moment - ticks / 1000.0
 
 
-def _ownership_path(override=None) -> Path:
-    """The endpoint-owned launch ledger; callers may pin it explicitly."""
+#: The canonical install root of the native endpoint (the launcher's default);
+#: standalone calls discover the official CAD domain through it.
+DEFAULT_ENDPOINT_ROOT = "C:\\description-v1-review"
 
+
+class DomainUnbound(PipelineError):
+    """No canonical CAD domain binding exists on this host."""
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+
+
+def _discovered_endpoint_ledger() -> Path | None:
+    """The ledger named by the installed endpoint configuration, or ``None``.
+
+    Discovery reads ``<DESCRIPTION_ENDPOINT_ROOT|default>/endpoint.json`` and
+    resolves its ``state_root``; non-Windows hosts have no default root.  An
+    unreadable configuration is loud, never a silent fallback.
+    """
+
+    root = os.environ.get("DESCRIPTION_ENDPOINT_ROOT") or (DEFAULT_ENDPOINT_ROOT if os.name == "nt" else None)
+    if not root:
+        return None
+    config = Path(root) / "endpoint.json"
+    if not config.is_file():
+        return None
+    try:
+        payload = read_data(config)
+    except (PipelineError, OSError, ValueError) as error:
+        raise PipelineError(
+            "cad_domain_unreadable", f"the endpoint configuration could not be read: {config}"
+        ) from error
+    state_root = payload.get("state_root") if isinstance(payload, dict) else None
+    if not isinstance(state_root, str) or not state_root.strip():
+        raise PipelineError("cad_domain_unreadable", f"the endpoint configuration names no state root: {config}")
+    return Path(state_root) / "cad-ownership.json"
+
+
+def _ownership_path(override=None) -> Path:
+    """Resolve THE canonical CAD domain ledger path.
+
+    Binding: the operational pin (``DESCRIPTION_CAD_OWNERSHIP_FILE``) or the
+    installed endpoint configuration (``DESCRIPTION_ENDPOINT_ROOT`` ->
+    ``endpoint.json`` -> ``state_root``).  Two disagreeing bindings refuse
+    instead of picking one, and an explicit ``override`` that diverges from a
+    bound canonical path refuses as well - a second domain must never be
+    created silently.  With no binding at all the path is unbound; only
+    callers with an explicit development fallback (``cad_domain_path``) may
+    substitute one.  The old per-user state-directory default is gone.
+    """
+
+    pinned = os.environ.get("DESCRIPTION_CAD_OWNERSHIP_FILE") or None
+    discovered = _discovered_endpoint_ledger()
+    if pinned is not None and discovered is not None and not _same_path(Path(pinned), discovered):
+        raise EnvironmentError_(
+            "cad_domain_override_refused",
+            "two CAD domain bindings disagree; refusing to create a second domain",
+            {"env": pinned, "endpoint": str(discovered)},
+        )
+    canonical = Path(pinned) if pinned is not None else discovered
     if override is not None:
-        return Path(override)
-    configured = os.environ.get("DESCRIPTION_CAD_OWNERSHIP_FILE")
-    if configured:
-        return Path(configured)
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
-    if not base:
-        base = str(Path.home() / ".local" / "state")
-    return Path(base) / "description-pipeline" / "cad-ownership.json"
+        candidate = Path(override)
+        if canonical is not None and not _same_path(candidate, canonical):
+            raise EnvironmentError_(
+                "cad_domain_override_refused",
+                "a divergent CAD domain override would create a second domain",
+                {"override": str(candidate), "canonical": str(canonical)},
+            )
+        return candidate
+    if canonical is None:
+        raise DomainUnbound(
+            "the CAD domain is not bound; pin DESCRIPTION_CAD_OWNERSHIP_FILE or install the endpoint configuration"
+        )
+    return canonical
+
+
+def cad_domain_path(fallback=None) -> Path:
+    """The canonical CAD domain path; ``fallback`` only for an unbound host.
+
+    The fallback keeps development and test callers working on hosts with no
+    pin and no installed configuration; on any bound host it is dead code, so
+    a changed ``state_root`` cannot silently open a second domain.
+    """
+
+    try:
+        return _ownership_path()
+    except DomainUnbound:
+        if fallback is None:
+            raise
+        return Path(fallback)
 
 
 def _lease_path(override=None) -> Path:
@@ -305,25 +384,47 @@ def _lease_path(override=None) -> Path:
 class DomainLease:
     """One session-lifetime kernel lock covering a whole CAD resource domain.
 
-    Acquired before an owned launch starts and released only when the last
-    owned process of this process closes, so read/capture/write actors cannot
-    interleave inside one domain: a second actor's non-blocking acquisition
-    fails closed with ``cad_domain_leased`` (holder pid from the lock file).
-    The lock is a kernel lock, so a crashed or killed holder releases it with
-    its process - recovery needs no sweeping - and the lock file, like the
-    ledger sidecar, is never unlinked.  The ledger's own short
-    read-modify-write lock is untouched by this lease, so ledger writers are
-    never blocked for the length of a session.
+    Strictly exclusive: one live acquisition per domain, in this process and
+    across processes.  A second acquisition - a second lease object, a second
+    owned launch in the same process, or even a re-acquire on the same object -
+    fails closed with ``cad_domain_leased`` (holder pid in the detail); there
+    is no reentry and no pid-based bypass.  Acquired before an owned launch
+    starts and released only once the owned process's exit is confirmed, so
+    read/capture/write actors cannot interleave inside one domain.  The lock
+    is a kernel lock, so a crashed or killed holder releases it with its
+    process - that makes the lock re-acquirable but is NOT proof the CAD
+    process exited: the existing identity/remnant classification still runs
+    at every launch and is never skipped.  The lock file, like the ledger
+    sidecar, is never unlinked.  The ledger's own short read-modify-write lock
+    is untouched by this lease, so ledger writers are never blocked for the
+    length of a session.
     """
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.handle: int | None = None
-        self.holders = 0
         self.holder_pid: int | None = None
 
+    @property
+    def holders(self) -> int:
+        """Live acquisitions on this lease object (0 or 1; exclusivity forbids 2)."""
+
+        return 1 if self.handle is not None else 0
+
+    def _leased(self, holder_pid, holder):
+        return EnvironmentError_(
+            "cad_domain_leased",
+            "the CAD resource domain is leased by another actor",
+            {"lease": str(self.path), "holder_pid": holder_pid, "holder": holder},
+        )
+
     def acquire(self) -> DomainLease:
-        if self.handle is None:
+        if self.handle is not None:
+            raise self._leased(self.holder_pid, "this-lease")
+        with _DOMAIN_LEASES_LOCK:
+            live = _HELD_LEASES.get(str(self.path))
+            if live is not None and live.handle is not None:
+                raise self._leased(live.holder_pid, "in-process")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 self.handle = acquire_process_lock(self.path)
@@ -331,20 +432,17 @@ class DomainLease:
                 holder = None
                 with contextlib.suppress(OSError):
                     holder = self.path.read_text(encoding="utf-8").strip() or None
-                raise EnvironmentError_(
-                    "cad_domain_leased",
-                    "the CAD resource domain is leased by another process",
-                    {"lease": str(self.path), "holder_pid": holder},
-                ) from error
+                raise self._leased(holder, "external") from error
             self.holder_pid = os.getpid()
-        self.holders += 1
-        return self
+            _HELD_LEASES[str(self.path)] = self
+            return self
 
     def release(self) -> None:
-        if self.holders == 0:
-            return
-        self.holders -= 1
-        if self.holders == 0 and self.handle is not None:
+        with _DOMAIN_LEASES_LOCK:
+            if self.handle is None:
+                return
+            if _HELD_LEASES.get(str(self.path)) is self:
+                del _HELD_LEASES[str(self.path)]
             os.close(self.handle)
             self.handle = None
             self.holder_pid = None
@@ -353,19 +451,49 @@ class DomainLease:
         return {"path": str(self.path), "held": self.handle is not None, "holder_pid": self.holder_pid}
 
 
-_DOMAIN_LEASES: dict[str, DomainLease] = {}
+_HELD_LEASES: dict[str, DomainLease] = {}
 _DOMAIN_LEASES_LOCK = threading.RLock()
 
 
 def domain_lease(ownership_file=None) -> DomainLease:
-    """This process's lease object for one resource domain (one per lease path)."""
+    """A fresh lease handle for one resource domain.
 
-    key = str(_lease_path(ownership_file))
+    Exclusivity is enforced at ``acquire``: one live acquisition per domain,
+    across processes and inside this process (no shared singleton, no
+    process-wide reentry).
+    """
+
+    return DomainLease(_lease_path(ownership_file))
+
+
+def domain_lease_facts(ownership_file=None) -> dict:
+    """Read-only receipt: whether the domain lease is actually held, and by whom.
+
+    This process's live holders are consulted first (a same-process kernel
+    probe cannot reliably see its own lock), then a short non-blocking kernel
+    probe (acquire + immediate release) observes another process's holder.
+    Unreadable probe states stay explicit (``held: None`` plus ``error``),
+    never a quiet zero.
+    """
+
+    path = _lease_path(ownership_file)
     with _DOMAIN_LEASES_LOCK:
-        lease = _DOMAIN_LEASES.get(key)
-        if lease is None:
-            lease = _DOMAIN_LEASES[key] = DomainLease(Path(key))
-        return lease
+        live = _HELD_LEASES.get(str(path))
+        if live is not None and live.handle is not None:
+            return {"path": str(path), "held": True, "holder": "in-process", "holder_pid": live.holder_pid}
+    if not path.exists():
+        return {"path": str(path), "held": False, "holder": None, "holder_pid": None}
+    try:
+        handle = acquire_process_lock(path)
+    except OSError:
+        holder = None
+        with contextlib.suppress(OSError):
+            holder = path.read_text(encoding="utf-8").strip() or None
+        return {"path": str(path), "held": True, "holder": "external", "holder_pid": holder}
+    except Exception as error:  # noqa: BLE001 - an unreadable probe stays explicit
+        return {"path": str(path), "held": None, "error": f"{type(error).__name__}: {error}"}
+    os.close(handle)
+    return {"path": str(path), "held": False, "holder": None, "holder_pid": None}
 
 
 class OwnershipStore:
@@ -653,9 +781,12 @@ def cad_session_facts(
                 external += 1
             continue
         external += 1  # verified process, but this endpoint does not own it
+    lease = domain_lease_facts(ownership_file)
+    if lease.get("held") is None and lease.get("error"):
+        problems.append("cad_lease_unreadable")
     return {
         "owned_sessions": owned,
-        "lease_held": owned > 0,
+        "lease_held": lease.get("held") is True,
         "external_session_detected": external > 0,
         "problems": problems,
     }
@@ -767,31 +898,41 @@ class WindowsCadProcess:
         import win32event
 
         with self._lock:
-            errors = []
-            try:
-                for name in ("_job", "_thread", "_process"):
-                    handle = getattr(self, name)
-                    if handle is not None:
-                        try:
-                            if name == "_process" and win32event.WaitForSingleObject(handle, 5000) != 0:
-                                raise OSError("Owned SolidWorks process has not exited")
-                        except Exception as error:
-                            errors.append(str(error))
-                        try:
-                            handle.Close()
-                        except Exception as error:
-                            errors.append(str(error))
-                        finally:
-                            setattr(self, name, None)
-            finally:
+            errors: list[str] = []
+            exit_confirmed = True
+            for name in ("_job", "_thread", "_process"):
+                handle = getattr(self, name)
+                if handle is None:
+                    continue
+                if name == "_process":
+                    try:
+                        if win32event.WaitForSingleObject(handle, 5000) != 0:
+                            exit_confirmed = False
+                            errors.append("Owned SolidWorks process has not exited")
+                    except Exception as error:  # noqa: BLE001
+                        exit_confirmed = False
+                        errors.append(str(error))
+                    if not exit_confirmed:
+                        # The OS boundary is not proven: keep this handle, the
+                        # ownership record and the domain lease so a later
+                        # close can still confirm the exit; nothing is
+                        # announced released before that proof.
+                        continue
+                try:
+                    handle.Close()
+                except Exception as error:  # noqa: BLE001
+                    errors.append(str(error))
+                else:
+                    setattr(self, name, None)
+            if exit_confirmed:
                 with _TRACKED_PIDS_LOCK:
                     _TRACKED_PIDS.discard(self.pid)
                 if self._ownership is not None:
                     with contextlib.suppress(Exception):
                         self._ownership.remove(self.pid, creation_time=self._record_creation)
                 if getattr(self, "_lease_held", False):
-                    # The lease is released last: the domain stays exclusive
-                    # until nothing of this owned launch remains.
+                    # The lease is released last, only once the owned
+                    # process's exit is proven: the domain stays exclusive.
                     with contextlib.suppress(Exception):
                         self._lease.release()
                     self._lease_held = False

@@ -56,13 +56,26 @@ class CadSessionFactsTests(unittest.TestCase):
             ownership_file=self.ledger,
         )
 
-    def test_a_proven_own_launch_is_one_owned_lease(self) -> None:
+    def test_a_proven_own_launch_is_one_owned_session(self) -> None:
         self._record(7)
         facts = self._facts(table=[(7, EXE)])
         self.assertEqual(facts["owned_sessions"], 1)
-        self.assertTrue(facts["lease_held"])
+        # lease_held reflects the actual domain lease, never the owned count.
+        self.assertFalse(facts["lease_held"])
         self.assertFalse(facts["external_session_detected"])
         self.assertEqual(facts["problems"], [])
+
+    def test_lease_held_reflects_the_domain_lease_not_the_owned_count(self) -> None:
+        lease = isolation.domain_lease(self.ledger)
+        lease.acquire()
+        self.addCleanup(lease.release)
+        self._record(7)
+        with_lease = self._facts(table=[(7, EXE)])
+        self.assertEqual(with_lease["owned_sessions"], 1)
+        self.assertTrue(with_lease["lease_held"])
+        without_launch = self._facts(table=[])
+        self.assertEqual(without_launch["owned_sessions"], 0)
+        self.assertTrue(without_launch["lease_held"])
 
     def test_pid_reuse_is_never_counted_as_owned(self) -> None:
         self._record(7, creation=100)

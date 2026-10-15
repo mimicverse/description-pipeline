@@ -442,8 +442,10 @@ class Jobs:
         self.native_reader = native_reader
         self.backend_factory = backend_factory or self._sealed_backend
         #: Every endpoint-side owned launch (selection and capture) records
-        #: into this one ledger.
-        self.cad_ownership_file = config["state_root"] / "cad-ownership.json"
+        #: into the one canonical CAD domain; resolved lazily so endpoint
+        #: construction keeps its import boundary and a bound host cannot be
+        #: diverted by a changed state root.  See ``cad_ownership_file``.
+        self._cad_domain = None
         self._plans = {}
         self.directory = config["state_root"] / "jobs"
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -490,6 +492,22 @@ class Jobs:
         except BaseException:
             os.close(self.handle)
             raise
+
+    @property
+    def cad_ownership_file(self):
+        """The canonical CAD domain ledger for every endpoint-side launch.
+
+        Resolution goes through the one canonical binding (the operational pin
+        or the installed endpoint configuration); a host with no binding at
+        all keeps a development fallback of its own state root, which is dead
+        code on any bound host.
+        """
+
+        if self._cad_domain is None:
+            from ..sources.solidworks import isolation
+
+            self._cad_domain = isolation.cad_domain_path(Path(self.config["state_root"]) / "cad-ownership.json")
+        return self._cad_domain
 
     def _save(self, job):
         write_json(self.directory / (job["run_id"] + ".json"), job)
@@ -1908,6 +1926,10 @@ def serve(config_path):
     with contextlib.ExitStack() as stack:
         jobs = Jobs(config)
         stack.callback(jobs.close)
+        # Pin the canonical domain for everything this service spawns (child
+        # tools and watchers resolve the very same ledger instead of a
+        # default of their own); an existing pin wins.
+        os.environ.setdefault("DESCRIPTION_CAD_OWNERSHIP_FILE", str(jobs.cad_ownership_file))
         server = ThreadingHTTPServer((config["host"], config["port"]), handler(jobs, config["token"]))
         stack.callback(server.server_close)
         print(
