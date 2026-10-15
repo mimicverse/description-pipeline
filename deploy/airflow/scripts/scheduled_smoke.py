@@ -1331,6 +1331,9 @@ def main() -> int:
                 "platform_schema": args.platform_schema or None,
                 "airflow_schema": args.airflow_schema or None,
                 "portal_admission": portal_mode,
+                # Exported by the operator environment from the install snapshot digest;
+                # the run freeze consumes it (conf first, environment second).
+                "platform_config_digest": os.environ.get("PLATFORM_CONFIG_DIGEST") or None,
             },
             "triggering_user_name": triggering_user_name,
             "dag_state": dag_state,
