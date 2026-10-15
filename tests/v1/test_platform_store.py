@@ -1021,6 +1021,7 @@ class PlatformStoreTests(unittest.TestCase):
                         run_id="r-1", stage="capture", operation_key="r-1/release:0", receipt=receipt
                     )
                 self.assertEqual(self.world.operations["r-1/release:0"][1], "running")
+        before = len(self.world.statements)
         settled = self.store.settle_cache_release(
             run_id="r-1",
             stage="capture",
@@ -1029,6 +1030,14 @@ class PlatformStoreTests(unittest.TestCase):
         )
         self.assertEqual(settled.state, "succeeded")
         self.assertEqual(self.world.operations["r-1/release:0"][1], "succeeded")
+        # The same-run lock order: run row first, then the operation transition,
+        # then the event - the one short transaction every event writer shares.
+        tail = self.world.statements[before:]
+        lock_index = next(i for i, text in enumerate(tail) if "FROM run" in text and "FOR UPDATE" in text)
+        settle_index = next(i for i, text in enumerate(tail) if text.startswith("UPDATE operation SET state = %s"))
+        event_index = next(i for i, text in enumerate(tail) if text.startswith("INSERT INTO run_event"))
+        self.assertLess(lock_index, settle_index)
+        self.assertLess(settle_index, event_index)
         recorded = [event for event in self.world.events if event[2] == "cache_release"]
         self.assertEqual(len(recorded), 1)
         self.assertEqual(json.loads(recorded[0][5])["receipt"]["operation_id"], operation.operation_id)
@@ -1101,7 +1110,12 @@ class PlatformStoreTests(unittest.TestCase):
 
     def test_run_events_reads_a_bounded_ordered_window(self) -> None:
         self._running_run()
+        before = len(self.world.statements)
         self.store.append_event("r-1", stage="freeze", kind="observed", payload={"step": 1})
+        tail = self.world.statements[before:]
+        lock_index = next(i for i, text in enumerate(tail) if "FROM run" in text and "FOR UPDATE" in text)
+        event_index = next(i for i, text in enumerate(tail) if text.startswith("INSERT INTO run_event"))
+        self.assertLess(lock_index, event_index)
         self.store.append_event("r-1", stage="freeze", kind="observed", payload={"step": 2})
         events = self.store.run_events("r-1")
         self.assertEqual(

@@ -522,15 +522,17 @@ class PlatformStore:
 
         if not isinstance(receipt, dict) or not receipt:
             raise PlatformStoreError("A cache release must bind its canonical release receipt")
-        try:
-            validate_cache_release_receipt(receipt)
-        except InterfaceRecordError as error:
-            raise PlatformStoreError("The cache release receipt is not the canonical IF-10 release receipt") from error
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
             if cursor.fetchone() is None:
                 raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            try:
+                validate_cache_release_receipt(receipt)
+            except InterfaceRecordError as error:
+                raise PlatformStoreError(
+                    "The cache release receipt is not the canonical IF-10 release receipt"
+                ) from error
             cursor.execute(_FIND_OPERATION, (operation_key,))
             existing = cursor.fetchone()
             if existing is None:
