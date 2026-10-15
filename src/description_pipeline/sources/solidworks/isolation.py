@@ -244,12 +244,36 @@ def _windows_terminate_matching(pid: int, creation_time: int) -> bool:
                 handle.Close()
 
 
-def _windows_boot_epoch() -> float:
+def _windows_uptime_ms(kernel32=None) -> int:
+    """Milliseconds since the host booted, from ``kernel32.GetTickCount64``.
+
+    pywin32 311 does not export ``GetTickCount64`` (measured on the staged and
+    production runtimes), so the tick is read through ctypes instead.  Only the
+    64-bit tick is used: the 32-bit ``GetTickCount`` wraps every 2**32 ms
+    (~49.7 days), and a wrapped value would silently corrupt the boot/creation
+    discrimination, so a missing 64-bit tick fails closed instead of
+    degrading.  The real ctypes wiring is Windows-only; Linux CI injects
+    ``kernel32``.
+    """
+
+    if kernel32 is None:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+    get64 = getattr(kernel32, "GetTickCount64", None)
+    if get64 is None:
+        raise AttributeError(
+            "kernel32.GetTickCount64 is required for the boot epoch; the 32-bit tick wraps and is not usable"
+        )
+    return int(get64())
+
+
+def _windows_boot_epoch(now: float | None = None, uptime_ms: int | None = None) -> float:
     """The host boot moment in Unix seconds (uptime-derived; no registry writes)."""
 
-    import win32api
-
-    return time.time() - win32api.GetTickCount64() / 1000.0
+    moment = time.time() if now is None else now
+    ticks = _windows_uptime_ms() if uptime_ms is None else uptime_ms
+    return moment - ticks / 1000.0
 
 
 def _ownership_path(override=None) -> Path:
