@@ -51,22 +51,22 @@ class RequestEvidenceTests(unittest.TestCase):
 
     def test_change_summary_is_lf_normalized_and_other_controls_are_refused(self) -> None:
         self.assertEqual(record(change_summary="line1\r\nline2\rline3")["change_summary"], "line1\nline2\nline3")
-        with self.assertRaisesRegex(PipelineError, "control characters"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             record(change_summary="bad\x07summary")
 
     def test_missing_or_misshaped_fields_are_refused(self) -> None:
-        with self.assertRaisesRegex(PipelineError, "request_id"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             record(request_id="")
-        with self.assertRaisesRegex(PipelineError, "change summary"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             record(change_summary="   ")
-        with self.assertRaisesRegex(PipelineError, "handoff_digest"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             record(handoff_digest="not-a-digest")
-        with self.assertRaisesRegex(PipelineError, "platform_config_digest"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             record(platform_config_digest="F" * 64)
-        with self.assertRaisesRegex(PipelineError, "unknown schema"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             request_evidence_bytes({**record(), "schema_version": "solidworks-to-urdf.request/v2"})
         extra = {**record(), "secret": "nope"}
-        with self.assertRaisesRegex(PipelineError, "exactly the seven"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             request_evidence_bytes(extra)
 
     def test_write_read_round_trip_is_byte_stable_and_binds_its_digest(self) -> None:
@@ -92,14 +92,13 @@ class RequestEvidenceTests(unittest.TestCase):
     def test_null_and_misshaped_required_fields_are_refusals(self) -> None:
         base = record()
         for field in ("request_id", "main_assembly", "handoff_digest", "platform_config_digest"):
-            expected = "sha256" if field == "platform_config_digest" else field
-            with self.subTest(field=field), self.assertRaisesRegex(PipelineError, expected):
+            with self.subTest(field=field), self.assertRaisesRegex(PipelineError, "request_record_invalid"):
                 request_evidence_bytes({**base, field: None})
-        with self.assertRaisesRegex(PipelineError, "request_id"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             request_evidence_bytes({**base, "request_id": 123})
-        with self.assertRaisesRegex(PipelineError, "sha256 platform_config_digest"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             request_evidence_bytes({**base, "platform_config_digest": "not-a-sha"})
-        with self.assertRaisesRegex(PipelineError, "sha256 handoff_digest"):
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             request_evidence_bytes({**base, "handoff_digest": "c" * 63})
 
     def test_duplicate_keys_in_the_carried_file_are_refused(self) -> None:

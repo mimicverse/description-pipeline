@@ -12,12 +12,12 @@ the file is refused; there is no fallback to any earlier representation.
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 
+from .interface_records import REQUEST_RECORD_SCHEMA, validate_request_record
 from .io import PipelineError, canonical, read_data
 
-REQUEST_SCHEMA = "solidworks-to-urdf.request/v1"
+REQUEST_SCHEMA = REQUEST_RECORD_SCHEMA
 REQUEST_RELATIVE = "input/request.json"
 REQUEST_FIELDS = (
     "schema_version",
@@ -28,11 +28,6 @@ REQUEST_FIELDS = (
     "handoff_digest",
     "platform_config_digest",
 )
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
-#: LF stays legal inside the summary; every other control character is refused.
-_CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
-
-
 def normalize_change_summary(value: str) -> str:
     """Fold CRLF (and a lone CR) into LF before the evidence is frozen."""
 
@@ -52,20 +47,22 @@ def build_request_evidence(
 
     record = {
         "schema_version": REQUEST_SCHEMA,
-        "request_id": _identifier(request_id, "request_id"),
-        "target_hardware": _identifier(target_hardware, "target_hardware"),
-        "change_summary": _summary(change_summary),
-        "main_assembly": _identifier(main_assembly, "main_assembly"),
-        "handoff_digest": _digest(handoff_digest, "handoff_digest"),
-        "platform_config_digest": _digest(platform_config_digest, "platform_config_digest"),
+        "request_id": request_id.strip() if isinstance(request_id, str) else request_id,
+        "target_hardware": target_hardware.strip() if isinstance(target_hardware, str) else target_hardware,
+        "change_summary": (
+            normalize_change_summary(change_summary) if isinstance(change_summary, str) else change_summary
+        ),
+        "main_assembly": main_assembly.strip() if isinstance(main_assembly, str) else main_assembly,
+        "handoff_digest": handoff_digest,
+        "platform_config_digest": platform_config_digest,
     }
-    return record
+    return validate_request_record(record)
 
 
 def request_evidence_bytes(record: dict) -> bytes:
     """The canonical bytes every consumer must carry verbatim."""
 
-    _validate(record)
+    validate_request_record(record)
     return canonical(record)
 
 
@@ -95,7 +92,7 @@ def read_request_evidence(path: str | Path) -> tuple[dict, str]:
         record = read_data(source)
     except PipelineError as error:
         raise PipelineError("The frozen request evidence is not the canonical strict JSON record") from error
-    _validate(record)
+    validate_request_record(record)
     return record, hashlib.sha256(payload).hexdigest()
 
 
@@ -154,42 +151,3 @@ def carry_request_evidence(run_dir: str | Path, tree_dir: str | Path) -> Path:
     return target
 
 
-def _identifier(value, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise PipelineError(f"The frozen request evidence lacks its {field}")
-    text = value.strip()
-    if _CONTROL.search(text):
-        raise PipelineError(f"The frozen request evidence carries control characters in {field}")
-    return text
-
-
-def _summary(value) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise PipelineError("The frozen request evidence lacks its change summary")
-    text = normalize_change_summary(value)
-    if _CONTROL.search(text):
-        raise PipelineError("The frozen request evidence carries control characters in change_summary")
-    return text
-
-
-def _digest(value, field: str) -> str:
-    if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
-        raise PipelineError(f"The frozen request evidence lacks a sha256 {field}")
-    return value
-
-
-def _validate(record: dict) -> None:
-    if not isinstance(record, dict) or set(record) != set(REQUEST_FIELDS):
-        raise PipelineError("The frozen request evidence must carry exactly the seven schema fields")
-    if record.get("schema_version") != REQUEST_SCHEMA:
-        raise PipelineError(f"The frozen request evidence uses an unknown schema: {record.get('schema_version')!r}")
-    rebuilt = build_request_evidence(
-        request_id=record["request_id"],
-        target_hardware=record["target_hardware"],
-        change_summary=record["change_summary"],
-        main_assembly=record["main_assembly"],
-        handoff_digest=record["handoff_digest"],
-        platform_config_digest=record["platform_config_digest"],
-    )
-    if rebuilt != record:
-        raise PipelineError("The frozen request evidence is not the canonical normalized form")

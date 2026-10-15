@@ -1348,6 +1348,48 @@ def validate_source_record(record) -> dict:
     return record
 
 
+REQUEST_RECORD_SCHEMA = "solidworks-to-urdf.request/v1"
+
+_REQUEST_RECORD_KEYS = {
+    "schema_version",
+    "request_id",
+    "target_hardware",
+    "change_summary",
+    "main_assembly",
+    "handoff_digest",
+    "platform_config_digest",
+}
+
+
+def validate_request_record(record) -> dict:
+    """``input/request.json``: the freeze-formed request record, before the generator ran.
+
+    One strict shape shared by the freeze writer and the offline verifier: all
+    seven fields required, no unknown keys (the foundation reader additionally
+    rejects duplicate keys and non-finite numbers while parsing), no null
+    values, strict types - ``request_id`` is non-empty text carried unchanged
+    across reuse and never compared with the current run UUID, and both digests
+    are lowercase SHA-256.
+    """
+
+    code = "request_record_invalid"
+    _exact_keys(record, _REQUEST_RECORD_KEYS, code, "request")
+    _require(record["schema_version"] == REQUEST_RECORD_SCHEMA, code, {"where": "schema_version"})
+    for key in ("request_id", "target_hardware", "main_assembly"):
+        _text(record[key], code, key)
+    summary = record["change_summary"]
+    _require(
+        isinstance(summary, str)
+        and summary.strip() != ""
+        and not any((ord(char) < 32 and char != "\n") or ord(char) == 127 for char in summary),
+        code,
+        {"where": "change_summary"},
+    )
+    for key in ("handoff_digest", "platform_config_digest"):
+        _hex64(record[key], code, key)
+    return record
+
+
 # --- IF-15 release identity: contract digests and the support matrix -------------
 
 
