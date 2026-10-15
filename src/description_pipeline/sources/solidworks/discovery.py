@@ -4238,6 +4238,18 @@ def derive_native_package(
             "identity": {"hardware_id": identity.get("hardware_id"), "revision": identity.get("revision")},
             "selection": {"files": {str(key): str(value) for key, value in sorted(native_files.items())}},
             "objects": plan_objects,
+            "groups": [
+                {
+                    "name": str(body["name"]),
+                    "components": sorted(str(member) for member in (body.get("components") or [])),
+                }
+                for body in bodies
+            ],
+            "axis_requests": [
+                {"name": str(joint["name"]), "axis_reference": joint["axis_reference"]}
+                for joint in joints
+                if isinstance(joint.get("axis_reference"), dict)
+            ],
             "datums": sorted(
                 {str(item["datum"]) for item in bodies if item.get("datum")}
                 | {

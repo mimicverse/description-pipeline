@@ -48,6 +48,11 @@ def build_package(root: Path) -> Path:
             {"name": "base-1", "document": "cad/base.SLDPRT", "state": 2},
             {"name": "arm-1", "document": "cad/arm.SLDPRT", "state": 2},
         ],
+        "groups": [
+            {"name": "base_link", "components": ["base-1"]},
+            {"name": "arm_link", "components": ["arm-1"]},
+        ],
+        "axis_requests": [{"name": "shoulder_pitch_joint", "axis_reference": {"point": [0, 0, 0]}}],
         "datums": ["CS_base_link"],
         "evidence_requests": ["evidence/capture.json", "evidence/geometry/", "evidence/native-runtime.json"],
     }

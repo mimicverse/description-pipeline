@@ -47,6 +47,8 @@ SOURCE_KEYS = {
     "geometry",
     "coordinate_systems",
     "require_saved",
+    "groups",
+    "axis_requests",
     "bodies",
     "joints",
     "frames",
@@ -263,6 +265,10 @@ def validate_source_config(config: object) -> dict[str, Any]:
                 _require(isinstance(closure[name], (dict, list)), f"source.closure.{name} has the wrong shape")
     geometry = config.get("geometry") or {}
     _require(isinstance(geometry, dict), "source.geometry must be a mapping")
+    groups = config.get("groups")
+    _require(isinstance(groups, list) and groups, "source.groups must be the native link-group selections")
+    axis_requests = config.get("axis_requests")
+    _require(isinstance(axis_requests, list), "source.axis_requests must be the native axis requests")
     if geometry.get("enabled"):
         _require(
             str(geometry.get("format", "stl_binary")) == "stl_binary",
@@ -418,9 +424,8 @@ def validate_source_config(config: object) -> dict[str, Any]:
         "geometry": dict(geometry),
         "coordinate_systems": [str(name) for name in coordinate_systems],
         "require_saved": True,
-        "bodies": list(config.get("bodies") or []),
-        "joints": list(config.get("joints") or []),
-        "frames": list(config.get("frames") or []),
+        "groups": [dict(item) for item in (config.get("groups") or [])],
+        "axis_requests": [dict(item) for item in (config.get("axis_requests") or [])],
         "robot_name": str(config.get("robot_name") or "robot"),
         "material_source": material_source,
         "documented_masses": documented,
@@ -1731,7 +1736,7 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
 
     reader = getattr(backend, "capture_axis_reference", None)
     captured: list[dict[str, Any]] = []
-    for joint in cfg.get("joints") or []:
+    for joint in cfg.get("axis_requests") or []:
         reference = joint.get("axis_reference")
         if not isinstance(reference, dict):
             continue
@@ -1854,7 +1859,7 @@ def _compose_link_selections(
     if len(set(leaves)) != len(leaves):
         raise BridgeError("link_group_occurrence_duplicate", "the captured scene repeats an occurrence", exit_code=3)
     leaf_set = set(leaves)
-    bodies = list(cfg.get("bodies") or [])
+    bodies = list(cfg.get("groups") or [])
     if not bodies:
         raise BridgeError("link_group_body_missing", "native discovery defines no rigid bodies", exit_code=3)
     body_of: dict[str, str] = {}
@@ -2187,8 +2192,8 @@ def _freeze_local(
         "geometry": cfg["geometry"],
         "material_source": cfg["material_source"],
         "require_saved": cfg["require_saved"],
-        "bodies": len(cfg["bodies"]),
-        "joints": len(cfg["joints"]),
+        "bodies": len(cfg.get("groups") or []),
+        "joints": len(cfg.get("axis_requests") or []),
         "declared_masses": len(cfg.get("documented_masses") or {}),
     }
     from .native import ACTIVITY_KEEPALIVE_SECONDS, _ActivityEmitter
@@ -2382,7 +2387,9 @@ def _freeze_local(
             },
             limits={
                 "native_cad": True,
-                "kinematics_defined_by": "source.bodies/source.joints" if cfg["joints"] else "not_defined",
+                "kinematics_defined_by": (
+                    "source.groups/source.axis_requests" if cfg.get("axis_requests") else "not_defined"
+                ),
                 "material_source": cfg["material_source"],
             },
         )

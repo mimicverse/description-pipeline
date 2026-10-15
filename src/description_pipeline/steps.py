@@ -413,6 +413,8 @@ _PLAN_KEYS = frozenset(
         "identity",
         "selection",
         "objects",
+        "groups",
+        "axis_requests",
         "datums",
         "evidence_requests",
     }
@@ -540,6 +542,31 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         raise PipelineError("The sealed capture plan carries unusable datums")
     if plan.get("evidence_requests") != _CAPTURE_EVIDENCE_REQUESTS:
         raise PipelineError("The sealed capture plan requests unknown evidence items")
+    groups = plan.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise PipelineError("The sealed capture plan carries no native link-group selections")
+    for item in groups:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "components"}
+            or not isinstance(item["name"], str)
+            or not item["name"]
+            or not isinstance(item["components"], list)
+            or any(not isinstance(member, str) or not member for member in item["components"])
+        ):
+            raise PipelineError("The sealed capture plan carries unusable native link-group selections")
+    axis_requests = plan.get("axis_requests")
+    if not isinstance(axis_requests, list):
+        raise PipelineError("The sealed capture plan carries no native axis requests")
+    for item in axis_requests:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "axis_reference"}
+            or not isinstance(item["name"], str)
+            or not item["name"]
+            or not isinstance(item["axis_reference"], dict)
+        ):
+            raise PipelineError("The sealed capture plan carries unusable native axis requests")
     return source, plan
 
 
@@ -599,6 +626,8 @@ def capture_evidence(
             "coordinate_systems": [str(name) for name in plan["datums"]],
             "material_source": "cad",
             "allowed_roots": [str(package.resolve())],
+            "groups": plan["groups"],
+            "axis_requests": plan["axis_requests"],
             "closure": native_source_closure(package),
         }
         definition = {"source": source, "plan": plan}
