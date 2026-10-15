@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import unittest
 from pathlib import Path
 
@@ -242,6 +243,241 @@ class MotionFixtureTests(unittest.TestCase):
         swapped = {**authored, "parent": "tool", "child": "base"}
         with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
             _motion(swapped, [swapped], components, datums, bodies, record)
+
+    @staticmethod
+    def _serial_joint(name, parent, child, owner):
+        return {
+            "name": name,
+            "type": "revolute",
+            "parent": parent,
+            "child": child,
+            "axis": [0.0, 0.0, 1.0],
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+            "axis_reference": {"component": owner, "feature_name": "Cyl-" + name},
+        }
+
+    @staticmethod
+    def _serial_record(name, point, owner):
+        return {
+            "component": owner,
+            "surface": "cylinder",
+            "body_type": "solid",
+            "radius_m": 0.01,
+            "selector": {"feature_name": "Cyl-" + name, "component": owner, "body_type": "solid"},
+            "coordinate_frame": "assembly",
+            "axis_point_m": list(point),
+            "axis_direction": [0.0, 0.0, 1.0],
+        }
+
+    def _serial_setup(self):
+        datums = {
+            "base_link": np.eye(4),
+            "link1": np.array([[1, 0, 0, 0.2], [0, 1, 0, 0], [0, 0, 1, 0.5], [0, 0, 0, 1]], float),
+            "link2": np.array([[1, 0, 0, 0.4], [0, 1, 0, 0], [0, 0, 1, 0.5], [0, 0, 0, 1]], float),
+        }
+        components = {f"part{index}": pose.copy() for index, pose in enumerate(datums.values())}
+        bodies = [
+            {"name": "base_link", "components": ["part0"]},
+            {"name": "link1", "components": ["part1"]},
+            {"name": "link2", "components": ["part2"]},
+        ]
+        joints = [
+            self._serial_joint("J1", "base_link", "link1", "part0"),
+            self._serial_joint("J2", "link1", "link2", "part1"),
+        ]
+        records = [
+            self._serial_record("J1", (0.2, 0.0, 0.5), "part0"),
+            self._serial_record("J2", (0.4, 0.0, 0.5), "part1"),
+        ]
+        return datums, components, bodies, joints, records
+
+    def test_product_gate_accepts_a_correct_serial_chain(self):
+        # G06: the expected side must carry the WHOLE delivered chain - a
+        # correct 2R chain is accepted at the upstream joint (whose motion
+        # moves the terminal body) and at the terminal joint; a combined
+        # non-zero pose matches the closed-form composition.
+        from description_pipeline.verification.motion import evaluate_motion
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        datums, components, bodies, joints, records = self._serial_setup()
+        upstream = _motion(joints[0], joints, components, datums, bodies, records[0])
+        self.assertLessEqual(upstream["worst_m"], 5e-5)
+        terminal = _motion(joints[1], joints, components, datums, bodies, records[1])
+        self.assertLessEqual(terminal["worst_m"], 5e-5)
+        doc_bodies = [
+            {
+                "id": body["name"],
+                "group": body["name"],
+                "frame": datums[body["name"]].tolist(),
+                "leaves": [
+                    {"id": leaf, "world": components[leaf].tolist()} for leaf in body["components"]
+                ],
+            }
+            for body in bodies
+        ]
+        doc_joints = [
+            {
+                "id": joint["name"],
+                "type": joint["type"],
+                "parent": joint["parent"],
+                "child": joint["child"],
+                "axis_point": list(record["axis_point_m"]),
+                "axis_dir": list(record["axis_direction"]),
+                "stored_direction": list(record["axis_direction"]),
+                "limits": joint["limits"],
+                "drive": {"effort": 1.0, "velocity": 1.0},
+                "origin_parent_child": np.eye(4).ravel().tolist(),
+            }
+            for joint, record in zip(joints, records, strict=True)
+        ]
+        interface = {
+            "name": "IF-J2",
+            "on_parent": "link1",
+            "on_child": "link2",
+            "axis_point": [0.4, 0.0, 0.5],
+            "axis_dir": [0.0, 0.0, 1.0],
+        }
+        q1, q2 = 0.5, -0.3
+
+        def line(angle, point):
+            cosine, sine = math.cos(angle), math.sin(angle)
+            rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+            matrix = np.eye(4)
+            matrix[:3, :3] = rotation
+            matrix[:3, 3] = np.asarray(point, float) - rotation @ np.asarray(point, float)
+            return matrix
+
+        combined = evaluate_motion(
+            bodies=doc_bodies, joints=doc_joints, interface=interface, poses={"J1": q1, "J2": q2}
+        )
+        expected = line(q1, (0.2, 0.0, 0.5)) @ line(q2, (0.4, 0.0, 0.5)) @ datums["link2"]
+        self.assertLessEqual(
+            float(np.max(np.abs(np.asarray(combined["world"]["part2"], float) - expected))), 1e-9
+        )
+
+    def test_product_gate_still_refuses_broken_serial_edges(self):
+        # G06 negatives kept on the chain: a reversed edge and a delivered axis
+        # that disagrees with the native shaft line both diverge under motion;
+        # one rigid group still cannot span two bodies.
+        from description_pipeline.verification.motion import evaluate_motion
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        datums, components, bodies, joints, records = self._serial_setup()
+        reversed_first = {**joints[0], "parent": "link1", "child": "base_link"}
+        with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
+            _motion(reversed_first, [reversed_first, joints[1]], components, datums, bodies, records[0])
+        wrong_axis = {**joints[0], "axis": [1.0, 0.0, 0.0]}
+        with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
+            _motion(wrong_axis, [wrong_axis, joints[1]], components, datums, bodies, records[0])
+        spanning = [
+            {"id": "base_link", "group": "shared", "frame": datums["base_link"].tolist(), "leaves": []},
+            {"id": "link1", "group": "shared", "frame": datums["link1"].tolist(), "leaves": []},
+        ]
+        with self.assertRaisesRegex(PipelineError, "spans more than one body"):
+            evaluate_motion(
+                bodies=spanning,
+                joints=[],
+                interface={
+                    "name": "IF",
+                    "on_parent": "base_link",
+                    "on_child": "link1",
+                    "axis_point": [0.0, 0.0, 0.0],
+                    "axis_dir": [0.0, 0.0, 1.0],
+                },
+                poses={},
+            )
+
+    def test_motion_owner_translates_a_prismatic_joint(self):
+        # G06: a prismatic joint moves the child along its evidenced axis by
+        # the pose and rotates nothing - positive and negative displacements.
+        from description_pipeline.verification.motion import evaluate_motion
+
+        base = np.eye(4)
+        tool = np.eye(4)
+        tool[:3, 3] = (0.2, 0.0, 0.5)
+        doc_bodies = [
+            {
+                "id": "base_link",
+                "group": "base_link",
+                "frame": base.tolist(),
+                "leaves": [{"id": "base_part", "world": base.tolist()}],
+            },
+            {
+                "id": "tool",
+                "group": "tool",
+                "frame": tool.tolist(),
+                "leaves": [{"id": "tool_part", "world": tool.tolist()}],
+            },
+        ]
+        doc_joint = {
+            "id": "slide",
+            "type": "prismatic",
+            "parent": "base_link",
+            "child": "tool",
+            "axis_point": [0.2, 0.0, 0.5],
+            "axis_dir": [0.0, 0.0, 1.0],
+            "stored_direction": [0.0, 0.0, 1.0],
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+            "drive": {"effort": 1.0, "velocity": 1.0},
+            "origin_parent_child": np.eye(4).ravel().tolist(),
+        }
+        interface = {
+            "name": "slide-line",
+            "on_parent": "base_link",
+            "on_child": "tool",
+            "axis_point": [0.2, 0.0, 0.5],
+            "axis_dir": [0.0, 0.0, 1.0],
+        }
+        for displacement in (0.5, -0.5):
+            with self.subTest(displacement=displacement):
+                result = evaluate_motion(
+                    bodies=doc_bodies, joints=[doc_joint], interface=interface, poses={"slide": displacement}
+                )
+                actual = np.asarray(result["world"]["tool_part"], float)
+                expected = tool.copy()
+                expected[:3, 3] += np.array([0.0, 0.0, displacement])
+                self.assertLessEqual(float(np.max(np.abs(actual - expected))), 1e-9)
+                self.assertLessEqual(float(np.max(np.abs(actual[:3, :3] - tool[:3, :3]))), 1e-9)
+        flipped = {**doc_joint, "stored_direction": [0.0, 0.0, -1.0]}
+        with self.assertRaisesRegex(PipelineError, "anti-parallel"):
+            evaluate_motion(bodies=doc_bodies, joints=[flipped], interface=interface, poses={"slide": 0.5})
+
+    def test_product_gate_accepts_a_prismatic_joint(self):
+        # The product bridge must translate the delivered child too; a bridge
+        # that still rotated it would diverge by the rotation's off-axis arc.
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        base = np.eye(4)
+        tool = np.eye(4)
+        tool[:3, 3] = (0.2, 0.0, 0.5)
+        datums = {"base_link": base, "tool": tool}
+        components = {"base_part": base.copy(), "tool_part": tool.copy()}
+        bodies = [
+            {"name": "base_link", "components": ["base_part"]},
+            {"name": "tool", "components": ["tool_part"]},
+        ]
+        authored = {
+            "name": "slide",
+            "type": "prismatic",
+            "parent": "base_link",
+            "child": "tool",
+            "axis": [0.0, 0.0, 1.0],
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+            "axis_reference": {"component": "base_part", "feature_name": "Cyl1"},
+        }
+        record = {
+            "component": "base_part",
+            "surface": "cylinder",
+            "body_type": "solid",
+            "radius_m": 0.01,
+            "selector": {"feature_name": "Cyl1", "component": "base_part", "body_type": "solid"},
+            "coordinate_frame": "assembly",
+            "axis_point_m": [0.2, 0.0, 0.5],
+            "axis_direction": [0.0, 0.0, 1.0],
+        }
+        details = _motion(authored, [authored], components, datums, bodies, record)
+        self.assertEqual([abs(value) for value in details["samples"]], [0.5, 0.5])
+        self.assertLessEqual(details["worst_m"], 5e-5)
 
 
 if __name__ == "__main__":

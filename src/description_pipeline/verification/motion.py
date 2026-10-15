@@ -2,12 +2,14 @@
 
 Re-derives, from the declared joint evidence alone, where every rigid group's
 leaves must be under any pose: the child group rotates about the joint's
-evidenced axis line, groups welded to it follow, and the interface remains
-coaxial.  Evidence defects are fail-closed (unordered limits, missing drive,
-anti-parallel stored direction, poses outside the authored limits), and a
-statically green candidate graph that keeps zero-pose leaf worlds while its
-parents, axis line or leaf ownership are wrong diverges from the re-derived
-worlds as soon as a pose is non-zero.
+evidenced axis line (a prismatic child translates along that axis and never
+rotates), fixed joints are rigid welds, groups welded to a moving child
+follow through the full chain, and the interface remains coaxial.  Evidence
+defects are fail-closed (unordered limits, missing drive, anti-parallel
+stored direction, poses outside the authored limits), and a statically green
+candidate graph that keeps zero-pose leaf worlds while its parents, axis
+line or leaf ownership are wrong diverges from the re-derived worlds as soon
+as a pose is non-zero.
 """
 
 from __future__ import annotations
@@ -56,6 +58,23 @@ def line_rotation(point, direction, angle: float) -> np.ndarray:
     return matrix
 
 
+def line_translation(direction, distance: float) -> np.ndarray:
+    """The 4x4 pure translation by ``distance`` along a ``direction``.
+
+    A prismatic joint moves its child along the evidenced axis and never
+    rotates it; the direction is normalised defensively because only the
+    direction is meaningful for a slide.
+    """
+
+    unit = np.asarray(direction, dtype=float)
+    norm = float(np.linalg.norm(unit)) if unit.shape == (3,) else 0.0
+    if norm == 0 or not math.isfinite(norm):
+        raise PipelineError("A prismatic axis has no usable direction")
+    value = np.eye(4)
+    value[:3, 3] = unit / norm * float(distance)
+    return value
+
+
 def evaluate_motion(*, bodies, joints, interface, poses, tolerance=None) -> dict:
     """Run the motion assertions of one pose sample over the declared evidence.
 
@@ -85,6 +104,9 @@ def evaluate_motion(*, bodies, joints, interface, poses, tolerance=None) -> dict
         raise PipelineError("Duplicate joint id in the motion evidence")
 
     def evidence(joint):
+        if joint.get("type") == "fixed":
+            # A fixed joint is a rigid weld: no drive, no limits, no pose.
+            return None
         if joint.get("type") not in {"revolute", "prismatic", "continuous"}:
             raise PipelineError(f"Joint {joint['id']} is not a moving joint")
         limits = joint.get("limits") or {}
@@ -112,6 +134,8 @@ def evaluate_motion(*, bodies, joints, interface, poses, tolerance=None) -> dict
     for joint_id, pose in poses.items():
         if joint_id not in by_id:
             raise PipelineError(f"Pose names unknown joint {joint_id!r}")
+        if by_id[joint_id]["type"] == "fixed":
+            raise PipelineError(f"Joint {joint_id} is fixed and cannot carry a pose")
         bound = limits[joint_id]
         if by_id[joint_id]["type"] != "continuous" and not (bound["lower"] <= pose <= bound["upper"]):
             raise PipelineError(f"Pose for joint {joint_id} leaves its authored limits")
@@ -130,9 +154,16 @@ def evaluate_motion(*, bodies, joints, interface, poses, tolerance=None) -> dict
             parent, child = groups.get(joint["parent"]), groups.get(joint["child"])
             if parent is None or child is None or parent not in group_world:
                 continue
-            group_world[child] = group_world[parent] @ line_rotation(
-                joint["axis_point"], joint["axis_dir"], float(poses.get(joint["id"], 0.0))
-            )
+            if joint["type"] == "fixed":
+                group_world[child] = group_world[parent]
+            elif joint["type"] == "prismatic":
+                group_world[child] = group_world[parent] @ line_translation(
+                    joint["axis_dir"], float(poses.get(joint["id"], 0.0))
+                )
+            else:
+                group_world[child] = group_world[parent] @ line_rotation(
+                    joint["axis_point"], joint["axis_dir"], float(poses.get(joint["id"], 0.0))
+                )
             pending.remove(joint)
             progressed = True
         if not progressed:

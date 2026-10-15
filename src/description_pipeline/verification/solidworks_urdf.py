@@ -927,6 +927,18 @@ def _axis_line(authored, record, components):
     return _cylinder_axis_line(reference, record, components)
 
 
+def _unit_axis(value):
+    """The unit direction of one delivered joint axis; an unusable axis refuses."""
+
+    try:
+        vector = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        vector = np.zeros(0)
+    norm = float(np.linalg.norm(vector)) if vector.shape == (3,) else 0.0
+    _require(np.isfinite(norm) and norm > 0, "A delivered joint axis has no usable direction")
+    return (vector / norm).tolist()
+
+
 def _reference_axis_line(reference, record, components):
     """Re-derive the native undirected RefAxis from its two measured endpoints."""
     _require(
@@ -990,10 +1002,13 @@ def _motion(authored, joints, components, body_datums, bodies, record):
 
     The motion owner re-derives, from the shaft evidence alone, where every
     driven occurrence must be under positive and negative poses inside the
-    authored limits; the delivered graph is forward-kinematicked from its own
-    datums and signed axes.  A statically green delivery whose parent chain,
-    axis binding or frame relations are wrong diverges as soon as a pose is
-    non-zero.
+    authored limits - over the WHOLE delivered chain: a further moving joint
+    at its zero pose (or a fixed weld) still carries its descendants exactly
+    as the delivered graph does.  The delivered graph is forward-kinematicked
+    from its own datums and signed axes - a revolute/continuous joint rotates
+    about its axis, a prismatic joint translates along it without rotating.
+    A statically green delivery whose parent chain, axis binding or frame
+    relations are wrong diverges as soon as a pose is non-zero.
     """
 
     from .motion import axis_rotation, evaluate_motion
@@ -1020,18 +1035,52 @@ def _motion(authored, joints, components, body_datums, bodies, record):
         }
         for body in bodies
     ]
-    doc_joint = {
-        "id": name,
-        "type": authored["type"],
-        "parent": authored["parent"],
-        "child": child,
-        "axis_point": point.tolist(),
-        "axis_dir": direction.tolist(),
-        "stored_direction": direction.tolist(),
-        "limits": dict(limits),
-        "drive": {"effort": float(limits["effort"]), "velocity": float(limits["velocity"])},
-        "origin_parent_child": np.eye(4).ravel().tolist(),
-    }
+    #: The expected side carries the full delivered chain: the sampled joint
+    #: uses its native shaft line; every other delivered edge (a further
+    #: moving joint at its zero pose, or a fixed weld) contributes no motion
+    #: but still inherits and passes on its parent's transform, exactly like
+    #: the delivered graph's forward kinematics below.
+    doc_joints = []
+    for joint in joints:
+        if joint["type"] == "fixed":
+            doc_joints.append(
+                {
+                    "id": joint["name"],
+                    "type": "fixed",
+                    "parent": joint["parent"],
+                    "child": joint["child"],
+                    "axis_point": [0.0, 0.0, 0.0],
+                    "axis_dir": [0.0, 0.0, 1.0],
+                    "stored_direction": [0.0, 0.0, 1.0],
+                    "limits": {},
+                    "drive": {},
+                    "origin_parent_child": np.eye(4).ravel().tolist(),
+                }
+            )
+            continue
+        if joint["name"] == name:
+            axis_point, axis_dir = point.tolist(), direction.tolist()
+            joint_limits = limits
+        else:
+            axis_point, axis_dir = [0.0, 0.0, 0.0], _unit_axis(joint.get("axis"))
+            joint_limits = joint.get("limits") or {}
+        doc_joints.append(
+            {
+                "id": joint["name"],
+                "type": joint["type"],
+                "parent": joint["parent"],
+                "child": joint["child"],
+                "axis_point": axis_point,
+                "axis_dir": axis_dir,
+                "stored_direction": axis_dir,
+                "limits": dict(joint_limits),
+                "drive": {
+                    "effort": joint_limits.get("effort"),
+                    "velocity": joint_limits.get("velocity"),
+                },
+                "origin_parent_child": np.eye(4).ravel().tolist(),
+            }
+        )
     interface = {
         "name": "IF-" + name,
         "on_parent": authored["parent"],
@@ -1050,7 +1099,11 @@ def _motion(authored, joints, components, body_datums, bodies, record):
             offset = np.linalg.inv(body_datums[joint["parent"]]) @ body_datums[body_name]
             if joint["name"] == name:
                 offset = offset.copy()
-                offset[:3, :3] = offset[:3, :3] @ axis_rotation(_vector(joint["axis"]), pose)
+                unit = np.asarray(_unit_axis(joint.get("axis")), float)
+                if joint["type"] == "prismatic":
+                    offset[:3, 3] = offset[:3, 3] + offset[:3, :3] @ (unit * pose)
+                else:
+                    offset[:3, :3] = offset[:3, :3] @ axis_rotation(unit, pose)
             value = model_transform(joint["parent"], pose, memo) @ offset
         memo[body_name] = value
         return value
@@ -1058,7 +1111,7 @@ def _motion(authored, joints, components, body_datums, bodies, record):
     worst = 0.0
     for pose in samples:
         result = evaluate_motion(
-            bodies=doc_bodies, joints=[doc_joint], interface=interface, poses={name: pose}
+            bodies=doc_bodies, joints=doc_joints, interface=interface, poses={name: pose}
         )
         _require(
             result["interface"]["line_distance_m"] <= 1e-9 and result["interface"]["parallelism"] >= 1 - 1e-6,
