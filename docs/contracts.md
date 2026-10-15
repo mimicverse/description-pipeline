@@ -40,6 +40,10 @@
 
 请求固定发布目标、其配置摘要和基线读取结果。读取失败明确标记为未解析，不能当作首次交付；允许采集与验证，发布前须在新请求中固定已解析的基线，完整上游可按复用规则沿用。请求变更、主装配变更或目标变更形成新请求。显示名修改不改变请求。
 
+`freeze` 在调用推导或生成器之前，将已接纳请求封存为 `input/request.json`，schema 为 `solidworks-to-urdf.request/v1`。记录包含 `schema_version`、`request_id`、`target_hardware`、`change_summary`、`main_assembly`、`handoff_digest` 和 `platform_config_digest`；它们分别绑定本次请求、经配置校验的所选硬件、规范 LF 的原始提交说明、明确的主装配、完整上传索引与实际平台配置快照身份。记录不包含秘密或凭据，冻结收据绑定其文件摘要，后续阶段原字节沿用，完整交付必须携带该件。
+
+独立验证从原生读数与该请求证据重算硬件和说明来源，并核对主装配及上传摘要；不能以 `input/source.json` 与发现结果两份生成声明相等替代来源证明。CAD 属性确证缺失才允许对应回退，读取失败、无效值或冲突保持拒绝。即使生成声明被同时修改并重新封装，原请求不变时仍须检出差异。关联运行使用本次封存请求，复用资格另由数据库中的原阶段、收据和输入绑定证明，不能伪造本次上游执行。
+
 <a id="stages"></a>
 ## 六阶段契约
 
@@ -116,6 +120,7 @@ Windows 端点以操作系统互斥锁保护一个 state root，以独占租约�
 ```text
 manifest.json                  # 主体清单、主体摘要、契约与策略身份
 input/handoff.json             # 完整上传索引和冻结身份
+input/request.json             # 生成器执行前封存的原请求证据
 input/source.json              # 工程内容身份、选择与元数据来源
 input/cad/                     # 原生依赖闭包的封存原件
 input/records/                 # 实际采用的受控规格原文
