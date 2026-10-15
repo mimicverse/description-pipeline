@@ -16,7 +16,7 @@
 --   end_date, falling back to start_date.
 --   request rows are accepted facts for reports only; the stop/drain gates ignore the kind.
 
-CREATE OR REPLACE VIEW platform.lifecycle_projection AS
+CREATE OR REPLACE VIEW :"platform_schema".lifecycle_projection AS
 SELECT object_kind, object_id, run_id, state, bucket, updated_at
 FROM (
     SELECT 'request'::text AS object_kind,
@@ -25,7 +25,7 @@ FROM (
            'accepted'::text AS state,
            'terminal'::text AS bucket,
            sealed_at AS updated_at
-    FROM platform.request
+    FROM :"platform_schema".request
     UNION ALL
     SELECT 'run'::text,
            run_id,
@@ -38,7 +38,7 @@ FROM (
                ELSE 'unknown'
            END,
            updated_at
-    FROM platform.run
+    FROM :"platform_schema".run
     UNION ALL
     SELECT 'stage'::text,
            run_id || ':' || stage,
@@ -51,7 +51,7 @@ FROM (
                ELSE 'unknown'
            END,
            updated_at
-    FROM platform.stage
+    FROM :"platform_schema".stage
     UNION ALL
     SELECT 'operation'::text,
            operation_id,
@@ -64,7 +64,7 @@ FROM (
                ELSE 'unknown'
            END,
            updated_at
-    FROM platform.operation
+    FROM :"platform_schema".operation
     UNION ALL
     SELECT 'scheduling'::text,
            o.operation_id,
@@ -77,7 +77,7 @@ FROM (
                ELSE 'unknown'
            END,
            COALESCE(ti.end_date, ti.start_date)
-    FROM platform.operation o
+    FROM :"platform_schema".operation o
     LEFT JOIN :"airflow_schema".task_instance ti
            ON ti.dag_id = o.dag_id
           AND ti.task_id = o.task_id
@@ -86,7 +86,7 @@ FROM (
     WHERE o.kind IN ('dispatch', 'native', 'publish', 'cancel')
 ) AS rows;
 
-CREATE OR REPLACE VIEW platform.admission_projection AS
+CREATE OR REPLACE VIEW :"platform_schema".admission_projection AS
 SELECT state, reason, actor, changed_at, revision
-FROM platform.admission
+FROM :"platform_schema".admission
 WHERE id = 1;

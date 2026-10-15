@@ -2,10 +2,11 @@
 #
 #   pwsh -NoProfile -File tests/deploy/test_instance_lifecycle.ps1 [-ScriptPath PATH] [-StaticOnly]
 #
-# The script's Windows cmdlets are never invoked: every fact the tests need flows through the
-# script's own seams (later definitions win at call time).  Running with -ScriptPath pointing at
+# Only the OS boundary is stubbed (Get-Process / cmd / the ScheduledTask cmdlets); the script's
+# own interpreters - Get-ProcessFacts, Test-LockProbeHeld, Get-OwnershipRefusalFacts,
+# Start-OrRefuse, Restore-PreviousEndpoint - run for real.  Running with -ScriptPath pointing at
 # a pre-change copy plus -StaticOnly is the negative-evidence mode: the old wording and the
-# missing ownership-proof gate must make this run fail.
+# missing observer/ownership gates must make that run fail.
 [CmdletBinding()]
 param(
   [string]$ScriptPath = (Join-Path $PSScriptRoot '..' '..' 'deploy' 'windows' 'instance-lifecycle.ps1'),
@@ -30,9 +31,13 @@ $parseErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$parseErrors)
 Check 'parse.clean' ($parseErrors.Count -eq 0) (($parseErrors | Out-String).Trim())
 $source = Get-Content -LiteralPath $ScriptPath -Raw
-# The design-lead wording (394ff8f-class settle rules): no blind wait/retry, ownership proof first.
+# Design-lead settle rules: no blind wait/retry, positive owner proof first, three-valued
+# observers, and a recorded safe restore on the failure path.
 Check 'wording.blind_retry_removed' (-not $source.Contains('waited out for')) 'the pre-change blind-retry wording is still present'
+Check 'wording.no_blind_sleep' (-not $source.Contains('Start-Sleep -Seconds 60')) 'an unconditional 60s sleep is still present'
 Check 'wording.owner_proof_gate' ($source.Contains('lock_refused_unproven') -and $source.Contains('owner_ended'))
+Check 'wording.observer_tristate' ($source.Contains('observer_failed') -and $source.Contains('PROBE_IMPORT_FAILED'))
+Check 'wording.restore_path' ($source.Contains('Restore-PreviousEndpoint') -and $source.Contains('restore=$restore'))
 Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath $lock')) 'never delete the ownership lock'
 if ($StaticOnly) {
   Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
@@ -41,25 +46,57 @@ if ($StaticOnly) {
 
 # ---- load the script without running its main flow --------------------------
 . $ScriptPath -Verb health -Binding @{ task_name = 'test-endpoint' }
-$seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner', 'Get-ProcessFacts'
+$seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
+  'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
-# ---- test harness (overrides the script's seams; later definitions win) -----
+# ---- harness: stub only the OS boundary -------------------------------------
 $script:TaskMissing = $false
 $script:TaskState = 'Ready'
-$script:LockHeld = $false
-$script:OwnerFacts = @{ alive = $false; image = ''; started = '' }
+$script:ProcScenario = 'missing'
+$script:ProbeScenario = 'refused'
 $script:SettleOutcomes = @()
 $script:Starts = 0
 $script:Sleeps = [System.Collections.Generic.List[int]]::new()
+$script:CallLog = [System.Collections.Generic.List[string]]::new()
+$script:OldHealthOk = $true
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
   if ($script:TaskMissing) { return $null }
   return [pscustomobject]@{ State = $script:TaskState }
 }
-function Start-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:Starts++ }
-function Get-ProcessFacts { param([int]$ownerPid) return $script:OwnerFacts }
-function Test-LockProbeHeld { param([string]$generation, [string]$lockPath) return [bool]$script:LockHeld }
+function Start-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:Starts++; $script:CallLog.Add('start') }
+function Stop-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:CallLog.Add('stop') }
+function Register-ScheduledTask {
+  [CmdletBinding()] param([string]$TaskName, [string]$Xml, [switch]$Force)
+  $script:CallLog.Add('register')
+  return $null
+}
+function Get-Process {
+  [CmdletBinding()] param([int]$Id)
+  switch ($script:ProcScenario) {
+    'missing' {
+      Write-Error ('Cannot find a process with the process ID: {0}.' -f $Id) -Category ObjectNotFound
+      return
+    }
+    'denied' {
+      Write-Error 'process query denied by injected observer failure' -Category PermissionDenied
+      return
+    }
+    'alive' {
+      return [pscustomobject]@{
+        Id = $Id; Path = 'C:\gen\runtime\Scripts\description.exe'; StartTime = [datetime]'2026-10-15T00:00:00Z' }
+    }
+    default { return $null }
+  }
+}
+function cmd {
+  switch ($script:ProbeScenario) {
+    'refused' { $global:LASTEXITCODE = 3; return 'LOCK_REFUSED' }
+    'free' { $global:LASTEXITCODE = 0; return '' }
+    default { $global:LASTEXITCODE = 7; return '' }
+  }
+}
 function Wait-Settled {
   param([string]$configPath, [object]$binding)
   if ($script:SettleOutcomes.Count -eq 0) { throw 'no settle outcome queued' }
@@ -69,6 +106,11 @@ function Wait-Settled {
   return @{ health = @{ install = @{ config_digest = 'digest' } }; settled_seconds = 180; listener_pid = 4242 }
 }
 function Wait-SettleRetryDelay { param([int]$Seconds = 60) $script:Sleeps.Add($Seconds) }
+function Health-Probe {
+  param([string]$configPath, [object]$binding)
+  if (-not $script:OldHealthOk) { throw 'the previous endpoint did not answer /health' }
+  return @{ ready = $true }
+}
 function Write-Receipt {
   param([string]$path, [hashtable]$payload)
   $parent = Split-Path -Parent $path
@@ -79,7 +121,10 @@ function Write-Receipt {
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("il-settle-" + [guid]::NewGuid().ToString('N'))
 $generation = Join-Path $root 'generation'
 $promotions = Join-Path $root 'instance-promotions'
+$previous = Join-Path $promotions 'previous-test'
 $null = New-Item -ItemType Directory -Path $generation -Force
+$null = New-Item -ItemType Directory -Path $previous -Force
+[System.IO.File]::WriteAllText((Join-Path $previous 'task.xml'), '<Task />')
 $configPath = Join-Path $generation 'endpoint.json'
 [System.IO.File]::WriteAllText($configPath, ('{{"state_root":"{0}"}}' -f ($root -replace '\\', '/')))
 $lockPath = Join-Path $root '.endpoint.lock'
@@ -87,62 +132,96 @@ $binding = @{ task_name = 'test-endpoint'; port = 8765; state_root = $root; gene
 function Reset-State {
   $script:TaskMissing = $false
   $script:TaskState = 'Ready'
-  $script:LockHeld = $false
-  $script:OwnerFacts = @{ alive = $false; image = ''; started = '' }
+  $script:ProcScenario = 'missing'
+  $script:ProbeScenario = 'refused'
   $script:SettleOutcomes = @()
   $script:Starts = 0
   $script:Sleeps.Clear()
+  $script:CallLog.Clear()
+  $script:OldHealthOk = $true
   if (Test-Path -LiteralPath $lockPath) { Remove-Item -LiteralPath $lockPath -Force }
+  $receipt = Join-Path $promotions 'lock-refusal.json'
+  if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
 }
 
-# ---- ownership-fact units ---------------------------------------------------
+# ---- ownership-fact units (real interpreters, stubbed OS boundary) ----------
 Reset-State
-$script:LockHeld = $true
-Check 'facts.no_lock_file' ((Get-OwnershipRefusalFacts $generation $binding).refused -eq $false)
+$facts = Get-OwnershipRefusalFacts $generation $binding
+Check 'facts.no_lock_file' ((-not $facts.refused) -and ($facts.state -eq 'no_lock_file'))
 [System.IO.File]::WriteAllText($lockPath, '999999')
-$script:LockHeld = $false
+$script:ProbeScenario = 'free'
 $facts = Get-OwnershipRefusalFacts $generation $binding
-Check 'facts.lock_free' (($facts.refused -eq $false) -and ($facts.reason -eq 'lock_free'))
-$script:LockHeld = $true
+Check 'facts.lock_free' ((-not $facts.refused) -and ($facts.state -eq 'lock_free'))
+$script:ProbeScenario = 'refused'
 $facts = Get-OwnershipRefusalFacts $generation $binding
-Check 'facts.owner_ended' ($facts.refused -and ($facts.owner_pid -eq 999999) -and ($facts.owner_ended -eq $true))
-$script:OwnerFacts = @{ alive = $true; image = 'C:\gen\runtime\Scripts\description.exe'; started = '2026-10-15T00:00:00.0000000Z' }
+Check 'facts.owner_ended' ($facts.refused -and ($facts.owner_state -eq 'ended') -and ($facts.owner_ended -eq $true) -and
+  ($facts.owner_process_alive -eq $false))
+$script:ProcScenario = 'alive'
 $facts = Get-OwnershipRefusalFacts $generation $binding
-Check 'facts.owner_alive' ($facts.refused -and ($facts.owner_ended -eq $false) -and ($facts.owner_process_alive -eq $true))
+Check 'facts.owner_alive' ($facts.refused -and ($facts.owner_state -eq 'alive') -and ($facts.owner_ended -eq $false) -and
+  ($facts.owner_process_alive -eq $true))
+$script:ProcScenario = 'denied'
+$facts = Get-OwnershipRefusalFacts $generation $binding
+Check 'facts.owner_query_unknown' ($facts.refused -and ($facts.owner_state -eq 'unknown') -and ($facts.owner_ended -eq $false) -and
+  ($null -eq $facts.owner_process_alive) -and ($facts.owner_process_error -match 'denied'))
+$script:ProcScenario = 'missing'
 [System.IO.File]::WriteAllText($lockPath, 'not-a-pid')
 $facts = Get-OwnershipRefusalFacts $generation $binding
-Check 'facts.owner_unreadable' ($facts.refused -and ($facts.reason -eq 'owner_unreadable') -and ($facts.owner_ended -eq $false))
+Check 'facts.owner_unreadable' ($facts.refused -and ($facts.reason -eq 'owner_unreadable') -and ($facts.owner_state -eq 'unknown') -and
+  ($facts.owner_ended -eq $false))
+[System.IO.File]::WriteAllText($lockPath, '999999')
+$script:ProbeScenario = 'observer'
+$facts = Get-OwnershipRefusalFacts $generation $binding
+Check 'facts.observer_failed' ((-not $facts.refused) -and ($facts.state -eq 'observer_failed'))
+$script:ProbeScenario = 'refused'
 $script:TaskState = 'Running'
 $facts = Get-OwnershipRefusalFacts $generation $binding
-Check 'facts.task_running' (($facts.refused -eq $false) -and ($facts.reason -eq 'task_running'))
+Check 'facts.task_running' ((-not $facts.refused) -and ($facts.state -eq 'task_running'))
 
-# ---- settle flow: retry only after the owner is proven ended ----------------
+# ---- settle flows: retry only on proven-ended; unknown/observer stop ---------
 Reset-State
 [System.IO.File]::WriteAllText($lockPath, '999999')
-$script:LockHeld = $true
 $script:SettleOutcomes = @('throw', 'ok')
 $result = Start-OrRefuse $configPath $binding $generation $promotions
 Check 'flow.retry_once_after_60s' (($script:Starts -eq 2) -and ($result.retried_after_s -eq 60) -and
   ($script:Sleeps.Count -eq 1) -and ($script:Sleeps[0] -ge 60))
 Check 'flow.refusal_owner_ended' ($result.lock_refusal.owner_ended -eq $true)
 $receipt = Get-Content -LiteralPath (Join-Path $promotions 'lock-refusal.json') -Raw | ConvertFrom-Json
-Check 'flow.receipt_records_proof' (($receipt.owner_ended -eq $true) -and ($receipt.retry_after_s -ge 60))
+Check 'flow.receipt_records_proof' (($receipt.owner_ended -eq $true) -and ($receipt.retryable -eq $true) -and
+  ($receipt.retry_after_s -ge 60) -and ($receipt.owner_state -eq 'ended'))
 
 Reset-State
 [System.IO.File]::WriteAllText($lockPath, '999999')
-$script:LockHeld = $true
-$script:OwnerFacts = @{ alive = $true; image = 'C:\unknown\process.exe'; started = '' }
+$script:ProcScenario = 'alive'
 $script:SettleOutcomes = @('throw')
 $message = ''
 try { $null = Start-OrRefuse $configPath $binding $generation $promotions } catch { $message = $_.Exception.Message }
-Check 'flow.unproven_no_retry' ($message.StartsWith('lock_refused_unproven:') -and ($script:Starts -eq 1) -and
-  ($script:Sleeps.Count -eq 0))
-$receipt = Get-Content -LiteralPath (Join-Path $promotions 'lock-refusal.json') -Raw | ConvertFrom-Json
-Check 'flow.unproven_receipt' ($receipt.owner_ended -eq $false)
+Check 'flow.unproven_alive_stops' ($message.StartsWith('lock_refused_unproven:') -and ($message -match 'owner_state=alive') -and
+  ($script:Starts -eq 1) -and ($script:Sleeps.Count -eq 0))
 
 Reset-State
 [System.IO.File]::WriteAllText($lockPath, '999999')
-$script:LockHeld = $true
+$script:ProcScenario = 'denied'
+$script:SettleOutcomes = @('throw')
+$message = ''
+try { $null = Start-OrRefuse $configPath $binding $generation $promotions } catch { $message = $_.Exception.Message }
+$receipt = Get-Content -LiteralPath (Join-Path $promotions 'lock-refusal.json') -Raw | ConvertFrom-Json
+Check 'flow.unproven_unknown_stops' ($message.StartsWith('lock_refused_unproven:') -and ($message -match 'owner_state=unknown') -and
+  ($script:Starts -eq 1) -and ($script:Sleeps.Count -eq 0) -and ($receipt.owner_state -eq 'unknown') -and
+  ($receipt.retryable -eq $false))
+
+Reset-State
+[System.IO.File]::WriteAllText($lockPath, '999999')
+$script:ProbeScenario = 'observer'
+$script:SettleOutcomes = @('throw')
+$message = ''
+try { $null = Start-OrRefuse $configPath $binding $generation $promotions } catch { $message = $_.Exception.Message }
+$receipt = Get-Content -LiteralPath (Join-Path $promotions 'lock-refusal.json') -Raw | ConvertFrom-Json
+Check 'flow.observer_failed_stops' ($message.StartsWith('lock_refused_unproven:') -and ($message -match 'observer_failed') -and
+  ($script:Starts -eq 1) -and ($script:Sleeps.Count -eq 0) -and ($receipt.reason -eq 'observer_failed'))
+
+Reset-State
+[System.IO.File]::WriteAllText($lockPath, '999999')
 $script:SettleOutcomes = @('throw', 'throw')
 $message = ''
 try { $null = Start-OrRefuse $configPath $binding $generation $promotions } catch { $message = $_.Exception.Message }
@@ -150,11 +229,24 @@ Check 'flow.second_refusal_stops' ($message.StartsWith('lock_refused:') -and ($s
   ($script:Sleeps.Count -eq 1))
 
 Reset-State
+$script:ProbeScenario = 'free'
 $script:SettleOutcomes = @('throw')
 $message = ''
 try { $null = Start-OrRefuse $configPath $binding $generation $promotions } catch { $message = $_.Exception.Message }
 Check 'flow.non_refusal_rethrows' (($message -match 'settle window') -and ($script:Starts -eq 1) -and
   ($script:Sleeps.Count -eq 0))
+
+# ---- failure-path restore: safe stop/restore is recorded --------------------
+Reset-State
+$restore = Restore-PreviousEndpoint $binding $previous $configPath
+Check 'restore.success_recorded' ($restore.stopped -and $restore.restored -and $restore.started -and $restore.healthy -and
+  ($restore.error -eq '') -and (($script:CallLog -join ',') -eq 'stop,register,start'))
+
+Reset-State
+$script:OldHealthOk = $false
+$restore = Restore-PreviousEndpoint $binding $previous $configPath
+Check 'restore.health_failure_recorded' ($restore.stopped -and $restore.restored -and $restore.started -and (-not $restore.healthy) -and
+  ($restore.error -match 'did not answer') -and (($script:CallLog -join ',') -eq 'stop,register,start'))
 
 Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
 exit ([int]($script:failures.Count -gt 0))

@@ -6,13 +6,13 @@
 GRANT USAGE ON SCHEMA platform TO platform_service;
 -- Controlled writes on the business objects, append-only on the event log.
 GRANT SELECT, INSERT, UPDATE ON
-    platform.admission, platform.request, platform.run, platform.stage, platform.operation
+    :"platform_schema".admission, :"platform_schema".request, :"platform_schema".run, :"platform_schema".stage, :"platform_schema".operation
     TO platform_service;
-GRANT SELECT, INSERT ON platform.run_event TO platform_service;
+GRANT SELECT, INSERT ON :"platform_schema".run_event TO platform_service;
 -- The store's read functions consume the same two read models.
-GRANT SELECT ON platform.lifecycle_projection, platform.admission_projection TO platform_service;
+GRANT SELECT ON :"platform_schema".lifecycle_projection, :"platform_schema".admission_projection TO platform_service;
 
 -- operator_ro: exactly the two read models; nothing else in the database.
 REVOKE ALL ON SCHEMA platform FROM PUBLIC;
 GRANT USAGE ON SCHEMA platform TO operator_ro;
-GRANT SELECT ON platform.lifecycle_projection, platform.admission_projection TO operator_ro;
+GRANT SELECT ON :"platform_schema".lifecycle_projection, :"platform_schema".admission_projection TO operator_ro;

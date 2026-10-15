@@ -8,8 +8,11 @@
 #           settles it for >=180s (task Running + listener PID constant + token-authenticated
 #           /health ready); a start refused by the ownership lock is recorded together with the
 #           lock owner's process facts, and the >=60s-later retry happens exactly once and only
-#           after that owner is proven ended - unprovable ownership or a second refusal stops
-#           with lock_refused for diagnosis (never kill an unknown process or delete the lock)
+#           after the owner is PROVEN ended.  Owner state and lock probe are three-valued
+#           (alive/ended/unknown; refused/free/observer-failed): an unknown owner, a failed
+#           observer or a second refusal stops with lock_refused_unproven / lock_refused for
+#           diagnosis, never by killing an unknown process or deleting the lock; every failure
+#           path runs the recorded safe stop/restore of the previous generation
 #   rollback restores exactly the previous generation directory the caller bounds
 #   health  relays the running endpoint's own /health payload
 # Each invocation prints one JSON object; receipts stay under the instance state root.
@@ -141,14 +144,26 @@ function Wait-Settled([string]$configPath, [object]$binding) {
   return @{health=$health; settled_seconds=[int][math]::Round($timer.Elapsed.TotalSeconds); listener_pid=$listenerPid}
 }
 function Get-ProcessFacts([int]$ownerPid) {
-  # Test seam: process lookup stays isolated so the settle tests can state owner facts directly.
-  $process = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
-  if (-not $process) { return @{alive=$false; image=''; started=''} }
+  # Three states with positive evidence only: 'alive' (the OS returned the process), 'ended' (the
+  # OS answered that no such process exists) and 'unknown' (every other outcome - a permission
+  # error or any query failure is never proof that the owner exited).
+  try {
+    $process = Get-Process -Id $ownerPid -ErrorAction Stop
+  } catch {
+    $message = [string]$_.Exception.Message
+    if ($message -match '(?i)cannot find (a|the) process') {
+      return @{state='ended'; alive=$false; image=''; started=''; error=''}
+    }
+    return @{state='unknown'; alive=$null; image=''; started=''; error=$message}
+  }
+  if ($null -eq $process) {
+    return @{state='unknown'; alive=$null; image=''; started=''; error='the process query returned nothing'}
+  }
   $image = ''
   $started = ''
   try { $image = [string]$process.Path } catch { }
   try { $started = $process.StartTime.ToUniversalTime().ToString('o') } catch { }
-  return @{alive=$true; image=$image; started=$started}
+  return @{state='alive'; alive=$true; image=$image; started=$started; error=''}
 }
 function Read-LockOwner([string]$lockPath) {
   # The lock file carries the owner PID as a diagnostic record (io.acquire_process_lock); the
@@ -163,63 +178,120 @@ function Read-LockOwner([string]$lockPath) {
   return @{present=$true; pid=$(if ($valid) { $ownerPid } else { $null }); valid=$valid}
 }
 function Test-LockProbeHeld([string]$generation, [string]$lockPath) {
-  # The refusal's own condition: the staged runtime cannot take the endpoint ownership lock.
-  $probe = 'import sys;from pathlib import Path;from description_pipeline.io import acquire_process_lock;acquire_process_lock(Path(sys.argv[1]))'
-  cmd /c "`"$(Runtime-Python $generation)`" -I -c `"$probe`" `"$lockPath`" 2>nul" | Out-Null
-  return ($LASTEXITCODE -ne 0)
+  # Three outcomes from the staged runtime itself: $true = the lock refused the acquire (marker
+  # plus the dedicated exit code), $false = the lock is free, $null = the observer failed
+  # (missing runtime, import or other error, unknown exit) - never folded into either answer.
+  $probeSource = @'
+import sys
+from pathlib import Path
+try:
+    from description_pipeline.io import acquire_process_lock
+except Exception as error:  # an observer failure, never a lock state
+    print("PROBE_IMPORT_FAILED: %s" % error, file=sys.stderr)
+    sys.exit(7)
+try:
+    acquire_process_lock(Path(sys.argv[1]))
+except Exception as error:
+    if "ownership lock is unavailable" in str(error):
+        print("LOCK_REFUSED")
+        sys.exit(3)
+    print("PROBE_FAILED: %s" % error, file=sys.stderr)
+    sys.exit(7)
+sys.exit(0)
+'@
+  $probePath = Join-Path ([System.IO.Path]::GetTempPath()) ('endpoint-lock-probe-' + [guid]::NewGuid().ToString('N') + '.py')
+  [System.IO.File]::WriteAllText($probePath, $probeSource, (New-Object System.Text.UTF8Encoding($false)))
+  $output = ''
+  $exitCode = -1
+  try {
+    $output = [string]((cmd /c "`"$(Runtime-Python $generation)`" -I `"$probePath`" `"$lockPath`" 2>nul") | Out-String)
+    $exitCode = [int]$LASTEXITCODE
+  } catch {
+    $output = ''
+    $exitCode = -1
+  } finally {
+    Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+  }
+  if ($exitCode -eq 0) { return $false }
+  if ($exitCode -eq 3 -and $output -match 'LOCK_REFUSED') { return $true }
+  return $null
 }
 function Get-OwnershipRefusalFacts([string]$generation, [object]$binding) {
-  # deployment.md settle: the refusal must name the lock owner and whether that owner is proven
-  # ended; nothing here kills a process or deletes the lock.
+  # deployment.md settle: only positive evidence may license a retry.  Refusal, owner process
+  # state and probe observer state are three-valued; a failed observation is unknown /
+  # observer_failed and stops the switch instead of being read as a pass.  Nothing here kills a
+  # process or deletes the lock.
   $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
   if ($taskNow -and [string]$taskNow.State -eq 'Running') {
-    return @{refused=$false; reason='task_running'}
+    return @{refused=$false; state='task_running'; reason='task_running'}
   }
   $config = Read-Json (Config-Path $generation)
   $lockPath = Join-Path ([string]$config.state_root) '.endpoint.lock'
   $owner = Read-LockOwner $lockPath
-  if (-not $owner.present) { return @{refused=$false; reason='no_lock_file'; lock_path=$lockPath} }
-  if (-not (Test-LockProbeHeld $generation $lockPath)) {
-    return @{refused=$false; reason='lock_free'; lock_path=$lockPath}
+  if (-not $owner.present) {
+    return @{refused=$false; state='no_lock_file'; reason='no_lock_file'; lock_path=$lockPath}
   }
+  $probe = Test-LockProbeHeld $generation $lockPath
+  if ($null -eq $probe) {
+    return @{refused=$false; state='observer_failed'; reason='observer_failed'; lock_path=$lockPath;
+             owner_pid=$owner.pid}
+  }
+  if (-not $probe) { return @{refused=$false; state='lock_free'; reason='lock_free'; lock_path=$lockPath} }
   if (-not $owner.valid) {
-    return @{refused=$true; reason='owner_unreadable'; lock_path=$lockPath; owner_pid=$null;
-             owner_process_alive=$null; owner_ended=$false}
+    return @{refused=$true; state='refused'; reason='owner_unreadable'; lock_path=$lockPath; owner_pid=$null;
+             owner_state='unknown'; owner_process_alive=$null; owner_ended=$false}
   }
   $facts = Get-ProcessFacts ([int]$owner.pid)
-  return @{refused=$true; reason='lock_held'; lock_path=$lockPath; owner_pid=[int]$owner.pid;
-           owner_process_alive=$facts.alive; owner_process_image=$facts.image;
-           owner_process_started=$facts.started; owner_ended=(-not $facts.alive)}
+  return @{refused=$true; state='refused'; reason='lock_held'; lock_path=$lockPath; owner_pid=[int]$owner.pid;
+           owner_state=[string]$facts.state; owner_process_alive=$facts.alive;
+           owner_process_image=$facts.image; owner_process_started=$facts.started;
+           owner_process_error=$facts.error; owner_ended=([string]$facts.state -eq 'ended')}
 }
 function Wait-SettleRetryDelay([int]$Seconds = 60) {
   # Reached only after the recorded owner is proven ended (deployment.md settle).
   Start-Sleep -Seconds $Seconds
 }
+function Write-LockRefusalReceipt([string]$promotions, [string]$stageDir, [hashtable]$refusal, [bool]$retryable) {
+  Write-Receipt (Join-Path $promotions 'lock-refusal.json') @{
+    verb='promote'; at=$refusal.at; generation=$stageDir; message=$refusal.message; reason=$refusal.reason;
+    owner_pid=$refusal.owner_pid; owner_state=$refusal.owner_state; owner_process_alive=$refusal.owner_process_alive;
+    owner_ended=$refusal.owner_ended; retry_after_s=60; retryable=$retryable}
+}
 function Start-OrRefuse([string]$configPath, [object]$binding, [string]$stageDir, [string]$promotions) {
   # Start the switched task and settle it.  A refusal by the ownership lock may be retried exactly
-  # once, >=60s after the recorded owner is proven ended; refusal, owner facts and the waiting
-  # time are recorded.  Unprovable ownership and a second refusal stop the switch for diagnosis.
+  # once, >=60s after the recorded owner is PROVEN ended; an unknown owner state, a failed lock
+  # observer and a second refusal stop the switch for diagnosis.  The refusal facts are recorded
+  # on every path; nothing kills processes or deletes the lock.
   $script:SettleRefusal = @{lock_refusal=$null; retried_after_s=$null}
   $result = @{settled=$null; lock_refusal=$null; retried_after_s=$null}
   Start-ScheduledTask -TaskName $binding.task_name
   try { $result.settled = Wait-Settled $configPath $binding; return $result }
   catch {
     $facts = Get-OwnershipRefusalFacts $stageDir $binding
+    if ([string]$facts.state -eq 'observer_failed') {
+      $refusal = @{
+        message='Another endpoint owns the state root or its ownership lock is unavailable';
+        at=(Get-Date).ToUniversalTime().ToString('o'); reason='observer_failed'; lock_path=$facts.lock_path;
+        owner_pid=$facts.owner_pid; owner_state='unknown'; owner_process_alive=$null; owner_ended=$false}
+      $result.lock_refusal = $refusal
+      $script:SettleRefusal = @{lock_refusal=$refusal; retried_after_s=$null}
+      Write-LockRefusalReceipt $promotions $stageDir $refusal $false
+      throw 'lock_refused_unproven: the lock observer failed; the refusal cannot be interpreted [observer_failed]'
+    }
     if (-not $facts.refused) { throw }
     $refusal = @{
       message='Another endpoint owns the state root or its ownership lock is unavailable';
       at=(Get-Date).ToUniversalTime().ToString('o'); reason=[string]$facts.reason; lock_path=$facts.lock_path;
-      owner_pid=$facts.owner_pid; owner_process_alive=$facts.owner_process_alive;
+      owner_pid=$facts.owner_pid; owner_state=[string]$facts.owner_state; owner_process_alive=$facts.owner_process_alive;
       owner_process_image=$facts.owner_process_image; owner_process_started=$facts.owner_process_started;
+      owner_process_error=$facts.owner_process_error;
       owner_ended=[bool]$facts.owner_ended}
     $result.lock_refusal = $refusal
     $script:SettleRefusal = @{lock_refusal=$refusal; retried_after_s=$null}
-    Write-Receipt (Join-Path $promotions 'lock-refusal.json') @{
-      verb='promote'; at=$refusal.at; generation=$stageDir; message=$refusal.message;
-      owner_pid=$refusal.owner_pid; owner_process_alive=$refusal.owner_process_alive;
-      owner_ended=$refusal.owner_ended; retry_after_s=60}
+    Write-LockRefusalReceipt $promotions $stageDir $refusal $refusal.owner_ended
     if (-not $facts.owner_ended) {
-      throw ('lock_refused_unproven: the endpoint lock owner is not proven ended [' + [string]$facts.reason + ']')
+      throw ('lock_refused_unproven: the endpoint lock owner is not proven ended [owner_state=' +
+             [string]$facts.owner_state + ' / ' + [string]$facts.reason + ']')
     }
     Wait-SettleRetryDelay 60
     $result.retried_after_s = 60
@@ -229,9 +301,35 @@ function Start-OrRefuse([string]$configPath, [object]$binding, [string]$stageDir
     catch {
       $second = Get-OwnershipRefusalFacts $stageDir $binding
       if (-not $second.refused) { throw }
-      throw ('lock_refused: the ownership lock was refused twice; stopping for diagnosis [' + [string]$second.reason + ']')
+      throw ('lock_refused: the ownership lock was refused twice; stopping for diagnosis [owner_state=' +
+             [string]$second.owner_state + ']')
     }
   }
+}
+function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$previousConfig) {
+  # The safe stop/restore every promote failure path runs: stop whatever now serves the task,
+  # restore the task snapshot, start the previous generation and verify it answers through the
+  # token-authenticated health of the previous configuration.  The facts land in the failure
+  # receipt; the admission stays closed regardless (operatorctl only opens it after its own
+  # end-to-end verification).
+  $restore = @{stopped=$false; restored=$false; started=$false; healthy=$false; error=''}
+  try {
+    Stop-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+    $restore.stopped = $true
+  } catch { if (-not $restore.error) { $restore.error = 'stop: ' + $_.Exception.Message } }
+  try {
+    Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
+    $restore.restored = $true
+  } catch { if (-not $restore.error) { $restore.error = 'restore: ' + $_.Exception.Message } }
+  if ($restore.restored) {
+    try {
+      Start-ScheduledTask -TaskName $binding.task_name
+      $restore.started = $true
+      $null = Health-Probe $previousConfig $binding
+      $restore.healthy = $true
+    } catch { if (-not $restore.error) { $restore.error = 'start/health: ' + $_.Exception.Message } }
+  }
+  return $restore
 }
 function Get-WriterResidue([object]$binding) {
   # The endpoint's own writers keep their image under the generation or the instance state root;
@@ -378,11 +476,10 @@ if ($Verb -eq 'promote') {
     Emit @{passed=$true; verb='promote'; generation=$StageDir; previous=$previous}
     exit 0
   } catch {
-    Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
-    Start-ScheduledTask -TaskName $binding.task_name
+    $restore = Restore-PreviousEndpoint $binding $previous $previousConfig
     $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-      message=$_.Exception.Message}
+      message=$_.Exception.Message; restore=$restore}
     $failureCode = 'promote_failed'
     if ($_.Exception.Message.StartsWith('lock_refused_unproven:')) { $failureCode = 'lock_refused_unproven' }
     elseif ($_.Exception.Message.StartsWith('lock_refused:')) { $failureCode = 'lock_refused' }
