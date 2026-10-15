@@ -37,6 +37,8 @@ from description_pipeline.orchestration.airflow_client import (
     drive_staging,
     native_run_id,
     normalize_change_summary,
+    reconcile_queued_cache_releases,
+    release_run_cache,
     resolved_routing,
     submission_identity,
     validate_main_assembly,
@@ -906,6 +908,18 @@ def solidworks_to_urdf():
             binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
             binding["source_run_id"] = None
             binding["from_stage"] = None
+            # IF-10: once the sealed capture import is admitted, release this run's
+            # staged Windows cache through its own recorded operation.  A deferred
+            # release is recorded for reconcile and never fails the stage.
+            endpoint = _endpoint(request["conn_id"])
+            reconcile_queued_cache_releases(store, endpoint)
+            release_run_cache(
+                store,
+                endpoint,
+                run_id=run_id,
+                intake=Path(request["intake_dir"]),
+                upload_files=request["upload_files"],
+            )
         log.info(
             "linux capture ready run_id=%s source=%s state=%s",
             run_id,
