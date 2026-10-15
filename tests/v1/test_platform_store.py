@@ -46,13 +46,14 @@ CHECKPOINT = "store://sealed/run-r-1"
 NATIVE_STAGE_STATES = {"freeze": "frozen", "discover": "discovered", "capture": "native_complete"}
 
 
-def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
+def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
     """One real sealed delivery: manifest record-for-record plus its digests.
 
     The tree covers the declared evidence of all six stages, so the same
-    delivery serves the portable and the native confirmations; the third
-    return value is the sealed ``input/handoff.json`` digest every receipt
-    must bind.
+    delivery serves the portable and the native confirmations. The digests
+    mirror the stage identity domains: the full prepared-index digest that
+    freeze binds, and the selected native transfer digest bound by every
+    later stage.
     """
 
     for name in ("input", "evidence", "model", "urdf", "meshes", "reports"):
@@ -61,27 +62,28 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
     (root / "evidence" / "native-meshes").mkdir()
     write_json(root / "input" / "source.json", {"source": "fixture"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
-    (root / "input" / "cad").mkdir()
-    (root / "input" / "cad" / "robot.SLDASM").write_bytes(b"fixture-native")
+    (root / "input" / "cad" / "cad").mkdir(parents=True)
+    (root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(b"fixture-native")
     package_files = {
         "source.json": file_digest(root / "input" / "source.json"),
         "records/arm.json": file_digest(root / "input" / "records" / "arm.json"),
-        "cad/robot.SLDASM": file_digest(root / "input" / "cad" / "robot.SLDASM"),
+        "cad/cad/robot.SLDASM": file_digest(root / "input" / "cad" / "cad" / "robot.SLDASM"),
     }
+    native_inventory = {"cad/robot.SLDASM": package_files["cad/cad/robot.SLDASM"]}
     write_json(
         root / "input" / "handoff.json",
         {
             "passed": True,
             "package_files": package_files,
-            "input_receipt": {"inventory": {"robot.SLDASM": package_files["cad/robot.SLDASM"]}},
+            "input_receipt": {"inventory": native_inventory},
         },
     )
     write_json(
         root / "evidence" / "discovery.json",
         {
             "discovery": "fixture",
-            "handoff_sha256": digest(package_files),
-            "native_files": {"robot.SLDASM": package_files["cad/robot.SLDASM"]},
+            "handoff_sha256": digest(native_inventory),
+            "native_files": native_inventory,
         },
     )
     write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
@@ -103,7 +105,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
             "runtime": {"role": "native"},
         },
     )
-    write_json(root / "transfer-manifest.json", {"handoff_sha256": digest(package_files)})
+    write_json(root / "transfer-manifest.json", {"handoff_sha256": digest(native_inventory)})
     write_delivery_manifest(
         root,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -111,8 +113,9 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
     )
     manifest = read_delivery_manifest(root)
     artifacts = [dict(record) for record in manifest["subject"]["files"]]
-    handoff = digest(package_files)
-    return manifest["subject"]["digest"], artifacts, handoff
+    handoff_full = digest(package_files)
+    handoff_native = digest(native_inventory)
+    return manifest["subject"]["digest"], artifacts, handoff_full, handoff_native
 
 
 class FakeWorld:
@@ -472,7 +475,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.delivery = Path(self.directory.name) / "sealed"
         self.delivery.mkdir()
-        self.subject, self.artifacts, self.handoff = build_sealed_delivery(self.delivery)
+        self.subject, self.artifacts, self.handoff_full, self.handoff_native = build_sealed_delivery(self.delivery)
         self.definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
         self.rebuilt = mock.Mock(return_value=self.definition)
         definition_patch = mock.patch.object(solidworks_urdf, "rebuilt_definition", new=self.rebuilt)
@@ -516,7 +519,7 @@ class PlatformStoreTests(unittest.TestCase):
             "state": "generated",
             "passed": False,
             "subject_sha256": self.subject,
-            "handoff_sha256": self.handoff,
+            "handoff_sha256": self.handoff_native,
             "artifacts": [dict(record) for record in self.artifacts],
         }
         payload.update(overrides)
@@ -531,7 +534,7 @@ class PlatformStoreTests(unittest.TestCase):
             "state": "verified",
             "passed": True,
             "subject_sha256": self.subject,
-            "handoff_sha256": self.handoff,
+            "handoff_sha256": self.handoff_native,
             "artifacts": [dict(record) for record in self.artifacts],
             "quality": self.qualified_quality(),
         }
@@ -839,7 +842,7 @@ class PlatformStoreTests(unittest.TestCase):
             "stage": stage,
             "state": NATIVE_STAGE_STATES[stage],
             "passed": False,
-            "handoff_sha256": self.handoff,
+            "handoff_sha256": self.handoff_full if stage == "freeze" else self.handoff_native,
             "artifacts": [dict(record) for record in self.artifacts],
         }
         if stage == "freeze":

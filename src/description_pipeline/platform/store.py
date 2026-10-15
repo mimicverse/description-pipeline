@@ -1199,6 +1199,12 @@ class PlatformStore:
             inventory = receipt_index.get("inventory") if isinstance(receipt_index, dict) else None
             if not isinstance(inventory, dict) or not inventory:
                 raise PlatformStoreError("The sealed handoff index carries no native input inventory")
+            natives = {path[len("input/cad/"):] for path in stamped if path.startswith("input/cad/")}
+            if set(inventory) != natives:
+                raise PlatformStoreError(
+                    "The native input inventory does not match the sealed native originals: "
+                    f"missing={sorted(natives - set(inventory))} extra={sorted(set(inventory) - natives)}"
+                )
             for name, checksum in inventory.items():
                 record = stamped.get("input/cad/" + str(name))
                 if record is None or record[1] != checksum:
@@ -1206,8 +1212,12 @@ class PlatformStore:
                         "The native input inventory is not byte-bound to the sealed originals"
                     )
             native_files = discovery.get("native_files")
-            if native_files is not None and native_files != inventory:
+            if not isinstance(native_files, dict) or native_files != inventory:
                 raise PlatformStoreError("The native input inventory differs from the sealed discovery record")
+            if digest(inventory) != transfer_handoff:
+                raise PlatformStoreError(
+                    "The native transfer identity is not the digest of the sealed native inventory"
+                )
             expected_handoff = transfer_handoff
         if expected_handoff != receipt.get("handoff_sha256"):
             raise PlatformStoreError("The receipt's handoff binding does not match the sealed identity for this stage")

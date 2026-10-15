@@ -1015,7 +1015,9 @@ class LinkedMaterializationTests(unittest.TestCase):
         self.world = FakeWorld()
         self.store = PlatformStore(self.world.connect, sealed=self._sealed)
         # A genuine (synthetic-byte) native capture: the transfer really verifies.
-        handoff = digest({"cad/robot.SLDASM": hashlib.sha256(b"CAD-BYTES").hexdigest()})
+        # The native transfer identity is the digest of the sealed input inventory
+        # exactly as ``capture_root`` writes it (bare staged names under input/cad).
+        handoff = digest({"robot.SLDASM": hashlib.sha256(b"CAD-BYTES").hexdigest()})
         self.tree = native.capture_root(Path(self.temporary.name) / "native", run_id=self.PARENT, handoff=handoff)
         write_json(self.tree / "input/source.json", {"source": "synthetic-native"})
         write_json(self.tree / "input/records/arm.json", {"record": "synthetic-native"})

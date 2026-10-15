@@ -21,7 +21,7 @@ class SealDeliveryTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.source = self.root / "delivery-source"
         self.source.mkdir()
-        self.subject, _artifacts, _handoff = build_sealed_delivery(self.source)
+        self.subject, _artifacts, _handoff_full, _handoff_native = build_sealed_delivery(self.source)
 
     def _rebuild_source(self, name: str) -> Path:
         directory = self.root / name
