@@ -1007,7 +1007,7 @@ class LinkedMaterializationTests(unittest.TestCase):
         identity = read_data(self.tree / "evidence/evidence/collection.json")["identity"]
         native.write_manifest(self.tree / "evidence", kind="solidworks", identity=identity, evidence_class="cad")
         transfer = native.seal(
-            self.tree, Path(self.temporary.name) / "native.zip", run_id=self.PARENT, handoff_sha256=handoff
+            self.tree, Path(self.temporary.name) / "fixture-native.zip", run_id=self.PARENT, handoff_sha256=handoff
         )
         write_json(self.tree / "transfer-manifest.json", transfer)
         write_json(self.tree / "input/request.json", {"request": "synthetic-frozen-original"})
