@@ -857,6 +857,7 @@ def write_target_delivery(
     originals: dict[str, str] | None = None,
     records: dict[str, str] | None = None,
     raw_source_config: dict | None = None,
+    request: dict | None = None,
 ) -> Path:
     """Create a minimal target-tree delivery holding the given capture blocks."""
 
@@ -887,6 +888,15 @@ def write_target_delivery(
         }
     write_json(root / "input/handoff.json", handoff)
     write_json(root / "input/source.json", source)
+    if request is None:
+        request = {
+            "schema_version": "solidworks-to-urdf.request/v1",
+            "request_id": "00000000-0000-4000-8000-000000000000",
+            "target_hardware": str(selection["hardware_id"]),
+            "change_summary": str((source.get("metadata") or {}).get("change_summary") or "fixture"),
+            "main_assembly": str(selection["main_assembly"]),
+        }
+    write_json(root / "input/request.json", request)
     for name, text in (originals or {}).items():
         target = root / "input/cad" / name
         target.parent.mkdir(parents=True, exist_ok=True)
