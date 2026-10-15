@@ -125,3 +125,25 @@ class SealDeliveryTests(unittest.TestCase):
             seal_delivery(self.root, "run-1", "generate", self.source)
         self.assertIn(Path(self.root).resolve(), calls)
         self.assertIn(Path(self.root).resolve() / "sealed", calls)
+
+    def test_first_creation_of_a_multi_level_root_syncs_every_new_ancestor(self) -> None:
+        from unittest import mock
+
+        from description_pipeline.platform import storage as storage_module
+
+        deep = self.root / "new-parent" / "new-child" / "store"
+        calls: list[Path] = []
+        real = storage_module._fsync_dir
+
+        def record(path):
+            calls.append(Path(path))
+            real(path)
+
+        with mock.patch.object(storage_module, "_fsync_dir", side_effect=record):
+            uri = seal_delivery(deep, "run-1", "generate", self.source)
+        resolved = deep.resolve()
+        self.assertIn(resolved, calls)
+        self.assertIn(resolved.parent.parent, calls)
+        self.assertIn(resolved / "sealed", calls)
+        self.assertTrue((resolved / "sealed" / "run-1" / "generate" / "manifest.json").is_file())
+        self.assertEqual(uri, "store://sealed/run-1/generate")

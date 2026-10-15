@@ -130,8 +130,17 @@ def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path)
     target = _guarded_seal_target(base, run_id, stage)
     parent = target.parent
     sealed_root = base / SEALED_ROOT_NAME
-    chain = (base, sealed_root, parent)
-    created = [directory for directory in chain if not directory.exists()]
+    # Account for every directory this call actually creates, including the
+    # implicit ancestors above the store root: walk up from the deepest needed
+    # path until the first existing directory, then persist each new level's
+    # parent entry on the way back down.
+    created: list[Path] = []
+    probe = parent
+    while not probe.exists():
+        created.append(probe)
+        if probe == probe.parent:  # pragma: no cover - the filesystem root always exists
+            break
+        probe = probe.parent
     parent.mkdir(parents=True, exist_ok=True)
     for directory in created:
         _fsync_dir(directory.parent)
