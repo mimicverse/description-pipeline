@@ -103,7 +103,6 @@ class EndpointFixture:
             "output_root": str(self.root / "outputs"),
             "state_root": str(self.root / "state"),
             "token_file": str(token),
-            "targets": {"nd_fixture": {"repository_slug": "a/b", "base": "feature/arm"}},
         }
         self.write_config()
         self.config = read_config(self.path)

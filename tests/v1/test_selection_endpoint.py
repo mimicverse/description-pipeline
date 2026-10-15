@@ -123,7 +123,6 @@ class SelectionEndpointTests(unittest.TestCase):
                 "output_root": str(self.root / "outputs"),
                 "state_root": str(self.root / "state"),
                 "token_file": str(token),
-                "targets": {"arm": {"repository_slug": "a/b", "base": "feature/arm"}},
             },
         )
         self.config_path = config_path
@@ -544,7 +543,7 @@ class SelectionEndpointTests(unittest.TestCase):
             },
         )
         config = read_config(minimal)
-        self.assertEqual(config["targets"], {})
+        self.assertNotIn("targets", config)
         self.assertEqual(config["config_digest"], digest(read_data(minimal)))
 
     def test_the_health_producer_satisfies_the_real_consumer(self) -> None:

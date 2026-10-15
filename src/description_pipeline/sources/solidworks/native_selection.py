@@ -613,6 +613,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "stored_references_phase": readings.get("stored_references_phase"),
         "search_configuration": readings.get("search") or {},
         "open_status": readings.get("open") or {},
+        "saved_configuration": readings.get("saved_configuration"),
+        "document_state": readings.get("document_state"),
         "preverify": preverify,
         "graph": graph_out,
         "documents": documents_out,
