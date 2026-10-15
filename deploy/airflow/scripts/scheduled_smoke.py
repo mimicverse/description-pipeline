@@ -624,6 +624,47 @@ def _portal_negative_checks(
     return results
 
 
+def _quality_rejection_comparisons(checks: list[dict], preview_failing: set[str]) -> dict:
+    """The documented control rejection: required gates executed and passed, failures
+    confined to the control limits, and both formal views agreeing on the failing set.
+
+    ``REQUIRED_CONTROL_GATES`` (nine checks) must each carry a definite executed
+    ``state == "passed"`` with ``passed is True`` - absent, not_run or failed all
+    refuse.  Failures are allowed only inside ``CONTROL_LIMITS`` (eight classes,
+    disjoint from the required set); anything else refuses.  The quality document
+    and the diagnostic summary must list the same failing identities.
+    """
+
+    from tests.v1.split_capture_fixture import (  # noqa: PLC0415
+        CONTROL_LIMITS,
+        REQUIRED_CONTROL_GATES,
+    )
+
+    by_id = {str(item.get("id")): item for item in checks}
+    executed = bool(checks) and all(
+        item.get("state") in {"passed", "failed"} and isinstance(item.get("passed"), bool)
+        for item in checks
+    )
+    consistent = executed and all(
+        (item.get("passed") is True) == (item.get("state") == "passed") for item in checks
+    )
+    failing = {
+        str(item.get("id")) for item in checks if item.get("passed") is False or item.get("state") == "failed"
+    }
+    required_ok = all(
+        (by_id.get(gate) or {}).get("state") == "passed" and (by_id.get(gate) or {}).get("passed") is True
+        for gate in REQUIRED_CONTROL_GATES
+    )
+    return {
+        "executed": executed,
+        "consistent": consistent,
+        "failing": failing,
+        "unexpected_gates": sorted(failing - set(CONTROL_LIMITS)),
+        "missing_required_gates": [] if required_ok else sorted(REQUIRED_CONTROL_GATES),
+        "views_agree": failing == preview_failing,
+    }
+
+
 def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
     """The strict settlement comparisons: platform rows versus the observed projection.
 
@@ -800,9 +841,7 @@ def main() -> int:
     from description_pipeline.orchestration.portal import AirflowApi  # noqa: PLC0415
     from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
     from tests.v1.split_capture_fixture import (  # noqa: PLC0415
-        CONTROL_LIMITS,
         QUALIFICATION,
-        REQUIRED_CONTROL_GATES,
         build_fixture_capture,
     )
 
@@ -1156,37 +1195,29 @@ def main() -> int:
             checks = [
                 item for item in (quality_doc.get("checks") or []) if isinstance(item, dict)
             ] if isinstance(quality_doc, dict) else []
-            executed = bool(checks) and all(
-                item.get("state") in {"passed", "failed"} and isinstance(item.get("passed"), bool)
-                for item in checks
-            )
-            failing = {
-                str(item.get("id"))
-                for item in checks
-                if item.get("passed") is False or item.get("state") == "failed"
-            }
             preview_failing = {
                 str(item.get("id"))
                 for item in (preview_payload.get("failing_checks") or [])
                 if isinstance(item, dict)
             }
-            unexpected_gates = sorted(failing - set(CONTROL_LIMITS))
-            missing_required = [gate for gate in REQUIRED_CONTROL_GATES if gate not in failing]
+            quality = _quality_rejection_comparisons(checks, preview_failing)
             subject = str(preview_payload.get("subject_sha256") or "")
             rejection = {
                 "served": status == 200,
                 "reason": preview_payload.get("reason"),
                 "verified": preview_payload.get("verified"),
                 "error": preview_payload.get("error"),
-                "failed_gates": sorted(failing),
-                "unexpected_gates": unexpected_gates,
-                "missing_required_gates": missing_required,
+                "failed_gates": sorted(quality["failing"]),
+                "unexpected_gates": quality["unexpected_gates"],
+                "missing_required_gates": quality["missing_required_gates"],
                 "subject_sha256": subject or None,
                 "urdf": preview_payload.get("urdf"),
                 "quality": {
                     "document_served": document_status == 200,
                     "checks": len(checks),
-                    "execution_evidence": executed,
+                    "execution_evidence": quality["executed"],
+                    "consistent": quality["consistent"],
+                    "views_agree": quality["views_agree"],
                     "document_subject_sha256": quality_doc.get("subject_sha256")
                     if isinstance(quality_doc, dict)
                     else None,
@@ -1205,16 +1236,20 @@ def main() -> int:
                     problems.append(f"the rejection error is not the documented verification failure: {rejection}")
                 if document_status != 200:
                     problems.append(f"the quality document could not be served: {document_status}")
-                elif not executed:
+                elif not quality["executed"] or not quality["consistent"]:
                     problems.append(f"quality checks carry no definite execution evidence: {rejection['quality']}")
-                elif failing != preview_failing:
+                elif not quality["views_agree"]:
                     problems.append(
                         f"the quality document and the diagnostic summary disagree on failures: {rejection}"
                     )
-                if unexpected_gates:
-                    problems.append(f"quality failed outside the documented control limits: {unexpected_gates}")
-                if missing_required:
-                    problems.append(f"quality skipped required gates: {missing_required}")
+                if quality["unexpected_gates"]:
+                    problems.append(
+                        f"quality failed outside the documented control limits: {quality['unexpected_gates']}"
+                    )
+                if quality["missing_required_gates"]:
+                    problems.append(
+                        f"required gates are missing or not passed: {quality['missing_required_gates']}"
+                    )
                 document_subject = (
                     str(quality_doc.get("subject_sha256") or "") if isinstance(quality_doc, dict) else ""
                 )

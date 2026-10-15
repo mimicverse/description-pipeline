@@ -15,6 +15,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+from tests.v1.split_capture_fixture import CONTROL_LIMITS, REQUIRED_CONTROL_GATES
+
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE = ROOT / "deploy" / "airflow" / "scripts" / "scheduled_smoke.py"
 
@@ -119,6 +121,59 @@ class SettlementCheckerTests(unittest.TestCase):
         rows = self.rows()
         rows["stages"] = [row for row in rows["stages"] if row[0] != "publish"]
         self.assertFalse(self.compare(rows)["stage_rows_match_projection"]["passed"])
+
+
+class QualityRejectionTests(unittest.TestCase):
+    """The legitimate control report must pass; missing or failed required gates refuse."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = _load_smoke()
+        cls.required = list(REQUIRED_CONTROL_GATES)
+        cls.limits = list(CONTROL_LIMITS)
+
+    def control_checks(self) -> list[dict]:
+        return [
+            {"id": gate, "state": "passed", "passed": True} for gate in self.required
+        ] + [{"id": gate, "state": "failed", "passed": False} for gate in self.limits]
+
+    def test_the_required_and_control_sets_are_disjoint(self) -> None:
+        self.assertFalse(set(self.required) & set(self.limits))
+
+    def test_the_legitimate_control_report_is_accepted(self) -> None:
+        quality = self.module._quality_rejection_comparisons(self.control_checks(), set(self.limits))
+        self.assertTrue(quality["executed"], quality)
+        self.assertTrue(quality["consistent"], quality)
+        self.assertTrue(quality["views_agree"], quality)
+        self.assertEqual(quality["unexpected_gates"], [])
+        self.assertEqual(quality["missing_required_gates"], [])
+
+    def test_a_missing_required_gate_is_rejected(self) -> None:
+        checks = [item for item in self.control_checks() if item["id"] != self.required[0]]
+        quality = self.module._quality_rejection_comparisons(checks, set(self.limits))
+        self.assertTrue(quality["missing_required_gates"])
+
+    def test_a_not_run_required_gate_is_rejected(self) -> None:
+        checks = self.control_checks()
+        checks[0] = {"id": self.required[0], "state": "not_run", "passed": False}
+        quality = self.module._quality_rejection_comparisons(checks, set(self.limits))
+        self.assertFalse(quality["executed"])
+        self.assertTrue(quality["missing_required_gates"])
+
+    def test_a_failed_required_gate_is_rejected(self) -> None:
+        checks = self.control_checks()
+        checks[0] = {"id": self.required[0], "state": "failed", "passed": False}
+        quality = self.module._quality_rejection_comparisons(checks, set(self.limits))
+        self.assertTrue(quality["missing_required_gates"])
+
+    def test_an_unexpected_failure_is_rejected(self) -> None:
+        checks = [*self.control_checks(), {"id": "other.check", "state": "failed", "passed": False}]
+        quality = self.module._quality_rejection_comparisons(checks, {*self.limits, "other.check"})
+        self.assertEqual(quality["unexpected_gates"], ["other.check"])
+
+    def test_disagreeing_views_are_rejected(self) -> None:
+        quality = self.module._quality_rejection_comparisons(self.control_checks(), set(self.limits[:-1]))
+        self.assertFalse(quality["views_agree"])
 
 
 if __name__ == "__main__":
