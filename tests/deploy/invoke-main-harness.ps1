@@ -74,6 +74,7 @@ $script:AccountEnv = @{}
 
 function Get-AccountEnvironment { param([string]$Name) return [string]$script:AccountEnv[$Name] }
 function Set-AccountEnvironment { param([string]$Name, [string]$Value) $script:AccountEnv[$Name] = $Value }
+function Get-ServedStateRoot { param([string]$configPath) return [string]$Root }
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
   [pscustomobject]@{ State='Ready'; Actions=@($script:CurrentAction) }

@@ -507,7 +507,27 @@ function Set-AccountEnvironment([string]$Name, [string]$Value) {
 function Domain-OwnershipPath([string]$StateRoot) {
   return (Join-Path $StateRoot 'cad-ownership.json')
 }
+function Get-ServedStateRoot([string]$configPath) {
+  # The served generation's own runtime reads its endpoint.json through the official parser;
+  # the binding's state_root never self-grants - it must equal what the configuration declares.
+  $generation = Split-Path -Parent $configPath
+  $runtime = Runtime-Python $generation
+  $program = "import json,sys;from description_pipeline.orchestration import windows;" +
+    "config=windows.read_config(sys.argv[1]);print(json.dumps({'state_root':str(config['state_root'])}))"
+  $output = & $runtime -I -c $program $configPath
+  if ($LASTEXITCODE -ne 0) {
+    Die 'served_config_unreadable' ('the served endpoint configuration cannot be read officially: ' + $configPath)
+  }
+  return [string]((($output | Select-Object -Last 1) | ConvertFrom-Json).state_root)
+}
 function Assert-DomainPins([string]$StateRoot, [string]$ServedGeneration) {
+  $officialRoot = ''
+  if ($ServedGeneration) {
+    $officialRoot = Get-ServedStateRoot (Config-Path $ServedGeneration)
+    if ($officialRoot -ne $StateRoot) {
+      Die 'state_root_mismatch' ('the served configuration binds another state root: ' + $officialRoot)
+    }
+  }
   $canonical = Domain-OwnershipPath $StateRoot
   $pinned = [string](Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE')
   if ($pinned -and ($pinned -ne $canonical)) {
