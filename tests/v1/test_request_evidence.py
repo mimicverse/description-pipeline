@@ -12,6 +12,8 @@ from description_pipeline.request_evidence import (
     REQUEST_FIELDS,
     REQUEST_SCHEMA,
     build_request_evidence,
+    carry_request_evidence,
+    freeze_request_evidence,
     read_request_evidence,
     request_evidence_bytes,
     verify_request_evidence,
@@ -109,3 +111,26 @@ class RequestEvidenceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineError, "canonical strict JSON"):
             read_request_evidence(self.path)
+
+    def test_freeze_writes_before_any_tree_and_carry_is_byte_verbatim(self) -> None:
+        run_dir = self.root / "run-1"
+        written = freeze_request_evidence(
+            run_dir,
+            request_id="portal-20261016T000000-abcdef01",
+            target_hardware="m3.0",
+            change_summary="freeze first",
+            main_assembly="3.0 总装.SLDASM",
+            handoff_digest=DIGEST,
+            platform_config_digest="b" * 64,
+        )
+        self.assertEqual(written, run_dir / "input" / "request.json")
+        frozen_bytes = written.read_bytes()
+        tree = self.root / "run-1" / "capture"
+        carried = carry_request_evidence(run_dir, tree)
+        self.assertEqual(carried.read_bytes(), frozen_bytes)
+        self.assertEqual(read_request_evidence(carried)[0], read_request_evidence(written)[0])
+        self.assertEqual(read_request_evidence(carried)[0]["request_id"], "portal-20261016T000000-abcdef01")
+
+    def test_carry_refuses_when_the_frozen_evidence_is_absent(self) -> None:
+        with self.assertRaisesRegex(PipelineError, "carries no input/request.json"):
+            carry_request_evidence(self.root / "run-empty", self.root / "run-empty" / "capture")

@@ -108,6 +108,52 @@ def verify_request_evidence(path: str | Path, *, expected_sha256: str) -> dict:
     return record
 
 
+def freeze_request_evidence(
+    run_dir: str | Path,
+    *,
+    request_id,
+    target_hardware,
+    change_summary,
+    main_assembly,
+    handoff_digest,
+    platform_config_digest,
+) -> Path:
+    """Form ``<run>/input/request.json`` before the derivation or generator runs.
+
+    Writing here, at freeze, is the timing contract: the frozen bytes are in
+    place before any later stage exists, and every later tree carries this
+    exact file (see :func:`carry_request_evidence`).  The freeze receipt binds
+    the file through its artifact inventory - not through a parallel field.
+    """
+
+    record = build_request_evidence(
+        request_id=request_id,
+        target_hardware=target_hardware,
+        change_summary=change_summary,
+        main_assembly=main_assembly,
+        handoff_digest=handoff_digest,
+        platform_config_digest=platform_config_digest,
+    )
+    target = Path(run_dir) / REQUEST_RELATIVE
+    write_request_evidence(target, record)
+    return target
+
+
+def carry_request_evidence(run_dir: str | Path, tree_dir: str | Path) -> Path:
+    """Copy the frozen evidence into a stage tree byte-for-byte; absence refuses."""
+
+    source = Path(run_dir) / REQUEST_RELATIVE
+    record, _ = read_request_evidence(source)
+    if record["schema_version"] != REQUEST_SCHEMA:  # pragma: no cover - _validate already refuses
+        raise PipelineError("The frozen request evidence uses an unknown schema")
+    target = Path(tree_dir) / REQUEST_RELATIVE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(source.read_bytes())
+    if target.read_bytes() != source.read_bytes():  # pragma: no cover - write or refuse
+        raise PipelineError("The carried request evidence differs from the frozen bytes")
+    return target
+
+
 def _identifier(value, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PipelineError(f"The frozen request evidence lacks its {field}")
