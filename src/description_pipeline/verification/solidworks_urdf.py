@@ -222,27 +222,29 @@ def require_qualified_report(report, definition, root=None):
 
 
 def _frozen_source_config(root) -> dict:
-    """The sealed capture config read verbatim from the raw evidence.
+    """The sealed material authority, read from the capture's own raw records.
 
-    The material authority is a fact of the native capture
-    (``evidence/raw/source_config.json``); the verifier reads the value exactly
-    as sealed - never derived from other blocks and never defaulted - so a
-    capture that carries no usable authority fails closed here instead of a
-    bare ``KeyError`` inside the physics gate.
+    The authority is a fact of the native capture: a controlled declared table
+    travels as ``raw/declared_masses.json``, otherwise the CAD direct reads in
+    ``raw/mass_properties.json`` carry it.  The value is never taken from the
+    generator's convenience config and never defaulted; a capture with no
+    usable mass evidence returns nothing so the caller fails closed instead of
+    a bare ``KeyError`` inside the physics gate.
     """
 
     delivery = Path(root).resolve()
     delivery = delivery.parent if delivery.name == "evidence" else delivery
-    from ..sources.solidworks.discovery import source_definition
-
-    config = source_definition(
-        delivery,
-        discovery_name="evidence/discovery.json",
-        cad_prefix="input/cad/",
-        records_prefix="input/records/",
-    )
-    _require(isinstance(config, dict), "The frozen source config is not an object")
-    return config
+    evidence = delivery / "evidence"
+    for name, authority in (
+        ("raw/declared_masses.json", "documented_table"),
+        ("raw/mass_properties.json", "cad"),
+    ):
+        if not (evidence / name).is_file():
+            continue
+        payload = read_data(confined(evidence, name))
+        if isinstance(payload, dict) and payload:
+            return {"material_source": authority}
+    return {}
 
 
 def rebuilt_definition(root) -> dict:
