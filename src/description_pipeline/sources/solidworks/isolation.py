@@ -290,6 +290,84 @@ def _ownership_path(override=None) -> Path:
     return Path(base) / "description-pipeline" / "cad-ownership.json"
 
 
+def _lease_path(override=None) -> Path:
+    """The resource-domain session lease beside the ownership ledger.
+
+    One kernel lock file per domain, derived from the ledger path so every
+    actor sharing the ledger shares the same domain identity.  It carries no
+    records (the ledger stays the single ownership record store); the lock
+    holder writes only its pid for diagnostics.
+    """
+
+    return Path(str(_ownership_path(override)) + ".lease")
+
+
+class DomainLease:
+    """One session-lifetime kernel lock covering a whole CAD resource domain.
+
+    Acquired before an owned launch starts and released only when the last
+    owned process of this process closes, so read/capture/write actors cannot
+    interleave inside one domain: a second actor's non-blocking acquisition
+    fails closed with ``cad_domain_leased`` (holder pid from the lock file).
+    The lock is a kernel lock, so a crashed or killed holder releases it with
+    its process - recovery needs no sweeping - and the lock file, like the
+    ledger sidecar, is never unlinked.  The ledger's own short
+    read-modify-write lock is untouched by this lease, so ledger writers are
+    never blocked for the length of a session.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.handle: int | None = None
+        self.holders = 0
+        self.holder_pid: int | None = None
+
+    def acquire(self) -> DomainLease:
+        if self.handle is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.handle = acquire_process_lock(self.path)
+            except OSError as error:
+                holder = None
+                with contextlib.suppress(OSError):
+                    holder = self.path.read_text(encoding="utf-8").strip() or None
+                raise EnvironmentError_(
+                    "cad_domain_leased",
+                    "the CAD resource domain is leased by another process",
+                    {"lease": str(self.path), "holder_pid": holder},
+                ) from error
+            self.holder_pid = os.getpid()
+        self.holders += 1
+        return self
+
+    def release(self) -> None:
+        if self.holders == 0:
+            return
+        self.holders -= 1
+        if self.holders == 0 and self.handle is not None:
+            os.close(self.handle)
+            self.handle = None
+            self.holder_pid = None
+
+    def receipt(self) -> dict:
+        return {"path": str(self.path), "held": self.handle is not None, "holder_pid": self.holder_pid}
+
+
+_DOMAIN_LEASES: dict[str, DomainLease] = {}
+_DOMAIN_LEASES_LOCK = threading.RLock()
+
+
+def domain_lease(ownership_file=None) -> DomainLease:
+    """This process's lease object for one resource domain (one per lease path)."""
+
+    key = str(_lease_path(ownership_file))
+    with _DOMAIN_LEASES_LOCK:
+        lease = _DOMAIN_LEASES.get(key)
+        if lease is None:
+            lease = _DOMAIN_LEASES[key] = DomainLease(Path(key))
+        return lease
+
+
 class OwnershipStore:
     """The small launch ledger; records only shrink through matching removals.
 
@@ -599,6 +677,13 @@ class WindowsCadProcess:
         import win32job
         import win32process
 
+        #: One session-lifetime resource-domain lease (kernel lock): acquired
+        #: before anything else and held until this owned process closes, so a
+        #: second actor in the same domain fails closed instead of interleaving.
+        self._lease = domain_lease(ownership_file)
+        self._lease_held = False
+        self._lease.acquire()
+        self._lease_held = True
         self.executable = executable
         self.pid = 0
         self._lock = threading.Lock()
@@ -670,6 +755,14 @@ class WindowsCadProcess:
         with self._lock:
             return self._process is not None and win32process.GetExitCodeProcess(self._process) == 259
 
+    def lease_receipt(self) -> dict:
+        """Observable receipt for the session-lifetime resource-domain lease."""
+
+        lease = getattr(self, "_lease", None)
+        if lease is None:
+            return {"path": None, "held": False, "holder_pid": None}
+        return lease.receipt()
+
     def close(self) -> None:
         import win32event
 
@@ -696,6 +789,12 @@ class WindowsCadProcess:
                 if self._ownership is not None:
                     with contextlib.suppress(Exception):
                         self._ownership.remove(self.pid, creation_time=self._record_creation)
+                if getattr(self, "_lease_held", False):
+                    # The lease is released last: the domain stays exclusive
+                    # until nothing of this owned launch remains.
+                    with contextlib.suppress(Exception):
+                        self._lease.release()
+                    self._lease_held = False
             if errors:
                 raise EnvironmentError_("cad_process_cleanup_failed", "; ".join(errors), {"pid": self.pid})
 
@@ -828,11 +927,14 @@ class CadSession:
         return app
 
     def identity(self) -> dict:
+        receipt = getattr(self.process, "lease_receipt", None)
+        lease = receipt() if callable(receipt) else None
         return {
             "pid": self.process.pid,
             "executable": self.process.executable,
             "ownership": "windows_job",
             "state": "closed" if self.closed else "active",
+            "lease": lease,
         }
 
     def terminate(self) -> None:
