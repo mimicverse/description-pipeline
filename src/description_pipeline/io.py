@@ -21,11 +21,13 @@ class PipelineError(ValueError):
     diagnostic_path: str | None = None
 
 
-def acquire_process_lock(path: Path) -> int:
-    """Hold a kernel lock until its descriptor closes, including on process exit.
+def try_acquire_process_lock(path: Path) -> int | None:
+    """Try to hold a kernel lock; ``None`` means another actor holds it now.
 
-    Keep the lock file in place: unlinking would let another process lock a
-    different inode while the first owner still runs. Its PID is diagnostic.
+    Opening failures (missing rights, IO errors, a symlinked lock) stay loud
+    and propagate: they are observation errors, never evidence of a lock
+    holder.  On success the lock file keeps this process's pid for
+    diagnostics, and the caller owns closing the returned descriptor.
     """
     if path.is_symlink() or path.is_junction():
         raise PipelineError("Ownership lock must be a real file")
@@ -39,12 +41,30 @@ def acquire_process_lock(path: Path) -> int:
             import fcntl
 
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(handle)
+        return None
+    try:
         owner = str(os.getpid()).encode("ascii")
         os.write(handle, owner)
         os.ftruncate(handle, len(owner))
     except BaseException:
         os.close(handle)
         raise
+    return handle
+
+
+def acquire_process_lock(path: Path) -> int:
+    """Hold a kernel lock until its descriptor closes, including on process exit.
+
+    Competitors refuse loudly (``OSError``) instead of waiting.  Keep the lock
+    file in place: unlinking would let another process lock a different inode
+    while the first owner still runs. Its PID is diagnostic.
+    """
+
+    handle = try_acquire_process_lock(path)
+    if handle is None:
+        raise OSError(f"the ownership lock is already held by another process: {path}")
     return handle
 
 

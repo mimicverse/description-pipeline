@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ...io import PipelineError, acquire_process_lock, read_data, write_json
+from ...io import PipelineError, acquire_process_lock, read_data, try_acquire_process_lock, write_json
 from .errors import EnvironmentError_
 
 # Published ISldWorks dual-interface IID in the SolidWorks type library.
@@ -276,11 +276,6 @@ def _windows_boot_epoch(now: float | None = None, uptime_ms: int | None = None) 
     return moment - ticks / 1000.0
 
 
-#: The canonical install root of the native endpoint (the launcher's default);
-#: standalone calls discover the official CAD domain through it.
-DEFAULT_ENDPOINT_ROOT = "C:\\description-v1-review"
-
-
 class DomainUnbound(PipelineError):
     """No canonical CAD domain binding exists on this host."""
 
@@ -292,27 +287,24 @@ def _same_path(left: Path, right: Path) -> bool:
 def _discovered_endpoint_ledger() -> Path | None:
     """The ledger named by the installed endpoint configuration, or ``None``.
 
-    Discovery reads ``<DESCRIPTION_ENDPOINT_ROOT|default>/endpoint.json`` and
-    resolves its ``state_root``; non-Windows hosts have no default root.  An
-    unreadable configuration is loud, never a silent fallback.
+    Discovery consumes the one formal endpoint configuration reader
+    (``orchestration.windows.read_config``) over
+    ``<DESCRIPTION_ENDPOINT_ROOT>/endpoint.json``; there is no guessed default
+    root.  A configuration the canonical parser rejects never grants a domain,
+    and an unreadable configuration is loud - never a silent fallback.  A
+    missing configuration file means "not installed" (``None``).
     """
 
-    root = os.environ.get("DESCRIPTION_ENDPOINT_ROOT") or (DEFAULT_ENDPOINT_ROOT if os.name == "nt" else None)
+    root = os.environ.get("DESCRIPTION_ENDPOINT_ROOT") or None
     if not root:
         return None
     config = Path(root) / "endpoint.json"
     if not config.is_file():
         return None
-    try:
-        payload = read_data(config)
-    except (PipelineError, OSError, ValueError) as error:
-        raise PipelineError(
-            "cad_domain_unreadable", f"the endpoint configuration could not be read: {config}"
-        ) from error
-    state_root = payload.get("state_root") if isinstance(payload, dict) else None
-    if not isinstance(state_root, str) or not state_root.strip():
-        raise PipelineError("cad_domain_unreadable", f"the endpoint configuration names no state root: {config}")
-    return Path(state_root) / "cad-ownership.json"
+    from ...orchestration.windows import read_config
+
+    payload = read_config(config)
+    return Path(payload["state_root"]) / "cad-ownership.json"
 
 
 def _ownership_path(override=None) -> Path:
@@ -320,12 +312,12 @@ def _ownership_path(override=None) -> Path:
 
     Binding: the operational pin (``DESCRIPTION_CAD_OWNERSHIP_FILE``) or the
     installed endpoint configuration (``DESCRIPTION_ENDPOINT_ROOT`` ->
-    ``endpoint.json`` -> ``state_root``).  Two disagreeing bindings refuse
-    instead of picking one, and an explicit ``override`` that diverges from a
-    bound canonical path refuses as well - a second domain must never be
-    created silently.  With no binding at all the path is unbound; only
-    callers with an explicit development fallback (``cad_domain_path``) may
-    substitute one.  The old per-user state-directory default is gone.
+    ``endpoint.json``, consumed through the formal ``read_config`` validator).
+    Two disagreeing bindings refuse instead of picking one, and an explicit
+    ``override`` that diverges from a bound canonical path refuses as well - a
+    second domain must never be created silently.  With no binding at all the
+    host is unbound and this raises ``DomainUnbound``: there is no fallback
+    domain.  The old per-user state-directory default is gone.
     """
 
     pinned = os.environ.get("DESCRIPTION_CAD_OWNERSHIP_FILE") or None
@@ -351,22 +343,6 @@ def _ownership_path(override=None) -> Path:
             "the CAD domain is not bound; pin DESCRIPTION_CAD_OWNERSHIP_FILE or install the endpoint configuration"
         )
     return canonical
-
-
-def cad_domain_path(fallback=None) -> Path:
-    """The canonical CAD domain path; ``fallback`` only for an unbound host.
-
-    The fallback keeps development and test callers working on hosts with no
-    pin and no installed configuration; on any bound host it is dead code, so
-    a changed ``state_root`` cannot silently open a second domain.
-    """
-
-    try:
-        return _ownership_path()
-    except DomainUnbound:
-        if fallback is None:
-            raise
-        return Path(fallback)
 
 
 def _lease_path(override=None) -> Path:
@@ -425,14 +401,21 @@ class DomainLease:
             live = _HELD_LEASES.get(str(self.path))
             if live is not None and live.handle is not None:
                 raise self._leased(live.holder_pid, "in-process")
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                self.handle = acquire_process_lock(self.path)
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                handle = try_acquire_process_lock(self.path)
             except OSError as error:
+                raise EnvironmentError_(
+                    "cad_domain_unreadable",
+                    "the CAD domain lease file cannot be opened; refusing to run",
+                    {"lease": str(self.path)},
+                ) from error
+            if handle is None:
                 holder = None
                 with contextlib.suppress(OSError):
                     holder = self.path.read_text(encoding="utf-8").strip() or None
-                raise self._leased(holder, "external") from error
+                raise self._leased(holder, "external")
+            self.handle = handle
             self.holder_pid = os.getpid()
             _HELD_LEASES[str(self.path)] = self
             return self
@@ -471,9 +454,10 @@ def domain_lease_facts(ownership_file=None) -> dict:
 
     This process's live holders are consulted first (a same-process kernel
     probe cannot reliably see its own lock), then a short non-blocking kernel
-    probe (acquire + immediate release) observes another process's holder.
-    Unreadable probe states stay explicit (``held: None`` plus ``error``),
-    never a quiet zero.
+    probe (try-acquire + immediate release) observes another process's holder.
+    Only a proven lock contention reports ``held: True``; an observation error
+    (open/permission/IO, an unreadable or symlinked lease file) reports
+    ``held: None`` plus ``error``, never a fabricated holder.
     """
 
     path = _lease_path(ownership_file)
@@ -484,14 +468,14 @@ def domain_lease_facts(ownership_file=None) -> dict:
     if not path.exists():
         return {"path": str(path), "held": False, "holder": None, "holder_pid": None}
     try:
-        handle = acquire_process_lock(path)
-    except OSError:
+        handle = try_acquire_process_lock(path)
+    except Exception as error:  # noqa: BLE001 - an unreadable probe stays explicit
+        return {"path": str(path), "held": None, "error": f"{type(error).__name__}: {error}"}
+    if handle is None:
         holder = None
         with contextlib.suppress(OSError):
             holder = path.read_text(encoding="utf-8").strip() or None
         return {"path": str(path), "held": True, "holder": "external", "holder_pid": holder}
-    except Exception as error:  # noqa: BLE001 - an unreadable probe stays explicit
-        return {"path": str(path), "held": None, "error": f"{type(error).__name__}: {error}"}
     os.close(handle)
     return {"path": str(path), "held": False, "holder": None, "holder_pid": None}
 

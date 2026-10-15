@@ -109,6 +109,14 @@ class SelectionEndpointTests(unittest.TestCase):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        #: The deployment pins the one canonical CAD domain; this fixture's
+        #: state root is that pin, so endpoint suites never resolve an unbound
+        #: host (and never invent a domain of their own).
+        pin = patch.dict(
+            os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(self.root / "state" / "cad-ownership.json")}
+        )
+        pin.start()
+        self.addCleanup(pin.stop)
         self.packages = self.root / "packages"
         self.engineering = self.root / "engineering"
         for path in (self.packages, self.engineering, self.root / "outputs", self.root / "state"):

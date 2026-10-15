@@ -50,8 +50,26 @@ class CadDomainBindingTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
-    def _endpoint_config(self, state_root: Path) -> None:
-        write_json(self.root / "endpoint.json", {"schema_version": "x", "state_root": str(state_root)})
+    def _endpoint_config(self, state_root: Path, name: str = "endpoint.json") -> Path:
+        """One strict, real endpoint configuration; the canonical parser rejects anything weaker."""
+
+        support = self.root / "installed"
+        (support / "packages").mkdir(parents=True, exist_ok=True)
+        (support / "outputs").mkdir(parents=True, exist_ok=True)
+        token = support / "token"
+        token.write_text("t" * 64, encoding="utf-8")
+        path = self.root / name
+        write_json(
+            path,
+            {
+                "schema_version": "solidworks-to-urdf.endpoint/v1",
+                "package_root": str(support / "packages"),
+                "output_root": str(support / "outputs"),
+                "state_root": str(state_root),
+                "token_file": str(token),
+            },
+        )
+        return path
 
     def _standalone(self, env):
         completed = subprocess.run(
@@ -69,11 +87,10 @@ class CadDomainBindingTests(unittest.TestCase):
         with patch.dict(os.environ, _clean_env(DESCRIPTION_CAD_OWNERSHIP_FILE=str(pinned)), clear=True):
             self.assertEqual(isolation._ownership_path(), pinned)
             self.assertEqual(isolation._lease_path(), Path(str(pinned) + ".lease"))
-            self.assertEqual(isolation.cad_domain_path(), pinned)
 
     def test_installed_endpoint_configuration_is_discovered(self) -> None:
-        state = self.root / "endpoint-state"
-        self._endpoint_config(state)
+        self._endpoint_config(self.root / "endpoint-state")
+        state = (self.root / "endpoint-state").resolve()
         with patch.dict(os.environ, _clean_env(DESCRIPTION_ENDPOINT_ROOT=str(self.root)), clear=True):
             self.assertEqual(isolation._ownership_path(), state / "cad-ownership.json")
             self.assertEqual(isolation._lease_path(), Path(str(state / "cad-ownership.json") + ".lease"))
@@ -89,7 +106,7 @@ class CadDomainBindingTests(unittest.TestCase):
             with self.assertRaises(EnvironmentError_) as caught:
                 isolation._ownership_path()
             self.assertEqual(caught.exception.code, "cad_domain_override_refused")
-        agreeing = self.root / "endpoint-state" / "cad-ownership.json"
+        agreeing = (self.root / "endpoint-state").resolve() / "cad-ownership.json"
         with patch.dict(
             os.environ,
             _clean_env(DESCRIPTION_CAD_OWNERSHIP_FILE=str(agreeing), DESCRIPTION_ENDPOINT_ROOT=str(self.root)),
@@ -110,18 +127,35 @@ class CadDomainBindingTests(unittest.TestCase):
     def test_an_unbound_host_refuses_and_keeps_no_user_state_default(self) -> None:
         empty = self.root / "no-endpoint"
         empty.mkdir()
+        with (
+            patch.dict(os.environ, _clean_env(DESCRIPTION_ENDPOINT_ROOT=str(empty)), clear=True),
+            self.assertRaises(isolation.DomainUnbound),
+        ):
+            isolation._ownership_path()
+        with patch.dict(os.environ, _clean_env(), clear=True), self.assertRaises(isolation.DomainUnbound):
+            # No binding at all also refuses: the old per-user state default is gone.
+            isolation._ownership_path()
+
+    def test_an_unbound_host_never_hands_jobs_a_domain_of_their_own(self) -> None:
+        # The old production fallback handed each endpoint-side Jobs its own
+        # state-root domain; with the fallback gone, an unbound host refuses.
+        empty = self.root / "no-endpoint"
+        empty.mkdir()
+        config_path = self._endpoint_config(self.root / "jobs-state", "job-config.json")
         with patch.dict(os.environ, _clean_env(DESCRIPTION_ENDPOINT_ROOT=str(empty)), clear=True):
-            with self.assertRaises(isolation.DomainUnbound):
-                isolation._ownership_path()
-            fallback = self.root / "dev" / "cad-ownership.json"
-            self.assertEqual(isolation.cad_domain_path(fallback), fallback)
+            jobs = Jobs(read_config(config_path))
+            try:
+                with self.assertRaises(isolation.DomainUnbound):
+                    _ = jobs.cad_ownership_file
+            finally:
+                jobs.close()
 
     def test_endpoint_and_standalone_default_share_one_domain(self) -> None:
         # Endpoint side: a Jobs instance whose state root deliberately differs
         # from the binding; standalone side: the default resolver in a child
         # process, exactly as a diagnostic or operator tool would resolve.
-        state = self.root / "endpoint-state"
-        self._endpoint_config(state)
+        self._endpoint_config(self.root / "endpoint-state")
+        state = (self.root / "endpoint-state").resolve()
         (self.root / "packages").mkdir()
         token = self.root / "token"
         token.write_text("t" * 64, encoding="utf-8")
