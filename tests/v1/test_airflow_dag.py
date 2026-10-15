@@ -413,7 +413,7 @@ class DagTests(unittest.TestCase):
         store_root = Path(tempfile.mkdtemp(prefix="dag-store-"))
         self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
         freeze_request_evidence(
-            store_root / parent_run_id,
+            store_root / "sealed" / parent_run_id / "freeze",
             request_id=parent_dag_run_id,
             target_hardware="m3.0",
             change_summary="linked capture rerun",
@@ -421,6 +421,12 @@ class DagTests(unittest.TestCase):
             handoff_digest=digest(upload),
             platform_config_digest="c" * 64,
         )
+        class _Platform:
+            def stage_records(self, run_id):
+                return {"freeze": {"state": "completed", "checkpoint_uri": f"store://sealed/{run_id}/freeze"}}
+
+            def sealed_path(self, uri):
+                return store_root / "sealed" / uri.removeprefix("store://sealed/")
         config = EndpointConfig(
             "http://127.0.0.1:1",
             "t" * 32,
@@ -430,6 +436,7 @@ class DagTests(unittest.TestCase):
         with (
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
             self.assertEqual(request["upload_files"], upload)
@@ -437,6 +444,10 @@ class DagTests(unittest.TestCase):
             self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
             started = dag.task_dict["discover"].python_callable(request)
+        self.assertEqual(
+            (store_root / request["run_id"] / "input" / "request.json").read_bytes(),
+            (store_root / "sealed" / parent_run_id / "freeze" / "input" / "request.json").read_bytes(),
+        )
         self.assertFalse(started)  # submission happened; the reschedule poll continues
         self.assertEqual(
             submitted,
@@ -477,12 +488,6 @@ class DagTests(unittest.TestCase):
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
         )
-        parent_meta = {
-            "handoff_sha256": "d" * 64,
-            "main_assembly": "assembly.SLDASM",
-            "repository_slug": None,
-            "repository_base": None,
-        }
         import shutil
         import tempfile
 
@@ -491,8 +496,9 @@ class DagTests(unittest.TestCase):
 
         store_root = Path(tempfile.mkdtemp(prefix="dag-linked-"))
         self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
+        parent_run_id = native_run_id("portal-parent-2")
         freeze_request_evidence(
-            store_root / native_run_id("portal-parent-2"),
+            store_root / "sealed" / parent_run_id / "freeze",
             request_id="portal-parent-2",
             target_hardware="m3.0",
             change_summary="rebound publish",
@@ -500,13 +506,25 @@ class DagTests(unittest.TestCase):
             handoff_digest="d" * 64,
             platform_config_digest="e" * 64,
         )
+        source = store_root / "sealed" / parent_run_id / "capture" / "input"
+        source.mkdir(parents=True)
+        (source / "source.json").write_text(
+            json.dumps({"identity": {"hardware_id": "m3.0"}, "metadata": {"revision": "r1"}}),
+            encoding="utf-8",
+        )
 
-        class Store:
-            def meta(self, run_id):
-                return dict(parent_meta)
+        class _Platform:
+            def confirmed_stage(self, run_id, stage):
+                return {"handoff_sha256": "d" * 64} if stage == "capture" else None
 
-            def run_dir(self, run_id):
-                return store_root / run_id
+            def stage_records(self, run_id):
+                return {
+                    "freeze": {"state": "completed", "checkpoint_uri": f"store://sealed/{run_id}/freeze"},
+                    "capture": {"state": "completed", "checkpoint_uri": f"store://sealed/{run_id}/capture"},
+                }
+
+            def sealed_path(self, uri):
+                return store_root / "sealed" / uri.removeprefix("store://sealed/")
 
         context = {
             "dag_run": SimpleNamespace(
@@ -522,9 +540,7 @@ class DagTests(unittest.TestCase):
         }
         with (
             patch.object(module, "config_from_airflow_connection", return_value=config),
-            patch.object(module, "_linux_store", return_value=Store()),
-            patch.object(module, "_root_capture", return_value=Path("/srv/capture")),
-            patch.object(module, "_root_identity", return_value=("m3.0", "r1")),
+            patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
             self.assertTrue(request["linux_owned"])
@@ -534,6 +550,8 @@ class DagTests(unittest.TestCase):
         self.assertEqual(binding["repository_slug"], "mimicverse/description")
         self.assertEqual(binding["repository_base"], "main")
         self.assertEqual(binding["handoff_sha256"], "d" * 64)
+        self.assertEqual(binding["main_assembly"], "assembly.SLDASM")
+        self.assertEqual((binding["hardware_id"], binding["revision"]), ("m3.0", "r1"))
         self.assertEqual(binding["state"], "linked")
 
 
@@ -698,7 +716,6 @@ class PlatformRegistrationTests(unittest.TestCase):
         (intake / "cad").mkdir(parents=True)
         (intake / "cad" / "robot.SLDASM").write_bytes(b"assembly bytes")
         upload = {"cad/robot.SLDASM": hashing.sha256(b"assembly bytes").hexdigest()}
-        store = SimpleNamespace(capture_dir=lambda _run: capture)
         released: list[tuple[str, dict]] = []
         settled: list[dict] = []
         digests: list[str] = []
@@ -739,12 +756,12 @@ class PlatformRegistrationTests(unittest.TestCase):
         )
         platform = _Ops()
         self.module._release_registered_cache(
-            platform, store, endpoint, "run-1", intake=intake, upload_files=upload
+            platform, endpoint, "run-1", capture, intake=intake, upload_files=upload
         )
         self.assertEqual(len(released), 1)
         self.assertEqual(len(settled), 1)
         self.module._release_registered_cache(
-            platform, store, endpoint, "run-1", intake=intake, upload_files=upload
+            platform, endpoint, "run-1", capture, intake=intake, upload_files=upload
         )
         self.assertEqual(len(released), 1, "a settled operation answers a repeat call without a side effect")
         self.assertEqual(digests[0], digests[1], "the registered parameter digest is stable across retries")
@@ -764,7 +781,6 @@ class PlatformRegistrationTests(unittest.TestCase):
         (intake / "cad").mkdir(parents=True)
         (intake / "cad" / "robot.SLDASM").write_bytes(b"assembly bytes")
         upload = {"cad/robot.SLDASM": hashing.sha256(b"assembly bytes").hexdigest()}
-        store = SimpleNamespace(capture_dir=lambda _run: capture)
         calls: list[str] = []
         settled: list[dict] = []
         digests: list[str] = []
@@ -815,12 +831,12 @@ class PlatformRegistrationTests(unittest.TestCase):
         )
         platform = _Ops()
         self.module._release_registered_cache(
-            platform, store, endpoint, "run-3", intake=intake, upload_files=upload
+            platform, endpoint, "run-3", capture, intake=intake, upload_files=upload
         )
         self.assertEqual(settled, [], "a lost response must not settle")
         mode["fail"] = False
         self.module._release_registered_cache(
-            platform, store, endpoint, "run-3", intake=intake, upload_files=upload
+            platform, endpoint, "run-3", capture, intake=intake, upload_files=upload
         )
         self.assertEqual(len(calls), 2, "the reconciliation replays the same operation identity")
         self.assertEqual(calls[0], calls[1])
@@ -842,7 +858,6 @@ class PlatformRegistrationTests(unittest.TestCase):
         (intake / "cad").mkdir(parents=True)
         (intake / "cad" / "robot.SLDASM").write_bytes(b"assembly bytes")
         upload = {"cad/robot.SLDASM": hashing.sha256(b"assembly bytes").hexdigest()}
-        store = SimpleNamespace(capture_dir=lambda _run: capture)
         settled: list[dict] = []
 
         class _Ops:
@@ -874,7 +889,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             release_cache=refuse,
         )
         self.module._release_registered_cache(
-            _Ops(), store, endpoint, "run-2", intake=intake, upload_files=upload
+            _Ops(), endpoint, "run-2", capture, intake=intake, upload_files=upload
         )
         self.assertEqual(settled, [], "a refused release never reports success")
 
@@ -886,8 +901,8 @@ class PlatformRegistrationTests(unittest.TestCase):
         capture = run_dir / "capture"
         capture.mkdir(parents=True)
         build_sealed_delivery(capture)
-        store = SimpleNamespace(run_dir=lambda _run: run_dir, capture_dir=lambda _run: capture)
-        self.module._register_native_stages(store, "run-1")
+        platform, store_root = self.module._platform_binding()
+        self.module._register_native_stages(platform, store_root, "run-1", capture, run_dir)
         self.assertEqual([call["stage"] for call in self.calls], ["discover", "capture"])
         self.assertEqual([call["state"] for call in self.calls], ["completed", "completed"])
         self.assertEqual([call["receipt"]["state"] for call in self.calls], ["discovered", "native_complete"])
@@ -947,17 +962,18 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertTrue(str(call["checkpoint_uri"]).endswith("/generate"))
 
     def test_a_portable_failure_snapshots_the_actual_products(self) -> None:
-        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        import uuid
+
+        run_id = str(uuid.uuid4())
+        run_dir = self.root / run_id
         (run_dir / "reports").mkdir(parents=True)
         (run_dir / "reports" / "structural-team.json").write_text("{}", encoding="utf-8")
         tree = run_dir / "stages" / "generate"
-        store = SimpleNamespace(run_dir=lambda _run: run_dir)
         with (
             patch.object(self.module.flow, "run_stage", side_effect=RuntimeError("no capture")),
-            patch.object(self.module, "_linux_store", return_value=store),
             self.assertRaises(RuntimeError),
         ):
-            self.module._portable_registered("run-1", "generate", tree=tree)
+            self.module._portable_registered(run_id, "generate", tree=tree)
         call = self.calls[0]
         self.assertEqual(call["state"], "failed")
         paths = {record["path"] for record in call["receipt"]["artifacts"]}

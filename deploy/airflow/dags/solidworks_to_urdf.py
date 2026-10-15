@@ -14,7 +14,6 @@ confirmed here before publication.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import shutil
@@ -31,7 +30,6 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointNotFound,
     EndpointProtocolError,
     WindowsEndpoint,
-    capture_archive_metadata,
     cache_release_manifest,
     cache_release_request,
     check_result,
@@ -43,9 +41,9 @@ from description_pipeline.orchestration.airflow_client import (
     submission_identity,
     validate_main_assembly,
 )
-from description_pipeline.orchestration.linux_runner import import_native_capture
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST
+from description_pipeline.platform import capture as native_capture
 from description_pipeline.platform import flow
 from description_pipeline.delivery import (
     BUNDLE_SCHEMA,
@@ -77,7 +75,7 @@ from description_pipeline.stages import (
     stage_view,
 )
 from description_pipeline.io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
-from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
+from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence, read_request_evidence
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import validate_file_index
 
@@ -280,7 +278,7 @@ def _converge_failed_stage(
         platform, store_root = _platform_binding()
         if tree is None and products:
             try:
-                tree = _failure_tree(_linux_store(CONN_ID).run_dir(run_id))
+                tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir)
             except Exception:  # pragma: no cover - the shape-only registration stands
                 log.exception("failure-product snapshot unavailable run=%s stage=%s", run_id, stage)
                 tree = None
@@ -419,15 +417,15 @@ def _register_freeze_stage(store: LinuxStore, run_id: str, *, intake: Path, uplo
         raise
 
 
-def _register_native_stages(store: LinuxStore, run_id: str) -> None:
+def _register_native_stages(
+    platform: PlatformStore, store_root: Path, run_id: str, capture: Path, run_dir: Path
+) -> None:
     """Seal one snapshot of the imported capture tree and confirm discover, then capture.
 
     The native members stay byte-exact in the run's capture tree; the sealed
     snapshot adds only the Linux-side subject layout and the delivery manifest.
     """
-    platform, store_root = _platform_binding()
-    capture = store.capture_dir(run_id)
-    snapshot = store.run_dir(run_id) / "seal" / "native"
+    snapshot = run_dir / "seal" / "native"
     if snapshot.exists():
         shutil.rmtree(snapshot)
     snapshot.parent.mkdir(parents=True, exist_ok=True)
@@ -457,9 +455,9 @@ def _confirmed_at_text(value) -> str | None:
 
 def _release_registered_cache(
     platform: PlatformStore,
-    store: LinuxStore,
     endpoint: WindowsEndpoint,
     run_id: str,
+    capture_dir: Path,
     *,
     intake: Path,
     upload_files: dict[str, str],
@@ -483,7 +481,7 @@ def _release_registered_cache(
             log.warning("cache release deferred run=%s: the capture stage records no instant", run_id)
             return
         manifest = cache_release_manifest(intake, upload_files)
-        sealed = file_digest(store.capture_dir(run_id) / CAPTURE_MANIFEST)
+        sealed = file_digest(capture_dir / CAPTURE_MANIFEST)
         production = {"run_id": run_id, "operation_id": f"{run_id}:native"}
         confirmation = {
             "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
@@ -600,31 +598,12 @@ def _parent_subject(platform: PlatformStore, parent_run: str, stage: str) -> str
     return subject
 
 
-def _root_capture(store: LinuxStore, run_id: str):
-    """The admitted capture directory of an attempt, following its source lineage."""
-    try:
-        return store.checkpoint_dir(run_id, "capture")
-    except PipelineError:
-        return None
-
-
-def _root_identity(store: LinuxStore, run_id: str) -> tuple[str | None, str | None]:
-    """Hardware and revision of the admitted delivery, read from its content identity record."""
-    capture = _root_capture(store, run_id)
-    if capture is None:
-        return None, None
-    path = capture / "input/source.json"
-    if not path.is_file():
-        return None, None
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    hardware = identity.get("hardware_id")
-    revision = metadata.get("revision")
-    return (
-        hardware if isinstance(hardware, str) and hardware else None,
-        revision if isinstance(revision, str) and revision else None,
-    )
+def _sealed_stage_tree(platform: PlatformStore, run_id: str, stage: str) -> Path:
+    """The sealed tree of one confirmed stage; a missing registration refuses loudly."""
+    row = platform.stage_records(run_id).get(stage) or {}
+    if row.get("state") != "completed" or not row.get("checkpoint_uri"):
+        raise AirflowFailException(f"the run {run_id} has no confirmed {stage!r} to read")
+    return platform.sealed_path(row["checkpoint_uri"])
 
 
 def _run_uuid(context) -> str:
@@ -1201,27 +1180,34 @@ def solidworks_to_urdf():
         if linked is not None:
             if linked["from_stage"] in DELIVERY_STAGES:
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
-                # contacts Windows: the parent store already holds the admitted capture.
-                store = _linux_store(CONN_ID)
-                parent_meta = store.meta(linked["parent_run"])
-                parent_capture = _root_capture(store, linked["parent_run"])
-                if not isinstance(parent_meta, dict) or not parent_meta.get("handoff_sha256") or parent_capture is None:
+                # contacts Windows: the parent's registered capture is the authority.
+                platform, store_root = _platform_binding()
+                receipt = platform.confirmed_stage(linked["parent_run"], "capture")
+                if receipt is None or not receipt.get("handoff_sha256"):
                     raise AirflowFailException(
                         f"Linked parent {linked['parent_run']} has no admitted Linux capture to resume"
                     )
                 request = {
                     "run_id": _run_uuid(context),
-                    "package": str(parent_capture),
-                    "handoff_sha256": str(parent_meta["handoff_sha256"]),
+                    "package": str(_sealed_stage_tree(platform, linked["parent_run"], "capture")),
+                    "handoff_sha256": str(receipt["handoff_sha256"]),
                     "conn_id": CONN_ID,
                     "resume": linked,
                     "linux_owned": True,
                     "repository_slug": routing["repository_slug"],
                     "repository_base": routing["base"],
                 }
-                carried = carry_request_evidence(store.run_dir(linked["parent_run"]), store.run_dir(request["run_id"]))
+                parent_record, _ = read_request_evidence(
+                    _sealed_stage_tree(platform, linked["parent_run"], "freeze") / "input" / "request.json"
+                )
+                carried = carry_request_evidence(
+                    _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
+                    flow.RunPaths(store_root, request["run_id"]).run_dir,
+                )
                 request["request_evidence"] = str(carried)
-                selection = _linked_selection(parent_meta.get("main_assembly"), context["params"].get("main_assembly"))
+                selection = _linked_selection(
+                    parent_record.get("main_assembly"), context["params"].get("main_assembly")
+                )
                 if selection is not None:
                     request["main_assembly"] = selection
                 return request
@@ -1247,8 +1233,11 @@ def solidworks_to_urdf():
                 "resume": linked,
                 "conn_id": CONN_ID,
             }
-            store = _linux_store(CONN_ID)
-            carried = carry_request_evidence(store.run_dir(linked["parent_run"]), store.run_dir(request["run_id"]))
+            platform, store_root = _platform_binding()
+            carried = carry_request_evidence(
+                _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
+                flow.RunPaths(store_root, request["run_id"]).run_dir,
+            )
             request["request_evidence"] = str(carried)
             if linked["from_stage"] != "capture":
                 # A freeze or discover rerun still serves the definition leg from the
@@ -1356,21 +1345,28 @@ def solidworks_to_urdf():
         doc_md=("Capture stage: import the sealed native capture into the Linux store and bind routing for generation.")
     )
     def capture(request: dict) -> dict:
-        store = _linux_store(request["conn_id"])
         run_id = request["run_id"]
         resume = request.get("resume") or {}
         if request.get("linux_owned"):
             parent_run = resume["parent_run"]
-            parent_meta = store.meta(parent_run) or {}
-            hardware, revision = _root_identity(store, parent_run)
+            platform, store_root = _platform_binding()
+            receipt = platform.confirmed_stage(parent_run, "capture")
+            if receipt is None or not receipt.get("handoff_sha256"):
+                raise AirflowFailException(f"Linked parent {parent_run} has no admitted Linux capture to resume")
+            parent_record, _ = read_request_evidence(
+                _sealed_stage_tree(platform, parent_run, "freeze") / "input" / "request.json"
+            )
+            hardware, revision = native_capture.source_identity(
+                _sealed_stage_tree(platform, parent_run, "capture")
+            )
             binding = {
                 "run_id": run_id,
                 "source_run_id": parent_run,
                 "from_stage": resume.get("from_stage"),
-                "handoff_sha256": parent_meta.get("handoff_sha256"),
-                "main_assembly": parent_meta.get("main_assembly"),
+                "handoff_sha256": receipt.get("handoff_sha256"),
+                "main_assembly": parent_record.get("main_assembly"),
                 # The trigger's conf target and its configured routing are the authority for a
-                # linked publish; the parent's stored meta may carry nulls.
+                # linked publish; the parent's stored record may carry nulls.
                 "repository_slug": request.get("repository_slug"),
                 "repository_base": request.get("repository_base"),
                 "hardware_id": hardware,
@@ -1379,36 +1375,35 @@ def solidworks_to_urdf():
             }
         else:
             try:
-                job = _endpoint(request["conn_id"]).get_job(run_id)
+                endpoint = _endpoint(request["conn_id"])
+                job = endpoint.get_job(run_id)
                 _same_request(job, request)
                 if job.get("status") != "native_complete":
                     raise AirflowFailException(
                         f"native job {run_id} is {job.get('status')}, not native_complete"
                     )
-                capture_archive_metadata(job)
-                binding = import_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
+                platform, store_root = _platform_binding()
+                paths = flow.RunPaths(store_root, run_id)
+                binding = native_capture.import_native_capture(platform, paths, run_id, job, endpoint)
                 # The frozen request evidence rides the delivery from the capture tree
                 # onward; generation and verification consume it byte-verbatim.
-                carry_request_evidence(store.run_dir(run_id), store.capture_dir(run_id))
+                carry_request_evidence(paths.run_dir, paths.capture_dir)
                 # The trigger's conf target and its configured routing are the authority;
                 # the native job no longer carries publication routing.
                 binding["repository_slug"] = request.get("repository_slug")
                 binding["repository_base"] = request.get("repository_base")
-                binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
                 binding["source_run_id"] = None
                 binding["from_stage"] = None
-                endpoint = _endpoint(request["conn_id"])
                 # The two native stages are registered over one sealed snapshot of the
                 # imported capture tree; the native members themselves stay byte-exact,
                 # and the confirmed capture import is the predecessor the IF-10
                 # release operation binds below through the platform operation family.
-                _register_native_stages(store, run_id)
-                platform, _store_root = _platform_binding()
+                _register_native_stages(platform, store_root, run_id, paths.capture_dir, paths.run_dir)
                 _release_registered_cache(
                     platform,
-                    store,
                     endpoint,
                     run_id,
+                    paths.capture_dir,
                     intake=Path(request["intake_dir"]),
                     upload_files=request["upload_files"],
                 )
