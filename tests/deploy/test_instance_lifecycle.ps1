@@ -2,11 +2,14 @@
 #
 #   pwsh -NoProfile -File tests/deploy/test_instance_lifecycle.ps1 [-ScriptPath PATH] [-StaticOnly]
 #
-# Only the OS boundary is stubbed (Get-Process / cmd / the ScheduledTask cmdlets); the script's
-# own interpreters - Get-ProcessFacts, Test-LockProbeHeld, Get-OwnershipRefusalFacts,
-# Start-OrRefuse, Restore-PreviousEndpoint - run for real.  Running with -ScriptPath pointing at
-# a pre-change copy plus -StaticOnly is the negative-evidence mode: the old wording and the
-# missing observer/ownership gates must make that run fail.
+# Stub inventory: the OS/network boundary (Get-Process / cmd / the ScheduledTask cmdlets /
+# Invoke-RestMethod), the settle timer (Wait-SettleRetryDelay) and the health probe are local
+# stubs; the script's own interpreters - Get-ProcessFacts, Test-LockProbeHeld,
+# Get-OwnershipRefusalFacts, Start-OrRefuse, Restore-PreviousEndpoint - run for real.  The
+# outer-promote cases additionally run the REAL Invoke-Main in a child pwsh via
+# tests/deploy/invoke-main-harness.ps1.  Running with -ScriptPath pointing at a pre-change copy
+# plus -StaticOnly is the negative-evidence mode: the old wording and the missing
+# observer/ownership gates must make that run fail.
 [CmdletBinding()]
 param(
   [string]$ScriptPath = (Join-Path $PSScriptRoot '..' '..' 'deploy' 'windows' 'instance-lifecycle.ps1'),
@@ -47,7 +50,8 @@ if ($StaticOnly) {
 # ---- load the script without running its main flow --------------------------
 . $ScriptPath -Verb health -Binding @{ task_name = 'test-endpoint' }
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
-  'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt'
+  'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
+  'Get-PreviousGenerationBinding'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
 # ---- harness: stub only the OS boundary -------------------------------------
@@ -60,6 +64,7 @@ $script:Starts = 0
 $script:Sleeps = [System.Collections.Generic.List[int]]::new()
 $script:CallLog = [System.Collections.Generic.List[string]]::new()
 $script:OldHealthOk = $true
+$script:HealthProbes = [System.Collections.Generic.List[string]]::new()
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
   if ($script:TaskMissing) { return $null }
@@ -108,6 +113,7 @@ function Wait-Settled {
 function Wait-SettleRetryDelay { param([int]$Seconds = 60) $script:Sleeps.Add($Seconds) }
 function Health-Probe {
   param([string]$configPath, [object]$binding)
+  $script:HealthProbes.Add([string]$binding.version)
   if (-not $script:OldHealthOk) { throw 'the previous endpoint did not answer /health' }
   return @{ ready = $true }
 }
@@ -125,6 +131,9 @@ $previous = Join-Path $promotions 'previous-test'
 $null = New-Item -ItemType Directory -Path $generation -Force
 $null = New-Item -ItemType Directory -Path $previous -Force
 [System.IO.File]::WriteAllText((Join-Path $previous 'task.xml'), '<Task />')
+[System.IO.File]::WriteAllText(
+  (Join-Path $previous 'stage-receipt.json'),
+  '{"passed":true,"verb":"stage","version":"1.4.3","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')
 $configPath = Join-Path $generation 'endpoint.json'
 [System.IO.File]::WriteAllText($configPath, ('{{"state_root":"{0}"}}' -f ($root -replace '\\', '/')))
 $lockPath = Join-Path $root '.endpoint.lock'
@@ -139,6 +148,10 @@ function Reset-State {
   $script:Sleeps.Clear()
   $script:CallLog.Clear()
   $script:OldHealthOk = $true
+  $script:HealthProbes.Clear()
+  [System.IO.File]::WriteAllText(
+    (Join-Path $previous 'stage-receipt.json'),
+    '{"passed":true,"verb":"stage","version":"1.4.3","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')
   if (Test-Path -LiteralPath $lockPath) { Remove-Item -LiteralPath $lockPath -Force }
   $receipt = Join-Path $promotions 'lock-refusal.json'
   if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
@@ -236,17 +249,61 @@ try { $null = Start-OrRefuse $configPath $binding $generation $promotions } catc
 Check 'flow.non_refusal_rethrows' (($message -match 'settle window') -and ($script:Starts -eq 1) -and
   ($script:Sleeps.Count -eq 0))
 
-# ---- failure-path restore: safe stop/restore is recorded --------------------
+# ---- failure-path restore: gated start + pinned previous identity -----------
+$sourceLauncher = Join-Path $previous 'runtime/Scripts/description.exe'
 Reset-State
-$restore = Restore-PreviousEndpoint $binding $previous $configPath
-Check 'restore.success_recorded' ($restore.stopped -and $restore.restored -and $restore.started -and $restore.healthy -and
-  ($restore.error -eq '') -and (($script:CallLog -join ',') -eq 'stop,register,start'))
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
+Check 'restore.success_pinned_health' ($restore.stopped -and $restore.restored -and $restore.startable -and $restore.started -and
+  ($restore.healthy -eq $true) -and ($restore.previous_generation -eq $previous) -and
+  ($script:HealthProbes.Count -eq 1) -and ($script:HealthProbes[0] -eq '1.4.3') -and
+  (($script:CallLog -join ',') -eq 'stop,register,start'))
+
+Reset-State
+[System.IO.File]::WriteAllText($lockPath, '999999')
+$script:ProcScenario = 'denied'
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
+Check 'restore.gate_unknown_no_start' ($restore.stopped -and $restore.restored -and (-not $restore.startable) -and (-not $restore.started) -and
+  ($restore.start_gate -eq 'refused') -and ($restore.error -match 'start gate is refused') -and
+  (($script:CallLog -join ',') -eq 'stop,register'))
 
 Reset-State
 $script:OldHealthOk = $false
-$restore = Restore-PreviousEndpoint $binding $previous $configPath
-Check 'restore.health_failure_recorded' ($restore.stopped -and $restore.restored -and $restore.started -and (-not $restore.healthy) -and
-  ($restore.error -match 'did not answer') -and (($script:CallLog -join ',') -eq 'stop,register,start'))
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
+Check 'restore.health_failure_pinned' ($restore.stopped -and $restore.restored -and $restore.started -and (-not $restore.healthy) -and
+  ($restore.error -match 'did not answer') -and ($script:HealthProbes.Count -eq 1) -and ($script:HealthProbes[0] -eq '1.4.3'))
+
+Reset-State
+Remove-Item -LiteralPath (Join-Path $previous 'stage-receipt.json') -Force
+$restore = Restore-PreviousEndpoint $binding $previous $configPath $generation $sourceLauncher
+Check 'restore.missing_receipt_unjudged' ($restore.started -and ($null -eq $restore.healthy) -and
+  ($restore.error -match 'receipt is unavailable') -and ($script:HealthProbes.Count -eq 0))
+
+# ---- real outer promote flow (child pwsh; real Invoke-Main) -----------------
+$harness = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'
+$pwshExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+function Invoke-Outer([string]$scenario) {
+  $outerRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('il-outer-' + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $outerRoot -Force
+  $json = & $pwshExe -NoProfile -File $harness -ScriptPath $ScriptPath -Scenario $scenario -Root $outerRoot
+  $result = ($json | Select-Object -Last 1) | ConvertFrom-Json
+  Remove-Item -LiteralPath $outerRoot -Recurse -Force -ErrorAction SilentlyContinue
+  return $result
+}
+$outer = Invoke-Outer 'unknown_owner'
+Check 'outer.unknown_owner_no_restart' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 0) -and
+  ($outer.receipt.restore.startable -eq $false) -and ($outer.receipt.restore.started -eq $false) -and
+  ($outer.receipt.restore.start_gate -eq 'refused') -and ($outer.message -match 'lock_refused_unproven'))
+Check 'outer.unknown_owner_candidate_started_once' ((@($outer.calls | Where-Object { $_ -like 'start:*new*' }).Count -eq 1))
+
+$outer = Invoke-Outer 'startable_second_refusal'
+Check 'outer.startable_starts_old_with_pinned_health' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 1) -and
+  ($outer.receipt.restore.startable -eq $true) -and ($outer.receipt.restore.started -eq $true) -and
+  ($outer.receipt.restore.healthy -eq $true) -and (@($outer.sleeps) -contains 60))
+
+$outer = Invoke-Outer 'startable_missing_receipt'
+Check 'outer.missing_receipt_health_unjudged' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 1) -and
+  ($outer.receipt.restore.started -eq $true) -and ($null -eq $outer.receipt.restore.healthy) -and
+  ($outer.receipt.restore.error -match 'receipt is unavailable'))
 
 Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
 exit ([int]($script:failures.Count -gt 0))
