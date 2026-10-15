@@ -954,15 +954,16 @@ class PlatformStore:
     def _verify_checkpoint_scope(
         self, checkpoint_uri, *, run_id: str, stage: str, reused_from_run: str | None
     ) -> None:
-        """A parseable sealed locator must name this run or a run of its registered reuse lineage.
+        """A parseable sealed locator must name this run or the proven origin of its reuse chain.
 
         Being able to parse a locator is not a consumption right: a reference
         that reads as the standard ``store://sealed/<run_id>/<stage>`` locator
-        is refused unless it names this run or one of its declared ancestors -
-        the registered reuse chain that may carry an admitted original's
-        checkpoint forward.  The chain is bounded and never walks a cycle.
-        Non-locator references stay opaque here and fail closed at their own
-        resolver contract.
+        is refused unless it names this run, or the direct parent's stage row
+        proves the chain up to the original producer the locator names - every
+        link explicit in ``reused_from_run``, every intermediate row completed
+        and carrying the same locator, bounded and never walking a cycle.
+        Run ancestry alone is never stage lineage.  Non-locator references
+        stay opaque here and fail closed at their own resolver contract.
         """
 
         if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith(SEALED_URI_PREFIX):
@@ -974,33 +975,52 @@ class PlatformStore:
             return
         if uri_stage != stage:
             raise PlatformStoreError("The sealed checkpoint names another stage than the confirmation")
-        if uri_run != run_id and uri_run != reused_from_run and uri_run not in self._reuse_lineage(run_id):
-            raise PlatformStoreError(
-                "The sealed checkpoint names a run that is neither the current run nor a run of its "
-                "registered reuse lineage"
-            )
+        if uri_run == run_id:
+            return
+        if reused_from_run is not None and uri_run == self._stage_reuse_origin(reused_from_run, stage):
+            return
+        raise PlatformStoreError(
+            "The sealed checkpoint names a run that is neither the current run nor the proven origin "
+            "of its registered stage reuse chain"
+        )
 
-    def _reuse_lineage(self, run_id: str) -> set[str]:
-        """The registered reuse chain of one attempt: itself plus its declared ancestors.
+    def _stage_reuse_origin(self, run_id: str, stage: str) -> str | None:
+        """The original producer one stage row's registered reuse chain resolves to, or ``None``.
 
-        A linked confirmation may carry the admitted original's locator
-        forward, so the scope check authorizes exactly the attempt's
-        registered lineage - nothing wider, and never a cycle.
+        Every link must be explicit: the row names its direct source in
+        ``reused_from_run``, every intermediate row is completed and carries
+        the same locator, and the first row without a reuse declaration must
+        name its own run.  The walk is bounded and never walks a cycle.
         """
 
-        lineage = {run_id}
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_STAGE, (run_id, stage))
+            row = cursor.fetchone()
+        if row is None or row[0] != "completed" or not row[2]:
+            return None
+        locator = row[2]
+        seen = {run_id}
         current = run_id
-        for _ in range(REUSE_LINEAGE_DEPTH):
+        while row[3] is not None:
+            reused = row[3]
+            if reused in seen or len(seen) >= REUSE_LINEAGE_DEPTH:
+                return None
+            seen.add(reused)
             with self._transaction() as connection:
                 cursor = connection.cursor()
-                cursor.execute(_READ_RUN_PARENT, (current,))
+                cursor.execute(_READ_STAGE, (reused, stage))
                 row = cursor.fetchone()
-            parent = row[0] if row is not None else None
-            if not parent or parent in lineage:
-                break
-            lineage.add(parent)
-            current = parent
-        return lineage
+            if row is None or row[0] != "completed" or row[2] != locator:
+                return None
+            current = reused
+        if not isinstance(locator, str) or not locator.startswith(SEALED_URI_PREFIX):
+            return None
+        with suppress(PipelineError):
+            origin_run, origin_stage = parse_sealed_uri(locator)
+            if origin_stage == stage and origin_run == current:
+                return origin_run
+        return None
 
     def _verify_reuse_source(
         self, *, run_id: str, stage: str, checkpoint_uri, reused_from_run: str

@@ -136,9 +136,12 @@ def revalidate_capture(platform: PlatformStore, run_id: str, capture: Path, froz
     summary = verify_transfer(capture, carried={"input/request.json": authority})
     if not isinstance(summary, dict):
         raise PipelineError("The admitted capture carries no sealed transfer to revalidate")
-    if summary.get("run_id") != run_id:
-        raise PipelineError("Admitted capture provenance differs from the recorded admission: run_id")
     receipt = registered_capture(platform, run_id)
+    if summary.get("run_id") != receipt.get("run_id"):
+        # The transfer belongs to the original native producer; a linked
+        # attempt's materialized copy must still present that producer's own
+        # summary, not the direct parent attempt's identity.
+        raise PipelineError("Admitted capture provenance differs from the recorded admission: run_id")
     if summary.get("handoff_sha256") != receipt.get("handoff_sha256"):
         raise PipelineError("Admitted capture provenance differs from the recorded admission: handoff_sha256")
     sealed_root = registered_checkpoint(platform, run_id, "capture")
@@ -234,8 +237,7 @@ def run_stage(
     owner = validate_run_id(source_run_id) if source_run_id else run_id
     confirmed = platform.confirmed_stage(run_id, stage)
     if confirmed is not None:
-        owner_paths = RunPaths(root, owner)
-        revalidate_capture(platform, owner, owner_paths.capture_dir, owner_paths.run_dir / "input" / "request.json")
+        revalidate_capture(platform, owner, paths.capture_dir, paths.run_dir / "input" / "request.json")
         portable_identity_gate(platform, owner)
         return confirmed
     record = platform.run_record(run_id)
@@ -245,9 +247,8 @@ def run_stage(
     output = paths.stage_output(stage)
     with solidworks.output_lock(paths.run_dir):
         try:
-            owner_paths = RunPaths(root, owner)
             capture_receipt = registered_capture(platform, owner)
-            revalidate_capture(platform, owner, owner_paths.capture_dir, owner_paths.run_dir / "input" / "request.json")
+            revalidate_capture(platform, owner, paths.capture_dir, paths.run_dir / "input" / "request.json")
             portable_identity_gate(platform, owner)
             if stage == "generate" and expected_subject is not None:
                 raise PipelineError("generate does not take an expected subject")

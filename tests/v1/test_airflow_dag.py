@@ -976,13 +976,16 @@ class LinkedMaterializationTests(unittest.TestCase):
     def setUp(self) -> None:
         import tempfile
 
+        import hashlib
+
         from description_pipeline.delivery import write_delivery_manifest
         from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
-        from description_pipeline.io import write_json
+        from description_pipeline.io import digest, read_data, write_json
         from description_pipeline.platform.store import PlatformStore
         from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
         from description_pipeline.verification import solidworks_urdf
-        from tests.v1.test_platform_store import FakeWorld, build_sealed_delivery
+        from tests.v1 import test_stage_transfer as native
+        from tests.v1.test_platform_store import FakeWorld
 
         bag = DagBag(str(DAG_DIR))
         self.module = sys.modules[bag.dags["solidworks_to_urdf"].task_dict["freeze"].python_callable.__module__]
@@ -992,10 +995,26 @@ class LinkedMaterializationTests(unittest.TestCase):
         self.root.mkdir()
         self.world = FakeWorld()
         self.store = PlatformStore(self.world.connect, sealed=self._sealed)
-        self.tree = Path(self.temporary.name) / "delivery"
-        self.tree.mkdir()
-        build_sealed_delivery(self.tree)
-        write_json(self.tree / "input" / "request.json", {"request": "fixture"})
+        # A genuine (synthetic-byte) native capture: the transfer really verifies.
+        handoff = digest({"cad/robot.SLDASM": hashlib.sha256(b"CAD-BYTES").hexdigest()})
+        self.tree = native.capture_root(Path(self.temporary.name) / "native", run_id=self.PARENT, handoff=handoff)
+        write_json(self.tree / "input/source.json", {"source": "synthetic-native"})
+        write_json(self.tree / "input/records/arm.json", {"record": "synthetic-native"})
+        for name in ("capture-plan", "capture", "native-runtime"):
+            write_json(self.tree / f"evidence/{name}.json", {"synthetic": name})
+        (self.tree / "evidence/native-meshes").mkdir()
+        (self.tree / "evidence/native-meshes/part.stl").write_bytes(b"synthetic-stl")
+        identity = read_data(self.tree / "evidence/evidence/collection.json")["identity"]
+        native.write_manifest(self.tree / "evidence", kind="solidworks", identity=identity, evidence_class="cad")
+        transfer = native.seal(
+            self.tree, Path(self.temporary.name) / "native.zip", run_id=self.PARENT, handoff_sha256=handoff
+        )
+        write_json(self.tree / "transfer-manifest.json", transfer)
+        write_json(self.tree / "input/request.json", {"request": "synthetic-frozen-original"})
+        self.module._ensure_subject_layout(self.tree)
+        write_json(self.tree / "model/robot.json", {"model": "synthetic"})
+        (self.tree / "urdf/robot.urdf").write_text("<robot/>\n", encoding="utf-8")
+        (self.tree / "meshes/part.stl").write_bytes(b"synthetic-stl")
         write_delivery_manifest(
             self.tree,
             contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -1088,21 +1107,12 @@ class LinkedMaterializationTests(unittest.TestCase):
     ) -> dict:
         tree = self.module.flow.RunPaths(self.root, run_id).stage_output(stage)
 
-        def capture(platform, owner):
-            gates.append(("capture", owner))
-            return {"handoff_sha256": "d" * 64}
-
-        def revalidate(platform, owner, capture_path, frozen_path):
-            gates.append(("revalidate", owner))
-
         def identity(platform, owner):
             gates.append(("identity", owner))
             return {}
 
         with (
             patch.object(self.module, "_platform_binding", return_value=(self.store, self.root)),
-            patch.object(self.module.flow, "registered_capture", side_effect=capture),
-            patch.object(self.module.flow, "revalidate_capture", side_effect=revalidate),
             patch.object(self.module.flow, "portable_identity_gate", side_effect=identity),
             patch.object(self.module.flow.solidworks, stage, side_effect=self._producer(run_id, stage, seeds)),
         ):
@@ -1116,77 +1126,99 @@ class LinkedMaterializationTests(unittest.TestCase):
                 base="main",
             )
 
+    def _registered_parent(self) -> None:
+        import shutil as _shutil
+
+        self._admit(self.PARENT)
+        for stage in ("freeze", "discover", "capture", "generate"):
+            self._register(self.PARENT, stage)
+        parent = self.module.flow.RunPaths(self.root, self.PARENT)
+        _shutil.copytree(self.root / "sealed" / self.PARENT / "capture", parent.capture_dir)
+        (parent.run_dir / "input").mkdir()
+        _shutil.copy2(self.tree / "input" / "request.json", parent.run_dir / "input" / "request.json")
+        # A real passing control for every capture byte, transfer and frozen request.
+        self.module.flow.revalidate_capture(
+            self.store, self.PARENT, parent.capture_dir, parent.run_dir / "input" / "request.json"
+        )
+
     def test_a_linked_chain_materializes_reused_rows_and_sealed_inputs(self):
         import shutil as _shutil
 
-        parent, child, grandchild = self.PARENT, self.CHILD, self.GRANDCHILD
-        self._admit(parent)
-        for stage in ("freeze", "discover", "capture", "generate"):
-            self._register(parent, stage)
-        parent_rows = self.store.stage_records(parent)
-        # A divergent mutable parent work tree must never be consumed by the linked attempt.
-        (self.root / parent / "capture" / "reports").mkdir(parents=True)
-        (self.root / parent / "capture" / "reports" / "native-tool.json").write_text('{"junk": true}', encoding="utf-8")
-        (self.root / parent / "input").mkdir(parents=True)
-        (self.root / parent / "input" / "request.json").write_text('{"junk": true}', encoding="utf-8")
-
-        self._admit(child, parent=parent, from_stage="verify")
+        self._registered_parent()
+        parent_rows = self.store.stage_records(self.PARENT)
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
         seeds, gates = [], []
-        receipt = self._linked_stage(child, "verify", source=parent, seeds=seeds, gates=gates, subject="b" * 64)
+        receipt = self._linked_stage(
+            self.CHILD, "verify", source=self.PARENT, seeds=seeds, gates=gates, subject="b" * 64
+        )
         self.assertEqual(receipt["state"], "verified")
-        self.assertEqual(seeds, [("verify", self.root / "sealed" / parent / "generate")])
-        self.assertEqual({owner for _, owner in gates}, {parent})
-
-        child_rows = self.store.stage_records(child)
+        self.assertEqual(seeds, [("verify", self.root / "sealed" / self.PARENT / "generate")])
+        self.assertEqual({owner for _, owner in gates}, {self.PARENT})
+        child_rows = self.store.stage_records(self.CHILD)
         for stage in ("freeze", "discover", "capture", "generate"):
             row, source = child_rows[stage], parent_rows[stage]
-            self.assertEqual((row["state"], row["reused_from_run"]), ("completed", parent))
+            self.assertEqual((row["state"], row["reused_from_run"]), ("completed", self.PARENT))
             self.assertEqual(row["checkpoint_uri"], source["checkpoint_uri"])
             self.assertEqual(row["original_executed_at"], source["original_executed_at"])
             # The original producer's receipt travels verbatim; nothing is rewritten
             # to fit the new attempt.
             self.assertEqual(row["receipt"], source["receipt"])
-            self.assertEqual(row["receipt"]["run_id"], parent)
+            self.assertEqual(row["receipt"]["run_id"], self.PARENT)
+        child_paths = self.module.flow.RunPaths(self.root, self.CHILD)
+        self.assertTrue(child_paths.capture_dir.is_dir())
         self.assertEqual(
-            (self.root / child / "capture" / "reports" / "native-tool.json").read_bytes(),
-            (self.root / "sealed" / parent / "capture" / "reports" / "native-tool.json").read_bytes(),
-        )
-        self.assertEqual(
-            (self.root / child / "input" / "request.json").read_bytes(),
-            (self.root / "sealed" / parent / "freeze" / "input" / "request.json").read_bytes(),
-        )
-        self.assertEqual(
-            self.module.flow.registered_checkpoint(self.store, child, "generate"),
-            self.root / "sealed" / parent / "generate",
-        )
-        self.assertEqual(
-            self.module.flow.registered_capture(self.store, child)["handoff_sha256"],
-            parent_rows["capture"]["receipt"]["handoff_sha256"],
+            (child_paths.run_dir / "input" / "request.json").read_bytes(),
+            (self.root / "sealed" / self.PARENT / "freeze" / "input" / "request.json").read_bytes(),
         )
 
-        self._admit(grandchild, parent=child, from_stage="verify")
-        _shutil.rmtree(self.root / parent, ignore_errors=True)  # no mutable parent work tree exists at all
+        # From here on no mutable parent work tree exists at all.
+        _shutil.rmtree(self.root / self.PARENT)
+        self._admit(self.GRANDCHILD, parent=self.CHILD, from_stage="verify")
         seeds, gates = [], []
-        receipt = self._linked_stage(grandchild, "verify", source=child, seeds=seeds, gates=gates, subject="b" * 64)
+        receipt = self._linked_stage(
+            self.GRANDCHILD, "verify", source=self.CHILD, seeds=seeds, gates=gates, subject="b" * 64
+        )
         self.assertEqual(receipt["state"], "verified")
-        self.assertEqual(seeds, [("verify", self.root / "sealed" / parent / "generate")])
-        self.assertEqual({owner for _, owner in gates}, {child})
-        self.assertEqual(self.store.stage_records(grandchild)["generate"]["reused_from_run"], child)
+        self.assertEqual(seeds, [("verify", self.root / "sealed" / self.PARENT / "generate")])
+        self.assertEqual({owner for _, owner in gates}, {self.CHILD})
+        self.assertEqual(self.store.stage_records(self.GRANDCHILD)["generate"]["reused_from_run"], self.CHILD)
 
         seeds, gates = [], []
         receipt = self._linked_stage(
-            grandchild,
+            self.GRANDCHILD,
             "publish",
-            source=child,
+            source=self.CHILD,
             seeds=seeds,
             gates=gates,
             subject="c" * 64,
             repository=self.root / "model-repository",
         )
         self.assertEqual(receipt["state"], "published")
-        self.assertEqual(seeds, [("publish", self.root / "sealed" / grandchild / "verify")])
-        self.assertEqual({owner for _, owner in gates}, {child})
-        self.assertEqual(self.store.stage_records(grandchild)["publish"]["state"], "completed")
+        self.assertEqual(seeds, [("publish", self.root / "sealed" / self.GRANDCHILD / "verify")])
+        self.assertEqual({owner for _, owner in gates}, {self.CHILD})
+        self.assertEqual(self.store.stage_records(self.GRANDCHILD)["publish"]["state"], "completed")
+
+    def test_a_removed_parent_work_tree_leaves_the_linked_attempt_intact(self):
+        import shutil as _shutil
+
+        self._registered_parent()
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        _shutil.rmtree(self.root / self.PARENT)
+        receipt = self._linked_stage(self.CHILD, "verify", source=self.PARENT, seeds=[], gates=[], subject="b" * 64)
+        self.assertEqual(receipt["state"], "verified")
+
+    def test_a_dirty_parent_request_never_replaces_the_materialized_copy(self):
+        from description_pipeline.io import write_json
+
+        self._registered_parent()
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        write_json(self.root / self.PARENT / "input" / "request.json", {"mutable": "untrusted"})
+        receipt = self._linked_stage(self.CHILD, "verify", source=self.PARENT, seeds=[], gates=[], subject="b" * 64)
+        self.assertEqual(receipt["state"], "verified")
+        self.assertEqual(
+            (self.root / self.CHILD / "input" / "request.json").read_bytes(),
+            (self.root / "sealed" / self.PARENT / "freeze" / "input" / "request.json").read_bytes(),
+        )
 
     def test_a_missing_source_stage_refuses_the_linked_attempt(self):
         from airflow.sdk.exceptions import AirflowFailException
@@ -1237,7 +1269,7 @@ class LinkedMaterializationTests(unittest.TestCase):
             executed,
         )
         self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
-        with self.assertRaisesRegex(PlatformStoreError, "registered reuse lineage"):
+        with self.assertRaisesRegex(PlatformStoreError, "proven origin"):
             self._linked_stage(self.CHILD, "verify", source=self.PARENT, seeds=[], gates=[], subject="b" * 64)
 
     def test_a_broken_parent_reuse_link_refuses(self):
@@ -1260,6 +1292,45 @@ class LinkedMaterializationTests(unittest.TestCase):
                 receipt=parent_rows["generate"]["receipt"],
                 checkpoint_uri=parent_rows["generate"]["checkpoint_uri"],
                 reused_from_run=parent,
+            )
+
+    def test_confirming_an_ancestor_locator_without_declared_stage_reuse_refuses(self):
+        from description_pipeline.platform.store import PlatformStoreError
+
+        self._registered_parent()
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        self.module._materialize_linked_attempt(self.store, self.root, self.CHILD, self.PARENT)
+        self._admit(self.GRANDCHILD, parent=self.CHILD, from_stage="verify")
+        original = self.store.stage_records(self.PARENT)["generate"]
+        with self.assertRaisesRegex(PlatformStoreError, "proven origin"):
+            self.store.confirm_stage(
+                run_id=self.GRANDCHILD,
+                stage="generate",
+                state="completed",
+                receipt=original["receipt"],
+                checkpoint_uri=original["checkpoint_uri"],
+                original_executed_at=original["original_executed_at"],
+            )
+
+    def test_a_removed_direct_parent_reuse_link_refuses_the_grandchild(self):
+        from description_pipeline.platform.store import PlatformStoreError
+
+        self._registered_parent()
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        self.module._materialize_linked_attempt(self.store, self.root, self.CHILD, self.PARENT)
+        state, receipt, uri, _reused, executed = self.world.stages[(self.CHILD, "generate")]
+        self.world.stages[(self.CHILD, "generate")] = (state, receipt, uri, None, executed)
+        self._admit(self.GRANDCHILD, parent=self.CHILD, from_stage="verify")
+        original = self.store.stage_records(self.PARENT)["generate"]
+        with self.assertRaisesRegex(PlatformStoreError, "proven origin"):
+            self.store.confirm_stage(
+                run_id=self.GRANDCHILD,
+                stage="generate",
+                state="completed",
+                receipt=original["receipt"],
+                checkpoint_uri=original["checkpoint_uri"],
+                reused_from_run=self.CHILD,
+                original_executed_at=original["original_executed_at"],
             )
 
 
