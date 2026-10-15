@@ -12,11 +12,10 @@ the file is refused; there is no fallback to any earlier representation.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from pathlib import Path
 
-from .io import PipelineError, canonical
+from .io import PipelineError, canonical, read_data
 
 REQUEST_SCHEMA = "solidworks-to-urdf.request/v1"
 REQUEST_RELATIVE = "input/request.json"
@@ -81,16 +80,21 @@ def write_request_evidence(path: str | Path, record: dict) -> str:
 
 
 def read_request_evidence(path: str | Path) -> tuple[dict, str]:
-    """Read and validate the frozen record; a missing file is an explicit refusal."""
+    """Read and validate the frozen record through the shared strict parser.
+
+    A missing file is an explicit refusal, and the shared ``io`` entry refuses
+    duplicate keys, non-finite numbers and malformed JSON before this module's
+    own seven-field validation runs - there is no lenient reading path.
+    """
 
     source = Path(path)
     if not source.is_file():
         raise PipelineError("The delivery carries no input/request.json; the frozen request evidence is required")
     payload = source.read_bytes()
     try:
-        record = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
-        raise PipelineError("The frozen request evidence is not readable JSON") from error
+        record = read_data(source)
+    except PipelineError as error:
+        raise PipelineError("The frozen request evidence is not the canonical strict JSON record") from error
     _validate(record)
     return record, hashlib.sha256(payload).hexdigest()
 

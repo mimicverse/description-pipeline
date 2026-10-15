@@ -86,3 +86,26 @@ class RequestEvidenceTests(unittest.TestCase):
         self.path.write_bytes(self.path.read_bytes() + b"\n")
         with self.assertRaisesRegex(PipelineError, "do not match the receipt binding"):
             verify_request_evidence(self.path, expected_sha256=written)
+
+    def test_null_and_misshaped_required_fields_are_refusals(self) -> None:
+        base = record()
+        for field in ("request_id", "main_assembly", "handoff_digest", "platform_config_digest"):
+            expected = "sha256" if field == "platform_config_digest" else field
+            with self.subTest(field=field), self.assertRaisesRegex(PipelineError, expected):
+                request_evidence_bytes({**base, field: None})
+        with self.assertRaisesRegex(PipelineError, "request_id"):
+            request_evidence_bytes({**base, "request_id": 123})
+        with self.assertRaisesRegex(PipelineError, "sha256 platform_config_digest"):
+            request_evidence_bytes({**base, "platform_config_digest": "not-a-sha"})
+        with self.assertRaisesRegex(PipelineError, "sha256 handoff_digest"):
+            request_evidence_bytes({**base, "handoff_digest": "c" * 63})
+
+    def test_duplicate_keys_in_the_carried_file_are_refused(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(
+            b'{"schema_version":"solidworks-to-urdf.request/v1","request_id":"a","request_id":"b",'
+            b'"target_hardware":"m3.0","change_summary":"x","main_assembly":"a.SLDASM",'
+            b'"handoff_digest":"' + b"a" * 64 + b'","platform_config_digest":"' + b"b" * 64 + b'"}'
+        )
+        with self.assertRaisesRegex(PipelineError, "canonical strict JSON"):
+            read_request_evidence(self.path)
