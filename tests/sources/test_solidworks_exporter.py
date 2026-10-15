@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from . import _paths  # noqa: F401
+from . import support  # noqa: E402
 from .test_solidworks_discovery import IDENTITY, FakeBackend
 from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
@@ -121,6 +122,7 @@ def raw_record() -> dict:
             "robot_name": "wire_test",
         },
         "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
         # The exporter fixture's frozen bytes are the deterministic placeholder
         # written by the preparation test; the derive contract binds them.
         "files": {

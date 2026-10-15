@@ -357,6 +357,7 @@ def fixture():
             "pid_bindings": [],
         },
         "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
         "selection": {"main_assembly": "robot.SLDASM"},
         "components": [
             component("base_part"),
@@ -1123,6 +1124,10 @@ class NativeDeclarationsTests(unittest.TestCase):
                 hardware_id="fixture",
                 revision="r1",
             )
+            # The sealed record carries the authored CAD summary; keep the
+            # fixture's source record coherent with the raw reading.
+            source["metadata"]["change_summary"] = raw["identity"]["change_summary"]
+            source["metadata"]["change_summary_source"] = "cad"
             support.write_target_delivery(
                 package,
                 capture={},

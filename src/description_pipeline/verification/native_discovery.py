@@ -194,6 +194,29 @@ def publication_metadata_state(raw: dict, namespace: str) -> dict:
     return _authored_identity(raw, namespace)
 
 
+def _saved_configuration_observed(raw: dict, name: str) -> bool:
+    """Independent rebuild of the saved-configuration proof from the raw readings.
+
+    The verifier recomputes the qualification the admission gate applied: the
+    native document state must show the document saved (``save_flag`` strictly
+    false) and the active configuration matching on both readings; a recorded
+    name alone never qualifies.
+    """
+
+    state = raw.get("document_state")
+    if not isinstance(state, dict):
+        return False
+    readings = (state.get("before"), state.get("after"))
+    if not all(isinstance(reading, dict) for reading in readings):
+        return False
+    return all(
+        reading.get("save_flag") is False
+        and isinstance(reading.get("configuration"), str)
+        and reading["configuration"].strip() == name
+        for reading in readings
+    )
+
+
 def _digest_files(root: Path) -> dict[str, str]:
     files: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -2405,9 +2428,9 @@ def verify_discovery(package: Path) -> dict:
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
         definition = {
             "schema_version": payload.get("schema_version"),
-            # The definition identity must reflect the authored claim the
-            # identity gate compares it against; a missing value stays missing
-            # (readiness), never silently substituted from the selection.
+            # The definition identity carries the generated claim; the identity
+            # gate recomputes the expected value from the raw reading plus the
+            # sealed selection and compares the claim against it.
             "hardware_id": identity.get("hardware_id"),
             "robot_name": payload.get("robot_name"),
             "source": {
@@ -2629,23 +2652,127 @@ def verify_discovery(package: Path) -> dict:
         state["authored_identity"] = authored
         claimed = payload.get("identity")
         _require(isinstance(claimed, dict), "discovery.identity", "generated identity claims are absent")
-        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+        source = read_source_record(package)
+        selection, metadata = source["selection"], source["metadata"]
+
+        for key in ("revision", "parent_revision", "owner", "control"):
             _require(
                 claimed.get(key) == authored[key],
                 "discovery.identity",
                 "generated metadata differs from native evidence",
                 {"field": key},
             )
+
+        # ``hardware_id`` and ``change_summary`` recompute their origin from the
+        # raw reading plus the sealed request record (input/source.json): a CAD
+        # reading must be labelled as such and match the claim, and a claimed
+        # value the CAD records do not carry must come back from the configured
+        # target (platform-config) or the sealed submission.  An absent claim
+        # stays deferred (publication readiness), never granted a value; the
+        # claim's own resolution notes are never trusted.
+        hardware = authored["hardware_id"]
+        if hardware is not None:
+            _require(
+                selection["hardware_source"] == "cad",
+                "discovery.identity",
+                "the sealed selection names a configured target although the CAD records carry the hardware identity",
+                {"field": "hardware_id"},
+            )
+            _require(
+                selection["hardware_id"] == hardware,
+                "discovery.identity",
+                "the sealed selection hardware identity differs from the authored CAD reading",
+                {"field": "hardware_id"},
+            )
+        elif claimed.get("hardware_id") is not None:
+            _require(
+                selection["hardware_source"] == "platform-config"
+                and claimed.get("hardware_id") == selection["hardware_id"],
+                "discovery.identity",
+                "the claimed hardware identity is not carried by the CAD records nor backed by the sealed selection",
+                {"field": "hardware_id"},
+            )
+            hardware = claimed.get("hardware_id")
         _require(
-            definition.get("hardware_id") == authored["hardware_id"],
+            claimed.get("hardware_id") == hardware,
             "discovery.identity",
-            "the definition hardware_id differs from authored native metadata",
+            "generated metadata differs from native evidence",
+            {"field": "hardware_id"},
+        )
+
+        summary = authored["change_summary"]
+        if summary is not None:
+            _require(
+                metadata["change_summary_source"] == "cad",
+                "discovery.identity",
+                "the sealed metadata names a non-CAD summary origin although the CAD records carry the change summary",
+                {"field": "change_summary"},
+            )
+            _require(
+                metadata["change_summary"] == summary,
+                "discovery.identity",
+                "the sealed change-summary value differs from the authored CAD reading",
+                {"field": "change_summary"},
+            )
+        elif claimed.get("change_summary") is not None:
+            _require(
+                metadata["change_summary_source"] == "submission"
+                and claimed.get("change_summary") == metadata["change_summary"],
+                "discovery.identity",
+                "the claim names a change summary the sealed submission does not carry",
+                {"field": "change_summary"},
+            )
+            summary = claimed.get("change_summary")
+        _require(
+            claimed.get("change_summary") == summary,
+            "discovery.identity",
+            "generated metadata differs from native evidence",
+            {"field": "change_summary"},
+        )
+
+        # The delivery configuration is qualified by native state, not by the
+        # name it carries: the observation must prove the document saved and
+        # the active configuration matching, and the sealed selection must
+        # agree with the claim.
+        configuration = claimed.get("delivery_configuration")
+        if configuration is not None:
+            _require(
+                isinstance(configuration, str) and configuration.strip() != "",
+                "discovery.configuration",
+                "the generated delivery configuration is malformed",
+                {"field": "delivery_configuration"},
+            )
+            configuration = configuration.strip()
+            _require(
+                selection["configuration"] == configuration,
+                "discovery.configuration",
+                "the sealed selection configuration differs from the generated claim",
+                {"field": "delivery_configuration"},
+            )
+            saved_name = (payload.get("raw") or {}).get("saved_configuration")
+            _require(
+                saved_name is None or (isinstance(saved_name, str) and saved_name.strip() == configuration),
+                "discovery.configuration",
+                "the recorded saved configuration differs from the generated claim",
+                {"field": "delivery_configuration"},
+            )
+            _require(
+                _saved_configuration_observed(payload.get("raw") or {}, configuration),
+                "discovery.configuration",
+                "the delivery configuration is not observed as the saved active configuration",
+                {"field": "delivery_configuration"},
+            )
+
+        _require(
+            definition.get("hardware_id") == hardware,
+            "discovery.identity",
+            "the definition hardware_id differs from the recomputed identity",
         )
         technical_name = authored["robot_name"]
         label_source = "authored_robot_name"
         if technical_name is None:
-            label_source = "hardware_id" if authored["hardware_id"] is not None else "technical_default"
-            technical_name = re.sub(r"[^0-9A-Za-z]+", "_", authored["hardware_id"] or "robot").strip("_").lower()
+            label_source = "hardware_id" if hardware is not None else "technical_default"
+            technical_name = re.sub(r"[^0-9A-Za-z]+", "_", hardware or "robot").strip("_").lower()
         _require(
             (definition.get("source") or {}).get("robot_name") == technical_name,
             "discovery.identity",

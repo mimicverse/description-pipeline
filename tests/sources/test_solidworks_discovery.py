@@ -30,6 +30,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     _identity,
     _mate_rows,
     _unit,
+    SubmissionIdentity,
     derive_native_package,
     prepare_native_package,
 )
@@ -192,6 +193,8 @@ def record() -> dict:
             "main_assembly": "cad/robot.SLDASM",
             "robot_name": "nd_fixture",
         },
+        "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
         "components": [
             {
                 "name2": "base-1",
@@ -1071,6 +1074,8 @@ class DiscoveryTests(unittest.TestCase):
                 "control": {"system": "handoff", "reference": "ref"},
                 "robot_name": "wire_test",
             },
+            "saved_configuration": "Default",
+            "document_state": support.saved_document_state(),
             "properties": {"document": {}},
         }
         for field, code, blocker in (
@@ -1986,6 +1991,157 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             _native_discovery(delivery)
 
+    # ------------------------------------------------ identity chain (IF-06)
+
+    def _derive_pure(self, raw: dict, submission=None):
+        """Derive one package straight from a raw record (the probe's producer path)."""
+
+        native, records = self._native()
+        output = self.tmp / f"prepared{self.serial}"
+        return (
+            derive_native_package(
+                native,
+                output,
+                "run-1",
+                raw,
+                settings=DiscoverySettings(record_roots=(records,)),
+                submission_identity=submission,
+            ),
+            output,
+        )
+
+    def _tamper_delivered(self, delivery: Path, relative: str, mutate) -> None:
+        path = delivery / relative
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        mutate(payload)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        support.seal_delivery(delivery)
+
+    def test_configured_target_and_submitted_summary_verify_end_to_end(self):
+        raw = record()
+        target = raw["identity"]["hardware_id"]
+        raw["identity"].pop("hardware_id")
+        raw["identity"].pop("change_summary")
+        result, output = self._derive_pure(
+            raw,
+            submission=SubmissionIdentity(hardware_id=target, change_summary="提交说明\n第二行"),
+        )
+        self.assertTrue(result.passed, result.findings)
+        source_record = json.loads((output / "source.json").read_text(encoding="utf-8"))
+        self.assertEqual(source_record["selection"]["hardware_source"], "platform-config")
+        self.assertEqual(source_record["metadata"]["change_summary_source"], "submission")
+        self.assertEqual(source_record["metadata"]["change_summary"], "提交说明\n第二行")
+        report = verify_discovery(self._deliver(output))
+        self.assertTrue(report["passed"], report["errors"])
+
+    def test_verifier_refuses_a_configured_target_over_authored_cad_identity(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+
+        def relabel(source_record: dict) -> None:
+            source_record["selection"]["hardware_source"] = "platform-config"
+
+        self._tamper_delivered(delivery, "input/source.json", relabel)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+    def test_verifier_refuses_a_cad_label_when_the_cad_records_carry_no_value(self):
+        raw = record()
+        target = raw["identity"]["hardware_id"]
+        raw["identity"].pop("hardware_id")
+        result, output = self._derive_pure(
+            raw,
+            submission=SubmissionIdentity(hardware_id=target, change_summary="提交说明\n第二行"),
+        )
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+
+        def relabel(source_record: dict) -> None:
+            source_record["selection"]["hardware_source"] = "cad"
+
+        self._tamper_delivered(delivery, "input/source.json", relabel)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+    def test_verifier_refuses_a_cad_claim_without_cad_evidence(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+
+        def drop_authored_hardware(payload: dict) -> None:
+            payload["raw"]["identity"].pop("hardware_id")
+
+        self._tamper_delivered(delivery, "evidence/discovery.json", drop_authored_hardware)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+    def test_verifier_refuses_a_claim_that_differs_from_the_sealed_target(self):
+        raw = record()
+        target = raw["identity"]["hardware_id"]
+        raw["identity"].pop("hardware_id")
+        result, output = self._derive_pure(
+            raw,
+            submission=SubmissionIdentity(hardware_id=target, change_summary="提交说明\n第二行"),
+        )
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+
+        def rebind_hardware(payload: dict) -> None:
+            payload["identity"]["hardware_id"] = "m9.0"
+
+        self._tamper_delivered(delivery, "evidence/discovery.json", rebind_hardware)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+    def test_verifier_refuses_a_submitted_summary_outside_the_sealed_record(self):
+        raw = record()
+        raw["identity"].pop("change_summary")
+        submission = SubmissionIdentity(
+            hardware_id=raw["identity"]["hardware_id"], change_summary="提交说明\n第二行"
+        )
+        result, output = self._derive_pure(raw, submission=submission)
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+
+        def rebind_summary(payload: dict) -> None:
+            payload["identity"]["change_summary"] = "被换掉的说明"
+
+        self._tamper_delivered(delivery, "evidence/discovery.json", rebind_summary)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+
+    def test_verifier_refuses_an_unobserved_delivery_configuration(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+
+        def set_flag(payload: dict, value) -> None:
+            for side in ("before", "after"):
+                payload["raw"]["document_state"][side]["save_flag"] = value
+
+        def set_observed_configuration(payload: dict, value: str) -> None:
+            for side in ("before", "after"):
+                payload["raw"]["document_state"][side]["configuration"] = value
+
+        for label, mutate in (
+            ("no_native_observation", lambda payload: payload["raw"].pop("document_state")),
+            ("unknown_save_state", lambda payload: set_flag(payload, None)),
+            ("unsaved_document", lambda payload: set_flag(payload, True)),
+            ("contradicting_active_configuration", lambda payload: set_observed_configuration(payload, "Other")),
+        ):
+            with self.subTest(case=label):
+                delivery = self._deliver(output)
+                self._tamper_delivered(delivery, "evidence/discovery.json", mutate)
+                report = verify_discovery(delivery)
+                self.assertFalse(report["passed"])
+                self.assertIn("discovery.configuration", [item["code"] for item in report["errors"]])
+
 
 class NativePropertyScopeTests(unittest.TestCase):
     def test_conflicting_dp_values_across_scopes_block(self):
@@ -2286,6 +2442,49 @@ class DerivationSplitTests(unittest.TestCase):
                 payload,
                 settings=DiscoverySettings(record_roots=(records,)),
             )
+
+    def test_derivation_requires_the_saved_configuration_observation(self) -> None:
+        source, records = self._scene()
+        settings = DiscoverySettings(record_roots=(records,))
+
+        def set_flag(payload, value):
+            for side in ("before", "after"):
+                payload["document_state"][side]["save_flag"] = value
+
+        def set_observed_configuration(payload, value):
+            for side in ("before", "after"):
+                payload["document_state"][side]["configuration"] = value
+
+        for label, mutate in (
+            ("no_native_observation", lambda payload: payload.pop("document_state")),
+            ("unknown_save_state", lambda payload: set_flag(payload, None)),
+            ("unsaved_document", lambda payload: set_flag(payload, True)),
+            ("contradicting_active_configuration", lambda payload: set_observed_configuration(payload, "Other")),
+        ):
+            with self.subTest(case=label):
+                payload = record()
+                mutate(payload)
+                result = derive_native_package(
+                    source,
+                    self.tmp / f"derived-config-{label}",
+                    "run-1",
+                    payload,
+                    settings=settings,
+                )
+                self.assertFalse(result.passed)
+                self.assertIn("discovery.configuration_unproven", {item["code"] for item in result.findings})
+
+    def test_derivation_accepts_a_saved_configuration_observed_without_the_dp_property(self) -> None:
+        source, records = self._scene()
+        payload = record()
+        payload["identity"]["delivery_configuration"] = None
+        output = self.tmp / "derived-native-saved-config"
+        result = derive_native_package(
+            source, output, "run-1", payload, settings=DiscoverySettings(record_roots=(records,))
+        )
+        self.assertTrue(result.passed, result.findings)
+        source_record = json.loads((output / "source.json").read_text(encoding="utf-8"))
+        self.assertEqual(source_record["selection"]["configuration"], "Default")
 
     def test_preparation_refuses_authored_files_before_any_native_read(self) -> None:
         source, records = self._scene()

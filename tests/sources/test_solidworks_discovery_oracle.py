@@ -113,6 +113,8 @@ def native_record() -> dict:
             "main_assembly": "cad/robot.SLDASM",
             "robot_name": "oracle_fixture",
         },
+        "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
         "components": [
             {
                 "name2": "base-1",
