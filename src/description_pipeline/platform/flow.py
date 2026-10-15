@@ -219,15 +219,21 @@ def run_stage(
     events stream through ``on_event``.  The caller owns sealing and
     registration; a failure leaves the structural report in the work tree for
     the failure registration to carry.
+
+    The capture/input authority is explicit: a portable resume binds the
+    parent attempt named by the caller, while a native-boundary attempt
+    (whose own capture was just imported) binds this attempt itself - the
+    registered parent is never a silent fallback.  The first executed stage
+    seeds from the parent's registered predecessor; every later stage seeds
+    from this attempt's completed registered checkpoint.
     """
     run_id = validate_run_id(run_id)
     if stage not in DELIVERY_STAGES:
         raise PipelineError(f"stage must be one of {DELIVERY_STAGES}: {stage!r}")
     paths = RunPaths(root, run_id)
+    owner = validate_run_id(source_run_id) if source_run_id else run_id
     confirmed = platform.confirmed_stage(run_id, stage)
     if confirmed is not None:
-        record = platform.run_record(run_id) or {}
-        owner = record.get("parent_run_id") or run_id
         owner_paths = RunPaths(root, owner)
         revalidate_capture(platform, owner, owner_paths.capture_dir, owner_paths.run_dir / "input" / "request.json")
         portable_identity_gate(platform, owner)
@@ -235,7 +241,6 @@ def run_stage(
     record = platform.run_record(run_id)
     if record is None:
         raise PipelineError("This run is not admitted; fetch the transfer first")
-    owner = validate_run_id(source_run_id) if source_run_id else (record.get("parent_run_id") or run_id)
     boundary = record.get("from_stage")
     output = paths.stage_output(stage)
     with solidworks.output_lock(paths.run_dir):
@@ -250,11 +255,15 @@ def run_stage(
                 raise PipelineError(f"{stage} requires the recorded subject of the previous checkpoint")
             if stage == "publish" and repository is None:
                 raise PipelineError("publish requires the configured model repository checkout")
-            seed = registered_checkpoint(platform, owner, _SEED_STAGE[stage])
+            seed_owner = owner if boundary == stage else run_id
+            seed = registered_checkpoint(platform, seed_owner, _SEED_STAGE[stage])
             resume = None
             if owner != run_id:
                 resume = {"parent_run": owner, "from_stage": boundary or stage}
-                reuse_events(platform, run_id, owner, stage)
+                if boundary == stage:
+                    # Only the boundary stage resumes past the parent's
+                    # upstream work; later stages are this attempt's own.
+                    reuse_events(platform, run_id, owner, stage)
             common = {
                 "run_id": run_id,
                 "prior_events": _prior_events(platform, run_id),
