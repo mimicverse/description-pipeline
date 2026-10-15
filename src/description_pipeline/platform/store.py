@@ -503,24 +503,34 @@ class PlatformStore:
                 return OperationClaim(record=fresh, granted=False)
             raise PlatformStoreError(f"The operation is {fresh.state!r}; it cannot be claimed again")
 
-    def settle_cache_release(
-        self, *, run_id: str, stage: str, operation_key: str, receipt: dict, state: str = "succeeded"
-    ) -> OperationRecord:
-        """Close a claimed cache release on its own recorded release receipt.
+    def settle_cache_release(self, *, run_id: str, stage: str, operation_key: str, receipt: dict) -> OperationRecord:
+        """Close a claimed cache release on the canonical IF-10 release receipt.
 
         A cleanup's terminal state is never inferred from a stage outcome: it
-        binds the receipt of the actual release call, recorded with the
-        transition in one short transaction.  Only a claimed (``running``)
-        ``cache_release`` may settle; repeating the same settled state returns
-        the recorded result without re-recording the receipt.
+        binds the receipt of the actual release call, validated by the one
+        canonical ``validate_cache_release_receipt`` and bound to this database
+        operation (its operation id and registered parameter digest) and to this
+        Linux run.  Only a claimed (``running``) ``cache_release`` of the
+        confirmed-import stage may settle, inside one short transaction that
+        locks the run before the event sequence is allocated; repeating an
+        already settled operation returns the recorded result.  A failed,
+        unknown, foreign or otherwise non-canonical receipt is refused - never
+        reported as success.
         """
 
-        if state not in {"succeeded", "failed"}:
-            raise PlatformStoreError(f"A cache release settles as succeeded or failed: {state!r}")
+        from ..interface_records import InterfaceRecordError, validate_cache_release_receipt
+
         if not isinstance(receipt, dict) or not receipt:
-            raise PlatformStoreError("A cache release must bind the release receipt it executed with")
+            raise PlatformStoreError("A cache release must bind its canonical release receipt")
+        try:
+            validate_cache_release_receipt(receipt)
+        except InterfaceRecordError as error:
+            raise PlatformStoreError("The cache release receipt is not the canonical IF-10 release receipt") from error
         with self._transaction() as connection:
             cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
             cursor.execute(_FIND_OPERATION, (operation_key,))
             existing = cursor.fetchone()
             if existing is None:
@@ -530,11 +540,17 @@ class PlatformStore:
                 raise OperationConflictError("The operation key belongs to a different run or stage")
             if record.kind != "cache_release":
                 raise PlatformStoreError("Only a registered cache release settles through its release receipt")
-            if record.state in {"succeeded", "failed"}:
-                if record.state == state:
-                    return record
-                raise PlatformStoreError(f"The cache release is already terminal ({record.state})")
-            cursor.execute(_SETTLE_CACHE_RELEASE, (state, operation_key, run_id, stage))
+            if receipt["operation_id"] != record.operation_id:
+                raise PlatformStoreError("The release receipt names another operation")
+            if receipt["params_sha256"] != record.params_digest:
+                raise PlatformStoreError("The release receipt does not bind this operation's parameters")
+            if receipt["import"]["linux_run_id"] != run_id:
+                raise PlatformStoreError("The release receipt names another Linux run")
+            if record.state == "succeeded":
+                return record
+            if record.state != "running":
+                raise PlatformStoreError(f"The cache release is {record.state!r}; claim it before it settles")
+            cursor.execute(_SETTLE_CACHE_RELEASE, ("succeeded", operation_key, run_id, stage))
             row = cursor.fetchone()
             if row is None:
                 raise PlatformStoreError(f"The cache release is {record.state!r}; claim it before it settles")
@@ -545,7 +561,7 @@ class PlatformStore:
                 stage=stage,
                 kind="cache_release",
                 operation_id=settled.operation_id,
-                payload={"state": state, "receipt": receipt},
+                payload={"state": "succeeded", "receipt": receipt},
             )
             return settled
 

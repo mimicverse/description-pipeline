@@ -16,7 +16,16 @@ from pathlib import Path
 from unittest import mock
 
 from description_pipeline.delivery import PIPELINE_ID, read_delivery_manifest, write_delivery_manifest
-from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, CHECK_POLICY_V1, check_policy_digest
+from description_pipeline.interface_records import (
+    CACHE_IMPORT_CONFIRMATION_SCHEMA,
+    CACHE_RELEASE_RECEIPT_SCHEMA,
+    CHECK_POLICY_SCHEMA,
+    CHECK_POLICY_V1,
+    cache_import_confirmation_digest,
+    cache_release_params_digest,
+    cache_release_receipt_digest,
+    check_policy_digest,
+)
 from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
 from description_pipeline.platform import store as store_module
 from description_pipeline.platform.store import (
@@ -533,6 +542,39 @@ class PlatformStoreTests(unittest.TestCase):
         key = "r-1/native:0"
         self.world.operations[key] = ("op-native-0", "unresolved", key, "e" * 64, "r-1", "generate", "native")
 
+    @staticmethod
+    def _release_import_block(name: str) -> dict:
+        production = {"run_id": "native-" + name, "operation_id": "production-" + name}
+        confirmation = {
+            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+            "imported": [{"path": "cad/synthetic.SLDASM", "bytes": 1, "sha256": "e" * 64}],
+            "production": production,
+            "sealed": {"confirmed_at": "2026-10-15T17:00:00Z", "receipt_sha256": "f" * 64},
+        }
+        confirmation["digest"] = cache_import_confirmation_digest(confirmation)
+        return {"linux_run_id": name, "production": production, "confirmation": confirmation}
+
+    @staticmethod
+    def _release_receipt(operation_id: str, imported: dict) -> dict:
+        value = {
+            "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
+            "status": "released",
+            "operation_id": operation_id,
+            "params_sha256": cache_release_params_digest(imported),
+            "import": imported,
+            "released": {"files": 1, "bytes": 1},
+            "retained": ["terminal_state", "import_confirmation"],
+            "released_at": "2026-10-15T17:00:01Z",
+            "identity": {
+                "version": "1.4.0",
+                "source_commit": "a" * 40,
+                "source_sha256": "b" * 64,
+                "role": "native",
+            },
+        }
+        value["receipt_sha256"] = cache_release_receipt_digest(value)
+        return value
+
     # ------------------------------------------------------------- admission
 
     def test_close_and_open_are_idempotent_versioned_and_released(self) -> None:
@@ -934,33 +976,62 @@ class PlatformStoreTests(unittest.TestCase):
             checkpoint_uri=CHECKPOINT,
             receipt=self._native_receipt("capture"),
         )
-        self.store.register_operation(
+        imported = self._release_import_block("r-1")
+        unclaimed = self.store.register_operation(
             run_id="r-1",
             stage="capture",
             kind="cache_release",
             operation_key="r-1/release:1",
-            params_digest="e" * 64,
+            params_digest=cache_release_params_digest(imported),
         )
         with self.assertRaisesRegex(PlatformStoreError, "claim it before it settles"):
             self.store.settle_cache_release(
-                run_id="r-1", stage="capture", operation_key="r-1/release:1", receipt={"released": True}
+                run_id="r-1",
+                stage="capture",
+                operation_key="r-1/release:1",
+                receipt=self._release_receipt(unclaimed.operation_id, imported),
             )
-        self.store.register_operation(
-            run_id="r-1", stage="capture", kind="cache_release", operation_key="r-1/release:0", params_digest="d" * 64
+        operation = self.store.register_operation(
+            run_id="r-1",
+            stage="capture",
+            kind="cache_release",
+            operation_key="r-1/release:0",
+            params_digest=cache_release_params_digest(imported),
         )
         claim = self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/release:0")
         self.assertTrue(claim.granted)
+        # A caller's dict is never a success report: malformed, foreign-operation
+        # and foreign-run receipts are refused and the operation stays running.
+        for label, receipt, expected in (
+            ("malformed", {"released": False}, "canonical IF-10 release receipt"),
+            (
+                "other-operation",
+                self._release_receipt("different-release-operation", imported),
+                "names another operation",
+            ),
+            (
+                "other-run",
+                self._release_receipt(operation.operation_id, self._release_import_block("different-linux-run")),
+                "does not bind this operation's parameters",
+            ),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(PlatformStoreError, expected):
+                    self.store.settle_cache_release(
+                        run_id="r-1", stage="capture", operation_key="r-1/release:0", receipt=receipt
+                    )
+                self.assertEqual(self.world.operations["r-1/release:0"][1], "running")
         settled = self.store.settle_cache_release(
             run_id="r-1",
             stage="capture",
             operation_key="r-1/release:0",
-            receipt={"released": True, "url": "smb://cache"},
+            receipt=self._release_receipt(operation.operation_id, imported),
         )
         self.assertEqual(settled.state, "succeeded")
         self.assertEqual(self.world.operations["r-1/release:0"][1], "succeeded")
         recorded = [event for event in self.world.events if event[2] == "cache_release"]
         self.assertEqual(len(recorded), 1)
-        self.assertEqual(json.loads(recorded[0][5])["receipt"], {"released": True, "url": "smb://cache"})
+        self.assertEqual(json.loads(recorded[0][5])["receipt"]["operation_id"], operation.operation_id)
 
     def test_declared_reuse_requires_the_registered_source_stage(self) -> None:
         self._running_run()
