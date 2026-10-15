@@ -266,8 +266,16 @@ def _register_failed_stage(
     platform.confirm_stage(run_id=run_id, stage=stage, state="failed", receipt=receipt)
 
 
-def _failure_tree(run_dir: Path) -> Path:
-    """One snapshot of the attempt's actual products and reports for a failed registration."""
+def _failure_tree(run_dir: Path, stage: str) -> Path:
+    """One snapshot of the attempt's actual products and reports for a failed registration.
+
+    The real failed-stage products live beside the stage output - the verifier
+    keeps its failed report in ``stages/verify.failed/`` (its own
+    ``reports/quality.json`` included), never in the run-level directories.
+    The failed stage's tree is merged in last so its products win over any
+    run-level placeholder, and the sealed manifest then binds exactly what the
+    attempt actually produced.
+    """
     tree = run_dir / "seal" / "failed"
     if tree.exists():
         shutil.rmtree(tree)
@@ -276,6 +284,16 @@ def _failure_tree(run_dir: Path) -> Path:
         source = run_dir / name
         if source.is_dir():
             shutil.copytree(source, tree / name)
+    failed_stage = run_dir / "stages" / f"{stage}.failed"
+    if failed_stage.is_dir():
+        for entry in sorted(failed_stage.iterdir()):
+            if entry.name == "manifest.json":
+                continue
+            destination = tree / entry.name
+            if entry.is_dir():
+                shutil.copytree(entry, destination, dirs_exist_ok=True)
+            elif entry.is_file():
+                shutil.copy2(entry, destination)
     _ensure_subject_layout(tree)
     contract, policy = _delivery_manifest_arguments()
     write_delivery_manifest(tree, contract=contract, policy=policy)
@@ -294,7 +312,7 @@ def _converge_failed_stage(
         platform, store_root = _platform_binding()
         if tree is None and products:
             try:
-                tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir)
+                tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir, stage)
             except Exception:  # pragma: no cover - the shape-only registration stands
                 log.exception("failure-product snapshot unavailable run=%s stage=%s", run_id, stage)
                 tree = None
