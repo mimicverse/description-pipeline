@@ -19,14 +19,14 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
-from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, read_data
+from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -87,6 +87,12 @@ class OperationClaim:
 
     record: OperationRecord
     granted: bool
+
+
+def _report_member(path: object) -> bool:
+    """The one class projection: ``reports/**`` members are report-class."""
+
+    return isinstance(path, str) and (path == "reports" or path.startswith("reports/"))
 
 
 @dataclass(frozen=True)
@@ -205,6 +211,7 @@ _READ_STAGE_ROW = (
     "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
 )
 _READ_STAGE = "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE_TIME = "SELECT original_executed_at FROM stage WHERE run_id = %s AND stage = %s"
 _LOCK_STAGE = "SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"
 _FIND_RECONCILE = (
     "SELECT 1 FROM operation"
@@ -253,6 +260,9 @@ _EVENTS_LIMIT_CAP = 1000
 #: cancellation commands); every other kind needs a non-terminal run.
 _TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled"})
 _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
+
+#: The bound on the registered reuse lineage of one attempt; a longer chain is malformed.
+REUSE_LINEAGE_DEPTH = 256
 
 
 def _json(value: Any) -> str | None:
@@ -776,11 +786,23 @@ class PlatformStore:
             reuse_binding = self._verify_reuse_source(
                 run_id=run_id, stage=stage, checkpoint_uri=checkpoint_uri, reused_from_run=reused_from_run
             )
+            if digest(receipt) != reuse_binding["receipt_digest"]:
+                raise PlatformStoreError(
+                    "The reused receipt is not the confirmed source receipt; reuse never re-authors it"
+                )
+            if original_executed_at != reuse_binding["original_executed_at"]:
+                raise PlatformStoreError("The reused execution instant is not the confirmed source instant")
         self._verify_checkpoint_scope(
             checkpoint_uri, run_id=run_id, stage=stage, reused_from_run=reused_from_run
         )
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
             definition, sealed_root = self._verify_sealed(checkpoint_uri, receipt)
+        elif state == "failed" and (receipt or {}).get("artifacts"):
+            # The failed diagnostic never skips byte verification: every
+            # declared sealed member (subject- or report-class) is rebound to
+            # the sealed bytes, while the success-only qualifications stay
+            # with the completed path.
+            self._verify_sealed(checkpoint_uri, receipt, completed=False)
         _sealed_receipt(
             receipt,
             run_id=run_id,
@@ -825,6 +847,16 @@ class PlatformStore:
                     or digest(source_row[1]) != reuse_binding["receipt_digest"]
                 ):
                     raise PlatformStoreError("The registered reuse source changed; retry the confirmation")
+                if digest(receipt) != reuse_binding["receipt_digest"]:
+                    raise PlatformStoreError(
+                        "The reused receipt is not the confirmed source receipt; retry the confirmation"
+                    )
+                cursor.execute(_READ_STAGE_TIME, (reused_from_run, stage))
+                time_row = cursor.fetchone()
+                if original_executed_at != (time_row[0] if time_row is not None else None):
+                    raise PlatformStoreError(
+                        "The reused execution instant is not the confirmed source instant; retry the confirmation"
+                    )
             if reconcile is not None:
                 operation_id = reconcile.get("operation_id")
                 if not isinstance(operation_id, str) or not operation_id:
@@ -939,13 +971,16 @@ class PlatformStore:
     def _verify_checkpoint_scope(
         self, checkpoint_uri, *, run_id: str, stage: str, reused_from_run: str | None
     ) -> None:
-        """A parseable sealed locator must name this run (or its declared reuse source), never another.
+        """A parseable sealed locator must name this run or the proven origin of its reuse chain.
 
-        Being able to parse a locator is not a consumption right: once a
-        reference reads as the standard ``store://sealed/<run_id>/<stage>``
-        locator, confirming or reusing it for another run or stage is refused.
-        Non-locator references stay opaque here and fail closed at their own
-        resolver contract.
+        Being able to parse a locator is not a consumption right: a reference
+        that reads as the standard ``store://sealed/<run_id>/<stage>`` locator
+        is refused unless it names this run, or the direct parent's stage row
+        proves the chain up to the original producer the locator names - every
+        link explicit in ``reused_from_run``, every intermediate row completed
+        and carrying the same locator, bounded and never walking a cycle.
+        Run ancestry alone is never stage lineage.  Non-locator references
+        stay opaque here and fail closed at their own resolver contract.
         """
 
         if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith(SEALED_URI_PREFIX):
@@ -957,10 +992,52 @@ class PlatformStore:
             return
         if uri_stage != stage:
             raise PlatformStoreError("The sealed checkpoint names another stage than the confirmation")
-        if uri_run != run_id and uri_run != reused_from_run:
-            raise PlatformStoreError(
-                "The sealed checkpoint names a run that is neither the current run nor its declared reuse source"
-            )
+        if uri_run == run_id:
+            return
+        if reused_from_run is not None and uri_run == self._stage_reuse_origin(reused_from_run, stage):
+            return
+        raise PlatformStoreError(
+            "The sealed checkpoint names a run that is neither the current run nor the proven origin "
+            "of its registered stage reuse chain"
+        )
+
+    def _stage_reuse_origin(self, run_id: str, stage: str) -> str | None:
+        """The original producer one stage row's registered reuse chain resolves to, or ``None``.
+
+        Every link must be explicit: the row names its direct source in
+        ``reused_from_run``, every intermediate row is completed and carries
+        the same locator, and the first row without a reuse declaration must
+        name its own run.  The walk is bounded and never walks a cycle.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_STAGE, (run_id, stage))
+            row = cursor.fetchone()
+        if row is None or row[0] != "completed" or not row[2]:
+            return None
+        locator = row[2]
+        seen = {run_id}
+        current = run_id
+        while row[3] is not None:
+            reused = row[3]
+            if reused in seen or len(seen) >= REUSE_LINEAGE_DEPTH:
+                return None
+            seen.add(reused)
+            with self._transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute(_READ_STAGE, (reused, stage))
+                row = cursor.fetchone()
+            if row is None or row[0] != "completed" or row[2] != locator:
+                return None
+            current = reused
+        if not isinstance(locator, str) or not locator.startswith(SEALED_URI_PREFIX):
+            return None
+        with suppress(PipelineError):
+            origin_run, origin_stage = parse_sealed_uri(locator)
+            if origin_stage == stage and origin_run == current:
+                return origin_run
+        return None
 
     def _verify_reuse_source(
         self, *, run_id: str, stage: str, checkpoint_uri, reused_from_run: str
@@ -981,6 +1058,8 @@ class PlatformStore:
             parent_row = cursor.fetchone()
             cursor.execute(_READ_STAGE, (reused_from_run, stage))
             source_row = cursor.fetchone()
+            cursor.execute(_READ_STAGE_TIME, (reused_from_run, stage))
+            source_time = cursor.fetchone()
         if parent_row is None or parent_row[0] != reused_from_run:
             raise PlatformStoreError("Reuse requires the registered parent run of this linked attempt")
         if source_row is None or source_row[0] != "completed":
@@ -997,9 +1076,13 @@ class PlatformStore:
             definition=definition,
             root=sealed_root,
         )
-        return {"checkpoint_uri": source_row[2], "receipt_digest": digest(source_row[1])}
+        return {
+            "checkpoint_uri": source_row[2],
+            "receipt_digest": digest(source_row[1]),
+            "original_executed_at": source_time[0] if source_time is not None else None,
+        }
 
-    def _verify_sealed(self, checkpoint_uri, receipt) -> tuple[dict | None, Path]:
+    def _verify_sealed(self, checkpoint_uri, receipt, *, completed: bool = True) -> tuple[dict | None, Path]:
         """Rebind the real sealed delivery for any stage before any registration.
 
         One owner for all six stages: the receipt's URI and inventory are
@@ -1020,7 +1103,7 @@ class PlatformStore:
         manifest = read_delivery_manifest(root)
         subject = manifest.get("subject") or {}
         stage = receipt.get("stage")
-        if stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
+        if completed and stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         records = subject.get("files") or []
         artifacts = receipt.get("artifacts")
@@ -1034,8 +1117,28 @@ class PlatformStore:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery") from error
         stamped = {record["path"]: (record["bytes"], record["sha256"]) for record in records}
         received = {record["path"]: (record["bytes"], record["sha256"]) for record in artifacts}
-        if received != stamped:
+        subject_stamped = {path: value for path, value in stamped.items() if not _report_member(path)}
+        subject_received = {path: value for path, value in received.items() if not _report_member(path)}
+        if subject_received != subject_stamped:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
+        for path, (size, checksum) in received.items():
+            if not _report_member(path):
+                continue
+            # Report members (class projected from the path) are verified
+            # against the actual sealed bytes; the subject stays report-free.
+            try:
+                member = confined(root, path)
+            except PipelineError as error:
+                raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes") from error
+            if not member.is_file() or member.stat().st_size != size or file_digest(member) != checksum:
+                raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes")
+        if not completed:
+            # Byte binding only: every declared member was just verified against
+            # the sealed bytes.  The handoff index, tool identities, the stage
+            # contract's declared evidence and the rebuilt definition are
+            # success qualifications and are never required to register a real
+            # failure - and never granted by one.
+            return None, root
         # The handoff identity is the sealed admission index's inventory digest
         # (the same owner as describe_handoff); the index file's own sha stays
         # an ordinary manifest artifact record, never conflated with it.
@@ -1352,8 +1455,11 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
 
     A terminal confirmation must bind its receipt completely, and the reuse
     query runs exactly the same validation - downstream can never trust the
-    state string alone.  ``blocked`` records an unexecuted stage and carries
-    no receipt requirements; native stages validate the bindings they carry.
+    state string alone.  A receipt produced by a reused stage keeps its
+    original producer's identity: it must name either this run or the run of
+    the locator it was carried under.  ``blocked`` records an unexecuted
+    stage and carries no receipt requirements; native stages validate the
+    bindings they carry.
     """
 
     if state == "blocked":
@@ -1364,7 +1470,11 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
         raise PlatformStoreError("A sealed stage confirmation must carry its bound receipt")
     if receipt.get("schema_version") != BUNDLE_SCHEMA:
         raise PlatformStoreError("The sealed receipt uses an unknown schema")
-    if receipt.get("run_id") != run_id or receipt.get("stage") != stage:
+    named = {run_id}
+    if isinstance(checkpoint_uri, str) and checkpoint_uri.startswith(SEALED_URI_PREFIX):
+        with suppress(PipelineError):
+            named.add(parse_sealed_uri(checkpoint_uri)[0])
+    if receipt.get("run_id") not in named or receipt.get("stage") != stage:
         raise PlatformStoreError("The sealed receipt names another run or stage")
     if state == "unresolved":
         if receipt.get("state") != "unresolved":

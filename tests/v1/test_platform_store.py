@@ -207,7 +207,14 @@ class FakeCursor:
             " FROM stage WHERE run_id = %s"
         ):
             self._rows = [
-                (stage, record[0], record[1], record[2], None, None)
+                (
+                    stage,
+                    record[0],
+                    record[1],
+                    record[2],
+                    record[3] if len(record) > 3 else None,
+                    record[4] if len(record) > 4 else None,
+                )
                 for (run_id, stage), record in world.stages.items()
                 if run_id == params[0]
             ]
@@ -298,7 +305,14 @@ class FakeCursor:
             "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
         ):
             record = world.stages.get((params[0], params[1]))
-            self._rows = [(record[0], record[1], record[2], None)] if record else []
+            self._rows = [
+                (record[0], record[1], record[2], record[3] if len(record) > 3 else None)
+            ] if record else []
+        elif normalized.startswith(
+            "SELECT original_executed_at FROM stage WHERE run_id = %s AND stage = %s"
+        ):
+            record = world.stages.get((params[0], params[1]))
+            self._rows = [(record[4] if len(record) > 4 else None,)] if record else []
         elif normalized.startswith("INSERT INTO stage"):
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
@@ -306,14 +320,26 @@ class FakeCursor:
             existing = world.stages.get((run_id, stage))
             if "= 'unresolved'" in normalized:  # the reconciliation statement
                 if existing is not None and existing[0] == "unresolved":
-                    world.stages[(run_id, stage)] = (state, receipt, checkpoint)
+                    world.stages[(run_id, stage)] = (
+                        state,
+                        receipt,
+                        checkpoint,
+                        params[5] if len(params) > 5 else None,
+                        params[6] if len(params) > 6 else None,
+                    )
                     self._rows = [(run_id, stage, state)]
                 else:
                     self._rows = []
             elif existing is not None and existing[0] in {"completed", "failed", "cancelled", "blocked", "unresolved"}:
                 self._rows = []
             else:
-                world.stages[(run_id, stage)] = (state, receipt, checkpoint)
+                world.stages[(run_id, stage)] = (
+                    state,
+                    receipt,
+                    checkpoint,
+                    params[5] if len(params) > 5 else None,
+                    params[6] if len(params) > 6 else None,
+                )
                 self._rows = [(run_id, stage, state)]
         elif normalized.startswith("SELECT COALESCE(MAX(seq), 0) + 1 FROM run_event"):
             highest = max((item[1] for item in world.events if item[0] == params[0]), default=0)
@@ -952,6 +978,101 @@ class PlatformStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
 
+    def test_report_members_are_byte_verified_with_the_subject_untouched(self) -> None:
+        self._running_run()
+        report_file = self.delivery / "reports" / "quality.json"
+        record = {
+            "path": "reports/quality.json",
+            "bytes": report_file.stat().st_size,
+            "sha256": file_digest(report_file),
+        }
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("freeze", artifacts=[*self.artifacts, record]),
+        )
+        self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
+        report_file.write_text('{"tampered": true}\n', encoding="utf-8")
+        with self.assertRaisesRegex(PlatformStoreError, "report inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self._native_receipt("capture", artifacts=[*self.artifacts, record]),
+            )
+
+    def test_failed_diagnostics_verify_report_bytes_too(self) -> None:
+        self._running_run()
+        report_file = self.delivery / "reports" / "quality.json"
+        record = {
+            "path": "reports/quality.json",
+            "bytes": report_file.stat().st_size,
+            "sha256": file_digest(report_file),
+        }
+        report_file.write_text('{"tampered": true}\n', encoding="utf-8")
+        failed_receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "run_id": "r-1",
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "artifacts": [*self.artifacts, record],
+        }
+        with self.assertRaisesRegex(PlatformStoreError, "report inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="failed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=failed_receipt,
+            )
+        self.assertNotIn(("r-1", "freeze"), self.world.stages)
+
+    def test_failed_registration_verifies_declared_subject_bytes_without_reports(self) -> None:
+        self._running_run()
+        subject_artifacts = [dict(record) for record in self.artifacts]
+        evidence = self.delivery / "evidence" / "capture.json"
+        evidence.write_text('{"tampered": true}\n', encoding="utf-8")
+        failed_receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "run_id": "r-1",
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "artifacts": subject_artifacts,
+        }
+        with self.assertRaisesRegex(PipelineError, "differ from manifest|bind the sealed delivery"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="failed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=failed_receipt,
+            )
+        self.assertNotIn(("r-1", "freeze"), self.world.stages)
+
+    def test_a_failed_registration_lists_only_the_real_products(self) -> None:
+        self._running_run()
+        failed_receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "run_id": "r-1",
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "artifacts": [dict(record) for record in self.artifacts],
+        }
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="failed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=failed_receipt,
+        )
+        self.assertEqual(self.world.stages[("r-1", "freeze")][0], "failed")
+
     def test_capture_completion_does_not_settle_an_unexecuted_cache_release(self) -> None:
         self._running_run(from_stage="capture")
         self.store.register_operation(
@@ -1055,27 +1176,54 @@ class PlatformStoreTests(unittest.TestCase):
             )
 
     def test_registered_reuse_source_stage_is_accepted(self) -> None:
+        from datetime import timedelta
+
         self.admit(
             run_id="r-0",
             request_id="q-0",
             dispatch={"stage": "capture", "operation_key": "r-0/capture:0", "params_digest": "a" * 64},
         )
+        instant = datetime(2026, 10, 15, 9, 30, tzinfo=UTC)
+        source_receipt = self._native_receipt("capture", run_id="r-0")
         self.world.stages[("r-0", "capture")] = (
             "completed",
-            self._native_receipt("capture", run_id="r-0"),
+            source_receipt,
             "store://sealed/r-0/capture",
+            None,
+            instant,
         )
         self.admit(run_id="r-1", parent_run_id="r-0")
         self.world.run_states["r-1"] = "running"
+        # The payload must BE the confirmed source: a rewritten producer, a
+        # shifted instant and a dropped instant all refuse before any write.
+        for label, receipt, when, expected in (
+            ("rewritten", {**source_receipt, "run_id": "r-1"}, instant, "not the confirmed source receipt"),
+            ("shifted", {**source_receipt}, instant + timedelta(seconds=1), "not the confirmed source instant"),
+            ("dropped", {**source_receipt}, None, "not the confirmed source instant"),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(PlatformStoreError, expected):
+                self.store.confirm_stage(
+                    run_id="r-1",
+                    stage="capture",
+                    state="completed",
+                    checkpoint_uri="store://sealed/r-0/capture",
+                    receipt=receipt,
+                    reused_from_run="r-0",
+                    original_executed_at=when,
+                )
         self.store.confirm_stage(
             run_id="r-1",
             stage="capture",
             state="completed",
             checkpoint_uri="store://sealed/r-0/capture",
-            receipt=self._native_receipt("capture"),
+            receipt={**source_receipt},
             reused_from_run="r-0",
+            original_executed_at=instant,
         )
-        self.assertEqual(self.world.stages[("r-1", "capture")][0], "completed")
+        row = self.world.stages[("r-1", "capture")]
+        self.assertEqual(row[0], "completed")
+        self.assertEqual(row[1]["run_id"], "r-0")
+        self.assertEqual(row[4], instant)
 
     def test_unresolved_moves_the_run_and_reconciliation_restores_it(self) -> None:
         self._running_run(from_stage="capture")

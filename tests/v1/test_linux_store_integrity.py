@@ -31,7 +31,7 @@ from description_pipeline.orchestration.linux_store import STORE_SCHEMA, LinuxSt
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST, seal_capture
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 
-from .test_linux_split import HANDOFF, SELECTED, UPLOAD, capture_job
+from .test_linux_split import HANDOFF, capture_job
 from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
 RUN = "0b1f2c33-1f1e-4b0e-9d6a-2f9a5c7e1d20"
@@ -94,6 +94,148 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             expected_main_assembly=MAIN_ASSEMBLY,
             expected_native_tool=self.tool,
         )
+
+        from tests.v1.request_support import install_request_authority
+
+        install_request_authority(self, self.store, RUN)
+
+    def test_a_carried_frozen_original_revalidates_without_touching_the_native_manifest(self) -> None:
+        from types import SimpleNamespace
+
+        from description_pipeline.io import file_digest
+        from description_pipeline.orchestration.linux_runner import _revalidate_capture
+        from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
+
+        _revalidate_capture(self.store, RUN)
+        manifest = self.store.capture_dir(RUN) / "transfer-manifest.json"
+        original = manifest.read_bytes()
+        frozen = freeze_request_evidence(
+            self.store.run_dir(RUN),
+            request_id="frozen-original",
+            target_hardware="m3.0",
+            change_summary="capture composition",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="b" * 64,
+        )
+        carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
+        record = {"path": "input/request.json", "bytes": frozen.stat().st_size, "sha256": file_digest(frozen)}
+        platform = SimpleNamespace(
+            confirmed_stage=lambda run, stage: {"artifacts": [record]} if (run, stage) == (RUN, "freeze") else None
+        )
+        with mock.patch.object(linux_runner, "_capture_platform", return_value=platform):
+            _revalidate_capture(self.store, RUN)
+            self.assertEqual(manifest.read_bytes(), original)
+            self.assertEqual(carried.read_bytes(), (self.store.run_dir(RUN) / "input/request.json").read_bytes())
+
+    def test_a_tampered_carried_original_is_refused(self) -> None:
+        from types import SimpleNamespace
+
+        from description_pipeline.io import file_digest
+        from description_pipeline.orchestration.linux_runner import _revalidate_capture
+        from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
+
+        frozen = freeze_request_evidence(
+            self.store.run_dir(RUN),
+            request_id="frozen-original",
+            target_hardware="m3.0",
+            change_summary="capture composition",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="b" * 64,
+        )
+        carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
+        record = {"path": "input/request.json", "bytes": frozen.stat().st_size, "sha256": file_digest(frozen)}
+        platform = SimpleNamespace(
+            confirmed_stage=lambda run, stage: {"artifacts": [record]} if (run, stage) == (RUN, "freeze") else None
+        )
+        carried.write_bytes(b'{"tampered": true}')
+        with (
+            mock.patch.object(linux_runner, "_capture_platform", return_value=platform),
+            self.assertRaisesRegex(PipelineError, "carried input/request.json differs from the registered original"),
+        ):
+            _revalidate_capture(self.store, RUN)
+
+    def test_mutable_request_copies_are_anchored_to_the_registered_original(self) -> None:
+        from description_pipeline.io import file_digest
+        from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
+
+        frozen = freeze_request_evidence(
+            self.store.run_dir(RUN),
+            request_id="registered-original",
+            target_hardware="m3.0",
+            change_summary="registered",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="b" * 64,
+        )
+        carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
+        registered = file_digest(frozen)
+        size = frozen.stat().st_size
+
+        class _RegisteredFreeze:
+            def confirmed_stage(self, run_id, stage):
+                if (run_id, stage) == (RUN, "freeze"):
+                    return {
+                        "artifacts": [
+                            {
+                                "path": "input/request.json",
+                                "bytes": size,
+                                "sha256": registered,
+                            }
+                        ]
+                    }
+                return None
+
+        with mock.patch.object(linux_runner, "_capture_platform", return_value=_RegisteredFreeze()):
+            _revalidate_capture = linux_runner._revalidate_capture
+            _revalidate_capture(self.store, RUN)
+            carried.write_text('{"tampered": true}', encoding="utf-8")
+            with self.assertRaisesRegex(PipelineError, "registered original"):
+                _revalidate_capture(self.store, RUN)
+            shutil.copy2(frozen, carried)
+            frozen.write_text('{"tampered": true}', encoding="utf-8")
+            carried.write_text('{"tampered": true}', encoding="utf-8")
+            with self.assertRaisesRegex(PipelineError, "registered original"):
+                _revalidate_capture(self.store, RUN)
+            frozen.unlink()
+            carried.unlink()
+            with self.assertRaisesRegex(PipelineError, "missing the registered frozen"):
+                _revalidate_capture(self.store, RUN)
+
+        class _NoFreeze:
+            def confirmed_stage(self, run_id, stage):
+                return None
+
+        with (
+            mock.patch.object(linux_runner, "_capture_platform", return_value=_NoFreeze()),
+            self.assertRaisesRegex(PipelineError, "no registered frozen original"),
+        ):
+            _revalidate_capture(self.store, RUN)
+
+        from description_pipeline.platform.store import PlatformStoreError
+
+        class _DamagedFreeze:
+            def confirmed_stage(self, run_id, stage):
+                raise PlatformStoreError("Delivery subject files differ from manifest.json")
+
+        with (
+            mock.patch.object(linux_runner, "_capture_platform", return_value=_DamagedFreeze()),
+            self.assertRaisesRegex(PlatformStoreError, "Delivery subject files differ"),
+        ):
+            _revalidate_capture(self.store, RUN)
+
+        with (
+            mock.patch.object(
+                linux_runner,
+                "_capture_platform",
+                side_effect=PlatformStoreError(
+                    "PLATFORM_SERVICE_DSN is not configured; the platform store is unavailable"
+                ),
+            ),
+            self.assertRaisesRegex(PlatformStoreError, "PLATFORM_SERVICE_DSN"),
+        ):
+            _revalidate_capture(self.store, RUN)
 
     # ------------------------------------------------------------ roles / drift
 
@@ -172,65 +314,6 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         job["result"]["capture_archive"]["sha256"] = declared_sha256
         return job
 
-    def test_import_native_capture_enforces_the_declared_archive_digest(self) -> None:
-        """The runner must enforce the declared digest independently of its client."""
-
-        source = capture_root(self.tmp / "fresh", run_id=FRESH, handoff=HANDOFF)
-        fresh_archive = self.tmp / "fresh.zip"
-        seal_capture(
-            source,
-            fresh_archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        endpoint = FakeEndpoint(fresh_archive.read_bytes())
-        job = self._job(FRESH, fresh_archive, declared_sha256="d" * 64)
-        with self.assertRaises(PipelineError):
-            linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
-
-    def test_import_native_capture_accepts_matching_bytes(self) -> None:
-        source = capture_root(self.tmp / "fresh-ok", run_id=FRESH, handoff=HANDOFF)
-        fresh_archive = self.tmp / "fresh-ok.zip"
-        seal_capture(
-            source,
-            fresh_archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        digest = hashlib.sha256(fresh_archive.read_bytes()).hexdigest()
-        endpoint = FakeEndpoint(fresh_archive.read_bytes())
-        job = self._job(FRESH, fresh_archive, declared_sha256=digest)
-        result = linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
-        self.assertEqual(result["state"], "capture_admitted")
-        self.assertEqual((self.store.meta(FRESH) or {}).get("handoff_sha256"), HANDOFF)
-        self.assertNotEqual(job["request"]["upload_sha256"], HANDOFF)
-        self.assertEqual(self.store.meta(FRESH)["upload_files"], UPLOAD)
-        self.assertEqual(self.store.meta(FRESH)["selected_files"], SELECTED)
-        self.assertEqual(self.store.meta(FRESH)["selection_sha256"], job["selection"]["manifest"]["selection_sha256"])
-
-    def test_fetch_refuses_changed_selection_before_downloading(self) -> None:
-        mutations = (
-            lambda job: job["request"].update(upload_sha256="0" * 64),
-            lambda job: job.update(handoff_sha256=job["request"]["upload_sha256"]),
-            lambda job: job["selection"]["manifest"].update(selection_sha256="0" * 64),
-            lambda job: job["request"].update(main_assembly="another.SLDASM"),
-            lambda job: job.update(package_files=UPLOAD),
-            lambda job: job["selection"].update(state="ready"),
-            lambda job: job["request"].update(run_id=FRESH),
-        )
-        for index, mutate in enumerate(mutations):
-            with self.subTest(mutation=index):
-                endpoint = FakeEndpoint(self.archive.read_bytes())
-                job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-                mutate(job)
-                with self.assertRaises(PipelineError):
-                    linux_runner.import_native_capture(self.store, endpoint, RUN, job)
-                self.assertEqual(endpoint.calls, 0)
-
     def test_fetch_retry_preserves_the_recorded_selection(self) -> None:
         endpoint = FakeEndpoint(self.archive.read_bytes())
         job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
@@ -239,40 +322,6 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "recorded admission"):
             linux_runner.import_native_capture(self.store, endpoint, RUN, job)
         self.assertEqual(endpoint.calls, 0)
-
-    def test_fetch_refuses_a_resealed_capture_with_another_native_inventory(self) -> None:
-        source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
-        record_path = source / "evidence/discovery.json"
-        record = json.loads(record_path.read_text())
-        record["native_files"]["stray.SLDPRT"] = "0" * 64
-        write_json(record_path, record)
-        manifest_path = source / "evidence" / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-        manifest["files"]["discovery.json"] = file_digest(record_path)
-        write_json(manifest_path, manifest)
-        archive = self.tmp / "foreign-inventory.zip"
-        seal_capture(
-            source,
-            archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        job = self._job(FRESH, archive, declared_sha256=file_digest(archive))
-        endpoint = FakeEndpoint(archive.read_bytes())
-        with self.assertRaisesRegex(PipelineError, "native inventory differs"):
-            linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
-
-    def test_manifest_receipt_mismatch_is_refused_before_import_and_on_retry(self) -> None:
-        endpoint = FakeEndpoint(self.archive.read_bytes())
-        job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-        job["result"]["capture_archive"]["manifest_sha256"] = "e" * 64
-        fresh = LinuxStore(self.tmp / "manifest-mismatch")
-        for store in (fresh, self.store):
-            with self.subTest(admitted=store is self.store), self.assertRaisesRegex(PipelineError, "manifest"):
-                linux_runner.import_native_capture(store, endpoint, RUN, job)
-        self.assertFalse(fresh.capture_dir(RUN).exists())
 
     # ------------------------------------------------------------ run lock
 

@@ -109,13 +109,17 @@ class LinuxSplitTests(unittest.TestCase):
         )
 
     def admit(self) -> dict:
-        return self.store.import_capture(
+        from tests.v1.request_support import install_request_authority
+
+        result = self.store.import_capture(
             self.run_id,
             self.archive,
             expected_handoff_sha256=HANDOFF,
             expected_main_assembly=MAIN_ASSEMBLY,
             expected_native_tool=self.tool,
         )
+        install_request_authority(self, self.store, self.run_id)
+        return result
 
     def test_capture_is_admitted_once_and_seeds_raw_native_events(self) -> None:
         self.assertIsNone(self.store.meta(self.run_id))

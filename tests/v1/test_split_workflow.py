@@ -260,8 +260,22 @@ class SplitWorkflowTests(unittest.TestCase):
             "from_stage": None,
         }
         with (
-            patch.object(module, "_linux_store", return_value=object()),
-            patch.object(module, "run_portable_stage", return_value=_failed_verify_receipt()),
+            patch.object(
+                module,
+                "_linux_store",
+                return_value=SimpleNamespace(stage_dir=lambda _run, stage: Path("/nonexistent") / RUN_ID / stage),
+            ),
+            patch.object(module.flow, "run_stage", return_value=_failed_verify_receipt()),
+            patch.object(
+                module,
+                "config_from_airflow_connection",
+                return_value=SimpleNamespace(store_root=Path("/nonexistent-work")),
+            ),
+            patch.object(
+                module,
+                "_platform_binding",
+                return_value=(SimpleNamespace(append_event=lambda *args, **kwargs: None), Path("/nonexistent")),
+            ),
         ):
             verify = module.dag.get_task("verify").python_callable
             with self.assertRaises(AirflowFailException):
@@ -286,7 +300,10 @@ class SplitWorkflowTests(unittest.TestCase):
             "repository_base": "feature/robot",
             "from_stage": None,
         }
-        config = SimpleNamespace(repositories={"example/robot": Path("/tmp/model-repository")})
+        config = SimpleNamespace(
+            repositories={"example/robot": Path("/tmp/model-repository")},
+            store_root=Path("/nonexistent-work"),
+        )
         with tempfile.TemporaryDirectory() as tmp:
             store = LinuxStore(Path(tmp))
             store.update_meta(
@@ -320,7 +337,13 @@ class SplitWorkflowTests(unittest.TestCase):
             store.append_events(RUN_ID, protocol_events(subject=SUBJECT))
             with (
                 patch.object(module, "_linux_store", return_value=store),
-                patch.object(module, "run_portable_stage", return_value=_passing_publish_receipt()),
+                patch.object(module.flow, "run_stage", return_value=_passing_publish_receipt()),
+                patch.object(
+                    module,
+                    "_platform_binding",
+                    return_value=(SimpleNamespace(append_event=lambda *args, **kwargs: None), Path("/nonexistent")),
+                ),
+                patch.object(module, "_register_completed_stage", side_effect=lambda *args, **kwargs: None),
                 patch.object(module, "config_from_airflow_connection", return_value=config),
             ):
                 publish = module.dag.get_task("publish").python_callable
