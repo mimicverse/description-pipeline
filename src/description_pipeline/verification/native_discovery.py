@@ -2731,35 +2731,32 @@ def verify_discovery(package: Path) -> dict:
         )
 
         # The delivery configuration is qualified by native state, not by the
-        # name it carries: the observation must prove the document saved and
-        # the active configuration matching, and the sealed selection must
-        # agree with the claim.
+        # name it carries.  The requirement is derived from the sealed selection
+        # plus the raw observation, so a missing or null generated claim never
+        # skips it: the selection's configuration must be observed as saved and
+        # active on both readings.  A present claim must agree with the sealed
+        # selection; an absent one stays deferred (publication readiness).
+        raw = payload.get("raw") or {}
+        expected_configuration = selection["configuration"]
+        saved_name = raw.get("saved_configuration")
+        _require(
+            saved_name is None or (isinstance(saved_name, str) and saved_name.strip() == expected_configuration),
+            "discovery.configuration",
+            "the recorded saved configuration differs from the sealed selection",
+            {"field": "delivery_configuration"},
+        )
+        _require(
+            _saved_configuration_observed(raw, expected_configuration),
+            "discovery.configuration",
+            "the delivery configuration is not observed as the saved active configuration",
+            {"field": "delivery_configuration"},
+        )
         configuration = claimed.get("delivery_configuration")
         if configuration is not None:
             _require(
-                isinstance(configuration, str) and configuration.strip() != "",
+                isinstance(configuration, str) and configuration.strip() == expected_configuration,
                 "discovery.configuration",
-                "the generated delivery configuration is malformed",
-                {"field": "delivery_configuration"},
-            )
-            configuration = configuration.strip()
-            _require(
-                selection["configuration"] == configuration,
-                "discovery.configuration",
-                "the sealed selection configuration differs from the generated claim",
-                {"field": "delivery_configuration"},
-            )
-            saved_name = (payload.get("raw") or {}).get("saved_configuration")
-            _require(
-                saved_name is None or (isinstance(saved_name, str) and saved_name.strip() == configuration),
-                "discovery.configuration",
-                "the recorded saved configuration differs from the generated claim",
-                {"field": "delivery_configuration"},
-            )
-            _require(
-                _saved_configuration_observed(payload.get("raw") or {}, configuration),
-                "discovery.configuration",
-                "the delivery configuration is not observed as the saved active configuration",
+                "the generated delivery configuration differs from the sealed selection",
                 {"field": "delivery_configuration"},
             )
 
