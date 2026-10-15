@@ -115,14 +115,34 @@ def _authored_identity(raw: dict, namespace: str) -> dict:
             if candidate is None:
                 continue
             _require(
-                isinstance(candidate, str)
-                and bool(candidate.strip())
-                and not any(ord(char) < 32 or ord(char) == 127 for char in candidate),
+                isinstance(candidate, str) and bool(candidate.strip()),
                 "discovery.identity",
                 "supplied metadata must be non-empty text",
                 {"field": key},
             )
-            normalized.append(candidate.strip())
+            text = candidate
+            if key == "change_summary":
+                # One line-ending standard with the generation side: LF stays
+                # inside a change summary, and CRLF or a lone CR fold to LF so
+                # equivalent readings never read as a conflict.  Every other
+                # control character still refuses, as it does for every other
+                # field (the independent read keeps its own, not the
+                # generator's, expectation values).
+                text = text.replace("\r\n", "\n").replace("\r", "\n")
+                _require(
+                    not any((ord(char) < 32 and char != "\n") or ord(char) == 127 for char in text),
+                    "discovery.identity",
+                    "supplied metadata must be non-empty text",
+                    {"field": key},
+                )
+            else:
+                _require(
+                    not any(ord(char) < 32 or ord(char) == 127 for char in text),
+                    "discovery.identity",
+                    "supplied metadata must be non-empty text",
+                    {"field": key},
+                )
+            normalized.append(text.strip())
         _require(
             len(set(normalized)) <= 1,
             "discovery.identity",
