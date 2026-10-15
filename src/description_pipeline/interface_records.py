@@ -1368,15 +1368,24 @@ def validate_request_record(record) -> dict:
     seven fields required, no unknown keys (the foundation reader additionally
     rejects duplicate keys and non-finite numbers while parsing), no null
     values, strict types - ``request_id`` is non-empty text carried unchanged
-    across reuse and never compared with the current run UUID, and both digests
-    are lowercase SHA-256.
+    across reuse and never compared with the current run UUID,
+    ``main_assembly`` is an engineering-relative portable path (the one
+    ``artifact_path_parts`` rule; absolute, UNC and escaping paths refuse), and
+    both digests are lowercase SHA-256.
     """
 
     code = "request_record_invalid"
     _exact_keys(record, _REQUEST_RECORD_KEYS, code, "request")
     _require(record["schema_version"] == REQUEST_RECORD_SCHEMA, code, {"where": "schema_version"})
-    for key in ("request_id", "target_hardware", "main_assembly"):
-        _text(record[key], code, key)
+    for key in ("request_id", "target_hardware"):
+        value = _text(record[key], code, key)
+        _require(value.strip() != "", code, {"where": key})
+    main = _text(record["main_assembly"], code, "main_assembly")
+    _require(main.strip() != "", code, {"where": "main_assembly"})
+    try:
+        artifact_path_parts(main)
+    except PipelineError as error:
+        raise InterfaceRecordError(code, {"where": "main_assembly", "reason": str(error)}) from error
     summary = record["change_summary"]
     _require(
         isinstance(summary, str)
