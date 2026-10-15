@@ -320,6 +320,15 @@ function Get-PreviousGenerationBinding([string]$generation, [object]$binding) {
             port=$binding.port; version=$record.version; source_commit=$record.source_commit;
             source_sha256=$record.source_sha256 }
 }
+function Get-UnsupportedEndpointConfigKeys([string]$configPath) {
+  # A8: the 1.5.0 endpoint refuses these keys.  The upgrade pre-check only reports them - the
+  # running configuration is never rewritten (the generation copy stays a byte copy).
+  $removed = @('targets')
+  if (-not (Test-Path -LiteralPath $configPath)) { return @() }
+  $config = Read-Json $configPath
+  $present = @($config.PSObject.Properties.Name)
+  return @($removed | Where-Object { $present -contains $_ })
+}
 function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$previousConfig, [string]$stageDir, [string]$sourceLauncher) {
   # The safe stop/restore every promote failure path runs: stop whatever now serves the task,
   # restore the task snapshot, then start the previous generation only on startable evidence
@@ -436,6 +445,15 @@ if ($Verb -eq 'stage') {
   if (-not $StageDir) { Die 'stage_dir_required' 'stage needs -StageDir (the new generation directory)' }
   if (Test-Path -LiteralPath $StageDir) { Die 'stage_exists' "preserve the existing generation: $StageDir" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  # Early upgrade pre-check (A8): a running configuration that still carries a removed key would
+  # be refused by the 1.5.0 endpoint; fail here with the manual fix instead of a mid-switch stop.
+  $runningConfig = Action-Config $task
+  $unsupported = @(Get-UnsupportedEndpointConfigKeys $runningConfig)
+  if ($unsupported.Count -gt 0) {
+    Die 'endpoint_config_targets' ('the running endpoint configuration still carries the removed ' +
+      ($unsupported -join ', ') + ' key: ' + $runningConfig + '; remove the key manually (the 1.5.0 ' +
+      'endpoint refuses it) and re-run stage')
+  }
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
   New-Item -ItemType Directory -Path $StageDir | Out-Null
@@ -460,7 +478,7 @@ if ($Verb -eq 'stage') {
   # runtime's own canonical owner - the endpoint's own /health stays the only install identity.
   # The generation configuration is a byte copy of the running instance's own configuration
   # (token path and roots preserved; no re-serialization, no BOM).
-  Copy-Item -LiteralPath (Action-Config $task) -Destination (Config-Path $StageDir)
+  Copy-Item -LiteralPath $runningConfig -Destination (Config-Path $StageDir)
   $expected = & $runtime -I -c "import json,sys;from description_pipeline import io;print(io.digest(json.load(open(sys.argv[1],encoding='utf-8'))))" (Config-Path $StageDir)
   if ($LASTEXITCODE -ne 0) { Die 'config_digest_failed' 'the staged runtime could not digest the generation configuration' }
   Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{

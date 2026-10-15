@@ -5,7 +5,8 @@
 # Only the OS/network boundaries and the settle retry timer are stubbed over synthetic temp
 # files; the candidate's own Invoke-Main, Start-OrRefuse, refusal interpreters, restore path and
 # health probe run for real (Wait-Settled runs real and fails fast on the stub task state).
-# Scenarios: unknown_owner | startable_second_refusal | startable_missing_receipt.
+# Scenarios: unknown_owner | startable_second_refusal | startable_missing_receipt |
+# stage_targets_refused.
 # Prints one JSON object (scenario, message, calls, sleeps, receipt) and exits 0.
 param(
   [Parameter(Mandatory=$true)][string]$ScriptPath,
@@ -23,7 +24,12 @@ $oldConfig = Join-Path $oldGeneration 'endpoint.json'
 $newConfig = Join-Path $newGeneration 'endpoint.json'
 $token = Join-Path $Root 'local-test-token'
 [System.IO.File]::WriteAllText($token, 'synthetic-offline-token')
-$configuration = @{state_root=$Root; port=8765; token_file=$token} | ConvertTo-Json
+$configuration = @{state_root=$Root; port=8765; token_file=$token}
+if ($Scenario -eq 'stage_targets_refused') {
+  # A8: the legacy running configuration still carries the removed targets key.
+  $configuration['targets'] = @{nd_fixture = @{repository_slug = 'a/b'; base = 'feature/arm'}}
+}
+$configuration = $configuration | ConvertTo-Json -Depth 4
 [System.IO.File]::WriteAllText($oldConfig, $configuration)
 [System.IO.File]::WriteAllText($newConfig, $configuration)
 [System.IO.File]::WriteAllText((Join-Path $newGeneration 'stage-receipt.json'), '{}')
@@ -87,9 +93,15 @@ function Invoke-RestMethod {
 }
 function Die { param([string]$code, [string]$message) throw ('DIE:' + $code + ':' + $message) }
 
-$Script:Verb = 'promote'
-$Script:Binding = $bindingPath
-$Script:StageDir = $newGeneration
+if ($Scenario -eq 'stage_targets_refused') {
+  $Script:Verb = 'stage'
+  $Script:Binding = $bindingPath
+  $Script:StageDir = Join-Path $Root 'staged'
+} else {
+  $Script:Verb = 'promote'
+  $Script:Binding = $bindingPath
+  $Script:StageDir = $newGeneration
+}
 $message = ''
 try { Invoke-Main } catch { $message = $_.Exception.Message }
 $failedFile = Get-ChildItem -LiteralPath (Join-Path $Root 'instance-promotions') -Recurse `
