@@ -276,10 +276,10 @@ class FakeCursor:
             record = world.stages.get((params[0], params[1]))
             self._rows = [(record[0],)] if record else []
         elif normalized.startswith(
-            "SELECT state, receipt, checkpoint_uri FROM stage WHERE run_id = %s AND stage = %s"
+            "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
         ):
             record = world.stages.get((params[0], params[1]))
-            self._rows = [record] if record else []
+            self._rows = [(record[0], record[1], record[2], None)] if record else []
         elif normalized.startswith("INSERT INTO stage"):
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
@@ -311,16 +311,35 @@ class FakeCursor:
                 self._rows = [updated]
             else:
                 self._rows = []
-        elif normalized.startswith("UPDATE operation SET state = %s"):
+        elif normalized.startswith("UPDATE operation SET state = CASE WHEN kind = 'cancel'"):
             outcome, run_id, stage = params
             for key, record in list(world.operations.items()):
                 if (
                     record[4] == run_id
                     and record[5] == stage
                     and record[6] != "reconcile"
-                    and record[1] in {"running", "unresolved"}
+                    and record[1] in {"queued", "running", "unresolved"}
                 ):
-                    world.operations[key] = (record[0], outcome, record[2], record[3], record[4], record[5], record[6])
+                    settled = "succeeded" if record[6] == "cancel" else outcome
+                    world.operations[key] = (record[0], settled, *record[2:])
+            self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = 'unresolved'"):
+            run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if record[4] == run_id and record[5] == stage and record[6] != "reconcile" and record[1] == "running":
+                    world.operations[key] = (record[0], "unresolved", *record[2:])
+            self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = 'succeeded'"):
+            operation_id, run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[0] == operation_id
+                    and record[4] == run_id
+                    and record[5] == stage
+                    and record[6] == "reconcile"
+                    and record[1] != "succeeded"
+                ):
+                    world.operations[key] = (record[0], "succeeded", *record[2:])
             self._rows = []
         elif normalized.startswith("SELECT seq, at, kind, stage, operation_id, payload FROM run_event"):
             run_id, after_seq, limit = params
@@ -470,12 +489,16 @@ class PlatformStoreTests(unittest.TestCase):
         return self.store.confirm_stage(**payload)
 
     def _unresolved_original(self):
-        record = self.store.register_operation(
-            run_id="r-1", stage="generate", kind="native", operation_key="r-1/native:0", params_digest="e" * 64
-        )
-        stored = self.world.operations["r-1/native:0"]
-        self.world.operations["r-1/native:0"] = (stored[0], "unresolved", *stored[2:])
-        return record
+        """One pre-existing original operation that already went unknown.
+
+        The row is seeded directly: a production run registers its intent
+        before the side effect, so a fresh registration after the stage is
+        already unresolved is refused by the store guard - exactly what the
+        real write path enforces.
+        """
+
+        key = "r-1/native:0"
+        self.world.operations[key] = ("op-native-0", "unresolved", key, "e" * 64, "r-1", "generate", "native")
 
     # ------------------------------------------------------------- admission
 
@@ -734,11 +757,11 @@ class PlatformStoreTests(unittest.TestCase):
         )
         self.assertEqual(record.state, "queued")
         claimed = self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
-        self.assertEqual(claimed.state, "running")
-        self.assertEqual(
-            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0").state,
-            "running",
-        )
+        self.assertTrue(claimed.granted)
+        self.assertEqual(claimed.record.state, "running")
+        replay = self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        self.assertFalse(replay.granted)
+        self.assertEqual(replay.record.state, "running")
         self.store.confirm_stage(
             run_id="r-1",
             stage="freeze",
@@ -748,12 +771,111 @@ class PlatformStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.world.operations["r-1/freeze:0"][1], "succeeded")
         self.assertEqual(self.world.open_transactions, 0)
-        with self.assertRaisesRegex(PlatformStoreError, "cannot be claimed"):
+        with self.assertRaisesRegex(PlatformStoreError, "only reconcile/cancel"):
             self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
         with self.assertRaisesRegex(PlatformStoreError, "not registered"):
             self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/missing:0")
         with self.assertRaisesRegex(OperationConflictError, "different run or stage"):
             self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/freeze:0")
+
+    def test_unknown_outcome_cannot_be_bypassed_with_a_new_key(self) -> None:
+        self._running_run()
+        self.store.register_operation(
+            run_id="r-1", stage="freeze", kind="dispatch", operation_key="r-1/freeze:0", params_digest="a" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0").granted
+        )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="unresolved",
+            receipt={
+                "schema_version": store_module.BUNDLE_SCHEMA,
+                "run_id": "r-1",
+                "stage": "freeze",
+                "state": "unresolved",
+            },
+        )
+        self.assertEqual(self.world.operations["r-1/freeze:0"][1], "unresolved")
+        with self.assertRaisesRegex(PlatformStoreError, "unresolved"):
+            self.store.register_operation(
+                run_id="r-1", stage="freeze", kind="dispatch", operation_key="r-1/freeze:1", params_digest="a" * 64
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "unresolved"):
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        # The evidenced reconciliation stays the one controlled continuation and
+        # settles both the original operation and its own reconcile operation.
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="freeze", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/reconcile:0").granted
+        )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("freeze"),
+            reconcile={"operation_id": reconcile_op.operation_id},
+        )
+        self.assertEqual(self.world.operations["r-1/freeze:0"][1], "succeeded")
+        self.assertEqual(self.world.operations["r-1/reconcile:0"][1], "succeeded")
+
+    def test_terminal_run_refuses_claiming_a_queued_side_effect(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="failed",
+            receipt={
+                "schema_version": store_module.BUNDLE_SCHEMA,
+                "run_id": "r-1",
+                "stage": "capture",
+                "state": "failed",
+                "passed": False,
+            },
+        )
+        self.assertEqual(self.world.run_states["r-1"], "failed")
+        self.assertEqual(self.world.operations["r-1/capture:0"][1], "failed")
+        with self.assertRaisesRegex(PlatformStoreError, "failed"):
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/capture:0")
+        # Reconciliation stays the controlled continuation on a terminal run.
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="capture", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/reconcile:0").granted
+        )
+        self.assertEqual(self.world.operations[reconcile_op.operation_key][1], "running")
+
+    def test_completed_confirmation_refuses_a_foreign_sealed_scope(self) -> None:
+        self._running_run()
+        with self.assertRaisesRegex(PlatformStoreError, "another stage"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="completed",
+                checkpoint_uri="store://sealed/r-1/generate",
+                receipt=self._native_receipt("freeze"),
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "neither the current run"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="completed",
+                checkpoint_uri="store://sealed/run-9/freeze",
+                receipt=self._native_receipt("freeze"),
+            )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri="store://sealed/r-1/freeze",
+            receipt=self._native_receipt("freeze"),
+        )
+        self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
 
     def test_run_events_reads_a_bounded_ordered_window(self) -> None:
         self._running_run()

@@ -159,16 +159,8 @@ def discover_structure(
         "discovery_sha256": prepared.discovery_sha256,
     }
     target = targets.get(prepared.hardware_id)
-    if target is None:
-        discovery["findings"].append(
-            {
-                "code": "discovery.publication_target_missing",
-                "object": "assembly",
-                "message": "No model repository is configured for this CAD identity; publication is unavailable",
-                "blocking": False,
-                "detail": {"hardware_id": prepared.hardware_id, "publication_blocker": "repository_target"},
-            }
-        )
+    # The publication-target decision is the platform request's authority; a
+    # missing native routing entry is no longer a discovery finding.
     _state(on_event, "discover", "running", discovery=discovery)
     checked(on_event, "discover", "output", "discovery.definition", lambda: discovery)
 

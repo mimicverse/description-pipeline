@@ -36,6 +36,7 @@ from ..stages import (
     STAGE_STATES,
     TERMINAL_STAGE_STATES,
 )
+from .storage import SEALED_URI_PREFIX, parse_sealed_uri
 
 
 class PlatformStoreError(PipelineError):
@@ -78,6 +79,14 @@ class OperationRecord:
     run_id: str
     stage: str
     kind: str
+
+
+@dataclass(frozen=True)
+class OperationClaim:
+    """One claim result: the record plus whether this call took the execution grant."""
+
+    record: OperationRecord
+    granted: bool
 
 
 @dataclass(frozen=True)
@@ -154,9 +163,19 @@ _SET_RUN_OUTCOME = (
     " WHERE run_id = %s AND state NOT IN ('succeeded', 'failed', 'cancelled')"
 )
 _SETTLE_OPERATIONS = (
-    "UPDATE operation SET state = %s, updated_at = now()"
+    "UPDATE operation SET state = CASE WHEN kind = 'cancel' THEN 'succeeded' ELSE %s END,"
+    " updated_at = now()"
     " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile'"
-    " AND state IN ('running', 'unresolved')"
+    " AND state IN ('queued', 'running', 'unresolved')"
+)
+_SETTLE_UNKNOWN = (
+    "UPDATE operation SET state = 'unresolved', updated_at = now()"
+    " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'running'"
+)
+_SETTLE_RECONCILE = (
+    "UPDATE operation SET state = 'succeeded', updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND stage = %s AND kind = 'reconcile'"
+    " AND state <> 'succeeded'"
 )
 _READ_RUN_RECORD = (
     "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
@@ -168,8 +187,10 @@ _READ_STAGE_RECORDS = (
 _CONFIRMED_PUBLISH = (
     "SELECT 1 FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
-_READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri FROM stage WHERE run_id = %s AND stage = %s"
-_READ_STAGE = "SELECT state, receipt, checkpoint_uri FROM stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE_ROW = (
+    "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
+)
+_READ_STAGE = "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
 _LOCK_STAGE = "SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"
 _FIND_RECONCILE = (
     "SELECT 1 FROM operation"
@@ -416,6 +437,7 @@ class PlatformStore:
                 return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
             if stage not in STAGE_IDS:
                 raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+            self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind)
             _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
             return self._insert_operation(
                 connection,
@@ -427,36 +449,85 @@ class PlatformStore:
                 dispatch=dispatch or {},
             )
 
-    def claim_operation(self, *, run_id: str, stage: str, operation_key: str) -> OperationRecord:
+    def claim_operation(self, *, run_id: str, stage: str, operation_key: str) -> OperationClaim:
         """Claim a registered operation as ``running`` (queued -> running; idempotent).
 
-        This is the only transition into ``running``: the driver asserts that it
-        is about to execute the side effect the intent named.  Re-claiming the
-        same key keeps the first claim; a terminal or unknown operation is never
-        restarted - its outcome settles on this same operation.
+        ``granted`` is True only for the call that performed the transition: a
+        driver must execute the side effect exactly once, and a repeat call
+        (``granted`` False) is a query/reconciliation of the already-claimed
+        operation - never a permission to execute again.  A side-effect claim
+        is refused while the run or the stage is terminal/unresolved, or while
+        the stage carries an unresolved operation; the reconcile/cancel kinds
+        stay claimable because reconciling the unknown outcome is the
+        controlled continuation.  Run and stage rows are locked before the
+        transition, so a claim racing a terminal confirmation is settled inside
+        one transaction instead of by a caller-side read.
         """
 
         if stage not in STAGE_IDS:
             raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
-        row = None
-        existing = None
         with self._transaction() as connection:
             cursor = connection.cursor()
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            existing = cursor.fetchone()
+            if existing is None:
+                raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
+            record = OperationRecord(*existing)
+            if record.run_id != run_id or record.stage != stage:
+                raise OperationConflictError("The operation key belongs to a different run or stage")
+            self._guard_domain(connection, run_id=run_id, stage=stage, kind=record.kind)
             cursor.execute(_CLAIM_OPERATION, (operation_key, run_id, stage))
             row = cursor.fetchone()
-            if row is None:
-                cursor.execute(_FIND_OPERATION, (operation_key,))
-                existing = cursor.fetchone()
-        if row is not None:
-            return OperationRecord(*row)
-        if existing is None:
-            raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
-        record = OperationRecord(*existing)
-        if record.run_id != run_id or record.stage != stage:
-            raise OperationConflictError("The operation key belongs to a different run or stage")
-        if record.state == "running":
-            return record
-        raise PlatformStoreError(f"The operation is {record.state!r}; it cannot be claimed again")
+            if row is not None:
+                return OperationClaim(record=OperationRecord(*row), granted=True)
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            fresh_row = cursor.fetchone()
+            if fresh_row is None:  # pragma: no cover - the row cannot vanish inside the transaction
+                raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
+            fresh = OperationRecord(*fresh_row)
+            if fresh.state == "running":
+                return OperationClaim(record=fresh, granted=False)
+            raise PlatformStoreError(f"The operation is {fresh.state!r}; it cannot be claimed again")
+
+    def _guard_domain(self, connection, *, run_id: str, stage: str, kind: str) -> None:
+        """One stage's side-effect domain: terminal and unknown states freeze it.
+
+        Runs inside the write transaction (run and stage rows locked in the
+        same order as every stage confirmation) so a registration or claim
+        racing a terminal confirmation is settled transactionally.  A
+        non-terminal kind is refused for a run that is not running (terminal
+        or unknown), for a terminal or unresolved stage, and while the stage
+        carries an unresolved operation - an unknown outcome only ever permits
+        reconciling that same operation, never a new key or parameter.  The
+        reconcile/cancel kinds skip the guard: they are the controlled
+        continuation.
+        """
+
+        if kind in _TERMINAL_KINDS:
+            return
+        cursor = connection.cursor()
+        cursor.execute(_LOCK_RUN, (run_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+        state = row[0]
+        if state in _TERMINAL_RUN_STATES:
+            raise PlatformStoreError(f"The run is terminal ({state}); only cancel/reconcile operations continue")
+        if state != "running":
+            raise PlatformStoreError(
+                f"The run is not running ({state!r}); a side effect of the {stage!r}"
+                " stage may neither register nor claim"
+            )
+        cursor.execute(_LOCK_STAGE, (run_id, stage))
+        stage_row = cursor.fetchone()
+        current = stage_row[0] if stage_row else None
+        if current is not None and (current in TERMINAL_STAGE_STATES or current == "unresolved"):
+            raise PlatformStoreError(
+                f"The {stage!r} stage of run {run_id!r} is {current!r}; only reconcile/cancel continue"
+            )
+        cursor.execute(_FIND_UNKNOWN_ORIGIN, (run_id, stage))
+        if cursor.fetchone() is not None:
+            raise PlatformStoreError("The stage has an unresolved operation; reconcile that same operation instead")
 
     def _identity_operation(
         self, *, run_id: str, stage: str, kind: str, operation_key: str, params_digest: str
@@ -513,6 +584,9 @@ class PlatformStore:
         definition = None
         sealed_root = None
         if predecessor in CONFIRMED_STAGE_STATES:
+            self._verify_checkpoint_scope(
+                predecessor_row[2], run_id=run_id, stage=predecessor, reused_from_run=predecessor_row[3]
+            )
             definition, sealed_root = self._verify_sealed(predecessor_row[2], predecessor_row[1])
         _sealed_receipt(
             predecessor_row[1],
@@ -600,6 +674,9 @@ class PlatformStore:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
         definition = None
         sealed_root = None
+        self._verify_checkpoint_scope(
+            checkpoint_uri, run_id=run_id, stage=stage, reused_from_run=reused_from_run
+        )
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
             definition, sealed_root = self._verify_sealed(checkpoint_uri, receipt)
         _sealed_receipt(
@@ -671,6 +748,7 @@ class PlatformStore:
                     payload={"state": state},
                 )
                 self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+                cursor.execute(_SETTLE_RECONCILE, (operation_id, run_id, stage))
                 return
             cursor.execute(
                 _INSERT_STAGE,
@@ -696,10 +774,14 @@ class PlatformStore:
         A failed or cancelled stage ends its run; the confirmed publication
         ends it successfully.  The guarded update keeps the first terminal
         outcome: a later record never rewrites a succeeded, failed or
-        cancelled run.  The same transaction settles the stage's claimed
-        operation (``running``/``unresolved``) to the confirmed outcome; an
-        unresolved stage only sets its operation unknown and leaves the run in
-        place until the evidenced reconciliation.
+        cancelled run.  The same transaction settles the stage's operations:
+        every decided outcome closes the stage's non-reconcile operations -
+        claimed and never-claimed alike - to the mapped terminal state (a
+        ``cancel`` command closes as ``succeeded``: whether it actually
+        cancelled is the stage record's business), so no queued/running shadow
+        is left for maintenance.  An unresolved outcome freezes only the
+        claimed operation as unknown and leaves the run in place until the
+        evidenced reconciliation, which then settles the rest.
         """
 
         run_outcome: str | None = None
@@ -715,6 +797,9 @@ class PlatformStore:
         else:
             return
         cursor = connection.cursor()
+        if outcome == "unresolved":
+            cursor.execute(_SETTLE_UNKNOWN, (run_id, stage))
+            return
         cursor.execute(_SETTLE_OPERATIONS, (outcome, run_id, stage))
         if run_outcome is not None:
             cursor.execute(_SET_RUN_OUTCOME, (run_outcome, run_id))
@@ -727,6 +812,32 @@ class PlatformStore:
         row = cursor.fetchone()
         sequence = row[0] if row else 1
         cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
+
+    def _verify_checkpoint_scope(
+        self, checkpoint_uri, *, run_id: str, stage: str, reused_from_run: str | None
+    ) -> None:
+        """A parseable sealed locator must name this run (or its declared reuse source), never another.
+
+        Being able to parse a locator is not a consumption right: once a
+        reference reads as the standard ``store://sealed/<run_id>/<stage>``
+        locator, confirming or reusing it for another run or stage is refused.
+        Non-locator references stay opaque here and fail closed at their own
+        resolver contract.
+        """
+
+        if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith(SEALED_URI_PREFIX):
+            return
+        try:
+            uri_run, uri_stage = parse_sealed_uri(checkpoint_uri)
+        except PipelineError:
+            # Not a standard locator: the deploy-side resolver contract decides.
+            return
+        if uri_stage != stage:
+            raise PlatformStoreError("The sealed checkpoint names another stage than the confirmation")
+        if uri_run != run_id and uri_run != reused_from_run:
+            raise PlatformStoreError(
+                "The sealed checkpoint names a run that is neither the current run nor its declared reuse source"
+            )
 
     def _verify_sealed(self, checkpoint_uri, receipt) -> tuple[dict | None, Path]:
         """Rebind the real sealed delivery for any stage before any registration.
@@ -844,6 +955,7 @@ class PlatformStore:
         if row is None or row[0] != "completed":
             return None
         receipt = row[1]
+        self._verify_checkpoint_scope(row[2], run_id=run_id, stage=stage, reused_from_run=row[3])
         definition, sealed_root = self._verify_sealed(row[2], receipt)
         _sealed_receipt(
             receipt,

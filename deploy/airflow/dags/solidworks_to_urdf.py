@@ -898,8 +898,10 @@ def solidworks_to_urdf():
                 raise AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
             capture_archive_metadata(job)
             binding = import_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
-            binding["repository_slug"] = job.get("repository_slug")
-            binding["repository_base"] = job.get("repository_base")
+            # The trigger's conf target and its configured routing are the authority;
+            # the native job no longer carries publication routing.
+            binding["repository_slug"] = request.get("repository_slug")
+            binding["repository_base"] = request.get("repository_base")
             binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
             binding["source_run_id"] = None
             binding["from_stage"] = None

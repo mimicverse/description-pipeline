@@ -331,8 +331,9 @@ def import_native_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -
         expected_native_tool=native_tool,
     )
     _check_selected_capture(store, run_id, selection)
-    slug = job.get("repository_slug")
-    base = job.get("repository_base")
+    # Publication routing is the platform request's authority; the native job no
+    # longer carries routing fields, so the capture binding records none here.
+    slug = base = None
     hardware = revision = None
     source_path = store.capture_dir(run_id) / "input/source.json"
     if source_path.is_file():

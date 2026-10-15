@@ -1297,7 +1297,6 @@ class WindowsEndpoint:
                     "recomputes",
                     "retains",
                     "prerequisites",
-                    "target_changed",
                 )
             ):
                 raise EndpointProtocolError("rerun plan row is incomplete")

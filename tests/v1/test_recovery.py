@@ -15,7 +15,6 @@ ALL_OK = {
     "capture": "ok",
     "generate": "ok",
     "receipt": "ok",
-    "target": "ok",
 }
 
 
@@ -127,23 +126,6 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(plan["accepted"], plan)
         blocked = start_plan(discovered, "verify", probe=dict(ALL_OK, capture="absent"), tool="ok")
         self.assertEqual(blocked["earliest_required"], "capture")
-
-    def test_changed_target_never_reuses_the_parent_binding(self) -> None:
-        probe = dict(ALL_OK, target="changed")
-        for stage in ("capture", "generate", "verify", "publish"):
-            with self.subTest(stage=stage):
-                plan = start_plan(job(), stage, probe=probe, tool="ok")
-                self.assertFalse(plan["accepted"])
-                self.assertEqual(plan["reason"], "target_changed")
-                self.assertEqual(plan["earliest_required"], "discover")
-                self.assertTrue(start_plan(job(), plan["earliest_required"], probe=probe, tool="ok")["accepted"])
-        self.assertTrue(start_plan(job(), "discover", probe=probe, tool="ok")["accepted"])
-        self.assertTrue(start_plan(job(), "freeze", probe=probe, tool="ok")["accepted"])
-        rows = {row["stage"]: row for row in stage_reruns(job(), probe=probe, tool="ok")}
-        self.assertTrue(rows["publish"]["target_changed"])
-        self.assertEqual(rows["publish"]["prerequisites"]["target"], "changed")
-        self.assertFalse(rows["publish"]["eligible"])
-        self.assertTrue(rows["discover"]["eligible"])
 
     def test_failed_freeze_outranks_a_changed_dependency_snapshot(self) -> None:
         failed_freeze = {
