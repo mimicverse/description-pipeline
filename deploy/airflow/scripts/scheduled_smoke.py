@@ -800,7 +800,9 @@ def main() -> int:
     from description_pipeline.orchestration.portal import AirflowApi  # noqa: PLC0415
     from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
     from tests.v1.split_capture_fixture import (  # noqa: PLC0415
+        CONTROL_LIMITS,
         QUALIFICATION,
+        REQUIRED_CONTROL_GATES,
         build_fixture_capture,
     )
 
@@ -964,6 +966,7 @@ def main() -> int:
         portal_csrf = ""
         projection: dict = {}
         negatives: list[dict] = []
+        rejection: dict = {}
         sql_evidence: dict | None = None
         identity_stable: bool | None = None
         trigger_kind = "portal-airflow-client"
@@ -1132,6 +1135,49 @@ def main() -> int:
                         f"portal negative check {item['check']} answered {item['status']}, "
                         f"expected {item['expected']}"
                     )
+            # The expected rejection must be provable from the formal report surface: the
+            # portal's diagnostic preview is digest-bound to the retained verify receipt and
+            # carries the exact failing checks, so a verifier crash can never masquerade as
+            # the documented control rejection.  Bytes are consumed only through this route;
+            # the store is never searched directly.
+            status, preview_payload, _ = _http_json(
+                "GET", f"{portal_base}/api/runs/{run_id}/preview", token=token, cookies=portal_cookie
+            )
+            failing = {
+                str(item.get("id"))
+                for item in (preview_payload.get("failing_checks") or [])
+                if isinstance(item, dict)
+            }
+            unexpected_gates = sorted(failing - set(CONTROL_LIMITS))
+            missing_required = [gate for gate in REQUIRED_CONTROL_GATES if gate not in failing]
+            subject = str(preview_payload.get("subject_sha256") or "")
+            rejection = {
+                "served": status == 200,
+                "reason": preview_payload.get("reason"),
+                "verified": preview_payload.get("verified"),
+                "error": preview_payload.get("error"),
+                "failed_gates": sorted(failing),
+                "unexpected_gates": unexpected_gates,
+                "missing_required_gates": missing_required,
+                "subject_sha256": subject or None,
+                "urdf": preview_payload.get("urdf"),
+            }
+            if status != 200:
+                problems.append(f"the diagnostic preview could not be served: {status}")
+            else:
+                if (
+                    preview_payload.get("reason") != "verification_failed"
+                    or preview_payload.get("verified") is not False
+                ):
+                    problems.append(f"the rejection is not the bound verification failure: {rejection}")
+                if "URDF verification failed" not in str(preview_payload.get("error") or ""):
+                    problems.append(f"the rejection error is not the documented verification failure: {rejection}")
+                if unexpected_gates:
+                    problems.append(f"quality failed outside the documented control limits: {unexpected_gates}")
+                if missing_required:
+                    problems.append(f"quality skipped required gates: {missing_required}")
+                if len(subject) != 64 or any(char not in "0123456789abcdef" for char in subject):
+                    problems.append("the diagnostic preview carries no subject-bound delivery digest")
             sql_evidence = _platform_sql_evidence(
                 args.platform_schema,
                 run_id,
@@ -1221,6 +1267,7 @@ def main() -> int:
             "fixture_identity_stable": identity_stable,
             "platform_sql": sql_evidence,
             "platform_admission": admission,
+            "verify_rejection": rejection,
             "portal_projection": {
                 "dag_run_id": run_id,
                 "state": projection.get("state") if isinstance(projection, dict) else None,
