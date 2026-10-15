@@ -33,6 +33,10 @@ def _fixture_link_group_record(source, components, notes, masses, assembly):
     """Direct link group record for the integration fixture (read 1 = recombination)."""
 
     from tests.sources.support import compose_fixture_link_reads
+    from tests.sources import support as _support
+
+    # Fixtures keep the bodies/joints carriers; the product consumes groups/axis_requests.
+    source = _support.capture_requests(source)
 
     scene_like = type("Scene", (), {"components": components, "mass_properties": masses})()
     effective = (notes or {}).get("effective_instances") or {}

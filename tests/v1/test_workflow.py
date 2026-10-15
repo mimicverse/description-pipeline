@@ -128,9 +128,60 @@ class WorkflowTests(unittest.TestCase):
             "schema_version": "solidworks-to-urdf.native-discovery/v1",
             "contract": "native-discovery/v1", "run_id": "metadata-control",
             "handoff_sha256": digest(files), "native_files": files, "identity": identity,
+            "components": [
+                {"instance_id": "base", "document": "part.SLDPRT"},
+                {"instance_id": "arm", "document": "part.SLDPRT"},
+            ],
         }
         record_path = self.package / "discovery/native-discovery.json"
-        write_json(record_path, record)
+        # The sealed carrier payload consumers rebuild from (the same shape the canonical
+        # producer seals): the raw native record embeds the recorded components.
+        write_json(
+            record_path,
+            {
+                "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                "run_id": record["run_id"],
+                "derivation": {
+                    "main_assembly": "assembly.SLDASM",
+                    "configuration": "Default",
+                    "frozen_names": {},
+                    "record_roots": [],
+                },
+                "identity": {
+                    "main_assembly": "assembly.SLDASM",
+                    "delivery_configuration": "Default",
+                    "robot_name": "robot",
+                },
+                "records": [],
+                "raw": record,
+                "native_files": dict(sorted(files.items())),
+            },
+        )
+        write_json(
+            self.package / "capture-plan.json",
+            {
+                "schema_version": "solidworks-to-urdf.capture-plan/v1",
+                "run_id": record["run_id"],
+                "handoff_sha256": digest(files),
+                "discovery_sha256": file_digest(record_path),
+                "main_assembly": "assembly.SLDASM",
+                "configuration": "Default",
+                "identity": identity,
+                "selection": {"main_assembly": "assembly.SLDASM", "configuration": "Default", "files": files},
+                "objects": [
+                    {"name": "base", "document": "part.SLDPRT"},
+                    {"name": "arm", "document": "part.SLDPRT"},
+                ],
+                "groups": [{"name": "link-group", "components": ["base", "arm"]}],
+                "axis_requests": [],
+                "datums": [],
+                "evidence_requests": [
+                    "evidence/capture.json",
+                    "evidence/geometry/",
+                    "evidence/native-runtime.json",
+                ],
+            },
+        )
         author["provenance"] = {
             "generator": "native-discovery", "generator_version": "1", "contract": record["contract"],
             "run_id": record["run_id"], "discovery_sha256": file_digest(record_path),
