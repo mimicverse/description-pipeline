@@ -16,8 +16,6 @@ def write_manifest(root: Path, *, kind: str, identity: dict, evidence_class: str
         raise PipelineError("Snapshot requires source kind and identity")
     scene = "raw/scene_raw.json" if kind == "solidworks" else "scene.json"
     confined(root, scene)
-    if kind == "solidworks":
-        confined(root, "raw/source_config.json")
     manifest = {
         "schema_version": SCHEMA,
         "kind": kind,
@@ -26,8 +24,6 @@ def write_manifest(root: Path, *, kind: str, identity: dict, evidence_class: str
         "scene": scene,
         "files": inventory(root, exclude=("manifest.json",)),
     }
-    if kind == "solidworks":
-        manifest["source_config"] = "raw/source_config.json"
     write_json(root / "manifest.json", manifest)
     return verify_snapshot(root)
 
@@ -57,11 +53,9 @@ def verify_snapshot(root: Path) -> dict:
         raise PipelineError("Source scene is not bound by manifest")
     if manifest.get("kind") == "solidworks" and (
         manifest.get("scene") != "raw/scene_raw.json"
-        or manifest.get("source_config") != "raw/source_config.json"
-        or manifest["source_config"] not in declared
         or "scene.json" in declared
     ):
-        raise PipelineError("SolidWorks snapshots must bind raw readings and source configuration only")
+        raise PipelineError("SolidWorks snapshots must bind the raw readings only")
     return manifest
 
 

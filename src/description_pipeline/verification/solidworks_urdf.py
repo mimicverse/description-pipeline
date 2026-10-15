@@ -233,7 +233,14 @@ def _frozen_source_config(root) -> dict:
 
     delivery = Path(root).resolve()
     delivery = delivery.parent if delivery.name == "evidence" else delivery
-    config = read_data(confined(delivery, "evidence/raw/source_config.json"))
+    from ..sources.solidworks.discovery import source_definition
+
+    config = source_definition(
+        delivery,
+        discovery_name="evidence/discovery.json",
+        cad_prefix="input/cad/",
+        records_prefix="input/records/",
+    )
     _require(isinstance(config, dict), "The frozen source config is not an object")
     return config
 

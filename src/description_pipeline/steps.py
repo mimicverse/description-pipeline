@@ -495,6 +495,14 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         raise PipelineError("The sealed capture plan configuration disagrees with the recorded saved configuration")
     if plan.get("run_id") != payload.get("run_id"):
         raise PipelineError("The sealed capture plan names another run than the sealed discovery")
+    raw_documents = {
+        str(item.get("instance_id") or item.get("name2")): str(item.get("document") or "").replace("\\", "/")
+        for item in (record.get("components") or [])
+        if isinstance(item, dict)
+        and not item.get("suppressed")
+        and isinstance(item.get("instance_id") or item.get("name2"), str)
+    }
+    registered = set(raw_documents)
     objects = plan.get("objects")
     if not isinstance(objects, list) or not objects:
         raise PipelineError("The sealed capture plan carries no native object selectors")
@@ -515,16 +523,12 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 raise PipelineError("The sealed capture plan carries an unsafe selector document") from error
             if not document.lower().endswith((".sldprt", ".sldasm")):
                 raise PipelineError("The sealed capture plan carries a non-CAD selector document")
+            recorded_document = raw_documents.get(name, "")
+            if recorded_document and recorded_document != document:
+                raise PipelineError("The sealed capture plan binds another document to a native instance")
         names.append(name)
     if len(set(names)) != len(names):
         raise PipelineError("The sealed capture plan repeats a native object selector")
-    registered = {
-        str(item.get("instance_id") or item.get("name2"))
-        for item in (record.get("components") or [])
-        if isinstance(item, dict)
-        and not item.get("suppressed")
-        and isinstance(item.get("instance_id") or item.get("name2"), str)
-    }
     if not registered or not set(names) <= registered:
         raise PipelineError("The sealed capture plan names instances outside the sealed record")
     datums = plan.get("datums")
@@ -559,7 +563,6 @@ def capture_evidence(
         PLAN_FILE,
         PLAN_SCHEMA,
         SOURCE_FILE,
-        source_definition,
     )
     from .sources.solidworks.freeze import freeze
     from .sources.solidworks.input import native_source_closure
@@ -575,13 +578,29 @@ def capture_evidence(
             error = PipelineError("The CAD package does not meet the input specification")
             error.details = {"errors": report.get("errors", [])}
             raise error
-        # Interim: the sealed plan is consumed and qualified first (and enforced
-        # against the actual capture); the capture configuration still rebuilds
-        # its carriers from the sealed record until the platform-side carrier
-        # migration lands.
+        # The capture consumes exactly the sealed plan and the sealed originals:
+        # a minimal capture policy drives the native API, and the plan's native
+        # selectors/datums/evidence requests are enforced against the capture.
         _sealed_source, plan = _consume_sealed_definition(package)
-        source = source_definition(package)
-        source["closure"] = native_source_closure(package)
+        main = str(plan["main_assembly"] or "")
+        assembly = package / main
+        if not assembly.is_file():
+            raise PipelineError("The sealed capture plan names no staged main assembly")
+        configuration = plan.get("configuration")
+        if not isinstance(configuration, str) or not configuration:
+            raise PipelineError("The sealed capture plan carries no saved configuration")
+        source = {
+            "provider": "solidworks",
+            "assembly": str(assembly.resolve()),
+            "configuration": configuration,
+            "require_saved": True,
+            "document_suffixes": [".sldasm", ".sldprt"],
+            "geometry": {"enabled": True, "format": "stl_binary"},
+            "coordinate_systems": [str(name) for name in plan["datums"]],
+            "material_source": "cad",
+            "allowed_roots": [str(package.resolve())],
+            "closure": native_source_closure(package),
+        }
         definition = {"source": source, "plan": plan}
         prepared_files = package_inventory(package)
         _archive_input(package, staging)

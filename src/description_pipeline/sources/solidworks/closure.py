@@ -40,7 +40,15 @@ def derive_mass_closure(evidence_root) -> dict:
     root = Path(evidence_root)
     native = _read(root, "raw/mass_closure.json")
     scene_raw = _read(root, "raw/scene_raw.json")
-    config = _read(root, "raw/source_config.json")
+    from .discovery import source_definition
+
+    delivery = root.parent if root.name == "evidence" else root
+    config = source_definition(
+        Path(delivery),
+        discovery_name="evidence/discovery.json",
+        cad_prefix="input/cad/",
+        records_prefix="input/records/",
+    )
     if not isinstance(native, dict) or not isinstance(scene_raw, dict) or not isinstance(config, dict):
         raise ValueError("closure evidence files must contain JSON objects")
     return {

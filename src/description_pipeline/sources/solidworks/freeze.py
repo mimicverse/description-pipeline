@@ -2338,7 +2338,6 @@ def _freeze_local(
 
         # Scene construction is portable work. Seal its exact inputs here;
         # Linux derives the scene without rewriting this native snapshot.
-        write_json(staging / "raw" / "source_config.json", cfg)
 
         # Product-convention proof and normalization, once, at the single
         # throat where the raw native evidence is final: the sealed dual reads

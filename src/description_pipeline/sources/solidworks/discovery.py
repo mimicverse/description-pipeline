@@ -4363,7 +4363,13 @@ def _derive_carriers(
     return bodies, joints, frames, derived_names
 
 
-def source_definition(package: Path) -> dict:
+def source_definition(
+    package: Path,
+    *,
+    discovery_name: str = DISCOVERY_FILE,
+    cad_prefix: str = "",
+    records_prefix: str = "",
+) -> dict:
     """Rebuild one prepared package's in-memory source definition (the freeze/scene ``source``).
 
     The frozen raw record, the recorded derivation settings and the embedded
@@ -4375,7 +4381,7 @@ def source_definition(package: Path) -> dict:
     import tempfile
 
     package = Path(package)
-    payload = read_data(package / DISCOVERY_FILE)
+    payload = read_data(package / discovery_name)
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
     derivation = payload.get("derivation") if isinstance(payload.get("derivation"), dict) else {}
@@ -4388,7 +4394,7 @@ def source_definition(package: Path) -> dict:
                 continue
             target = confined(root, relative, exists=False)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(confined(package, str(entry.get("package_file") or "")), target)
+            shutil.copyfile(confined(package, records_prefix + str(entry.get("package_file") or "")), target)
         settings = DiscoverySettings(
             record_roots=(root,),
             frozen_names=dict(derivation.get("frozen_names") or {}),
@@ -4406,7 +4412,7 @@ def source_definition(package: Path) -> dict:
         raise PipelineError(
             f"the frozen discovery carriers cannot be rebuilt: {[item['code'] for item in blocking][:5]}"
         )
-    discovery_sha256 = hashlib.sha256((package / DISCOVERY_FILE).read_bytes()).hexdigest()
+    discovery_sha256 = hashlib.sha256((package / discovery_name).read_bytes()).hexdigest()
     by_name = {body["name"]: body for body in bodies}
     joints_out: list[dict] = []
     for joint in sorted(joints, key=lambda item: item.get("name") or ""):
@@ -4499,7 +4505,7 @@ def source_definition(package: Path) -> dict:
     source: dict[str, Any] = {
         "provider": "solidworks",
         "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
-        "assembly": str(confined(package.resolve(), str(view["main_assembly"]))),
+        "assembly": str(confined(package.resolve(), cad_prefix + str(view["main_assembly"]))),
         "configuration": view["delivery_configuration"],
         "allowed_roots": [str(package.resolve())],
         "document_suffixes": [".sldasm", ".sldprt"],
