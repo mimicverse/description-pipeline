@@ -181,6 +181,8 @@ class ImportedSourceTests(unittest.TestCase):
                 "components": components,
                 "files": dict(native if raw_files is None else raw_files),
                 "identity": {},
+                "saved_configuration": "Default",
+                "document_state": support.saved_document_state(),
                 **(extra_raw or {}),
             },
             "identity": {},

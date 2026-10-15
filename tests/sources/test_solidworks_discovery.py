@@ -2143,6 +2143,40 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertIn("discovery.configuration", [item["code"] for item in report["errors"]])
 
 
+    def test_verifier_requires_the_configuration_proof_without_a_generated_claim(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+
+        def mutation(claim: str, observation: str):
+            def apply(payload: dict) -> None:
+                if claim == "omitted":
+                    payload["identity"].pop("delivery_configuration", None)
+                elif claim == "null":
+                    payload["identity"]["delivery_configuration"] = None
+                if observation == "absent":
+                    payload["raw"].pop("document_state", None)
+                    payload["raw"].pop("saved_configuration", None)
+                elif observation == "contradicting":
+                    for side in ("before", "after"):
+                        payload["raw"]["document_state"][side]["configuration"] = "Other"
+
+            return apply
+
+        for label, claim, observation, expected in (
+            ("omitted_claim_with_observations", "omitted", "kept", True),
+            ("omitted_claim_no_observation", "omitted", "absent", False),
+            ("null_claim_no_observation", "null", "absent", False),
+            ("omitted_claim_contradictory_observation", "omitted", "contradicting", False),
+        ):
+            with self.subTest(case=label):
+                delivery = self._deliver(output)
+                self._tamper_delivered(delivery, "evidence/discovery.json", mutation(claim, observation))
+                report = verify_discovery(delivery)
+                self.assertEqual(report["passed"], expected)
+                if not expected:
+                    self.assertIn("discovery.configuration", [item["code"] for item in report["errors"]])
+
+
 class NativePropertyScopeTests(unittest.TestCase):
     def test_conflicting_dp_values_across_scopes_block(self):
         with self.assertRaises(CadError) as raised:
