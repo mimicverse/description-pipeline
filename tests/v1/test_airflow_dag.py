@@ -537,5 +537,127 @@ class DagTests(unittest.TestCase):
         self.assertEqual(binding["state"], "linked")
 
 
+@unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
+class PlatformRegistrationTests(unittest.TestCase):
+    """The production registration wiring: every stage seals its tree and confirms for real."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        bag = DagBag(str(DAG_DIR))
+        self.module = sys.modules[bag.dags["solidworks_to_urdf"].task_dict["freeze"].python_callable.__module__]
+        self.temporary = tempfile.TemporaryDirectory(prefix="platform-registration-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "store-root"
+        self.root.mkdir()
+        self.calls: list[dict] = []
+        platform = SimpleNamespace(confirm_stage=lambda **payload: self.calls.append(payload))
+        binding = patch.object(self.module, "_platform_binding", return_value=(platform, self.root))
+        binding.start()
+        self.addCleanup(binding.stop)
+
+    def _tree(self, *, run_id: str = "run-1", stage: str = "generate") -> Path:
+        from tests.v1.test_platform_store import build_sealed_delivery
+
+        tree = Path(self.temporary.name) / "store-root" / run_id / "stages" / stage
+        tree.mkdir(parents=True)
+        build_sealed_delivery(tree)
+        return tree
+
+    def test_a_completed_portable_stage_is_sealed_and_confirmed(self) -> None:
+        from description_pipeline.delivery import read_delivery_manifest
+
+        tree = self._tree(stage="generate")
+        subject = read_delivery_manifest(tree)["subject"]["digest"]
+        receipt = {"run_id": "run-1", "state": "generated", "subject_sha256": subject}
+        with patch.object(self.module, "run_portable_stage", return_value=receipt):
+            result = self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+        self.assertEqual(result, receipt)
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual(call["run_id"], "run-1")
+        self.assertEqual(call["stage"], "generate")
+        self.assertEqual(call["state"], "completed")
+        self.assertEqual(call["checkpoint_uri"], "store://sealed/run-1/generate")
+        self.assertEqual(call["receipt"]["state"], "generated")
+        self.assertIs(call["receipt"]["passed"], False)
+        paths = {record["path"] for record in call["receipt"]["artifacts"]}
+        self.assertIn("model/robot.json", paths)
+        self.assertIn("reports/quality.json", paths)
+        self.assertTrue((self.root / "sealed" / "run-1" / "generate" / "manifest.json").is_file())
+
+    def test_a_stage_failure_converges_with_the_actual_products(self) -> None:
+        tree = self._tree(stage="generate")
+        with (
+            patch.object(self.module, "run_portable_stage", side_effect=RuntimeError("stage exploded")),
+            self.assertRaises(RuntimeError),
+        ):
+            self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+        call = self.calls[0]
+        self.assertEqual(call["state"], "failed")
+        self.assertEqual(call["receipt"]["state"], "failed")
+        self.assertIs(call["receipt"]["passed"], False)
+        self.assertIn("stage exploded", call["receipt"]["error"])
+        self.assertEqual(call["checkpoint_uri"], "store://sealed/run-1/generate")
+
+    def test_an_early_failure_without_a_tree_registers_its_shape_only(self) -> None:
+        absent = Path(self.temporary.name) / "absent"
+        with (
+            patch.object(self.module, "run_portable_stage", side_effect=RuntimeError("no products")),
+            self.assertRaises(RuntimeError),
+        ):
+            self.module._portable_registered(object(), "run-1", "generate", tree=absent)
+        call = self.calls[0]
+        self.assertEqual(call["state"], "failed")
+        self.assertEqual(call["receipt"]["state"], "failed")
+        self.assertNotIn("checkpoint_uri", call)
+
+    def test_the_freeze_stage_seals_the_admitted_originals(self) -> None:
+        from description_pipeline.delivery import read_delivery_manifest
+        from description_pipeline.io import digest as io_digest
+
+        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        (run_dir / "input").mkdir(parents=True)
+        (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        intake = Path(self.temporary.name) / "intake"
+        (intake / "cad").mkdir(parents=True)
+        (intake / "cad" / "part.sldprt").write_bytes(b"cad-bytes")
+        (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
+        upload_files = {"assembly.sldasm": "a" * 64, "cad/part.sldprt": "b" * 64}
+        stages = run_dir / "stages"
+        store = SimpleNamespace(run_dir=lambda _run: run_dir, stage_dir=lambda _run, stage: stages / stage)
+        self.module._register_freeze_stage(store, "run-1", intake=intake, upload_files=upload_files)
+        call = self.calls[0]
+        self.assertEqual(call["stage"], "freeze")
+        self.assertEqual(call["state"], "completed")
+        self.assertEqual(call["receipt"]["state"], "frozen")
+        self.assertEqual(call["receipt"]["handoff_sha256"], io_digest(upload_files))
+        tree = stages / "freeze"
+        self.assertTrue((tree / "input" / "cad" / "part.sldprt").is_file())
+        self.assertTrue((tree / "input" / "assembly.sldasm").is_file())
+        self.assertTrue((tree / "input" / "request.json").is_file())
+        manifest = read_delivery_manifest(tree)
+        self.assertIn("input/assembly.sldasm", {record["path"] for record in manifest["subject"]["files"]})
+
+    def test_the_native_stages_seal_one_snapshot_and_confirm_in_order(self) -> None:
+        from description_pipeline.io import read_data
+        from tests.v1.test_platform_store import build_sealed_delivery
+
+        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        capture = run_dir / "capture"
+        capture.mkdir(parents=True)
+        build_sealed_delivery(capture)
+        store = SimpleNamespace(run_dir=lambda _run: run_dir, capture_dir=lambda _run: capture)
+        self.module._register_native_stages(store, "run-1")
+        self.assertEqual([call["stage"] for call in self.calls], ["discover", "capture"])
+        self.assertEqual([call["state"] for call in self.calls], ["completed", "completed"])
+        self.assertEqual([call["receipt"]["state"] for call in self.calls], ["discovered", "native_complete"])
+        native_tool = read_data(capture / "reports" / "native-tool.json")
+        for call in self.calls:
+            self.assertEqual(call["receipt"]["native_tool"], native_tool)
+        self.assertTrue((self.root / "sealed" / "run-1" / "discover").is_dir())
+        self.assertTrue((self.root / "sealed" / "run-1" / "capture").is_dir())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -260,7 +260,11 @@ class SplitWorkflowTests(unittest.TestCase):
             "from_stage": None,
         }
         with (
-            patch.object(module, "_linux_store", return_value=object()),
+            patch.object(
+                module,
+                "_linux_store",
+                return_value=SimpleNamespace(stage_dir=lambda _run, stage: Path("/nonexistent") / RUN_ID / stage),
+            ),
             patch.object(module, "run_portable_stage", return_value=_failed_verify_receipt()),
         ):
             verify = module.dag.get_task("verify").python_callable
@@ -321,6 +325,7 @@ class SplitWorkflowTests(unittest.TestCase):
             with (
                 patch.object(module, "_linux_store", return_value=store),
                 patch.object(module, "run_portable_stage", return_value=_passing_publish_receipt()),
+                patch.object(module, "_register_completed_stage", side_effect=lambda *args, **kwargs: None),
                 patch.object(module, "config_from_airflow_connection", return_value=config),
             ):
                 publish = module.dag.get_task("publish").python_callable
