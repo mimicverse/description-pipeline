@@ -459,10 +459,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
         )
         allowed = auth.DagDetails(id=auth.ALLOWED_DAG_ID)
         transport_failure = {
-            "freeze": "success",
-            "discover": "success",
-            "capture": "failed",
-            "publish": "upstream_failed",
+            "resolve_handoff": "success",
+            "start_job": "success",
+            "wait_for_job": "failed",
+            "confirm_job": "upstream_failed",
         }
         self._record_run(
             "run-own",
@@ -479,29 +479,29 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self._record_run(
             "run-resolve-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"freeze": "failed", "discover": "upstream_failed"},
+            tasks={"resolve_handoff": "failed", "start_job": "upstream_failed"},
         )
         self._record_run(
             "run-start-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"freeze": "success", "discover": "failed"},
+            tasks={"resolve_handoff": "success", "start_job": "failed"},
         )
         self._record_run(
             "run-start-unproven",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"discover": "failed"},
+            tasks={"start_job": "failed"},
         )
         self._record_run(
             "run-mapped",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"freeze": "success", "discover": "failed"},
+            tasks={"resolve_handoff": "success", "wait_for_job": "failed"},
         )
         with self.sessions() as session:
             session.execute(
                 TaskInstance.__table__.insert().values(
                     dag_id=auth.ALLOWED_DAG_ID,
                     run_id="run-mapped",
-                    task_id="discover",
+                    task_id="wait_for_job",
                     map_index=0,
                     state="success",
                     pool="default_pool",
@@ -519,12 +519,12 @@ class FeishuAuthManagerTests(unittest.TestCase):
             "run-running",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
             state="running",
-            tasks={"discover": "failed"},
+            tasks={"wait_for_job": "failed"},
         )
         self._record_run(
             "run-no-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"freeze": "success"},
+            tasks={"resolve_handoff": "success"},
         )
 
         def decide(
@@ -548,7 +548,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-legacy"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-damaged"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-resolve-failed"))
-        # A failed discover is retryable only with a positively successful resolution.
+        # A failed start_job is retryable only with a positively successful resolution.
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-failed"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-mapped"))
@@ -603,72 +603,67 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertEqual(seen, [True, False])
         self.assertIsNone(request_context.bound_request())
 
-    def test_transport_retry_classification_matrix(self) -> None:
-        classify = run_ownership.classify_transport_retry
+    def test_recovery_classification_matrix(self) -> None:
+        classify = run_ownership.classify_recovery
 
-        eligible = classify(
+        # (2) evidence corruption: the capture is sealed; only the import re-reads.
+        sealed = classify(
             "failed",
-            {
-                "freeze": "success",
-                "discover": "success",
-                "capture": "failed",
-                "publish": "upstream_failed",
-            },
+            {"resolve_handoff": "success", "start_job": "success", "fetch_capture": "failed"},
+            "native_complete",
         )
-        self.assertTrue(eligible.eligible)
-        self.assertEqual(eligible.reason, "transport_recovery")
-        self.assertEqual(eligible.cleared_tasks, ("capture", "publish"))
-        for state, tasks, reason in (
-            ("running", {"discover": "failed"}, "run_active"),
-            ("success", {"discover": "failed"}, "run_succeeded"),
-            ("failed", {}, "no_failed_transport_task"),
-            ("failed", {"freeze": "failed"}, "resolution_or_capture_failed"),
-            ("failed", {"discover": "failed"}, "resolution_not_success"),
-            (
-                "failed",
-                {"freeze": "success", "publish": "failed"},
-                "publication_failed",
-            ),
-            (
-                "failed",
-                {"freeze": "success", "other_task": "failed"},
-                "unknown_failed_task",
-            ),
-            (
-                "failed",
-                {"freeze": "success", "publish": "upstream_failed"},
-                "no_failed_transport_task",
-            ),
-            (
-                "failed",
-                {
-                    "freeze": "success",
-                    "discover": run_ownership.AMBIGUOUS_TASK_STATE,
-                },
-                "unknown_failed_task",
-            ),
+        self.assertTrue(sealed.eligible)
+        self.assertEqual(sealed.classification, run_ownership.RECOVERY_EVIDENCE_CORRUPTION)
+        self.assertEqual(sealed.reason, "sealed_evidence_reimport")
+        self.assertEqual(sealed.cleared_tasks, ("fetch_capture",))
+        # (1) temporary disconnection: the same native job is still in flight.
+        in_flight = classify("failed", {"resolve_handoff": "success", "start_job": "failed"}, "running")
+        self.assertTrue(in_flight.eligible)
+        self.assertEqual(in_flight.classification, run_ownership.RECOVERY_TEMPORARY_DISCONNECTION)
+        self.assertEqual(in_flight.cleared_tasks, ("start_job",))
+        for state, tasks, status, reason in (
+            ("running", {"start_job": "failed"}, None, "run_active"),
+            ("success", {"start_job": "failed"}, None, "run_succeeded"),
+            ("failed", {}, None, "unknown_failed_task"),
+            ("failed", {"other_task": "failed"}, None, "unknown_failed_task"),
+            ("failed", {"start_job": run_ownership.AMBIGUOUS_TASK_STATE}, None, "unknown_failed_task"),
+            ("failed", {"start_job": "failed"}, "failed", "native_terminal_failure"),
+            ("failed", {"run_publish": "failed"}, "native_complete", "publication_response_unknown"),
         ):
-            with self.subTest(state=state, tasks=tasks):
-                assessment = classify(state, tasks)
+            with self.subTest(state=state, tasks=tasks, status=status):
+                assessment = classify(state, tasks, status)
                 self.assertFalse(assessment.eligible)
                 self.assertEqual(assessment.reason, reason)
-        start_retry = classify(
-            "failed", {"freeze": "success", "discover": "failed", "capture": "upstream_failed"}
-        )
-        self.assertTrue(start_retry.eligible)
-        self.assertEqual(start_retry.cleared_tasks, ("capture", "discover"))
 
-    def test_split_transport_retry_preserves_the_engineering_boundary(self) -> None:
-        classify = run_ownership.classify_transport_retry
-        tasks = dict.fromkeys(run_ownership.KNOWN_TASKS, "upstream_failed")
-        tasks.update(freeze="success", discover="failed")
-        self.assertTrue(classify("failed", tasks).eligible)
-        tasks.update(discover="success", capture="failed")
-        self.assertTrue(classify("failed", tasks).eligible)
-        for stage in ("generate", "verify", "publish"):
-            with self.subTest(stage=stage):
-                changed = {**tasks, "capture": "success", stage: "failed"}
-                self.assertFalse(classify("failed", changed).eligible)
+    def test_split_recovery_preserves_the_engineering_boundary(self) -> None:
+        classify = run_ownership.classify_recovery
+        portable = classify(
+            "failed",
+            {
+                "resolve_handoff": "success",
+                "start_job": "success",
+                "fetch_capture": "success",
+                "run_generate": "upstream_failed",
+                "run_verify": "failed",
+            },
+            "native_complete",
+        )
+        self.assertTrue(portable.eligible)
+        self.assertEqual(portable.classification, run_ownership.RECOVERY_TEMPORARY_DISCONNECTION)
+        self.assertEqual(portable.cleared_tasks, ("run_generate", "run_verify"))
+        # An attempted publication is never retried in place; an unattempted one is untouched.
+        attempted = classify(
+            "failed",
+            {
+                "resolve_handoff": "success",
+                "start_job": "success",
+                "fetch_capture": "success",
+                "run_publish": "failed",
+            },
+            "native_complete",
+        )
+        self.assertFalse(attempted.eligible)
+        self.assertEqual(attempted.classification, run_ownership.RECOVERY_UNKNOWN_PUBLICATION)
 
     def test_clear_body_candidate_matrix_and_replay(self) -> None:
         evaluate = request_context.evaluate_clear_candidate

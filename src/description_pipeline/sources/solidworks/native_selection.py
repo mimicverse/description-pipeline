@@ -65,10 +65,16 @@ _COMPONENT_INTERNAL_ID_MISMATCH = 5
 _COMPONENT_STATES = (0, 1, 2, 3, 4)
 
 #: CU pre-verification (W6): the main document's declared delivery identity.
-#: The list mirrors the W5 probe-v4 check set; admission refuses fail-closed
-#: when a required declaration is absent (or the property set is unreadable),
-#: so no native capture runs on a package that only carries submitted values.
-REQUIRED_DECLARATIONS = (
+#: Frozen identity contract: the property set must be readable - an unreadable
+#: set is unknown, never missing, and refuses the run.  Per field: an absent
+#: ``dp.hardware_id`` adopts the configured target downstream (marked
+#: ``platform_configuration``); an absent ``dp.delivery_configuration`` keeps
+#: the natively saved configuration and its source while a present value is
+#: carried for the discovery-side saved/actual consistency check; absence of
+#: revision, owner, control or change summary is a review-displayed gap that
+#: never borrows a submitted value.  Only an unreadable set and an unusable
+#: present configuration refuse here.
+IDENTITY_DECLARATIONS = (
     "dp.hardware_id",
     "dp.revision",
     "dp.owner",
@@ -297,28 +303,45 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     declarations_error = readings.get("identity_properties_error")
     missing_declarations = [
         key
-        for key in REQUIRED_DECLARATIONS
+        for key in IDENTITY_DECLARATIONS
         if not (isinstance(declarations.get(key), str) and declarations[key].strip())
     ]
+    configuration_value = declarations.get("dp.delivery_configuration")
+    configuration_declared = configuration_value.strip() if isinstance(configuration_value, str) else None
+    configuration_invalid = configuration_value is not None and not configuration_declared
     preverify = {
         "schema": "m303-probe-v4/selection",
         "open_errors": open_errors,
         "open_warnings": open_status.get("warnings"),
-        "declarations": {key: declarations.get(key) for key in (*REQUIRED_DECLARATIONS, *OPTIONAL_DECLARATIONS)},
+        "declarations": {key: declarations.get(key) for key in (*IDENTITY_DECLARATIONS, *OPTIONAL_DECLARATIONS)},
         "declarations_missing": missing_declarations,
         "declarations_error": declarations_error,
-        "verdict": "attention" if (missing_declarations or declarations_error) else "pass",
+        "delivery_configuration": {
+            "declared": configuration_declared,
+            "source": "cad" if configuration_declared else "native_saved_configuration",
+            "verbatim": configuration_value,
+        },
+        "verdict": "attention" if (declarations_error or configuration_invalid) else "pass",
     }
-    if missing_declarations or declarations_error:
+    if declarations_error:
         problems.append(
             _problem(
-                "selection_declarations_missing",
-                "the staged main carries no complete declared delivery identity (dp.*); "
-                "submitted values never replace CAD-authored declarations",
+                "selection_identity_unreadable",
+                "the staged main's declared delivery identity (dp.*) is unreadable; an unread "
+                "identity is unknown, never missing, and submitted values never replace it",
                 document=main,
-                missing=missing_declarations,
                 declarations_error=declarations_error,
                 declarations=preverify["declarations"],
+            )
+        )
+    if configuration_invalid:
+        problems.append(
+            _problem(
+                "selection_configuration_invalid",
+                "the declared delivery configuration is present but not usable text; the natively "
+                "saved configuration is never replaced by a default or a submitted value",
+                document=main,
+                configuration=configuration_value,
             )
         )
     for record in occurrences:

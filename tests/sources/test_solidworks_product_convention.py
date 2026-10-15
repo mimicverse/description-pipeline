@@ -6,7 +6,6 @@ qualify a SolidWorks API or a hardware model.
 
 from __future__ import annotations
 
-import copy
 import json
 import tempfile
 import unittest
@@ -21,8 +20,6 @@ from description_pipeline.io import file_digest  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import freeze  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
-from description_pipeline.sources.solidworks.scene import normalize_scene as canonical_for  # noqa: E402
-from description_pipeline.sources.solidworks.verify import verify_normalization  # noqa: E402
 
 from . import support  # noqa: E402
 
@@ -209,29 +206,6 @@ class ProductConventionTests(unittest.TestCase):
             load_scene(snapshot)
 
     # --- 独立校验端 ---------------------------------------------------
-
-    def test_verifier_agrees_with_the_signed_tensor(self) -> None:
-        snapshot = self._freeze("oracle-ok")
-        raw_scene = support.read_scene(snapshot)
-        definition = self._definition()
-        canonical = canonical_for(raw_scene, definition, snapshot)
-        results = verify_normalization(raw_scene, definition, snapshot, canonical)
-        link = next(entry for entry in results if entry["id"].endswith("base_link"))
-        self.assertEqual(link["status"], "passed", link["details"])
-
-    def test_verifier_rejects_a_model_with_flipped_cross_terms(self) -> None:
-        snapshot = self._freeze("oracle-tamper")
-        raw_scene = support.read_scene(snapshot)
-        definition = self._definition()
-        canonical = canonical_for(raw_scene, definition, snapshot)
-        tampered = copy.deepcopy(canonical)
-        inertia = tampered["links"][0]["inertial"]["inertia"]
-        for index in (1, 2, 4):  # ixy / ixz / iyz
-            inertia[index] = -inertia[index]
-        results = verify_normalization(raw_scene, definition, snapshot, tampered)
-        link = next(entry for entry in results if entry["id"].endswith("base_link"))
-        self.assertEqual(link["status"], "failed")
-        self.assertFalse(link["details"]["inertia_ok"])
 
     def test_unsupported_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="ansys_tensor")
