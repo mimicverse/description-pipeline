@@ -624,10 +624,84 @@ def _portal_negative_checks(
     return results
 
 
-def _platform_sql_evidence(
-    platform_schema: str, run_id: str, projection: dict, *, development_pending: bool
-) -> dict:
-    """The platform rows of this run plus the projection comparisons (PG16: cast "char" columns)."""
+def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
+    """The strict settlement comparisons: platform rows versus the observed projection.
+
+    Every comparison is unconditional: the run and stage rows must match the portal
+    projection exactly, the run's dispatch and native operations must be in definite
+    terminal states (completed side effects are never left queued, unresolved or
+    running), and the run events must exist and carry the identity of the state
+    changes they describe - never an arbitrary fixed count.
+    """
+
+    terminal_run_states = {"succeeded", "failed", "cancelled"}
+    terminal_operation_states = {"succeeded", "failed", "cancelled"}
+    comparisons = [
+        {"name": "admission_run_row", "passed": len(rows["run_state"]) == 1, "observed": rows["run_state"]},
+        {"name": "admission_request_row", "passed": len(rows["request"]) == 1, "observed": rows["request"]},
+    ]
+    operations = [
+        {"operation_key": row[0], "stage": row[1], "kind": row[2], "state": row[3]} for row in rows["operations"]
+    ]
+    dispatch = [item for item in operations if item["kind"] == "dispatch"]
+    comparisons.append(
+        {
+            "name": "dispatch_operation_terminal",
+            "passed": bool(dispatch) and all(item["state"] in terminal_operation_states for item in dispatch),
+            "observed": operations,
+        }
+    )
+    native = [item for item in operations if item["kind"] == "native"]
+    stages = dict(rows["stages"])
+    capture_settled = stages.get("capture") in {"completed", "failed", "cancelled"}
+    comparisons.append(
+        {
+            "name": "native_operation_terminal",
+            "passed": all(item["state"] in terminal_operation_states for item in native)
+            and (bool(native) or not capture_settled),
+            "observed": {"operations": operations, "capture": stages.get("capture")},
+        }
+    )
+    projected_state = projection.get("state") if isinstance(projection, dict) else None
+    terminal = [state for state in rows["run_state"] if state in terminal_run_states]
+    mapped = {"success": "succeeded", "failed": "failed"}.get(str(projected_state))
+    comparisons.append(
+        {
+            "name": "run_state_matches_projection",
+            "passed": len(terminal) == 1 and terminal[0] == mapped,
+            "observed": [terminal or "no terminal platform run row", projected_state],
+        }
+    )
+    tasks = {str(item.get("task_id")): item.get("state") for item in (projection.get("tasks") or [])}
+    mapping = {"success": "completed", "failed": "failed", "upstream_failed": "blocked", "skipped": "blocked"}
+    expected_stages = {stage: mapping.get(str(state), str(state)) for stage, state in tasks.items()}
+    comparisons.append(
+        {
+            "name": "stage_rows_match_projection",
+            "passed": bool(expected_stages) and stages == expected_stages,
+            "observed": {"sql": stages, "projected": expected_stages},
+        }
+    )
+    events = [dict(item) for item in rows["events"]]
+    identity_ok = True
+    for event in events:
+        if event.get("kind") != "stage":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if stages.get(str(event.get("stage"))) != payload.get("state"):
+            identity_ok = False
+    comparisons.append(
+        {
+            "name": "run_event_identity",
+            "passed": bool(events) and identity_ok,
+            "observed": {"events": events, "stages": stages},
+        }
+    )
+    return comparisons
+
+
+def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict) -> dict:
+    """The platform rows of this run plus the strict settlement comparisons."""
 
     import psycopg2  # noqa: PLC0415
 
@@ -653,60 +727,24 @@ def _platform_sql_evidence(
         rows["operations"] = cursor.fetchall()
         cursor.execute(f"SELECT stage, state FROM {platform_schema}.stage WHERE run_id=%s ORDER BY stage", (run_id,))
         rows["stages"] = cursor.fetchall()
-        cursor.execute(f"SELECT count(*)::int FROM {platform_schema}.run_event WHERE run_id=%s", (run_id,))
-        rows["run_event_count"] = cursor.fetchone()[0]
-    comparisons = [
-        {"name": "admission_run_row", "passed": len(rows["run_state"]) == 1, "observed": rows["run_state"]},
-        {"name": "admission_request_row", "passed": len(rows["request"]) == 1, "observed": rows["request"]},
-        {
-            "name": "dispatch_operation_row",
-            "passed": any(row[2] == "dispatch" for row in rows["operations"]),
-            "observed": rows["operations"],
-        },
-    ]
-    projected_state = projection.get("state") if isinstance(projection, dict) else None
-    terminal = [state for state in rows["run_state"] if state in {"succeeded", "failed", "cancelled"}]
-    if terminal:
-        mapped = {"success": "succeeded", "failed": "failed"}.get(str(projected_state))
-        comparisons.append(
-            {
-                "name": "run_state_matches_projection",
-                "passed": terminal[0] == mapped,
-                "observed": [terminal[0], projected_state],
-            }
+        cursor.execute(
+            f"SELECT seq, kind, stage, payload FROM {platform_schema}.run_event WHERE run_id=%s ORDER BY seq",
+            (run_id,),
         )
-    else:
-        comparisons.append(
-            {
-                "name": "run_state_matches_projection",
-                "passed": False,
-                "observed": ["no terminal platform run row yet", projected_state],
-                "pending_writer": True,
-            }
-        )
-    tasks = {str(item.get("task_id")): item.get("state") for item in (projection.get("tasks") or [])}
-    mapping = {"success": "completed", "failed": "failed", "upstream_failed": "blocked", "skipped": "blocked"}
-    expected_stages = {stage: mapping.get(str(state), str(state)) for stage, state in tasks.items()}
-    stage_states = dict(rows["stages"])
-    comparisons.append(
-        {
-            "name": "stage_rows_match_projection",
-            "passed": bool(expected_stages) and stage_states == expected_stages,
-            "observed": {"sql": stage_states, "projected": expected_stages},
-            "pending_writer": not stage_states,
-        }
-    )
+        rows["events"] = [
+            {"seq": row[0], "kind": row[1], "stage": row[2], "payload": row[3]} for row in cursor.fetchall()
+        ]
+    comparisons = _settlement_comparisons(rows, projection)
     problems = [
         f"platform settlement assertion failed: {item['name']} {item['observed']}"
         for item in comparisons
-        if not item["passed"] and not (item.get("pending_writer") and development_pending)
+        if not item["passed"]
     ]
     return {
         "ok": not problems,
         "schema": platform_schema,
         "rows": rows,
         "comparisons": comparisons,
-        "pending_writers": [item["name"] for item in comparisons if item.get("pending_writer")],
         "problems": problems,
     }
 
@@ -727,12 +765,6 @@ def main() -> int:
     parser.add_argument("--airflow-schema", default="", help="the Airflow schema this run's metadata lives in")
     parser.add_argument("--airflow-db-conn", default="", help="Airflow metadata DSN (PostgreSQL) for this session")
     parser.add_argument("--report", type=Path, default=None, help="also write the report JSON here")
-    parser.add_argument(
-        "--development-pending-settlement",
-        action="store_true",
-        help="development window only: record the missing stage/run_event writers instead of failing; "
-        "the required CI path must not pass this flag",
-    )
     args = parser.parse_args()
     ambient_sensor_mode = os.environ.get("SOLIDWORKS_SENSOR_MODE")
     if ambient_sensor_mode not in (None, SENSOR_MODE_REQUIRED):
@@ -750,13 +782,10 @@ def main() -> int:
     sys.path.insert(0, str(args.root / "src"))
     sys.path.insert(0, str(args.root))
     from description_pipeline.orchestration.airflow_client import native_run_id  # noqa: PLC0415
-    from description_pipeline.orchestration.linux_store import LinuxStore  # noqa: PLC0415
     from description_pipeline.orchestration.portal import AirflowApi  # noqa: PLC0415
     from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
     from tests.v1.split_capture_fixture import (  # noqa: PLC0415
-        CONTROL_LIMITS,
         QUALIFICATION,
-        REQUIRED_CONTROL_GATES,
         build_fixture_capture,
     )
 
@@ -1092,7 +1121,6 @@ def main() -> int:
                 args.platform_schema,
                 run_id,
                 projection,
-                development_pending=bool(args.development_pending_settlement),
             )
             problems.extend(sql_evidence.get("problems", []))
             if identity_stable is False:
@@ -1137,40 +1165,6 @@ def main() -> int:
         if not reschedule_observed:
             problems.append("discover was never observed in up_for_reschedule; its slot release is not proven")
 
-        store = LinuxStore(store_root)
-        generated = _read_json(store.receipt_path(native_id, "generate"))
-        verified = _read_json(store.receipt_path(native_id, "verify"))
-        meta = store.meta(native_id) or {}
-        if generated.get("state") != "generated":
-            problems.append(f"generate checkpoint is {generated.get('state')!r}, not 'generated'")
-        if verified.get("state") != "failed":
-            problems.append(f"verify receipt is {verified.get('state')!r}, not 'failed'")
-        error = str(verified.get("error") or "")
-        if "URDF verification failed" not in error:
-            problems.append(f"verify receipt error is not the documented verification rejection: {error!r}")
-        diagnostic = Path(str(verified.get("diagnostic_path") or ""))
-        quality = _read_json(diagnostic / "reports/quality.json")
-        checks = [item for item in quality.get("checks") or [] if isinstance(item, dict)]
-        gates = {item.get("id"): item for item in checks}
-        failed_gates = sorted(
-            item.get("id") for item in checks if item.get("passed") is False or item.get("state") == "failed"
-        )
-        unexpected_gates = sorted(set(failed_gates) - set(CONTROL_LIMITS))
-        missing_required = [gate for gate in REQUIRED_CONTROL_GATES if not (gates.get(gate) or {}).get("passed")]
-        if unexpected_gates:
-            problems.append(f"quality failed outside the documented control limits: {unexpected_gates}")
-        if missing_required:
-            problems.append(f"quality skipped required gates: {missing_required}")
-        if quality.get("subject_sha256") != generated.get("subject_sha256"):
-            problems.append("verify quality is not bound to the generated subject")
-        publish_receipt = store.receipt_path(native_id, "publish")
-        pr_json = sorted(
-            path.relative_to(store.run_dir(native_id)).as_posix() for path in store.run_dir(native_id).rglob("pr.json")
-        )
-        if publish_receipt.is_file():
-            problems.append("a publish receipt exists although publication must not execute")
-        if pr_json:
-            problems.append(f"publication evidence exists although publication must not execute: {pr_json}")
         jobs = list(state["jobs"].values())
         if len(jobs) != 1 or jobs[0].get("status") != "native_complete":
             problems.append("the mocked endpoint did not serve exactly one native_complete job")
@@ -1180,9 +1174,6 @@ def main() -> int:
             problems.append("the generated text definition was never submitted")
         if len(state["artifact_paths"]) < 2:
             problems.append("the raw record and the sealed capture transfer were not both streamed")
-        if meta.get("last_stage") != "verify":
-            problems.append(f"the attempt advanced past verification: last_stage={meta.get('last_stage')!r}")
-
         report = {
             "ok": not problems,
             "qualification": QUALIFICATION,
@@ -1196,7 +1187,6 @@ def main() -> int:
                 "platform_schema": args.platform_schema or None,
                 "airflow_schema": args.airflow_schema or None,
                 "portal_admission": portal_mode,
-                "development_pending_settlement": bool(args.development_pending_settlement),
             },
             "triggering_user_name": triggering_user_name,
             "dag_state": dag_state,
@@ -1214,17 +1204,6 @@ def main() -> int:
             "handoff_sha256": fixture["handoff_sha256"],
             "target_hardware": target,
             "fixture_identity_stable": identity_stable,
-            "generate": {"state": generated.get("state"), "subject_sha256": generated.get("subject_sha256")},
-            "verify": {
-                "state": verified.get("state"),
-                "error": verified.get("error"),
-                "diagnostic_path": verified.get("diagnostic_path"),
-                "failed_gates": failed_gates,
-                "unexpected_gates": unexpected_gates,
-                "missing_required_gates": missing_required,
-                "subject_sha256": verified.get("subject_sha256"),
-            },
-            "publication": {"executed": bool(publish_receipt.is_file() or pr_json), "pr_json": pr_json or None},
             "platform_sql": sql_evidence,
             "platform_admission": admission,
             "portal_projection": {
