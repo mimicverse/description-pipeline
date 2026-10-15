@@ -1122,14 +1122,18 @@ def compose_delivery_inputs(
     Copies the genuine CAD bytes into ``input/cad/<relative>``, writes the
     sealed discovery payload (with its raw native record) at
     ``evidence/discovery.json`` and, when a material authority is given,
-    merges the canonical provenance block into ``evidence/capture.json``.
-    This only translates fixture inputs before the actual consumers run; no
-    consumer output is injected.
+    ensures the canonical provenance block exists in ``evidence/capture.json``.
+    Synthetic consumer-fixture inputs only: it must never feed the unchanged
+    canonical/E2E producers, which produce their own evidence.  Existing
+    fixture blocks (warnings and readouts included) are preserved, and the
+    provenance identity binds to the record's captured identity rather than a
+    relocated fixture path.  No consumer output is injected.
     """
 
     import shutil
 
     from description_pipeline.io import file_digest, read_data, write_json
+    from description_pipeline.sources.solidworks.discovery import DISCOVERY_SCHEMA
 
     delivery = Path(delivery)
     evidence = delivery / "evidence"
@@ -1144,7 +1148,7 @@ def compose_delivery_inputs(
     write_json(
         evidence / "discovery.json",
         {
-            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "schema_version": DISCOVERY_SCHEMA,
             "run_id": str(record.get("run_id") or "fixture-run"),
             "derivation": {
                 "main_assembly": main_assembly,
@@ -1167,12 +1171,16 @@ def compose_delivery_inputs(
         capture = read_data(capture_path) if capture_path.is_file() else {}
         if not isinstance(capture, dict):
             capture = {}
-        capture["material_provenance"] = {
-            "schema_version": "solidworks-to-urdf.material-provenance/v1",
-            "assembly": str((delivery / "input" / "cad" / main_assembly).resolve()),
-            "configuration": configuration,
-            "material_source": material_source,
-            "measured_source": "cad_api",
-            "warnings": [],
-        }
-        write_json(capture_path, capture)
+        existing = capture.get("material_provenance")
+        if not isinstance(existing, dict):
+            captured_assembly = str(identity.get("main_assembly") or main_assembly)
+            captured_configuration = str(identity.get("delivery_configuration") or configuration)
+            capture["material_provenance"] = {
+                "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                "assembly": captured_assembly,
+                "configuration": captured_configuration,
+                "material_source": material_source,
+                "measured_source": "cad_api",
+                "warnings": [],
+            }
+            write_json(capture_path, capture)
