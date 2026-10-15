@@ -701,18 +701,28 @@ class PlatformRegistrationTests(unittest.TestCase):
         store = SimpleNamespace(capture_dir=lambda _run: capture)
         released: list[tuple[str, dict]] = []
         settled: list[dict] = []
-        state = {"claimed": False}
+        digests: list[str] = []
 
         class _Ops:
-            def register_operation(self, *, run_id, stage, kind, operation_key, params_digest):
-                return SimpleNamespace(operation_id=str(uuid.uuid4()), state="queued")
+            def __init__(self):
+                self.state = "new"
+
+            def register_operation(self, *, run_id, stage, kind, operation_key, params_digest, dispatch=None):
+                digests.append(params_digest)
+                current = {"new": "queued", "running": "running", "settled": "succeeded"}[self.state]
+                return SimpleNamespace(operation_id=str(uuid.uuid4()), state=current)
+
+            def stage_records(self, run_id):
+                return {"capture": {"original_executed_at": "2026-10-16T00:00:00Z"}}
 
             def claim_operation(self, *, run_id, stage, operation_key):
-                granted = not state["claimed"]
-                state["claimed"] = True
-                return SimpleNamespace(granted=granted)
+                granted = self.state == "new"
+                if granted:
+                    self.state = "running"
+                return SimpleNamespace(granted=granted, record=SimpleNamespace(state="running"))
 
             def settle_cache_release(self, *, run_id, stage, operation_key, receipt):
+                self.state = "settled"
                 settled.append(receipt)
 
         endpoint = SimpleNamespace(
@@ -725,8 +735,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                 },
                 "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             },
-            release_cache=lambda run_id, request: released.append((run_id, request))
-            or {"status": "released"},
+            release_cache=lambda run_id, request: released.append((run_id, request)) or {"status": "released"},
         )
         platform = _Ops()
         self.module._release_registered_cache(
@@ -737,7 +746,86 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.module._release_registered_cache(
             platform, store, endpoint, "run-1", intake=intake, upload_files=upload
         )
-        self.assertEqual(len(released), 1, "a repeat claim is a query; the side effect never re-executes")
+        self.assertEqual(len(released), 1, "a settled operation answers a repeat call without a side effect")
+        self.assertEqual(digests[0], digests[1], "the registered parameter digest is stable across retries")
+
+    def test_a_lost_response_replays_the_same_operation_and_settles(self) -> None:
+        import hashlib as hashing
+        import uuid
+        from types import SimpleNamespace
+
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        run_dir = Path(self.temporary.name) / "runs" / "run-3"
+        capture = run_dir / "capture"
+        capture.mkdir(parents=True)
+        (capture / "transfer-manifest.json").write_bytes(b"manifest bytes")
+        intake = Path(self.temporary.name) / "intake-release-3"
+        (intake / "cad").mkdir(parents=True)
+        (intake / "cad" / "robot.SLDASM").write_bytes(b"assembly bytes")
+        upload = {"cad/robot.SLDASM": hashing.sha256(b"assembly bytes").hexdigest()}
+        store = SimpleNamespace(capture_dir=lambda _run: capture)
+        calls: list[str] = []
+        settled: list[dict] = []
+        digests: list[str] = []
+        mode = {"fail": True}
+
+        class _Ops:
+            def __init__(self):
+                self.state = "new"
+                self.operation_id = None
+
+            def register_operation(self, *, run_id, stage, kind, operation_key, params_digest, dispatch=None):
+                digests.append(params_digest)
+                if self.operation_id is None:
+                    self.operation_id = str(uuid.uuid4())
+                current = {"new": "queued", "running": "running", "settled": "succeeded"}[self.state]
+                return SimpleNamespace(operation_id=self.operation_id, state=current)
+
+            def stage_records(self, run_id):
+                return {"capture": {"original_executed_at": "2026-10-16T00:00:00Z"}}
+
+            def claim_operation(self, *, run_id, stage, operation_key):
+                granted = self.state == "new"
+                if granted:
+                    self.state = "running"
+                return SimpleNamespace(granted=granted, record=SimpleNamespace(state="running"))
+
+            def settle_cache_release(self, *, run_id, stage, operation_key, receipt):
+                self.state = "settled"
+                settled.append(receipt)
+
+        def release(run_id, request):
+            calls.append(request["operation_id"])
+            if mode["fail"]:
+                raise RuntimeError("response lost")
+            return {"status": "released"}
+
+        endpoint = SimpleNamespace(
+            health=lambda: {
+                "release": {
+                    "version": "1.4.0",
+                    "source_commit": "ab" * 20,
+                    "source_sha256": "cd" * 32,
+                    "role": "native",
+                },
+                "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            },
+            release_cache=release,
+        )
+        platform = _Ops()
+        self.module._release_registered_cache(
+            platform, store, endpoint, "run-3", intake=intake, upload_files=upload
+        )
+        self.assertEqual(settled, [], "a lost response must not settle")
+        mode["fail"] = False
+        self.module._release_registered_cache(
+            platform, store, endpoint, "run-3", intake=intake, upload_files=upload
+        )
+        self.assertEqual(len(calls), 2, "the reconciliation replays the same operation identity")
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(digests[0], digests[1])
+        self.assertEqual(len(settled), 1)
 
     def test_a_failed_cache_release_never_fails_the_stage(self) -> None:
         import hashlib as hashing
@@ -758,11 +846,14 @@ class PlatformRegistrationTests(unittest.TestCase):
         settled: list[dict] = []
 
         class _Ops:
-            def register_operation(self, *, run_id, stage, kind, operation_key, params_digest):
+            def register_operation(self, *, run_id, stage, kind, operation_key, params_digest, dispatch=None):
                 return SimpleNamespace(operation_id=str(uuid.uuid4()), state="queued")
 
+            def stage_records(self, run_id):
+                return {"capture": {"original_executed_at": "2026-10-16T00:00:00Z"}}
+
             def claim_operation(self, *, run_id, stage, operation_key):
-                return SimpleNamespace(granted=True)
+                return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
 
             def settle_cache_release(self, *, run_id, stage, operation_key, receipt):
                 settled.append(receipt)
@@ -824,7 +915,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             def start_run(self, run_id):
                 return {"run_id": run_id, "state": "running"}
 
-            def confirm_stage(self, *, run_id, stage, state, receipt, checkpoint_uri):
+            def confirm_stage(self, *, run_id, stage, state, receipt, checkpoint_uri, original_executed_at=None):
                 records[(run_id, stage)] = dict(receipt)
                 confirmations.append(stage)
 

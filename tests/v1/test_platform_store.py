@@ -207,7 +207,14 @@ class FakeCursor:
             " FROM stage WHERE run_id = %s"
         ):
             self._rows = [
-                (stage, record[0], record[1], record[2], None, None)
+                (
+                    stage,
+                    record[0],
+                    record[1],
+                    record[2],
+                    record[3] if len(record) > 3 else None,
+                    record[4] if len(record) > 4 else None,
+                )
                 for (run_id, stage), record in world.stages.items()
                 if run_id == params[0]
             ]
@@ -298,7 +305,9 @@ class FakeCursor:
             "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
         ):
             record = world.stages.get((params[0], params[1]))
-            self._rows = [(record[0], record[1], record[2], None)] if record else []
+            self._rows = [
+                (record[0], record[1], record[2], record[3] if len(record) > 3 else None)
+            ] if record else []
         elif normalized.startswith("INSERT INTO stage"):
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
@@ -306,14 +315,26 @@ class FakeCursor:
             existing = world.stages.get((run_id, stage))
             if "= 'unresolved'" in normalized:  # the reconciliation statement
                 if existing is not None and existing[0] == "unresolved":
-                    world.stages[(run_id, stage)] = (state, receipt, checkpoint)
+                    world.stages[(run_id, stage)] = (
+                        state,
+                        receipt,
+                        checkpoint,
+                        params[5] if len(params) > 5 else None,
+                        params[6] if len(params) > 6 else None,
+                    )
                     self._rows = [(run_id, stage, state)]
                 else:
                     self._rows = []
             elif existing is not None and existing[0] in {"completed", "failed", "cancelled", "blocked", "unresolved"}:
                 self._rows = []
             else:
-                world.stages[(run_id, stage)] = (state, receipt, checkpoint)
+                world.stages[(run_id, stage)] = (
+                    state,
+                    receipt,
+                    checkpoint,
+                    params[5] if len(params) > 5 else None,
+                    params[6] if len(params) > 6 else None,
+                )
                 self._rows = [(run_id, stage, state)]
         elif normalized.startswith("SELECT COALESCE(MAX(seq), 0) + 1 FROM run_event"):
             highest = max((item[1] for item in world.events if item[0] == params[0]), default=0)

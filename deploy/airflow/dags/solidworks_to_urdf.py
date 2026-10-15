@@ -19,8 +19,7 @@ import logging
 import os
 import shutil
 import tempfile
-import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from airflow.sdk import Param, dag, task
@@ -194,6 +193,7 @@ def _seal_and_confirm(
     """Seal the stage tree through the one writer primitive, then register the stage record."""
     sealed_receipt = _platform_receipt(run_id, stage, receipt, tree, state=None if state == "completed" else "failed")
     uri, completed = seal_stage_confirmation(store_root, run_id, stage, Path(tree), sealed_receipt)
+    executed_at = datetime.now(UTC) if state == "completed" else None
     if state == "completed":
         confirmed = platform.confirmed_stage(run_id, stage)
         if confirmed is not None:
@@ -205,7 +205,14 @@ def _seal_and_confirm(
             raise AirflowFailException(
                 f"The {stage!r} stage of run {run_id!r} is already confirmed with another identity"
             )
-    platform.confirm_stage(run_id=run_id, stage=stage, state=state, receipt=completed, checkpoint_uri=uri)
+    platform.confirm_stage(
+        run_id=run_id,
+        stage=stage,
+        state=state,
+        receipt=completed,
+        checkpoint_uri=uri,
+        original_executed_at=executed_at,
+    )
 
 
 def _register_failed_stage(
@@ -370,6 +377,16 @@ def _register_native_stages(store: LinuxStore, run_id: str) -> None:
         )
 
 
+def _confirmed_at_text(value) -> str | None:
+    """The platform-stored confirmation instant as the canonical second-resolution text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        stamped = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return stamped.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
+
+
 def _release_registered_cache(
     platform: PlatformStore,
     store: LinuxStore,
@@ -381,25 +398,30 @@ def _release_registered_cache(
 ) -> None:
     """The IF-10 release through the platform operation family: intent -> claim -> settle.
 
-    The intent is registered under the capture stage (the confirmed import is
-    the predecessor a release binds); only the claim that performs
-    queued->running executes the endpoint call - a repeat claim is a query and
-    never re-executes.  A deferred or failed release is recorded and never
-    fails the engineering stage.
+    The confirmation instant comes from the platform's own capture record, so
+    the import block - and with it the registered parameter digest - is stable
+    across every retry; the block is persisted with the intent (``dispatch``)
+    as the one stored request identity.  Only the claim that performs
+    queued->running executes a new side effect; once claimed, a lost response
+    is reconciled by replaying the same operation id, which the endpoint's own
+    release journal answers with its original receipt or a safe resume, and
+    the settle closes that same DB identity - never a new one, never a file
+    fallback.  A deferred or failed release never fails the engineering stage.
     """
     try:
+        records = platform.stage_records(run_id)
+        confirmed_at = _confirmed_at_text((records.get("capture") or {}).get("original_executed_at"))
+        if confirmed_at is None:
+            log.warning("cache release deferred run=%s: the capture stage records no instant", run_id)
+            return
         manifest = cache_release_manifest(intake, upload_files)
         sealed = file_digest(store.capture_dir(run_id) / CAPTURE_MANIFEST)
-        health = endpoint.health()
         production = {"run_id": run_id, "operation_id": f"{run_id}:native"}
         confirmation = {
             "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
             "imported": [dict(entry) for entry in manifest],
             "production": dict(production),
-            "sealed": {
-                "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "receipt_sha256": sealed,
-            },
+            "sealed": {"confirmed_at": confirmed_at, "receipt_sha256": sealed},
             "digest": "",
         }
         confirmation["digest"] = cache_import_confirmation_digest(confirmation)
@@ -415,14 +437,14 @@ def _release_registered_cache(
         if record.state == "succeeded":
             return
         claim = platform.claim_operation(run_id=run_id, stage="capture", operation_key=operation_key)
-        if not claim.granted:
+        if not claim.granted and claim.record.state != "running":
             return
         request = cache_release_request(
             run_id=run_id,
             linux_run_id=run_id,
             production_operation_id=production["operation_id"],
             operation_id=record.operation_id,
-            health=health,
+            health=endpoint.health(),
             imported=manifest,
             sealed_receipt_sha256=sealed,
             import_block=import_block,
