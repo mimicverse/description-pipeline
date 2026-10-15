@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -66,3 +68,77 @@ def sealed_resolver_from_environment(environ: Mapping[str, str] | None = None) -
     if not root:
         raise PipelineError("PIPELINE_STORE_ROOT is not configured; sealed deliveries cannot be resolved")
     return sealed_resolver(Path(root))
+
+
+def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path) -> str:
+    """Atomically seal one validated delivery tree and return its locator.
+
+    The source must be a validated delivery tree: ``read_delivery_manifest``
+    re-binds every subject record before anything is written.  The tree lands
+    at ``<root>/sealed/<run_id>/<stage>`` through a same-filesystem temporary
+    directory, per-file fsync and one atomic ``os.replace`` - readers resolve
+    either the previous state or the complete new one, never a partial tree.
+    Sealing is idempotent per subject digest (the same subject returns the same
+    locator); a different subject for the same run and stage is refused.
+
+    The sealed tree carries the delivery byte-verbatim - including the frozen
+    ``input/request.json`` once it exists.  Which members verify against the
+    native manifest and which original verifies against its database
+    registration is a verification concern of the combination chain; this
+    writer only commits bytes.
+    """
+
+    from ..delivery import read_delivery_manifest
+
+    uri = f"{SEALED_URI_PREFIX}{run_id}/{stage}"
+    parse_sealed_uri(uri)
+    origin = Path(source).resolve()
+    if not origin.is_dir():
+        raise PipelineError("A sealed delivery source must be an existing directory")
+    if any(path.is_symlink() for path in origin.rglob("*")):
+        raise PipelineError("A sealed delivery source may not contain symbolic links")
+    manifest = read_delivery_manifest(origin)
+    subject = manifest["subject"]["digest"]
+
+    base = Path(root).resolve()
+    parent = base / SEALED_ROOT_NAME / run_id
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / stage
+    if target.exists():
+        existing = read_delivery_manifest(target)
+        if existing["subject"]["digest"] != subject:
+            raise PipelineError("The sealed delivery already holds a different subject")
+        return uri
+
+    temporary = Path(tempfile.mkdtemp(prefix=f".{stage}.", dir=parent))
+    try:
+        shutil.copytree(origin, temporary, dirs_exist_ok=True)
+        for path in sorted(temporary.rglob("*")):
+            if path.is_file():
+                _fsync_path(path)
+        _fsync_dir(temporary)
+        os.replace(temporary, target)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    sealed = read_delivery_manifest(target)
+    if sealed["subject"]["digest"] != subject:  # pragma: no cover - replace is atomic
+        raise PipelineError("The sealed delivery does not carry the sealed subject")
+    _fsync_dir(parent)
+    return uri
+
+
+def _fsync_path(path: Path) -> None:  # pragma: no cover - durability syscall
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_dir(path: Path) -> None:  # pragma: no cover - durability syscall
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
