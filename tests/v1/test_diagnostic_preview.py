@@ -347,13 +347,16 @@ class DiagnosticPreviewTests(unittest.TestCase):
         rows = _failing_checks(
             {
                 "checks": [
+                    # canonical Gate.run rows carry both fields
+                    {"id": "canonical.limit", "state": "failed", "passed": False, "details": {"reason": "limit"}},
+                    {"id": "ok", "state": "passed", "passed": True, "details": {}},
+                    # the missing-field producer anomaly stays covered by the same convention
                     {"id": "limit.dof", "state": "failed", "details": {"reason": "8 control limits"}},
-                    {"id": "ok", "state": "passed"},
                     {"id": "other", "passed": False, "details": {"error": "boom"}},
                 ]
             }
         )
-        self.assertEqual([row["id"] for row in rows], ["limit.dof", "other"])
+        self.assertEqual([row["id"] for row in rows], ["canonical.limit", "limit.dof", "other"])
         self.assertEqual(rows[0]["state"], "failed")
 
     def test_diagnostic_artifacts_stream_only_bound_bytes(self) -> None:
