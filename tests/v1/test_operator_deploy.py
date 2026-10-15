@@ -2445,6 +2445,15 @@ class NativePoolTests(unittest.TestCase):
         self.assertIn("scripts/ensure_pool.py", text)
         self.assertLess(text.index("db migrate"), text.index("scripts/ensure_pool.py"))
 
+    def test_install_creates_the_auth_state_table_in_the_migration_window(self) -> None:
+        """The runtime identity owns no DDL: the auth state table must be created by the
+        migration window through the manager's own store constructor."""
+
+        text = self.INSTALL.read_text(encoding="utf-8")
+        self.assertIn("feishu_auth import MetadataStateStore", text)
+        self.assertLess(text.index("db migrate"), text.index("MetadataStateStore"))
+        self.assertLess(text.index("MetadataStateStore"), text.index("scripts/ensure_pool.py"))
+
     def test_health_battery_requires_the_pool(self) -> None:
         text = HEALTH.read_text(encoding="utf-8")
         self.assertIn("windows_native", text)
