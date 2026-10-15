@@ -2002,9 +2002,13 @@ class PortalApp:
                     if "change_summary" in overrides
                     else _optional_str(parent_conf.get("change_summary"))
                 )
+                change_summary = (
+                    normalize_change_summary(change_summary).strip()
+                    if isinstance(change_summary, str)
+                    else ""
+                )
                 if not change_summary:
                     raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
-                change_summary = normalize_change_summary(change_summary)
                 principal = _optional_str(parent_conf.get("submission_principal"))
                 if principal is None or not principal.strip():
                     principal = session.principal

@@ -2285,6 +2285,17 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(len(self.airflow.trigger_payloads), before)
 
+    def test_rerun_attempt_rejects_a_crlf_only_parent_summary(self) -> None:
+        self._seed_retryable_run()
+        self.airflow.dag_runs[DAG_RUN_ID]["conf"]["change_summary"] = "\r\n"
+        self.client.login()
+        rows = self._rerun_rows()
+        before = len(self.airflow.trigger_payloads)
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(len(self.airflow.trigger_payloads), before)
+
     def test_rerun_attempt_same_stage_is_idempotent_and_other_stage_conflicts(self) -> None:
         self._seed_retryable_run()
         child = "portal-20261009T000000-deadbeef"
