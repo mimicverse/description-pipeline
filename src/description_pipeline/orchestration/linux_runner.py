@@ -57,19 +57,36 @@ def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
 def _revalidate_capture(store: LinuxStore, run_id: str) -> None:
     """Revalidate the admitted payload against its sealed transfer at point of use.
 
-    Native members are checked record-for-record against the transfer manifest;
-    the carried frozen original of this run (``input/request.json``) is verified
-    against its own frozen bytes in the run directory - the same bytes the
-    freeze stage registered - so the Linux addition never pollutes and never
-    escapes the native verification, and unknown extras still refuse.
+    Native members are checked record-for-record against the transfer manifest.
+    The frozen original of this run (``input/request.json``) is anchored to the
+    **registered sealed freeze original** when the run has one: the mutable
+    copies - run directory and capture tree - must both exist and equal the
+    sealed bytes, so a coordinated change of the copies can never pass and
+    deleting them refuses; without a freeze registration the run-directory
+    original is the binding, exactly as before.  Unknown extras still refuse.
     """
+    from ..platform.storage import sealed_resolver
+
     meta = store.meta(run_id) or {}
     recorded = meta.get("transfer") or {}
     capture = store.capture_dir(run_id)
     carried_bindings: dict[str, str] = {}
     carried = capture / "input" / "request.json"
-    if carried.is_file():
-        frozen = store.run_dir(run_id) / "input" / "request.json"
+    frozen = store.run_dir(run_id) / "input" / "request.json"
+    sealed = sealed_resolver(store.root)(f"store://sealed/{run_id}/freeze") / "input" / "request.json"
+    if sealed.is_file():
+        expected = file_digest(sealed)
+        if not carried.is_file():
+            raise PipelineError("The admitted capture is missing the registered frozen input/request.json")
+        if not frozen.is_file():
+            raise PipelineError("The run is missing the registered frozen input/request.json")
+        for label, path in (("carried", carried), ("frozen", frozen)):
+            if file_digest(path) != expected:
+                raise PipelineError(
+                    f"The {label} input/request.json differs from the registered sealed original"
+                )
+        carried_bindings["input/request.json"] = expected
+    elif carried.is_file():
         if not frozen.is_file():
             raise PipelineError("The admitted capture carries input/request.json without a frozen original")
         carried_bindings["input/request.json"] = file_digest(frozen)

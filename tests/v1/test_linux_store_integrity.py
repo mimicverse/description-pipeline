@@ -134,6 +134,46 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "carried original differs"):
             _revalidate_capture(self.store, RUN)
 
+    def test_mutable_request_copies_are_anchored_to_the_registered_sealed_original(self) -> None:
+        from description_pipeline.delivery import write_delivery_manifest
+        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+        from description_pipeline.orchestration.linux_runner import _revalidate_capture
+        from description_pipeline.platform.storage import seal_delivery
+        from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
+        from description_pipeline.runtime import tool_record
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        frozen = freeze_request_evidence(
+            self.store.run_dir(RUN),
+            request_id="registered-original",
+            target_hardware="m3.0",
+            change_summary="registered",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="b" * 64,
+        )
+        carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
+        tree = self.tmp / "freeze-tree"
+        for name in ("input", "evidence", "model", "urdf", "meshes"):
+            (tree / name).mkdir(parents=True, exist_ok=True)
+        shutil.copy2(frozen, tree / "input" / "request.json")
+        write_json(tree / "tool.json", tool_record(role="portable"))
+        write_delivery_manifest(
+            tree,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+        seal_delivery(self.store.root, RUN, "freeze", tree)
+        _revalidate_capture(self.store, RUN)
+        carried.write_text('{"tampered": true}', encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "registered sealed original"):
+            _revalidate_capture(self.store, RUN)
+        shutil.copy2(frozen, carried)
+        frozen.write_text('{"tampered": true}', encoding="utf-8")
+        carried.write_text('{"tampered": true}', encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "registered sealed original"):
+            _revalidate_capture(self.store, RUN)
+
     # ------------------------------------------------------------ roles / drift
 
     def test_verify_refuses_a_runtime_that_drifted_from_the_native_capture(self) -> None:
