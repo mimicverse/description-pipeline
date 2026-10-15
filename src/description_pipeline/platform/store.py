@@ -787,15 +787,12 @@ class PlatformStore:
         )
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
             definition, sealed_root = self._verify_sealed(checkpoint_uri, receipt)
-        elif state == "failed" and any(
-            _report_member(record.get("path"))
-            for record in (receipt or {}).get("artifacts") or []
-            if isinstance(record, dict)
-        ):
-            # The failed diagnostic never skips byte verification: report
-            # members carried by the receipt are rebound to the sealed bytes
-            # exactly like a completed confirmation.
-            self._verify_sealed(checkpoint_uri, receipt)
+        elif state == "failed" and (receipt or {}).get("artifacts"):
+            # The failed diagnostic never skips byte verification: every
+            # declared sealed member (subject- or report-class) is rebound to
+            # the sealed bytes, while the success-only qualifications stay
+            # with the completed path.
+            self._verify_sealed(checkpoint_uri, receipt, completed=False)
         _sealed_receipt(
             receipt,
             run_id=run_id,
@@ -1014,7 +1011,7 @@ class PlatformStore:
         )
         return {"checkpoint_uri": source_row[2], "receipt_digest": digest(source_row[1])}
 
-    def _verify_sealed(self, checkpoint_uri, receipt) -> tuple[dict | None, Path]:
+    def _verify_sealed(self, checkpoint_uri, receipt, *, completed: bool = True) -> tuple[dict | None, Path]:
         """Rebind the real sealed delivery for any stage before any registration.
 
         One owner for all six stages: the receipt's URI and inventory are
@@ -1035,7 +1032,7 @@ class PlatformStore:
         manifest = read_delivery_manifest(root)
         subject = manifest.get("subject") or {}
         stage = receipt.get("stage")
-        if stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
+        if completed and stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         records = subject.get("files") or []
         artifacts = receipt.get("artifacts")
@@ -1064,6 +1061,13 @@ class PlatformStore:
                 raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes") from error
             if not member.is_file() or member.stat().st_size != size or file_digest(member) != checksum:
                 raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes")
+        if not completed:
+            # Byte binding only: every declared member was just verified against
+            # the sealed bytes.  The handoff index, tool identities, the stage
+            # contract's declared evidence and the rebuilt definition are
+            # success qualifications and are never required to register a real
+            # failure - and never granted by one.
+            return None, root
         # The handoff identity is the sealed admission index's inventory digest
         # (the same owner as describe_handoff); the index file's own sha stays
         # an ordinary manifest artifact record, never conflated with it.
