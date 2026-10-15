@@ -222,29 +222,34 @@ def require_qualified_report(report, definition, root=None):
 
 
 def _frozen_source_config(root) -> dict:
-    """The sealed material authority, read from the capture's own raw records.
+    """The sealed material authority, read from the capture's own provenance record.
 
-    The authority is a fact of the native capture: a controlled declared table
-    travels as ``raw/declared_masses.json``, otherwise the CAD direct reads in
-    ``raw/mass_properties.json`` carry it.  The value is never taken from the
-    generator's convenience config and never defaulted; a capture with no
-    usable mass evidence returns nothing so the caller fails closed instead of
-    a bare ``KeyError`` inside the physics gate.
+    ``raw/material_provenance.json`` is written by the capture itself and
+    states the assembly, configuration and material source.  The verifier
+    reads exactly that record: an unknown schema, missing identity or an
+    absent/unknown material source returns nothing so the physics gate fails
+    closed.  Nothing is inferred from mass dictionaries and no generator-side
+    rebuild is invoked.
     """
 
     delivery = Path(root).resolve()
     delivery = delivery.parent if delivery.name == "evidence" else delivery
     evidence = delivery / "evidence"
-    for name, authority in (
-        ("raw/declared_masses.json", "documented_table"),
-        ("raw/mass_properties.json", "cad"),
-    ):
-        if not (evidence / name).is_file():
-            continue
-        payload = read_data(confined(evidence, name))
-        if isinstance(payload, dict) and payload:
-            return {"material_source": authority}
-    return {}
+    if not (evidence / "raw/material_provenance.json").is_file():
+        return {}
+    record = read_data(confined(evidence, "raw/material_provenance.json"))
+    if not isinstance(record, dict):
+        return {}
+    if record.get("schema_version") != "solidworks-to-urdf.material-provenance/v1":
+        return {}
+    if not isinstance(record.get("assembly"), str) or not record["assembly"].strip():
+        return {}
+    if not isinstance(record.get("configuration"), str) or not record["configuration"].strip():
+        return {}
+    source = record.get("material_source")
+    if source not in ("cad", "documented_table"):
+        return {}
+    return {"material_source": source}
 
 
 def rebuilt_definition(root) -> dict:
