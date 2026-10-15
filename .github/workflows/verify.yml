@@ -287,6 +287,11 @@ jobs:
             tests.v1.test_recovery \
             tests.v1.test_portal \
             tests.v1.test_run_metadata
+      - name: The interface-layer reuse fixtures (production store, real PostgreSQL)
+        if: always()
+        run: |
+          "$AIRFLOW_VENV/bin/python" deploy/airflow/scripts/settlement_fixtures.py \
+            --report "$RUNNER_TEMP/settlement-fixtures.json"
       - name: Keep the real-chain evidence with the run
         if: always()
         uses: actions/upload-artifact@v4
