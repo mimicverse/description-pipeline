@@ -189,31 +189,9 @@ class SplitRoundtripTests(unittest.TestCase):
             },
         )
 
-        # The freeze side forms input/request.json before the generator runs; the
-        # fixture passes the same material through the archiver so the sealed
-        # capture carries it (replay compares the retained inventory with the
-        # recorded receipt, so it must enter before that receipt is taken).
-        request = {
-            "schema_version": "solidworks-to-urdf.request/v1",
-            "request_id": "5d9a0d1c-3b2a-4c1e-8f77-0a6b5c4d3e2f",
-            "target_hardware": "nd_fixture",
-            "change_summary": "control fixture submission",
-            "main_assembly": "cad/robot.SLDASM",
-            "handoff_digest": self.handoff,
-            "platform_config_digest": "c" * 64,
-        }
-        archive_input = steps._archive_input
-
-        def archive_with_request(package: Path, staging: Path) -> None:
-            archive_input(package, staging)
-            write_json(staging / "input" / "request.json", request)
-
         # The capture phase runs under the native role; simulate only that environment
         # fact (the role-aware tool record refuses the portable host).
-        with (
-            patch.object(solidworks, "_native_tool_record", return_value=native_tool()),
-            patch.object(steps, "_archive_input", side_effect=archive_with_request),
-        ):
+        with patch.object(solidworks, "_native_tool_record", return_value=native_tool()):
             capture = solidworks.capture(
                 prepared_package,
                 self.capture_output,
