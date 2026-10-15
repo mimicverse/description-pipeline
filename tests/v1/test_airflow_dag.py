@@ -579,8 +579,8 @@ class PlatformRegistrationTests(unittest.TestCase):
         tree = self._tree(stage="generate")
         subject = read_delivery_manifest(tree)["subject"]["digest"]
         receipt = {"run_id": "run-1", "state": "generated", "subject_sha256": subject}
-        with patch.object(self.module, "run_portable_stage", return_value=receipt):
-            result = self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+        with patch.object(self.module.flow, "run_stage", return_value=receipt):
+            result = self.module._portable_registered("run-1", "generate", tree=tree)
         self.assertEqual(result, receipt)
         self.assertEqual(len(self.calls), 1)
         call = self.calls[0]
@@ -598,10 +598,10 @@ class PlatformRegistrationTests(unittest.TestCase):
     def test_a_stage_failure_converges_with_the_actual_products(self) -> None:
         tree = self._tree(stage="generate")
         with (
-            patch.object(self.module, "run_portable_stage", side_effect=RuntimeError("stage exploded")),
+            patch.object(self.module.flow, "run_stage", side_effect=RuntimeError("stage exploded")),
             self.assertRaises(RuntimeError),
         ):
-            self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+            self.module._portable_registered("run-1", "generate", tree=tree)
         call = self.calls[0]
         self.assertEqual(call["state"], "failed")
         self.assertEqual(call["receipt"]["state"], "failed")
@@ -612,10 +612,10 @@ class PlatformRegistrationTests(unittest.TestCase):
     def test_an_early_failure_without_a_tree_registers_its_shape_only(self) -> None:
         absent = Path(self.temporary.name) / "absent"
         with (
-            patch.object(self.module, "run_portable_stage", side_effect=RuntimeError("no products")),
+            patch.object(self.module.flow, "run_stage", side_effect=RuntimeError("no products")),
             self.assertRaises(RuntimeError),
         ):
-            self.module._portable_registered(object(), "run-1", "generate", tree=absent)
+            self.module._portable_registered("run-1", "generate", tree=absent)
         call = self.calls[0]
         self.assertEqual(call["state"], "failed")
         self.assertEqual(call["receipt"]["state"], "failed")
@@ -672,13 +672,13 @@ class PlatformRegistrationTests(unittest.TestCase):
             "subject_sha256": read_delivery_manifest(tree)["subject"]["digest"],
         }
 
-        def fake_stage(store, run_id, stage, **kwargs):
+        def fake_stage(platform, root, run_id, stage, **kwargs):
             kwargs["on_event"]({"stage": stage, "state": "running"})
             kwargs["on_event"]({"stage": stage, "state": "completed"})
             return receipt
 
-        with patch.object(self.module, "run_portable_stage", side_effect=fake_stage):
-            self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+        with patch.object(self.module.flow, "run_stage", side_effect=fake_stage):
+            self.module._portable_registered("run-1", "generate", tree=tree)
         self.assertEqual([event["payload"]["state"] for event in self.live_events], ["running", "completed"])
         self.assertEqual({event["kind"] for event in self.live_events}, {"stage"})
         self.assertEqual({event["run_id"] for event in self.live_events}, {"run-1"})
@@ -953,11 +953,11 @@ class PlatformRegistrationTests(unittest.TestCase):
         tree = run_dir / "stages" / "generate"
         store = SimpleNamespace(run_dir=lambda _run: run_dir)
         with (
-            patch.object(self.module, "run_portable_stage", side_effect=RuntimeError("no capture")),
+            patch.object(self.module.flow, "run_stage", side_effect=RuntimeError("no capture")),
             patch.object(self.module, "_linux_store", return_value=store),
             self.assertRaises(RuntimeError),
         ):
-            self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+            self.module._portable_registered("run-1", "generate", tree=tree)
         call = self.calls[0]
         self.assertEqual(call["state"], "failed")
         paths = {record["path"] for record in call["receipt"]["artifacts"]}

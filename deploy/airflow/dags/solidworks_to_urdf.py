@@ -44,9 +44,9 @@ from description_pipeline.orchestration.airflow_client import (
     validate_main_assembly,
 )
 from description_pipeline.orchestration.linux_runner import import_native_capture
-from description_pipeline.orchestration.linux_runner import run_portable_stage
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST
+from description_pipeline.platform import flow
 from description_pipeline.delivery import (
     BUNDLE_SCHEMA,
     PIPELINE_ID,
@@ -103,6 +103,16 @@ def _linux_store(conn_id: str) -> LinuxStore:
             "pipeline.store_root / PIPELINE_STORE_ROOT is not configured; the Linux portable half cannot run"
         )
     return LinuxStore(config.store_root)
+
+
+def _work_paths(conn_id: str, run_id: str) -> flow.RunPaths:
+    """The in-flight working layout of one run; no state file is business authority."""
+    config = config_from_airflow_connection(conn_id)
+    if config.store_root is None:
+        raise AirflowFailException(
+            "pipeline.store_root / PIPELINE_STORE_ROOT is not configured; the Linux portable half cannot run"
+        )
+    return flow.RunPaths(config.store_root, run_id)
 
 
 def _platform_binding() -> tuple[PlatformStore, Path]:
@@ -285,16 +295,15 @@ def _register_completed_stage(run_id: str, stage: str, tree: str | Path, receipt
     _seal_and_confirm(platform, store_root, run_id, stage, tree, receipt, state="completed")
 
 
-def _portable_registered(
-    store: LinuxStore, run_id: str, stage: str, *, tree: Path, context: dict | None = None, **kwargs
-) -> dict:
+def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict | None = None, **kwargs) -> dict:
     """Run one portable stage, report its boundary, then register it through the sealed chain.
 
     The platform binding is required before the stage runs - an unavailable
     platform refuses before any side effect - and every recorded stage event
-    is mirrored into the platform's live event stream.
+    is mirrored into the platform's live event stream.  The stage itself is
+    produced by the registered flow from the sealed predecessor trees.
     """
-    platform, _store_root = _platform_binding()
+    platform, store_root = _platform_binding()
 
     def live(event: dict) -> None:
         try:
@@ -304,7 +313,7 @@ def _portable_registered(
 
     kwargs.setdefault("on_event", live)
     try:
-        receipt = run_portable_stage(store, run_id, stage, **kwargs)
+        receipt = flow.run_stage(platform, store_root, run_id, stage, **kwargs)
         _portable_report(receipt, stage=stage, context=context)
         _portable_summary(receipt, stage=stage)  # a non-confirmed receipt never reaches registration
     except Exception as error:
@@ -521,13 +530,12 @@ def _portable_report(receipt: dict, *, stage: str, context: dict | None = None) 
     return stages
 
 
-def _parent_subject(store: LinuxStore, parent_run: str, stage: str) -> str:
+def _parent_subject(platform: PlatformStore, parent_run: str, stage: str) -> str:
     """The recorded subject of a parent portable checkpoint a linked rerun reuses."""
-    path = store.checkpoint_receipt(parent_run, stage)
-    if not path.is_file():
+    row = platform.stage_records(parent_run).get(stage) or {}
+    if row.get("state") != "completed" or not row.get("checkpoint_uri"):
         raise AirflowFailException(f"parent attempt {parent_run} has no {stage} checkpoint to reuse")
-    receipt = json.loads(path.read_text(encoding="utf-8"))
-    subject = receipt.get("subject_sha256")
+    subject = (row.get("receipt") or {}).get("subject_sha256")
     if not isinstance(subject, str) or not subject:
         raise AirflowFailException(f"parent attempt {parent_run} {stage} checkpoint carries no subject")
     return subject
@@ -1360,15 +1368,14 @@ def solidworks_to_urdf():
     def generate(binding: dict, **context) -> dict:
         if binding.get("from_stage") in {"verify", "publish"}:
             # The linked attempt resumes past generation: reuse the parent checkpoint.
-            store = _linux_store(binding["request"]["conn_id"])
-            subject = _parent_subject(store, binding["source_run_id"], "generate")
+            platform, _root = _platform_binding()
+            subject = _parent_subject(platform, binding["source_run_id"], "generate")
             return {**binding, "generate": {"state": "reused", "passed": True, "subject_sha256": subject}}
-        store = _linux_store(binding["request"]["conn_id"])
+        paths = _work_paths(binding["request"]["conn_id"], binding["run_id"])
         receipt = _portable_registered(
-            store,
             binding["run_id"],
             "generate",
-            tree=store.stage_dir(binding["run_id"], "generate"),
+            tree=paths.stage_dir("generate"),
             context=context,
             source_run_id=binding.get("source_run_id"),
         )
@@ -1378,18 +1385,17 @@ def solidworks_to_urdf():
     def verify(generated: dict, **context) -> dict:
         if generated.get("from_stage") == "publish":
             # The linked attempt resumes past verification: reuse the parent checkpoint.
-            store = _linux_store(generated["request"]["conn_id"])
-            subject = _parent_subject(store, generated["source_run_id"], "verify")
+            platform, _root = _platform_binding()
+            subject = _parent_subject(platform, generated["source_run_id"], "verify")
             return {**generated, "verify": {"state": "reused", "passed": True, "subject_sha256": subject}}
         subject = (generated.get("generate") or {}).get("subject_sha256")
         if not subject:
             raise AirflowFailException("generate produced no subject to verify")
-        store = _linux_store(generated["request"]["conn_id"])
+        paths = _work_paths(generated["request"]["conn_id"], generated["run_id"])
         receipt = _portable_registered(
-            store,
             generated["run_id"],
             "verify",
-            tree=store.stage_dir(generated["run_id"], "verify"),
+            tree=paths.stage_dir("verify"),
             context=context,
             expected_subject=subject,
             source_run_id=generated.get("source_run_id"),
@@ -1409,12 +1415,11 @@ def solidworks_to_urdf():
         repository = config_from_airflow_connection(CONN_ID).repositories.get(str(slug or ""))
         if repository is None:
             raise AirflowFailException(f"no configured Linux checkout for model repository {slug!r}")
-        store = _linux_store(verified["request"]["conn_id"])
+        paths = _work_paths(verified["request"]["conn_id"], verified["run_id"])
         receipt = _portable_registered(
-            store,
             verified["run_id"],
             "publish",
-            tree=store.output_dir(verified["run_id"]),
+            tree=paths.output_dir,
             context=context,
             expected_subject=subject,
             repository=repository,
