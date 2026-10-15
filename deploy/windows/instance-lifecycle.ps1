@@ -320,14 +320,105 @@ function Get-PreviousGenerationBinding([string]$generation, [object]$binding) {
             port=$binding.port; version=$record.version; source_commit=$record.source_commit;
             source_sha256=$record.source_sha256 }
 }
-function Get-UnsupportedEndpointConfigKeys([string]$configPath) {
-  # A8: the 1.5.0 endpoint refuses these keys.  The upgrade pre-check only reports them - the
-  # running configuration is never rewritten (the generation copy stays a byte copy).
+function Get-EndpointConfigEarlyProblems([string]$configPath) {
+  # Early fail-closed scan for the 1.5.0 upgrade path: the known removed key set (currently
+  # targets) is transformed away by the single candidate generation; any other top-level key -
+  # or a repeated key - stops the stage explicitly and is never silently dropped.  The running
+  # file itself is never modified.
+  $allowed = @('schema_version','package_root','output_root','state_root','token_file','host','port')
   $removed = @('targets')
-  if (-not (Test-Path -LiteralPath $configPath)) { return @() }
-  $config = Read-Json $configPath
-  $present = @($config.PSObject.Properties.Name)
-  return @($removed | Where-Object { $present -contains $_ })
+  if (-not (Test-Path -LiteralPath $configPath)) { return @{unreadable=''; duplicates=@(); unknown=@()} }
+  $raw = [System.IO.File]::ReadAllText($configPath)
+  $document = $null
+  try { $document = [System.Text.Json.JsonDocument]::Parse($raw) } catch {
+    return @{unreadable=$_.Exception.Message; duplicates=@(); unknown=@()}
+  }
+  $names = @()
+  foreach ($property in $document.RootElement.EnumerateObject()) { $names += $property.Name }
+  $duplicates = @($names | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name } | Sort-Object)
+  $unknown = @($names | Sort-Object -Unique | Where-Object { ($allowed -notcontains $_) -and ($removed -notcontains $_) })
+  return @{unreadable=''; duplicates=$duplicates; unknown=$unknown}
+}
+function Get-EndpointConfigTransformProgram {
+  # The single generator of the 1.5.0 candidate configuration.  It runs with the staged runtime so
+  # the candidate is serialized and digested by the release's own canonical writer; the policy is
+  # deliberately minimal - drop the known removed keys, keep every other field's value, refuse
+  # anything else (unknown keys, duplicate keys, malformed values) instead of guessing.
+  return @'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from description_pipeline import io
+
+
+def fail(code, detail):
+    print(json.dumps({"error": code, "detail": detail}, sort_keys=True))
+    raise SystemExit(1)
+
+
+def pairs_hook(pairs):
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError("duplicate key: %s" % key)
+        document[key] = value
+    return document
+
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+raw = source.read_bytes()
+try:
+    document = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs_hook)
+except ValueError as error:
+    duplicated = "duplicate key" in str(error)
+    fail("endpoint_config_duplicate_keys" if duplicated else "endpoint_config_unreadable", str(error))
+except Exception as error:
+    fail("endpoint_config_unreadable", str(error))
+if not isinstance(document, dict):
+    fail("endpoint_config_invalid", "the endpoint configuration is not an object")
+
+allowed = ("schema_version", "package_root", "output_root", "state_root", "token_file", "host", "port")
+removed = ("targets",)
+unknown = sorted(set(document) - set(allowed) - set(removed))
+if unknown:
+    fail("endpoint_config_unknown_keys", ", ".join(unknown))
+if document.get("schema_version") != "solidworks-to-urdf.endpoint/v1":
+    fail("endpoint_config_invalid_values", "schema_version")
+for key in ("package_root", "output_root", "state_root", "token_file", "host"):
+    if key in document and not isinstance(document[key], str):
+        fail("endpoint_config_invalid_values", key)
+port = document.get("port")
+if port is not None and (not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535):
+    fail("endpoint_config_invalid_values", "port")
+
+candidate = {key: document[key] for key in allowed if key in document}
+io.write_json(target, candidate)
+
+try:
+    from description_pipeline.orchestration.windows import read_config
+except Exception as error:
+    fail("endpoint_config_validator_unavailable", str(error))
+try:
+    loaded = read_config(target)
+except Exception as error:
+    fail("candidate_rejected_by_read_config", str(error))
+loaded_digest = loaded.get("config_digest") if isinstance(loaded, dict) else None
+if not isinstance(loaded_digest, str) or len(loaded_digest) != 64:
+    fail("candidate_digest_unrecorded", repr(loaded_digest))
+
+result = {
+    "source_sha256": hashlib.sha256(raw).hexdigest(),
+    "candidate_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+    "canonical_digest": io.digest(candidate),
+    "config_digest": loaded_digest,
+    "removed_keys": [key for key in removed if key in document],
+    "read_config": "passed",
+}
+print(json.dumps(result, sort_keys=True))
+'@
 }
 function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$previousConfig, [string]$stageDir, [string]$sourceLauncher) {
   # The safe stop/restore every promote failure path runs: stop whatever now serves the task,
@@ -445,14 +536,24 @@ if ($Verb -eq 'stage') {
   if (-not $StageDir) { Die 'stage_dir_required' 'stage needs -StageDir (the new generation directory)' }
   if (Test-Path -LiteralPath $StageDir) { Die 'stage_exists' "preserve the existing generation: $StageDir" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
-  # Early upgrade pre-check (A8): a running configuration that still carries a removed key would
-  # be refused by the 1.5.0 endpoint; fail here with the manual fix instead of a mid-switch stop.
+  # Early fail-closed scan (A8 upgrade path): the known removed key set (targets) is transformed
+  # away by the single candidate generation below, but anything the 1.5.0 schema does not define -
+  # including duplicate keys - stops the stage here, before any heavy work, and is never silently
+  # dropped.
   $runningConfig = Action-Config $task
-  $unsupported = @(Get-UnsupportedEndpointConfigKeys $runningConfig)
-  if ($unsupported.Count -gt 0) {
-    Die 'endpoint_config_targets' ('the running endpoint configuration still carries the removed ' +
-      ($unsupported -join ', ') + ' key: ' + $runningConfig + '; remove the key manually (the 1.5.0 ' +
-      'endpoint refuses it) and re-run stage')
+  $early = Get-EndpointConfigEarlyProblems $runningConfig
+  if ($early.unreadable) {
+    Die 'endpoint_config_unreadable' ('the running endpoint configuration cannot be parsed: ' +
+      $runningConfig + ' (' + $early.unreadable + ')')
+  }
+  if (@($early.duplicates).Count -gt 0) {
+    Die 'endpoint_config_duplicate_keys' ('the running endpoint configuration repeats keys: ' +
+      ($early.duplicates -join ', ') + ' in ' + $runningConfig)
+  }
+  if (@($early.unknown).Count -gt 0) {
+    Die 'endpoint_config_unknown_keys' ('the running endpoint configuration carries keys the 1.5.0 ' +
+      'schema does not define: ' + ($early.unknown -join ', ') + ' in ' + $runningConfig +
+      '; remove them under change control and re-run stage')
   }
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
@@ -473,16 +574,35 @@ if ($Verb -eq 'stage') {
   if ($identity.tool.version -ne $binding.version -or $identity.tool.source_sha256 -ne $binding.source_sha256 -or $identity.tool.release.source_commit -ne $binding.source_commit -or -not $identity.doctor.passed) {
     Die 'identity_mismatch' 'the staged runtime identity differs from the release manifest'
   }
-  # The generation carries its own minimal endpoint configuration; the token path stays the one
-  # the running instance already uses.  The expected config digest is computed by the staged
-  # runtime's own canonical owner - the endpoint's own /health stays the only install identity.
-  # The generation configuration is a byte copy of the running instance's own configuration
-  # (token path and roots preserved; no re-serialization, no BOM).
-  Copy-Item -LiteralPath $runningConfig -Destination (Config-Path $StageDir)
-  $expected = & $runtime -I -c "import json,sys;from description_pipeline import io;print(io.digest(json.load(open(sys.argv[1],encoding='utf-8'))))" (Config-Path $StageDir)
-  if ($LASTEXITCODE -ne 0) { Die 'config_digest_failed' 'the staged runtime could not digest the generation configuration' }
+  # The generation consumes a generated 1.5.0 candidate configuration: the staged runtime's own
+  # canonical writer drops the known removed key set (targets), keeps every other field's value
+  # and meaning, and the release's own read_config test-loads the candidate before stage accepts
+  # it; the running file stays byte-sealed for controlled recovery.  (Necessity: the 1.5.0
+  # endpoint refuses the removed keys, so the former byte copy would ship a configuration the new
+  # validator rejects - one deterministic generation replaces it.)
+  $transformProgram = Get-EndpointConfigTransformProgram
+  $transform = & $runtime -I -c $transformProgram $runningConfig (Config-Path $StageDir)
+  if ($LASTEXITCODE -ne 0) {
+    $problem = ($transform | Select-Object -Last 1)
+    $code = 'endpoint_config_transform_failed'
+    $detail = [string]$problem
+    try {
+      $parsed = $problem | ConvertFrom-Json
+      if ($parsed.error) { $code = [string]$parsed.error; $detail = [string]$parsed.detail }
+    } catch { }
+    Die $code $detail
+  }
+  $transformInfo = ($transform | Select-Object -Last 1) | ConvertFrom-Json
+  $expected = [string]$transformInfo.config_digest
+  Write-Receipt (Join-Path $StageDir 'config-transformation.json') @{
+    verb='stage-config-transform'; at=(Get-Date).ToUniversalTime().ToString('o'); source=$runningConfig;
+    source_sha256=[string]$transformInfo.source_sha256; candidate_sha256=[string]$transformInfo.candidate_sha256;
+    canonical_digest=[string]$transformInfo.canonical_digest; config_digest=$expected;
+    removed_keys=@($transformInfo.removed_keys); read_config=[string]$transformInfo.read_config}
   Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{
-    expected=$true; config_digest=("$expected".Trim()); version=$binding.version;
+    expected=$true; config_digest=$expected; config_sha256=[string]$transformInfo.candidate_sha256;
+    source_config=$runningConfig; source_config_sha256=[string]$transformInfo.source_sha256;
+    removed_keys=@($transformInfo.removed_keys); version=$binding.version;
     source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
   Write-Receipt (Join-Path $StageDir 'stage-receipt.json') @{
     passed=$true; verb='stage'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
@@ -498,7 +618,23 @@ if ($Verb -eq 'promote') {
   if (-not (Test-Path -LiteralPath (Config-Path $StageDir))) { Die 'generation_config_missing' 'the generation carries no endpoint configuration' }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered; install the instance before promoting' }
   if (@($task.Actions).Count -ne 1) { Die 'task_ambiguous' 'the instance task must carry exactly one action' }
+  # The candidate configuration is consumed, never regenerated here: the staged bytes must match
+  # the digest the stage recorded, and that record must belong to the configuration that is
+  # running right now.
+  $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
+  if (-not $candidate.config_sha256) {
+    Die 'candidate_config_unrecorded' 'the staged generation records no candidate configuration digest; re-run stage with the 1.5.0 toolchain'
+  }
+  if ((Sha256 (Config-Path $StageDir)) -ne [string]$candidate.config_sha256) {
+    Die 'candidate_config_mismatch' ('the staged candidate configuration differs from the staged digest: ' + (Config-Path $StageDir))
+  }
   $previousConfig = Action-Config $task
+  if (-not $candidate.source_config_sha256) {
+    Die 'candidate_source_unrecorded' 'the staged generation records no source configuration digest; re-run stage with the 1.5.0 toolchain'
+  }
+  if ((Sha256 $previousConfig) -ne [string]$candidate.source_config_sha256) {
+    Die 'candidate_source_mismatch' ('the staged candidate belongs to another running configuration: ' + $previousConfig)
+  }
   $sourceExecute = $task.Actions[0].Execute
   $sourceConfig = $previousConfig
   Stop-Endpoint $binding
@@ -522,7 +658,6 @@ if ($Verb -eq 'promote') {
     $lockRefusal = $started.lock_refusal
     $retriedAfter = $started.retried_after_s
     $health = $settled.health
-    $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
     if ($health.install.config_digest -ne $candidate.config_digest) {
       throw 'the running endpoint config digest differs from the staged generation configuration'
     }

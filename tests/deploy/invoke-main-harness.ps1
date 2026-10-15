@@ -6,7 +6,8 @@
 # files; the candidate's own Invoke-Main, Start-OrRefuse, refusal interpreters, restore path and
 # health probe run for real (Wait-Settled runs real and fails fast on the stub task state).
 # Scenarios: unknown_owner | startable_second_refusal | startable_missing_receipt |
-# stage_targets_refused.
+# stage_unknown_key_refused | stage_duplicate_key_refused | promote_candidate_mismatch |
+# promote_source_mismatch.
 # Prints one JSON object (scenario, message, calls, sleeps, receipt) and exits 0.
 param(
   [Parameter(Mandatory=$true)][string]$ScriptPath,
@@ -25,13 +26,19 @@ $newConfig = Join-Path $newGeneration 'endpoint.json'
 $token = Join-Path $Root 'local-test-token'
 [System.IO.File]::WriteAllText($token, 'synthetic-offline-token')
 $configuration = @{state_root=$Root; port=8765; token_file=$token}
-if ($Scenario -eq 'stage_targets_refused') {
-  # A8: the legacy running configuration still carries the removed targets key.
+if ($Scenario -eq 'stage_unknown_key_refused') {
+  # A8: the known removable key plus a key the 1.5.0 schema does not define.
   $configuration['targets'] = @{nd_fixture = @{repository_slug = 'a/b'; base = 'feature/arm'}}
+  $configuration['bogus_key'] = $true
 }
-$configuration = $configuration | ConvertTo-Json -Depth 4
-[System.IO.File]::WriteAllText($oldConfig, $configuration)
-[System.IO.File]::WriteAllText($newConfig, $configuration)
+if ($Scenario -eq 'stage_duplicate_key_refused') {
+  $configurationText = '{"schema_version":"solidworks-to-urdf.endpoint/v1","port":8765,' +
+    '"token_file":"' + ($token -replace '\\', '/') + '","port":8766}'
+} else {
+  $configurationText = $configuration | ConvertTo-Json -Depth 4
+}
+[System.IO.File]::WriteAllText($oldConfig, $configurationText)
+[System.IO.File]::WriteAllText($newConfig, $configurationText)
 [System.IO.File]::WriteAllText((Join-Path $newGeneration 'stage-receipt.json'), '{}')
 [System.IO.File]::WriteAllText((Join-Path $Root '.endpoint.lock'), '4242')
 if ($Scenario -ne 'startable_missing_receipt') {
@@ -45,6 +52,17 @@ $bindingPath = Join-Path $Root 'binding.json'
   archive='synthetic.zip'; artifact_sha256='synthetic'; port=8765; package_root=$Root; output_root=$Root;
   version='1.5.0'; source_commit=('b' * 40); source_sha256=('b' * 64)} |
   ConvertTo-Json | Set-Content -LiteralPath $bindingPath
+if ($Scenario -notlike 'stage_*') {
+  $candidateSha = (Get-FileHash -LiteralPath $newConfig -Algorithm SHA256).Hash.ToLower()
+  $sourceSha = (Get-FileHash -LiteralPath $oldConfig -Algorithm SHA256).Hash.ToLower()
+  if ($Scenario -eq 'promote_candidate_mismatch') { $candidateSha = ('0' * 64) }
+  if ($Scenario -eq 'promote_source_mismatch') { $sourceSha = ('1' * 64) }
+  [System.IO.File]::WriteAllText(
+    (Join-Path $newGeneration 'candidate-identity.json'),
+    (@{expected=$true; config_digest='digest'; config_sha256=$candidateSha; source_config=$oldConfig;
+       source_config_sha256=$sourceSha; removed_keys=@(); version='1.5.0'; source_commit=('b' * 40);
+       source_sha256=('b' * 64)} | ConvertTo-Json -Compress))
+}
 
 $script:OldAction = [pscustomobject]@{
   Execute = (Join-Path $oldGeneration 'runtime/Scripts/description.exe')
@@ -93,7 +111,7 @@ function Invoke-RestMethod {
 }
 function Die { param([string]$code, [string]$message) throw ('DIE:' + $code + ':' + $message) }
 
-if ($Scenario -eq 'stage_targets_refused') {
+if ($Scenario -like 'stage_*') {
   $Script:Verb = 'stage'
   $Script:Binding = $bindingPath
   $Script:StageDir = Join-Path $Root 'staged'
@@ -103,10 +121,11 @@ if ($Scenario -eq 'stage_targets_refused') {
   $Script:StageDir = $newGeneration
 }
 $message = ''
-try { Invoke-Main } catch { $message = $_.Exception.Message }
+$stack = ''
+try { Invoke-Main } catch { $message = $_.Exception.Message; $stack = $_.ScriptStackTrace }
 $failedFile = Get-ChildItem -LiteralPath (Join-Path $Root 'instance-promotions') -Recurse `
   -Filter 'failed-promotion.json' -ErrorAction SilentlyContinue | Select-Object -First 1
 $receipt = if ($failedFile) { Get-Content -LiteralPath $failedFile.FullName -Raw | ConvertFrom-Json } else { $null }
-@{scenario=$Scenario; message=$message; calls=@($script:Calls); sleeps=@($script:Sleeps); receipt=$receipt} |
+@{scenario=$Scenario; message=$message; stack=$stack; calls=@($script:Calls); sleeps=@($script:Sleeps); receipt=$receipt} |
   ConvertTo-Json -Depth 12 -Compress
 exit 0
