@@ -45,6 +45,7 @@ from description_pipeline.orchestration.portal import (
 from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
 from description_pipeline.io import PipelineError
 from description_pipeline.platform.store import AdmissionClosedError, PlatformStoreError
+from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import CONTRACT
 
 from .protocol_support import protocol_events
@@ -1104,6 +1105,7 @@ class PortalTests(unittest.TestCase):
             "unknown_target": {"target_hardware": "ghost", "change_summary": TEST_SUMMARY},
             "missing_summary": {"target_hardware": TEST_TARGET},
             "whitespace_summary": {"target_hardware": TEST_TARGET, "change_summary": " \t "},
+            "whitespace_lines_summary": {"target_hardware": TEST_TARGET, "change_summary": " \n\t "},
         }
         for label, choices in cases.items():
             with self.subTest(case=label):
@@ -1116,6 +1118,45 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 400, body)
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual(self.airflow.dag_runs, {})
+
+    def test_multiline_change_summary_normalizes_line_breaks_and_reaches_discovery(self) -> None:
+        self.client.login()
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(
+                fields=[
+                    ("target_hardware", TEST_TARGET),
+                    ("change_summary", "第一行\r\n第二行\r第三行\n第四行"),
+                ]
+            ),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 201, body)
+        stored = "第一行\n第二行\n第三行\n第四行"
+        payload = json.loads(body)
+        self.assertEqual(payload["change_summary"], stored)
+        self.assertEqual(self.airflow.conf["change_summary"], stored)
+        self.assertEqual(self.airflow.trigger_payloads[-1]["conf"]["change_summary"], stored)
+        # End-to-end smoke: the recorded summary passes the discovery summary check without blocking.
+        findings: list[dict] = []
+        identity, _sources = discovery._identity(
+            {"identity": {}, "properties": {"document": {}}},
+            discovery.DiscoverySettings(),
+            findings,
+            configuration=None,
+            assembly=None,
+            native_files={},
+            submission=discovery.SubmissionIdentity(
+                hardware_id=TEST_TARGET,
+                change_summary=stored,
+                as_of="20261015",
+                inventory_digest="a" * 64,
+            ),
+            handoff_sha256=None,
+        )
+        self.assertEqual(identity["change_summary"], stored)
+        self.assertNotIn("discovery.summary_invalid", [finding["code"] for finding in findings])
 
     def test_submission_conf_always_carries_target_summary_and_principal(self) -> None:
         self.client.login()
@@ -2210,7 +2251,7 @@ class PortalTests(unittest.TestCase):
             status, _, body = self.client.request(
                 "POST",
                 f"/api/runs/{DAG_RUN_ID}/attempts",
-                {"stage": "generate", "target_hardware": "m3.1", "change_summary": "rebound summary"},
+                {"stage": "generate", "target_hardware": "m3.1", "change_summary": "rebound\r\nsummary"},
             )
         self.assertEqual(status, 202, body)
         self.assertEqual(
@@ -2220,7 +2261,7 @@ class PortalTests(unittest.TestCase):
                 "parent_dag_run_id": DAG_RUN_ID,
                 "resume_from": "generate",
                 "target_hardware": "m3.1",
-                "change_summary": "rebound summary",
+                "change_summary": "rebound\nsummary",
                 "submission_principal": FEISHU_PRINCIPAL,
             },
         )

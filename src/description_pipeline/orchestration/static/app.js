@@ -32,6 +32,7 @@ const state = {
   uploading: false,
   uploadAbort: null,
   blockedPick: false,
+  targetsRetryPick: null,
   stages: [],
   selectedStage: null,
   viewer: null,
@@ -254,17 +255,37 @@ async function loadTargets(pick) {
   select.hidden = false;
   summary.hidden = false;
   const main = state.assemblyChoice ? `${pick.top}/${state.assemblyChoice}` : "";
-  let payload = { targets: [], suggestion: null };
+  let payload;
   try {
     payload = await api(
       `/api/targets?folder=${encodeURIComponent(pick.top)}&main_assembly=${encodeURIComponent(main)}`
     );
-  } catch {
-    // The selector stays empty; without a configured target the submission is blocked.
+  } catch (error) {
+    // A failed fetch is not "no targets configured": keep the pick so the fetch retries once a
+    // session is ready again, and say what happened instead of misreporting an empty platform.
+    state.targetsRetryPick = pick;
+    const failure = document.createElement("option");
+    failure.value = "";
+    failure.textContent = "发布目标加载失败";
+    failure.disabled = true;
+    failure.selected = true;
+    select.append(failure);
+    note.hidden = false;
+    if (error.status === 401) {
+      note.textContent = "会话已失效，发布目标加载失败：请重新登录后再试。";
+      clearSession();
+      setError($("login-error"), "会话已失效，请重新登录后再试。");
+    } else {
+      note.textContent = "发布目标加载失败：网络或服务异常，请重新选择文件夹后重试。";
+    }
+    updateStartEnabled();
+    return;
   }
+  state.targetsRetryPick = null;
   const targets = payload.targets || [];
   const placeholder = document.createElement("option");
   placeholder.value = "";
+  // Success with configured:false lands here; a fetch failure never does (handled above).
   placeholder.textContent = targets.length ? "请选择发布目标" : "平台未配置发布目标";
   select.append(placeholder);
   for (const item of targets) {
@@ -433,6 +454,7 @@ function showSession(session) {
   $("workspace").hidden = false;
   $("account").hidden = false;
   $("account-user").textContent = session.user;
+  if (state.targetsRetryPick) void loadTargets(state.targetsRetryPick);
 }
 
 function clearPreview() {

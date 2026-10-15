@@ -192,6 +192,16 @@ def _authored_text(value: Any) -> bool:
     return isinstance(value, str) and value.strip() != "" and not any(ord(c) < 32 or ord(c) == 127 for c in value)
 
 
+def _authored_multiline_text(value: Any) -> bool:
+    """Non-empty text whose only control character is the U+000A line break."""
+
+    return (
+        isinstance(value, str)
+        and value.strip() != ""
+        and not any((ord(c) < 32 and c != "\n") or ord(c) == 127 for c in value)
+    )
+
+
 def _snake(value: Any) -> str | None:
     """Return a stable snake_case identifier, or ``None`` when nothing remains."""
 
@@ -3638,12 +3648,12 @@ def _identity(
             "change summary is not recorded in the CAD records and the submission carries none; "
             "publication readiness requires it",
         )
-    if summary is not None and not _authored_text(summary):
+    if summary is not None and not _authored_multiline_text(summary):
         findings.append(
             _finding(
                 "discovery.summary_invalid",
                 "assembly",
-                "recorded change summary must be non-empty text without control characters",
+                "recorded change summary must be non-empty text without control characters other than line breaks",
                 {"value": summary},
             )
         )

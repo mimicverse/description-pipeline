@@ -179,6 +179,11 @@ input, select, textarea { font: inherit; }
   min-width: 240px; max-width: 100%; padding: 6px 8px; font: inherit;
   border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--card);
 }
+.assembly-row textarea {
+  flex: 1 1 320px; min-width: 240px; max-width: 100%; padding: 6px 8px; font: inherit;
+  border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--card);
+  resize: vertical;
+}
 .assembly-row p { margin: 0; }
 .folder-summary { font-size: 12.5px; overflow-wrap: anywhere; }
 #upload-status { font-variant-numeric: tabular-nums; }

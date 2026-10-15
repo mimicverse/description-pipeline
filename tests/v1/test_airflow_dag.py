@@ -85,10 +85,14 @@ class DagTests(unittest.TestCase):
             identity, routing = module._submission_frame(
                 context({"target_hardware": "m3.0", "change_summary": "rebind"})
             )
+            multiline, _routing = module._submission_frame(
+                context({"target_hardware": "m3.0", "change_summary": "第一行\r\n第二行\r第三行"})
+            )
         self.assertEqual(routing, {"repository_slug": "mimicverse/description", "base": "main"})
         self.assertEqual(identity["hardware_id"], "m3.0")
         self.assertEqual(identity["change_summary"], "rebind")
         self.assertIsNone(identity["parent_revision"])
+        self.assertEqual(multiline["change_summary"], "第一行\n第二行\n第三行")
 
     def test_resolve_handoff_fails_before_any_endpoint_contact(self) -> None:
         from types import SimpleNamespace

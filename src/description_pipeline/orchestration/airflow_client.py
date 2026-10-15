@@ -268,6 +268,17 @@ def validate_main_assembly(value: object) -> str:
     return value
 
 
+def normalize_change_summary(value: str) -> str:
+    """Normalize a change summary's line endings to LF before it is recorded.
+
+    The discovery contract admits U+000A inside a change summary and still rejects every
+    other control character, so the portal and the DAG intake fold CRLF (and a lone CR)
+    into LF instead of forwarding a carriage return into the records.
+    """
+
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def submission_identity(
     *,
     target_hardware,
