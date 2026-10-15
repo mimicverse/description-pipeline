@@ -58,7 +58,8 @@ DAG_ID = "solidworks_to_urdf"
 PIPELINE_ID = "solidworks-to-urdf"
 #: One relative operator path inside the connection's intake allowlist.
 HANDOFF_PATH = "handoff/m3.0"
-TARGET_HARDWARE = "m3.0"
+#: The control fixture's CAD carries its own hardware identity (``fixture["hardware_id"]``);
+#: the connection, the portal configuration and the submission all name that identity.
 REPOSITORY_SLUG = "example/m3.0"
 REPOSITORY_BASE = "feature/m3.0"
 #: The smoke verifies the contract's slot-release semantics: the native wait must
@@ -284,6 +285,7 @@ def _mock_endpoint(
                 return
             if len(segments) == 2 and segments[1] == "abort":
                 payload = json.loads(body or b"{}")
+                state.setdefault("aborts", []).append(payload)
                 job["status"] = "failed"
                 job["error"] = str(payload.get("error") or "derivation refused")
                 job["events"] = [*job.get("events", []), {"stage": "job", "state": "failed", "at": "t0"}]
@@ -417,22 +419,24 @@ def _task_reschedule_evidence(
     code = (
         "import json\n"
         "from airflow.models.taskreschedule import TaskReschedule\n"
+        "from airflow.models.taskinstance import TaskInstance\n"
         "from airflow.settings import Session\n"
         f"dag, run, task = {dag_id!r}, {run_id!r}, {task_id!r}\n"
         "def row(record):\n"
         "    return {\n"
         "        name: (None if getattr(record, name, None) is None else str(getattr(record, name)))\n"
-        "        for name in ('id', 'dag_id', 'run_id', 'task_id', 'try_number', 'start_date', 'end_date',\n"
-        "                     'reschedule_date', 'map_index')\n"
+        "        for name in ('id', 'ti_id', 'start_date', 'end_date', 'reschedule_date')\n"
         "    }\n"
         "with Session() as session:\n"
         "    rows = [\n"
         "        row(record)\n"
-        "        for record in session.query(TaskReschedule).filter(\n"
-        "            TaskReschedule.dag_id == dag,\n"
-        "            TaskReschedule.run_id == run,\n"
-        "            TaskReschedule.task_id == task,\n"
-        "        ).all()\n"
+        "        for record in session.query(TaskReschedule).join(\n"
+        "            TaskInstance, TaskReschedule.ti_id == TaskInstance.id\n"
+        "        ).filter(\n"
+        "            TaskInstance.dag_id == dag,\n"
+        "            TaskInstance.run_id == run,\n"
+        "            TaskInstance.task_id == task,\n"
+        "        ).order_by(TaskReschedule.id).all()\n"
         "    ]\n"
         "print(json.dumps({'rows': rows}))\n"
     )
@@ -540,9 +544,14 @@ def _http_json(
 
 
 def _portal_admit(
-    portal_base: str, token: str, intake_dir: Path, top_name: str, target: str, summary: str
+    portal_base: str, token: str, intake_dir: Path, folder_name: str, target: str, summary: str
 ) -> tuple[str, str, dict]:
-    """Adopt an operator session (Airflow SSO cookie) and submit the folder through the portal."""
+    """Adopt an operator session (Airflow SSO cookie) and submit the folder through the portal.
+
+    ``folder_name`` is the leaf of the handoff root: the portal reconstitutes the upload as
+    ``upload_root/<dag_run_id>/<folder_name>`` and the DAG reads that path as its handoff, so
+    the leaf keeps the fixture-relative file layout intact.
+    """
 
     from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
     from tests.v1.test_portal import _upload_body  # noqa: PLC0415
@@ -555,7 +564,7 @@ def _portal_admit(
     )
     files = [(name, (intake_dir / name).read_bytes()) for name in sorted(package_inventory(intake_dir))]
     body = _upload_body(
-        folder=top_name,
+        folder=folder_name,
         files=files,
         fields=[("target_hardware", target), ("change_summary", summary)],
     )
@@ -574,7 +583,7 @@ def _portal_admit(
 
 
 def _portal_negative_checks(
-    portal_base: str, token: str, cookie: str, csrf: str, top_name: str, run_id: str
+    portal_base: str, token: str, cookie: str, csrf: str, top_name: str, run_id: str, target: str
 ) -> list[dict]:
     """The HTTP-driven negative matrix (illegal fields and an illegal rerun stage)."""
 
@@ -587,7 +596,7 @@ def _portal_negative_checks(
     checks = (
         ("missing_target", multipart([("change_summary", "x")])),
         ("unconfigured_target", multipart([("target_hardware", "not-configured"), ("change_summary", "x")])),
-        ("missing_summary", multipart([("target_hardware", TARGET_HARDWARE)])),
+        ("missing_summary", multipart([("target_hardware", target)])),
     )
     for name, body in checks:
         status, payload, _ = _http_json(
@@ -754,6 +763,10 @@ def main() -> int:
     portal_mode = bool(args.portal_admission)
     run_id = f"smoke-{uuid.uuid4().hex[:12]}"
     native_id = native_run_id(run_id)
+    # The smoke owns its scratch space inside its own AIRFLOW_HOME: a previous attempt (or an
+    # earlier smoke on a persistent home) must not collide with this run's fixtures, staged
+    # transfer archives or intake folder.
+    shutil.rmtree(args.airflow_home / "smoke", ignore_errors=True)
     if portal_mode:
         # The real portal admits the run and its dag_run_id binds the native identity; the
         # placeholder built below exists only to prepare the uploaded folder before admission.
@@ -766,13 +779,14 @@ def main() -> int:
     except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
         print(json.dumps({"ok": False, "stage": "control_fixture", "error": f"{type(error).__name__}: {error}"}))
         return 1
+    # The control fixture's CAD carries its own hardware identity; the submission must name
+    # exactly that identity (and the connection must route it), or the derivation refuses the
+    # run as an identity conflict.
+    target = str(fixture["hardware_id"])
 
     api_port = args.api_port or _free_port()
     intake_root = args.airflow_home / "smoke" / "intake"
     intake = intake_root / HANDOFF_PATH
-    # The smoke owns this intake path inside its own AIRFLOW_HOME; a previous attempt (or an
-    # earlier smoke on a persistent home) must not collide with the fresh fixture copy.
-    shutil.rmtree(intake, ignore_errors=True)
     shutil.copytree(fixture_root / "native", intake)
     upload_files = package_inventory(intake)
     record = _native_record(fixture_root)
@@ -799,7 +813,7 @@ def main() -> int:
             "extra": {
                 "store_root": str(store_root),
                 "repositories": {REPOSITORY_SLUG: str(args.airflow_home / "smoke-repository")},
-                "targets": {TARGET_HARDWARE: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
+                "targets": {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
                 "handoff_roots": [str(intake_root)],
                 "discovery": {"record_roots": [str(fixture_root / "records")]},
             },
@@ -928,13 +942,18 @@ def main() -> int:
                 intake_root,
                 store_root,
                 args.airflow_home / "smoke-repository",
-                {TARGET_HARDWARE: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
+                {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
                 DAG_ID,
                 endpoint_holder,
             )
             try:
                 run_id, portal_cookie, portal_session = _portal_admit(
-                    portal_base, token, intake, HANDOFF_PATH, TARGET_HARDWARE, "scheduled control-fixture smoke"
+                    portal_base,
+                    token,
+                    intake,
+                    Path(HANDOFF_PATH).name,
+                    target,
+                    "scheduled control-fixture smoke",
                 )
                 portal_csrf = str(portal_session.get("csrf_token") or "")
             except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
@@ -955,9 +974,11 @@ def main() -> int:
                     )
                 )
                 return 1
-            identity_stable = (
-                rebuilt.get("handoff_sha256") == fixture.get("handoff_sha256")
-                and Path(str(rebuilt.get("archive"))).read_bytes() == Path(str(fixture.get("archive"))).read_bytes()
+            # The uploaded folder is the frozen handoff: its relative inventory must equal the
+            # rebuilt fixture's native tree and seal the same handoff digest.  The derived
+            # capture archive is bound to the run identity and legitimately differs per build.
+            identity_stable = rebuilt.get("handoff_sha256") == fixture.get("handoff_sha256") and (
+                package_inventory(rebuilt_root / "native") == package_inventory(intake)
             )
             fixture = rebuilt
             fixture_root = rebuilt_root
@@ -998,7 +1019,7 @@ def main() -> int:
                     run_id,
                     {
                         "handoff_path": str(intake),
-                        "target_hardware": TARGET_HARDWARE,
+                        "target_hardware": target,
                         "change_summary": "scheduled control-fixture smoke",
                     },
                 )
@@ -1034,7 +1055,9 @@ def main() -> int:
                         "state": "up_for_reschedule",
                     }
                 )
-            time.sleep(5)
+            # One-second reschedule windows: a looser poll misses the observable state even
+            # though the TaskReschedule rows prove the slot release.
+            time.sleep(1)
         else:
             tails = {c: (log_dir / f"{c}.log").read_text(encoding="utf-8")[-400:] for c in logs}
             print(
@@ -1056,7 +1079,9 @@ def main() -> int:
             )
             if status != 200:
                 problems.append(f"the portal projection could not be read: {status}")
-            negatives = _portal_negative_checks(portal_base, token, portal_cookie, portal_csrf, HANDOFF_PATH, run_id)
+            negatives = _portal_negative_checks(
+                portal_base, token, portal_cookie, portal_csrf, HANDOFF_PATH, run_id, target
+            )
             for item in negatives:
                 if not item["ok"]:
                     problems.append(
@@ -1185,7 +1210,9 @@ def main() -> int:
             "selection_uploads": state["uploads"],
             "definition_posts": state["definition_posts"],
             "artifact_paths": state["artifact_paths"],
+            "endpoint_aborts": state.get("aborts") or None,
             "handoff_sha256": fixture["handoff_sha256"],
+            "target_hardware": target,
             "fixture_identity_stable": identity_stable,
             "generate": {"state": generated.get("state"), "subject_sha256": generated.get("subject_sha256")},
             "verify": {
