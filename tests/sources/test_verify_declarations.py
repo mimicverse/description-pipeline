@@ -1113,6 +1113,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                     "schema_version": "solidworks-to-urdf.native-discovery/v1",
                     "run_id": "test",
                     "contract": "native-discovery/v1",
+                    "handoff_sha256": "0" * 64,
                     "raw": raw,
                     "identity": copy.deepcopy(raw["identity"]),
                 },
