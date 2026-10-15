@@ -597,10 +597,17 @@ class LinuxStore:
         subject = subject_digest(delivery)
         if not isinstance(receipt, dict) or receipt.get("subject_sha256") != subject:
             raise PipelineError("The retained diagnostic delivery is not bound to its recorded subject")
-        report = read_data(confined(delivery, "reports/quality.json"))
+        report_path = confined(delivery, "reports/quality.json")
+        report = read_data(report_path)
         files = subject_inventory(delivery)
         if "urdf/robot.urdf" not in files:
             raise PipelineError("The retained diagnostic delivery carries no urdf/robot.urdf artifact")
+        # The quality report stays outside the subject (it cannot digest itself), but it
+        # is only exposed when its own subject claim matches this delivery: the digest
+        # binds the exact retained bytes and the artifact stream re-proves them.
+        report_files: dict[str, str] = {}
+        if isinstance(report, dict) and report.get("subject_sha256") == subject:
+            report_files["reports/quality.json"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
         failing = _failing_checks(report)
         warnings = _delivery_warnings(delivery)
         return {
@@ -610,6 +617,7 @@ class LinuxStore:
             "subject_sha256": subject,
             "urdf": "urdf/robot.urdf",
             "files": files,
+            "report_files": report_files,
             "verified": False,
             "state": "unverified",
             "reason": "verification_failed",
@@ -634,6 +642,8 @@ class LinuxStore:
         """
         root, preview = self._bound_preview(run_id)
         expected = preview["files"].get(name)
+        if expected is None:
+            expected = (preview.get("report_files") or {}).get(name)
         if expected is None or expected != sha256:
             raise PipelineError("The requested artifact is not part of the previewed delivery")
         path = confined(root, name)
