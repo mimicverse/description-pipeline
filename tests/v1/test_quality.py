@@ -17,6 +17,7 @@ import numpy as np
 from description_pipeline.interface_records import CHECK_POLICY_V1, validate_qualification
 from description_pipeline.io import PipelineError, canonical, write_json
 from description_pipeline.sources.solidworks import verify as oracle
+from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification import solidworks_urdf as quality
 from description_pipeline.verification.solidworks_physics import verify_physics, verify_urdf_mass_equality
 from tests.sources import support
@@ -45,13 +46,16 @@ class PhysicsTests(unittest.TestCase):
                 }
             ],
         }
-        # The record quotes the capture session's assembly path (an environment
-        # fact, kept verbatim); the frozen collection identity names the same
-        # document package-relative and binds the record by normalized suffix.
+        # The record quotes the capture session's assembly path verbatim; the
+        # frozen capture identity (the snapshot manifest identity, kept equal to
+        # the collection block) carries exactly that assembly.
         self.captured_identity = {
             "assembly": "C:\\endpoint\\prepared\\robot.SLDASM",
             "configuration": "Default",
         }
+        # The frozen identity's assembly is fixed; mutations may repoint the
+        # record's quoted capture-session path to prove the binding refuses.
+        self.frozen_assembly = self.captured_identity["assembly"]
         material = {
             "part": {"name": "Analytic control material", "database": "unit-test"},
             "bodies": [{"material": {}, "effective_source": "part"}],
@@ -222,6 +226,11 @@ class PhysicsTests(unittest.TestCase):
             configuration=self.captured_identity["configuration"],
             revision=None,
         )
+        identity = {
+            "assembly": self.frozen_assembly,
+            "configuration": self.captured_identity["configuration"],
+            "provider": "solidworks",
+        }
         capture = {
             "scene": copy.deepcopy(self.raw),
             "components": [
@@ -238,7 +247,7 @@ class PhysicsTests(unittest.TestCase):
             "collection": {
                 "kind": "solidworks",
                 "evidence_class": "cad",
-                "identity": copy.deepcopy(source["identity"]),
+                "identity": copy.deepcopy(identity),
                 "limits": {"native_cad": True},
                 "environment": {"solidworks": {"revision": "34.0"}},
             },
@@ -257,6 +266,9 @@ class PhysicsTests(unittest.TestCase):
             capture=capture,
             source=source,
         )
+        (self.root / "raw/scene_raw.json").write_text('{"scene": "fixture"}', encoding="utf-8")
+        write_manifest(self.root, kind="solidworks", identity=copy.deepcopy(identity), evidence_class="cad")
+        support.seal_delivery(self.bundle)
 
     def block(self, name):
         return support.load_capture_block(self.root, name)
