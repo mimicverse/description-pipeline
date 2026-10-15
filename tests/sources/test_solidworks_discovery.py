@@ -2190,6 +2190,7 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
+        payload = json.loads((delivery / "evidence" / "discovery.json").read_text(encoding="utf-8"))
         original = json.dumps(
             {
                 "schema_version": "solidworks-to-urdf.request/v1",
@@ -2197,6 +2198,8 @@ class DiscoveryTests(unittest.TestCase):
                 "target_hardware": target,
                 "change_summary": "真实提交说明\n第二行",
                 "main_assembly": "cad/robot.SLDASM",
+                "handoff_digest": payload["handoff_sha256"],
+                "platform_config_digest": "d" * 64,
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -2244,6 +2247,39 @@ class DiscoveryTests(unittest.TestCase):
         report = verify_discovery(delivery)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.request", [item["code"] for item in report["errors"]])
+
+
+    def test_verifier_refuses_a_malformed_frozen_request(self):
+        delivery, original = self._delivery_with_frozen_request(drop=("hardware_id",))
+        request_path = delivery / "input" / "request.json"
+        request_path.write_bytes(original)
+        support.seal_delivery(delivery)
+        self.assertTrue(verify_discovery(delivery)["passed"])
+        valid = json.loads(original.decode("utf-8"))
+
+        def rewrite(changed: dict) -> None:
+            request_path.write_text(json.dumps(changed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            support.seal_delivery(delivery)
+
+        mutations = [
+            (f"omit_{field}", {key: value for key, value in valid.items() if key != field})
+            for field in sorted(valid)
+        ]
+        mutations += [
+            (f"null_{field}", {**valid, field: None})
+            for field in ("request_id", "main_assembly", "handoff_digest", "platform_config_digest")
+        ]
+        mutations += [
+            ("bad_request_id_type", {**valid, "request_id": 123}),
+            ("bad_platform_digest", {**valid, "platform_config_digest": "not-a-sha256"}),
+        ]
+        for name, changed in mutations:
+            with self.subTest(case=name):
+                rewrite(changed)
+                report = verify_discovery(delivery)
+                self.assertFalse(report["passed"])
+                self.assertIn("discovery.request", [item["code"] for item in report["errors"]])
+                rewrite(valid)
 
 
 class NativePropertyScopeTests(unittest.TestCase):
