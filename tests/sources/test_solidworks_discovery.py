@@ -2177,6 +2177,75 @@ class DiscoveryTests(unittest.TestCase):
                     self.assertIn("discovery.configuration", [item["code"] for item in report["errors"]])
 
 
+    def _delivery_with_frozen_request(self, *, drop: tuple[str, ...]):
+        """One fallback delivery whose request record is written before any tamper."""
+
+        raw = record()
+        target = raw["identity"]["hardware_id"]
+        for field in drop:
+            raw["identity"].pop(field)
+        result, output = self._derive_pure(
+            raw,
+            submission=SubmissionIdentity(hardware_id=target, change_summary="真实提交说明\n第二行"),
+        )
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+        original = json.dumps(
+            {
+                "schema_version": "solidworks-to-urdf.request/v1",
+                "request_id": "89e1c51f-e6c9-4d01-9467-f3c403c081e1",
+                "target_hardware": target,
+                "change_summary": "真实提交说明\n第二行",
+                "main_assembly": "cad/robot.SLDASM",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        (delivery / "input" / "request.json").write_bytes(original)
+        return delivery, original
+
+    def test_verifier_refuses_a_dual_claim_hardware_change_against_the_frozen_request(self):
+        delivery, original = self._delivery_with_frozen_request(drop=("hardware_id",))
+
+        def retarget(payload: dict) -> None:
+            payload["identity"]["hardware_id"] = "different_target"
+
+        def rebind(source_record: dict) -> None:
+            source_record["selection"]["hardware_id"] = "different_target"
+            source_record["identity"]["hardware_id"] = "different_target"
+            source_record["source_revision_id"] = digest(source_record["identity"])
+
+        self._tamper_delivered(delivery, "evidence/discovery.json", retarget)
+        self._tamper_delivered(delivery, "input/source.json", rebind)
+        self.assertEqual((delivery / "input" / "request.json").read_bytes(), original)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+    def test_verifier_refuses_a_dual_claim_summary_change_against_the_frozen_request(self):
+        delivery, original = self._delivery_with_frozen_request(drop=("change_summary",))
+
+        def rebind_summary(payload: dict) -> None:
+            payload["identity"]["change_summary"] = "被生成器共同换掉的说明"
+
+        def rebind_source_summary(source_record: dict) -> None:
+            source_record["metadata"]["change_summary"] = "被生成器共同换掉的说明"
+
+        self._tamper_delivered(delivery, "evidence/discovery.json", rebind_summary)
+        self._tamper_delivered(delivery, "input/source.json", rebind_source_summary)
+        self.assertEqual((delivery / "input" / "request.json").read_bytes(), original)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+    def test_verifier_refuses_a_fallback_without_the_frozen_request(self):
+        delivery, _original = self._delivery_with_frozen_request(drop=("hardware_id",))
+        (delivery / "input" / "request.json").unlink()
+        support.seal_delivery(delivery)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.request", [item["code"] for item in report["errors"]])
+
+
 class NativePropertyScopeTests(unittest.TestCase):
     def test_conflicting_dp_values_across_scopes_block(self):
         with self.assertRaises(CadError) as raised:
