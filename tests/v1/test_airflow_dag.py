@@ -367,6 +367,7 @@ class DagTests(unittest.TestCase):
         from airflow.sdk.exceptions import AirflowFailException
         from description_pipeline.io import digest
         from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.request_evidence import freeze_request_evidence
 
         module = self._module()
         dag = module.dag
@@ -406,10 +407,25 @@ class DagTests(unittest.TestCase):
             ),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
+        import shutil
+        import tempfile
+
+        store_root = Path(tempfile.mkdtemp(prefix="dag-store-"))
+        self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
+        freeze_request_evidence(
+            store_root / parent_run_id,
+            request_id=parent_dag_run_id,
+            target_hardware="m3.0",
+            change_summary="linked capture rerun",
+            main_assembly="3.0 总装1008.SLDASM",
+            handoff_digest=digest(upload),
+            platform_config_digest="c" * 64,
+        )
         config = EndpointConfig(
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            store_root=store_root,
         )
         with (
             patch.object(module, "_endpoint", return_value=Stub()),
@@ -467,10 +483,30 @@ class DagTests(unittest.TestCase):
             "repository_slug": None,
             "repository_base": None,
         }
+        import shutil
+        import tempfile
+
+        from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.request_evidence import freeze_request_evidence
+
+        store_root = Path(tempfile.mkdtemp(prefix="dag-linked-"))
+        self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
+        freeze_request_evidence(
+            store_root / native_run_id("portal-parent-2"),
+            request_id="portal-parent-2",
+            target_hardware="m3.0",
+            change_summary="rebound publish",
+            main_assembly="assembly.SLDASM",
+            handoff_digest="d" * 64,
+            platform_config_digest="e" * 64,
+        )
 
         class Store:
             def meta(self, run_id):
                 return dict(parent_meta)
+
+            def run_dir(self, run_id):
+                return store_root / run_id
 
         context = {
             "dag_run": SimpleNamespace(

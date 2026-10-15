@@ -56,6 +56,7 @@ from description_pipeline.stages import (
     stage_view,
 )
 from description_pipeline.io import PipelineError, confined, digest, inventory, read_data
+from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import validate_file_index
 
@@ -766,6 +767,8 @@ def solidworks_to_urdf():
                     "repository_slug": routing["repository_slug"],
                     "repository_base": routing["base"],
                 }
+                carried = carry_request_evidence(store.run_dir(linked["parent_run"]), store.run_dir(request["run_id"]))
+                request["request_evidence"] = str(carried)
                 selection = _linked_selection(parent_meta.get("main_assembly"), context["params"].get("main_assembly"))
                 if selection is not None:
                     request["main_assembly"] = selection
@@ -792,6 +795,9 @@ def solidworks_to_urdf():
                 "resume": linked,
                 "conn_id": CONN_ID,
             }
+            store = _linux_store(CONN_ID)
+            carried = carry_request_evidence(store.run_dir(linked["parent_run"]), store.run_dir(request["run_id"]))
+            request["request_evidence"] = str(carried)
             if linked["from_stage"] != "capture":
                 # A freeze or discover rerun still serves the definition leg from the
                 # original sealed intake; the local folder must match it exactly.
@@ -831,6 +837,30 @@ def solidworks_to_urdf():
             "conn_id": CONN_ID,
         }
         request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+        conf = getattr(context["dag_run"], "conf", None)
+        conf = conf if isinstance(conf, dict) else {}
+        request_id = str(conf.get("request_id") or context["params"].get("request_id") or "").strip()
+        if not request_id:
+            raise AirflowFailException("request_id is required: the run carries no authenticated request identity")
+        config_digest = str(
+            conf.get("platform_config_digest") or os.environ.get("PLATFORM_CONFIG_DIGEST") or ""
+        ).strip()
+        if not config_digest:
+            raise AirflowFailException(
+                "platform_config_digest is required: the platform configuration snapshot identity is unavailable"
+            )
+        store = _linux_store(CONN_ID)
+        evidence = freeze_request_evidence(
+            store.run_dir(run_id),
+            request_id=request_id,
+            target_hardware=identity["hardware_id"],
+            change_summary=identity.get("change_summary") or "",
+            main_assembly=main,
+            handoff_digest=request["upload_sha256"],
+            platform_config_digest=config_digest,
+        )
+        request["request_evidence"] = str(evidence)
+        request["request_id"] = request_id
         return request
 
     @task.sensor(
@@ -898,6 +928,9 @@ def solidworks_to_urdf():
                 raise AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
             capture_archive_metadata(job)
             binding = import_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
+            # The frozen request evidence rides the delivery from the capture tree
+            # onward; generation and verification consume it byte-verbatim.
+            carry_request_evidence(store.run_dir(run_id), store.capture_dir(run_id))
             # The trigger's conf target and its configured routing are the authority;
             # the native job no longer carries publication routing.
             binding["repository_slug"] = request.get("repository_slug")
