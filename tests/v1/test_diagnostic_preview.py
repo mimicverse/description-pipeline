@@ -341,6 +341,21 @@ class DiagnosticPreviewTests(unittest.TestCase):
         # Binding is once per immutable checkpoint: the same object serves the next call.
         self.assertIs(self.store.preview(RUN), preview)
 
+    def test_failing_checks_accept_the_state_failed_convention(self) -> None:
+        from description_pipeline.orchestration.linux_store import _failing_checks
+
+        rows = _failing_checks(
+            {
+                "checks": [
+                    {"id": "limit.dof", "state": "failed", "details": {"reason": "8 control limits"}},
+                    {"id": "ok", "state": "passed"},
+                    {"id": "other", "passed": False, "details": {"error": "boom"}},
+                ]
+            }
+        )
+        self.assertEqual([row["id"] for row in rows], ["limit.dof", "other"])
+        self.assertEqual(rows[0]["state"], "failed")
+
     def test_diagnostic_artifacts_stream_only_bound_bytes(self) -> None:
         failed = self._retained_failed_verify()
         preview = self.store.preview(RUN)
