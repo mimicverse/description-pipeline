@@ -4140,7 +4140,7 @@ def derive_native_package(
             },
         )
     checks, budget_entry = _budgets(record, settings, findings)
-    _bodies, joints, frames, derived_names = _derive_carriers(record, identity, settings, findings)
+    bodies, joints, frames, derived_names = _derive_carriers(record, identity, settings, findings)
     blocking = [item for item in findings if item["blocking"]]
     output.mkdir(parents=True, exist_ok=True)
     discovery_path = output / DISCOVERY_FILE
@@ -4213,17 +4213,19 @@ def derive_native_package(
     # never copied into it.
     plan_objects = []
     for component in record.get("components") or ():
-        if not isinstance(component, dict):
+        if not isinstance(component, dict) or component.get("suppressed"):
             continue
-        name = component.get("name")
+        name = component.get("instance_id") or component.get("name2")
         if not isinstance(name, str) or not name:
             continue
         selector = {"name": name}
-        for key in ("document", "instance", "path", "state"):
-            value = component.get(key)
-            if isinstance(value, str) and value:
-                selector[key] = value
+        document = component.get("document")
+        if isinstance(document, str) and document:
+            selector["document"] = document.replace("\\", "/")
+        state = component.get("state")
+        selector["state"] = int(state) if type(state) is int else 2
         plan_objects.append(selector)
+    plan_objects.sort(key=lambda item: item["name"])
     write_json(
         output / PLAN_FILE,
         {
@@ -4236,9 +4238,14 @@ def derive_native_package(
             "identity": {"hardware_id": identity.get("hardware_id"), "revision": identity.get("revision")},
             "selection": {"files": {str(key): str(value) for key, value in sorted(native_files.items())}},
             "objects": plan_objects,
-            "datums": [
-                str(item["name"]) for item in frames if isinstance(item, dict) and isinstance(item.get("name"), str)
-            ],
+            "datums": sorted(
+                {str(item["datum"]) for item in bodies if item.get("datum")}
+                | {
+                    str(item["coordinate_system"])
+                    for item in frames
+                    if isinstance(item, dict) and item.get("coordinate_system")
+                }
+            ),
             "evidence_requests": [
                 "evidence/capture.json",
                 "evidence/geometry/",

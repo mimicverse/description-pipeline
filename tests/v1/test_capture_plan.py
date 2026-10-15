@@ -19,9 +19,16 @@ def build_package(root: Path) -> Path:
 
     discovery = {
         "schema_version": "solidworks-to-urdf.native-discovery/v1",
+        "run_id": "r-1",
         "derivation": {"main_assembly": MAIN, "configuration": None},
         "native_files": {MAIN: "a" * 64, "cad/part.SLDPRT": "b" * 64},
-        "raw": {"saved_configuration": "Default"},
+        "raw": {
+            "saved_configuration": "Default",
+            "components": [
+                {"instance_id": "base-1", "name2": "base-1", "document": "cad/base.SLDPRT"},
+                {"instance_id": "arm-1", "name2": "arm-1", "document": "cad/arm.SLDPRT"},
+            ],
+        },
     }
     (root / "discovery").mkdir(parents=True)
     discovery_path = root / "discovery" / "native-discovery.json"
@@ -37,8 +44,11 @@ def build_package(root: Path) -> Path:
         "configuration": "Default",
         "identity": {"hardware_id": "m3.0", "revision": "r1"},
         "selection": {"files": files},
-        "objects": [{"name": "base_link"}, {"name": "neck-A"}],
-        "datums": [],
+        "objects": [
+            {"name": "base-1", "document": "cad/base.SLDPRT", "state": 2},
+            {"name": "arm-1", "document": "cad/arm.SLDPRT", "state": 2},
+        ],
+        "datums": ["CS_base_link"],
         "evidence_requests": ["evidence/capture.json", "evidence/geometry/", "evidence/native-runtime.json"],
     }
     write_json(root / "capture-plan.json", plan)
@@ -59,8 +69,9 @@ class CapturePlanTests(unittest.TestCase):
         write_json(self.root / "capture-plan.json", plan)
 
     def test_an_intact_plan_is_consumed_with_the_sealed_source(self) -> None:
-        source = steps._consume_sealed_definition(self.root)
+        source, plan = steps._consume_sealed_definition(self.root)
         self.assertEqual(source["robot_name"], "robot")
+        self.assertEqual(plan["run_id"], "r-1")
 
     def test_a_missing_plan_is_refused(self) -> None:
         (self.root / "capture-plan.json").unlink()
@@ -88,8 +99,33 @@ class CapturePlanTests(unittest.TestCase):
             steps._consume_sealed_definition(self.root)
 
     def test_a_plan_without_usable_object_selectors_is_refused(self) -> None:
-        self._rewrite_plan(lambda plan: plan.update(objects=[{"name": ""}, {"instance": "x"}]))
-        with self.assertRaisesRegex(PipelineError, "object selectors"):
+        self._rewrite_plan(lambda plan: plan.update(objects=[]))
+        with self.assertRaisesRegex(PipelineError, "no native object selectors"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_with_an_unknown_selector_field_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan["objects"][1].update(instance="x"))
+        with self.assertRaisesRegex(PipelineError, "unknown native selector field"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_with_an_unknown_top_level_field_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan.update(invented=True))
+        with self.assertRaisesRegex(PipelineError, "unknown field"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_naming_an_unregistered_instance_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan["objects"][1].update(name="ghost-1"))
+        with self.assertRaisesRegex(PipelineError, "outside the sealed record"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_naming_another_run_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan.update(run_id="r-2"))
+        with self.assertRaisesRegex(PipelineError, "another run"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_requesting_unknown_evidence_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan["evidence_requests"].append("evidence/invented.json"))
+        with self.assertRaisesRegex(PipelineError, "unknown evidence items"):
             steps._consume_sealed_definition(self.root)
 
     def test_a_missing_source_identity_is_refused(self) -> None:

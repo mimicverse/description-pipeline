@@ -394,7 +394,55 @@ def _snapshot_details(staging, manifest):
     }
 
 
-def _consume_sealed_definition(package: Path) -> dict:
+#: The evidence items a capture plan must request (the capture stage contract).
+_CAPTURE_EVIDENCE_REQUESTS = [
+    "evidence/capture.json",
+    "evidence/geometry/",
+    "evidence/native-runtime.json",
+]
+
+#: The exact field set of one sealed capture plan.
+_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "handoff_sha256",
+        "discovery_sha256",
+        "main_assembly",
+        "configuration",
+        "identity",
+        "selection",
+        "objects",
+        "datums",
+        "evidence_requests",
+    }
+)
+
+
+def _require_plan_against_capture(staging: Path, plan: dict) -> None:
+    """The planned selectors, datums and evidence items must match the actual capture."""
+
+    evidence = staging / "evidence"
+    captured = read_data(evidence / "raw" / "mass_properties.json")
+    captured_names = {str(name) for name in (captured or {})}
+    if not {str(item["name"]) for item in plan["objects"]} <= captured_names:
+        raise PipelineError("The capture did not read every planned native instance")
+    if plan["datums"]:
+        systems = read_data(evidence / "raw" / "coordinate_systems.json")
+        known = {str(name) for name in (systems or {})}
+        if not set(map(str, plan["datums"])) <= known:
+            raise PipelineError("The capture did not read every planned datum")
+    for requested in plan["evidence_requests"]:
+        requested = str(requested)
+        target = evidence / requested.removeprefix("evidence/")
+        if requested.endswith("/"):
+            if not target.is_dir():
+                raise PipelineError(f"The capture did not produce a planned evidence item: {requested}")
+        elif not target.is_file():
+            raise PipelineError(f"The capture did not produce a planned evidence item: {requested}")
+
+
+def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     """Consume the sealed Linux-origin definition of one prepared package.
 
     The capture reads the derived content identity (``source.json``) and the
@@ -405,6 +453,7 @@ def _consume_sealed_definition(package: Path) -> dict:
     rederivation happens on the Windows side.
     """
 
+    from .io import artifact_path_parts
     from .sources.solidworks.discovery import DISCOVERY_FILE, PLAN_FILE, PLAN_SCHEMA, SOURCE_FILE
 
     discovery_path = package / DISCOVERY_FILE
@@ -422,6 +471,8 @@ def _consume_sealed_definition(package: Path) -> dict:
     plan = read_data(plan_path)
     if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA:
         raise PipelineError("The sealed capture plan has an unexpected schema")
+    if set(plan) != _PLAN_KEYS:
+        raise PipelineError("The sealed capture plan carries an unknown field")
     payload = read_data(discovery_path)
     if not isinstance(payload, dict):
         raise PipelineError("The sealed discovery record is not a usable record")
@@ -442,12 +493,50 @@ def _consume_sealed_definition(package: Path) -> dict:
     saved = record.get("saved_configuration")
     if isinstance(saved, str) and saved and plan.get("configuration") != saved:
         raise PipelineError("The sealed capture plan configuration disagrees with the recorded saved configuration")
+    if plan.get("run_id") != payload.get("run_id"):
+        raise PipelineError("The sealed capture plan names another run than the sealed discovery")
     objects = plan.get("objects")
-    if not isinstance(objects, list) or any(
-        not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"] for item in objects
+    if not isinstance(objects, list) or not objects:
+        raise PipelineError("The sealed capture plan carries no native object selectors")
+    names: list[str] = []
+    for item in objects:
+        if not isinstance(item, dict) or set(item) - {"name", "document", "state"}:
+            raise PipelineError("The sealed capture plan carries an unknown native selector field")
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            raise PipelineError("The sealed capture plan carries no usable native object selectors")
+        document = item.get("document")
+        if document is not None:
+            if not isinstance(document, str) or not document:
+                raise PipelineError("The sealed capture plan carries an unusable selector document")
+            try:
+                artifact_path_parts(document)
+            except PipelineError as error:
+                raise PipelineError("The sealed capture plan carries an unsafe selector document") from error
+            if not document.lower().endswith((".sldprt", ".sldasm")):
+                raise PipelineError("The sealed capture plan carries a non-CAD selector document")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise PipelineError("The sealed capture plan repeats a native object selector")
+    registered = {
+        str(item.get("instance_id") or item.get("name2"))
+        for item in (record.get("components") or [])
+        if isinstance(item, dict)
+        and not item.get("suppressed")
+        and isinstance(item.get("instance_id") or item.get("name2"), str)
+    }
+    if not registered or not set(names) <= registered:
+        raise PipelineError("The sealed capture plan names instances outside the sealed record")
+    datums = plan.get("datums")
+    if (
+        not isinstance(datums, list)
+        or any(not isinstance(item, str) or not item for item in datums)
+        or len(set(datums)) != len(datums)
     ):
-        raise PipelineError("The sealed capture plan carries no usable native object selectors")
-    return source
+        raise PipelineError("The sealed capture plan carries unusable datums")
+    if plan.get("evidence_requests") != _CAPTURE_EVIDENCE_REQUESTS:
+        raise PipelineError("The sealed capture plan requests unknown evidence items")
+    return source, plan
 
 
 def capture_evidence(
@@ -486,13 +575,14 @@ def capture_evidence(
             error = PipelineError("The CAD package does not meet the input specification")
             error.details = {"errors": report.get("errors", [])}
             raise error
-        # Interim: the sealed plan is consumed and qualified first; the capture
-        # configuration still rebuilds its carriers from the sealed record until
-        # the platform-side carrier migration lands.
-        _consume_sealed_definition(package)
+        # Interim: the sealed plan is consumed and qualified first (and enforced
+        # against the actual capture); the capture configuration still rebuilds
+        # its carriers from the sealed record until the platform-side carrier
+        # migration lands.
+        _sealed_source, plan = _consume_sealed_definition(package)
         source = source_definition(package)
         source["closure"] = native_source_closure(package)
-        definition = {"source": source}
+        definition = {"source": source, "plan": plan}
         prepared_files = package_inventory(package)
         _archive_input(package, staging)
         report["package_files"] = dict(sorted(inventory(staging / "input").items()))
@@ -542,6 +632,7 @@ def capture_evidence(
         describe=lambda value: _snapshot_details(staging, value),
     )
     _rehome_evidence(staging, package)
+    _require_plan_against_capture(staging, definition["plan"])
 
     def stable_inputs():
         if package_inventory(package) != original_files:
