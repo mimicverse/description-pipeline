@@ -838,7 +838,20 @@ class PortalTests(unittest.TestCase):
             artifacts=_endpoint_artifacts(),
             checkpoints=("capture", "generate", "verify"),
         )
+        self._record_fixture_events(run_id)
         return dag_run_id
+
+    def _record_fixture_events(self, run_id: str) -> None:
+        """Mirror the seeded protocol events into the registered side.
+
+        The runner records the observed stage/check events in the platform store,
+        which is the read authority for the run page; the fixture models that by
+        copying the seeded job's events into the registered row.
+        """
+
+        job = self.endpoint_server.jobs.get(run_id) or {}
+        entry = self.store.runs[run_id]
+        entry["merged"] = {**(entry.get("merged") or {}), "events": job.get("events") or []}
 
     def _passed_result(self, *, subject: str = "a" * 64, quality_subject: str | None = None) -> dict:
         return {
@@ -946,6 +959,7 @@ class PortalTests(unittest.TestCase):
             },
             artifacts=dict(members),
         )
+        self._record_fixture_events(run_id)
 
     def _seed_airflow_run(
         self,
@@ -2023,6 +2037,69 @@ class PortalTests(unittest.TestCase):
         # A member with no registration at all stays a clear 404.
         status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/other.json")
         self.assertEqual(status, 404)
+
+    def test_edited_evidence_refuses_the_preview_like_the_download(self) -> None:
+        """The diagnostic preview parses the registered bytes: an edit before the first
+        read refuses with the same 502 class as the download, never empty findings."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        # Replaced before the first read: the preview refuses exactly like the download.
+        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b'{"checks":[]}'
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 502, body)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        self.assertEqual(status, 502, body)
+
+    def test_incomplete_evidence_registration_refuses_the_preview(self) -> None:
+        """A member whose digest is missing is an incomplete registration: the preview
+        refuses before any parse instead of reporting zero failing checks."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        self.store.runs[run_id]["preview"]["report_files"]["reports/quality.json"] = None
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 502, body)
+
+    def test_registered_run_state_and_events_outrank_the_native_job(self) -> None:
+        """The DB registration owns the run state and the recorded events; the endpoint
+        only supplements display detail and never overrides them."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID, status="running", events=[{"stage": "capture", "state": "running", "at": "t0"}])
+        run_id = native_run_id(DAG_RUN_ID)
+        recorded = protocol_events(failed_stage="verify", subject="a" * 64)
+        self.store.add(
+            run_id,
+            meta={"handoff_sha256": "d" * 64},
+            merged={"status": "failed", "events": recorded},
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        # The registered run state outranks the native job's "running".
+        self.assertEqual(payload["job"]["status"], "failed")
+        # The recorded events - not the native-only capture event - drive the stage view.
+        self.assertEqual(payload["report"]["failure"]["stage"], "verify")
 
     def test_registered_diagnostics_are_the_only_servable_copy(self) -> None:
         self.client.login()

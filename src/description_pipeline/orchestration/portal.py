@@ -1791,11 +1791,10 @@ class PortalApp:
                 rows = None
         if not isinstance(rows, list) or not rows:
             rows = None
-        platform = self.config.platform_store
-        record = self._platform_read(lambda: platform.run_record(native_id)) if platform is not None else None
+        record = self._platform_read(lambda: self._platform().run_record(native_id))
         if not isinstance(record, dict):
             return rows
-        stages = self._platform_read(lambda: platform.stage_records(native_id))
+        stages = self._platform_read(lambda: self._platform().stage_records(native_id))
 
         def checkpoint(stage: str) -> str | None:
             row = stages.get(stage)
@@ -2213,13 +2212,10 @@ class PortalApp:
         digests always come from that registration, never from current bytes.
         """
 
-        platform = self.config.platform_store
-        if platform is None:
-            return None
-        record = self._platform_read(lambda: platform.run_record(run_id))
+        record = self._platform_read(lambda: self._platform().run_record(run_id))
         if not isinstance(record, dict):
             return None
-        stages = self._platform_read(lambda: platform.stage_records(run_id))
+        stages = self._platform_read(lambda: self._platform().stage_records(run_id))
         stages = stages if isinstance(stages, dict) else {}
         by_stage: dict[str, dict] = {}
         for stage in _STAGE_READ_ORDER:
@@ -2251,24 +2247,51 @@ class PortalApp:
                 members.setdefault(path, member)
         return {"run": record, "stages": stages, "members": members, "by_stage": by_stage}
 
-    def _member_bytes(self, path: str, member: dict) -> bytes | None:
-        """Read one registered member's sealed bytes; failure stays absent."""
+    @staticmethod
+    def _registered_member_fields(member: dict) -> tuple[str, int, str]:
+        """The digest, byte length and checkpoint of one completely registered member."""
 
-        platform = self.config.platform_store
+        expected = member.get("sha256")
+        length = member.get("bytes")
         checkpoint = member.get("checkpoint_uri")
-        if platform is None or not isinstance(checkpoint, str) or not checkpoint:
-            return None
+        if not (
+            isinstance(expected, str)
+            and _SHA256_TEXT.fullmatch(expected)
+            and type(length) is int
+            and length >= 0
+            and isinstance(checkpoint, str)
+            and checkpoint
+        ):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供")
+        return expected, length, checkpoint
+
+    def _registered_member_bytes(self, path: str, member: dict) -> bytes:
+        """One registered member's sealed bytes, verified against its registration.
+
+        The one check both read surfaces share: the artifact download and the
+        preview's evidence parsing (quality report, warnings) consume the same
+        registered digest, length and checkpoint, so replaced, missing or
+        incompletely registered bytes refuse identically with the fixed 502
+        classes - the preview can never self-sign a serving decision or degrade
+        to empty findings.
+        """
+
+        expected, length, checkpoint = self._registered_member_fields(member)
+        platform = self._platform_read(self._platform)
         try:
             root = Path(platform.sealed_path(checkpoint)).resolve()
-        except (PlatformStoreError, PipelineError, OSError, ValueError):
-            return None
-        target = (root / path).resolve()
-        if root not in target.parents:
-            return None
+        except (PlatformStoreError, PipelineError, OSError, ValueError) as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供") from error
         try:
-            return target.read_bytes()
-        except OSError:
-            return None
+            target = (root / path).resolve()
+            if root not in target.parents:
+                raise OSError("member path escapes the registered checkpoint")
+            data = target.read_bytes()
+        except OSError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
+        if len(data) != length or hashlib.sha256(data).hexdigest() != expected:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供")
+        return data
 
     def _preview_from_projection(self, run_id: str, projection: dict) -> dict | None:
         """One preview payload over the registered members of this attempt.
@@ -2286,15 +2309,20 @@ class PortalApp:
             return None
         receipt = verify.get("receipt") if isinstance(verify.get("receipt"), dict) else {}
         verified = state == "completed"
+        # Every advertised member must be completely registered before any byte is
+        # served or parsed: an incomplete registration refuses outright, never a
+        # half-signed projection.
+        for member in members.values():
+            self._registered_member_fields(member)
         files = {
             path: member["sha256"]
             for path, member in members.items()
-            if _member_class(path) == "subject" and path != "manifest.json" and isinstance(member.get("sha256"), str)
+            if _member_class(path) == "subject" and path != "manifest.json"
         }
         report_files = {
             path: member["sha256"]
             for path, member in members.items()
-            if _member_class(path) == "report" and isinstance(member.get("sha256"), str)
+            if _member_class(path) == "report"
         }
         if "urdf/robot.urdf" not in files:
             raise PipelineError("The registered delivery carries no urdf/robot.urdf member")
@@ -2310,12 +2338,16 @@ class PortalApp:
             "state": "verified" if verified else "unverified",
         }
         if not verified:
-            quality_member = members.get("reports/quality.json", {})
-            report = _parse_member_json(self._member_bytes("reports/quality.json", quality_member))
+            quality_member = members.get("reports/quality.json")
+            report = (
+                _parse_member_json(self._registered_member_bytes("reports/quality.json", quality_member))
+                if isinstance(quality_member, dict)
+                else {}
+            )
             failing = _failing_checks(report)
             warnings = _delivery_warnings(
                 {
-                    path: self._member_bytes(path, member)
+                    path: self._registered_member_bytes(path, member)
                     for path, member in members.items()
                     if path in {"input/handoff.json", "evidence/discovery.json"}
                 }
@@ -2373,40 +2405,7 @@ class PortalApp:
         member = projection["members"].get(artifact) if projection is not None else None
         if member is None:
             raise PortalError(HTTPStatus.NOT_FOUND, "该文件尚未登记为本次运行的封存产物")
-        expected = member.get("sha256")
-        length = member.get("bytes")
-        checkpoint = member.get("checkpoint_uri")
-        if not (
-            isinstance(expected, str)
-            and _SHA256_TEXT.fullmatch(expected)
-            and type(length) is int
-            and length >= 0
-            and isinstance(checkpoint, str)
-            and checkpoint
-        ):
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供")
-        platform = self.config.platform_store
-        try:
-            root = Path(platform.sealed_path(checkpoint)).resolve() if platform is not None else None
-        except (PlatformStoreError, PipelineError, OSError, ValueError) as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供") from error
-        data = bytearray()
-        try:
-            if root is None:
-                raise OSError("sealed storage is not configured")
-            target = (root / artifact).resolve()
-            if root not in target.parents:
-                raise OSError("member path escapes the registered checkpoint")
-            with target.open("rb") as handle:
-                while True:
-                    chunk = handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-        except OSError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
-        if len(data) != length or hashlib.sha256(data).hexdigest() != expected:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供")
+        data = self._registered_member_bytes(artifact, member)
         content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
         headers = [
             ("Content-Type", content_type),
@@ -2414,7 +2413,7 @@ class PortalApp:
             ("Cache-Control", "private, max-age=300"),
         ]
         start_response("200 OK", _common_headers(headers, self.config))
-        return [bytes(data)]
+        return [data]
 
     def _retained_report_links(self, dag_run_id: str) -> list[dict]:
         """Downloadable entries of the automatically retained structural-team report.
@@ -2464,36 +2463,39 @@ class PortalApp:
         return endpoint() if callable(endpoint) else endpoint
 
     def _job_snapshot(self, run_id: str, endpoint: WindowsEndpoint) -> dict | None:
-        """The authoritative run snapshot: the registered platform projection when the attempt
-        entered it, the native endpoint job otherwise."""
+        """The run snapshot: the registered platform record is the run/event authority.
+
+        Once the attempt entered the platform store, its registered run state and
+        recorded events own the snapshot; the native endpoint only supplements
+        non-authoritative display details (activity telemetry, native findings,
+        submission facts) and can never override the registered run state or
+        events. Without a registration the native job is served as-is.
+        """
         native = None
         try:
             native = endpoint.get_job(run_id)
         except (EndpointNotFound, EndpointError):
             # An admitted attempt stays readable even when Windows is unreachable.
             native = None
-        platform = self.config.platform_store
-        record = self._platform_read(lambda: platform.run_record(run_id)) if platform is not None else None
-        events = (
-            self._platform_read(lambda: platform.run_events(run_id, limit=200)) if isinstance(record, dict) else []
+        record = self._platform_read(lambda: self._platform().run_record(run_id))
+        if not isinstance(record, dict):
+            return native
+        events = self._platform_read(lambda: self._platform().run_events(run_id, limit=200))
+        detail = dict(native) if isinstance(native, dict) else {}
+        state = record.get("state")
+        status = (
+            _JOB_STATUS_BY_RUN_STATE.get(state, state) if isinstance(state, str) and state else detail.get("status")
         )
-        if isinstance(record, dict):
-            if isinstance(native, dict):
-                # The native job owns the live record while its half blocks.
-                return native
-            synthesized = {
-                "schema_version": "solidworks-to-urdf.job/v1",
-                "pipeline_id": PIPELINE_ID,
-                "run_id": run_id,
-                "events": events,
-                "result": None,
-                "error": None,
-            }
-            state = record.get("state")
-            if isinstance(state, str) and state:
-                synthesized["status"] = _JOB_STATUS_BY_RUN_STATE.get(state, state)
-            return synthesized
-        return native
+        return {
+            **detail,
+            "schema_version": "solidworks-to-urdf.job/v1",
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "status": status,
+            "events": events,
+            "result": detail.get("result"),
+            "error": detail.get("error"),
+        }
 
     def _body(self, environ: dict) -> dict:
         try:

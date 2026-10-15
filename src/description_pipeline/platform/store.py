@@ -36,7 +36,7 @@ from ..stages import (
     STAGE_STATES,
     TERMINAL_STAGE_STATES,
 )
-from .storage import SEALED_URI_PREFIX, parse_sealed_uri
+from .storage import SEALED_URI_PREFIX, parse_sealed_uri, sealed_resolver_from_environment
 
 
 class PlatformStoreError(PipelineError):
@@ -286,13 +286,22 @@ class PlatformStore:
         Install (``platform_env``) exports ``PLATFORM_SERVICE_DSN`` for the
         platform_service role; the driver is imported lazily so the package
         carries no database dependency, and a missing DSN is an explicit
-        refusal - never a silent fallback to another store.
+        refusal - never a silent fallback to another store.  The one official
+        instance also carries the deploy-side sealed resolver derived from the
+        same environment (``PIPELINE_STORE_ROOT``); a missing store root is an
+        explicit refusal too, so no production path exists that reads registered
+        rows but cannot resolve their sealed checkpoints.
         """
 
         source = os.environ if environ is None else environ
         dsn = source.get("PLATFORM_SERVICE_DSN")
         if not dsn:
             raise PlatformStoreError("PLATFORM_SERVICE_DSN is not configured; the platform store is unavailable")
+        if sealed is None:
+            try:
+                sealed = sealed_resolver_from_environment(source)
+            except PipelineError as error:
+                raise PlatformStoreError(str(error)) from error
 
         def connect():
             import psycopg2

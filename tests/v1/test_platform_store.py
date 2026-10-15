@@ -1532,6 +1532,20 @@ class PlatformStoreTests(unittest.TestCase):
         )
         self.assertIsInstance(store, PlatformStore)
 
+    def test_the_environment_factory_carries_the_deploy_sealed_resolver(self) -> None:
+        """The one official instance always has a real sealed resolver: no production
+        path reads registered rows and then cannot resolve their checkpoints."""
+
+        dsn = "postgresql://service@/platform?host=/sock"
+        with self.assertRaisesRegex(PlatformStoreError, "PIPELINE_STORE_ROOT"):
+            PlatformStore.from_environment({"PLATFORM_SERVICE_DSN": dsn})
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PlatformStore.from_environment({"PLATFORM_SERVICE_DSN": dsn, "PIPELINE_STORE_ROOT": tmp})
+            self.assertEqual(
+                store.sealed_path("store://sealed/run-1/verify"),
+                Path(tmp).resolve() / "sealed/run-1/verify",
+            )
+
     def test_missing_admission_row_is_refused_without_typing_it_closed(self) -> None:
         self.world.admission = None
         with self.assertRaises(PlatformStoreError) as caught:
