@@ -551,7 +551,10 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.root = Path(self.temporary.name) / "store-root"
         self.root.mkdir()
         self.calls: list[dict] = []
-        platform = SimpleNamespace(confirm_stage=lambda **payload: self.calls.append(payload))
+        platform = SimpleNamespace(
+            confirm_stage=lambda **payload: self.calls.append(payload),
+            confirmed_stage=lambda *args, **kwargs: None,
+        )
         binding = patch.object(self.module, "_platform_binding", return_value=(platform, self.root))
         binding.start()
         self.addCleanup(binding.stop)
@@ -657,6 +660,34 @@ class PlatformRegistrationTests(unittest.TestCase):
             self.assertEqual(call["receipt"]["native_tool"], native_tool)
         self.assertTrue((self.root / "sealed" / "run-1" / "discover").is_dir())
         self.assertTrue((self.root / "sealed" / "run-1" / "capture").is_dir())
+
+    def test_a_repeated_freeze_confirmation_consumes_the_confirmed_fact(self) -> None:
+        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        (run_dir / "input").mkdir(parents=True)
+        (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        intake = Path(self.temporary.name) / "intake-retry"
+        intake.mkdir()
+        (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
+        upload_files = {"assembly.sldasm": "a" * 64}
+        stages = run_dir / "stages"
+        store = SimpleNamespace(run_dir=lambda _run: run_dir, stage_dir=lambda _run, stage: stages / stage)
+
+        records: dict[tuple[str, str], dict] = {}
+        confirmations: list[str] = []
+
+        class _RetainingPlatform:
+            def confirm_stage(self, *, run_id, stage, state, receipt, checkpoint_uri):
+                records[(run_id, stage)] = dict(receipt)
+                confirmations.append(stage)
+
+            def confirmed_stage(self, run_id, stage):
+                return records.get((run_id, stage))
+
+        platform = _RetainingPlatform()
+        with patch.object(self.module, "_platform_binding", return_value=(platform, self.root)):
+            self.module._register_freeze_stage(store, "run-1", intake=intake, upload_files=upload_files)
+            self.module._register_freeze_stage(store, "run-1", intake=intake, upload_files=upload_files)
+        self.assertEqual(confirmations, ["freeze"])
 
 
 if __name__ == "__main__":

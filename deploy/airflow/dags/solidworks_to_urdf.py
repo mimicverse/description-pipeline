@@ -124,13 +124,14 @@ def _ensure_subject_layout(tree: Path) -> None:
 
 
 def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, *, state: str | None = None) -> dict:
-    """The one platform receipt for one stage tree: every binding is read back from the sealed bytes."""
+    """The one platform receipt for one stage tree: every binding is read back from the sealed bytes.
+
+    A completion must bind the sealed handoff inventory; a real failure
+    registers its actual products with or without a successful handoff and
+    never loses the reports its tree already carries.
+    """
     tree = Path(tree)
     manifest = read_delivery_manifest(tree)
-    handoff = read_data(tree / "input" / "handoff.json")
-    package_files = handoff.get("package_files") if isinstance(handoff, dict) else None
-    if not isinstance(package_files, dict) or not package_files:
-        raise AirflowFailException(f"The {stage!r} stage tree carries no input/handoff.json inventory")
     if state is None:
         if stage == "publish":
             state = (receipt.get("submission") or {}).get("state")
@@ -139,6 +140,13 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
             if len(confirmed) != 1:  # pragma: no cover - the contract pins one state per stage
                 raise AirflowFailException(f"The {stage!r} stage carries no single confirmed state")
             state = next(iter(confirmed))
+    handoff_path = tree / "input" / "handoff.json"
+    handoff = read_data(handoff_path) if handoff_path.is_file() else None
+    package_files = handoff.get("package_files") if isinstance(handoff, dict) else None
+    if not isinstance(package_files, dict) or not package_files:
+        if state == "completed":
+            raise AirflowFailException(f"The {stage!r} stage tree carries no input/handoff.json inventory")
+        package_files = None
     payload = {
         "schema_version": BUNDLE_SCHEMA,
         "pipeline_id": PIPELINE_ID,
@@ -147,9 +155,10 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
         "state": state,
         "passed": False if state == "failed" else CONFIRMED_STAGE_PASSED[stage],
         "subject_sha256": (manifest.get("subject") or {}).get("digest"),
-        "handoff_sha256": digest(package_files),
         "artifacts": [dict(record) for record in (manifest.get("subject") or {}).get("files") or []],
     }
+    if package_files is not None:
+        payload["handoff_sha256"] = digest(package_files)
     for key in ("error", "tool", "native_tool", "quality", "submission"):
         if receipt.get(key) is not None:
             payload[key] = receipt[key]
@@ -169,6 +178,17 @@ def _seal_and_confirm(
     """Seal the stage tree through the one writer primitive, then register the stage record."""
     sealed_receipt = _platform_receipt(run_id, stage, receipt, tree, state=None if state == "completed" else "failed")
     uri, completed = seal_stage_confirmation(store_root, run_id, stage, Path(tree), sealed_receipt)
+    if state == "completed":
+        confirmed = platform.confirmed_stage(run_id, stage)
+        if confirmed is not None:
+            # The store is immutable: a retry consumes the confirmed fact instead
+            # of overwriting it, and a different identity still refuses.
+            if confirmed == completed:
+                log.info("stage already confirmed with the same identity run=%s stage=%s", run_id, stage)
+                return
+            raise AirflowFailException(
+                f"The {stage!r} stage of run {run_id!r} is already confirmed with another identity"
+            )
     platform.confirm_stage(run_id=run_id, stage=stage, state=state, receipt=completed, checkpoint_uri=uri)
 
 
@@ -199,10 +219,38 @@ def _register_failed_stage(
     platform.confirm_stage(run_id=run_id, stage=stage, state="failed", receipt=receipt)
 
 
-def _converge_failed_stage(run_id: str, stage: str, error: Exception, tree: Path | None = None) -> None:
-    """Best-effort failure convergence; the original stage failure is never masked."""
+def _failure_tree(run_dir: Path) -> Path:
+    """One snapshot of the attempt's actual products and reports for a failed registration."""
+    tree = run_dir / "seal" / "failed"
+    if tree.exists():
+        shutil.rmtree(tree)
+    tree.mkdir(parents=True)
+    for name in ("input", "reports", "evidence"):
+        source = run_dir / name
+        if source.is_dir():
+            shutil.copytree(source, tree / name)
+    _ensure_subject_layout(tree)
+    contract, policy = _delivery_manifest_arguments()
+    write_delivery_manifest(tree, contract=contract, policy=policy)
+    return tree
+
+
+def _converge_failed_stage(
+    run_id: str, stage: str, error: Exception, tree: Path | None = None, *, products: bool = False
+) -> None:
+    """Best-effort failure convergence; the original stage failure is never masked.
+
+    ``products`` snapshots the attempt's actual files (its reports included)
+    so a real failure registers what it actually produced, never less.
+    """
     try:
         platform, store_root = _platform_binding()
+        if tree is None and products:
+            try:
+                tree = _failure_tree(_linux_store(CONN_ID).run_dir(run_id))
+            except Exception:  # pragma: no cover - the shape-only registration stands
+                log.exception("failure-product snapshot unavailable run=%s stage=%s", run_id, stage)
+                tree = None
         _register_failed_stage(platform, store_root, run_id, stage, error, tree=tree)
     except Exception:  # pragma: no cover - the stage failure stays the primary signal
         log.exception("failed-stage registration unavailable run=%s stage=%s", run_id, stage)
@@ -225,7 +273,13 @@ def _portable_registered(
     except Exception as error:
         _converge_failed_stage(run_id, stage, error, tree=tree if Path(tree).is_dir() else None)
         raise
-    _register_completed_stage(run_id, stage, tree, receipt)
+    try:
+        _register_completed_stage(run_id, stage, tree, receipt)
+    except Exception as error:
+        _converge_failed_stage(
+            run_id, stage, error, tree=tree if (Path(tree) / "manifest.json").is_file() else None
+        )
+        raise
     return receipt
 
 
@@ -801,7 +855,7 @@ def _poke(request: dict, **context) -> bool:
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
         _store_failure_report(endpoint, request, job)
         failure = AirflowFailException(f"SolidWorks job {request['run_id']} failed: {job.get('error')}")
-        _converge_failed_stage(request["run_id"], _failed_native_stage(job), failure)
+        _converge_failed_stage(request["run_id"], _failed_native_stage(job), failure, products=True)
         raise failure
     return job["status"] in {"passed", "native_complete"}
 
@@ -1139,39 +1193,43 @@ def solidworks_to_urdf():
                 "state": "linked",
             }
         else:
-            job = _endpoint(request["conn_id"]).get_job(run_id)
-            _same_request(job, request)
-            if job.get("status") != "native_complete":
-                failure = AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
-                _converge_failed_stage(run_id, "capture", failure)
-                raise failure
-            capture_archive_metadata(job)
-            binding = import_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
-            # The frozen request evidence rides the delivery from the capture tree
-            # onward; generation and verification consume it byte-verbatim.
-            carry_request_evidence(store.run_dir(run_id), store.capture_dir(run_id))
-            # The trigger's conf target and its configured routing are the authority;
-            # the native job no longer carries publication routing.
-            binding["repository_slug"] = request.get("repository_slug")
-            binding["repository_base"] = request.get("repository_base")
-            binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
-            binding["source_run_id"] = None
-            binding["from_stage"] = None
-            # IF-10: once the sealed capture import is admitted, release this run's
-            # staged Windows cache through its own recorded operation.  A deferred
-            # release is recorded for reconcile and never fails the stage.
-            endpoint = _endpoint(request["conn_id"])
-            reconcile_queued_cache_releases(store, endpoint)
-            release_run_cache(
-                store,
-                endpoint,
-                run_id=run_id,
-                intake=Path(request["intake_dir"]),
-                upload_files=request["upload_files"],
-            )
-            # The two native stages are registered over one sealed snapshot of the
-            # imported capture tree; the native members themselves stay byte-exact.
-            _register_native_stages(store, run_id)
+            try:
+                job = _endpoint(request["conn_id"]).get_job(run_id)
+                _same_request(job, request)
+                if job.get("status") != "native_complete":
+                    raise AirflowFailException(
+                        f"native job {run_id} is {job.get('status')}, not native_complete"
+                    )
+                capture_archive_metadata(job)
+                binding = import_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
+                # The frozen request evidence rides the delivery from the capture tree
+                # onward; generation and verification consume it byte-verbatim.
+                carry_request_evidence(store.run_dir(run_id), store.capture_dir(run_id))
+                # The trigger's conf target and its configured routing are the authority;
+                # the native job no longer carries publication routing.
+                binding["repository_slug"] = request.get("repository_slug")
+                binding["repository_base"] = request.get("repository_base")
+                binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
+                binding["source_run_id"] = None
+                binding["from_stage"] = None
+                # IF-10: once the sealed capture import is admitted, release this run's
+                # staged Windows cache through its own recorded operation.  A deferred
+                # release is recorded for reconcile and never fails the stage.
+                endpoint = _endpoint(request["conn_id"])
+                reconcile_queued_cache_releases(store, endpoint)
+                release_run_cache(
+                    store,
+                    endpoint,
+                    run_id=run_id,
+                    intake=Path(request["intake_dir"]),
+                    upload_files=request["upload_files"],
+                )
+                # The two native stages are registered over one sealed snapshot of the
+                # imported capture tree; the native members themselves stay byte-exact.
+                _register_native_stages(store, run_id)
+            except Exception as error:
+                _converge_failed_stage(run_id, "capture", error, products=True)
+                raise
         log.info(
             "linux capture ready run_id=%s source=%s state=%s",
             run_id,
