@@ -308,6 +308,11 @@ class FakeCursor:
             self._rows = [
                 (record[0], record[1], record[2], record[3] if len(record) > 3 else None)
             ] if record else []
+        elif normalized.startswith(
+            "SELECT original_executed_at FROM stage WHERE run_id = %s AND stage = %s"
+        ):
+            record = world.stages.get((params[0], params[1]))
+            self._rows = [(record[4] if len(record) > 4 else None,)] if record else []
         elif normalized.startswith("INSERT INTO stage"):
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
@@ -1171,27 +1176,54 @@ class PlatformStoreTests(unittest.TestCase):
             )
 
     def test_registered_reuse_source_stage_is_accepted(self) -> None:
+        from datetime import timedelta
+
         self.admit(
             run_id="r-0",
             request_id="q-0",
             dispatch={"stage": "capture", "operation_key": "r-0/capture:0", "params_digest": "a" * 64},
         )
+        instant = datetime(2026, 10, 15, 9, 30, tzinfo=UTC)
+        source_receipt = self._native_receipt("capture", run_id="r-0")
         self.world.stages[("r-0", "capture")] = (
             "completed",
-            self._native_receipt("capture", run_id="r-0"),
+            source_receipt,
             "store://sealed/r-0/capture",
+            None,
+            instant,
         )
         self.admit(run_id="r-1", parent_run_id="r-0")
         self.world.run_states["r-1"] = "running"
+        # The payload must BE the confirmed source: a rewritten producer, a
+        # shifted instant and a dropped instant all refuse before any write.
+        for label, receipt, when, expected in (
+            ("rewritten", {**source_receipt, "run_id": "r-1"}, instant, "not the confirmed source receipt"),
+            ("shifted", {**source_receipt}, instant + timedelta(seconds=1), "not the confirmed source instant"),
+            ("dropped", {**source_receipt}, None, "not the confirmed source instant"),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(PlatformStoreError, expected):
+                self.store.confirm_stage(
+                    run_id="r-1",
+                    stage="capture",
+                    state="completed",
+                    checkpoint_uri="store://sealed/r-0/capture",
+                    receipt=receipt,
+                    reused_from_run="r-0",
+                    original_executed_at=when,
+                )
         self.store.confirm_stage(
             run_id="r-1",
             stage="capture",
             state="completed",
             checkpoint_uri="store://sealed/r-0/capture",
-            receipt=self._native_receipt("capture"),
+            receipt={**source_receipt},
             reused_from_run="r-0",
+            original_executed_at=instant,
         )
-        self.assertEqual(self.world.stages[("r-1", "capture")][0], "completed")
+        row = self.world.stages[("r-1", "capture")]
+        self.assertEqual(row[0], "completed")
+        self.assertEqual(row[1]["run_id"], "r-0")
+        self.assertEqual(row[4], instant)
 
     def test_unresolved_moves_the_run_and_reconciliation_restores_it(self) -> None:
         self._running_run(from_stage="capture")

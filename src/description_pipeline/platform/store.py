@@ -211,6 +211,7 @@ _READ_STAGE_ROW = (
     "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
 )
 _READ_STAGE = "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE_TIME = "SELECT original_executed_at FROM stage WHERE run_id = %s AND stage = %s"
 _LOCK_STAGE = "SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"
 _FIND_RECONCILE = (
     "SELECT 1 FROM operation"
@@ -785,6 +786,12 @@ class PlatformStore:
             reuse_binding = self._verify_reuse_source(
                 run_id=run_id, stage=stage, checkpoint_uri=checkpoint_uri, reused_from_run=reused_from_run
             )
+            if digest(receipt) != reuse_binding["receipt_digest"]:
+                raise PlatformStoreError(
+                    "The reused receipt is not the confirmed source receipt; reuse never re-authors it"
+                )
+            if original_executed_at != reuse_binding["original_executed_at"]:
+                raise PlatformStoreError("The reused execution instant is not the confirmed source instant")
         self._verify_checkpoint_scope(
             checkpoint_uri, run_id=run_id, stage=stage, reused_from_run=reused_from_run
         )
@@ -840,6 +847,16 @@ class PlatformStore:
                     or digest(source_row[1]) != reuse_binding["receipt_digest"]
                 ):
                     raise PlatformStoreError("The registered reuse source changed; retry the confirmation")
+                if digest(receipt) != reuse_binding["receipt_digest"]:
+                    raise PlatformStoreError(
+                        "The reused receipt is not the confirmed source receipt; retry the confirmation"
+                    )
+                cursor.execute(_READ_STAGE_TIME, (reused_from_run, stage))
+                time_row = cursor.fetchone()
+                if original_executed_at != (time_row[0] if time_row is not None else None):
+                    raise PlatformStoreError(
+                        "The reused execution instant is not the confirmed source instant; retry the confirmation"
+                    )
             if reconcile is not None:
                 operation_id = reconcile.get("operation_id")
                 if not isinstance(operation_id, str) or not operation_id:
@@ -1041,6 +1058,8 @@ class PlatformStore:
             parent_row = cursor.fetchone()
             cursor.execute(_READ_STAGE, (reused_from_run, stage))
             source_row = cursor.fetchone()
+            cursor.execute(_READ_STAGE_TIME, (reused_from_run, stage))
+            source_time = cursor.fetchone()
         if parent_row is None or parent_row[0] != reused_from_run:
             raise PlatformStoreError("Reuse requires the registered parent run of this linked attempt")
         if source_row is None or source_row[0] != "completed":
@@ -1057,7 +1076,11 @@ class PlatformStore:
             definition=definition,
             root=sealed_root,
         )
-        return {"checkpoint_uri": source_row[2], "receipt_digest": digest(source_row[1])}
+        return {
+            "checkpoint_uri": source_row[2],
+            "receipt_digest": digest(source_row[1]),
+            "original_executed_at": source_time[0] if source_time is not None else None,
+        }
 
     def _verify_sealed(self, checkpoint_uri, receipt, *, completed: bool = True) -> tuple[dict | None, Path]:
         """Rebind the real sealed delivery for any stage before any registration.
