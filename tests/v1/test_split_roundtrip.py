@@ -233,6 +233,9 @@ class SplitRoundtripTests(unittest.TestCase):
             event for event in store.events(self.run_id) if event.get("stage") in {"freeze", "discover", "capture"}
         ]
         self.assertEqual(seeded, native_stages["events"])
+        from tests.v1.request_support import install_request_authority
+
+        install_request_authority(self, store, self.run_id)
 
         with patch.object(linux_runner, "tool_record", return_value=portable_record(native_tool())):
             generated = linux_runner.run_portable_stage(store, self.run_id, "generate")

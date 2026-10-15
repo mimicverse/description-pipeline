@@ -95,14 +95,21 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             expected_native_tool=self.tool,
         )
 
+        from tests.v1.request_support import install_request_authority
+
+        install_request_authority(self, self.store, RUN)
+
     def test_a_carried_frozen_original_revalidates_without_touching_the_native_manifest(self) -> None:
+        from types import SimpleNamespace
+
+        from description_pipeline.io import file_digest
         from description_pipeline.orchestration.linux_runner import _revalidate_capture
         from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
 
         _revalidate_capture(self.store, RUN)
         manifest = self.store.capture_dir(RUN) / "transfer-manifest.json"
         original = manifest.read_bytes()
-        freeze_request_evidence(
+        frozen = freeze_request_evidence(
             self.store.run_dir(RUN),
             request_id="frozen-original",
             target_hardware="m3.0",
@@ -112,15 +119,23 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             platform_config_digest="b" * 64,
         )
         carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
-        _revalidate_capture(self.store, RUN)
-        self.assertEqual(manifest.read_bytes(), original)
-        self.assertEqual(carried.read_bytes(), (self.store.run_dir(RUN) / "input/request.json").read_bytes())
+        record = {"path": "input/request.json", "bytes": frozen.stat().st_size, "sha256": file_digest(frozen)}
+        platform = SimpleNamespace(
+            confirmed_stage=lambda run, stage: {"artifacts": [record]} if (run, stage) == (RUN, "freeze") else None
+        )
+        with mock.patch.object(linux_runner, "_capture_platform", return_value=platform):
+            _revalidate_capture(self.store, RUN)
+            self.assertEqual(manifest.read_bytes(), original)
+            self.assertEqual(carried.read_bytes(), (self.store.run_dir(RUN) / "input/request.json").read_bytes())
 
     def test_a_tampered_carried_original_is_refused(self) -> None:
+        from types import SimpleNamespace
+
+        from description_pipeline.io import file_digest
         from description_pipeline.orchestration.linux_runner import _revalidate_capture
         from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
 
-        freeze_request_evidence(
+        frozen = freeze_request_evidence(
             self.store.run_dir(RUN),
             request_id="frozen-original",
             target_hardware="m3.0",
@@ -130,18 +145,20 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             platform_config_digest="b" * 64,
         )
         carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
+        record = {"path": "input/request.json", "bytes": frozen.stat().st_size, "sha256": file_digest(frozen)}
+        platform = SimpleNamespace(
+            confirmed_stage=lambda run, stage: {"artifacts": [record]} if (run, stage) == (RUN, "freeze") else None
+        )
         carried.write_bytes(b'{"tampered": true}')
-        with self.assertRaisesRegex(PipelineError, "carried original differs"):
+        with (
+            mock.patch.object(linux_runner, "_capture_platform", return_value=platform),
+            self.assertRaisesRegex(PipelineError, "carried input/request.json differs from the registered original"),
+        ):
             _revalidate_capture(self.store, RUN)
 
-    def test_mutable_request_copies_are_anchored_to_the_registered_sealed_original(self) -> None:
-        from description_pipeline.delivery import write_delivery_manifest
-        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
-        from description_pipeline.orchestration.linux_runner import _revalidate_capture
-        from description_pipeline.platform.storage import seal_delivery
+    def test_mutable_request_copies_are_anchored_to_the_registered_original(self) -> None:
+        from description_pipeline.io import file_digest
         from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
-        from description_pipeline.runtime import tool_record
-        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
         frozen = freeze_request_evidence(
             self.store.run_dir(RUN),
@@ -153,25 +170,71 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             platform_config_digest="b" * 64,
         )
         carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
-        tree = self.tmp / "freeze-tree"
-        for name in ("input", "evidence", "model", "urdf", "meshes"):
-            (tree / name).mkdir(parents=True, exist_ok=True)
-        shutil.copy2(frozen, tree / "input" / "request.json")
-        write_json(tree / "tool.json", tool_record(role="portable"))
-        write_delivery_manifest(
-            tree,
-            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
-            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
-        )
-        seal_delivery(self.store.root, RUN, "freeze", tree)
-        _revalidate_capture(self.store, RUN)
-        carried.write_text('{"tampered": true}', encoding="utf-8")
-        with self.assertRaisesRegex(PipelineError, "registered sealed original"):
+        registered = file_digest(frozen)
+        size = frozen.stat().st_size
+
+        class _RegisteredFreeze:
+            def confirmed_stage(self, run_id, stage):
+                if (run_id, stage) == (RUN, "freeze"):
+                    return {
+                        "artifacts": [
+                            {
+                                "path": "input/request.json",
+                                "bytes": size,
+                                "sha256": registered,
+                            }
+                        ]
+                    }
+                return None
+
+        with mock.patch.object(linux_runner, "_capture_platform", return_value=_RegisteredFreeze()):
+            _revalidate_capture = linux_runner._revalidate_capture
             _revalidate_capture(self.store, RUN)
-        shutil.copy2(frozen, carried)
-        frozen.write_text('{"tampered": true}', encoding="utf-8")
-        carried.write_text('{"tampered": true}', encoding="utf-8")
-        with self.assertRaisesRegex(PipelineError, "registered sealed original"):
+            carried.write_text('{"tampered": true}', encoding="utf-8")
+            with self.assertRaisesRegex(PipelineError, "registered original"):
+                _revalidate_capture(self.store, RUN)
+            shutil.copy2(frozen, carried)
+            frozen.write_text('{"tampered": true}', encoding="utf-8")
+            carried.write_text('{"tampered": true}', encoding="utf-8")
+            with self.assertRaisesRegex(PipelineError, "registered original"):
+                _revalidate_capture(self.store, RUN)
+            frozen.unlink()
+            carried.unlink()
+            with self.assertRaisesRegex(PipelineError, "missing the registered frozen"):
+                _revalidate_capture(self.store, RUN)
+
+        class _NoFreeze:
+            def confirmed_stage(self, run_id, stage):
+                return None
+
+        with (
+            mock.patch.object(linux_runner, "_capture_platform", return_value=_NoFreeze()),
+            self.assertRaisesRegex(PipelineError, "no registered frozen original"),
+        ):
+            _revalidate_capture(self.store, RUN)
+
+        from description_pipeline.platform.store import PlatformStoreError
+
+        class _DamagedFreeze:
+            def confirmed_stage(self, run_id, stage):
+                raise PlatformStoreError("Delivery subject files differ from manifest.json")
+
+        with (
+            mock.patch.object(linux_runner, "_capture_platform", return_value=_DamagedFreeze()),
+            self.assertRaisesRegex(PlatformStoreError, "Delivery subject files differ"),
+        ):
+            _revalidate_capture(self.store, RUN)
+
+        with (
+            mock.patch.object(
+                linux_runner,
+                "_capture_platform",
+                side_effect=PlatformStoreError(
+                    "PLATFORM_SERVICE_DSN is not configured; the platform store is unavailable"
+                ),
+            ),
+            self.assertRaisesRegex(PlatformStoreError, "PLATFORM_SERVICE_DSN"),
+        ):
             _revalidate_capture(self.store, RUN)
 
     # ------------------------------------------------------------ roles / drift

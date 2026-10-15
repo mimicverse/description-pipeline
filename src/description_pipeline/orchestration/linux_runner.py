@@ -11,18 +11,23 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import logging
 import zipfile
 
 from packaging.utils import canonicalize_name
 
 from .. import solidworks
 from ..io import PipelineError, digest, file_digest, read_data
+from ..platform.storage import sealed_resolver
+from ..platform.store import PlatformStore
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..sources.solidworks.selection import validate_file_index, verify_selection
 from ..stages import DELIVERY_STAGES, STAGE_IDS
 from .airflow_client import capture_archive_metadata, validate_run_id
 from .linux_store import LinuxStore
 from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, MAX_MANIFEST_BYTES, verify_transfer
+
+log = logging.getLogger(__name__)
 
 
 def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
@@ -54,42 +59,63 @@ def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
     return portable
 
 
+def _capture_platform(store: LinuxStore) -> PlatformStore:
+    """The platform handle for capture consumption: the deploy DSN and the sealed resolver.
+
+    Probes and tests inject at this seam; production resolves the same service
+    identity the registration side uses.
+    """
+    return PlatformStore.from_environment(sealed=sealed_resolver(store.root))
+
+
+def _registered_request_sha256(store: LinuxStore, run_id: str) -> str:
+    """The registered frozen-original digest, from the platform authority.
+
+    There is no file fallback: a missing platform binding, a missing freeze
+    registration and a registration whose sealed bytes no longer rebind all
+    refuse.  ``confirmed_stage`` re-verifies the sealed tree against the
+    registered receipt, so the returned digest is the registered one.
+    """
+    platform = _capture_platform(store)
+    freeze = platform.confirmed_stage(run_id, "freeze")
+    if freeze is None:
+        raise PipelineError("The run has no registered frozen original to bind input/request.json")
+    record = next(
+        (item for item in freeze.get("artifacts") or [] if item.get("path") == "input/request.json"), None
+    )
+    if record is None or not isinstance(record.get("sha256"), str):
+        raise PipelineError("The registered freeze receipt binds no input/request.json")
+    return record["sha256"]
+
+
 def _revalidate_capture(store: LinuxStore, run_id: str) -> None:
     """Revalidate the admitted payload against its sealed transfer at point of use.
 
     Native members are checked record-for-record against the transfer manifest.
-    The frozen original of this run (``input/request.json``) is anchored to the
-    **registered sealed freeze original** when the run has one: the mutable
-    copies - run directory and capture tree - must both exist and equal the
-    sealed bytes, so a coordinated change of the copies can never pass and
-    deleting them refuses; without a freeze registration the run-directory
-    original is the binding, exactly as before.  Unknown extras still refuse.
+    The frozen original of this run (``input/request.json``) is driven by the
+    **registered freeze record** (``confirmed_stage``): its registered digest
+    anchors both mutable copies - run directory and capture tree - which must
+    exist and equal it, so a coordinated change of the copies can never pass
+    and deleting them refuses, and a registered record whose sealed bytes no
+    longer rebind refuses through the platform check itself.  The platform
+    binding and the freeze registration are requirements - there is no file
+    fallback.  Unknown extras still refuse.
     """
-    from ..platform.storage import sealed_resolver
-
     meta = store.meta(run_id) or {}
     recorded = meta.get("transfer") or {}
     capture = store.capture_dir(run_id)
     carried_bindings: dict[str, str] = {}
     carried = capture / "input" / "request.json"
     frozen = store.run_dir(run_id) / "input" / "request.json"
-    sealed = sealed_resolver(store.root)(f"store://sealed/{run_id}/freeze") / "input" / "request.json"
-    if sealed.is_file():
-        expected = file_digest(sealed)
-        if not carried.is_file():
-            raise PipelineError("The admitted capture is missing the registered frozen input/request.json")
-        if not frozen.is_file():
-            raise PipelineError("The run is missing the registered frozen input/request.json")
-        for label, path in (("carried", carried), ("frozen", frozen)):
-            if file_digest(path) != expected:
-                raise PipelineError(
-                    f"The {label} input/request.json differs from the registered sealed original"
-                )
-        carried_bindings["input/request.json"] = expected
-    elif carried.is_file():
-        if not frozen.is_file():
-            raise PipelineError("The admitted capture carries input/request.json without a frozen original")
-        carried_bindings["input/request.json"] = file_digest(frozen)
+    authority = _registered_request_sha256(store, run_id)
+    if not carried.is_file():
+        raise PipelineError("The admitted capture is missing the registered frozen input/request.json")
+    if not frozen.is_file():
+        raise PipelineError("The run is missing the registered frozen input/request.json")
+    for label, path in (("carried", carried), ("frozen", frozen)):
+        if file_digest(path) != authority:
+            raise PipelineError(f"The {label} input/request.json differs from the registered original")
+    carried_bindings["input/request.json"] = authority
     summary = verify_transfer(capture, carried=carried_bindings)
     if not isinstance(summary, dict):
         raise PipelineError("The admitted capture carries no sealed transfer to revalidate")

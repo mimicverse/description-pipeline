@@ -102,7 +102,9 @@ def _replay_seeded_inputs(staging: Path) -> tuple[dict, dict]:
     if replayed.get("passed") is not True:
         raise PipelineError("Retained native inputs no longer pass static validation")
     retained_files = {
-        path: checksum for path, checksum in inventory(staging / "input").items() if path != "handoff.json"
+        path: checksum
+        for path, checksum in inventory(staging / "input").items()
+        if path not in {"handoff.json", "request.json"}
     }
     if retained_files != input_report.get("package_files"):
         raise PipelineError("Retained input bytes do not match the recorded inspection receipt")
@@ -112,9 +114,11 @@ def _replay_seeded_inputs(staging: Path) -> tuple[dict, dict]:
     receipt_rows = (input_report.get("input_receipt") or {}).get("inventory")
     replayed_rows = (replayed.get("input_receipt") or {}).get("inventory")
     if isinstance(replayed_rows, list):
-        # The frozen handoff record lives inside input/ but is not part of the
-        # archived native package inventory.
-        replayed_rows = [row for row in replayed_rows if row.get("path") != "handoff.json"]
+        # The frozen handoff record and the registered request original live
+        # inside input/ but are not part of the archived native package
+        # inventory; the request original is bound by its own registered
+        # record, never re-counted here.
+        replayed_rows = [row for row in replayed_rows if row.get("path") not in {"handoff.json", "request.json"}]
     if receipt_rows and replayed_rows != receipt_rows:
         raise PipelineError("Retained input inspection receipt does not match its archived native inputs")
     # Resolve from the fresh inspection of the archived input: its receipt root is
