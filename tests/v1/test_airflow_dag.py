@@ -422,6 +422,9 @@ class DagTests(unittest.TestCase):
             platform_config_digest="c" * 64,
         )
         class _Platform:
+            def confirmed_stage(self, run_id, stage):
+                return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
+
             def stage_records(self, run_id):
                 return {"freeze": {"state": "completed", "checkpoint_uri": f"store://sealed/{run_id}/freeze"}}
 
@@ -515,7 +518,7 @@ class DagTests(unittest.TestCase):
 
         class _Platform:
             def confirmed_stage(self, run_id, stage):
-                return {"handoff_sha256": "d" * 64} if stage == "capture" else None
+                return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
 
             def stage_records(self, run_id):
                 return {

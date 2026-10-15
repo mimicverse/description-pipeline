@@ -599,9 +599,17 @@ def _parent_subject(platform: PlatformStore, parent_run: str, stage: str) -> str
 
 
 def _sealed_stage_tree(platform: PlatformStore, run_id: str, stage: str) -> Path:
-    """The sealed tree of one confirmed stage; a missing registration refuses loudly."""
+    """The sealed tree of one confirmed stage, byte- and scope-qualified by the store.
+
+    The row's completed flag and locator are never trusted alone: the store's
+    own confirmation query re-verifies the sealed bytes, the locator scope and
+    the receipt before the tree is handed out, and a missing registration
+    refuses loudly.
+    """
+    if platform.confirmed_stage(run_id, stage) is None:
+        raise AirflowFailException(f"the run {run_id} has no confirmed {stage!r} to read")
     row = platform.stage_records(run_id).get(stage) or {}
-    if row.get("state") != "completed" or not row.get("checkpoint_uri"):
+    if not row.get("checkpoint_uri"):
         raise AirflowFailException(f"the run {run_id} has no confirmed {stage!r} to read")
     return platform.sealed_path(row["checkpoint_uri"])
 
