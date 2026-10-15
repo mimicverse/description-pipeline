@@ -201,6 +201,48 @@ class MotionFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
             _motion(authored, joints, components, datums, bodies, flipped)
 
+    def test_product_gate_rejects_a_wrong_parent_on_the_delivered_graph(self):
+        # G06 dependency boundary: with the native hinge line off the child
+        # frame's origin, a swapped parent/child chain is statically plausible
+        # but diverges from the re-derived motion as soon as the pose is
+        # non-zero; the correctly attached chain passes on the same bytes.
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        point = (0.2, 0.0, 0.5)
+        base = np.eye(4)
+        tool = np.eye(4)
+        tool[:3, 3] = point
+        datums = {"base": base, "tool": tool}
+        components = {"base_part": base.copy(), "tool_part": tool.copy()}
+        bodies = [
+            {"name": "base", "components": ["base_part"]},
+            {"name": "tool", "components": ["tool_part"]},
+        ]
+        authored = {
+            "name": "hinge",
+            "type": "revolute",
+            "parent": "base",
+            "child": "tool",
+            "axis": [0.0, 0.0, 1.0],
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+            "axis_reference": {"component": "base_part", "feature_name": "Cyl1"},
+        }
+        record = {
+            "component": "base_part",
+            "surface": "cylinder",
+            "selector": {"feature_name": "Cyl1", "component": "base_part", "body_type": "solid"},
+            "body_type": "solid",
+            "radius_m": 0.01,
+            "coordinate_frame": "assembly",
+            "axis_point_m": list(point),
+            "axis_direction": [0.0, 0.0, 1.0],
+        }
+        details = _motion(authored, [authored], components, datums, bodies, record)
+        self.assertLessEqual(details["worst_m"], 5e-5)
+        swapped = {**authored, "parent": "tool", "child": "base"}
+        with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
+            _motion(swapped, [swapped], components, datums, bodies, record)
+
 
 if __name__ == "__main__":
     unittest.main()
