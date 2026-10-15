@@ -24,6 +24,7 @@ from ..geometry import stl
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
+from ..sources.snapshot import verify_snapshot
 from ..interface_records import CHECK_POLICY_V1, QUALIFICATION_SCHEMA, qualification_facts, validate_qualification
 from ..stages import required_rows_complete
 from . import native_discovery as evidence
@@ -349,20 +350,19 @@ def _input(root, diagnostics=None):
     }
 
 
-def _native(root):
-    source = read_source_record(root)
-    collection = evidence.collection(root)
+def _native(root, manifest):
     _require(
-        collection.get("kind") == "solidworks" and collection.get("evidence_class") == "cad",
+        manifest["kind"] == "solidworks" and manifest["evidence_class"] == "cad",
         "A release requires native SolidWorks evidence",
     )
-    _require(collection.get("identity") == source["identity"], "Collection and archived source identities differ")
+    collection = evidence.collection(root)
+    _require(collection.get("identity") == manifest["identity"], "Collection and archived source identities differ")
     environment = evidence.runtime(root)
     _require(environment == collection.get("environment"), "Environment evidence differs")
     revision = str(environment["solidworks"]["revision"])
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
     _require((collection.get("limits") or {}).get("native_cad") is True, "Native capture was not recorded")
-    return {"solidworks_revision": revision, "configuration": source["selection"]["configuration"]}
+    return {"solidworks_revision": revision, "configuration": manifest["identity"]["configuration"]}
 
 
 def _native_discovery(package, diagnostics=None):
@@ -413,10 +413,11 @@ def _dependencies(root, definition):
     _require(closure["configuration"] == definition["source"]["configuration"], "Captured another configuration")
     original = closure["original_files"]
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
-    actual = {"source/" + name: checksum for name, checksum in inventory(root / "input/cad").items()}
+    actual = {"source/" + name: checksum for name, checksum in inventory(root / "evidence/source").items()}
     _require(actual == closure["copy_files"], "Collected CAD changed")
-    # The archived input carries the dependency-closure copies; the frozen
-    # discovery inventory binds those copy bytes.
+    # The frozen tree carries the dependency-closure copies under
+    # ``evidence/source``; the discovery inventory binds the frozen originals
+    # under ``input/cad``.
     _handoff_native_hashes(root)
     # Original coverage is a digest-mapping decision: the originals stay in the
     # platform's frozen upload storage, so their identity is the handoff upload
@@ -430,11 +431,14 @@ def _dependencies(root, definition):
     _require(len(top) == 1, "Missing unique top assembly mapping")
     main = str(definition["source"]["assembly"])
     normalized_main = ntpath.normcase(main.replace("/", "\\"))
-    # The frozen package-relative main assembly must exist in the upload index
-    # exactly; there is no suffix fallback that could rewrite its path.  (The
-    # native absolute path's rooted original->copy mapping is a separate layer.)
+    # The frozen intake keeps the selected CAD under ``input/cad``; the main
+    # assembly's package-relative path in the upload index is therefore
+    # ``cad/<main>``.  It must exist exactly; there is no suffix fallback that
+    # could rewrite its path.  (The native absolute path's rooted
+    # original->copy mapping is a separate layer.)
+    archived_key = ntpath.normcase(("cad/" + main).replace("/", "\\"))
     exact = [
-        name for name in package_files if ntpath.normcase(str(name).replace("/", "\\")) == normalized_main
+        name for name in package_files if ntpath.normcase(str(name).replace("/", "\\")) == archived_key
     ]
     _require(len(exact) == 1, "The frozen upload index does not name exactly one captured main assembly")
     main_key = exact[0]
@@ -507,7 +511,7 @@ def _dependencies(root, definition):
     # captured input inventory.
     capture = evidence.capture(root)
     _require(capture.get("dependency_closure") == closure, "Capture dependency record differs")
-    stability = capture.get("originals_unchanged")
+    stability = (evidence.collection(root).get("capture") or {}).get("originals_unchanged")
     _require(
         isinstance(stability, dict) and stability.get("files_checked") == len(original),
         "Source stability was not verified",
@@ -1303,7 +1307,7 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
     gates.add("tool.identity", lambda: _tool(root, native_receipts))
     manifest = gates.add("source.integrity", lambda: read_delivery_manifest(root))
     if manifest is not None:
-        gates.add("source.native", lambda: _native(root))
+        gates.add("source.native", lambda: _native(root, verify_snapshot(root / "evidence")))
     model = gates.add("model.schema", lambda: _model(root))
     raw = gates.add("source.raw", lambda: evidence.scene(root))
     gates.add("physics.mass_closure_equality", lambda: _mass_closure_equality(root, definition))

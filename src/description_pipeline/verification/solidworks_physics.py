@@ -17,6 +17,7 @@ import numpy as np
 from ..io import PipelineError, confined
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 from ..sources.solidworks import verify as oracle
+from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
 
 MASS_RTOL = 1e-6
@@ -556,43 +557,26 @@ def _compare(actual, expected, label, *, com_atol=COM_ATOL_M, tensor_rtol=TENSOR
 
 
 def _capture_identity(root):
-    """The sealed capture identity: the collection block bound to the source record.
+    """The sealed capture identity: the snapshot manifest identity bound to the collection.
 
-    The frozen tree carries the capture identity once, as the collection block's
-    identity, and ``input/source.json`` is its binding authority: the two must
-    name the same source revision.  The old evidence snapshot's ``manifest.json``
-    identity is no longer a read point.
+    The frozen tree carries the capture identity once, as the snapshot
+    manifest's identity (kept equal to the collection block's identity); the
+    records quote the capture session's assembly path verbatim, and that path
+    is the identity's assembly.
     """
 
-    collection = evidence.collection(root)
-    identity = collection.get("identity")
+    evidence_dir = Path(root) if Path(root).name == "evidence" else Path(root) / "evidence"
+    identity = verify_snapshot(evidence_dir).get("identity")
     _require(isinstance(identity, dict), "Capture collection identity is missing")
     _require(
-        identity == evidence.source(root).get("identity"),
+        identity == evidence.collection(root).get("identity"),
         "Collection and archived source identities differ",
     )
     _require(
-        isinstance(identity.get("main_assembly"), str) and bool(identity["main_assembly"]),
+        isinstance(identity.get("assembly"), str) and bool(identity["assembly"]),
         "Capture identity carries no main assembly",
     )
     return identity
-
-
-def _record_assembly_belongs(record_assembly, main_assembly) -> bool:
-    """Whether a record's capture-session assembly path names the frozen main assembly.
-
-    The record quotes the assembly path of the capture session (an environment
-    fact, kept verbatim and never rewritten); the frozen source identity names
-    the same document package-relative.  The binding is a normalized suffix
-    match: POSIX separators plus casefold, then the recorded path must end with
-    ``"/" + main_assembly``.
-    """
-
-    if not isinstance(record_assembly, str) or not isinstance(main_assembly, str) or not main_assembly:
-        return False
-    recorded = record_assembly.replace("\\", "/").casefold()
-    expected = main_assembly.replace("\\", "/").casefold()
-    return recorded.endswith("/" + expected)
 
 
 def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]:
@@ -702,7 +686,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         # bound to the archived source record); the record must belong to it.
         identity = _capture_identity(root)
         _require(
-            _record_assembly_belongs(record.get("assembly"), identity["main_assembly"]),
+            record.get("assembly") == identity["assembly"],
             "Material provenance assembly differs from the capture identity",
         )
         _require(
@@ -785,7 +769,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             "Effective instance schema changed",
         )
         _require(
-            _record_assembly_belongs(record.get("assembly"), identity["main_assembly"]),
+            record.get("assembly") == identity["assembly"],
             "Effective instance record belongs to another assembly",
         )
         _require(

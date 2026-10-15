@@ -916,6 +916,7 @@ def store_capture_block(root: Path, name: str, value) -> None:
     capture = read_data(path)
     capture[name] = value
     write_json(path, capture)
+    _refresh_snapshot_manifest(path.parent.parent)
     seal_delivery(path.parent.parent)
 
 
@@ -928,7 +929,31 @@ def delete_capture_block(root: Path, name: str) -> None:
     capture = read_data(path)
     capture.pop(name, None)
     write_json(path, capture)
+    _refresh_snapshot_manifest(path.parent.parent)
     seal_delivery(path.parent.parent)
+
+
+def _refresh_snapshot_manifest(delivery_root: Path) -> None:
+    """Rebuild the snapshot manifest inventory when the tree carries one.
+
+    Trees that model the frozen delivery keep ``evidence/manifest.json`` (the
+    capture identity and the file inventory the verifier re-checks); rewriting
+    a capture block must keep that inventory true.
+    """
+
+    from description_pipeline.io import read_data
+    from description_pipeline.sources.snapshot import write_manifest
+
+    manifest_path = Path(delivery_root) / "evidence/manifest.json"
+    if not manifest_path.is_file():
+        return
+    current = read_data(manifest_path)
+    write_manifest(
+        Path(delivery_root) / "evidence",
+        kind=current["kind"],
+        identity=current["identity"],
+        evidence_class=current["evidence_class"],
+    )
 
 
 # ---------------------------------------------------------------------------

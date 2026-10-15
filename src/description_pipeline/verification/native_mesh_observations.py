@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 
 from ..io import PipelineError
+from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
 
 
@@ -13,8 +14,8 @@ def _require(condition, message):
 
 
 def verify_native_mesh_observations(bundle: Path) -> dict:
-    collection = evidence.collection(bundle)
-    native = collection.get("kind") == "solidworks" and collection.get("evidence_class") == "cad"
+    manifest = verify_snapshot(Path(bundle) / "evidence")
+    native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
     rows = evidence.geometry(bundle)
     warnings = []
     observed = 0

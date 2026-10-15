@@ -104,11 +104,16 @@ def _publish(bundle: Path, evidence: Path) -> dict:
         hardware_id="fixture",
         revision=None,
     )
+    native_identity = json.loads((evidence / "manifest.json").read_text(encoding="utf-8"))["identity"]
     support.write_target_delivery(
         Path(bundle) / "delivery",
-        capture=_capture_from_raw(evidence, identity=source["identity"]),
+        capture=_capture_from_raw(evidence, identity=native_identity),
         source=source,
     )
+    delivery_evidence = Path(bundle) / "delivery" / "evidence"
+    (delivery_evidence / "raw/scene_raw.json").write_text('{"scene": "fixture"}', encoding="utf-8")
+    write_manifest(delivery_evidence, kind="solidworks", identity=dict(native_identity), evidence_class="cad")
+    support.seal_delivery(Path(bundle) / "delivery")
     return source
 
 

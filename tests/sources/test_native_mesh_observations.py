@@ -10,6 +10,7 @@ from . import _paths  # noqa: F401
 from . import support
 
 from description_pipeline.io import PipelineError
+from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.native_mesh_observations import verify_native_mesh_observations
 
 
@@ -21,10 +22,20 @@ class NativeMeshObservationTests(unittest.TestCase):
         support.write_target_delivery(
             self.root,
             capture={
-                "collection": {"kind": "solidworks", "evidence_class": "cad"},
+                "collection": {},
                 "geometry": [],
             },
         )
+        # The strictness comes from the frozen snapshot manifest identity, never
+        # from the capture collection block (which carries no kind fields).
+        (self.root / "evidence/raw/scene_raw.json").write_text('{"scene": "fixture"}', encoding="utf-8")
+        write_manifest(
+            self.root / "evidence",
+            kind="solidworks",
+            identity={"capture": {"evidence_class": "cad"}},
+            evidence_class="cad",
+        )
+        support.seal_delivery(self.root)
         self.row = {
             "component": "pcb", "bodies": {"solid": 0, "sheet": 4},
             "tessellation": {"faces": 12, "no_facets_faces": [{
@@ -35,15 +46,27 @@ class NativeMeshObservationTests(unittest.TestCase):
             }]},
         }
 
-    def verify(self):
+    def verify(self, capture_class: str = "cad"):
         # Adversarial rows keep NaN/Infinity literals on purpose: the verifier
         # must reject them semantically, so the block bytes are written raw.
         path = support.capture_file_for(self.root)
         capture = json.loads(path.read_text(encoding="utf-8"))
         capture["geometry"] = [self.row]
         path.write_text(json.dumps(capture, ensure_ascii=False, allow_nan=True), encoding="utf-8")
+        write_manifest(
+            self.root / "evidence",
+            kind="solidworks",
+            identity={"capture": {"evidence_class": capture_class}},
+            evidence_class="cad",
+        )
         support.seal_delivery(self.root)
         return verify_native_mesh_observations(self.root)
+
+    def test_strictness_follows_the_snapshot_manifest_not_the_collection_block(self):
+        self.row = {"component": "pcb", "bodies": {"solid": 0, "sheet": 4}}
+        with self.assertRaisesRegex(PipelineError, "native tessellation accounting is missing"):
+            self.verify()
+        self.assertEqual(0, self.verify("fixture")["components"])
 
     def test_native_refusal_is_explicit_unqualified_surface_warning(self):
         result = self.verify()
