@@ -141,7 +141,15 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
                 raise AirflowFailException(f"The {stage!r} stage carries no single confirmed state")
             state = next(iter(confirmed))
     handoff_path = tree / "input" / "handoff.json"
-    handoff = read_data(handoff_path) if handoff_path.is_file() else None
+    handoff = None
+    if handoff_path.is_file():
+        try:
+            handoff = read_data(handoff_path)
+        except (PipelineError, OSError, ValueError):
+            # A real failure byte-binds whatever the tree carries, malformed
+            # inputs included; only a completion must parse its handoff index.
+            if state == "completed":
+                raise
     package_files = handoff.get("package_files") if isinstance(handoff, dict) else None
     if not isinstance(package_files, dict) or not package_files:
         if state == "completed":
@@ -271,7 +279,9 @@ def _portable_registered(
         _portable_report(receipt, stage=stage, context=context)
         _portable_summary(receipt, stage=stage)  # a non-confirmed receipt never reaches registration
     except Exception as error:
-        _converge_failed_stage(run_id, stage, error, tree=tree if Path(tree).is_dir() else None)
+        _converge_failed_stage(
+            run_id, stage, error, tree=tree if Path(tree).is_dir() else None, products=True
+        )
         raise
     try:
         _register_completed_stage(run_id, stage, tree, receipt)

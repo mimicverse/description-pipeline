@@ -689,6 +689,42 @@ class PlatformRegistrationTests(unittest.TestCase):
             self.module._register_freeze_stage(store, "run-1", intake=intake, upload_files=upload_files)
         self.assertEqual(confirmations, ["freeze"])
 
+    def test_a_failed_registration_tolerates_a_malformed_handoff(self) -> None:
+        tree = Path(self.temporary.name) / "malformed"
+        self.module._ensure_subject_layout(tree)
+        (tree / "reports").mkdir()
+        (tree / "reports" / "structural-team.json").write_text("{}", encoding="utf-8")
+        (tree / "input" / "handoff.json").write_text("{not json", encoding="utf-8")
+        contract, policy = self.module._delivery_manifest_arguments()
+        self.module.write_delivery_manifest(tree, contract=contract, policy=policy)
+        self.module._converge_failed_stage("run-1", "generate", RuntimeError("bad handoff"), tree=tree)
+        call = self.calls[0]
+        self.assertEqual(call["state"], "failed")
+        self.assertEqual(call["receipt"]["state"], "failed")
+        self.assertNotIn("handoff_sha256", call["receipt"])
+        paths = {record["path"] for record in call["receipt"]["artifacts"]}
+        self.assertIn("reports/structural-team.json", paths)
+        self.assertIn("input/handoff.json", paths)
+        self.assertTrue(str(call["checkpoint_uri"]).endswith("/generate"))
+
+    def test_a_portable_failure_snapshots_the_actual_products(self) -> None:
+        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        (run_dir / "reports").mkdir(parents=True)
+        (run_dir / "reports" / "structural-team.json").write_text("{}", encoding="utf-8")
+        tree = run_dir / "stages" / "generate"
+        store = SimpleNamespace(run_dir=lambda _run: run_dir)
+        with (
+            patch.object(self.module, "run_portable_stage", side_effect=RuntimeError("no capture")),
+            patch.object(self.module, "_linux_store", return_value=store),
+            self.assertRaises(RuntimeError),
+        ):
+            self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+        call = self.calls[0]
+        self.assertEqual(call["state"], "failed")
+        paths = {record["path"] for record in call["receipt"]["artifacts"]}
+        self.assertIn("reports/structural-team.json", paths)
+        self.assertTrue(str(call["checkpoint_uri"]).endswith("/generate"))
+
 
 if __name__ == "__main__":
     unittest.main()
