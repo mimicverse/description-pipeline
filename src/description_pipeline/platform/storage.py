@@ -183,6 +183,35 @@ def _fsync_tree(root: Path) -> None:  # pragma: no cover - durability syscalls
     _fsync_dir(root)
 
 
+def seal_stage_confirmation(
+    root: str | Path, run_id: str, stage: str, source: str | Path, receipt: dict
+) -> tuple[str, dict]:
+    """Seal a stage tree and complete its receipt with the report members.
+
+    The writer's one registration primitive: the tree is sealed first
+    (:func:`seal_delivery` - byte-verified and atomic), then every file under
+    ``reports/**`` of the **sealed** tree is recorded in the receipt's existing
+    ``artifacts`` list with its actual size and sha256.  The read side only
+    compares these registered records; the subject members stay exactly as the
+    receipt carried them, and subject never absorbs report members.
+    """
+
+    from ..io import file_digest
+
+    uri = seal_delivery(root, run_id, stage, source)
+    sealed = sealed_resolver(root)(uri)
+    artifacts = [dict(record) for record in (receipt.get("artifacts") or []) if isinstance(record, dict)]
+    known = {record.get("path") for record in artifacts}
+    reports_root = sealed / "reports"
+    members = sorted(path for path in reports_root.rglob("*") if path.is_file()) if reports_root.is_dir() else []
+    for path in members:
+        relative = path.relative_to(sealed).as_posix()
+        if relative in known:
+            continue
+        artifacts.append({"path": relative, "bytes": path.stat().st_size, "sha256": file_digest(path)})
+    return uri, {**receipt, "artifacts": artifacts}
+
+
 def _fsync_path(path: Path) -> None:  # pragma: no cover - durability syscall
     descriptor = os.open(path, os.O_RDONLY)
     try:

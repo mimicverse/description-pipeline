@@ -147,3 +147,19 @@ class SealDeliveryTests(unittest.TestCase):
         self.assertIn(resolved / "sealed", calls)
         self.assertTrue((resolved / "sealed" / "run-1" / "generate" / "manifest.json").is_file())
         self.assertEqual(uri, "store://sealed/run-1/generate")
+
+    def test_stage_confirmation_registers_report_members_from_the_sealed_bytes(self) -> None:
+        from description_pipeline.io import file_digest
+        from description_pipeline.platform.storage import seal_stage_confirmation
+
+        manifest = read_delivery_manifest(self.source)
+        receipt = {"stage": "verify", "artifacts": [dict(record) for record in manifest["subject"]["files"]]}
+        uri, completed = seal_stage_confirmation(self.root, "run-1", "verify", self.source, receipt)
+        self.assertEqual(uri, "store://sealed/run-1/verify")
+        subject_side = [record for record in completed["artifacts"] if not record["path"].startswith("reports/")]
+        self.assertEqual(subject_side, receipt["artifacts"])
+        registered = next(record for record in completed["artifacts"] if record["path"] == "reports/quality.json")
+        sealed_report = self.root / "sealed" / "run-1" / "verify" / "reports" / "quality.json"
+        self.assertEqual(registered["bytes"], sealed_report.stat().st_size)
+        self.assertEqual(registered["sha256"], file_digest(sealed_report))
+        self.assertIn("reports/native-tool.json", {record["path"] for record in completed["artifacts"]})
