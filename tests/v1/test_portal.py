@@ -853,6 +853,18 @@ class PortalTests(unittest.TestCase):
         entry = self.store.runs[run_id]
         entry["merged"] = {**(entry.get("merged") or {}), "events": job.get("events") or []}
 
+    def _rebind_attempt_member(self, run_id: str, path: str, payload: bytes) -> None:
+        """Re-register one member with new bytes: the fixture keeps the registration
+        consistent, so only the parse/shape handling of the registered content is
+        under test (mirroring a producer that registered what it actually wrote)."""
+
+        entry = self.store.runs[run_id]
+        entry["artifacts"][path] = payload
+        digest = hashlib.sha256(payload).hexdigest()
+        for key in ("files", "report_files"):
+            if path in (entry["preview"].get(key) or {}):
+                entry["preview"][key][path] = digest
+
     def _passed_result(self, *, subject: str = "a" * 64, quality_subject: str | None = None) -> dict:
         return {
             "passed": True,
@@ -2078,6 +2090,79 @@ class PortalTests(unittest.TestCase):
         self.store.runs[run_id]["preview"]["report_files"]["reports/quality.json"] = None
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
         self.assertEqual(status, 502, body)
+
+    def test_registered_report_parse_defects_refuse_the_preview(self) -> None:
+        """A registered report that cannot be consumed as an object refuses (502) instead
+        of silently reporting zero failing checks; its bytes still download unchanged."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        route = f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        for payload in (b"{", b"[]", b'{"passed":false,"checks":"invalid"}'):
+            with self.subTest(payload=payload):
+                self._rebind_attempt_member(run_id, "reports/quality.json", payload)
+                status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+                self.assertEqual(status, 502, body)
+                # The changed bytes are correctly registered: the refusal is the parse side.
+                status, _, body = self.client.request("GET", route)
+                self.assertEqual(status, 200)
+                self.assertEqual(body, payload)
+
+    def test_registered_warning_source_parse_defect_refuses_the_preview(self) -> None:
+        """A registered warning source that cannot be parsed refuses (502), never a
+        silently empty warning list."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        handoff = json.dumps({"warnings": [{"code": "fixture_warning", "message": "kept"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {
+                "urdf/robot.urdf": b"<robot name='fixture'/>",
+                "reports/quality.json": quality,
+                "input/handoff.json": handoff,
+            },
+            verified=False,
+        )
+        self._rebind_attempt_member(run_id, "input/handoff.json", b"{")
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 502, body)
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/input/handoff.json")
+        self.assertEqual(status, 200)
+
+    def test_undeclared_optional_warning_source_is_not_an_error(self) -> None:
+        """A warning source the registration does not carry stays absent: no error, and
+        the registered report still serves its failing-check count."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["failing_checks_total"], 1)
+        self.assertEqual(payload["warnings_total"], 0)
 
     def test_registered_run_state_and_events_outrank_the_native_job(self) -> None:
         """The DB registration owns the run state and the recorded events; the endpoint

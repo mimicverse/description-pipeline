@@ -177,12 +177,14 @@ def _failing_checks(report: dict) -> list[dict]:
     """The exact failed checks of the one registered quality report.
 
     The one convention both writers share: a row is failed when it carries the
-    boolean ``passed`` false OR the recorded ``state`` is ``"failed"``.
+    boolean ``passed`` false OR the recorded ``state`` is ``"failed"``.  A
+    registered report whose consumed ``checks`` field has the wrong shape
+    refuses instead of silently reading as zero failures.
     """
 
     checks: list[dict] = []
-    for row in report.get("checks") or []:
-        if not isinstance(row, dict) or not (row.get("passed") is False or row.get("state") == "failed"):
+    for row in _registered_source_rows(report, "checks"):
+        if not (row.get("passed") is False or row.get("state") == "failed"):
             continue
         details = row.get("details") if isinstance(row.get("details"), dict) else {}
         checks.append(
@@ -195,25 +197,51 @@ def _failing_checks(report: dict) -> list[dict]:
     return checks
 
 
-def _parse_member_json(data) -> dict:
-    """Parse one registered member's sealed bytes; missing or malformed stays empty."""
+def _parse_registered_json(data: bytes) -> dict:
+    """Parse one registered diagnostic source; unreadable content refuses, never empty.
 
-    if not isinstance(data, bytes):
-        return {}
+    These bytes were already verified against the registration, so a parse
+    failure is a defect of the registered content itself: the preview refuses
+    with the fixed 502 class instead of silently reporting no findings or
+    warnings.
+    """
+
+    if not isinstance(data, (bytes, bytearray)):
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容无法解析，已拒绝提供")
     try:
-        parsed = json.loads(data.decode("utf-8-sig"))
-    except (ValueError, UnicodeDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        parsed = json.loads(bytes(data).decode("utf-8-sig"))
+    except (ValueError, UnicodeDecodeError) as error:
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容无法解析，已拒绝提供") from error
+    if not isinstance(parsed, dict):
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容无法解析，已拒绝提供")
+    return parsed
+
+
+def _registered_source_rows(report: dict, field: str, *, code_required: bool = False) -> list[dict]:
+    """The consumed rows of one registered list field.
+
+    An absent optional field reads as no rows; a present field that is not a
+    list of usable records is a shape error and refuses (502): a declared,
+    registered diagnostic source can never silently contribute zero.
+    """
+
+    if field not in report:
+        return []
+    rows = report[field]
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict) or (code_required and not row.get("code")) for row in rows
+    ):
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容结构无效，已拒绝提供")
+    return rows
 
 
 def _delivery_warnings(members: dict) -> list[dict]:
     """Input warnings and non-blocking discovery findings, from the same registered members."""
 
     warnings: list[dict] = []
-    report = _parse_member_json(members.get("input/handoff.json"))
-    for item in report.get("warnings") or []:
-        if isinstance(item, dict) and item.get("code"):
+    handoff = members.get("input/handoff.json")
+    if handoff is not None:
+        for item in _registered_source_rows(_parse_registered_json(handoff), "warnings", code_required=True):
             warnings.append(
                 {
                     "source": "input",
@@ -223,10 +251,12 @@ def _delivery_warnings(members: dict) -> list[dict]:
                     "detail": item.get("detail"),
                 }
             )
-    payload = _parse_member_json(members.get("evidence/discovery.json"))
-    rows = payload.get("findings")
-    for item in rows if isinstance(rows, list) else []:
-        if isinstance(item, dict) and item.get("code") and item.get("blocking") is not True:
+    discovery = members.get("evidence/discovery.json")
+    if discovery is not None:
+        findings = _registered_source_rows(_parse_registered_json(discovery), "findings", code_required=True)
+        for item in findings:
+            if item.get("blocking") is True:
+                continue
             warnings.append(
                 {
                     "source": "discovery",
@@ -2340,7 +2370,7 @@ class PortalApp:
         if not verified:
             quality_member = members.get("reports/quality.json")
             report = (
-                _parse_member_json(self._registered_member_bytes("reports/quality.json", quality_member))
+                _parse_registered_json(self._registered_member_bytes("reports/quality.json", quality_member))
                 if isinstance(quality_member, dict)
                 else {}
             )
