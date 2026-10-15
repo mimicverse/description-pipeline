@@ -108,3 +108,20 @@ class SealDeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "symbolic link"):
             seal_delivery(self.root, "run-1", "generate", self.source)
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_newly_created_sealed_directory_syncs_its_parent_entry(self) -> None:
+        from unittest import mock
+
+        from description_pipeline.platform import storage as storage_module
+
+        calls: list[Path] = []
+        real = storage_module._fsync_dir
+
+        def record(path):
+            calls.append(Path(path))
+            real(path)
+
+        with mock.patch.object(storage_module, "_fsync_dir", side_effect=record):
+            seal_delivery(self.root, "run-1", "generate", self.source)
+        self.assertIn(Path(self.root).resolve(), calls)
+        self.assertIn(Path(self.root).resolve() / "sealed", calls)

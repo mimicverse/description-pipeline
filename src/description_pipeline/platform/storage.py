@@ -106,6 +106,12 @@ def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path)
     native manifest and which original verifies against its database
     registration is a verification concern of the combination chain; this
     writer only commits bytes.
+
+    Durability is explicit: the writer creates the root chain when it is
+    absent (root, ``sealed``, the run directory) and fsyncs, for every
+    directory it created, that directory's **parent entry** as well as the
+    directory itself - a freshly created ``sealed/`` is persisted in its
+    parent ``store/`` before the seal is reported complete.
     """
 
     from ..delivery import read_delivery_manifest
@@ -123,9 +129,14 @@ def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path)
     base = Path(root).resolve()
     target = _guarded_seal_target(base, run_id, stage)
     parent = target.parent
+    sealed_root = base / SEALED_ROOT_NAME
+    chain = (base, sealed_root, parent)
+    created = [directory for directory in chain if not directory.exists()]
     parent.mkdir(parents=True, exist_ok=True)
-    _fsync_dir(base / SEALED_ROOT_NAME)
-    _fsync_dir(parent)
+    for directory in created:
+        _fsync_dir(directory.parent)
+    for directory in (sealed_root, parent):
+        _fsync_dir(directory)
     if target.exists():
         if target.is_symlink():
             raise PipelineError("A sealed delivery path may not traverse a symbolic link")
