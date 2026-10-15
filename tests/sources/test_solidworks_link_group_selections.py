@@ -34,7 +34,7 @@ def _scene(names, masses=None):
 
 
 def _cfg(*bodies):
-    return {"bodies": [{"id": name, "name": name, "components": list(members)} for name, members in bodies]}
+    return {"groups": [{"name": name, "components": list(members)} for name, members in bodies]}
 
 
 def _read(mass=1.0):

@@ -14,11 +14,17 @@ from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
     _relative_document_name,
     _source_inputs,
-    freeze,
+    freeze as _freeze,
 )
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
 from . import support  # noqa: E402
+
+
+def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
+    """Freeze with the fixture's carriers translated into the native request sets."""
+
+    return _freeze(support.capture_requests(config), *args, **kwargs)
 
 
 class FreezeTests(unittest.TestCase):

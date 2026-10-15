@@ -222,14 +222,15 @@ def require_qualified_report(report, definition, root=None):
 
 
 def _frozen_source_config(root) -> dict:
-    """The sealed material authority, read from the capture's own provenance record.
+    """The sealed material authority, read from the canonical capture block.
 
-    ``raw/material_provenance.json`` is written by the capture itself and
-    states the assembly, configuration and material source.  The verifier
-    reads exactly that record: an unknown schema, missing identity or an
-    absent/unknown material source returns nothing so the physics gate fails
-    closed.  Nothing is inferred from mass dictionaries and no generator-side
-    rebuild is invoked.
+    The ``material_provenance`` block of the sealed ``capture.json`` states the
+    assembly, configuration and material source; it is the same authority the
+    physics gate consumes.  The verifier reads exactly that block: an unknown
+    schema, missing identity or an absent/unknown material source returns
+    nothing so the reconstruction and the gate fail closed.  Nothing is
+    inferred from mass dictionaries, no raw side copy is preferred over a
+    diverging canonical block, and no generator-side rebuild is invoked.
     """
 
     delivery = Path(root).resolve()

@@ -1078,3 +1078,31 @@ def source_record_for_robot(record: dict) -> dict:
         main_assembly=str(identity.get("main_assembly") or "robot.SLDASM"),
         revision=revision if isinstance(revision, str) and revision else None,
     )
+
+
+def capture_requests(config: dict) -> dict:
+    """Translate a fixture config's carriers into the minimal native request sets.
+
+    The product consumes ``groups``/``axis_requests`` only; fixtures keep their
+    bodies/joints data structures and translate at the call boundary.  No
+    product code carries a compatibility fallback.
+    """
+
+    cfg = dict(config)
+    bodies = cfg.pop("bodies", None)
+    if bodies is not None and "groups" not in cfg:
+        cfg["groups"] = [
+            {
+                "name": str(body.get("name") or body.get("id") or ""),
+                "components": sorted(str(member) for member in (body.get("components") or [])),
+            }
+            for body in bodies
+        ]
+    joints = cfg.pop("joints", None)
+    if joints is not None and "axis_requests" not in cfg:
+        cfg["axis_requests"] = [
+            {"name": str(joint.get("name") or joint.get("id") or ""), "axis_reference": joint["axis_reference"]}
+            for joint in joints
+            if isinstance(joint.get("axis_reference"), dict)
+        ]
+    return cfg

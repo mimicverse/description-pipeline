@@ -16,10 +16,19 @@ from pathlib import Path
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import freeze, validate_source_config  # noqa: E402
+from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
+from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
 from . import support  # noqa: E402
+
+
+def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
+    return _freeze(support.capture_requests(config), *args, **kwargs)
+
+
+def validate_source_config(config):  # noqa: F811 - fixture adapter for the request sets
+    return _validate_source_config(support.capture_requests(config))
 
 
 def _detail(error: Exception) -> dict:

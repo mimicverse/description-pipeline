@@ -18,10 +18,14 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.io import file_digest  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import freeze  # noqa: E402
+from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
 from . import support  # noqa: E402
+
+
+def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
+    return _freeze(support.capture_requests(config), *args, **kwargs)
 
 #: 审阅记录里公布的解析张量（零件轴向、质心处，kg·m²）
 BENCHMARK: dict[str, dict[str, Any]] = {
