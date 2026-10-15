@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import shutil
 import zipfile
 
 from ..io import PipelineError, digest, file_digest, read_data
@@ -76,10 +77,17 @@ def _check_selected_capture(capture: Path, selection: dict) -> None:
 
 
 def _append_native_events(platform: PlatformStore, run_id: str, capture: Path) -> None:
-    """Mirror the sealed native stage receipts into the platform's live stream."""
+    """Mirror the sealed native stage receipts into the platform's live stream, once each."""
     receipt = read_data(capture / "reports/native-stages.json")
+    remaining = [
+        row.get("payload") if isinstance(row, dict) else None for row in platform.run_events(run_id)
+    ]
     for event in (receipt or {}).get("events") or []:
         if not isinstance(event, dict):
+            continue
+        if event in remaining:
+            # An earlier attempt already mirrored this event; recovery never duplicates it.
+            remaining.remove(event)
             continue
         platform.append_event(
             run_id,
@@ -131,14 +139,30 @@ def import_native_capture(
         # A committed identical admission is reused only after the installed
         # tree re-verifies against the registered freeze request and its own
         # transfer manifest - a mutated or resealed tree never passes.
+        authority = _registered_request_sha256(platform, run_id)
         frozen = capture / "input" / "request.json"
         if not frozen.is_file():
+            # Interrupted between the raw install and the DAG's carry: recover the
+            # registered frozen request from its sealed source - the same bytes the
+            # registration bound, never weaker.
+            freeze_row = platform.stage_records(run_id).get("freeze") or {}
+            freeze_uri = freeze_row.get("checkpoint_uri")
+            sealed_request = (
+                platform.sealed_path(freeze_uri) / "input" / "request.json" if freeze_uri else None
+            )
+            if sealed_request is None or not sealed_request.is_file():
+                raise PipelineError("The registered frozen request is missing from its sealed freeze tree")
+            if file_digest(sealed_request) != authority:
+                raise PipelineError("The registered frozen request differs from its sealed binding")
+            frozen.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sealed_request, frozen)
+        if file_digest(frozen) != authority:
             raise PipelineError("The admitted capture is missing the registered frozen input/request.json")
-        authority = _registered_request_sha256(platform, run_id)
         summary = verify_transfer(capture, carried={"input/request.json": authority})
         if not isinstance(summary, dict) or summary.get("handoff_sha256") != handoff:
             raise PipelineError("The admitted capture differs from its native manifest receipt")
         _check_selected_capture(capture, selection)
+        _append_native_events(platform, run_id, capture)
     else:
         paths.run_dir.mkdir(parents=True, exist_ok=True)
         archive_path = paths.run_dir / CAPTURE_ARCHIVE

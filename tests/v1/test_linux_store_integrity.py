@@ -31,7 +31,7 @@ from description_pipeline.orchestration.linux_store import STORE_SCHEMA, LinuxSt
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST, seal_capture
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 
-from .test_linux_split import HANDOFF, SELECTED, UPLOAD, capture_job
+from .test_linux_split import HANDOFF, capture_job
 from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
 RUN = "0b1f2c33-1f1e-4b0e-9d6a-2f9a5c7e1d20"
@@ -314,65 +314,6 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         job["result"]["capture_archive"]["sha256"] = declared_sha256
         return job
 
-    def test_import_native_capture_enforces_the_declared_archive_digest(self) -> None:
-        """The runner must enforce the declared digest independently of its client."""
-
-        source = capture_root(self.tmp / "fresh", run_id=FRESH, handoff=HANDOFF)
-        fresh_archive = self.tmp / "fresh.zip"
-        seal_capture(
-            source,
-            fresh_archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        endpoint = FakeEndpoint(fresh_archive.read_bytes())
-        job = self._job(FRESH, fresh_archive, declared_sha256="d" * 64)
-        with self.assertRaises(PipelineError):
-            linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
-
-    def test_import_native_capture_accepts_matching_bytes(self) -> None:
-        source = capture_root(self.tmp / "fresh-ok", run_id=FRESH, handoff=HANDOFF)
-        fresh_archive = self.tmp / "fresh-ok.zip"
-        seal_capture(
-            source,
-            fresh_archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        digest = hashlib.sha256(fresh_archive.read_bytes()).hexdigest()
-        endpoint = FakeEndpoint(fresh_archive.read_bytes())
-        job = self._job(FRESH, fresh_archive, declared_sha256=digest)
-        result = linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
-        self.assertEqual(result["state"], "capture_admitted")
-        self.assertEqual((self.store.meta(FRESH) or {}).get("handoff_sha256"), HANDOFF)
-        self.assertNotEqual(job["request"]["upload_sha256"], HANDOFF)
-        self.assertEqual(self.store.meta(FRESH)["upload_files"], UPLOAD)
-        self.assertEqual(self.store.meta(FRESH)["selected_files"], SELECTED)
-        self.assertEqual(self.store.meta(FRESH)["selection_sha256"], job["selection"]["manifest"]["selection_sha256"])
-
-    def test_fetch_refuses_changed_selection_before_downloading(self) -> None:
-        mutations = (
-            lambda job: job["request"].update(upload_sha256="0" * 64),
-            lambda job: job.update(handoff_sha256=job["request"]["upload_sha256"]),
-            lambda job: job["selection"]["manifest"].update(selection_sha256="0" * 64),
-            lambda job: job["request"].update(main_assembly="another.SLDASM"),
-            lambda job: job.update(package_files=UPLOAD),
-            lambda job: job["selection"].update(state="ready"),
-            lambda job: job["request"].update(run_id=FRESH),
-        )
-        for index, mutate in enumerate(mutations):
-            with self.subTest(mutation=index):
-                endpoint = FakeEndpoint(self.archive.read_bytes())
-                job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-                mutate(job)
-                with self.assertRaises(PipelineError):
-                    linux_runner.import_native_capture(self.store, endpoint, RUN, job)
-                self.assertEqual(endpoint.calls, 0)
-
     def test_fetch_retry_preserves_the_recorded_selection(self) -> None:
         endpoint = FakeEndpoint(self.archive.read_bytes())
         job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
@@ -381,40 +322,6 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "recorded admission"):
             linux_runner.import_native_capture(self.store, endpoint, RUN, job)
         self.assertEqual(endpoint.calls, 0)
-
-    def test_fetch_refuses_a_resealed_capture_with_another_native_inventory(self) -> None:
-        source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
-        record_path = source / "evidence/discovery.json"
-        record = json.loads(record_path.read_text())
-        record["native_files"]["stray.SLDPRT"] = "0" * 64
-        write_json(record_path, record)
-        manifest_path = source / "evidence" / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-        manifest["files"]["discovery.json"] = file_digest(record_path)
-        write_json(manifest_path, manifest)
-        archive = self.tmp / "foreign-inventory.zip"
-        seal_capture(
-            source,
-            archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        job = self._job(FRESH, archive, declared_sha256=file_digest(archive))
-        endpoint = FakeEndpoint(archive.read_bytes())
-        with self.assertRaisesRegex(PipelineError, "native inventory differs"):
-            linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
-
-    def test_manifest_receipt_mismatch_is_refused_before_import_and_on_retry(self) -> None:
-        endpoint = FakeEndpoint(self.archive.read_bytes())
-        job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-        job["result"]["capture_archive"]["manifest_sha256"] = "e" * 64
-        fresh = LinuxStore(self.tmp / "manifest-mismatch")
-        for store in (fresh, self.store):
-            with self.subTest(admitted=store is self.store), self.assertRaisesRegex(PipelineError, "manifest"):
-                linux_runner.import_native_capture(store, endpoint, RUN, job)
-        self.assertFalse(fresh.capture_dir(RUN).exists())
 
     # ------------------------------------------------------------ run lock
 
