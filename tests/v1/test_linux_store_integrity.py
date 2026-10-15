@@ -95,6 +95,45 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             expected_native_tool=self.tool,
         )
 
+    def test_a_carried_frozen_original_revalidates_without_touching_the_native_manifest(self) -> None:
+        from description_pipeline.orchestration.linux_runner import _revalidate_capture
+        from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
+
+        _revalidate_capture(self.store, RUN)
+        manifest = self.store.capture_dir(RUN) / "transfer-manifest.json"
+        original = manifest.read_bytes()
+        freeze_request_evidence(
+            self.store.run_dir(RUN),
+            request_id="frozen-original",
+            target_hardware="m3.0",
+            change_summary="capture composition",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="b" * 64,
+        )
+        carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
+        _revalidate_capture(self.store, RUN)
+        self.assertEqual(manifest.read_bytes(), original)
+        self.assertEqual(carried.read_bytes(), (self.store.run_dir(RUN) / "input/request.json").read_bytes())
+
+    def test_a_tampered_carried_original_is_refused(self) -> None:
+        from description_pipeline.orchestration.linux_runner import _revalidate_capture
+        from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
+
+        freeze_request_evidence(
+            self.store.run_dir(RUN),
+            request_id="frozen-original",
+            target_hardware="m3.0",
+            change_summary="capture composition",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="b" * 64,
+        )
+        carried = carry_request_evidence(self.store.run_dir(RUN), self.store.capture_dir(RUN))
+        carried.write_bytes(b'{"tampered": true}')
+        with self.assertRaisesRegex(PipelineError, "carried original differs"):
+            _revalidate_capture(self.store, RUN)
+
     # ------------------------------------------------------------ roles / drift
 
     def test_verify_refuses_a_runtime_that_drifted_from_the_native_capture(self) -> None:

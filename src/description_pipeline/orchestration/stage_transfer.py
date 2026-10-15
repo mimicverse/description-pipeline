@@ -613,7 +613,9 @@ def admit_capture(
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict | None:
+def verify_transfer(
+    bundle: Path, *, regenerated: tuple[str, ...] = (), carried: dict[str, str] | None = None
+) -> dict | None:
     """Revalidate transferred native provenance inside a delivery bundle.
 
     Returns ``None`` for a neutral delivery that carries no transfer.  A partial triplet is
@@ -625,6 +627,11 @@ def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict 
     re-creates from its own receipt (the structural-team reports).  Admission still binds
     them against the sealed manifest; a delivery is checked for everything else and may
     carry its own regenerated copy or none at all.
+
+    ``carried`` names the Linux-side originals the freeze stage registered from their own
+    bytes (``input/request.json``), mapped to the frozen binding of this attempt.  A carried
+    original is never a native member, is verified against its frozen bytes on every
+    revalidation, and never exempts anything else: unknown extras still refuse.
     """
 
     bundle = Path(bundle)
@@ -635,6 +642,8 @@ def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict 
     _require(not missing, f"Transferred capture provenance is incomplete; missing: {missing}")
 
     derived = set(regenerated)
+    carried_bindings = dict(carried or {})
+    skip = derived | set(carried_bindings)
     manifest = read_data(confined(bundle, CAPTURE_MANIFEST))
     _require(isinstance(manifest, dict), "Transfer manifest must be an object")
     _require(manifest.get("schema_version") == TRANSFER_SCHEMA, "Transfer manifest uses an unknown schema")
@@ -663,7 +672,7 @@ def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict 
         for path in bundle.rglob("*")
         if path.is_file()
         and _allowed_payload(path.relative_to(bundle).as_posix())
-        and path.relative_to(bundle).as_posix() not in derived
+        and path.relative_to(bundle).as_posix() not in skip
     }
     absent = sorted(set(files) - derived - actual_payload)
     extra = sorted(actual_payload - set(files))
@@ -671,6 +680,14 @@ def verify_transfer(bundle: Path, *, regenerated: tuple[str, ...] = ()) -> dict 
         not absent and not extra,
         f"Delivered capture inventory differs from the transfer manifest: missing={absent[:5]}, extra={extra[:5]}",
     )
+    for name, checksum in carried_bindings.items():
+        _require(_allowed_payload(name), f"Carried original lies outside the capture payload: {name!r}")
+        _require(name not in files, f"Carried original duplicates a native member: {name!r}")
+        _require(_is_sha256(checksum), f"Carried original binding is not a sha256: {name}")
+        _require(
+            file_digest(confined(bundle, name)) == checksum,
+            f"Delivered carried original differs from its frozen bytes: {name}",
+        )
     if not derived & set(files):
         _require(
             manifest.get("total_bytes") == sum(confined(bundle, name).stat().st_size for name in files),

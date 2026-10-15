@@ -55,11 +55,25 @@ def _portable_identity_gate(store: LinuxStore, run_id: str) -> dict:
 
 
 def _revalidate_capture(store: LinuxStore, run_id: str) -> None:
-    """Revalidate the admitted payload against its sealed transfer at point of use."""
+    """Revalidate the admitted payload against its sealed transfer at point of use.
+
+    Native members are checked record-for-record against the transfer manifest;
+    the carried frozen original of this run (``input/request.json``) is verified
+    against its own frozen bytes in the run directory - the same bytes the
+    freeze stage registered - so the Linux addition never pollutes and never
+    escapes the native verification, and unknown extras still refuse.
+    """
     meta = store.meta(run_id) or {}
     recorded = meta.get("transfer") or {}
     capture = store.capture_dir(run_id)
-    summary = verify_transfer(capture)
+    carried_bindings: dict[str, str] = {}
+    carried = capture / "input" / "request.json"
+    if carried.is_file():
+        frozen = store.run_dir(run_id) / "input" / "request.json"
+        if not frozen.is_file():
+            raise PipelineError("The admitted capture carries input/request.json without a frozen original")
+        carried_bindings["input/request.json"] = file_digest(frozen)
+    summary = verify_transfer(capture, carried=carried_bindings)
     if not isinstance(summary, dict):
         raise PipelineError("The admitted capture carries no sealed transfer to revalidate")
     for key in ("run_id", "handoff_sha256", "main_assembly"):
