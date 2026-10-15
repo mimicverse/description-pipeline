@@ -842,12 +842,15 @@ def solidworks_to_urdf():
         request_id = str(conf.get("request_id") or context["params"].get("request_id") or "").strip()
         if not request_id:
             raise AirflowFailException("request_id is required: the run carries no authenticated request identity")
-        config_digest = str(
-            conf.get("platform_config_digest") or os.environ.get("PLATFORM_CONFIG_DIGEST") or ""
-        ).strip()
+        config_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
         if not config_digest:
             raise AirflowFailException(
-                "platform_config_digest is required: the platform configuration snapshot identity is unavailable"
+                "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
+            )
+        conf_digest = str(conf.get("platform_config_digest") or "").strip()
+        if conf_digest and conf_digest != config_digest:
+            raise AirflowFailException(
+                "conf platform_config_digest does not match the controlled platform configuration identity"
             )
         store = _linux_store(CONN_ID)
         evidence = freeze_request_evidence(
