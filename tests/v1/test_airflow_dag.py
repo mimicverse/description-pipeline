@@ -965,5 +965,303 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertTrue(str(call["checkpoint_uri"]).endswith("/generate"))
 
 
+@unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
+class LinkedMaterializationTests(unittest.TestCase):
+    """A linked attempt materializes reused rows and sealed inputs through the real writer."""
+
+    PARENT = "11111111-1111-4111-8111-111111111111"
+    CHILD = "22222222-2222-4222-8222-222222222222"
+    GRANDCHILD = "33333333-3333-4333-8333-333333333333"
+
+    def setUp(self) -> None:
+        import tempfile
+
+        from description_pipeline.delivery import write_delivery_manifest
+        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+        from description_pipeline.io import write_json
+        from description_pipeline.platform.store import PlatformStore
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+        from description_pipeline.verification import solidworks_urdf
+        from tests.v1.test_platform_store import FakeWorld, build_sealed_delivery
+
+        bag = DagBag(str(DAG_DIR))
+        self.module = sys.modules[bag.dags["solidworks_to_urdf"].task_dict["freeze"].python_callable.__module__]
+        self.temporary = tempfile.TemporaryDirectory(prefix="linked-materialization-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "store-root"
+        self.root.mkdir()
+        self.world = FakeWorld()
+        self.store = PlatformStore(self.world.connect, sealed=self._sealed)
+        self.tree = Path(self.temporary.name) / "delivery"
+        self.tree.mkdir()
+        build_sealed_delivery(self.tree)
+        write_json(self.tree / "input" / "request.json", {"request": "fixture"})
+        write_delivery_manifest(
+            self.tree,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+        self.definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+        rebuild = patch.object(solidworks_urdf, "rebuilt_definition", return_value=self.definition)
+        rebuild.start()
+        self.addCleanup(rebuild.stop)
+
+    def _sealed(self, uri: str) -> Path:
+        return self.root / "sealed" / uri.removeprefix("store://sealed/")
+
+    def _admit(self, run_id: str, *, parent: str | None = None, from_stage: str | None = None) -> None:
+        self.store.admit_run(
+            request_id=f"q-{run_id}",
+            run_id=run_id,
+            principal="portal",
+            target_hardware="nd",
+            main_assembly="cad/robot.SLDASM",
+            dispatch={
+                "stage": from_stage or "capture",
+                "operation_key": f"{run_id}/dispatch:0",
+                "params_digest": "a" * 64,
+            },
+            from_stage=from_stage,
+            parent_run_id=parent,
+        )
+        self.world.run_states[run_id] = "running"
+
+    def _register(self, run_id: str, stage: str) -> None:
+        from description_pipeline.io import read_data
+
+        receipt = {"run_id": run_id, "stage": stage}
+        if stage == "freeze":
+            receipt["tool"] = read_data(self.tree / "tool.json")
+        if stage in {"discover", "capture"}:
+            receipt["native_tool"] = read_data(self.tree / "reports" / "native-tool.json")
+        self.module._seal_and_confirm(self.store, self.root, run_id, stage, self.tree, receipt, state="completed")
+
+    def _producer(self, run_id: str, stage: str, seeds: list):
+        from description_pipeline.delivery import read_delivery_manifest
+        from description_pipeline.verification import solidworks_urdf
+        from description_pipeline.verification.solidworks_urdf import required_checks
+        from tests.v1.test_platform_store import build_sealed_delivery
+
+        def call(seed, output, **kwargs):
+            seeds.append((stage, Path(seed)))
+            output = Path(output)
+            output.mkdir(parents=True, exist_ok=True)
+            build_sealed_delivery(output)
+            subject = read_delivery_manifest(output)["subject"]["digest"]
+            receipt = {
+                "run_id": run_id,
+                "stage": stage,
+                "state": {"verify": "verified", "publish": "published"}[stage],
+                "passed": True,
+                "subject_sha256": subject,
+            }
+            expected = required_checks(self.definition)
+            checks = [{"id": name, "state": "passed", "passed": True, "details": {}} for name in expected]
+            receipt["quality"] = {
+                "passed": True,
+                "subject_sha256": subject,
+                "checks": checks,
+                "required_checks": expected,
+                "qualifications": solidworks_urdf.qualifications(output, self.definition, checks),
+            }
+            if stage == "publish":
+                receipt["submission"] = {
+                    "passed": True,
+                    "state": "published",
+                    "url": "https://example.invalid/review/1",
+                    "subject_sha256": subject,
+                }
+            return receipt
+
+        return call
+
+    def _linked_stage(
+        self,
+        run_id: str,
+        stage: str,
+        *,
+        source: str,
+        seeds: list,
+        gates: list,
+        subject: str,
+        repository: Path | None = None,
+    ) -> dict:
+        tree = self.module.flow.RunPaths(self.root, run_id).stage_output(stage)
+
+        def capture(platform, owner):
+            gates.append(("capture", owner))
+            return {"handoff_sha256": "d" * 64}
+
+        def revalidate(platform, owner, capture_path, frozen_path):
+            gates.append(("revalidate", owner))
+
+        def identity(platform, owner):
+            gates.append(("identity", owner))
+            return {}
+
+        with (
+            patch.object(self.module, "_platform_binding", return_value=(self.store, self.root)),
+            patch.object(self.module.flow, "registered_capture", side_effect=capture),
+            patch.object(self.module.flow, "revalidate_capture", side_effect=revalidate),
+            patch.object(self.module.flow, "portable_identity_gate", side_effect=identity),
+            patch.object(self.module.flow.solidworks, stage, side_effect=self._producer(run_id, stage, seeds)),
+        ):
+            return self.module._portable_registered(
+                run_id,
+                stage,
+                tree=tree,
+                source_run_id=source,
+                expected_subject=subject,
+                repository=repository,
+                base="main",
+            )
+
+    def test_a_linked_chain_materializes_reused_rows_and_sealed_inputs(self):
+        import shutil as _shutil
+
+        parent, child, grandchild = self.PARENT, self.CHILD, self.GRANDCHILD
+        self._admit(parent)
+        for stage in ("freeze", "discover", "capture", "generate"):
+            self._register(parent, stage)
+        parent_rows = self.store.stage_records(parent)
+        # A divergent mutable parent work tree must never be consumed by the linked attempt.
+        (self.root / parent / "capture" / "reports").mkdir(parents=True)
+        (self.root / parent / "capture" / "reports" / "native-tool.json").write_text('{"junk": true}', encoding="utf-8")
+        (self.root / parent / "input").mkdir(parents=True)
+        (self.root / parent / "input" / "request.json").write_text('{"junk": true}', encoding="utf-8")
+
+        self._admit(child, parent=parent, from_stage="verify")
+        seeds, gates = [], []
+        receipt = self._linked_stage(child, "verify", source=parent, seeds=seeds, gates=gates, subject="b" * 64)
+        self.assertEqual(receipt["state"], "verified")
+        self.assertEqual(seeds, [("verify", self.root / "sealed" / parent / "generate")])
+        self.assertEqual({owner for _, owner in gates}, {parent})
+
+        child_rows = self.store.stage_records(child)
+        for stage in ("freeze", "discover", "capture", "generate"):
+            row, source = child_rows[stage], parent_rows[stage]
+            self.assertEqual((row["state"], row["reused_from_run"]), ("completed", parent))
+            self.assertEqual(row["checkpoint_uri"], source["checkpoint_uri"])
+            self.assertEqual(row["original_executed_at"], source["original_executed_at"])
+            # The original producer's receipt travels verbatim; nothing is rewritten
+            # to fit the new attempt.
+            self.assertEqual(row["receipt"], source["receipt"])
+            self.assertEqual(row["receipt"]["run_id"], parent)
+        self.assertEqual(
+            (self.root / child / "capture" / "reports" / "native-tool.json").read_bytes(),
+            (self.root / "sealed" / parent / "capture" / "reports" / "native-tool.json").read_bytes(),
+        )
+        self.assertEqual(
+            (self.root / child / "input" / "request.json").read_bytes(),
+            (self.root / "sealed" / parent / "freeze" / "input" / "request.json").read_bytes(),
+        )
+        self.assertEqual(
+            self.module.flow.registered_checkpoint(self.store, child, "generate"),
+            self.root / "sealed" / parent / "generate",
+        )
+        self.assertEqual(
+            self.module.flow.registered_capture(self.store, child)["handoff_sha256"],
+            parent_rows["capture"]["receipt"]["handoff_sha256"],
+        )
+
+        self._admit(grandchild, parent=child, from_stage="verify")
+        _shutil.rmtree(self.root / parent, ignore_errors=True)  # no mutable parent work tree exists at all
+        seeds, gates = [], []
+        receipt = self._linked_stage(grandchild, "verify", source=child, seeds=seeds, gates=gates, subject="b" * 64)
+        self.assertEqual(receipt["state"], "verified")
+        self.assertEqual(seeds, [("verify", self.root / "sealed" / parent / "generate")])
+        self.assertEqual({owner for _, owner in gates}, {child})
+        self.assertEqual(self.store.stage_records(grandchild)["generate"]["reused_from_run"], child)
+
+        seeds, gates = [], []
+        receipt = self._linked_stage(
+            grandchild,
+            "publish",
+            source=child,
+            seeds=seeds,
+            gates=gates,
+            subject="c" * 64,
+            repository=self.root / "model-repository",
+        )
+        self.assertEqual(receipt["state"], "published")
+        self.assertEqual(seeds, [("publish", self.root / "sealed" / grandchild / "verify")])
+        self.assertEqual({owner for _, owner in gates}, {child})
+        self.assertEqual(self.store.stage_records(grandchild)["publish"]["state"], "completed")
+
+    def test_a_missing_source_stage_refuses_the_linked_attempt(self):
+        from airflow.sdk.exceptions import AirflowFailException
+
+        self._admit(self.PARENT)
+        for stage in ("freeze", "discover", "capture"):
+            self._register(self.PARENT, stage)
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        with self.assertRaisesRegex(AirflowFailException, "without a confirmed source stage to reuse"):
+            self._linked_stage(self.CHILD, "verify", source=self.PARENT, seeds=[], gates=[], subject="b" * 64)
+
+    def test_a_damaged_reuse_source_refuses_instead_of_falling_back(self):
+        from description_pipeline.platform.store import PlatformStoreError
+
+        parent, child = self.PARENT, self.CHILD
+        self._admit(parent)
+        for stage in ("freeze", "discover", "capture", "generate"):
+            self._register(parent, stage)
+        state, receipt, _uri, reused, executed = self.world.stages[(parent, "generate")]
+        self.world.stages[(parent, "generate")] = (
+            state,
+            receipt,
+            f"store://sealed/{parent}/capture",
+            reused,
+            executed,
+        )
+        self._admit(child, parent=parent, from_stage="verify")
+        with self.assertRaisesRegex(PlatformStoreError, "names another stage"):
+            self._linked_stage(child, "verify", source=parent, seeds=[], gates=[], subject="b" * 64)
+
+    def test_an_otherwise_valid_source_outside_the_lineage_refuses(self):
+        from description_pipeline.platform.store import PlatformStoreError
+
+        outsider = "44444444-4444-4444-8444-444444444444"
+        self._admit(outsider)
+        self._register(outsider, "freeze")
+        self._admit(self.PARENT)
+        for stage in ("freeze", "discover", "capture", "generate"):
+            self._register(self.PARENT, stage)
+        # The parent's registered freeze row is retargeted at an outsider tree with
+        # matching bytes: only the registered lineage may justify consumption.
+        state, receipt, _uri, reused, executed = self.world.stages[(self.PARENT, "freeze")]
+        self.world.stages[(self.PARENT, "freeze")] = (
+            state,
+            receipt,
+            f"store://sealed/{outsider}/freeze",
+            reused,
+            executed,
+        )
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        with self.assertRaisesRegex(PlatformStoreError, "registered reuse lineage"):
+            self._linked_stage(self.CHILD, "verify", source=self.PARENT, seeds=[], gates=[], subject="b" * 64)
+
+    def test_a_broken_parent_reuse_link_refuses(self):
+        from description_pipeline.platform.store import PlatformStoreError
+
+        parent, child, grandchild = self.PARENT, self.CHILD, self.GRANDCHILD
+        self._admit(parent)
+        for stage in ("freeze", "discover", "capture", "generate"):
+            self._register(parent, stage)
+        self._admit(child, parent=parent, from_stage="verify")
+        self._admit(grandchild, parent=child, from_stage="verify")
+        parent_rows = self.store.stage_records(parent)
+        # Reusing the grandparent's row directly - skipping the registered parent -
+        # is refused even though the receipt and locator exist and verify.
+        with self.assertRaisesRegex(PlatformStoreError, "registered parent run"):
+            self.store.confirm_stage(
+                run_id=grandchild,
+                stage="generate",
+                state="completed",
+                receipt=parent_rows["generate"]["receipt"],
+                checkpoint_uri=parent_rows["generate"]["checkpoint_uri"],
+                reused_from_run=parent,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

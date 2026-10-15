@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -259,6 +259,9 @@ _EVENTS_LIMIT_CAP = 1000
 #: cancellation commands); every other kind needs a non-terminal run.
 _TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled"})
 _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
+
+#: The bound on the registered reuse lineage of one attempt; a longer chain is malformed.
+REUSE_LINEAGE_DEPTH = 256
 
 
 def _json(value: Any) -> str | None:
@@ -951,11 +954,13 @@ class PlatformStore:
     def _verify_checkpoint_scope(
         self, checkpoint_uri, *, run_id: str, stage: str, reused_from_run: str | None
     ) -> None:
-        """A parseable sealed locator must name this run (or its declared reuse source), never another.
+        """A parseable sealed locator must name this run or a run of its registered reuse lineage.
 
-        Being able to parse a locator is not a consumption right: once a
-        reference reads as the standard ``store://sealed/<run_id>/<stage>``
-        locator, confirming or reusing it for another run or stage is refused.
+        Being able to parse a locator is not a consumption right: a reference
+        that reads as the standard ``store://sealed/<run_id>/<stage>`` locator
+        is refused unless it names this run or one of its declared ancestors -
+        the registered reuse chain that may carry an admitted original's
+        checkpoint forward.  The chain is bounded and never walks a cycle.
         Non-locator references stay opaque here and fail closed at their own
         resolver contract.
         """
@@ -969,10 +974,33 @@ class PlatformStore:
             return
         if uri_stage != stage:
             raise PlatformStoreError("The sealed checkpoint names another stage than the confirmation")
-        if uri_run != run_id and uri_run != reused_from_run:
+        if uri_run != run_id and uri_run != reused_from_run and uri_run not in self._reuse_lineage(run_id):
             raise PlatformStoreError(
-                "The sealed checkpoint names a run that is neither the current run nor its declared reuse source"
+                "The sealed checkpoint names a run that is neither the current run nor a run of its "
+                "registered reuse lineage"
             )
+
+    def _reuse_lineage(self, run_id: str) -> set[str]:
+        """The registered reuse chain of one attempt: itself plus its declared ancestors.
+
+        A linked confirmation may carry the admitted original's locator
+        forward, so the scope check authorizes exactly the attempt's
+        registered lineage - nothing wider, and never a cycle.
+        """
+
+        lineage = {run_id}
+        current = run_id
+        for _ in range(REUSE_LINEAGE_DEPTH):
+            with self._transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute(_READ_RUN_PARENT, (current,))
+                row = cursor.fetchone()
+            parent = row[0] if row is not None else None
+            if not parent or parent in lineage:
+                break
+            lineage.add(parent)
+            current = parent
+        return lineage
 
     def _verify_reuse_source(
         self, *, run_id: str, stage: str, checkpoint_uri, reused_from_run: str
@@ -1384,8 +1412,11 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
 
     A terminal confirmation must bind its receipt completely, and the reuse
     query runs exactly the same validation - downstream can never trust the
-    state string alone.  ``blocked`` records an unexecuted stage and carries
-    no receipt requirements; native stages validate the bindings they carry.
+    state string alone.  A receipt produced by a reused stage keeps its
+    original producer's identity: it must name either this run or the run of
+    the locator it was carried under.  ``blocked`` records an unexecuted
+    stage and carries no receipt requirements; native stages validate the
+    bindings they carry.
     """
 
     if state == "blocked":
@@ -1396,7 +1427,11 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
         raise PlatformStoreError("A sealed stage confirmation must carry its bound receipt")
     if receipt.get("schema_version") != BUNDLE_SCHEMA:
         raise PlatformStoreError("The sealed receipt uses an unknown schema")
-    if receipt.get("run_id") != run_id or receipt.get("stage") != stage:
+    named = {run_id}
+    if isinstance(checkpoint_uri, str) and checkpoint_uri.startswith(SEALED_URI_PREFIX):
+        with suppress(PipelineError):
+            named.add(parse_sealed_uri(checkpoint_uri)[0])
+    if receipt.get("run_id") not in named or receipt.get("stage") != stage:
         raise PlatformStoreError("The sealed receipt names another run or stage")
     if state == "unresolved":
         if receipt.get("state") != "unresolved":

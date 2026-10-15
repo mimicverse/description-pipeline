@@ -295,6 +295,62 @@ def _register_completed_stage(run_id: str, stage: str, tree: str | Path, receipt
     _seal_and_confirm(platform, store_root, run_id, stage, tree, receipt, state="completed")
 
 
+def _materialize_linked_attempt(platform: PlatformStore, store_root: Path, run_id: str, source_run_id: str) -> None:
+    """Materialize a linked attempt from its parent's registered rows and sealed trees.
+
+    Every stage the attempt resumes past is confirmed from the parent's
+    registered receipt and checkpoint; the receipt and its original execution
+    instant travel verbatim, so the original producer identity stays visible
+    instead of being rewritten for this attempt.  The attempt's own capture
+    tree and frozen request are materialized from the sealed source trees -
+    never from a mutable parent work directory - so a missing or damaged
+    source refuses instead of falling back.
+    """
+    boundary = (platform.run_record(run_id) or {}).get("from_stage")
+    if boundary not in DELIVERY_STAGES:
+        return
+    existing = platform.stage_records(run_id)
+    source_rows = platform.stage_records(source_run_id)
+    for stage in STAGE_IDS[: STAGE_IDS.index(boundary)]:
+        if (existing.get(stage) or {}).get("state") == "completed":
+            continue
+        source = source_rows.get(stage) or {}
+        if source.get("state") != "completed" or not source.get("checkpoint_uri"):
+            raise AirflowFailException(
+                f"The linked attempt resumes past {stage!r} without a confirmed source stage to reuse"
+            )
+        platform.confirm_stage(
+            run_id=run_id,
+            stage=stage,
+            state="completed",
+            receipt=source.get("receipt"),
+            checkpoint_uri=source["checkpoint_uri"],
+            reused_from_run=source_run_id,
+            original_executed_at=source.get("original_executed_at"),
+        )
+    paths = flow.RunPaths(store_root, run_id)
+    frozen = paths.run_dir / "input" / "request.json"
+    if paths.capture_dir.is_dir() and frozen.is_file():
+        return
+    rows = platform.stage_records(run_id)
+    capture_uri = (rows.get("capture") or {}).get("checkpoint_uri")
+    freeze_uri = (rows.get("freeze") or {}).get("checkpoint_uri")
+    if not capture_uri or not freeze_uri:
+        raise AirflowFailException("The linked attempt has no reusable capture and frozen request to materialize")
+    sealed_request = platform.sealed_path(freeze_uri) / "input" / "request.json"
+    if not sealed_request.is_file():
+        raise AirflowFailException("The linked attempt's frozen request is missing from the registered freeze tree")
+    if paths.capture_dir.exists():
+        shutil.rmtree(paths.capture_dir)
+    shutil.copytree(platform.sealed_path(capture_uri), paths.capture_dir)
+    carried = paths.capture_dir / "input" / "request.json"
+    if not carried.is_file():
+        carried.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sealed_request, carried)
+    frozen.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(sealed_request, frozen)
+
+
 def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict | None = None, **kwargs) -> dict:
     """Run one portable stage, report its boundary, then register it through the sealed chain.
 
@@ -304,6 +360,9 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
     produced by the registered flow from the sealed predecessor trees.
     """
     platform, store_root = _platform_binding()
+    source_run_id = kwargs.get("source_run_id")
+    if source_run_id:
+        _materialize_linked_attempt(platform, store_root, run_id, source_run_id)
 
     def live(event: dict) -> None:
         try:
