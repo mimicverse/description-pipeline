@@ -29,6 +29,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -36,6 +37,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -85,7 +88,7 @@ def _native_record(fixture_root: Path) -> dict:
 
 
 def _mock_endpoint(
-    fixture: dict, *, run_id: str, upload_files: dict[str, str], record: dict, bundle_dir: Path
+    fixture: dict, *, run_id: str, upload_files: dict[str, str], record: dict, bundle_dir: Path, port: int = 0
 ) -> tuple[ThreadingHTTPServer, dict]:
     """The one-workflow endpoint contract: full-folder staging, raw record, definition, capture."""
 
@@ -288,7 +291,7 @@ def _mock_endpoint(
                 return
             self._send(404, {"error": "not found"})
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, state
 
@@ -449,6 +452,256 @@ def _task_reschedule_evidence(
     return (rows if isinstance(rows, list) else []), None
 
 
+def _start_portal_server(
+    root: Path,
+    airflow_base: str,
+    upload_root: Path,
+    store_root: Path,
+    repository: Path,
+    targets: dict,
+    dag_id: str,
+    endpoint_holder: dict,
+) -> tuple[object, str]:
+    """Start the real portal in-process (admission through the operator HTTP surface).
+
+    The endpoint is bound lazily: the portal is up before the mocked Windows endpoint exists
+    (admission happens while the DAG is still paused, so no task can call it yet).
+    """
+
+    from wsgiref.simple_server import make_server  # noqa: PLC0415
+
+    from description_pipeline.orchestration.portal import AirflowApi, PortalApp, PortalConfig  # noqa: PLC0415
+
+    config = PortalConfig(
+        airflow=AirflowApi(airflow_base),
+        endpoint=lambda: endpoint_holder["endpoint"],
+        static_dir=root / "src/description_pipeline/orchestration/static",
+        upload_root=upload_root,
+        pipeline_store_root=store_root,
+        pipeline_repositories={REPOSITORY_SLUG: repository},
+        pipeline_targets=targets,
+        dag_id=dag_id,
+    )
+    server = make_server("127.0.0.1", 0, PortalApp(config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def _open_platform_admission() -> dict:
+    """The operator ``start`` step through the same store API the deployment uses.
+
+    Installation seeds the single admission row CLOSED; every submission path refuses until
+    the gate is opened.  The smoke opens it exactly as ``operatorctl start`` does, so the
+    portal admission below exercises the real open-gate path instead of a bypass.
+    """
+
+    from description_pipeline.platform.store import PlatformStore, PlatformStoreError  # noqa: PLC0415
+
+    try:
+        view = PlatformStore.from_environment(os.environ).open_admission(
+            reason="start", actor="scheduled_smoke"
+        )
+    except PlatformStoreError as error:
+        return {"state": "", "error": str(error)}
+    return {"state": view.state, "revision": view.revision, "actor": view.actor}
+
+
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    token: str = "",
+    cookies: str = "",
+    csrf: str = "",
+    data: bytes | None = None,
+    content_type: str = "",
+) -> tuple[int, dict, list[str]]:
+    headers: dict[str, str] = {}
+    cookie = "; ".join(item for item in (f"_token={token}" if token else "", cookies) if item)
+    if cookie:
+        headers["Cookie"] = cookie
+    if csrf:
+        headers["X-CSRF-Token"] = csrf
+    if content_type:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read()
+            payload = json.loads(body) if body else {}
+            return response.status, payload, response.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as error:
+        body = error.read()
+        try:
+            payload = json.loads(body) if body else {}
+        except ValueError:
+            payload = {"error": body[:200].decode("utf-8", "replace")}
+        return error.code, payload, []
+
+
+def _portal_admit(
+    portal_base: str, token: str, intake_dir: Path, top_name: str, target: str, summary: str
+) -> tuple[str, str, dict]:
+    """Adopt an operator session (Airflow SSO cookie) and submit the folder through the portal."""
+
+    from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
+    from tests.v1.test_portal import _upload_body  # noqa: PLC0415
+
+    status, session, set_cookies = _http_json("GET", f"{portal_base}/api/session", token=token)
+    if status != 200:
+        raise RuntimeError(f"portal session failed: {status} {session}")
+    cookie = next(
+        (item.split(";", 1)[0] for item in set_cookies if item.startswith("solidworks_portal_session=")), ""
+    )
+    files = [(name, (intake_dir / name).read_bytes()) for name in sorted(package_inventory(intake_dir))]
+    body = _upload_body(
+        folder=top_name,
+        files=files,
+        fields=[("target_hardware", target), ("change_summary", summary)],
+    )
+    status, payload, _ = _http_json(
+        "POST",
+        f"{portal_base}/api/runs",
+        token=token,
+        cookies=cookie,
+        csrf=str(session.get("csrf_token") or ""),
+        data=body,
+        content_type="multipart/form-data; boundary=portal-boundary",
+    )
+    if status != 201 or not payload.get("dag_run_id"):
+        raise RuntimeError(f"portal admission failed: {status} {payload}")
+    return str(payload["dag_run_id"]), cookie, session
+
+
+def _portal_negative_checks(
+    portal_base: str, token: str, cookie: str, csrf: str, top_name: str, run_id: str
+) -> list[dict]:
+    """The HTTP-driven negative matrix (illegal fields and an illegal rerun stage)."""
+
+    from tests.v1.test_portal import _upload_body  # noqa: PLC0415
+
+    def multipart(fields: list[tuple[str, str]]) -> bytes:
+        return _upload_body(folder=top_name, files=[], fields=fields)
+
+    results = []
+    checks = (
+        ("missing_target", multipart([("change_summary", "x")])),
+        ("unconfigured_target", multipart([("target_hardware", "not-configured"), ("change_summary", "x")])),
+        ("missing_summary", multipart([("target_hardware", TARGET_HARDWARE)])),
+    )
+    for name, body in checks:
+        status, payload, _ = _http_json(
+            "POST",
+            f"{portal_base}/api/runs",
+            token=token,
+            cookies=cookie,
+            csrf=csrf,
+            data=body,
+            content_type="multipart/form-data; boundary=portal-boundary",
+        )
+        results.append({"check": name, "status": status, "expected": 400, "ok": status == 400, "payload": payload})
+    status, payload, _ = _http_json(
+        "POST",
+        f"{portal_base}/api/runs/{run_id}/attempts",
+        token=token,
+        cookies=cookie,
+        csrf=csrf,
+        data=json.dumps({"stage": "bogus"}).encode("utf-8"),
+        content_type="application/json",
+    )
+    results.append(
+        {"check": "illegal_stage", "status": status, "expected": 400, "ok": status == 400, "payload": payload}
+    )
+    return results
+
+
+def _platform_sql_evidence(
+    platform_schema: str, run_id: str, projection: dict, *, development_pending: bool
+) -> dict:
+    """The platform rows of this run plus the projection comparisons (PG16: cast "char" columns)."""
+
+    import psycopg2  # noqa: PLC0415
+
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*", platform_schema or ""):
+        return {"ok": False, "problems": ["platform schema name is not queryable"], "rows": {}, "comparisons": []}
+    dsn = os.environ.get("PLATFORM_SERVICE_DSN", "")
+    if not dsn:
+        return {"ok": False, "problems": ["PLATFORM_SERVICE_DSN is not set"], "rows": {}, "comparisons": []}
+    rows: dict = {}
+    with psycopg2.connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute(f"SELECT state FROM {platform_schema}.run WHERE run_id=%s", (run_id,))
+        rows["run_state"] = [row[0] for row in cursor.fetchall()]
+        cursor.execute(
+            f"SELECT request_id, target_hardware, principal FROM {platform_schema}.request WHERE request_id=%s",
+            (f"portal-{run_id}",),
+        )
+        rows["request"] = cursor.fetchall()
+        cursor.execute(
+            f"SELECT operation_key, stage, kind, state FROM {platform_schema}.operation WHERE run_id=%s "
+            "ORDER BY operation_id",
+            (run_id,),
+        )
+        rows["operations"] = cursor.fetchall()
+        cursor.execute(f"SELECT stage, state FROM {platform_schema}.stage WHERE run_id=%s ORDER BY stage", (run_id,))
+        rows["stages"] = cursor.fetchall()
+        cursor.execute(f"SELECT count(*)::int FROM {platform_schema}.run_event WHERE run_id=%s", (run_id,))
+        rows["run_event_count"] = cursor.fetchone()[0]
+    comparisons = [
+        {"name": "admission_run_row", "passed": len(rows["run_state"]) == 1, "observed": rows["run_state"]},
+        {"name": "admission_request_row", "passed": len(rows["request"]) == 1, "observed": rows["request"]},
+        {
+            "name": "dispatch_operation_row",
+            "passed": any(row[2] == "dispatch" for row in rows["operations"]),
+            "observed": rows["operations"],
+        },
+    ]
+    projected_state = projection.get("state") if isinstance(projection, dict) else None
+    terminal = [state for state in rows["run_state"] if state in {"succeeded", "failed", "cancelled"}]
+    if terminal:
+        mapped = {"success": "succeeded", "failed": "failed"}.get(str(projected_state))
+        comparisons.append(
+            {
+                "name": "run_state_matches_projection",
+                "passed": terminal[0] == mapped,
+                "observed": [terminal[0], projected_state],
+            }
+        )
+    else:
+        comparisons.append(
+            {
+                "name": "run_state_matches_projection",
+                "passed": False,
+                "observed": ["no terminal platform run row yet", projected_state],
+                "pending_writer": True,
+            }
+        )
+    tasks = {str(item.get("task_id")): item.get("state") for item in (projection.get("tasks") or [])}
+    mapping = {"success": "completed", "failed": "failed", "upstream_failed": "blocked", "skipped": "blocked"}
+    expected_stages = {stage: mapping.get(str(state), str(state)) for stage, state in tasks.items()}
+    stage_states = dict(rows["stages"])
+    comparisons.append(
+        {
+            "name": "stage_rows_match_projection",
+            "passed": bool(expected_stages) and stage_states == expected_stages,
+            "observed": {"sql": stage_states, "projected": expected_stages},
+            "pending_writer": not stage_states,
+        }
+    )
+    problems = [
+        f"platform settlement assertion failed: {item['name']} {item['observed']}"
+        for item in comparisons
+        if not item["passed"] and not (item.get("pending_writer") and development_pending)
+    ]
+    return {
+        "ok": not problems,
+        "schema": platform_schema,
+        "rows": rows,
+        "comparisons": comparisons,
+        "pending_writers": [item["name"] for item in comparisons if item.get("pending_writer")],
+        "problems": problems,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -456,6 +709,21 @@ def main() -> int:
     parser.add_argument("--airflow-home", type=Path, required=True)
     parser.add_argument("--api-port", type=int, default=0, help="loopback api-server port (0 picks a free one)")
     parser.add_argument("--timeout", type=float, default=420)
+    parser.add_argument(
+        "--portal-admission",
+        action="store_true",
+        help="submit through a locally started real portal (HTTP multipart) instead of the client trigger",
+    )
+    parser.add_argument("--platform-schema", default="", help="platform schema for the SQL evidence queries")
+    parser.add_argument("--airflow-schema", default="", help="the Airflow schema this run's metadata lives in")
+    parser.add_argument("--airflow-db-conn", default="", help="Airflow metadata DSN (PostgreSQL) for this session")
+    parser.add_argument("--report", type=Path, default=None, help="also write the report JSON here")
+    parser.add_argument(
+        "--development-pending-settlement",
+        action="store_true",
+        help="development window only: record the missing stage/run_event writers instead of failing; "
+        "the required CI path must not pass this flag",
+    )
     args = parser.parse_args()
     ambient_sensor_mode = os.environ.get("SOLIDWORKS_SENSOR_MODE")
     if ambient_sensor_mode not in (None, SENSOR_MODE_REQUIRED):
@@ -483,11 +751,18 @@ def main() -> int:
         build_fixture_capture,
     )
 
+    portal_mode = bool(args.portal_admission)
     run_id = f"smoke-{uuid.uuid4().hex[:12]}"
     native_id = native_run_id(run_id)
-    fixture_root = args.airflow_home / "smoke" / f"fixture-{native_id}"
+    if portal_mode:
+        # The real portal admits the run and its dag_run_id binds the native identity; the
+        # placeholder built below exists only to prepare the uploaded folder before admission.
+        run_id = ""
+        native_id = ""
+    placeholder_native = native_run_id(f"smoke-{uuid.uuid4().hex[:12]}")
+    fixture_root = args.airflow_home / "smoke" / f"fixture-{placeholder_native}"
     try:
-        fixture = build_fixture_capture(fixture_root, run_id=native_id)
+        fixture = build_fixture_capture(fixture_root, run_id=placeholder_native)
     except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
         print(json.dumps({"ok": False, "stage": "control_fixture", "error": f"{type(error).__name__}: {error}"}))
         return 1
@@ -495,17 +770,25 @@ def main() -> int:
     api_port = args.api_port or _free_port()
     intake_root = args.airflow_home / "smoke" / "intake"
     intake = intake_root / HANDOFF_PATH
+    # The smoke owns this intake path inside its own AIRFLOW_HOME; a previous attempt (or an
+    # earlier smoke on a persistent home) must not collide with the fresh fixture copy.
+    shutil.rmtree(intake, ignore_errors=True)
     shutil.copytree(fixture_root / "native", intake)
     upload_files = package_inventory(intake)
     record = _native_record(fixture_root)
-    server, state = _mock_endpoint(
-        fixture,
-        run_id=native_id,
-        upload_files=upload_files,
-        record=record,
-        bundle_dir=args.airflow_home / "smoke" / "definition",
-    )
-    port = server.server_address[1]
+    server = None
+    portal_server = None
+    state: dict = {}
+    port = _free_port() if portal_mode else 0
+    if not portal_mode:
+        server, state = _mock_endpoint(
+            fixture,
+            run_id=native_id,
+            upload_files=upload_files,
+            record=record,
+            bundle_dir=args.airflow_home / "smoke" / "definition",
+        )
+        port = server.server_address[1]
     store_root = args.airflow_home / "smoke-store"
     connection = json.dumps(
         {
@@ -538,15 +821,19 @@ def main() -> int:
         AIRFLOW__CORE__DAGS_FOLDER=str(args.root / "deploy/airflow/dags"),
         AIRFLOW__CORE__EXECUTION_API_SERVER_URL=f"http://127.0.0.1:{api_port}/execution",
     )
+    if args.airflow_db_conn:
+        env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = args.airflow_db_conn
     problem = _plugin_preflight(args.venv, env, args.airflow_home)
     if problem is not None:
         print(json.dumps({"ok": False, "stage": "plugin_missing", "error": problem}))
-        server.close()
+        if server is not None:
+            server.close()
         return 1
     migrate = _run(args.venv, env, "db", "migrate")
     if migrate.returncode != 0:
         print(json.dumps({"ok": False, "stage": "db_migrate", "stderr": migrate.stderr[-500:]}))
-        server.close()
+        if server is not None:
+            server.close()
         return 1
     # The production pool entry (install.sh runs the same script): a freshly migrated home only
     # carries the stock default pool, and the DAG's native stage waits on windows_native; without
@@ -560,7 +847,8 @@ def main() -> int:
     )
     if pool.returncode != 0:
         print(json.dumps({"ok": False, "stage": "ensure_pool", "stderr": pool.stderr[-500:]}))
-        server.close()
+        if server is not None:
+            server.close()
         return 1
     log_dir = args.airflow_home / "logs" / "smoke"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -611,28 +899,112 @@ def main() -> int:
                 )
             )
             return 1
-        unpause = _run(args.venv, env, "dags", "unpause", DAG_ID)
-        if unpause.returncode != 0:
-            print(json.dumps({"ok": False, "stage": "unpause", "stderr": unpause.stderr[-500:]}))
-            return 1
-        # Trigger exactly as the operator page does: the portal's client, a real operator JWT and
-        # the pinned strict request model.  A CLI trigger could not catch a body regression.
         airflow = AirflowApi(f"http://127.0.0.1:{api_port}")
         token = _operator_jwt(args.venv, env)
-        try:
-            airflow.trigger_dag_run(
-                token,
+        portal_base = ""
+        portal_cookie = ""
+        portal_csrf = ""
+        projection: dict = {}
+        negatives: list[dict] = []
+        sql_evidence: dict | None = None
+        identity_stable: bool | None = None
+        trigger_kind = "portal-airflow-client"
+        endpoint_holder: dict = {}
+        admission: dict = {}
+        portal_server = None
+        if portal_mode:
+            # The operator "start" half of the workflow: the gate is opened through the store
+            # API before any submission can be admitted.
+            admission = _open_platform_admission()
+            if admission.get("state") != "open":
+                print(json.dumps({"ok": False, "stage": "platform_admission", "admission": admission}))
+                return 1
+            # Admission first, while the DAG is paused: the portal's dag_run_id binds the native
+            # identity, so the fixture and mocked endpoint are built for it afterwards and only
+            # then is scheduling released.
+            portal_server, portal_base = _start_portal_server(
+                args.root,
+                f"http://127.0.0.1:{api_port}",
+                intake_root,
+                store_root,
+                args.airflow_home / "smoke-repository",
+                {TARGET_HARDWARE: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
                 DAG_ID,
-                run_id,
-                {
-                    "handoff_path": str(intake),
-                    "target_hardware": TARGET_HARDWARE,
-                    "change_summary": "scheduled control-fixture smoke",
-                },
+                endpoint_holder,
             )
-        except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
-            print(json.dumps({"ok": False, "stage": "portal_trigger", "error": str(error)}))
-            return 1
+            try:
+                run_id, portal_cookie, portal_session = _portal_admit(
+                    portal_base, token, intake, HANDOFF_PATH, TARGET_HARDWARE, "scheduled control-fixture smoke"
+                )
+                portal_csrf = str(portal_session.get("csrf_token") or "")
+            except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+                print(json.dumps({"ok": False, "stage": "portal_admission", "error": str(error)}))
+                return 1
+            native_id = native_run_id(run_id)
+            rebuilt_root = args.airflow_home / "smoke" / f"fixture-{native_id}"
+            try:
+                rebuilt = build_fixture_capture(rebuilt_root, run_id=native_id)
+            except Exception as error:  # noqa: BLE001
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "stage": "control_fixture_rebuild",
+                            "error": f"{type(error).__name__}: {error}",
+                        }
+                    )
+                )
+                return 1
+            identity_stable = (
+                rebuilt.get("handoff_sha256") == fixture.get("handoff_sha256")
+                and Path(str(rebuilt.get("archive"))).read_bytes() == Path(str(fixture.get("archive"))).read_bytes()
+            )
+            fixture = rebuilt
+            fixture_root = rebuilt_root
+            upload_files = package_inventory(intake)
+            record = _native_record(fixture_root)
+            server, state = _mock_endpoint(
+                fixture,
+                run_id=native_id,
+                upload_files=upload_files,
+                record=record,
+                bundle_dir=args.airflow_home / "smoke" / "definition",
+                port=port,
+            )
+            from description_pipeline.orchestration.airflow_client import (  # noqa: PLC0415
+                EndpointConfig,
+                WindowsEndpoint,
+            )
+
+            endpoint_holder["endpoint"] = WindowsEndpoint(
+                EndpointConfig(base_url=f"http://127.0.0.1:{port}", token=TOKEN)
+            )
+            resume = _run(args.venv, env, "dags", "unpause", DAG_ID)
+            if resume.returncode != 0:
+                print(json.dumps({"ok": False, "stage": "unpause", "stderr": resume.stderr[-500:]}))
+                return 1
+            trigger_kind = "portal-http-admission"
+        else:
+            unpause = _run(args.venv, env, "dags", "unpause", DAG_ID)
+            if unpause.returncode != 0:
+                print(json.dumps({"ok": False, "stage": "unpause", "stderr": unpause.stderr[-500:]}))
+                return 1
+            # Trigger exactly as the operator page does: the portal's client, a real operator JWT
+            # and the pinned strict request model.  A CLI trigger could not catch a body regression.
+            try:
+                airflow.trigger_dag_run(
+                    token,
+                    DAG_ID,
+                    run_id,
+                    {
+                        "handoff_path": str(intake),
+                        "target_hardware": TARGET_HARDWARE,
+                        "change_summary": "scheduled control-fixture smoke",
+                    },
+                )
+            except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+                print(json.dumps({"ok": False, "stage": "portal_trigger", "error": str(error)}))
+                return 1
         deadline = time.time() + args.timeout
         triggering_user_name = None
         dag_state = None
@@ -678,6 +1050,31 @@ def main() -> int:
             for item in instances
         }
         problems: list[str] = []
+        if portal_mode:
+            status, projection, _ = _http_json(
+                "GET", f"{portal_base}/api/runs/{run_id}", token=token, cookies=portal_cookie
+            )
+            if status != 200:
+                problems.append(f"the portal projection could not be read: {status}")
+            negatives = _portal_negative_checks(portal_base, token, portal_cookie, portal_csrf, HANDOFF_PATH, run_id)
+            for item in negatives:
+                if not item["ok"]:
+                    problems.append(
+                        f"portal negative check {item['check']} answered {item['status']}, "
+                        f"expected {item['expected']}"
+                    )
+            sql_evidence = _platform_sql_evidence(
+                args.platform_schema,
+                run_id,
+                projection,
+                development_pending=bool(args.development_pending_settlement),
+            )
+            problems.extend(sql_evidence.get("problems", []))
+            if identity_stable is False:
+                problems.append(
+                    "the rebuilt fixture differs from the uploaded placeholder fixture; "
+                    "the run identity binding is unstable"
+                )
         if dag_state != "failed":
             problems.append(f"DAG run state is {dag_state!r}, expected the documented rejection (failed)")
         for task_id, expected_state in (
@@ -761,44 +1158,63 @@ def main() -> int:
         if meta.get("last_stage") != "verify":
             problems.append(f"the attempt advanced past verification: last_stage={meta.get('last_stage')!r}")
 
-        print(
-            json.dumps(
-                {
-                    "ok": not problems,
-                    "qualification": QUALIFICATION,
-                    "run_id": run_id,
-                    "native_run_id": native_id,
-                    "api_port": api_port,
-                    "auth_health": auth_health,
-                    "trigger": "portal-airflow-client",
-                    "triggering_user_name": triggering_user_name,
-                    "dag_state": dag_state,
-                    "reschedule_evidence": {
-                        "query": reschedule_query,
-                        "rows": reschedule_rows,
-                        "observed": reschedule_observed,
-                        "error": reschedule_error,
-                    },
-                    "task_states": task_states,
-                    "selection_uploads": state["uploads"],
-                    "definition_posts": state["definition_posts"],
-                    "artifact_paths": state["artifact_paths"],
-                    "handoff_sha256": fixture["handoff_sha256"],
-                    "generate": {"state": generated.get("state"), "subject_sha256": generated.get("subject_sha256")},
-                    "verify": {
-                        "state": verified.get("state"),
-                        "error": verified.get("error"),
-                        "diagnostic_path": verified.get("diagnostic_path"),
-                        "failed_gates": failed_gates,
-                        "unexpected_gates": unexpected_gates,
-                        "missing_required_gates": missing_required,
-                        "subject_sha256": verified.get("subject_sha256"),
-                    },
-                    "publication": {"executed": bool(publish_receipt.is_file() or pr_json), "pr_json": pr_json or None},
-                    "problems": problems,
-                }
+        report = {
+            "ok": not problems,
+            "qualification": QUALIFICATION,
+            "run_id": run_id,
+            "native_run_id": native_id,
+            "api_port": api_port,
+            "auth_health": auth_health,
+            "trigger": trigger_kind,
+            "native_endpoint": "mock (transport-only)",
+            "scope": {
+                "platform_schema": args.platform_schema or None,
+                "airflow_schema": args.airflow_schema or None,
+                "portal_admission": portal_mode,
+                "development_pending_settlement": bool(args.development_pending_settlement),
+            },
+            "triggering_user_name": triggering_user_name,
+            "dag_state": dag_state,
+            "reschedule_evidence": {
+                "query": reschedule_query,
+                "rows": reschedule_rows,
+                "observed": reschedule_observed,
+                "error": reschedule_error,
+            },
+            "task_states": task_states,
+            "selection_uploads": state["uploads"],
+            "definition_posts": state["definition_posts"],
+            "artifact_paths": state["artifact_paths"],
+            "handoff_sha256": fixture["handoff_sha256"],
+            "fixture_identity_stable": identity_stable,
+            "generate": {"state": generated.get("state"), "subject_sha256": generated.get("subject_sha256")},
+            "verify": {
+                "state": verified.get("state"),
+                "error": verified.get("error"),
+                "diagnostic_path": verified.get("diagnostic_path"),
+                "failed_gates": failed_gates,
+                "unexpected_gates": unexpected_gates,
+                "missing_required_gates": missing_required,
+                "subject_sha256": verified.get("subject_sha256"),
+            },
+            "publication": {"executed": bool(publish_receipt.is_file() or pr_json), "pr_json": pr_json or None},
+            "platform_sql": sql_evidence,
+            "platform_admission": admission,
+            "portal_projection": {
+                "dag_run_id": run_id,
+                "state": projection.get("state") if isinstance(projection, dict) else None,
+                "tasks": projection.get("tasks") if isinstance(projection, dict) else None,
+                "handoff_path": projection.get("handoff_path") if isinstance(projection, dict) else None,
+            },
+            "negative_http": negatives,
+            "problems": problems,
+        }
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
-        )
+        print(json.dumps(report))
         return 0 if not problems else 1
     finally:
         stack.close()
@@ -808,8 +1224,10 @@ def main() -> int:
         for proc in procs:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=20)
-        server.shutdown()
-        server.server_close()
+        for httpd in (server, portal_server):
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
 
 
 if __name__ == "__main__":
