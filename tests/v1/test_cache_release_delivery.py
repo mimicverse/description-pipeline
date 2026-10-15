@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.io import PipelineError, write_json
-from description_pipeline.interface_records import validate_cache_release_request
+from description_pipeline.interface_records import CACHE_RELEASE_RECEIPT_SCHEMA, validate_cache_release_request
 from description_pipeline.orchestration.airflow_client import (
     CAPTURE_MANIFEST,
     EndpointConfig,
@@ -55,7 +55,7 @@ class StubEndpoint:
         self.calls.append((run_id, request))
         if self.error is not None:
             raise self.error
-        return {"schema_version": "solidworks-to-urdf.cache-release-receipt/v1", "status": "released", "run_id": run_id}
+        return {"schema_version": CACHE_RELEASE_RECEIPT_SCHEMA, "status": "released", "run_id": run_id}
 
 
 class Store:
