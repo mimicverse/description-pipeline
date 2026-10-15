@@ -838,8 +838,8 @@ class PortalTests(unittest.TestCase):
         self.airflow.task_states[DAG_RUN_ID] = [
             {"task_id": "resolve_handoff", "state": "success"},
             {"task_id": "start_job", "state": "success"},
-            {"task_id": "wait_for_job", "state": "failed"},
-            {"task_id": "confirm_job", "state": "upstream_failed"},
+            {"task_id": "fetch_capture", "state": "failed"},
+            {"task_id": "run_generate", "state": "upstream_failed"},
         ]
 
     def test_retry_capability_uses_current_profile_and_recorded_actor(self) -> None:
@@ -852,7 +852,14 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 200, body)
                 detail = json.loads(body)
                 self.assertIs(detail["can_manage"], can_manage)
-                self.assertEqual(detail["retry"], {"eligible": True, "reason": "transport_recovery"})
+                self.assertEqual(
+                    detail["retry"],
+                    {
+                        "eligible": True,
+                        "reason": "sealed_evidence_reimport",
+                        "classification": "evidence_corruption",
+                    },
+                )
         self.client.login()
         self.airflow.dag_runs[DAG_RUN_ID]["triggering_user_name"] = f"{FEISHU_PRINCIPAL}|broken"
         self.assertFalse(json.loads(self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")[2])["can_manage"])
@@ -870,7 +877,7 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 200, body)
                 self.assertEqual(
                     json.loads(body),
-                    {"dag_run_id": DAG_RUN_ID, "state": "queued", "cleared_tasks": ["confirm_job", "wait_for_job"]},
+                    {"dag_run_id": DAG_RUN_ID, "state": "queued", "cleared_tasks": ["fetch_capture", "run_generate"]},
                 )
                 self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], conf_before)
                 self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
@@ -912,12 +919,22 @@ class PortalTests(unittest.TestCase):
         self._fail_job()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "native_terminal_failure"})
+        self.assertEqual(
+            json.loads(body)["retry"],
+            {"eligible": False, "reason": "native_terminal_failure", "classification": "engineering_terminal_failure"},
+        )
         self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
         with patch.object(self.endpoint, "get_job", side_effect=EndpointError("offline")):
             status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
             self.assertEqual(status, 200, body)
-            self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "endpoint_evidence_unavailable"})
+            self.assertEqual(
+                json.loads(body)["retry"],
+                {
+                    "eligible": False,
+                    "reason": "endpoint_evidence_unavailable",
+                    "classification": "temporary_disconnection",
+                },
+            )
             self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
         self.assertEqual(self.airflow.clear_requests, [])
 
@@ -926,11 +943,11 @@ class PortalTests(unittest.TestCase):
         self.client.login()
         for selected in [
             [{"task_id": "resolve_handoff", "state": "failed"}],
-            [{"task_id": "wait_for_job", "state": "success"}],
-            [{"task_id": "wait_for_job", "state": "failed"}],
-            [{"task_id": "wait_for_job", "state": "failed", "dag_run_id": "another-run"}],
-            [{"task_id": "wait_for_job", "state": "failed", "map_index": 0}],
-            [{"task_id": "wait_for_job", "state": "failed"}] * 2,
+            [{"task_id": "fetch_capture", "state": "success"}],
+            [{"task_id": "fetch_capture", "state": "failed"}],
+            [{"task_id": "fetch_capture", "state": "failed", "dag_run_id": "another-run"}],
+            [{"task_id": "fetch_capture", "state": "failed", "map_index": 0}],
+            [{"task_id": "fetch_capture", "state": "failed"}] * 2,
         ]:
             with self.subTest(selected=selected):
                 self.airflow.clear_selection = selected
@@ -944,12 +961,19 @@ class PortalTests(unittest.TestCase):
         self.endpoint_server.jobs.clear()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["retry"], {"eligible": False, "reason": "endpoint_evidence_unavailable"})
+        self.assertEqual(
+            json.loads(body)["retry"],
+            {
+                "eligible": False,
+                "reason": "endpoint_evidence_unavailable",
+                "classification": "temporary_disconnection",
+            },
+        )
         self.airflow.task_states[DAG_RUN_ID][1]["state"] = "failed"
         self.airflow.task_states[DAG_RUN_ID][2]["state"] = "upstream_failed"
         status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["cleared_tasks"], ["confirm_job", "start_job", "wait_for_job"])
+        self.assertEqual(json.loads(body)["cleared_tasks"], ["fetch_capture", "run_generate", "start_job"])
         self._seed_retryable_run()
         self.airflow.task_states[DAG_RUN_ID][0]["state"] = "failed"
         self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
@@ -1008,7 +1032,6 @@ class PortalTests(unittest.TestCase):
             "main_assembly": "model.SLDASM",
             "target_hardware": TEST_TARGET,
             "change_summary": TEST_SUMMARY,
-            "submission_principal": FEISHU_PRINCIPAL,
         }
         self.assertEqual(self.airflow.conf, expected_conf)
         self.assertEqual(
@@ -1158,7 +1181,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(identity["change_summary"], stored)
         self.assertNotIn("discovery.summary_invalid", [finding["code"] for finding in findings])
 
-    def test_submission_conf_always_carries_target_summary_and_principal(self) -> None:
+    def test_submission_conf_always_carries_target_and_summary(self) -> None:
         self.client.login()
         status, _, body = self.client.request_raw(
             "POST",
@@ -1175,9 +1198,10 @@ class PortalTests(unittest.TestCase):
                 "main_assembly": "model.SLDASM",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
-                "submission_principal": FEISHU_PRINCIPAL,
             },
         )
+        # The recorded submitter is the run's stored actor, never a create-body claim.
+        self.assertNotIn("submission_principal", self.airflow.conf)
 
     def test_unknown_target_hardware_is_rejected(self) -> None:
         self.client.login()
@@ -1216,7 +1240,6 @@ class PortalTests(unittest.TestCase):
                 "main_assembly": "parts/arm.SLDASM",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
-                "submission_principal": FEISHU_PRINCIPAL,
             },
         )
         status, _, body = self.client.request("GET", f"/api/runs/{dag_run_id}")

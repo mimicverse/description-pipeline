@@ -15,7 +15,7 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
     read_search_folders,
 )
 from description_pipeline.sources.solidworks.native_selection import (  # noqa: E402
-    REQUIRED_DECLARATIONS,
+    IDENTITY_DECLARATIONS,
     NativeSelectionReader,
 )
 from description_pipeline.sources.solidworks.selection import (  # noqa: E402
@@ -888,16 +888,26 @@ class CuPreverifyTests(unittest.TestCase):
         self.assertEqual(preverify["declarations"]["dp.hardware_id"], "m3.0")
         self.assertEqual(preverify["declarations"]["dp.delivery_configuration"], "3.0 总装")
 
-    def test_missing_declarations_refuse_before_native_work(self) -> None:
+    def test_missing_declarations_are_recorded_and_never_refuse(self) -> None:
+        payload = self.observe(identity_properties={"dp.hardware_id": "m3.0"})
+        preverify = payload["preverify"]
+        self.assertEqual(preverify["verdict"], "pass")
+        self.assertEqual(set(preverify["declarations_missing"]), set(IDENTITY_DECLARATIONS) - {"dp.hardware_id"})
+        self.assertEqual(preverify["declarations"]["dp.hardware_id"], "m3.0")
+
+    def test_absent_delivery_configuration_keeps_the_native_saved_configuration(self) -> None:
+        payload = self.observe(identity_properties={"dp.hardware_id": "m3.0"})
+        recorded = payload["preverify"]["delivery_configuration"]
+        self.assertIsNone(recorded["declared"])
+        self.assertEqual(recorded["source"], "native_saved_configuration")
+
+    def test_unusable_delivery_configuration_refuses(self) -> None:
         with self.assertRaises(SelectionError) as raised:
-            self.observe(identity_properties={"dp.hardware_id": "m3.0"})
+            self.observe(identity_properties={"dp.hardware_id": "m3.0", "dp.delivery_configuration": "   "})
         error = raised.exception
-        self.assertEqual(error.code, "selection_declarations_missing")
-        problems = error.detail["problems"]
-        problem = next(item for item in problems if item["code"] == "selection_declarations_missing")
-        self.assertEqual(set(problem["missing"]), set(REQUIRED_DECLARATIONS) - {"dp.hardware_id"})
-        self.assertEqual(problem["document"], "robot.SLDASM")
-        self.assertEqual(problem["declarations"]["dp.hardware_id"], "m3.0")
+        self.assertEqual(error.code, "selection_configuration_invalid")
+        problem = next(item for item in error.detail["problems"] if item["code"] == "selection_configuration_invalid")
+        self.assertEqual(problem["configuration"], "   ")
 
     def test_unreadable_declaration_set_refuses_with_the_reason(self) -> None:
         with self.assertRaises(SelectionError) as raised:
@@ -906,10 +916,9 @@ class CuPreverifyTests(unittest.TestCase):
                 identity_properties_error="CadError: custom properties unreadable",
             )
         error = raised.exception
-        self.assertEqual(error.code, "selection_declarations_missing")
-        problem = next(item for item in error.detail["problems"] if item["code"] == "selection_declarations_missing")
+        self.assertEqual(error.code, "selection_identity_unreadable")
+        problem = next(item for item in error.detail["problems"] if item["code"] == "selection_identity_unreadable")
         self.assertEqual(problem["declarations_error"], "CadError: custom properties unreadable")
-        self.assertEqual(set(problem["missing"]), set(REQUIRED_DECLARATIONS))
 
 
 if __name__ == "__main__":

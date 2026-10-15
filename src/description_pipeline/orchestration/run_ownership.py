@@ -7,11 +7,14 @@ server-owned — the routed endpoint and path parameters bound by the root middl
 Linked-run creation additionally checks the stored parent actor. Missing, damaged or absent
 authority values deny; they never grant.
 
-Eligibility is a positive transport classification: the run must be failed, the failed task set
-must be submission, polling or sealed-capture transfer (only with a positively successful
-``resolve_handoff``, whose service-side create is idempotent for the identical frozen request and
-refuses a changed one), with any other failed instance merely upstream-failed. Resolution,
-publication, unknown or mapped-ambiguous failures always require a new run.
+Eligibility is a positive stage/operation classification: the failed task set is read through the
+operation model (admission, native boundary, portable stages, publication) and one of the four
+recovery classes - temporary disconnection, evidence corruption, engineering terminal failure,
+unknown publication response - decides the outcome.  No recovery path may repeat a CAD or a
+publication side effect: a temporary disconnection resumes the same native job (created once for
+the run UUID) or re-runs side-effect-free portable work, corrupted sealed evidence is re-imported
+without touching CAD, and terminal engineering failures or unknown publication responses refuse
+in-place recovery entirely.  Unknown or mapped-ambiguous failures always require a new run.
 """
 
 from __future__ import annotations
@@ -34,18 +37,31 @@ DAG_RUN_ROUTES_MODULE = "airflow.api_fastapi.core_api.routes.public.dag_run"
 MANUAL_CREATE_ENDPOINT = "trigger_dag_run"
 SINGLE_RUN_CLEAR_ENDPOINT = "clear_dag_run"
 
-#: Transport retries retain the same frozen request and revalidate capture digests.
-#: Engineering failures use a linked attempt; their downstream tasks may be upstream-failed.
-RESOLUTION_TASK = "resolve_handoff"
-START_TASK = "start_job"
-TRANSPORT_TASK = "wait_for_job"
-PUBLICATION_TASK = "confirm_job"
-FETCH_TASK = "fetch_capture"
-TRANSPORT_TASKS = frozenset({START_TASK, TRANSPORT_TASK, FETCH_TASK})
-KNOWN_TASKS = TRANSPORT_TASKS | {RESOLUTION_TASK, PUBLICATION_TASK, "run_generate", "run_verify", "run_publish"}
+#: The one task vocabulary of the workflow DAG, grouped by the operation model:
+#: admission resolves the frozen intake (idempotent, no side effects), the native
+#: boundary submits and imports the endpoint's capture (the native job is created
+#: once for the run UUID and only poked afterwards, so a retry never replays CAD),
+#: the portable stages generate and verify (no external side effects) and the
+#: publication stage is the one external write.  Recovery decisions key off these
+#: operation classes and the native status authority - never off task-name
+#: compatibility rows.
+ADMISSION_TASKS = frozenset({"resolve_handoff"})
+NATIVE_TASKS = frozenset({"start_job", "fetch_capture"})
+PORTABLE_TASKS = frozenset({"run_generate", "run_verify"})
+PUBLICATION_TASKS = frozenset({"run_publish"})
+KNOWN_TASKS = ADMISSION_TASKS | NATIVE_TASKS | PORTABLE_TASKS | PUBLICATION_TASKS
 FAILED_STATES = frozenset({"failed", "upstream_failed"})
 #: Sentinel for a task id that appears with several map indices; eligibility is then unprovable.
 AMBIGUOUS_TASK_STATE = "ambiguous_mapped_indices"
+#: Native job statuses that never prove a terminal CAD outcome.
+NATIVE_IN_FLIGHT = frozenset({"queued", "selecting", "running", "awaiting_definition"})
+#: Native job statuses that prove the sealed capture exists.
+NATIVE_SEALED = frozenset({"passed", "native_complete"})
+#: The four recovery classes of the stage/operation model.
+RECOVERY_TEMPORARY_DISCONNECTION = "temporary_disconnection"
+RECOVERY_EVIDENCE_CORRUPTION = "evidence_corruption"
+RECOVERY_ENGINEERING_TERMINAL = "engineering_terminal_failure"
+RECOVERY_UNKNOWN_PUBLICATION = "unknown_publication_response"
 
 
 @dataclass(frozen=True)
@@ -60,10 +76,11 @@ class RoutedRoute:
 
 
 @dataclass(frozen=True)
-class RetryAssessment:
-    """Positive transport-recovery classification from authoritative run/task state."""
+class RecoveryAssessment:
+    """One stage/operation recovery classification from authoritative run/task state."""
 
     eligible: bool
+    classification: str
     reason: str
     cleared_tasks: tuple[str, ...]
 
@@ -131,40 +148,64 @@ def _state_value(state: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def classify_transport_retry(run_state: object, task_states: dict[str, object]) -> RetryAssessment:
-    """Classify one run as positive transport recovery, or name the reason it is not.
+def classify_recovery(
+    run_state: object, task_states: dict[str, object], native_status: str | None = None
+) -> RecoveryAssessment:
+    """Classify one failed run through the stage/operation model.
 
-    Resolution must be successful. Only submission, polling or capture transfer may fail;
-    downstream tasks may be upstream-failed. Failed resolution or engineering work, active or
-    successful runs and an empty failed set refuse. The portal additionally checks native status.
+    ``native_status`` is the endpoint job snapshot's status when the caller can
+    consult it (the portal), or ``None`` when no endpoint authority is available
+    (the authorization layer): without that authority only the permissive
+    operation patterns are decided and the portal narrows them with the
+    authoritative snapshot.  Terminal native failures and attempted
+    publications refuse in every case; an unattempted publication is untouched.
     """
+
     state = _state_value(run_state)
     if state != "failed":
-        return RetryAssessment(False, "run_succeeded" if state == "success" else "run_active", ())
+        return RecoveryAssessment(False, "", "run_succeeded" if state == "success" else "run_active", ())
     normalized = {task: _state_value(value) for task, value in task_states.items()}
     if any(value == AMBIGUOUS_TASK_STATE for value in normalized.values()):
-        return RetryAssessment(False, "unknown_failed_task", ())
+        return RecoveryAssessment(False, "", "unknown_failed_task", ())
     failed = {task for task, value in normalized.items() if value in FAILED_STATES}
-    if not failed:
-        return RetryAssessment(False, "no_failed_transport_task", ())
-    if failed - KNOWN_TASKS:
-        return RetryAssessment(False, "unknown_failed_task", ())
-    resolve_state = normalized.get(RESOLUTION_TASK)
-    if resolve_state in FAILED_STATES:
-        return RetryAssessment(False, "resolution_or_capture_failed", ())
-    if resolve_state != "success":
-        # No positively successful resolution means no proven frozen input to replay.
-        return RetryAssessment(False, "resolution_not_success", ())
+    if not failed or failed - KNOWN_TASKS:
+        return RecoveryAssessment(False, "", "unknown_failed_task", ())
     real_failed = {task for task in failed if normalized[task] == "failed"}
-    if real_failed & {PUBLICATION_TASK, "run_publish"}:
-        return RetryAssessment(False, "publication_failed", ())
-    if not real_failed & TRANSPORT_TASKS:
-        return RetryAssessment(False, "no_failed_transport_task", ())
-    if real_failed - TRANSPORT_TASKS:
-        return RetryAssessment(False, "native_terminal_failure", ())
-    if FETCH_TASK in real_failed and normalized.get(TRANSPORT_TASK) != "success":
-        return RetryAssessment(False, "no_failed_transport_task", ())
-    return RetryAssessment(True, "transport_recovery", tuple(sorted(failed)))
+    cleared = tuple(sorted(failed))
+    if not real_failed:
+        return RecoveryAssessment(False, "", "no_failed_operation", ())
+    if real_failed & PUBLICATION_TASKS:
+        # A publish attempt with an unknown outcome must be reconciled first;
+        # retrying could repeat the external write.
+        return RecoveryAssessment(False, RECOVERY_UNKNOWN_PUBLICATION, "publication_response_unknown", ())
+    if real_failed & ADMISSION_TASKS and real_failed - ADMISSION_TASKS:
+        # A failed admission cannot resume native or portable operations: their
+        # frozen request never resolved.
+        return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "admission_failed", ())
+    if native_status == "failed":
+        return RecoveryAssessment(False, RECOVERY_ENGINEERING_TERMINAL, "native_terminal_failure", ())
+    if real_failed & NATIVE_TASKS:
+        if native_status in NATIVE_SEALED:
+            # The CAD capture is sealed; recovery re-reads the sealed evidence
+            # and never repeats the capture.
+            return RecoveryAssessment(True, RECOVERY_EVIDENCE_CORRUPTION, "sealed_evidence_reimport", cleared)
+        if native_status is None or native_status in NATIVE_IN_FLIGHT:
+            # Either no endpoint authority exists here (the portal narrows it) or
+            # the same native job is still in flight: resuming pokes the job that
+            # the run UUID already created and never replays CAD.
+            return RecoveryAssessment(True, RECOVERY_TEMPORARY_DISCONNECTION, "temporary_disconnection", cleared)
+        return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "native_evidence_unavailable", ())
+    if real_failed & PORTABLE_TASKS:
+        if native_status is None or native_status in NATIVE_SEALED or native_status in NATIVE_IN_FLIGHT:
+            # Portable work has no external side effects: a retry can repeat
+            # neither CAD nor a publication.
+            return RecoveryAssessment(True, RECOVERY_TEMPORARY_DISCONNECTION, "portable_retry", cleared)
+        return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "native_evidence_unavailable", ())
+    if real_failed & ADMISSION_TASKS:
+        if native_status is None or native_status in NATIVE_IN_FLIGHT:
+            return RecoveryAssessment(True, RECOVERY_TEMPORARY_DISCONNECTION, "temporary_disconnection", cleared)
+        return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "native_evidence_unavailable", ())
+    return RecoveryAssessment(False, "", "unknown_failed_task", ())
 
 
 def recorded_run_facts(dag_id: str, run_id: str) -> tuple[str | None, object, dict[str, object]] | None:
@@ -194,13 +235,13 @@ def recorded_run_facts(dag_id: str, run_id: str) -> tuple[str | None, object, di
     return recorded_actor_principal(run.triggering_user_name), run.state, task_states
 
 
-def retry_assessment_for_run(dag_id: str, run_id: str) -> RetryAssessment:
+def retry_assessment_for_run(dag_id: str, run_id: str) -> RecoveryAssessment:
     """The authoritative classification of one run; a missing row refuses as ``run_missing``."""
     facts = recorded_run_facts(dag_id, run_id)
     if facts is None:
-        return RetryAssessment(False, "run_missing", ())
+        return RecoveryAssessment(False, "", "run_missing", ())
     _, run_state, task_states = facts
-    return classify_transport_retry(run_state, task_states)
+    return classify_recovery(run_state, task_states)
 
 
 def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
@@ -211,7 +252,7 @@ def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
     principal, run_state, task_states = facts
     if principal is None or principal != user.get_id():
         return False
-    return classify_transport_retry(run_state, task_states).eligible
+    return classify_recovery(run_state, task_states).eligible
 
 
 def owner_create_allowed(user: Any, dag_id: str) -> bool:

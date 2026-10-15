@@ -161,17 +161,16 @@ class PortalSplitTests(unittest.TestCase):
         tasks = [
             {"task_id": "resolve_handoff", "state": "success"},
             {"task_id": "start_job", "state": "success"},
-            {"task_id": "wait_for_job", "state": "failed"},
-            {"task_id": "fetch_capture", "state": "upstream_failed"},
+            {"task_id": "fetch_capture", "state": "failed"},
             {"task_id": "run_generate", "state": "upstream_failed"},
             {"task_id": "run_verify", "state": "upstream_failed"},
             {"task_id": "run_publish", "state": "upstream_failed"},
-            {"task_id": "confirm_job", "state": "upstream_failed"},
         ]
         assessment = portal_module._retry_assessment({"state": "failed"}, tasks, job, None)
         self.assertTrue(assessment.eligible)
-        self.assertEqual(assessment.reason, "transport_recovery")
-        self.assertIn("wait_for_job", assessment.cleared_tasks)
+        self.assertEqual(assessment.reason, "sealed_evidence_reimport")
+        self.assertEqual(assessment.classification, "evidence_corruption")
+        self.assertIn("fetch_capture", assessment.cleared_tasks)
         self.assertEqual(portal_module._automatic_summary(job)["state"], "running")
 
         session = portal_module.PortalSession(

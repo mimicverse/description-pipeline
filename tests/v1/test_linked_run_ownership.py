@@ -85,6 +85,31 @@ class LinkedRunOwnershipTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_submission_frame_fields_are_admitted_for_operators(self):
+        self.assertEqual(
+            self.candidate({"handoff_path": "/input", "target_hardware": "m3.0", "change_summary": "第一行\n第二行"}),
+            {"safe": True, "parent_dag_run_id": None},
+        )
+        self.assertEqual(
+            self.candidate({"handoff_path": "/input", "main_assembly": "model.SLDASM"}),
+            {"safe": True, "parent_dag_run_id": None},
+        )
+        # CRLF folds to LF exactly like the portal and the DAG intake fold it.
+        self.assertIs(self.candidate({"change_summary": "a\r\nb\r"})["safe"], True)
+        for conf in (
+            {"target_hardware": ""},
+            {"target_hardware": "m3.0\x01"},
+            {"change_summary": ""},
+            {"change_summary": "bad\x01value"},
+            {"change_summary": "x" * 4096},
+            {"handoff_path": "x" * 5000},
+            # A client-provided identity claim is not a submission frame field.
+            {"submission_principal": "forged:tenant-a:ou_attacker"},
+            {"target_hardware": "m3.0", "owner": "admin"},
+        ):
+            with self.subTest(conf=conf):
+                self.assertIs(self.candidate(conf)["safe"], False)
+
     def test_create_route_shape_is_not_itself_an_authorization(self):
         for path in ("/api/v2/dags/workflow/dagRuns", "/dags/workflow/dagRuns"):
             self.assertTrue(context._selects_create_candidate({"method": "POST", "path": path}))

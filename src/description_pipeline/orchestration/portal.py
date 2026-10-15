@@ -73,8 +73,10 @@ from .feishu_oauth import (
 )
 from .run_ownership import (
     AMBIGUOUS_TASK_STATE,
-    RetryAssessment,
-    classify_transport_retry,
+    RECOVERY_ENGINEERING_TERMINAL,
+    RECOVERY_UNKNOWN_PUBLICATION,
+    RecoveryAssessment,
+    classify_recovery,
     recorded_actor_principal,
 )
 from .report_view import build_report
@@ -736,31 +738,42 @@ def _automatic_summary(job: dict | None) -> dict:
     return {"state": "unverified", "job_state": status, "checks": checks, "message": message}
 
 
-def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None) -> RetryAssessment:
+_NATIVE_JOB_STATUSES = frozenset(
+    {"queued", "selecting", "running", "awaiting_definition", "passed", "native_complete", "failed"}
+)
+_RETRY_REFUSED_MESSAGES = {
+    RECOVERY_UNKNOWN_PUBLICATION: (
+        "发布响应未知：为避免重复发布，此运行不可原地重试；请先完成结果对账，必要时从已确认检查点新建关联运行"
+    ),
+    RECOVERY_ENGINEERING_TERMINAL: ("工程阶段已终态失败：请按检查结果修复后新建关联运行；此运行不再原地重试"),
+}
+
+
+def _retry_assessment(
+    run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None
+) -> RecoveryAssessment:
     states: dict[str, object] = {}
     for task in tasks:
         name = task.get("task_id")
         if not isinstance(name, str) or not name:
-            return RetryAssessment(False, "unknown_failed_task", ())
+            return RecoveryAssessment(False, "", "unknown_failed_task", ())
         states[name] = AMBIGUOUS_TASK_STATE if name in states or task.get("map_index", -1) != -1 else task.get("state")
-    assessment = classify_transport_retry(run.get("state"), states)
+    status = job.get("status") if isinstance(job, dict) and isinstance(job.get("status"), str) else None
+    assessment = classify_recovery(run.get("state"), states, status)
     if not assessment.eligible:
         return assessment
-    if endpoint_error:
-        return RetryAssessment(False, "endpoint_evidence_unavailable", ())
     if job is None:
-        # An authoritative 404 permits the first submission to resume from the saved resolution.
-        return (
-            assessment
-            if states.get("start_job") == "failed"
-            else RetryAssessment(False, "endpoint_evidence_unavailable", ())
-        )
-    if job.get("status") == "failed":
-        return RetryAssessment(False, "native_terminal_failure", ())
-    # native_complete is the split pipeline's native boundary: the immutable evidence exists
-    # and recovery revalidates it, so it must not read as evidence-unavailable.
-    if job.get("status") not in {"queued", "selecting", "running", "awaiting_definition", "passed", "native_complete"}:
-        return RetryAssessment(False, "endpoint_evidence_unavailable", ())
+        # The endpoint holds no job for this run: only the submission poke may
+        # resume; a capture import without a job is unprovable, and an endpoint
+        # error means even the absence is unconfirmed.
+        if endpoint_error is not None:
+            return RecoveryAssessment(False, assessment.classification, "endpoint_evidence_unavailable", ())
+        real_failed = {name for name, value in states.items() if value == "failed"}
+        if real_failed - {"resolve_handoff", "start_job"}:
+            return RecoveryAssessment(False, assessment.classification, "endpoint_evidence_unavailable", ())
+        return assessment
+    if status is None or status not in _NATIVE_JOB_STATUSES:
+        return RecoveryAssessment(False, assessment.classification, "endpoint_evidence_unavailable", ())
     return assessment
 
 
@@ -1299,11 +1312,12 @@ class PortalApp:
         main_assembly: str | None = None,
     ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
+        # The recorded submitter of a run is its stored actor: the create body
+        # never carries a client-provided identity claim.
         conf = {
             "handoff_path": handoff_path,
             "target_hardware": target_hardware,
             "change_summary": change_summary,
-            "submission_principal": session.principal,
         }
         if main_assembly is not None:
             conf["main_assembly"] = main_assembly
@@ -1538,7 +1552,11 @@ class PortalApp:
             "parent_dag_run_id": _optional_str(conf.get("parent_dag_run_id")),
             "resume_from": _optional_str(conf.get("resume_from")),
             "resume_from_name_zh": _stage_name_zh(conf.get("resume_from")),
-            "retry": {"eligible": retry.eligible, "reason": retry.reason},
+            "retry": {
+                "eligible": retry.eligible,
+                "reason": retry.reason,
+                "classification": retry.classification,
+            },
             "started_at": airflow_run.get("start_date"),
             "ended_at": airflow_run.get("end_date"),
             "tasks": [
@@ -1605,7 +1623,12 @@ class PortalApp:
                     raise PortalError(HTTPStatus.CONFLICT, "无法确认原作业状态，请稍后重试") from error
                 assessment = _retry_assessment(run, tasks, job, None)
                 if not assessment.eligible:
-                    raise PortalError(HTTPStatus.CONFLICT, "此运行无法重试，请查看检查结果并按需新建运行")
+                    raise PortalError(
+                        HTTPStatus.CONFLICT,
+                        _RETRY_REFUSED_MESSAGES.get(
+                            assessment.classification, "此运行无法重试，请查看检查结果并按需新建运行"
+                        ),
+                    )
                 preview = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=True)
                 selected = preview.get("task_instances")
                 if (
