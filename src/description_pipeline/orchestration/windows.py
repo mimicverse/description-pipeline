@@ -1900,7 +1900,7 @@ def handler(jobs, token):
         def do_POST(self):
             if not self._authorized():
                 return
-            match = re.fullmatch(r"/v1/jobs/([0-9a-f-]+)/(files|definition|abort|cache-release)", self.path)
+            match = re.fullmatch(r"/v1/jobs/([0-9a-f-]+)/(files|definition|abort|cache/release)", self.path)
             if self.path != "/v1/jobs" and match is None:
                 self._reply(404, {"error": "Unknown API route"})
                 return
@@ -1942,7 +1942,7 @@ def handler(jobs, token):
                 _require(0 < size <= 8 * 1024**2 and not self.headers.get("Transfer-Encoding"), "Invalid request size")
                 self.connection.settimeout(10)
                 request = json.loads(self.rfile.read(size))
-                if operation == "cache-release":
+                if operation == "cache/release":
                     self._reply(200, jobs.release_cache(identifier, request))
                 elif operation == "abort":
                     self._reply(200, jobs.abort(identifier, request))

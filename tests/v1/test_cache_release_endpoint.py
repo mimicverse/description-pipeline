@@ -217,7 +217,7 @@ class CacheReleaseTests(EndpointFixture, unittest.TestCase):
             if token:
                 headers["Authorization"] = "Bearer " + jobs.config["token"]
             request = urllib.request.Request(
-                f"{base}/v1/jobs/{run_id}/cache-release",
+                f"{base}/v1/jobs/{run_id}/cache/release",
                 data=json.dumps(payload).encode("utf-8"),
                 headers=headers,
                 method="POST",
