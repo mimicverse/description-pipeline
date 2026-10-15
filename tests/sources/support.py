@@ -889,12 +889,15 @@ def write_target_delivery(
     write_json(root / "input/handoff.json", handoff)
     write_json(root / "input/source.json", source)
     if request is None:
+        payload_handoff = (discovery or {}).get("handoff_sha256") if isinstance(discovery, dict) else None
         request = {
             "schema_version": "solidworks-to-urdf.request/v1",
             "request_id": "00000000-0000-4000-8000-000000000000",
             "target_hardware": str(selection["hardware_id"]),
             "change_summary": str((source.get("metadata") or {}).get("change_summary") or "fixture"),
             "main_assembly": str(selection["main_assembly"]),
+            "handoff_digest": payload_handoff if isinstance(payload_handoff, str) else "0" * 64,
+            "platform_config_digest": "0" * 64,
         }
     write_json(root / "input/request.json", request)
     for name, text in (originals or {}).items():

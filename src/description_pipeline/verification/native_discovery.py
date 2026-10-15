@@ -41,7 +41,8 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 from ..delivery import read_delivery_manifest, read_source_record
-from ..io import PipelineError, confined, digest, read_data
+from ..interface_records import validate_request_record
+from ..io import PipelineError, confined, digest, parse_data, read_data
 from ..schemas import exporter_declaration_present
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
@@ -218,15 +219,14 @@ def _saved_configuration_observed(raw: dict, name: str) -> bool:
 
 
 REQUEST_RECORD = "input/request.json"
-REQUEST_SCHEMA = "solidworks-to-urdf.request/v1"
 
 
 def _sealed_request(package: Path) -> dict:
-    """The freeze-formed request record: the only offline evidence of the submission.
+    """The strict freeze-formed request record: the only offline evidence of the submission.
 
-    Formed before the generator runs, carried byte-for-byte and bound by the
-    freeze receipt; a missing, escaping or unreadable record refuses any
-    substitution that relies on it.
+    Parsed with the one foundation reader (duplicate and non-finite inputs
+    refuse) and validated by the shared ``validate_request_record`` entry; a
+    missing, escaping, unreadable or malformed record refuses.
     """
 
     try:
@@ -240,40 +240,27 @@ def _sealed_request(package: Path) -> dict:
     if not path.is_file():
         raise _Failure("discovery.request", "the sealed request record is missing", {"file": REQUEST_RECORD})
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+        record = parse_data(path.read_bytes(), path)
+        validate_request_record(record)
+    except PipelineError as error:
         raise _Failure(
             "discovery.request",
-            "the sealed request record is not readable",
-            {"file": REQUEST_RECORD, "error": str(error)},
+            f"the sealed request record is invalid: {error}",
+            {"file": REQUEST_RECORD},
         ) from error
-    _require(
-        isinstance(record, dict) and record.get("schema_version") == REQUEST_SCHEMA,
-        "discovery.request",
-        "the sealed request record uses an unknown schema",
-        {"file": REQUEST_RECORD},
-    )
     return record
 
 
 def _request_target(record: dict) -> str:
-    target = record.get("target_hardware")
-    _require(
-        isinstance(target, str) and target.strip() != "",
-        "discovery.request",
-        "the sealed request record carries no configured target",
-    )
-    return target.strip()
+    """The requested configured target (its text shape is already validated)."""
+
+    return record["target_hardware"].strip()
 
 
 def _request_summary(record: dict) -> str:
-    summary = record.get("change_summary")
-    _require(
-        isinstance(summary, str) and summary.strip() != "",
-        "discovery.request",
-        "the sealed request record carries no change summary",
-    )
-    return summary.replace("\r\n", "\n").replace("\r", "\n").strip()
+    """The requested change summary under the one LF line-ending standard."""
+
+    return record["change_summary"].replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _digest_files(root: Path) -> dict[str, str]:
@@ -2484,6 +2471,20 @@ def verify_discovery(package: Path) -> dict:
             "the discovery record does not match the delivery manifest subject",
         )
         source = read_source_record(package)
+        request = _sealed_request(package)
+        _require(
+            request["main_assembly"] == source["selection"]["main_assembly"],
+            "discovery.request",
+            "the sealed request names another main assembly",
+            {"field": "main_assembly"},
+        )
+        _require(
+            request["handoff_digest"] == payload.get("handoff_sha256"),
+            "discovery.request",
+            "the sealed request was not formed against this frozen upload",
+            {"field": "handoff_digest"},
+        )
+        state["request"] = request
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
         definition = {
             "schema_version": payload.get("schema_version"),
@@ -2714,30 +2715,7 @@ def verify_discovery(package: Path) -> dict:
         source = read_source_record(package)
         selection, metadata = source["selection"], source["metadata"]
 
-        sealed: dict | None = None
-
-        def request_record() -> dict:
-            """The sealed request, read once; its content must match this delivery."""
-
-            nonlocal sealed
-            if sealed is None:
-                sealed = _sealed_request(package)
-                main = sealed.get("main_assembly")
-                _require(
-                    main is None or (isinstance(main, str) and main == selection["main_assembly"]),
-                    "discovery.request",
-                    "the sealed request names another main assembly",
-                    {"field": "main_assembly"},
-                )
-                handoff = sealed.get("handoff_digest")
-                _require(
-                    handoff is None
-                    or (isinstance(handoff, str) and handoff == payload.get("handoff_sha256")),
-                    "discovery.request",
-                    "the sealed request was not formed against this frozen upload",
-                    {"field": "handoff_digest"},
-                )
-            return sealed
+        request = state["request"]
 
         for key in ("revision", "parent_revision", "owner", "control"):
             _require(
@@ -2793,7 +2771,7 @@ def verify_discovery(package: Path) -> dict:
         )
         if claimed.get("hardware_id") is not None:
             _require(
-                claimed.get("hardware_id") == _request_target(request_record()),
+                claimed.get("hardware_id") == _request_target(request),
                 "discovery.identity",
                 "the hardware identity does not match the sealed request target",
                 {"field": "hardware_id"},
@@ -2820,7 +2798,7 @@ def verify_discovery(package: Path) -> dict:
                 "the sealed metadata names no submission origin for the claimed change summary",
                 {"field": "change_summary"},
             )
-            requested_summary = _request_summary(request_record())
+            requested_summary = _request_summary(request)
             _require(
                 claimed.get("change_summary") == requested_summary == metadata["change_summary"],
                 "discovery.identity",

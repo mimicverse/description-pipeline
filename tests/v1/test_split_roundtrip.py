@@ -200,6 +200,7 @@ class SplitRoundtripTests(unittest.TestCase):
             "change_summary": "control fixture submission",
             "main_assembly": "cad/robot.SLDASM",
             "handoff_digest": self.handoff,
+            "platform_config_digest": "c" * 64,
         }
         archive_input = steps._archive_input
 
