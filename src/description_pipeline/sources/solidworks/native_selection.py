@@ -18,7 +18,13 @@ bytes in the backend's owned session:
 * admission is the native closure: every resolved document must lie under the
   staged root and be a staged upload-index file with matching sha256; any
   out-of-stage, unresolved or unbound-import edge refuses the run with the
-  verbatim stored/resolved paths.
+  verbatim stored/resolved paths,
+* the CU pre-verification (W6, the W5 probe-v4 check set) reads the main
+  document's declared delivery identity (``dp.*``) in the same read-only pass
+  and refuses when a required declaration is absent or the property set is
+  unreadable: submitted values never replace CAD-authored declarations, and
+  no definition exchange or native capture runs on such a package.  The
+  sealed selection record carries the ``preverify`` block as its receipt.
 
 No basename or suffix substitution exists anywhere in this module: engine
 reported paths are mapped to upload-index names by their exact staged
@@ -57,6 +63,21 @@ _COMPONENT_LIGHTWEIGHT = 1
 _COMPONENT_FULLY_LIGHTWEIGHT = 4
 _COMPONENT_INTERNAL_ID_MISMATCH = 5
 _COMPONENT_STATES = (0, 1, 2, 3, 4)
+
+#: CU pre-verification (W6): the main document's declared delivery identity.
+#: The list mirrors the W5 probe-v4 check set; admission refuses fail-closed
+#: when a required declaration is absent (or the property set is unreadable),
+#: so no native capture runs on a package that only carries submitted values.
+REQUIRED_DECLARATIONS = (
+    "dp.hardware_id",
+    "dp.revision",
+    "dp.owner",
+    "dp.change_summary",
+    "dp.control.system",
+    "dp.control.reference",
+    "dp.delivery_configuration",
+)
+OPTIONAL_DECLARATIONS = ("dp.robot_name", "dp.design_budget_record")
 
 
 def _path(value: object) -> str:
@@ -270,6 +291,35 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 )
             ],
             open_status=open_status,
+        )
+    declarations = readings.get("identity_properties")
+    declarations = dict(declarations) if isinstance(declarations, Mapping) else {}
+    declarations_error = readings.get("identity_properties_error")
+    missing_declarations = [
+        key
+        for key in REQUIRED_DECLARATIONS
+        if not (isinstance(declarations.get(key), str) and declarations[key].strip())
+    ]
+    preverify = {
+        "schema": "m303-probe-v4/selection",
+        "open_errors": open_errors,
+        "open_warnings": open_status.get("warnings"),
+        "declarations": {key: declarations.get(key) for key in (*REQUIRED_DECLARATIONS, *OPTIONAL_DECLARATIONS)},
+        "declarations_missing": missing_declarations,
+        "declarations_error": declarations_error,
+        "verdict": "attention" if (missing_declarations or declarations_error) else "pass",
+    }
+    if missing_declarations or declarations_error:
+        problems.append(
+            _problem(
+                "selection_declarations_missing",
+                "the staged main carries no complete declared delivery identity (dp.*); "
+                "submitted values never replace CAD-authored declarations",
+                document=main,
+                missing=missing_declarations,
+                declarations_error=declarations_error,
+                declarations=preverify["declarations"],
+            )
         )
     for record in occurrences:
         if not isinstance(record, Mapping):
@@ -553,6 +603,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         entry["resolved_edges"] = sorted(entry["resolved_edges"], key=lambda item: str(item.get("instance")))
         documents_out[name] = entry
     excluded = sorted(set(files) - set(graph))
+    preverify["closure_ok"] = True
     return {
         "schema_version": CLOSURE_SCHEMA,
         "stage_root": str(stage_root),
@@ -562,6 +613,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "stored_references_phase": readings.get("stored_references_phase"),
         "search_configuration": readings.get("search") or {},
         "open_status": readings.get("open") or {},
+        "preverify": preverify,
         "graph": graph_out,
         "documents": documents_out,
         "imports": sorted(imports, key=lambda item: (str(item.get("document")), str(item.get("instance")))),

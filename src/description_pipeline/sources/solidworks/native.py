@@ -4730,6 +4730,24 @@ class SolidWorksBackend(CadBackend):
                         {"main_assembly": str(main_assembly), "open": readings["open"]},
                     )
                 _manager, configuration = _active_configuration_view(doc)
+                # CU pre-verification input: the main document's declared delivery
+                # identity (dp.*), read-only with the primitive configuration name.
+                # An unreadable declaration set is recorded, never raised; the
+                # admission policy (native_selection) refuses it fail-closed.
+                try:
+                    _context_manager, _context_configuration, configuration_name = _configuration_context(doc)
+                    readings["configuration_name_error"] = None
+                except CadError as error:
+                    configuration_name = ""
+                    readings["configuration_name_error"] = f"{type(error).__name__}: {error}"[:200]
+                try:
+                    identity_properties = _custom_properties(doc, configuration_name)
+                except Exception as error:  # noqa: BLE001 - recorded; admission refuses unreadable declarations
+                    identity_properties = None
+                    readings["identity_properties_error"] = f"{type(error).__name__}: {error}"[:200]
+                else:
+                    readings["identity_properties_error"] = None
+                readings["identity_properties"] = identity_properties
                 root = _component(_member(configuration, "GetRootComponent3", True))
                 occurrences = []
                 stack = [
