@@ -6,8 +6,10 @@
 #   promote stops the old endpoint (no listener AND no writer residue under the generation or
 #           state root), switches the task to the generation runtime + config, starts it and
 #           settles it for >=180s (task Running + listener PID constant + token-authenticated
-#           /health ready); a start refused by the ownership lock is recorded, waited out for
-#           >=60s and retried exactly once, and a second refusal stops with lock_refused
+#           /health ready); a start refused by the ownership lock is recorded together with the
+#           lock owner's process facts, and the >=60s-later retry happens exactly once and only
+#           after that owner is proven ended - unprovable ownership or a second refusal stops
+#           with lock_refused for diagnosis (never kill an unknown process or delete the lock)
 #   rollback restores exactly the previous generation directory the caller bounds
 #   health  relays the running endpoint's own /health payload
 # Each invocation prints one JSON object; receipts stay under the instance state root.
@@ -138,19 +140,98 @@ function Wait-Settled([string]$configPath, [object]$binding) {
   $health = Health-Probe $configPath $binding
   return @{health=$health; settled_seconds=[int][math]::Round($timer.Elapsed.TotalSeconds); listener_pid=$listenerPid}
 }
-function Test-OwnershipLockRefusal([string]$generation, [object]$binding) {
-  # The scheduler does not capture the launcher's stderr, so the documented refusal is proven by
-  # the condition its message describes: the launcher exited without answering /health while the
-  # endpoint ownership lock under the instance state root is held elsewhere.  The probe acquires
-  # the same lock through the staged runtime's own owner function (released on probe exit).
-  $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
-  if ($taskNow -and [string]$taskNow.State -eq 'Running') { return $false }
-  $config = Read-Json (Config-Path $generation)
-  $lock = Join-Path ([string]$config.state_root) '.endpoint.lock'
-  if (-not (Test-Path -LiteralPath $lock)) { return $false }
+function Get-ProcessFacts([int]$ownerPid) {
+  # Test seam: process lookup stays isolated so the settle tests can state owner facts directly.
+  $process = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+  if (-not $process) { return @{alive=$false; image=''; started=''} }
+  $image = ''
+  $started = ''
+  try { $image = [string]$process.Path } catch { }
+  try { $started = $process.StartTime.ToUniversalTime().ToString('o') } catch { }
+  return @{alive=$true; image=$image; started=$started}
+}
+function Read-LockOwner([string]$lockPath) {
+  # The lock file carries the owner PID as a diagnostic record (io.acquire_process_lock); the
+  # kernel lock itself lives in the descriptor and dies with the process.
+  if (-not (Test-Path -LiteralPath $lockPath)) { return @{present=$false; pid=$null; valid=$false} }
+  $raw = ''
+  try { $raw = ([string](Get-Content -LiteralPath $lockPath -Raw -ErrorAction Stop)).Trim() } catch {
+    return @{present=$true; pid=$null; valid=$false}
+  }
+  $ownerPid = 0
+  $valid = [int]::TryParse($raw, [ref]$ownerPid) -and $ownerPid -gt 0
+  return @{present=$true; pid=$(if ($valid) { $ownerPid } else { $null }); valid=$valid}
+}
+function Test-LockProbeHeld([string]$generation, [string]$lockPath) {
+  # The refusal's own condition: the staged runtime cannot take the endpoint ownership lock.
   $probe = 'import sys;from pathlib import Path;from description_pipeline.io import acquire_process_lock;acquire_process_lock(Path(sys.argv[1]))'
-  cmd /c "`"$(Runtime-Python $generation)`" -I -c `"$probe`" `"$lock`" 2>nul" | Out-Null
+  cmd /c "`"$(Runtime-Python $generation)`" -I -c `"$probe`" `"$lockPath`" 2>nul" | Out-Null
   return ($LASTEXITCODE -ne 0)
+}
+function Get-OwnershipRefusalFacts([string]$generation, [object]$binding) {
+  # deployment.md settle: the refusal must name the lock owner and whether that owner is proven
+  # ended; nothing here kills a process or deletes the lock.
+  $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+  if ($taskNow -and [string]$taskNow.State -eq 'Running') {
+    return @{refused=$false; reason='task_running'}
+  }
+  $config = Read-Json (Config-Path $generation)
+  $lockPath = Join-Path ([string]$config.state_root) '.endpoint.lock'
+  $owner = Read-LockOwner $lockPath
+  if (-not $owner.present) { return @{refused=$false; reason='no_lock_file'; lock_path=$lockPath} }
+  if (-not (Test-LockProbeHeld $generation $lockPath)) {
+    return @{refused=$false; reason='lock_free'; lock_path=$lockPath}
+  }
+  if (-not $owner.valid) {
+    return @{refused=$true; reason='owner_unreadable'; lock_path=$lockPath; owner_pid=$null;
+             owner_process_alive=$null; owner_ended=$false}
+  }
+  $facts = Get-ProcessFacts ([int]$owner.pid)
+  return @{refused=$true; reason='lock_held'; lock_path=$lockPath; owner_pid=[int]$owner.pid;
+           owner_process_alive=$facts.alive; owner_process_image=$facts.image;
+           owner_process_started=$facts.started; owner_ended=(-not $facts.alive)}
+}
+function Wait-SettleRetryDelay([int]$Seconds = 60) {
+  # Reached only after the recorded owner is proven ended (deployment.md settle).
+  Start-Sleep -Seconds $Seconds
+}
+function Start-OrRefuse([string]$configPath, [object]$binding, [string]$stageDir, [string]$promotions) {
+  # Start the switched task and settle it.  A refusal by the ownership lock may be retried exactly
+  # once, >=60s after the recorded owner is proven ended; refusal, owner facts and the waiting
+  # time are recorded.  Unprovable ownership and a second refusal stop the switch for diagnosis.
+  $script:SettleRefusal = @{lock_refusal=$null; retried_after_s=$null}
+  $result = @{settled=$null; lock_refusal=$null; retried_after_s=$null}
+  Start-ScheduledTask -TaskName $binding.task_name
+  try { $result.settled = Wait-Settled $configPath $binding; return $result }
+  catch {
+    $facts = Get-OwnershipRefusalFacts $stageDir $binding
+    if (-not $facts.refused) { throw }
+    $refusal = @{
+      message='Another endpoint owns the state root or its ownership lock is unavailable';
+      at=(Get-Date).ToUniversalTime().ToString('o'); reason=[string]$facts.reason; lock_path=$facts.lock_path;
+      owner_pid=$facts.owner_pid; owner_process_alive=$facts.owner_process_alive;
+      owner_process_image=$facts.owner_process_image; owner_process_started=$facts.owner_process_started;
+      owner_ended=[bool]$facts.owner_ended}
+    $result.lock_refusal = $refusal
+    $script:SettleRefusal = @{lock_refusal=$refusal; retried_after_s=$null}
+    Write-Receipt (Join-Path $promotions 'lock-refusal.json') @{
+      verb='promote'; at=$refusal.at; generation=$stageDir; message=$refusal.message;
+      owner_pid=$refusal.owner_pid; owner_process_alive=$refusal.owner_process_alive;
+      owner_ended=$refusal.owner_ended; retry_after_s=60}
+    if (-not $facts.owner_ended) {
+      throw ('lock_refused_unproven: the endpoint lock owner is not proven ended [' + [string]$facts.reason + ']')
+    }
+    Wait-SettleRetryDelay 60
+    $result.retried_after_s = 60
+    $script:SettleRefusal.retried_after_s = 60
+    Start-ScheduledTask -TaskName $binding.task_name
+    try { $result.settled = Wait-Settled $configPath $binding; return $result }
+    catch {
+      $second = Get-OwnershipRefusalFacts $stageDir $binding
+      if (-not $second.refused) { throw }
+      throw ('lock_refused: the ownership lock was refused twice; stopping for diagnosis [' + [string]$second.reason + ']')
+    }
+  }
 }
 function Get-WriterResidue([object]$binding) {
   # The endpoint's own writers keep their image under the generation or the instance state root;
@@ -175,6 +256,8 @@ function Stop-Endpoint([object]$binding) {
   Die 'stop_failed' 'the old endpoint still listens or leaves a writing process under the generation/state root; refusing to switch'
 }
 
+function Invoke-Main {
+# (Body intentionally kept unindented so this refactor's diff stays reviewable.)
 $binding = Read-Json $Binding
 foreach ($field in ('task_name','state_root','generation','dir','archive','artifact_sha256','port',
                     'package_root','output_root','version','source_commit','source_sha256')) {
@@ -276,38 +359,11 @@ if ($Verb -eq 'promote') {
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
     -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
-  $lockRefusal = $null
-  $retriedAfter = $null
   try {
-    Start-ScheduledTask -TaskName $binding.task_name
-    try {
-      $settled = Wait-Settled (Config-Path $StageDir) $binding
-    } catch {
-      if (-not (Test-OwnershipLockRefusal $StageDir $binding)) { throw }
-      # Documented transient refusal (deployment.md settle): record it durably, wait at least
-      # 60 seconds and retry exactly once.
-      $lockRefusal = @{
-        message='Another endpoint owns the state root or its ownership lock is unavailable';
-        at=(Get-Date).ToUniversalTime().ToString('o')}
-      Write-Receipt (Join-Path $promotions 'lock-refusal.json') @{
-        verb='promote'; at=$lockRefusal.at; generation=$StageDir; message=$lockRefusal.message; retry_after_s=60}
-      Start-Sleep -Seconds 60
-      $retriedAfter = 60
-      Start-ScheduledTask -TaskName $binding.task_name
-      try {
-        $settled = Wait-Settled (Config-Path $StageDir) $binding
-      } catch {
-        if (-not (Test-OwnershipLockRefusal $StageDir $binding)) { throw }
-        # A second refusal is stop-and-diagnose, never a third attempt.
-        Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
-        Start-ScheduledTask -TaskName $binding.task_name
-        Write-Receipt (Join-Path $previous 'failed-promotion.json') @{
-          passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-          lock_refusal=$lockRefusal; retried=@{after_s=$retriedAfter};
-          second_refusal_at=(Get-Date).ToUniversalTime().ToString('o'); message=$_.Exception.Message}
-        Die 'lock_refused' ('the ownership lock was refused twice; stopping for diagnosis: ' + $_.Exception.Message)
-      }
-    }
+    $started = Start-OrRefuse (Config-Path $StageDir) $binding $StageDir $promotions
+    $settled = $started.settled
+    $lockRefusal = $started.lock_refusal
+    $retriedAfter = $started.retried_after_s
     $health = $settled.health
     $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
     if ($health.install.config_digest -ne $candidate.config_digest) {
@@ -327,9 +383,15 @@ if ($Verb -eq 'promote') {
     $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       message=$_.Exception.Message}
-    if ($lockRefusal) { $failed['lock_refusal']=$lockRefusal; $failed['retried']=@{after_s=$retriedAfter} }
+    $failureCode = 'promote_failed'
+    if ($_.Exception.Message.StartsWith('lock_refused_unproven:')) { $failureCode = 'lock_refused_unproven' }
+    elseif ($_.Exception.Message.StartsWith('lock_refused:')) { $failureCode = 'lock_refused' }
+    if ($script:SettleRefusal -and $script:SettleRefusal.lock_refusal) {
+      $failed['lock_refusal']=$script:SettleRefusal.lock_refusal
+      if ($script:SettleRefusal.retried_after_s) { $failed['retried']=@{after_s=$script:SettleRefusal.retried_after_s} }
+    }
     Write-Receipt (Join-Path $previous 'failed-promotion.json') $failed
-    Die 'promote_failed' ('the promotion failed and the previous task was restored: ' + $_.Exception.Message)
+    Die $failureCode ('the promotion failed and the previous task was restored: ' + $_.Exception.Message)
   }
 }
 
@@ -357,3 +419,6 @@ if ($Verb -eq 'rollback') {
   Emit @{passed=$true; verb='rollback'; restored_from=$Previous}
   exit 0
 }
+
+}
+if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }
