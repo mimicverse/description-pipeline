@@ -136,7 +136,8 @@ def _missing_relation(error: Exception) -> bool:
     origin = getattr(error, "orig", None)
     if getattr(origin, "pgcode", None) == "42P01":
         return True
-    return "no such table" in str(origin or error).lower()
+    # Only the sqlite driver's own OperationalError carries the development wording.
+    return type(origin).__module__ == "sqlite3" and "no such table" in str(origin).lower()
 
 
 class MetadataStateStore:
