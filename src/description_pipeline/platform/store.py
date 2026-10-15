@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
-from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, read_data
+from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -87,6 +87,12 @@ class OperationClaim:
 
     record: OperationRecord
     granted: bool
+
+
+def _report_member(path: object) -> bool:
+    """The one class projection: ``reports/**`` members are report-class."""
+
+    return isinstance(path, str) and (path == "reports" or path.startswith("reports/"))
 
 
 @dataclass(frozen=True)
@@ -781,6 +787,15 @@ class PlatformStore:
         )
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
             definition, sealed_root = self._verify_sealed(checkpoint_uri, receipt)
+        elif state == "failed" and any(
+            _report_member(record.get("path"))
+            for record in (receipt or {}).get("artifacts") or []
+            if isinstance(record, dict)
+        ):
+            # The failed diagnostic never skips byte verification: report
+            # members carried by the receipt are rebound to the sealed bytes
+            # exactly like a completed confirmation.
+            self._verify_sealed(checkpoint_uri, receipt)
         _sealed_receipt(
             receipt,
             run_id=run_id,
@@ -1034,8 +1049,21 @@ class PlatformStore:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery") from error
         stamped = {record["path"]: (record["bytes"], record["sha256"]) for record in records}
         received = {record["path"]: (record["bytes"], record["sha256"]) for record in artifacts}
-        if received != stamped:
+        subject_stamped = {path: value for path, value in stamped.items() if not _report_member(path)}
+        subject_received = {path: value for path, value in received.items() if not _report_member(path)}
+        if subject_received != subject_stamped:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
+        for path, (size, checksum) in received.items():
+            if not _report_member(path):
+                continue
+            # Report members (class projected from the path) are verified
+            # against the actual sealed bytes; the subject stays report-free.
+            try:
+                member = confined(root, path)
+            except PipelineError as error:
+                raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes") from error
+            if not member.is_file() or member.stat().st_size != size or file_digest(member) != checksum:
+                raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes")
         # The handoff identity is the sealed admission index's inventory digest
         # (the same owner as describe_handoff); the index file's own sha stays
         # an ordinary manifest artifact record, never conflated with it.

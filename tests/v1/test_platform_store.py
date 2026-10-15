@@ -952,6 +952,59 @@ class PlatformStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
 
+    def test_report_members_are_byte_verified_with_the_subject_untouched(self) -> None:
+        self._running_run()
+        report_file = self.delivery / "reports" / "quality.json"
+        record = {
+            "path": "reports/quality.json",
+            "bytes": report_file.stat().st_size,
+            "sha256": file_digest(report_file),
+        }
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("freeze", artifacts=[*self.artifacts, record]),
+        )
+        self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
+        report_file.write_text('{"tampered": true}\n', encoding="utf-8")
+        with self.assertRaisesRegex(PlatformStoreError, "report inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self._native_receipt("capture", artifacts=[*self.artifacts, record]),
+            )
+
+    def test_failed_diagnostics_verify_report_bytes_too(self) -> None:
+        self._running_run()
+        report_file = self.delivery / "reports" / "quality.json"
+        record = {
+            "path": "reports/quality.json",
+            "bytes": report_file.stat().st_size,
+            "sha256": file_digest(report_file),
+        }
+        report_file.write_text('{"tampered": true}\n', encoding="utf-8")
+        failed_receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "run_id": "r-1",
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "artifacts": [*self.artifacts, record],
+        }
+        with self.assertRaisesRegex(PlatformStoreError, "report inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="failed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=failed_receipt,
+            )
+        self.assertNotIn(("r-1", "freeze"), self.world.stages)
+
     def test_capture_completion_does_not_settle_an_unexecuted_cache_release(self) -> None:
         self._running_run(from_stage="capture")
         self.store.register_operation(
