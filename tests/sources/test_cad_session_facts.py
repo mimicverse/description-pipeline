@@ -98,6 +98,27 @@ class CadSessionFactsTests(unittest.TestCase):
         self.assertTrue(facts["external_session_detected"])
         self.assertIn("cad_identity_unverified", facts["problems"])
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+        "real POSIX permission boundary",
+    )
+    def test_an_unreadable_lease_file_is_unknown_never_a_proven_holder(self) -> None:
+        # A chmod-000 lease file makes the kernel probe raise (open EACCES):
+        # that is an observation error, not evidence of a lock holder - the
+        # fact stays unknown and the health identity says why.
+        lease_path = Path(str(self.ledger) + ".lease")
+        lease_path.write_text("diagnostic-only", encoding="utf-8")
+        lease_path.chmod(0)
+        try:
+            facts = isolation.domain_lease_facts(self.ledger)
+            cad = self._facts(table=[])
+        finally:
+            lease_path.chmod(0o600)
+        self.assertIsNone(facts.get("held"), facts)
+        self.assertTrue(facts.get("error"), facts)
+        self.assertFalse(cad["lease_held"])
+        self.assertIn("cad_lease_unreadable", cad["problems"])
+
     def test_unrecorded_matching_processes_are_external(self) -> None:
         facts = self._facts(table=[(9, EXE)])
         self.assertEqual(facts["owned_sessions"], 0)

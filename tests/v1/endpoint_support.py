@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
@@ -92,6 +93,14 @@ class EndpointFixture:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        #: The deployment pins the one canonical CAD domain; this fixture's
+        #: state root is that pin, so endpoint suites never resolve an unbound
+        #: host (and never invent a domain of their own).
+        pin = patch.dict(
+            os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(self.root / "state" / "cad-ownership.json")}
+        )
+        pin.start()
+        self.addCleanup(pin.stop)
         self.packages = self.root / "packages"
         self.packages.mkdir()
         token = self.root / "token"

@@ -498,15 +498,15 @@ class Jobs:
         """The canonical CAD domain ledger for every endpoint-side launch.
 
         Resolution goes through the one canonical binding (the operational pin
-        or the installed endpoint configuration); a host with no binding at
-        all keeps a development fallback of its own state root, which is dead
-        code on any bound host.
+        or the installed endpoint configuration, validated by its formal
+        parser); a host with no binding at all raises ``DomainUnbound`` - an
+        endpoint never invents a domain of its own.
         """
 
         if self._cad_domain is None:
             from ..sources.solidworks import isolation
 
-            self._cad_domain = isolation.cad_domain_path(Path(self.config["state_root"]) / "cad-ownership.json")
+            self._cad_domain = isolation._ownership_path()
         return self._cad_domain
 
     def _save(self, job):
