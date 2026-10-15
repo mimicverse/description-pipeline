@@ -190,8 +190,25 @@ class SplitRoundtripTests(unittest.TestCase):
         )
 
         # The capture phase runs under the native role; simulate only that environment
-        # fact (the role-aware tool record refuses the portable host).
-        with patch.object(solidworks, "_native_tool_record", return_value=native_tool()):
+        # fact (the role-aware tool record refuses the portable host).  A Windows-rooted
+        # producer root, when the scenario asks for one, enters the handoff BEFORE the
+        # seal so the sealed receipt carries it coherently.
+        windows_root = getattr(self, "_windows_root", None)
+        original_inspect = steps.inspect_prepared_input
+
+        def inspect_with_root(*args, **kwargs):
+            report = original_inspect(*args, **kwargs)
+            if windows_root is not None:
+                report["input_receipt"] = {
+                    **(report.get("input_receipt") or {}),
+                    "resolved_package_root": windows_root,
+                }
+            return report
+
+        with (
+            patch.object(solidworks, "_native_tool_record", return_value=native_tool()),
+            patch.object(steps, "inspect_prepared_input", side_effect=inspect_with_root),
+        ):
             capture = solidworks.capture(
                 prepared_package,
                 self.capture_output,
@@ -301,15 +318,20 @@ class SplitRoundtripTests(unittest.TestCase):
         genuine native capture records, while the archived Linux inputs stay identical.
         """
 
-        self._capture(events, prepared_package, prepared_files)
+        self._windows_root = rf"C:\description-v1-review\acceptance-review\state\prepared\{self.run_id}"
+        try:
+            self._capture(events, prepared_package, prepared_files)
+        finally:
+            del self._windows_root
         seed = self.root / "resume-seed"
         shutil.copytree(self.capture_output, seed)
         sealed_receipt = seed / "input/handoff.json"
-        report = json.loads(sealed_receipt.read_text(encoding="utf-8"))
-        report["input_receipt"]["resolved_package_root"] = (
-            rf"C:\description-v1-review\acceptance-review\state\prepared\{self.run_id}"
+        # The Windows producer root is part of the sealed receipt itself - nothing is
+        # edited after the seal.
+        self.assertIn(
+            "resolved_package_root",
+            json.loads(sealed_receipt.read_text(encoding="utf-8"))["input_receipt"],
         )
-        write_json(sealed_receipt, report)
         return seed, sealed_receipt
 
     def test_windows_rooted_receipt_resumes_from_the_local_archived_input(self) -> None:
