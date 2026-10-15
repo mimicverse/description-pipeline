@@ -1659,7 +1659,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(
             [task["task_id"] for task in payload["tasks"]],
-            ["freeze", "discover", "wait_for_job", "confirm_job"],
+            ["freeze", "discover", "capture", "generate", "verify", "publish"],
         )
         self.assertEqual(payload["job"]["status"], "passed")
 

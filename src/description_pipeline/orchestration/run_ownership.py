@@ -159,6 +159,9 @@ def classify_recovery(
     operation patterns are decided and the portal narrows them with the
     authoritative snapshot.  Terminal native failures and attempted
     publications refuse in every case; an unattempted publication is untouched.
+    A failed or unproven admission (no positively successful ``freeze``) also
+    refuses in place: the frozen request never resolved, so native and portable
+    work may only be resumed by a new run.
     """
 
     state = _state_value(run_state)
@@ -178,12 +181,16 @@ def classify_recovery(
         # A publish attempt with an unknown outcome must be reconciled first;
         # retrying could repeat the external write.
         return RecoveryAssessment(False, RECOVERY_UNKNOWN_PUBLICATION, "publication_response_unknown", ())
-    if real_failed & ADMISSION_TASKS and real_failed - ADMISSION_TASKS:
+    if real_failed & ADMISSION_TASKS:
         # A failed admission cannot resume native or portable operations: their
-        # frozen request never resolved.
+        # frozen request never resolved; a retry is a new run.
         return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "admission_failed", ())
     if native_status == "failed":
         return RecoveryAssessment(False, RECOVERY_ENGINEERING_TERMINAL, "native_terminal_failure", ())
+    if not any(normalized.get(task) == "success" for task in ADMISSION_TASKS):
+        # Positive resolution proof stays required: without a successful admission the
+        # frozen request was never bound, so nothing downstream may be retried in place.
+        return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "resolution_not_success", ())
     if real_failed & NATIVE_TASKS:
         if native_status in NATIVE_SEALED:
             # The CAD capture is sealed; recovery re-reads the sealed evidence
@@ -200,10 +207,6 @@ def classify_recovery(
             # Portable work has no external side effects: a retry can repeat
             # neither CAD nor a publication.
             return RecoveryAssessment(True, RECOVERY_TEMPORARY_DISCONNECTION, "portable_retry", cleared)
-        return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "native_evidence_unavailable", ())
-    if real_failed & ADMISSION_TASKS:
-        if native_status is None or native_status in NATIVE_IN_FLIGHT:
-            return RecoveryAssessment(True, RECOVERY_TEMPORARY_DISCONNECTION, "temporary_disconnection", cleared)
         return RecoveryAssessment(False, RECOVERY_TEMPORARY_DISCONNECTION, "native_evidence_unavailable", ())
     return RecoveryAssessment(False, "", "unknown_failed_task", ())
 
