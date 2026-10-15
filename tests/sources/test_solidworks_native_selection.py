@@ -675,7 +675,8 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         robot = _Doc(
             str(stage / "robot.SLDASM"), children=(arm,), configuration="默认", properties=dict(DECLARED)
         )
-        robot.GetSaveFlag = lambda: False
+        get_save_calls: list = []
+        robot.GetSaveFlag = lambda: (get_save_calls.append(1), False)[1]
         robot.Extension.NeedsRebuild2 = 0
 
         class FakeApp:
@@ -754,6 +755,8 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.assertEqual(state["after"]["configuration"], "默认")
         self.assertEqual(state["before"]["read_only"], True)
         self.assertIn("used_api", state)
+        # Two saved-state samples: one at open and one after the native walk.
+        self.assertGreaterEqual(len(get_save_calls), 2)
 
         payload = NativeSelectionReader(
             walker=lambda stage_root, main, index: readings, reader_sha256=READER

@@ -4753,12 +4753,9 @@ class SolidWorksBackend(CadBackend):
                 # discovery record: the actual saved configuration name plus the
                 # before/after saved-state observations of the opened document.
                 # Persisted as read - unknowns and read errors stay explicit.
+                # The "after" snapshot is taken when the native walk below has
+                # completed and before the document is closed.
                 readings["saved_configuration"] = str(configuration_name or "") or None
-                readings["document_state"] = {
-                    "before": document_state_before,
-                    "after": _discovery_document_state(doc),
-                    "used_api": "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
-                }
                 root = _component(_member(configuration, "GetRootComponent3", True))
                 occurrences = []
                 stack = [
@@ -4829,6 +4826,11 @@ class SolidWorksBackend(CadBackend):
                         )
                 readings["occurrences"] = occurrences
                 readings["documents_after"] = int(_member(app, "GetDocumentCount"))
+                readings["document_state"] = {
+                    "before": document_state_before,
+                    "after": _discovery_document_state(doc),
+                    "used_api": "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
+                }
             finally:
                 try:
                     _member(
