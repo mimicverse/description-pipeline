@@ -37,7 +37,10 @@ class FreezeTests(unittest.TestCase):
                 {
                     "name": "arm-1",
                     "transform": support.placement((0.0, 0.0, 0.2)),
-                    "mass": support.mass_payload(0.5, (0.0, 0.0, 0.05)),
+                    # Off-axis COM: the group's product signal must be able to
+                    # prove the product convention at capture time (the z-only
+                    # COM of the historical fixture cannot).
+                    "mass": support.mass_payload(0.5, (0.01, 0.02, 0.05)),
                 },
             ],
             dependencies=self.parts,
@@ -402,7 +405,8 @@ class FreezeTests(unittest.TestCase):
                 {
                     "name": "base-1",
                     "transform": support.placement(),
-                    "mass": support.mass_payload(1.0),
+                    # Off-axis COM: the product signal proves the convention at capture time.
+                    "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
                 },
                 {
                     "name": "arm-1",
@@ -656,7 +660,8 @@ class FreezeTests(unittest.TestCase):
                     "name": "base-1",
                     "path": str(self.parts[0]),
                     "transform": support.placement(),
-                    "mass": support.mass_payload(1.0),
+                    # Off-axis COM: the product signal proves the convention at capture time.
+                    "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
                 },
                 {
                     "name": "arm-1",
@@ -1074,7 +1079,8 @@ class FreezeTests(unittest.TestCase):
                     "name": "base-1",
                     "path": str(self.parts[0]),
                     "transform": support.placement(),
-                    "mass": support.mass_payload(1.0),
+                    # Off-axis COM: the product signal proves the convention at capture time.
+                    "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
                 },
                 {
                     "name": "arm-1",
@@ -1397,7 +1403,12 @@ class SharedModelContractTests(unittest.TestCase):
         self.backend = support.FixtureCadBackend(
             self.assembly,
             [
-                {"name": "base-1", "transform": support.placement(), "mass": support.mass_payload(1.0)},
+                {
+                    "name": "base-1",
+                    "transform": support.placement(),
+                    # Off-axis COM: the product signal proves the convention at capture time.
+                    "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
+                },
                 {
                     "name": "arm-1",
                     "transform": support.placement((0.0, 0.0, 0.2)),
@@ -1474,7 +1485,7 @@ class DocumentedMassTests(unittest.TestCase):
                     "name": "base-1",
                     "transform": support.placement(),
                     "mass": support.mass_payload(
-                        1.0, (0.0, 0.0, 0.0), [[0.004, 0.0, 0.0], [0.0, 0.002, 0.0], [0.0, 0.0, 0.002]]
+                        1.0, (0.01, 0.02, 0.0), [[0.004, 0.0, 0.0], [0.0, 0.002, 0.0], [0.0, 0.0, 0.002]]
                     ),
                 }
             ],

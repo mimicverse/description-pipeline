@@ -598,6 +598,9 @@ def _raw_tensor(component: str, payload: dict) -> np.ndarray:
                 f"component {component} inertia scope and product_convention disagree: {scope!r} vs {convention!r}"
             )
         convention = expected
+    # Fail-closed backstop for the post-2026-10-15 layering: the capture
+    # normalizes at the single evidence throat; a record that still carries
+    # any other convention never passed normalization and must not be consumed.
     if convention != "solidworks_standard":
         raise ValueError(f"component {component} has an unsupported product_convention: {convention!r}")
     return matrix

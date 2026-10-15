@@ -192,13 +192,29 @@ def compose_fixture_link_reads(
                 transform, mass = by_name[str(name)]
                 entries.append(entry_for(str(name), mass, _matrix16(transform)))
         combined = combine_mass_properties(entries)
+        mass = float(combined["mass"])
+        com = [float(value) for value in combined["com"]]
+        tensor = [[float(value) for value in row] for row in combined["inertia"]]
+        # The second recording mirrors GetMomentOfInertia(1): the same tensor
+        # about the assembly origin, related to the about-COM tensor by the
+        # parallel-axis identity in the standard product convention.  The
+        # capture-side convention proof reads exactly this pair.
+        norm = sum(value * value for value in com)
+        origin = [
+            [
+                tensor[row][column]
+                + mass * ((norm - com[row] * com[column]) if row == column else -com[row] * com[column])
+                for column in range(3)
+            ]
+            for row in range(3)
+        ]
         read = {
-            "mass_kg": float(combined["mass"]),
+            "mass_kg": mass,
             "volume_m3": None,
             "density_kg_m3": None,
-            "com_m": [float(value) for value in combined["com"]],
-            "inertia_tensor_about_com": [[float(value) for value in row] for row in combined["inertia"]],
-            "inertia_values_about_origin_api": {"error": "fixture"},
+            "com_m": com,
+            "inertia_tensor_about_com": tensor,
+            "inertia_values_about_origin_api": [origin[row][column] for row in range(3) for column in range(3)],
             "overrides": {
                 "OverrideMass": False,
                 "OverrideCenterOfMass": False,

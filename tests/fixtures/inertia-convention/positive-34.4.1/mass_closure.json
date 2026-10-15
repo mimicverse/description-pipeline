@@ -1,0 +1,49 @@
+{
+ "schema_version": "solidworks-to-urdf.mass-closure/v1",
+ "status": "recorded",
+ "mode": "full",
+ "top_level": {
+  "com": [
+   -6.859983688962952e-05,
+   -0.11122202997621668,
+   9.713349829563985e-05
+  ],
+  "inertia": [
+   [
+    0.005585369572176096,
+    3.687820117924328e-05,
+    4.1083357993004875e-06
+   ],
+   [
+    3.687820117924328e-05,
+    0.004992249273939511,
+    0.0006113415380329522
+   ],
+   [
+    4.1083357993004875e-06,
+    0.0006113415380329522,
+    0.009760200697258069
+   ]
+  ],
+  "mass": 1.0392699999999988,
+  "reference": {
+   "axes": "assembly_document_axes",
+   "configuration": "Default",
+   "convention_basis": "same_api_selection_family_as_measured_group",
+   "density_kg_m3": 2552.7485628417294,
+   "document": "C:\\description-v1-review\\endpoint-deliveries\\.5a73ccbc-0508-5ad4-a811-f5296333d660-capture-vs8aw65d\\evidence.partial\\source\\3.0 总装.SLDASM",
+   "overrides": {
+    "OverrideCenterOfMass": false,
+    "OverrideMass": false,
+    "OverrideMomentsOfInertia": false
+   },
+   "product_convention": "solidworks_standard",
+   "readout_window": "pristine-reopen",
+   "reference_point": "center_of_mass",
+   "scope": "assembly_document",
+   "use_system_units": true,
+   "used_api": "IMassProperty2.GetMomentOfInertia(0)",
+   "volume_m3": 0.0004071180433231072
+  }
+ }
+}

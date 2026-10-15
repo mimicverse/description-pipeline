@@ -56,12 +56,11 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
     "arm": {"repository_slug": "<owner>/<model-repository>", "base": "main"}
   },
   "specifications": {"record_roots": ["/srv/description/specifications"]},
-  "execution": {"linux_concurrency": 1},
   "retention": {"unreferenced_evidence_days": null}
 }
 ```
 
-`execution.linux_concurrency` 为 Linux 工程任务并行上限，默认 `1`；原生资源始终为 `1`。`retention.unreferenced_evidence_days` 默认为 `null`，不自动删除封存证据；正整数只控制无引用证据保留天数。
+`retention.unreferenced_evidence_days` 默认为 `null`，不自动删除封存证据；正整数只控制无引用证据保留天数。
 
 `windows.instance` 固定 Windows 执行端的任务名及工程、产物和状态目录，维护命令依据配置和安装记录定位该目标。同一主机上的任务共享 CAD 排他资源约束，新用户或新目录不形成独立资源域。
 
@@ -165,4 +164,4 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 
 升级时停止 Windows 端点遵循统一 settle 规程：停止端点任务后等待端口无监听且无写入进程残留（停止脚本的清扫循环以此为准，超时即判停止失败）；随后启动任务并做 **≥3 分钟存活校验**——任务 Running、8765 监听 PID 连续、经令牌认证的 `/health` ready。启动若被拒绝并报 `Another endpoint owns the state root or its ownership lock is unavailable`：属瞬时状态，等待 **≥60 秒后仅重试一次**，并在回执中记录拒绝与重试；再次拒绝即停机排查。交互 CAD 机器离线期间，solidworks 隧道单元可能显示 activating/重试——这是**外部状态**，如实记录，绝不判为部署失败。
 
-部署安装会把发行树内的 `inspect-release.py` 装到操作员工作目录；若某代切换时缺少该件（旧发行树），按重装该文件处理，不是代码变更。两线均不存在 `feature/<hardware>` 的 PR base 规则；现役唯一规则=well-formed branch name 校验。
+`inspect-release.py` 随发行树交付并由操作员就地运行；不另行“装入操作员工作目录”。若某代切换时缺少该件（旧发行树），从当前发行树补拷该件，不是代码变更。两线均不存在 `feature/<hardware>` 的 PR base 规则；现役唯一规则=well-formed branch name 校验。

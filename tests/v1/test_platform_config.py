@@ -121,7 +121,6 @@ class ValidationTests(unittest.TestCase):
             },
         )
         self.assertEqual(resolved["windows"]["tunnel_loopback_port"], platform_config.DEFAULT_TUNNEL_LOOPBACK_PORT)
-        self.assertEqual(resolved["execution"], {"linux_concurrency": 1})
         self.assertEqual(resolved["retention"], {"unreferenced_evidence_days": None})
         self.assertEqual(resolved["derived"]["store_root"], "/srv/description-e2e/state/runs")
         self.assertEqual(
@@ -251,12 +250,6 @@ class ValidationTests(unittest.TestCase):
                 "windows empty segment",
                 lambda d: d["windows"]["instance"].__setitem__("output_root", "C:/e2e//results"),
                 "traversal",
-            ),
-            ("zero concurrency", lambda d: d.__setitem__("execution", {"linux_concurrency": 0}), "positive integer"),
-            (
-                "unknown execution key",
-                lambda d: d.__setitem__("execution", {"linux_concurrency": 1, "x": 1}),
-                "unknown keys",
             ),
             (
                 "zero retention days",

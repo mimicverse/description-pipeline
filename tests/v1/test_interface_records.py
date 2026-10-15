@@ -166,7 +166,6 @@ def config_snapshot() -> dict:
             },
             "targets": {"arm": {"repository_slug": "owner/model-repository", "base": "main"}},
             "specifications": {"record_roots": ["/srv/description/specifications"]},
-            "execution": {"linux_concurrency": 1},
             "retention": {"unreferenced_evidence_days": None},
             "derived": {
                 "store_root": "/srv/description/state/runs",
