@@ -2147,6 +2147,11 @@ class PortalApp:
         retained = artifact in TEAM_REPORTS
         preview = self._preview_payload(session, dag_run_id, missing_ok=retained)
         digest = (preview or {}).get("files", {}).get(artifact)
+        if not isinstance(digest, str):
+            # Non-subject report members of a bound unverified delivery are served by the
+            # same digest rule: the preview binding lists them and the store's artifact
+            # stream still proves the exact bytes.
+            digest = (preview or {}).get("report_files", {}).get(artifact)
         if not isinstance(digest, str) and retained:
             return self._retained_report(start_response, dag_run_id, artifact)
         if not isinstance(digest, str):
