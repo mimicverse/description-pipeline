@@ -217,6 +217,65 @@ def _saved_configuration_observed(raw: dict, name: str) -> bool:
     )
 
 
+REQUEST_RECORD = "input/request.json"
+REQUEST_SCHEMA = "solidworks-to-urdf.request/v1"
+
+
+def _sealed_request(package: Path) -> dict:
+    """The freeze-formed request record: the only offline evidence of the submission.
+
+    Formed before the generator runs, carried byte-for-byte and bound by the
+    freeze receipt; a missing, escaping or unreadable record refuses any
+    substitution that relies on it.
+    """
+
+    try:
+        path = confined(Path(package), REQUEST_RECORD, exists=False)
+    except PipelineError as error:
+        raise _Failure(
+            "discovery.request",
+            "the sealed request record is not an immutable artifact",
+            {"file": REQUEST_RECORD, "error": str(error)},
+        ) from error
+    if not path.is_file():
+        raise _Failure("discovery.request", "the sealed request record is missing", {"file": REQUEST_RECORD})
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise _Failure(
+            "discovery.request",
+            "the sealed request record is not readable",
+            {"file": REQUEST_RECORD, "error": str(error)},
+        ) from error
+    _require(
+        isinstance(record, dict) and record.get("schema_version") == REQUEST_SCHEMA,
+        "discovery.request",
+        "the sealed request record uses an unknown schema",
+        {"file": REQUEST_RECORD},
+    )
+    return record
+
+
+def _request_target(record: dict) -> str:
+    target = record.get("target_hardware")
+    _require(
+        isinstance(target, str) and target.strip() != "",
+        "discovery.request",
+        "the sealed request record carries no configured target",
+    )
+    return target.strip()
+
+
+def _request_summary(record: dict) -> str:
+    summary = record.get("change_summary")
+    _require(
+        isinstance(summary, str) and summary.strip() != "",
+        "discovery.request",
+        "the sealed request record carries no change summary",
+    )
+    return summary.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def _digest_files(root: Path) -> dict[str, str]:
     files: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -2655,6 +2714,31 @@ def verify_discovery(package: Path) -> dict:
         source = read_source_record(package)
         selection, metadata = source["selection"], source["metadata"]
 
+        sealed: dict | None = None
+
+        def request_record() -> dict:
+            """The sealed request, read once; its content must match this delivery."""
+
+            nonlocal sealed
+            if sealed is None:
+                sealed = _sealed_request(package)
+                main = sealed.get("main_assembly")
+                _require(
+                    main is None or (isinstance(main, str) and main == selection["main_assembly"]),
+                    "discovery.request",
+                    "the sealed request names another main assembly",
+                    {"field": "main_assembly"},
+                )
+                handoff = sealed.get("handoff_digest")
+                _require(
+                    handoff is None
+                    or (isinstance(handoff, str) and handoff == payload.get("handoff_sha256")),
+                    "discovery.request",
+                    "the sealed request was not formed against this frozen upload",
+                    {"field": "handoff_digest"},
+                )
+            return sealed
+
         for key in ("revision", "parent_revision", "owner", "control"):
             _require(
                 claimed.get(key) == authored[key],
@@ -2664,12 +2748,15 @@ def verify_discovery(package: Path) -> dict:
             )
 
         # ``hardware_id`` and ``change_summary`` recompute their origin from the
-        # raw reading plus the sealed request record (input/source.json): a CAD
-        # reading must be labelled as such and match the claim, and a claimed
-        # value the CAD records do not carry must come back from the configured
-        # target (platform-config) or the sealed submission.  An absent claim
-        # stays deferred (publication readiness), never granted a value; the
-        # claim's own resolution notes are never trusted.
+        # raw reading plus the sealed request record (input/request.json,
+        # formed before the generator ran): a CAD reading must be labelled as
+        # such and match the claim, and a claimed value the CAD records do not
+        # carry must come back from the configured target recorded in the
+        # sealed request.  A fallback is allowed only after the authored
+        # property is confirmed missing - a conflicted or unreadable authored
+        # reading refuses inside the independent read.  An absent claim stays
+        # deferred (publication readiness), never granted a value; the claim's
+        # own resolution notes are never trusted.
         hardware = authored["hardware_id"]
         if hardware is not None:
             _require(
@@ -2686,10 +2773,15 @@ def verify_discovery(package: Path) -> dict:
             )
         elif claimed.get("hardware_id") is not None:
             _require(
-                selection["hardware_source"] == "platform-config"
-                and claimed.get("hardware_id") == selection["hardware_id"],
+                selection["hardware_source"] == "platform-config",
                 "discovery.identity",
-                "the claimed hardware identity is not carried by the CAD records nor backed by the sealed selection",
+                "the sealed selection does not record a configured target for the claimed hardware identity",
+                {"field": "hardware_id"},
+            )
+            _require(
+                claimed.get("hardware_id") == selection["hardware_id"],
+                "discovery.identity",
+                "the claimed hardware identity differs from the sealed selection target",
                 {"field": "hardware_id"},
             )
             hardware = claimed.get("hardware_id")
@@ -2699,6 +2791,13 @@ def verify_discovery(package: Path) -> dict:
             "generated metadata differs from native evidence",
             {"field": "hardware_id"},
         )
+        if claimed.get("hardware_id") is not None:
+            _require(
+                claimed.get("hardware_id") == _request_target(request_record()),
+                "discovery.identity",
+                "the hardware identity does not match the sealed request target",
+                {"field": "hardware_id"},
+            )
 
         summary = authored["change_summary"]
         if summary is not None:
@@ -2716,10 +2815,16 @@ def verify_discovery(package: Path) -> dict:
             )
         elif claimed.get("change_summary") is not None:
             _require(
-                metadata["change_summary_source"] == "submission"
-                and claimed.get("change_summary") == metadata["change_summary"],
+                metadata["change_summary_source"] == "submission",
                 "discovery.identity",
-                "the claim names a change summary the sealed submission does not carry",
+                "the sealed metadata names no submission origin for the claimed change summary",
+                {"field": "change_summary"},
+            )
+            requested_summary = _request_summary(request_record())
+            _require(
+                claimed.get("change_summary") == requested_summary == metadata["change_summary"],
+                "discovery.identity",
+                "the claimed change summary does not match the sealed request record",
                 {"field": "change_summary"},
             )
             summary = claimed.get("change_summary")
