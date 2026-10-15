@@ -12,7 +12,9 @@
 #           (alive/ended/unknown; refused/free/observer-failed): an unknown owner, a failed
 #           observer or a second refusal stops with lock_refused_unproven / lock_refused for
 #           diagnosis, never by killing an unknown process or deleting the lock; every failure
-#           path runs the recorded safe stop/restore of the previous generation
+#           path restores the previous task definition but starts it only on startable evidence
+#           (lock free, or refused with a proven-ended owner) and verifies health against the
+#           previous generation's own pinned release identity
 #   rollback restores exactly the previous generation directory the caller bounds
 #   health  relays the running endpoint's own /health payload
 # Each invocation prints one JSON object; receipts stay under the instance state root.
@@ -306,13 +308,28 @@ function Start-OrRefuse([string]$configPath, [object]$binding, [string]$stageDir
     }
   }
 }
-function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$previousConfig) {
+function Get-PreviousGenerationBinding([string]$generation, [object]$binding) {
+  # The previous generation's own pinned release identity, read from its stage receipt; without a
+  # receipt the binding stays unavailable instead of borrowing the candidate's new identity.
+  if (-not $generation) { return $null }
+  $receipt = Join-Path $generation 'stage-receipt.json'
+  if (-not (Test-Path -LiteralPath $receipt)) { return $null }
+  try { $record = Read-Json $receipt } catch { return $null }
+  if (-not ($record.version -and $record.source_commit -and $record.source_sha256)) { return $null }
+  return @{ task_name=$binding.task_name; state_root=$binding.state_root; generation=$generation;
+            port=$binding.port; version=$record.version; source_commit=$record.source_commit;
+            source_sha256=$record.source_sha256 }
+}
+function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$previousConfig, [string]$stageDir, [string]$sourceLauncher) {
   # The safe stop/restore every promote failure path runs: stop whatever now serves the task,
-  # restore the task snapshot, start the previous generation and verify it answers through the
-  # token-authenticated health of the previous configuration.  The facts land in the failure
-  # receipt; the admission stays closed regardless (operatorctl only opens it after its own
-  # end-to-end verification).
-  $restore = @{stopped=$false; restored=$false; started=$false; healthy=$false; error=''}
+  # restore the task snapshot, then start the previous generation only on startable evidence
+  # (lock free, no lock file, or refused with a proven-ended owner) - an unknown owner or a
+  # failed observer keeps the endpoint stopped for diagnosis.  Health is verified against the
+  # previous generation's own pinned release identity; without that receipt the health stays
+  # unjudged instead of being misfired at the new binding.  The facts land in the failure
+  # receipt; the admission stays closed regardless.
+  $restore = @{stopped=$false; restored=$false; start_gate=''; startable=$false; started=$false;
+               healthy=$null; previous_generation=''; error=''}
   try {
     Stop-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
     $restore.stopped = $true
@@ -321,13 +338,37 @@ function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$
     Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
     $restore.restored = $true
   } catch { if (-not $restore.error) { $restore.error = 'restore: ' + $_.Exception.Message } }
-  if ($restore.restored) {
+  $previousGeneration = ''
+  if ($sourceLauncher) {
     try {
-      Start-ScheduledTask -TaskName $binding.task_name
-      $restore.started = $true
-      $null = Health-Probe $previousConfig $binding
-      $restore.healthy = $true
-    } catch { if (-not $restore.error) { $restore.error = 'start/health: ' + $_.Exception.Message } }
+      $directory = [System.IO.Path]::GetDirectoryName($sourceLauncher)
+      $directory = if ($directory) { [System.IO.Path]::GetDirectoryName($directory) } else { '' }
+      $previousGeneration = if ($directory) { [System.IO.Path]::GetDirectoryName($directory) } else { '' }
+    } catch { $previousGeneration = '' }
+  }
+  $restore.previous_generation = [string]$previousGeneration
+  $gate = Get-OwnershipRefusalFacts $stageDir $binding
+  $restore.start_gate = [string]$gate.state
+  $restore.startable = ($gate.state -in @('lock_free', 'no_lock_file')) -or
+    (($gate.state -eq 'refused') -and [bool]$gate.owner_ended)
+  if ($restore.restored) {
+    if ($restore.startable) {
+      try {
+        Start-ScheduledTask -TaskName $binding.task_name
+        $restore.started = $true
+        $pinned = Get-PreviousGenerationBinding $previousGeneration $binding
+        if ($null -eq $pinned) {
+          if (-not $restore.error) {
+            $restore.error = 'the previous generation receipt is unavailable; the health probe stays unbound'
+          }
+        } else {
+          $null = Health-Probe $previousConfig $pinned
+          $restore.healthy = $true
+        }
+      } catch { if (-not $restore.error) { $restore.error = 'start/health: ' + $_.Exception.Message } }
+    } elseif (-not $restore.error) {
+      $restore.error = 'the previous endpoint was not started: start gate is ' + [string]$gate.state
+    }
   }
   return $restore
 }
@@ -476,7 +517,7 @@ if ($Verb -eq 'promote') {
     Emit @{passed=$true; verb='promote'; generation=$StageDir; previous=$previous}
     exit 0
   } catch {
-    $restore = Restore-PreviousEndpoint $binding $previous $previousConfig
+    $restore = Restore-PreviousEndpoint $binding $previous $previousConfig $StageDir $sourceExecute
     $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       message=$_.Exception.Message; restore=$restore}

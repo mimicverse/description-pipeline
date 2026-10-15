@@ -3,7 +3,7 @@
 -- role creation and role attributes live in bootstrap.sql (cluster identity only).
 -- Run through apply.sh after views.sql; idempotent.
 
-GRANT USAGE ON SCHEMA platform TO platform_service;
+GRANT USAGE ON SCHEMA :"platform_schema" TO platform_service;
 -- Controlled writes on the business objects, append-only on the event log.
 GRANT SELECT, INSERT, UPDATE ON
     :"platform_schema".admission, :"platform_schema".request, :"platform_schema".run, :"platform_schema".stage, :"platform_schema".operation
@@ -13,6 +13,6 @@ GRANT SELECT, INSERT ON :"platform_schema".run_event TO platform_service;
 GRANT SELECT ON :"platform_schema".lifecycle_projection, :"platform_schema".admission_projection TO platform_service;
 
 -- operator_ro: exactly the two read models; nothing else in the database.
-REVOKE ALL ON SCHEMA platform FROM PUBLIC;
-GRANT USAGE ON SCHEMA platform TO operator_ro;
+REVOKE ALL ON SCHEMA :"platform_schema" FROM PUBLIC;
+GRANT USAGE ON SCHEMA :"platform_schema" TO operator_ro;
 GRANT SELECT ON :"platform_schema".lifecycle_projection, :"platform_schema".admission_projection TO operator_ro;

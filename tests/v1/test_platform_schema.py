@@ -83,6 +83,19 @@ class ApplySchemaVariableTests(unittest.TestCase):
             self.assertEqual(calls.count("airflow_schema=airflow_ci_run7"), 1)
             self.assertEqual([line for line in calls if line.endswith(".sql")], [str(PLATFORM_DIR / "bootstrap.sql")])
 
+    def test_airflow_grants_mode_runs_one_parameterized_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="platform-schema-") as temporary:
+            log = Path(temporary) / "psql.log"
+            run_apply(
+                log, "--airflow-grants", "--platform-schema", "platform_ci_run7", "--airflow-schema", "airflow_ci_run7"
+            )
+            calls = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(calls.count("platform_schema=platform_ci_run7"), 1)
+            self.assertEqual(calls.count("airflow_schema=airflow_ci_run7"), 1)
+            self.assertEqual(
+                [line for line in calls if line.endswith(".sql")], [str(PLATFORM_DIR / "grants-airflow.sql")]
+            )
+
 
 class SchemaQualifierTests(unittest.TestCase):
     def test_bootstrap_parameterizes_the_schema_and_the_read_role(self) -> None:
@@ -99,6 +112,27 @@ class SchemaQualifierTests(unittest.TestCase):
             text = (PLATFORM_DIR / name).read_text(encoding="utf-8")
             self.assertIn(':"platform_schema".', text, name)
             self.assertIsNone(re.search(r"(?<![_a-z])platform\.[a-z_]", text), name)
+
+    def test_no_sql_file_carries_a_bare_schema_identifier(self) -> None:
+        # A standalone `platform`/`airflow` token in SQL code (SCHEMA platform, "airflow", ...)
+        # would bind a default schema again; comments may still describe the families in prose.
+        files = ("bootstrap.sql", "schema.sql", "views.sql", "roles.sql", "grants-airflow.sql")
+        for name in files:
+            text = (PLATFORM_DIR / name).read_text(encoding="utf-8")
+            code = "\n".join(line.split("--", 1)[0] for line in text.splitlines())
+            for token in ("platform", "airflow"):
+                pattern = re.compile(rf"(?<![_a-zA-Z]){token}(?![_a-zA-Z])")
+                self.assertIsNone(pattern.search(code), f"{name}: {token}")
+
+    def test_the_airflow_grants_file_is_schema_variable_aware(self) -> None:
+        text = (PLATFORM_DIR / "grants-airflow.sql").read_text(encoding="utf-8")
+        self.assertIn('GRANT SELECT ON :"airflow_schema".task_instance TO platform_migrate;', text)
+
+    def test_operatorctl_uses_the_single_airflow_grants_owner(self) -> None:
+        text = (ROOT / "deploy/operator/operatorctl.sh").read_text(encoding="utf-8")
+        self.assertIn("--airflow-grants", text)
+        self.assertNotIn("GRANT USAGE ON SCHEMA airflow TO airflow_runtime", text)
+        self.assertNotIn("GRANT USAGE ON SCHEMA ${AIRFLOW_SCHEMA:-airflow} TO platform_migrate", text)
 
     def test_runtime_sql_stays_schema_free_for_the_role_search_path(self) -> None:
         pattern = re.compile(r"\b(FROM|INTO|UPDATE|WHERE|JOIN) platform\.")
