@@ -29,6 +29,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from jwt import InvalidTokenError
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX, get_cookie_path
 from airflow.api_fastapi.auth.managers.base_auth_manager import COOKIE_NAME_JWT_TOKEN, BaseAuthManager
@@ -128,8 +129,10 @@ class MetadataStateStore:
     """Single-use OAuth state and its PKCE verifier in the Airflow metadata database.
 
     Every api-server worker and every restart uses this one table on the pinned ``airflow_meta``
-    connection. ``CREATE TABLE IF NOT EXISTS`` is idempotent and needs no migration; consuming a
-    state deletes the row, so a replayed callback can never reuse an authorization code.
+    connection.  The migration identity creates the table inside the install window (PostgreSQL
+    denies DDL on the schema to the DML-only runtime identity even for ``IF NOT EXISTS`` when
+    the table already exists); the runtime only proves the table is usable.  Consuming a state
+    deletes the row, so a replayed callback can never reuse an authorization code.
     """
 
     def __init__(self, session_factory: Any | None = None) -> None:
@@ -139,15 +142,22 @@ class MetadataStateStore:
             session_factory = Session
         self._session = session_factory
         with self._session() as session:
-            session.execute(
-                text(
-                    "CREATE TABLE IF NOT EXISTS feishu_auth_state ("
-                    "state_hash VARCHAR(64) PRIMARY KEY, "
-                    "verifier VARCHAR(128) NOT NULL, "
-                    "expires_at DOUBLE PRECISION NOT NULL)"
+            try:
+                # One probe: the table must exist and be readable by this identity already.
+                session.execute(text("SELECT 1 FROM feishu_auth_state WHERE 1 = 0"))
+            except (OperationalError, ProgrammingError):
+                # Only an identity that owns the migration window can create it; a runtime
+                # identity without the table fails here instead of serving sign-in unready.
+                session.rollback()
+                session.execute(
+                    text(
+                        "CREATE TABLE IF NOT EXISTS feishu_auth_state ("
+                        "state_hash VARCHAR(64) PRIMARY KEY, "
+                        "verifier VARCHAR(128) NOT NULL, "
+                        "expires_at DOUBLE PRECISION NOT NULL)"
+                    )
                 )
-            )
-            session.commit()
+                session.commit()
 
     def issue(self, ttl: float = STATE_TTL_SECONDS) -> tuple[str, str]:
         state = secrets.token_urlsafe(32)

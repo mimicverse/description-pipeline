@@ -35,6 +35,7 @@ if AIRFLOW_AVAILABLE:
     from fastapi.testclient import TestClient
     from starlette.requests import Request
     from sqlalchemy import create_engine, text
+    from sqlalchemy.exc import ProgrammingError
     from sqlalchemy.orm import sessionmaker
 
     from airflow.configuration import conf
@@ -944,6 +945,57 @@ class FeishuAuthManagerTests(unittest.TestCase):
             stored = [str(row[0]) for row in session.execute(text("SELECT state_hash FROM feishu_auth_state"))]
         self.assertNotIn(state, stored)
         self.assertNotIn(state_digest(state), stored)
+
+    def test_state_store_uses_an_existing_table_without_issuing_ddl(self) -> None:
+        """The DML-only runtime identity cannot run CREATE on the metadata schema."""
+
+        statements: list[str] = []
+
+        class RuntimeSession:
+            def __enter__(self) -> RuntimeSession:
+                return self
+
+            def __exit__(self, *error: object) -> bool:
+                return False
+
+            def execute(self, statement: object, parameters: object = None) -> None:
+                statements.append(str(statement))
+                if str(statement).lstrip().upper().startswith("CREATE"):
+                    raise ProgrammingError(
+                        str(statement), parameters, Exception("permission denied for schema")
+                    )
+
+            def rollback(self) -> None:
+                return None
+
+            def commit(self) -> None:
+                return None
+
+        auth.MetadataStateStore(session_factory=RuntimeSession)
+        self.assertTrue(any(item.lstrip().upper().startswith("SELECT") for item in statements))
+        self.assertFalse(any(item.lstrip().upper().startswith("CREATE") for item in statements))
+
+    def test_state_store_refuses_when_the_table_is_missing_and_ddl_is_denied(self) -> None:
+        """A runtime identity without the migrated table fails instead of serving sign-in unready."""
+
+        class DeniedSession:
+            def __enter__(self) -> DeniedSession:
+                return self
+
+            def __exit__(self, *error: object) -> bool:
+                return False
+
+            def execute(self, statement: object, parameters: object = None) -> None:
+                raise ProgrammingError(str(statement), parameters, Exception("permission denied for schema"))
+
+            def rollback(self) -> None:
+                return None
+
+            def commit(self) -> None:
+                return None
+
+        with self.assertRaises(ProgrammingError):
+            auth.MetadataStateStore(session_factory=DeniedSession)
 
 
 if __name__ == "__main__":
