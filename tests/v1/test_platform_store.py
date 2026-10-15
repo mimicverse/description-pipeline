@@ -61,12 +61,29 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
     (root / "evidence" / "native-meshes").mkdir()
     write_json(root / "input" / "source.json", {"source": "fixture"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
+    (root / "input" / "cad").mkdir()
+    (root / "input" / "cad" / "robot.SLDASM").write_bytes(b"fixture-native")
     package_files = {
         "source.json": file_digest(root / "input" / "source.json"),
         "records/arm.json": file_digest(root / "input" / "records" / "arm.json"),
+        "cad/robot.SLDASM": file_digest(root / "input" / "cad" / "robot.SLDASM"),
     }
-    write_json(root / "input" / "handoff.json", {"passed": True, "package_files": package_files})
-    write_json(root / "evidence" / "discovery.json", {"discovery": "fixture"})
+    write_json(
+        root / "input" / "handoff.json",
+        {
+            "passed": True,
+            "package_files": package_files,
+            "input_receipt": {"inventory": {"robot.SLDASM": package_files["cad/robot.SLDASM"]}},
+        },
+    )
+    write_json(
+        root / "evidence" / "discovery.json",
+        {
+            "discovery": "fixture",
+            "handoff_sha256": digest(package_files),
+            "native_files": {"robot.SLDASM": package_files["cad/robot.SLDASM"]},
+        },
+    )
     write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
     write_json(root / "evidence" / "capture.json", {"capture": "fixture"})
     write_json(root / "evidence" / "native-runtime.json", {"runtime": "fixture"})
@@ -86,6 +103,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
             "runtime": {"role": "native"},
         },
     )
+    write_json(root / "transfer-manifest.json", {"handoff_sha256": digest(package_files)})
     write_delivery_manifest(
         root,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},

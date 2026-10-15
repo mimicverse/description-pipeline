@@ -1019,6 +1019,15 @@ class LinkedMaterializationTests(unittest.TestCase):
         self.tree = native.capture_root(Path(self.temporary.name) / "native", run_id=self.PARENT, handoff=handoff)
         write_json(self.tree / "input/source.json", {"source": "synthetic-native"})
         write_json(self.tree / "input/records/arm.json", {"record": "synthetic-native"})
+        from description_pipeline.io import file_digest
+
+        report = read_data(self.tree / "input" / "handoff.json")
+        report["package_files"] = {
+            **report["package_files"],
+            "source.json": file_digest(self.tree / "input/source.json"),
+            "records/arm.json": file_digest(self.tree / "input/records/arm.json"),
+        }
+        write_json(self.tree / "input" / "handoff.json", report)
         for name in ("capture-plan", "capture", "native-runtime"):
             write_json(self.tree / f"evidence/{name}.json", {"synthetic": name})
         (self.tree / "evidence/native-meshes").mkdir()

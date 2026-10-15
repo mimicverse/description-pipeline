@@ -1170,18 +1170,45 @@ class PlatformStore:
             record = stamped.get("input/" + name)
             if record is None or record[1] != checksum:
                 raise PlatformStoreError("The receipt's handoff binding does not match the sealed original bytes")
+        # The prepared index must be complete: every staged input member except the
+        # carried request and the index itself has to appear in its inventory.
+        indexed = {path[len("input/"):] for path in stamped if path.startswith("input/")}
+        missing = sorted(indexed - set(files) - {"request.json", "handoff.json"})
+        if missing:
+            raise PlatformStoreError(f"The sealed input/handoff.json index is incomplete: {missing}")
         expected_handoff = digest(files)
         if stage != "freeze":
             # Freeze binds the full admitted upload; every later stage binds the
-            # selected native transfer identity carried by the sealed transfer.
-            # The prepared-package index above stays member-for-member validated.
+            # selected native transfer identity, byte-bound to the native discovery
+            # record.  A missing or self-declared-only identity refuses; the prepared
+            # index above stays member-for-member and completeness validated.
             transfer_path = root / "transfer-manifest.json"
-            if transfer_path.is_file():
-                transfer = read_data(transfer_path)
-                transfer_handoff = transfer.get("handoff_sha256") if isinstance(transfer, dict) else None
-                if not _is_sha256(transfer_handoff):
-                    raise PlatformStoreError("The sealed transfer manifest carries no handoff identity")
-                expected_handoff = transfer_handoff
+            if not transfer_path.is_file():
+                raise PlatformStoreError("The sealed stage tree carries no native transfer identity")
+            transfer = read_data(transfer_path)
+            transfer_handoff = transfer.get("handoff_sha256") if isinstance(transfer, dict) else None
+            if not _is_sha256(transfer_handoff):
+                raise PlatformStoreError("The sealed transfer manifest carries no handoff identity")
+            try:
+                discovery = read_data(confined(root, "evidence/discovery.json"))
+            except (PipelineError, OSError) as error:
+                raise PlatformStoreError("The sealed tree carries no readable native discovery record") from error
+            if not isinstance(discovery, dict) or discovery.get("handoff_sha256") != transfer_handoff:
+                raise PlatformStoreError("The native transfer identity is not byte-bound to the sealed discovery")
+            receipt_index = index.get("input_receipt")
+            inventory = receipt_index.get("inventory") if isinstance(receipt_index, dict) else None
+            if not isinstance(inventory, dict) or not inventory:
+                raise PlatformStoreError("The sealed handoff index carries no native input inventory")
+            for name, checksum in inventory.items():
+                record = stamped.get("input/cad/" + str(name))
+                if record is None or record[1] != checksum:
+                    raise PlatformStoreError(
+                        "The native input inventory is not byte-bound to the sealed originals"
+                    )
+            native_files = discovery.get("native_files")
+            if native_files is not None and native_files != inventory:
+                raise PlatformStoreError("The native input inventory differs from the sealed discovery record")
+            expected_handoff = transfer_handoff
         if expected_handoff != receipt.get("handoff_sha256"):
             raise PlatformStoreError("The receipt's handoff binding does not match the sealed identity for this stage")
         if stage == "freeze":
