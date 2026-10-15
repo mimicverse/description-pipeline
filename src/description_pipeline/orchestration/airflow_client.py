@@ -43,22 +43,20 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
-from ..io import PipelineError, artifact_path_parts, digest, file_digest, read_data, write_json
+from ..io import PipelineError, artifact_path_parts, digest
 from ..interface_records import (
     cache_import_confirmation_digest,
-    cache_release_params_digest,
     validate_cache_release_request,
 )
 from ..schemas import CACHE_IMPORT_CONFIRMATION_SCHEMA
 from ..sources.solidworks.selection import validate_file_index
 from ..stages import STAGE_IDS
 from .selection_client import prepare_staging_archive
-from .stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, MAX_TRANSFER_BYTES
+from .stage_transfer import CAPTURE_ARCHIVE, MAX_TRANSFER_BYTES
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 #: One release ledger per run fixes the cache-release operation identity and
 #: its full request, so retries resend the same operation, never new parameters.
-CACHE_RELEASE_LEDGER_SCHEMA = "solidworks-to-urdf.cache-release-ledger/v1"
 NATIVE_RUN_NAMESPACE = "solidworks_to_urdf"
 EVENT_KEYS = ("stage", "state", "at")
 #: ``native_complete`` means the Windows half finished and the sealed capture archive
@@ -393,6 +391,7 @@ def cache_release_request(
     health: dict,
     imported: list[dict],
     sealed_receipt_sha256: str,
+    import_block: dict | None = None,
 ) -> dict:
     """One frozen IF-10 release request, bound to the endpoint identity read live.
 
@@ -400,142 +399,44 @@ def cache_release_request(
     hard-coded): the release triple and the contract digest the caller must
     bind.  ``sealed_receipt_sha256`` identifies the Linux sealed import
     confirmation (the admitted capture manifest digest); the endpoint keeps it
-    opaque.  The request validates against the frozen record layer before it
-    leaves the Linux side.
+    opaque.  ``import_block`` reuses one already-frozen import block, so the
+    registered parameter digest and the executed request bind the same
+    confirmation bytes.  The request validates against the frozen record layer
+    before it leaves the Linux side.
     """
 
     release = health.get("release") if isinstance(health.get("release"), dict) else None
     contract = health.get("contract") if isinstance(health.get("contract"), dict) else None
     if release is None or contract is None:
         raise EndpointProtocolError("the endpoint health carries no release identity or contract binding")
-    production = {"run_id": validate_run_id(run_id), "operation_id": production_operation_id}
-    confirmation = {
-        "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
-        "imported": [dict(entry) for entry in imported],
-        "production": dict(production),
-        "sealed": {
-            "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "receipt_sha256": sealed_receipt_sha256,
-        },
-        "digest": "",
-    }
-    confirmation["digest"] = cache_import_confirmation_digest(confirmation)
+    if import_block is None:
+        production = {"run_id": validate_run_id(run_id), "operation_id": production_operation_id}
+        confirmation = {
+            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+            "imported": [dict(entry) for entry in imported],
+            "production": dict(production),
+            "sealed": {
+                "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "receipt_sha256": sealed_receipt_sha256,
+            },
+            "digest": "",
+        }
+        confirmation["digest"] = cache_import_confirmation_digest(confirmation)
+        import_block = {
+            "linux_run_id": linux_run_id,
+            "production": dict(production),
+            "confirmation": confirmation,
+        }
     request = {
         "operation_id": operation_id,
         "binding": {
             "release": {key: release[key] for key in ("version", "source_commit", "source_sha256")},
             "contract": dict(contract),
         },
-        "import": {"linux_run_id": linux_run_id, "production": dict(production), "confirmation": confirmation},
+        "import": dict(import_block),
     }
     validate_cache_release_request(request)
     return request
-
-
-def release_run_cache(
-    store,
-    endpoint: WindowsEndpoint,
-    *,
-    run_id: str,
-    intake: Path,
-    upload_files: dict[str, str],
-) -> dict:
-    """Best-effort IF-10 release of one run's staged cache; never raises.
-
-    One ledger file per run fixes the operation identity and the full request
-    at the first attempt; every retry (task retry or reconcile) re-sends
-    exactly that request, so the endpoint returns the original receipt or
-    safely resumes.  Failures are recorded for the reconcile pass and never
-    fail the engineering stage.  A blocked ledger (no request yet) is rebuilt
-    on the next attempt under the same operation id.
-    """
-
-    ledger_path = Path(store.run_dir(run_id)) / "cache-release.json"
-    ledger = read_data(ledger_path) if ledger_path.is_file() else None
-    if isinstance(ledger, dict) and ledger.get("state") == "released":
-        return ledger
-    if not isinstance(ledger, dict) or not isinstance(ledger.get("request"), dict):
-        ledger = None
-    try:
-        if ledger is None:
-            manifest = cache_release_manifest(intake, upload_files)
-            sealed = file_digest(Path(store.capture_dir(run_id)) / CAPTURE_MANIFEST)
-            release_request = cache_release_request(
-                run_id=run_id,
-                linux_run_id=run_id,
-                production_operation_id=f"{run_id}:native",
-                operation_id=f"cache-release:{run_id}",
-                health=endpoint.health(),
-                imported=manifest,
-                sealed_receipt_sha256=sealed,
-            )
-            ledger = {
-                "schema_version": CACHE_RELEASE_LEDGER_SCHEMA,
-                "kind": "cache_release",
-                "run_id": validate_run_id(run_id),
-                "operation_id": release_request["operation_id"],
-                "params_sha256": cache_release_params_digest(release_request["import"]),
-                "request": release_request,
-                "state": "pending",
-                "receipt": None,
-                "error": None,
-            }
-            write_json(ledger_path, ledger)
-        receipt = endpoint.release_cache(run_id, ledger["request"])
-        ledger.update(state="released", receipt=receipt, error=None)
-    except Exception as error:  # noqa: BLE001 - a deferred release is recorded, never fatal
-        payload = getattr(error, "payload", None)
-        ledger = ledger or {
-            "schema_version": CACHE_RELEASE_LEDGER_SCHEMA,
-            "kind": "cache_release",
-            "run_id": str(run_id),
-            "operation_id": None,
-            "params_sha256": None,
-            "request": None,
-            "state": "blocked",
-            "receipt": None,
-        }
-        ledger["state"] = "pending" if isinstance(ledger.get("request"), dict) else "blocked"
-        ledger["error"] = {
-            "error": str(error)[:400],
-            "error_code": payload.get("error_code") if isinstance(payload, dict) else None,
-            "reason": payload.get("reason") if isinstance(payload, dict) else None,
-        }
-    write_json(ledger_path, ledger)
-    return ledger
-
-
-def reconcile_queued_cache_releases(store, endpoint: WindowsEndpoint, *, limit: int = 20) -> int:
-    """Resend recorded pending releases with their own identities; no new parameters."""
-
-    resent = 0
-    try:
-        candidates = sorted(path for path in Path(store.root).iterdir() if path.is_dir())
-    except OSError:
-        return 0
-    for run_dir in candidates:
-        if resent >= limit:
-            break
-        ledger_path = run_dir / "cache-release.json"
-        if not ledger_path.is_file():
-            continue
-        try:
-            ledger = read_data(ledger_path)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(ledger, dict) or ledger.get("state") != "pending":
-            continue
-        request = ledger.get("request")
-        if not isinstance(request, dict):
-            continue
-        try:
-            receipt = endpoint.release_cache(ledger["run_id"], request)
-            ledger.update(state="released", receipt=receipt, error=None)
-        except Exception as error:  # noqa: BLE001 - reconcile records and moves on
-            ledger["error"] = {"error": str(error)[:400]}
-        write_json(ledger_path, ledger)
-        resent += 1
-    return resent
 
 
 def _validate_base_url(url: str) -> str:

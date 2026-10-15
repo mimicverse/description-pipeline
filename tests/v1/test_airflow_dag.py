@@ -683,6 +683,110 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertEqual({event["kind"] for event in self.live_events}, {"stage"})
         self.assertEqual({event["run_id"] for event in self.live_events}, {"run-1"})
 
+    def test_the_cache_release_runs_through_the_operation_family(self) -> None:
+        import hashlib as hashing
+        import uuid
+        from types import SimpleNamespace
+
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        capture = run_dir / "capture"
+        capture.mkdir(parents=True)
+        (capture / "transfer-manifest.json").write_bytes(b"manifest bytes")
+        intake = Path(self.temporary.name) / "intake-release"
+        (intake / "cad").mkdir(parents=True)
+        (intake / "cad" / "robot.SLDASM").write_bytes(b"assembly bytes")
+        upload = {"cad/robot.SLDASM": hashing.sha256(b"assembly bytes").hexdigest()}
+        store = SimpleNamespace(capture_dir=lambda _run: capture)
+        released: list[tuple[str, dict]] = []
+        settled: list[dict] = []
+        state = {"claimed": False}
+
+        class _Ops:
+            def register_operation(self, *, run_id, stage, kind, operation_key, params_digest):
+                return SimpleNamespace(operation_id=str(uuid.uuid4()), state="queued")
+
+            def claim_operation(self, *, run_id, stage, operation_key):
+                granted = not state["claimed"]
+                state["claimed"] = True
+                return SimpleNamespace(granted=granted)
+
+            def settle_cache_release(self, *, run_id, stage, operation_key, receipt):
+                settled.append(receipt)
+
+        endpoint = SimpleNamespace(
+            health=lambda: {
+                "release": {
+                    "version": "1.4.0",
+                    "source_commit": "ab" * 20,
+                    "source_sha256": "cd" * 32,
+                    "role": "native",
+                },
+                "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            },
+            release_cache=lambda run_id, request: released.append((run_id, request))
+            or {"status": "released"},
+        )
+        platform = _Ops()
+        self.module._release_registered_cache(
+            platform, store, endpoint, "run-1", intake=intake, upload_files=upload
+        )
+        self.assertEqual(len(released), 1)
+        self.assertEqual(len(settled), 1)
+        self.module._release_registered_cache(
+            platform, store, endpoint, "run-1", intake=intake, upload_files=upload
+        )
+        self.assertEqual(len(released), 1, "a repeat claim is a query; the side effect never re-executes")
+
+    def test_a_failed_cache_release_never_fails_the_stage(self) -> None:
+        import hashlib as hashing
+        import uuid
+        from types import SimpleNamespace
+
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        run_dir = Path(self.temporary.name) / "runs" / "run-2"
+        capture = run_dir / "capture"
+        capture.mkdir(parents=True)
+        (capture / "transfer-manifest.json").write_bytes(b"manifest bytes")
+        intake = Path(self.temporary.name) / "intake-release-2"
+        (intake / "cad").mkdir(parents=True)
+        (intake / "cad" / "robot.SLDASM").write_bytes(b"assembly bytes")
+        upload = {"cad/robot.SLDASM": hashing.sha256(b"assembly bytes").hexdigest()}
+        store = SimpleNamespace(capture_dir=lambda _run: capture)
+        settled: list[dict] = []
+
+        class _Ops:
+            def register_operation(self, *, run_id, stage, kind, operation_key, params_digest):
+                return SimpleNamespace(operation_id=str(uuid.uuid4()), state="queued")
+
+            def claim_operation(self, *, run_id, stage, operation_key):
+                return SimpleNamespace(granted=True)
+
+            def settle_cache_release(self, *, run_id, stage, operation_key, receipt):
+                settled.append(receipt)
+
+        def refuse(run_id, request):
+            raise RuntimeError("endpoint refuses the release")
+
+        endpoint = SimpleNamespace(
+            health=lambda: {
+                "release": {
+                    "version": "1.4.0",
+                    "source_commit": "ab" * 20,
+                    "source_sha256": "cd" * 32,
+                    "role": "native",
+                },
+                "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            },
+            release_cache=refuse,
+        )
+        self.module._release_registered_cache(
+            _Ops(), store, endpoint, "run-2", intake=intake, upload_files=upload
+        )
+        self.assertEqual(settled, [], "a refused release never reports success")
+
     def test_the_native_stages_seal_one_snapshot_and_confirm_in_order(self) -> None:
         from description_pipeline.io import read_data
         from tests.v1.test_platform_store import build_sealed_delivery

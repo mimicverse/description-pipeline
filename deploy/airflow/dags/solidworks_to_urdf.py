@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -32,13 +33,13 @@ from description_pipeline.orchestration.airflow_client import (
     EndpointProtocolError,
     WindowsEndpoint,
     capture_archive_metadata,
+    cache_release_manifest,
+    cache_release_request,
     check_result,
     config_from_airflow_connection,
     drive_staging,
     native_run_id,
     normalize_change_summary,
-    reconcile_queued_cache_releases,
-    release_run_cache,
     resolved_routing,
     submission_identity,
     validate_main_assembly,
@@ -46,13 +47,20 @@ from description_pipeline.orchestration.airflow_client import (
 from description_pipeline.orchestration.linux_runner import import_native_capture
 from description_pipeline.orchestration.linux_runner import run_portable_stage
 from description_pipeline.orchestration.linux_store import LinuxStore
+from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST
 from description_pipeline.delivery import (
     BUNDLE_SCHEMA,
     PIPELINE_ID,
     read_delivery_manifest,
     write_delivery_manifest,
 )
-from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+from description_pipeline.interface_records import (
+    CACHE_IMPORT_CONFIRMATION_SCHEMA,
+    CHECK_POLICY_SCHEMA,
+    cache_import_confirmation_digest,
+    cache_release_params_digest,
+    check_policy_digest,
+)
 from description_pipeline.platform.storage import seal_stage_confirmation, sealed_resolver
 from description_pipeline.platform.store import PlatformStore
 from description_pipeline.runtime import tool_record
@@ -69,7 +77,7 @@ from description_pipeline.stages import (
     stage_log,
     stage_view,
 )
-from description_pipeline.io import PipelineError, confined, digest, inventory, read_data, write_json
+from description_pipeline.io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.request_evidence import carry_request_evidence, freeze_request_evidence
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import validate_file_index
@@ -360,6 +368,69 @@ def _register_native_stages(store: LinuxStore, run_id: str) -> None:
         _seal_and_confirm(
             platform, store_root, run_id, stage, snapshot, {"native_tool": native_tool}, state="completed"
         )
+
+
+def _release_registered_cache(
+    platform: PlatformStore,
+    store: LinuxStore,
+    endpoint: WindowsEndpoint,
+    run_id: str,
+    *,
+    intake: Path,
+    upload_files: dict[str, str],
+) -> None:
+    """The IF-10 release through the platform operation family: intent -> claim -> settle.
+
+    The intent is registered under the capture stage (the confirmed import is
+    the predecessor a release binds); only the claim that performs
+    queued->running executes the endpoint call - a repeat claim is a query and
+    never re-executes.  A deferred or failed release is recorded and never
+    fails the engineering stage.
+    """
+    try:
+        manifest = cache_release_manifest(intake, upload_files)
+        sealed = file_digest(store.capture_dir(run_id) / CAPTURE_MANIFEST)
+        health = endpoint.health()
+        production = {"run_id": run_id, "operation_id": f"{run_id}:native"}
+        confirmation = {
+            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+            "imported": [dict(entry) for entry in manifest],
+            "production": dict(production),
+            "sealed": {
+                "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "receipt_sha256": sealed,
+            },
+            "digest": "",
+        }
+        confirmation["digest"] = cache_import_confirmation_digest(confirmation)
+        import_block = {"linux_run_id": run_id, "production": dict(production), "confirmation": confirmation}
+        operation_key = f"{run_id}/cache:0"
+        record = platform.register_operation(
+            run_id=run_id,
+            stage="capture",
+            kind="cache_release",
+            operation_key=operation_key,
+            params_digest=cache_release_params_digest(import_block),
+        )
+        if record.state == "succeeded":
+            return
+        claim = platform.claim_operation(run_id=run_id, stage="capture", operation_key=operation_key)
+        if not claim.granted:
+            return
+        request = cache_release_request(
+            run_id=run_id,
+            linux_run_id=run_id,
+            production_operation_id=production["operation_id"],
+            operation_id=record.operation_id,
+            health=health,
+            imported=manifest,
+            sealed_receipt_sha256=sealed,
+            import_block=import_block,
+        )
+        receipt = endpoint.release_cache(run_id, request)
+        platform.settle_cache_release(run_id=run_id, stage="capture", operation_key=operation_key, receipt=receipt)
+    except Exception as error:  # noqa: BLE001 - a deferred release never fails the stage
+        log.warning("cache release deferred run=%s error=%s", run_id, error)
 
 
 def _failed_native_stage(job: dict) -> str:
@@ -1237,21 +1308,21 @@ def solidworks_to_urdf():
                 binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
                 binding["source_run_id"] = None
                 binding["from_stage"] = None
-                # IF-10: once the sealed capture import is admitted, release this run's
-                # staged Windows cache through its own recorded operation.  A deferred
-                # release is recorded for reconcile and never fails the stage.
                 endpoint = _endpoint(request["conn_id"])
-                reconcile_queued_cache_releases(store, endpoint)
-                release_run_cache(
+                # The two native stages are registered over one sealed snapshot of the
+                # imported capture tree; the native members themselves stay byte-exact,
+                # and the confirmed capture import is the predecessor the IF-10
+                # release operation binds below through the platform operation family.
+                _register_native_stages(store, run_id)
+                platform, _store_root = _platform_binding()
+                _release_registered_cache(
+                    platform,
                     store,
                     endpoint,
-                    run_id=run_id,
+                    run_id,
                     intake=Path(request["intake_dir"]),
                     upload_files=request["upload_files"],
                 )
-                # The two native stages are registered over one sealed snapshot of the
-                # imported capture tree; the native members themselves stay byte-exact.
-                _register_native_stages(store, run_id)
             except Exception as error:
                 _converge_failed_stage(run_id, "capture", error, products=True)
                 raise
