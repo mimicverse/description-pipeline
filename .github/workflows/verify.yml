@@ -61,6 +61,8 @@ jobs:
           echo "node identity: $actual"
       - name: Regression suite
         run: python -B -m unittest discover -s tests -t .
+      - name: The Windows settle semantics (offline pwsh matrix)
+        run: pwsh -NoProfile -File tests/deploy/test_instance_lifecycle.ps1
 
   distribution:
     runs-on: ubuntu-24.04
@@ -123,6 +125,8 @@ jobs:
           set -eu
           (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" > "$RUNNER_TEMP/release-b.log")
           diff -r "$RUNNER_TEMP/release-a" "$RUNNER_TEMP/release-b"
+      - name: The release carries exactly its six assets with bound digests
+        run: python tools/check_release_assets.py "$RUNNER_TEMP/release-a"
       - name: The role archives resolve offline for their targets
         run: |
           set -eu
