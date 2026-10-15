@@ -1143,7 +1143,29 @@ def main() -> int:
             status, preview_payload, _ = _http_json(
                 "GET", f"{portal_base}/api/runs/{run_id}/preview", token=token, cookies=portal_cookie
             )
+            # The full quality document comes through the artifact route, which binds the
+            # bytes to the digest its own preview declared (no client-supplied digest);
+            # every check must carry definite execution evidence, so "absent from the
+            # failing summary" can never pass for "executed and passed".
+            document_status, quality_doc, _ = _http_json(
+                "GET",
+                f"{portal_base}/api/runs/{run_id}/artifacts/reports/quality.json",
+                token=token,
+                cookies=portal_cookie,
+            )
+            checks = [
+                item for item in (quality_doc.get("checks") or []) if isinstance(item, dict)
+            ] if isinstance(quality_doc, dict) else []
+            executed = bool(checks) and all(
+                item.get("state") in {"passed", "failed"} and isinstance(item.get("passed"), bool)
+                for item in checks
+            )
             failing = {
+                str(item.get("id"))
+                for item in checks
+                if item.get("passed") is False or item.get("state") == "failed"
+            }
+            preview_failing = {
                 str(item.get("id"))
                 for item in (preview_payload.get("failing_checks") or [])
                 if isinstance(item, dict)
@@ -1161,6 +1183,15 @@ def main() -> int:
                 "missing_required_gates": missing_required,
                 "subject_sha256": subject or None,
                 "urdf": preview_payload.get("urdf"),
+                "quality": {
+                    "document_served": document_status == 200,
+                    "checks": len(checks),
+                    "execution_evidence": executed,
+                    "document_subject_sha256": quality_doc.get("subject_sha256")
+                    if isinstance(quality_doc, dict)
+                    else None,
+                },
+                "subject_binding": "route-bound preview and quality document; platform receipts at wiring",
             }
             if status != 200:
                 problems.append(f"the diagnostic preview could not be served: {status}")
@@ -1172,12 +1203,29 @@ def main() -> int:
                     problems.append(f"the rejection is not the bound verification failure: {rejection}")
                 if "URDF verification failed" not in str(preview_payload.get("error") or ""):
                     problems.append(f"the rejection error is not the documented verification failure: {rejection}")
+                if document_status != 200:
+                    problems.append(f"the quality document could not be served: {document_status}")
+                elif not executed:
+                    problems.append(f"quality checks carry no definite execution evidence: {rejection['quality']}")
+                elif failing != preview_failing:
+                    problems.append(
+                        f"the quality document and the diagnostic summary disagree on failures: {rejection}"
+                    )
                 if unexpected_gates:
                     problems.append(f"quality failed outside the documented control limits: {unexpected_gates}")
                 if missing_required:
                     problems.append(f"quality skipped required gates: {missing_required}")
-                if len(subject) != 64 or any(char not in "0123456789abcdef" for char in subject):
-                    problems.append("the diagnostic preview carries no subject-bound delivery digest")
+                document_subject = (
+                    str(quality_doc.get("subject_sha256") or "") if isinstance(quality_doc, dict) else ""
+                )
+                if (
+                    len(subject) != 64
+                    or any(char not in "0123456789abcdef" for char in subject)
+                    or document_subject != subject
+                ):
+                    problems.append(
+                        "the preview and the quality document do not agree on one bound subject digest"
+                    )
             sql_evidence = _platform_sql_evidence(
                 args.platform_schema,
                 run_id,
