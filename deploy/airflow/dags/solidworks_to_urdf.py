@@ -273,7 +273,21 @@ def _register_completed_stage(run_id: str, stage: str, tree: str | Path, receipt
 def _portable_registered(
     store: LinuxStore, run_id: str, stage: str, *, tree: Path, context: dict | None = None, **kwargs
 ) -> dict:
-    """Run one portable stage, report its boundary, then register it through the sealed chain."""
+    """Run one portable stage, report its boundary, then register it through the sealed chain.
+
+    The platform binding is required before the stage runs - an unavailable
+    platform refuses before any side effect - and every recorded stage event
+    is mirrored into the platform's live event stream.
+    """
+    platform, _store_root = _platform_binding()
+
+    def live(event: dict) -> None:
+        try:
+            platform.append_event(run_id, stage=stage, kind="stage", payload=event)
+        except Exception:  # pragma: no cover - live events are best-effort
+            log.exception("live event write failed run=%s stage=%s", run_id, stage)
+
+    kwargs.setdefault("on_event", live)
     try:
         receipt = run_portable_stage(store, run_id, stage, **kwargs)
         _portable_report(receipt, stage=stage, context=context)
@@ -296,6 +310,7 @@ def _portable_registered(
 def _register_freeze_stage(store: LinuxStore, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
     """Seal the admitted originals with the frozen request evidence and confirm the freeze stage."""
     platform, store_root = _platform_binding()
+    platform.start_run(run_id)  # the first driver action claims the admitted run
     tree = store.stage_dir(run_id, "freeze")
     try:
         if not (tree / "manifest.json").is_file():

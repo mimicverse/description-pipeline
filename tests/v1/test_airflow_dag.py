@@ -551,9 +551,15 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.root = Path(self.temporary.name) / "store-root"
         self.root.mkdir()
         self.calls: list[dict] = []
+        self.started: list[str] = []
+        self.live_events: list[dict] = []
         platform = SimpleNamespace(
             confirm_stage=lambda **payload: self.calls.append(payload),
             confirmed_stage=lambda *args, **kwargs: None,
+            start_run=lambda run_id: self.started.append(run_id),
+            append_event=lambda run_id, *, stage, kind, payload=None: self.live_events.append(
+                {"run_id": run_id, "stage": stage, "kind": kind, "payload": payload}
+            ),
         )
         binding = patch.object(self.module, "_platform_binding", return_value=(platform, self.root))
         binding.start()
@@ -642,6 +648,41 @@ class PlatformRegistrationTests(unittest.TestCase):
         manifest = read_delivery_manifest(tree)
         self.assertIn("input/assembly.sldasm", {record["path"] for record in manifest["subject"]["files"]})
 
+    def test_the_freeze_stage_starts_the_admitted_run(self) -> None:
+        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        (run_dir / "input").mkdir(parents=True)
+        (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        intake = Path(self.temporary.name) / "intake-start"
+        intake.mkdir()
+        (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
+        stages = run_dir / "stages"
+        store = SimpleNamespace(run_dir=lambda _run: run_dir, stage_dir=lambda _run, stage: stages / stage)
+        self.module._register_freeze_stage(
+            store, "run-1", intake=intake, upload_files={"assembly.sldasm": "a" * 64}
+        )
+        self.assertEqual(self.started, ["run-1"])
+
+    def test_stage_events_are_mirrored_into_the_live_platform_stream(self) -> None:
+        from description_pipeline.delivery import read_delivery_manifest
+
+        tree = self._tree(stage="generate")
+        receipt = {
+            "run_id": "run-1",
+            "state": "generated",
+            "subject_sha256": read_delivery_manifest(tree)["subject"]["digest"],
+        }
+
+        def fake_stage(store, run_id, stage, **kwargs):
+            kwargs["on_event"]({"stage": stage, "state": "running"})
+            kwargs["on_event"]({"stage": stage, "state": "completed"})
+            return receipt
+
+        with patch.object(self.module, "run_portable_stage", side_effect=fake_stage):
+            self.module._portable_registered(object(), "run-1", "generate", tree=tree)
+        self.assertEqual([event["payload"]["state"] for event in self.live_events], ["running", "completed"])
+        self.assertEqual({event["kind"] for event in self.live_events}, {"stage"})
+        self.assertEqual({event["run_id"] for event in self.live_events}, {"run-1"})
+
     def test_the_native_stages_seal_one_snapshot_and_confirm_in_order(self) -> None:
         from description_pipeline.io import read_data
         from tests.v1.test_platform_store import build_sealed_delivery
@@ -676,6 +717,9 @@ class PlatformRegistrationTests(unittest.TestCase):
         confirmations: list[str] = []
 
         class _RetainingPlatform:
+            def start_run(self, run_id):
+                return {"run_id": run_id, "state": "running"}
+
             def confirm_stage(self, *, run_id, stage, state, receipt, checkpoint_uri):
                 records[(run_id, stage)] = dict(receipt)
                 confirmations.append(stage)

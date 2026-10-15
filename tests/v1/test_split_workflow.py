@@ -266,6 +266,11 @@ class SplitWorkflowTests(unittest.TestCase):
                 return_value=SimpleNamespace(stage_dir=lambda _run, stage: Path("/nonexistent") / RUN_ID / stage),
             ),
             patch.object(module, "run_portable_stage", return_value=_failed_verify_receipt()),
+            patch.object(
+                module,
+                "_platform_binding",
+                return_value=(SimpleNamespace(append_event=lambda *args, **kwargs: None), Path("/nonexistent")),
+            ),
         ):
             verify = module.dag.get_task("verify").python_callable
             with self.assertRaises(AirflowFailException):
@@ -325,6 +330,11 @@ class SplitWorkflowTests(unittest.TestCase):
             with (
                 patch.object(module, "_linux_store", return_value=store),
                 patch.object(module, "run_portable_stage", return_value=_passing_publish_receipt()),
+                patch.object(
+                    module,
+                    "_platform_binding",
+                    return_value=(SimpleNamespace(append_event=lambda *args, **kwargs: None), Path("/nonexistent")),
+                ),
                 patch.object(module, "_register_completed_stage", side_effect=lambda *args, **kwargs: None),
                 patch.object(module, "config_from_airflow_connection", return_value=config),
             ):
