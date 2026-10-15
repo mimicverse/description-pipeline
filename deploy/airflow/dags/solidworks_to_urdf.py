@@ -182,6 +182,19 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
     }
     if package_files is not None:
         payload["handoff_sha256"] = digest(package_files)
+    if stage != "freeze":
+        # Every stage after the freeze binds the selected native transfer identity
+        # the transfer itself carries; the prepared-package index above stays
+        # validated through the sealed delivery manifest and the artifact records.
+        transfer_path = tree / CAPTURE_MANIFEST
+        if transfer_path.is_file():
+            transfer = read_data(transfer_path)
+            transfer_handoff = transfer.get("handoff_sha256") if isinstance(transfer, dict) else None
+            if not isinstance(transfer_handoff, str) or not transfer_handoff:
+                raise AirflowFailException(
+                    f"The {stage!r} stage tree carries an unreadable transfer handoff identity"
+                )
+            payload["handoff_sha256"] = transfer_handoff
     for key in ("error", "tool", "native_tool", "quality", "submission"):
         if receipt.get(key) is not None:
             payload[key] = receipt[key]

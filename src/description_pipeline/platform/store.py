@@ -1170,10 +1170,20 @@ class PlatformStore:
             record = stamped.get("input/" + name)
             if record is None or record[1] != checksum:
                 raise PlatformStoreError("The receipt's handoff binding does not match the sealed original bytes")
-        if digest(files) != receipt.get("handoff_sha256"):
-            raise PlatformStoreError(
-                "The receipt's handoff binding does not match the sealed input/handoff.json inventory"
-            )
+        expected_handoff = digest(files)
+        if stage != "freeze":
+            # Freeze binds the full admitted upload; every later stage binds the
+            # selected native transfer identity carried by the sealed transfer.
+            # The prepared-package index above stays member-for-member validated.
+            transfer_path = root / "transfer-manifest.json"
+            if transfer_path.is_file():
+                transfer = read_data(transfer_path)
+                transfer_handoff = transfer.get("handoff_sha256") if isinstance(transfer, dict) else None
+                if not _is_sha256(transfer_handoff):
+                    raise PlatformStoreError("The sealed transfer manifest carries no handoff identity")
+                expected_handoff = transfer_handoff
+        if expected_handoff != receipt.get("handoff_sha256"):
+            raise PlatformStoreError("The receipt's handoff binding does not match the sealed identity for this stage")
         if stage == "freeze":
             try:
                 sealed_tool = read_data(confined(root, "tool.json"))
