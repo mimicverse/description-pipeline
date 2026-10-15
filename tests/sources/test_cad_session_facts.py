@@ -124,29 +124,39 @@ class CadSessionFactsTests(unittest.TestCase):
         self.assertIn("cad_lease_unreadable", cad["problems"])
 
     @unittest.skipUnless(os.name == "posix", "fcntl.flock boundary")
-    def test_a_lock_call_io_error_is_unknown_never_a_contention(self) -> None:
-        # Only the platform's proven contention result may read as held: a
-        # lock-call IO failure (synthetic OS EIO here, not a real filesystem
-        # fault) is an observation error - the fact stays unknown and the
-        # health identity says why.
+    def test_only_proven_flock_contention_reads_held(self) -> None:
+        # By ACTUAL errno: only EAGAIN/EWOULDBLOCK are proven contention.
+        # EINPROGRESS/EALREADY are BlockingIOError instances too, and every
+        # other flock failure is an observation error: the fact stays unknown
+        # and the health identity says why.  (Synthetic OS results only.)
         import errno
 
         from description_pipeline import io
 
         lease_path = Path(str(self.ledger) + ".lease")
         lease_path.write_text("no-real-holder", encoding="utf-8")
-        with (
-            mock.patch("fcntl.flock", side_effect=OSError(errno.EIO, "injected OS lock IO failure")),
-            self.assertRaises(OSError),
-        ):
-            io.try_acquire_process_lock(lease_path)
-        with mock.patch("fcntl.flock", side_effect=OSError(errno.EIO, "injected OS lock IO failure")):
+        for label in ("EINPROGRESS", "EALREADY", "EIO", "EACCES", "ENOLCK"):
+            with self.subTest(errno=label):
+                with (
+                    mock.patch("fcntl.flock", side_effect=OSError(getattr(errno, label), f"injected flock {label}")),
+                    self.assertRaises(OSError),
+                ):
+                    io.try_acquire_process_lock(lease_path)
+                with mock.patch(
+                    "fcntl.flock", side_effect=OSError(getattr(errno, label), f"injected flock {label}")
+                ):
+                    facts = isolation.domain_lease_facts(self.ledger)
+                    cad = self._facts(table=[])
+                self.assertIsNone(facts.get("held"), facts)
+                self.assertTrue(facts.get("error"), facts)
+                self.assertFalse(cad["lease_held"])
+                self.assertIn("cad_lease_unreadable", cad["problems"])
+        with mock.patch("fcntl.flock", side_effect=OSError(errno.EAGAIN, "injected flock EAGAIN")):
             facts = isolation.domain_lease_facts(self.ledger)
             cad = self._facts(table=[])
-        self.assertIsNone(facts.get("held"), facts)
-        self.assertTrue(facts.get("error"), facts)
-        self.assertFalse(cad["lease_held"])
-        self.assertIn("cad_lease_unreadable", cad["problems"])
+        self.assertTrue(facts.get("held") is True and not facts.get("error"), facts)
+        self.assertTrue(cad["lease_held"])
+        self.assertNotIn("cad_lease_unreadable", cad["problems"])
 
     def test_unrecorded_matching_processes_are_external(self) -> None:
         facts = self._facts(table=[(9, EXE)])

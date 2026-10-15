@@ -24,17 +24,20 @@ class PipelineError(ValueError):
 def _lock_contention(error: OSError) -> bool:
     """Whether this platform's lock call failed BECAUSE another owner holds it.
 
-    Only the platform's documented contention result counts: a POSIX
-    non-blocking ``flock`` reports EAGAIN/EWOULDBLOCK (``BlockingIOError``),
-    while ``msvcrt.locking`` reports a held region as EACCES (EDEADLK on a
-    deadlock).  Every other lock-call failure is an observation error.
+    Only the platform's documented contention result counts, by ACTUAL errno:
+    a POSIX non-blocking ``flock`` reports EAGAIN/EWOULDBLOCK, while
+    ``msvcrt.locking`` reports a held region as EACCES (EDEADLK on a
+    deadlock).  The exception class alone is not enough on POSIX -
+    ``EINPROGRESS`` and ``EALREADY`` are also ``BlockingIOError`` instances
+    but are not contention.  Every other lock-call failure is an observation
+    error.
     """
 
-    if os.name == "nt":
-        import errno
+    import errno
 
+    if os.name == "nt":
         return error.errno in (errno.EACCES, errno.EDEADLK)
-    return isinstance(error, BlockingIOError)
+    return error.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
 
 
 def try_acquire_process_lock(path: Path) -> int | None:
