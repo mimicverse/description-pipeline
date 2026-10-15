@@ -15,6 +15,7 @@ import dataclasses
 import importlib.util
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime
@@ -1030,7 +1031,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 statements.append(str(statement))
                 if str(statement).lstrip().upper().startswith("SELECT"):
                     raise OperationalError(
-                        str(statement), parameters, _Origin("no such table: feishu_auth_state")
+                        str(statement), parameters, sqlite3.OperationalError("no such table: feishu_auth_state")
                     )
 
             def rollback(self) -> None:
