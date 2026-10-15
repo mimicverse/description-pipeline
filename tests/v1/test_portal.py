@@ -590,7 +590,10 @@ class PreviewStore:
     def open_artifact(self, run_id: str, name: str, *, sha256: str):
         entry = self.runs.get(run_id) or {}
         preview = entry.get("preview") or {}
-        if (preview.get("files") or {}).get(name) != sha256:
+        expected = (preview.get("files") or {}).get(name)
+        if expected is None:
+            expected = (preview.get("report_files") or {}).get(name)
+        if expected != sha256:
             raise PipelineError("The requested artifact is not part of the previewed delivery")
         data = (entry.get("artifacts") or {}).get(name)
         if data is None:
@@ -1797,6 +1800,58 @@ class PortalTests(unittest.TestCase):
         anonymous = PortalClient(self.client.base)
         status, _, _ = anonymous.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
         self.assertEqual(status, 401)
+
+    def test_failed_run_serves_the_bound_diagnostic_quality_document(self) -> None:
+        """The unverified preview's report member is served under the same digest rule."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        urdf = b"<robot name='fixture'/>"
+        document = json.dumps({"passed": False, "subject_sha256": "d" * 64, "checks": []}).encode()
+        digest = hashlib.sha256(document).hexdigest()
+        self.store.add(
+            run_id,
+            meta={"handoff_sha256": "d" * 64},
+            delivery=True,
+            preview={
+                "schema_version": "solidworks-to-urdf.preview/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": run_id,
+                "subject_sha256": "d" * 64,
+                "urdf": "urdf/robot.urdf",
+                "files": {"urdf/robot.urdf": hashlib.sha256(urdf).hexdigest()},
+                "report_files": {"reports/quality.json": digest},
+                "verified": False,
+                "state": "unverified",
+                "reason": "verification_failed",
+            },
+            artifacts={"urdf/robot.urdf": urdf, "reports/quality.json": document},
+        )
+        status, headers, body = self.client.request(
+            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, document)
+        self.assertEqual(headers.get("Content-Type"), "application/json")
+        # The digest rule is unchanged: tampered bytes surface as a stream failure.
+        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b"tampered"
+        status, _, body = self.client.request(
+            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        )
+        self.assertEqual(status, 502)
+        self.assertNotIn(b"tampered", body)
+        # A member outside the bound member maps stays a clear 404.
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/other.json")
+        self.assertEqual(status, 404)
+
+    def test_verified_preview_does_not_expose_report_members(self) -> None:
+        self.client.login()
+        self._seed_passed_job()
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        self.assertEqual(status, 404)
 
     def test_failed_publish_diagnostics_take_precedence_over_older_copies(self) -> None:
         self.client.login()

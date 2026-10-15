@@ -467,5 +467,36 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
                 self.store.preview(RUN)
 
 
+    def test_diagnostic_preview_binds_the_retained_quality_report(self) -> None:
+        """The unverified preview exposes the quality report only bound to its subject."""
+
+        from description_pipeline.delivery import subject_digest
+
+        delivery = self._verified_delivery()
+        subject = subject_digest(delivery)
+        quality = delivery / "reports/quality.json"
+        write_json(quality, {"passed": False, "subject_sha256": subject, "checks": []})
+        write_json(self.store.receipt_path(RUN, "verify"), {"subject_sha256": subject, "error": "failed"})
+
+        preview = self.store._diagnostic_preview(RUN, delivery)
+        digest = hashlib.sha256(quality.read_bytes()).hexdigest()
+        self.assertEqual(preview["report_files"], {"reports/quality.json": digest})
+        self.assertIs(preview["verified"], False)
+
+        self.store._bound_previews[RUN] = (delivery, preview)
+        stream, size = self.store.open_artifact(RUN, "reports/quality.json", sha256=digest)
+        with contextlib.closing(stream):
+            served = stream.read()
+        self.assertEqual(served, quality.read_bytes())
+        self.assertEqual(size, len(served))
+        with self.assertRaises(PipelineError):
+            self.store.open_artifact(RUN, "reports/quality.json", sha256="f" * 64)
+
+        # An unbound report is not exposed through the member map at all.
+        write_json(quality, {"passed": False})
+        unbound = self.store._diagnostic_preview(RUN, delivery)
+        self.assertEqual(unbound["report_files"], {})
+
+
 if __name__ == "__main__":
     unittest.main()
