@@ -41,6 +41,7 @@ Check 'wording.no_blind_sleep' (-not $source.Contains('Start-Sleep -Seconds 60')
 Check 'wording.owner_proof_gate' ($source.Contains('lock_refused_unproven') -and $source.Contains('owner_ended'))
 Check 'wording.observer_tristate' ($source.Contains('observer_failed') -and $source.Contains('PROBE_IMPORT_FAILED'))
 Check 'wording.restore_path' ($source.Contains('Restore-PreviousEndpoint') -and $source.Contains('restore=$restore'))
+Check 'wording.stage_targets_precheck' ($source.Contains('endpoint_config_targets') -and $source.Contains('Get-UnsupportedEndpointConfigKeys'))
 Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath $lock')) 'never delete the ownership lock'
 if ($StaticOnly) {
   Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
@@ -51,7 +52,7 @@ if ($StaticOnly) {
 . $ScriptPath -Verb health -Binding @{ task_name = 'test-endpoint' }
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
-  'Get-PreviousGenerationBinding'
+  'Get-PreviousGenerationBinding', 'Get-UnsupportedEndpointConfigKeys'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
 # ---- harness: stub only the OS boundary -------------------------------------
@@ -158,6 +159,14 @@ function Reset-State {
 }
 
 # ---- ownership-fact units (real interpreters, stubbed OS boundary) ----------
+Reset-State
+$cleanConfig = Join-Path $generation 'clean-endpoint.json'
+[System.IO.File]::WriteAllText($cleanConfig, '{"schema_version":"solidworks-to-urdf.endpoint/v1","port":8765}')
+$legacyConfig = Join-Path $generation 'legacy-endpoint.json'
+[System.IO.File]::WriteAllText($legacyConfig, '{"schema_version":"solidworks-to-urdf.endpoint/v1","targets":{}}')
+Check 'precheck.clean_config' ((@(Get-UnsupportedEndpointConfigKeys $cleanConfig)).Count -eq 0)
+Check 'precheck.targets_reported' ((@(Get-UnsupportedEndpointConfigKeys $legacyConfig)) -contains 'targets')
+
 Reset-State
 $facts = Get-OwnershipRefusalFacts $generation $binding
 Check 'facts.no_lock_file' ((-not $facts.refused) -and ($facts.state -eq 'no_lock_file'))
@@ -304,6 +313,10 @@ $outer = Invoke-Outer 'startable_missing_receipt'
 Check 'outer.missing_receipt_health_unjudged' ((@($outer.calls | Where-Object { $_ -like 'start:*old*' }).Count -eq 1) -and
   ($outer.receipt.restore.started -eq $true) -and ($null -eq $outer.receipt.restore.healthy) -and
   ($outer.receipt.restore.error -match 'receipt is unavailable'))
+
+$outer = Invoke-Outer 'stage_targets_refused'
+Check 'outer.stage_refuses_targets_config' (($outer.message -match 'endpoint_config_targets') -and
+  ($outer.message -match 'targets') -and ($outer.message -match 'manually') -and (@($outer.calls).Count -eq 0))
 
 Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
 exit ([int]($script:failures.Count -gt 0))
