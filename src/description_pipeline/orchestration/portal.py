@@ -20,6 +20,7 @@ Run ``python -m description_pipeline.orchestration.portal --help`` for the confi
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import hmac
 import json
 import logging
@@ -59,6 +60,7 @@ from .airflow_client import (
     verified_result,
 )
 from ..io import PipelineError, digest
+from ..delivery import PIPELINE_ID
 from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
 from .linux_store import LinuxStore
@@ -157,6 +159,86 @@ _ARTIFACT_TYPES = {
     ".json": "application/json",
     ".png": "image/png",
 }
+#: Bounded preview payloads: totals always report the untruncated count.
+_PREVIEW_LIMIT = 50
+_SHA256_TEXT = re.compile(r"\A[0-9a-f]{64}\Z")
+#: Read precedence across the registered stages: the first registration of a member
+#: path wins, so a later stage's sealed copy is never shadowed by an earlier one.
+_STAGE_READ_ORDER = ("publish", "verify", "generate", "capture", "discover", "freeze")
+
+
+def _member_class(path: str) -> str:
+    """The member class projected from its path: reports are never subject members."""
+
+    return "report" if path.startswith("reports/") else "subject"
+
+
+def _failing_checks(report: dict) -> list[dict]:
+    """The exact failed checks of the one registered quality report.
+
+    The one convention both writers share: a row is failed when it carries the
+    boolean ``passed`` false OR the recorded ``state`` is ``"failed"``.
+    """
+
+    checks: list[dict] = []
+    for row in report.get("checks") or []:
+        if not isinstance(row, dict) or not (row.get("passed") is False or row.get("state") == "failed"):
+            continue
+        details = row.get("details") if isinstance(row.get("details"), dict) else {}
+        checks.append(
+            {
+                "id": str(row.get("id") or ""),
+                "state": str(row.get("state") or "failed"),
+                "message": str(details.get("error") or details.get("reason") or "自动检查未通过"),
+            }
+        )
+    return checks
+
+
+def _parse_member_json(data) -> dict:
+    """Parse one registered member's sealed bytes; missing or malformed stays empty."""
+
+    if not isinstance(data, bytes):
+        return {}
+    try:
+        parsed = json.loads(data.decode("utf-8-sig"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _delivery_warnings(members: dict) -> list[dict]:
+    """Input warnings and non-blocking discovery findings, from the same registered members."""
+
+    warnings: list[dict] = []
+    report = _parse_member_json(members.get("input/handoff.json"))
+    for item in report.get("warnings") or []:
+        if isinstance(item, dict) and item.get("code"):
+            warnings.append(
+                {
+                    "source": "input",
+                    "code": str(item["code"]),
+                    "object": "",
+                    "message": str(item.get("message") or ""),
+                    "detail": item.get("detail"),
+                }
+            )
+    payload = _parse_member_json(members.get("evidence/discovery.json"))
+    rows = payload.get("findings")
+    for item in rows if isinstance(rows, list) else []:
+        if isinstance(item, dict) and item.get("code") and item.get("blocking") is not True:
+            warnings.append(
+                {
+                    "source": "discovery",
+                    "code": str(item["code"]),
+                    "object": str(item.get("object") or ""),
+                    "message": str(item.get("message") or ""),
+                    "detail": item.get("detail"),
+                }
+            )
+    return warnings
+
+
 #: Readable labels for the automatically retained structural-team reports.
 _STRUCTURAL_REPORT_LABELS = {
     "reports/structural-team.md": "结构团队报告（可读 Markdown）",
@@ -2096,40 +2178,175 @@ class PortalApp:
         )
 
     # --------------------------------------------------------------- preview
-    def _preview_payload(self, session: PortalSession, dag_run_id: str, *, missing_ok: bool = False) -> dict | None:
+    def _authorize_run(self, session: PortalSession, dag_run_id: str) -> str:
+        """Every preview and every artifact re-authorizes against Airflow first.
+
+        An expired or revoked session, a deleted tenant or a run the operator
+        may not read can never be served from the preview cache or the endpoint.
+        """
+
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
-        # Every preview and every artifact re-authorizes against Airflow first: an expired or
-        # revoked session, a deleted tenant or a run the operator may not read can never be served
-        # from this cache or from the endpoint.
         try:
             self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
         except AirflowAuthError as error:
             raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录") from error
         except AirflowApiError as error:
             raise PortalError(HTTPStatus.NOT_FOUND, "该运行不存在或无权访问") from error
-        run_id = native_run_id(dag_run_id)
+        return native_run_id(dag_run_id)
+
+    def _read_projection(self, run_id: str) -> dict | None:
+        """The one DB read projection: registered run and stage rows of this attempt.
+
+        Members are the registered stage ``receipt.artifacts`` rows
+        (``{path, bytes, sha256}``) with their ``checkpoint_uri``; expected
+        digests always come from that registration, never from current bytes.
+        """
+
+        platform = self.config.platform_store
+        if platform is None:
+            return None
+        record = platform.run_record(run_id)
+        if not isinstance(record, dict):
+            return None
+        stages = platform.stage_records(run_id)
+        stages = stages if isinstance(stages, dict) else {}
+        by_stage: dict[str, dict] = {}
+        for stage in _STAGE_READ_ORDER:
+            row = stages.get(stage)
+            if not isinstance(row, dict):
+                continue
+            receipt = row.get("receipt") if isinstance(row.get("receipt"), dict) else {}
+            members: dict[str, dict] = {}
+            for artifact in receipt.get("artifacts") if isinstance(receipt.get("artifacts"), list) else []:
+                if not isinstance(artifact, dict):
+                    continue
+                path = artifact.get("path")
+                if not isinstance(path, str) or not path:
+                    continue
+                members.setdefault(
+                    path,
+                    {
+                        "bytes": artifact.get("bytes"),
+                        "sha256": artifact.get("sha256"),
+                        "checkpoint_uri": row.get("checkpoint_uri"),
+                        "stage": stage,
+                        "state": row.get("state"),
+                    },
+                )
+            by_stage[stage] = members
+        members: dict[str, dict] = {}
+        for stage in _STAGE_READ_ORDER:
+            for path, member in by_stage.get(stage, {}).items():
+                members.setdefault(path, member)
+        return {"run": record, "stages": stages, "members": members, "by_stage": by_stage}
+
+    def _member_bytes(self, path: str, member: dict) -> bytes | None:
+        """Read one registered member's sealed bytes; failure stays absent."""
+
+        platform = self.config.platform_store
+        checkpoint = member.get("checkpoint_uri")
+        if platform is None or not isinstance(checkpoint, str) or not checkpoint:
+            return None
+        try:
+            root = Path(platform.sealed_path(checkpoint)).resolve()
+        except (PlatformStoreError, PipelineError, OSError, ValueError):
+            return None
+        target = (root / path).resolve()
+        if root not in target.parents:
+            return None
+        try:
+            return target.read_bytes()
+        except OSError:
+            return None
+
+    def _preview_from_projection(self, run_id: str, projection: dict) -> dict | None:
+        """One preview payload over the registered members of this attempt.
+
+        A completed verify stage serves the verified preview; a failed verify
+        stage with registered members serves the explicitly unverified
+        diagnostic preview; anything else returns ``None`` (readiness).
+        """
+
+        stages = projection.get("stages")
+        verify = stages.get("verify") if isinstance(stages, dict) else None
+        state = verify.get("state") if isinstance(verify, dict) else None
+        members = projection.get("by_stage", {}).get("verify") or {}
+        if state != "completed" and not (state == "failed" and members):
+            return None
+        receipt = verify.get("receipt") if isinstance(verify.get("receipt"), dict) else {}
+        verified = state == "completed"
+        files = {
+            path: member["sha256"]
+            for path, member in members.items()
+            if _member_class(path) == "subject" and path != "manifest.json" and isinstance(member.get("sha256"), str)
+        }
+        report_files = {
+            path: member["sha256"]
+            for path, member in members.items()
+            if _member_class(path) == "report" and isinstance(member.get("sha256"), str)
+        }
+        if "urdf/robot.urdf" not in files:
+            raise PipelineError("The registered delivery carries no urdf/robot.urdf member")
+        payload = {
+            "schema_version": "solidworks-to-urdf.preview/v1",
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "subject_sha256": receipt.get("subject_sha256"),
+            "urdf": "urdf/robot.urdf",
+            "files": files,
+            "report_files": report_files,
+            "verified": verified,
+            "state": "verified" if verified else "unverified",
+        }
+        if not verified:
+            quality_member = members.get("reports/quality.json", {})
+            report = _parse_member_json(self._member_bytes("reports/quality.json", quality_member))
+            failing = _failing_checks(report)
+            warnings = _delivery_warnings(
+                {
+                    path: self._member_bytes(path, member)
+                    for path, member in members.items()
+                    if path in {"input/handoff.json", "evidence/discovery.json"}
+                }
+            )
+            payload.update(
+                {
+                    "reason": "verification_failed",
+                    "error": str(receipt.get("error") or ""),
+                    "failing_checks": failing[:_PREVIEW_LIMIT],
+                    "failing_checks_total": len(failing),
+                    "warnings": warnings[:_PREVIEW_LIMIT],
+                    "warnings_total": len(warnings),
+                }
+            )
+        return payload
+
+    def _preview_payload(self, session: PortalSession, dag_run_id: str, *, missing_ok: bool = False) -> dict | None:
+        run_id = self._authorize_run(session, dag_run_id)
         now = time.time()
         with self._lock:
             cached = self._previews.get(run_id)
         if cached is not None and now - cached[0] <= self.config.preview_ttl:
             return cached[1]
-        store = self._store()
-        if store is not None and isinstance(store.meta(run_id), dict):
+        projection = self._read_projection(run_id)
+        preview = None
+        failure: PipelineError | None = None
+        if projection is not None:
             try:
-                preview = store.preview(run_id)
+                preview = self._preview_from_projection(run_id, projection)
             except PipelineError as error:
-                if missing_ok:
-                    return None
-                if store.delivery_dir(run_id) is None:
-                    raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付") from error
-                raise PortalError(HTTPStatus.CONFLICT, f"模型尚未通过独立校验：{error}") from error
-            with self._lock:
-                self._previews[run_id] = (now, preview)
-            return preview
-        if missing_ok:
-            return None
-        raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
+                failure = error
+        if preview is None:
+            if missing_ok:
+                return None
+            if projection is not None and projection["members"]:
+                detail = f"：{failure}" if failure is not None else ""
+                raise PortalError(HTTPStatus.CONFLICT, f"模型尚未通过独立校验{detail}")
+            raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
+        with self._lock:
+            self._previews[run_id] = (now, preview)
+        return preview
 
     def _preview(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ)
@@ -2141,97 +2358,53 @@ class PortalApp:
             artifact = validate_artifact_name(name)
         except EndpointProtocolError as error:
             raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
-        # The automatically generated structural-team report must stay downloadable on
-        # failed runs, which carry no verified delivery: fall back to the copy the
-        # pipeline retained in the run's evidence.
-        retained = artifact in TEAM_REPORTS
-        preview = self._preview_payload(session, dag_run_id, missing_ok=retained)
-        digest = (preview or {}).get("files", {}).get(artifact)
-        if not isinstance(digest, str):
-            # Non-subject report members of a bound unverified delivery are served by the
-            # same digest rule: the preview binding lists them and the store's artifact
-            # stream still proves the exact bytes.
-            digest = (preview or {}).get("report_files", {}).get(artifact)
-        if not isinstance(digest, str) and retained:
-            return self._retained_report(start_response, dag_run_id, artifact)
-        if not isinstance(digest, str):
-            raise PortalError(HTTPStatus.NOT_FOUND, "该文件不在已验证交付清单中")
-        store = self._store()
-        store_run_id = native_run_id(dag_run_id)
-        if store is not None and isinstance(store.meta(store_run_id), dict):
-            try:
-                stream, _size = store.open_artifact(store_run_id, artifact, sha256=digest)
-            except PipelineError as error:
-                raise PortalError(HTTPStatus.NOT_FOUND, str(error)) from error
-            data = bytearray()
-            try:
-                with stream:
-                    while True:
-                        chunk = stream.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        data.extend(chunk)
-            except PipelineError as error:
-                # The stream verifies the digest at EOF; nothing may reach the browser first.
-                raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
-            content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
-            headers = [
-                ("Content-Type", content_type),
-                ("Content-Length", str(len(data))),
-                ("Cache-Control", "private, max-age=300"),
-            ]
-            start_response("200 OK", _common_headers(headers, self.config))
-            return [bytes(data)]
-        raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
-
-    def _structural_report_files(self, dag_run_id: str) -> dict[str, Path]:
-        """Resolve the automatically retained structural-team report members of one run.
-
-        Shared by the artifact route and the run-page links so both can never diverge.
-        The candidates are display projections, never part of the engineering subject:
-        the newest failed-publish diagnostics under ``<run>/output.failed/reports/``
-        take precedence, then the bound delivery that ``store.delivery_dir`` resolves
-        (the published output or the verified-but-unpublished checkpoint), then the
-        fetched native report of ``<run>/structural-team/`` and a recorded failure
-        receipt under ``<run>/reports/``.  Names are fixed to ``TEAM_REPORTS`` and
-        every candidate stays inside this run's store directory.
-        """
-
-        store = self._store()
-        if store is None or _RUN_ID.fullmatch(dag_run_id) is None:
-            return {}
-        run_id = native_run_id(dag_run_id)
-        run_dir = store.run_dir(run_id)
-        delivery = store.delivery_dir(run_id)
-        resolved: dict[str, Path] = {}
-        for artifact in TEAM_REPORTS:
-            name = Path(artifact).name
-            candidates = [
-                run_dir / "output.failed" / "reports" / name,
-                *([delivery / "reports" / name] if delivery is not None else []),
-                run_dir / "structural-team" / name,
-                run_dir / "reports" / name,
-            ]
-            for candidate in candidates:
-                if candidate.is_file():
-                    resolved[artifact] = candidate
-                    break
-        return resolved
-
-    def _retained_report(self, start_response: Callable, dag_run_id: str, artifact: str) -> Iterable[bytes]:
-        """Serve one retained structural-team report member through the authorized route."""
-
-        path = self._structural_report_files(dag_run_id).get(artifact)
-        if path is not None:
-            data = path.read_bytes()
-            headers = [
-                ("Content-Type", _ARTIFACT_TYPES.get(path.suffix.lower(), "application/octet-stream")),
-                ("Content-Length", str(len(data))),
-                ("Cache-Control", "private, max-age=60"),
-            ]
-            start_response("200 OK", _common_headers(headers, self.config))
-            return [data]
-        raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有结构团队报告")
+        run_id = self._authorize_run(session, dag_run_id)
+        projection = self._read_projection(run_id)
+        member = projection["members"].get(artifact) if projection is not None else None
+        if member is None:
+            raise PortalError(HTTPStatus.NOT_FOUND, "该文件尚未登记为本次运行的封存产物")
+        expected = member.get("sha256")
+        length = member.get("bytes")
+        checkpoint = member.get("checkpoint_uri")
+        if not (
+            isinstance(expected, str)
+            and _SHA256_TEXT.fullmatch(expected)
+            and type(length) is int
+            and length >= 0
+            and isinstance(checkpoint, str)
+            and checkpoint
+        ):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供")
+        platform = self.config.platform_store
+        try:
+            root = Path(platform.sealed_path(checkpoint)).resolve() if platform is not None else None
+        except (PlatformStoreError, PipelineError, OSError, ValueError) as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供") from error
+        data = bytearray()
+        try:
+            if root is None:
+                raise OSError("sealed storage is not configured")
+            target = (root / artifact).resolve()
+            if root not in target.parents:
+                raise OSError("member path escapes the registered checkpoint")
+            with target.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+        except OSError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
+        if len(data) != length or hashlib.sha256(data).hexdigest() != expected:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供")
+        content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
+        headers = [
+            ("Content-Type", content_type),
+            ("Content-Length", str(len(data))),
+            ("Cache-Control", "private, max-age=300"),
+        ]
+        start_response("200 OK", _common_headers(headers, self.config))
+        return [bytes(data)]
 
     def _retained_report_links(self, dag_run_id: str) -> list[dict]:
         """Downloadable entries of the automatically retained structural-team report.
@@ -2240,7 +2413,10 @@ class PortalApp:
         same resolver backs the download so a link can never point at a missing member.
         """
 
-        resolved = self._structural_report_files(dag_run_id)
+        if _RUN_ID.fullmatch(dag_run_id) is None:
+            return []
+        projection = self._read_projection(native_run_id(dag_run_id))
+        resolved = projection["members"] if projection is not None else {}
         return [
             {
                 "path": artifact,
