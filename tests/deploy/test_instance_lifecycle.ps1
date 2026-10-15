@@ -55,7 +55,8 @@ if ($StaticOnly) {
 . $ScriptPath -Verb health -Binding @{ task_name = 'test-endpoint' }
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
-  'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram'
+  'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram',
+  'Get-ServedStateRoot'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
 # In-process refusal cases need the script's top-level Die to throw instead of exiting the
@@ -67,6 +68,7 @@ $script:TaskMissing = $false
 $script:TaskState = 'Ready'
 $script:ProcScenario = 'missing'
 $script:AccountEnv = @{}
+$script:ServedStateRoot = ''
 $script:ProbeScenario = 'refused'
 $script:SettleOutcomes = @()
 $script:Starts = 0
@@ -134,6 +136,7 @@ function Write-Receipt {
 }
 function Get-AccountEnvironment { param([string]$Name) return [string]$script:AccountEnv[$Name] }
 function Set-AccountEnvironment { param([string]$Name, [string]$Value) $script:AccountEnv[$Name] = $Value }
+function Get-ServedStateRoot { param([string]$configPath) return [string]$script:ServedStateRoot }
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("il-settle-" + [guid]::NewGuid().ToString('N'))
 $generation = Join-Path $root 'generation'
@@ -159,6 +162,7 @@ function Reset-State {
   $script:Sleeps.Clear()
   $script:CallLog.Clear()
   $script:AccountEnv.Clear()
+  $script:ServedStateRoot = $root
   $script:OldHealthOk = $true
   $script:HealthProbes.Clear()
   [System.IO.File]::WriteAllText(
@@ -202,11 +206,11 @@ $script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = (Join-Path $root 'other/c
 $message = ''
 try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
 Check 'pins.divergent_ownership_refused' ($message -match 'cad_domain_override_refused')
-# A changed state root cannot slip in as a new domain.
+# A changed state root cannot slip in as a new domain: the served configuration refuses it first.
 $script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical
 $message = ''
 try { $null = Assert-DomainPins (Join-Path $root 'other-state') $generation } catch { $message = $_.Exception.Message }
-Check 'pins.state_root_change_refused' ($message -match 'cad_domain_override_refused')
+Check 'pins.state_root_change_refused' ($message -match 'state_root_mismatch')
 # A divergent endpoint-root pin is refused: the served generation may only be restated.
 $script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = (Join-Path $root 'somewhere-else')
 $message = ''
@@ -220,6 +224,12 @@ Check 'pins.survive_restart' (($script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] -
   ($script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] -eq $canonical))
 # An independent default call (no override) resolves the pinned domain.
 Check 'pins.independent_default_call' ((Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE') -eq $canonical)
+# The binding's state_root never self-grants: a served configuration declaring another root refuses.
+$script:ServedStateRoot = (Join-Path $root 'other-state')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.served_state_root_mismatch_refused' ($message -match 'state_root_mismatch')
+$script:ServedStateRoot = $root
 
 Reset-State
 $facts = Get-OwnershipRefusalFacts $generation $binding
