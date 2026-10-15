@@ -202,6 +202,29 @@ def _authored_multiline_text(value: Any) -> bool:
     )
 
 
+def _saved_configuration_observed(record: dict, name: str) -> bool:
+    """The delivery configuration must be observed as the saved active one.
+
+    A recorded name (the dp property or the saved-name string) is not evidence
+    by itself: the native document state must show the document saved
+    (``save_flag`` strictly false, never unknown) and the active configuration
+    matching on both the before and the after reading.
+    """
+
+    state = record.get("document_state")
+    if not isinstance(state, dict):
+        return False
+    readings = (state.get("before"), state.get("after"))
+    if not all(isinstance(reading, dict) for reading in readings):
+        return False
+    return all(
+        reading.get("save_flag") is False
+        and isinstance(reading.get("configuration"), str)
+        and reading["configuration"].strip() == name
+        for reading in readings
+    )
+
+
 def _snake(value: Any) -> str | None:
     """Return a stable snake_case identifier, or ``None`` when nothing remains."""
 
@@ -3609,6 +3632,11 @@ def _identity(
     summary = str(summary).strip() if _text(summary) else None
     if summary is not None:
         sources["change_summary"] = "cad"
+        # One line-ending standard with the independent read: a CAD-authored
+        # summary folds CRLF and a lone CR to LF before it is validated and
+        # recorded, while every other control character still refuses.  The
+        # submission path stays LF-only (the portal already normalizes it).
+        summary = summary.replace("\r\n", "\n").replace("\r", "\n").strip()
     elif sub_summary is not None:
         summary = sub_summary
         sources["change_summary"] = "submission"
@@ -3683,6 +3711,17 @@ def _identity(
             _finding("discovery.configuration_missing", "assembly", "no saved delivery configuration is recorded")
         )
     delivery = str(delivery).strip() if _text(delivery) else None
+    if delivery is not None and not _saved_configuration_observed(record, delivery):
+        findings.append(
+            _finding(
+                "discovery.configuration_unproven",
+                "assembly",
+                "the delivery configuration is not observed as the saved active configuration; "
+                "a recorded name alone is not evidence",
+                {"configuration": delivery, "document_state": record.get("document_state")},
+            )
+        )
+        delivery = None
     main = assembly or _identity_value(record, namespace, "main_assembly")
     main = str(main).replace("\\", "/") if _text(main) else None
     if main is None or main not in native_files:
@@ -4490,7 +4529,7 @@ def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, 
                 "configuration": content["configuration"],
                 "hardware_id": content["hardware_id"],
                 "hardware_source": "platform-config"
-                if identity_sources.get("hardware_id") == "submission"
+                if identity_sources.get("hardware_id") == "platform_configuration"
                 else "cad",
             },
             "metadata": {

@@ -778,6 +778,23 @@ def read_scene(snapshot: Path) -> dict:
 CONTRACT_SCHEMA_VERSION = "solidworks-to-urdf.stage-contract/v1"
 
 
+def saved_document_state(configuration: str = "Default") -> dict:
+    """The native before/after document readings of one saved, active configuration."""
+
+    observed = {
+        "save_flag": False,
+        "configuration": configuration,
+        "needs_rebuild2_value": 0,
+        "configuration_needs_rebuild": False,
+        "read_only": True,
+    }
+    return {
+        "before": copy.deepcopy(observed),
+        "after": copy.deepcopy(observed),
+        "used_api": "IModelDoc2.GetSaveFlag/IConfiguration.Name",
+    }
+
+
 def default_source_record(
     *,
     hardware_id: str = "m3.0",
@@ -995,9 +1012,9 @@ def native_discovery_delivery(root: Path, prepared: Path, *, record: dict | None
     The CAD originals move to ``input/cad`` at their frozen-source-relative
     paths; the record becomes ``evidence/discovery.json`` (frozen additions
     applied); the embedded records move under ``input/records`` keeping their
-    recorded ``package_file`` names; ``input/source.json`` carries the archived
-    content identity rebuilt from the recorded identity.  Returns the delivery
-    root.
+    recorded ``package_file`` names; ``input/source.json`` is the prepared
+    package's archived content identity verbatim (the fixture record only
+    backs packages that could not name one).  Returns the delivery root.
     """
 
     import hashlib
@@ -1025,7 +1042,8 @@ def native_discovery_delivery(root: Path, prepared: Path, *, record: dict | None
         if package_file and source.is_file():
             records[package_file] = source.read_text(encoding="utf-8")
     payload = frozen_discovery_payload(record, files=files)
-    source_record = source_record_for_robot(record)
+    prepared_source = prepared / "source.json"
+    source_record = read_data(prepared_source) if prepared_source.is_file() else source_record_for_robot(record)
     return write_target_delivery(
         root,
         capture={},

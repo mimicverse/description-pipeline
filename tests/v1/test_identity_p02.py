@@ -19,6 +19,7 @@ from description_pipeline.orchestration.airflow_client import (
 from description_pipeline.orchestration.discovery_transfer import _GENERATED_MEMBERS
 from description_pipeline.repository import urdf_pr
 from description_pipeline.sources.solidworks import discovery
+from tests.sources import support
 
 DIGEST = "a" * 64
 CONTROL = "b" * 64
@@ -29,6 +30,7 @@ def _record(identity: dict | None = None) -> dict:
     return {
         "identity": identity or {},
         "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
         "properties": {},
         "components": [],
         "datums": [],
