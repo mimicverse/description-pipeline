@@ -11,7 +11,7 @@
 --   operation  queued / running / succeeded / failed / cancelled / unresolved
 --   request    immutable record; the projection reports the accepted fact only
 
-CREATE TABLE IF NOT EXISTS platform.admission (
+CREATE TABLE IF NOT EXISTS :"platform_schema".admission (
     id smallint PRIMARY KEY CHECK (id = 1),
     state text NOT NULL CHECK (state IN ('open', 'closed')),
     reason text NOT NULL,
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS platform.admission (
     revision bigint NOT NULL DEFAULT 1
 );
 
-CREATE TABLE IF NOT EXISTS platform.request (
+CREATE TABLE IF NOT EXISTS :"platform_schema".request (
     request_id text PRIMARY KEY,
     principal text NOT NULL,
     target_hardware text NOT NULL,
@@ -34,10 +34,10 @@ CREATE TABLE IF NOT EXISTS platform.request (
     sealed_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS platform.run (
+CREATE TABLE IF NOT EXISTS :"platform_schema".run (
     run_id text PRIMARY KEY,
-    request_id text NOT NULL REFERENCES platform.request (request_id),
-    parent_run_id text REFERENCES platform.run (run_id),
+    request_id text NOT NULL REFERENCES :"platform_schema".request (request_id),
+    parent_run_id text REFERENCES :"platform_schema".run (run_id),
     from_stage text,
     state text NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'unresolved')),
     tool_identity jsonb,
@@ -49,8 +49,8 @@ CREATE TABLE IF NOT EXISTS platform.run (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS platform.stage (
-    run_id text NOT NULL REFERENCES platform.run (run_id),
+CREATE TABLE IF NOT EXISTS :"platform_schema".stage (
+    run_id text NOT NULL REFERENCES :"platform_schema".run (run_id),
     stage text NOT NULL,
     state text NOT NULL CHECK (state IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'unresolved', 'blocked')),
     -- Sealed receipt / checkpoint reference, registered atomically with a confirmation.
@@ -62,9 +62,9 @@ CREATE TABLE IF NOT EXISTS platform.stage (
     PRIMARY KEY (run_id, stage)
 );
 
-CREATE TABLE IF NOT EXISTS platform.operation (
+CREATE TABLE IF NOT EXISTS :"platform_schema".operation (
     operation_id text PRIMARY KEY,
-    run_id text NOT NULL REFERENCES platform.run (run_id),
+    run_id text NOT NULL REFERENCES :"platform_schema".run (run_id),
     stage text,
     kind text NOT NULL CHECK (kind IN ('dispatch', 'native', 'publish', 'cancel', 'reconcile', 'cache_release')),
     state text NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'unresolved')),
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS platform.operation (
 
 -- Installation initializes the single admission row CLOSED; the start verb opens it through
 -- the store API, which owns every later transition.
-INSERT INTO platform.admission (id, state, reason, actor)
+INSERT INTO :"platform_schema".admission (id, state, reason, actor)
 VALUES (1, 'closed', 'install', 'apply')
 ON CONFLICT (id) DO NOTHING;
 
@@ -94,8 +94,8 @@ ON CONFLICT (id) DO NOTHING;
 -- change they describe.  ``seq`` is assigned by the application inside the run-locked
 -- transaction; the primary key serializes duplicates.  The role boundary keeps this table
 -- append-only (INSERT/SELECT only - no UPDATE/DELETE grants, no triggers).
-CREATE TABLE IF NOT EXISTS platform.run_event (
-    run_id text NOT NULL REFERENCES platform.run (run_id),
+CREATE TABLE IF NOT EXISTS :"platform_schema".run_event (
+    run_id text NOT NULL REFERENCES :"platform_schema".run (run_id),
     seq bigint NOT NULL CHECK (seq > 0),
     at timestamptz NOT NULL DEFAULT now(),
     kind text NOT NULL,
