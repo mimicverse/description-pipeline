@@ -139,6 +139,10 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
+验收固定同一个已合入受保护 `main` 的提交。CI 的必需门包含锁定 Airflow 环境中的真实普通操作员提交/调度及发行完整性；模拟端点只覆盖运输与失败阻断。发布完整发行后，校验资产摘要并在两端按同一版本 stage/promote，不对活动发行目录补拷源码或脚本。最终记录绑定源码提交、发行清单、双端安装/配置、原始工程清单、运行、六阶段收据、独立报告、实际 URDF 预览和模型 PR。当前模型仓库为 `mimicverse/description`，集成 base 为 `main`；历史 PR 只作对照。
+
+正式入口须验证普通操作员的必选目标及多行说明，并用浏览器实际加载绑定交付的 URDF/网格、执行关节交互。生成后自动显示预览；独立验证未通过时只提供明确标注的未验证诊断预览，不能使用通过绿标。页面阶段、检查计数和资格与同一封存结果一致。验收中的待执行项保持待执行，不因服务健康或历史运行通过而封板。
+
 <a id="lifecycle"></a>
 ## 维护、升级与恢复
 
@@ -162,6 +166,4 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 
 ## 端点停止与重启（settle 规程与锁拒绝）
 
-升级时停止 Windows 端点遵循统一 settle 规程：停止端点任务后等待端口无监听且无写入进程残留（停止脚本的清扫循环以此为准，超时即判停止失败）；随后启动任务并做 **≥3 分钟存活校验**——任务 Running、8765 监听 PID 连续、经令牌认证的 `/health` ready。启动若被拒绝并报 `Another endpoint owns the state root or its ownership lock is unavailable`：属瞬时状态，等待 **≥60 秒后仅重试一次**，并在回执中记录拒绝与重试；再次拒绝即停机排查。交互 CAD 机器离线期间，solidworks 隧道单元可能显示 activating/重试——这是**外部状态**，如实记录，绝不判为部署失败。
-
-`inspect-release.py` 随发行树交付并由操作员就地运行；不另行“装入操作员工作目录”。若某代切换时缺少该件（旧发行树），从当前发行树补拷该件，不是代码变更。两线均不存在 `feature/<hardware>` 的 PR base 规则；现役唯一规则=well-formed branch name 校验。
+停止 Windows 端点后等待端口无监听且无自有写入进程残留，超时即停止失败；随后启动任务并做 **≥3 分钟存活校验**：任务 Running、配置端口的监听进程身份连续、经令牌认证的 `/health` ready。启动若因所有权锁不可用被拒绝，先核对锁属主和进程；确认上一自有端点已结束后，等待 **≥60 秒再重试一次**并记录。无法证明锁属主已结束或再次拒绝时停止切换并排查，不能杀死未知进程或删锁强行启动。Windows 离线或隧道重试均如实记为不可用；双端未完成身份与就绪核验时不能开放准入或报告部署成功。
