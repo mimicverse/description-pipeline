@@ -15,6 +15,8 @@ from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import EndpointError
 from description_pipeline.orchestration.linux_store import LinuxStore
 
+from .portal_read_support import StoreProjection
+
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
 CHILD = "3f6a5c2e-6c41-4a1e-9c2a-2a1f7a1d0c33"
 SUBJECT = "a" * 64
@@ -128,7 +130,7 @@ class PortalSplitTests(unittest.TestCase):
             portal_module.PortalConfig(
                 airflow=self.airflow,
                 endpoint=lambda: self.windows,
-                pipeline_store_root=self.store.root,
+                platform_store=StoreProjection(self.store),
             )
         )
 
@@ -234,7 +236,7 @@ class PortalSplitTests(unittest.TestCase):
             portal_module.PortalConfig(
                 airflow=self.airflow,
                 endpoint=lambda: self.windows,
-                pipeline_store_root=self.store.root,
+                platform_store=StoreProjection(self.store),
                 upload_root=upload_root,
             )
         )

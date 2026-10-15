@@ -71,11 +71,13 @@ const TASK_STATES = {
   none: "待执行",
   completed: "完成",
 };
-const TRANSPORT = {
-  resolve_handoff: "接收目录",
-  start_job: "提交作业",
-  wait_for_job: "查询作业",
-  confirm_job: "确认交付",
+const TASK_LABELS = {
+  freeze: "冻结输入",
+  discover: "解析结构",
+  capture: "采集证据",
+  generate: "生成 URDF",
+  verify: "独立验证",
+  publish: "提交评审 PR",
 };
 const CHECK_STATES = { passed: "通过", failed: "失败", not_run: "未执行", unsupported: "不支持" };
 const STAGE_STATES = { not_run: "未执行", running: "执行中", completed: "完成", failed: "失败", blocked: "上游阻断" };
@@ -91,18 +93,22 @@ const AUTOMATIC_STATES = {
   running: "检查中",
 };
 const RETRY_REASONS = {
-  transport_recovery: "继续原作业，不重新采集 CAD。",
+  temporary_disconnection: "继续原作业，不重新采集 CAD。",
+  evidence_corruption: "捕获证据已封存：恢复只重读封存证据，不重采 CAD。",
+  engineering_terminal_failure: "工程阶段已终态失败：请按检查结果修复后新建关联运行。",
+  publication_response_unknown: "发布响应未知：请先完成结果对账，不可原地重试。",
   run_active: "运行尚未结束。",
   run_succeeded: "运行已成功。",
   run_missing: "该运行已不存在，请刷新运行列表。",
-  resolution_not_success: "原输入未完成冻结，请查看问题并新建运行。",
+  admission_failed: "原输入未完成冻结，请查看问题并新建运行。",
   unknown_failed_task: "无法确认可恢复的任务，请联系平台维护人员。",
-  resolution_or_capture_failed: "请修正工程目录或采集问题，再新建运行。",
-  publication_failed: "发布失败，请修正问题后新建运行。",
-  deleted: "此运行已删除：请先恢复后再重试或重跑。",
-  native_terminal_failure: "原作业已终止；可在阶段页选择重新运行。",
-  no_failed_transport_task: "没有可恢复的任务，请查看问题与发现。",
+  no_failed_operation: "没有失败的操作可恢复，请查看问题与发现。",
+  native_terminal_failure: "原作业已终止；可查看检查结果后新建关联运行。",
+  native_evidence_unavailable: "无法确认原生作业证据，稍后再试。",
+  sealed_evidence_reimport: "捕获证据已封存：恢复只重读封存证据，不重采 CAD。",
+  portable_retry: "继续无副作用阶段，不重新采集 CAD。",
   endpoint_evidence_unavailable: "无法确认原作业状态，稍后再试。",
+  deleted: "此运行已删除：请先恢复后再重试或重跑。",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -2030,7 +2036,7 @@ function renderRun(run) {
   for (const task of run.tasks || []) {
     const chip = document.createElement("span");
     chip.className = `chip ${task.state || ""}`.trim();
-    chip.textContent = `${TRANSPORT[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
+    chip.textContent = `${TASK_LABELS[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
     progress.append(chip);
   }
 

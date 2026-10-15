@@ -592,7 +592,10 @@ class PreviewStore:
     def open_artifact(self, run_id: str, name: str, *, sha256: str):
         entry = self.runs.get(run_id) or {}
         preview = entry.get("preview") or {}
-        if (preview.get("files") or {}).get(name) != sha256:
+        expected = (preview.get("files") or {}).get(name)
+        if expected is None:
+            expected = (preview.get("report_files") or {}).get(name)
+        if expected != sha256:
             raise PipelineError("The requested artifact is not part of the previewed delivery")
         data = (entry.get("artifacts") or {}).get(name)
         if data is None:
@@ -635,6 +638,114 @@ class FakePlatformStore:
         self.admit_error: Exception | None = None
         self.admits: list[dict] = []
         self.displays: dict[str, object] = {}
+        #: The one preview fixture this double projects registered reads from.
+        self.fixtures: PreviewStore | None = None
+
+    # ------------------------------------------- registered read projection (IF-13)
+    def _entry(self, run_id: str) -> dict | None:
+        if self.fixtures is None:
+            return None
+        entry = self.fixtures.runs.get(run_id)
+        return entry if isinstance(entry, dict) and entry.get("meta") is not None else None
+
+    def run_record(self, run_id: str) -> dict | None:
+        entry = self._entry(run_id)
+        if entry is None:
+            return None
+        merged = entry.get("merged") or {}
+        state = merged.get("status")
+        return {
+            "run_id": run_id,
+            "state": str(state) if isinstance(state, str) and state else None,
+            "request_id": None,
+            "parent_run_id": None,
+            "from_stage": None,
+            "tool_identity": None,
+        }
+
+    def _stage_members(self, run_id: str) -> list[dict]:
+        entry = self._entry(run_id) or {}
+        preview = entry.get("preview")
+        if not isinstance(preview, dict):
+            return []
+        files = {**(preview.get("files") or {}), **(preview.get("report_files") or {})}
+        artifacts = entry.get("artifacts") or {}
+        rows = []
+        for path in sorted(files):
+            data = artifacts.get(path)
+            rows.append(
+                {
+                    "path": path,
+                    "bytes": len(data) if isinstance(data, (bytes, bytearray)) else 0,
+                    "sha256": files[path],
+                }
+            )
+        return rows
+
+    def stage_records(self, run_id: str) -> dict[str, dict]:
+        entry = self._entry(run_id)
+        if entry is None:
+            return {}
+        stages: dict[str, dict] = {
+            stage: {
+                "stage": stage,
+                "state": "completed",
+                "receipt": {"subject_sha256": None, "artifacts": []},
+                "checkpoint_uri": f"store://sealed/{run_id}/{stage}",
+                "reused_from_run": None,
+                "original_executed_at": None,
+            }
+            for stage in entry.get("checkpoints") or ()
+        }
+        preview = entry.get("preview")
+        if isinstance(preview, dict):
+            verified = preview.get("verified") is not False
+            stages["verify"] = {
+                "stage": "verify",
+                "state": "completed" if verified else "failed",
+                "receipt": {
+                    "subject_sha256": preview.get("subject_sha256"),
+                    "artifacts": self._stage_members(run_id),
+                    "error": preview.get("error"),
+                },
+                "checkpoint_uri": f"store://sealed/{run_id}/verify",
+                "reused_from_run": None,
+                "original_executed_at": None,
+            }
+        return stages
+
+    def run_events(self, run_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict]:
+        entry = self._entry(run_id) or {}
+        events = (entry.get("merged") or {}).get("events")
+        return list(events) if isinstance(events, list) else []
+
+    def sealed_path(self, checkpoint_uri: str):
+        """Materialize the registered checkpoint members and return their root."""
+
+        prefix = "store://sealed/"
+        if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith(prefix):
+            raise PlatformStoreError("invalid sealed reference")
+        parts = checkpoint_uri.removeprefix(prefix).split("/")
+        if len(parts) != 2 or not all(parts) or self.fixtures is None:
+            raise PlatformStoreError("invalid sealed reference")
+        run_id, stage = parts
+        entry = self._entry(run_id)
+        if entry is None:
+            raise PlatformStoreError("the run is not registered")
+        base = self.fixtures.root / "sealed" / run_id / stage
+        preview = entry.get("preview")
+        files = {}
+        if isinstance(preview, dict):
+            files = {**(preview.get("files") or {}), **(preview.get("report_files") or {})}
+        artifacts = entry.get("artifacts") or {}
+        for path, _digest in files.items():
+            data = artifacts.get(path)
+            if not isinstance(data, (bytes, bytearray)):
+                continue
+            target = base / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(bytes(data))
+        return base
 
     def admission(self):
         if self.read_error is not None:
@@ -668,16 +779,13 @@ class PortalTests(unittest.TestCase):
         self.store_root = Path(tempfile.mkdtemp(prefix="portal-store-"))
         self.addCleanup(shutil.rmtree, self.store_root, ignore_errors=True)
         self.store = PreviewStore(self.store_root)
-        store_patch = patch("description_pipeline.orchestration.portal.LinuxStore", lambda root: self.store)
-        store_patch.start()
-        self.addCleanup(store_patch.stop)
+        self.platform.fixtures = self.store
         self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         config = PortalConfig(
             airflow=AirflowApi(self.airflow.url),
             endpoint=lambda: self.endpoint,
             static_dir=self.static_dir,
             upload_root=self.upload_root,
-            pipeline_store_root=self.store_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
         )
@@ -704,7 +812,6 @@ class PortalTests(unittest.TestCase):
             endpoint=lambda: self.endpoint,
             static_dir=self.static_dir,
             upload_root=self.upload_root,
-            pipeline_store_root=self.store_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
         )
@@ -731,7 +838,32 @@ class PortalTests(unittest.TestCase):
             artifacts=_endpoint_artifacts(),
             checkpoints=("capture", "generate", "verify"),
         )
+        self._record_fixture_events(run_id)
         return dag_run_id
+
+    def _record_fixture_events(self, run_id: str) -> None:
+        """Mirror the seeded protocol events into the registered side.
+
+        The runner records the observed stage/check events in the platform store,
+        which is the read authority for the run page; the fixture models that by
+        copying the seeded job's events into the registered row.
+        """
+
+        job = self.endpoint_server.jobs.get(run_id) or {}
+        entry = self.store.runs[run_id]
+        entry["merged"] = {**(entry.get("merged") or {}), "events": job.get("events") or []}
+
+    def _rebind_attempt_member(self, run_id: str, path: str, payload: bytes) -> None:
+        """Re-register one member with new bytes: the fixture keeps the registration
+        consistent, so only the parse/shape handling of the registered content is
+        under test (mirroring a producer that registered what it actually wrote)."""
+
+        entry = self.store.runs[run_id]
+        entry["artifacts"][path] = payload
+        digest = hashlib.sha256(payload).hexdigest()
+        for key in ("files", "report_files"):
+            if path in (entry["preview"].get(key) or {}):
+                entry["preview"][key][path] = digest
 
     def _passed_result(self, *, subject: str = "a" * 64, quality_subject: str | None = None) -> dict:
         return {
@@ -808,6 +940,39 @@ class PortalTests(unittest.TestCase):
             events=protocol_events(failed_stage="discover"),
         )
 
+    def _register_attempt(self, run_id: str, members: dict[str, bytes], *, verified: bool) -> None:
+        """One registered attempt: the fixture members are the only servable bytes."""
+
+        files = {
+            path: hashlib.sha256(data).hexdigest()
+            for path, data in members.items()
+            if not path.startswith("reports/") and path != "manifest.json"
+        }
+        report_files = {
+            path: hashlib.sha256(data).hexdigest()
+            for path, data in members.items()
+            if path.startswith("reports/")
+        }
+        self.store.add(
+            run_id,
+            meta={"handoff_sha256": "d" * 64},
+            delivery=True,
+            preview={
+                "schema_version": "solidworks-to-urdf.preview/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": run_id,
+                "subject_sha256": "d" * 64,
+                "urdf": "urdf/robot.urdf",
+                "files": files,
+                "report_files": report_files,
+                "verified": verified,
+                "state": "verified" if verified else "unverified",
+                "reason": "verification_failed",
+            },
+            artifacts=dict(members),
+        )
+        self._record_fixture_events(run_id)
+
     def _seed_airflow_run(
         self,
         dag_run_id: str = DAG_RUN_ID,
@@ -841,7 +1006,7 @@ class PortalTests(unittest.TestCase):
             {"task_id": "freeze", "state": "success"},
             {"task_id": "discover", "state": "success"},
             {"task_id": "capture", "state": "failed"},
-            {"task_id": "publish", "state": "upstream_failed"},
+            {"task_id": "generate", "state": "upstream_failed"},
         ]
 
     def test_retry_capability_uses_current_profile_and_recorded_actor(self) -> None:
@@ -879,7 +1044,7 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 200, body)
                 self.assertEqual(
                     json.loads(body),
-                    {"dag_run_id": DAG_RUN_ID, "state": "queued", "cleared_tasks": ["capture", "publish"]},
+                    {"dag_run_id": DAG_RUN_ID, "state": "queued", "cleared_tasks": ["capture", "generate"]},
                 )
                 self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], conf_before)
                 self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
@@ -975,7 +1140,7 @@ class PortalTests(unittest.TestCase):
         self.airflow.task_states[DAG_RUN_ID][2]["state"] = "upstream_failed"
         status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["cleared_tasks"], ["capture", "discover", "publish"])
+        self.assertEqual(json.loads(body)["cleared_tasks"], ["capture", "discover", "generate"])
         self._seed_retryable_run()
         self.airflow.task_states[DAG_RUN_ID][0]["state"] = "failed"
         self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
@@ -1032,6 +1197,7 @@ class PortalTests(unittest.TestCase):
         expected_conf = {
             "handoff_path": str(stored),
             "main_assembly": "model.SLDASM",
+            "request_id": f"portal-{dag_run_id}",
             "target_hardware": TEST_TARGET,
             "change_summary": TEST_SUMMARY,
         }
@@ -1198,6 +1364,7 @@ class PortalTests(unittest.TestCase):
             {
                 "handoff_path": str(stored),
                 "main_assembly": "model.SLDASM",
+                "request_id": f"portal-{json.loads(body)['dag_run_id']}",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
             },
@@ -1240,6 +1407,7 @@ class PortalTests(unittest.TestCase):
             {
                 "handoff_path": str(stored),
                 "main_assembly": "parts/arm.SLDASM",
+                "request_id": f"portal-{dag_run_id}",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
             },
@@ -1669,7 +1837,8 @@ class PortalTests(unittest.TestCase):
         self._seed_job()
         self._fail_job()
         run_id = native_run_id(DAG_RUN_ID)
-        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True, preview=None)
+        # A registered attempt without the urdf member stays unqualified: the preview refuses.
+        self._register_attempt(run_id, {"meshes/only.stl": b"member\n"}, verified=True)
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         payload = json.loads(body)
@@ -1733,16 +1902,14 @@ class PortalTests(unittest.TestCase):
         self._seed_job(DAG_RUN_ID)
         self._fail_job(DAG_RUN_ID)
         run_id = native_run_id(DAG_RUN_ID)
-        self.store.add(run_id, meta={"handoff_sha256": "d" * 64})
-        report = self.store.run_dir(run_id) / "reports/structural-team.md"
-        report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_bytes("# 结构团队报告\n\n阻塞项与警告见结构化证据。\n".encode())
+        document = "# 结构团队报告\n\n阻塞项与警告见结构化证据。\n".encode()
+        self._register_attempt(run_id, {"reports/structural-team.md": document}, verified=False)
 
         status, headers, body = self.client.request(
             "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md"
         )
         self.assertEqual(status, 200, body)
-        self.assertEqual(body, report.read_bytes())
+        self.assertEqual(body, document)
         self.assertEqual(headers.get("Content-Type"), "text/markdown; charset=utf-8")
         # The run page itself links the retained report; no URL hunting required.
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
@@ -1758,14 +1925,12 @@ class PortalTests(unittest.TestCase):
         self._seed_job(DAG_RUN_ID)
         self._fail_job(DAG_RUN_ID)
         run_id = native_run_id(DAG_RUN_ID)
-        self.store.add(run_id, meta={"handoff_sha256": "d" * 64})
-        markdown = self.store.run_dir(run_id) / "structural-team/structural-team.md"
-        markdown.parent.mkdir(parents=True, exist_ok=True)
-        markdown.write_bytes(b"native capture blocked\n")
+        markdown = b"native capture blocked\n"
+        self._register_attempt(run_id, {"reports/structural-team.md": markdown}, verified=False)
 
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
         self.assertEqual(status, 200, body)
-        self.assertEqual(body, markdown.read_bytes())
+        self.assertEqual(body, markdown)
 
         # A member the run never retained is a clear 404, never a substitute report.
         status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.json")
@@ -1781,16 +1946,18 @@ class PortalTests(unittest.TestCase):
         self._seed_job(DAG_RUN_ID)
         self._fail_job(DAG_RUN_ID)
         run_id = native_run_id(DAG_RUN_ID)
-        # Verify green, publish unroutable: the bound delivery resolves to the verify
-        # checkpoint through store.delivery_dir and still carries the report.
-        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True)
-        report = self.store.delivery_dir(run_id) / "reports/structural-team.md"
-        report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_bytes(b"verify checkpoint report\n")
+        # Verify green, publish unroutable: the registered verify checkpoint still
+        # carries the report as a bound member.
+        document = b"verify checkpoint report\n"
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/structural-team.md": document},
+            verified=True,
+        )
 
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
         self.assertEqual(status, 200, body)
-        self.assertEqual(body, report.read_bytes())
+        self.assertEqual(body, document)
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         links = json.loads(body)["structural_report"]
@@ -1800,23 +1967,243 @@ class PortalTests(unittest.TestCase):
         status, _, _ = anonymous.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
         self.assertEqual(status, 401)
 
-    def test_failed_publish_diagnostics_take_precedence_over_older_copies(self) -> None:
+    def test_failed_run_serves_the_bound_diagnostic_quality_document(self) -> None:
+        """The unverified preview's report member is served under the same digest rule."""
+
         self.client.login()
         self._seed_airflow_run(DAG_RUN_ID, state="failed")
         self._seed_job(DAG_RUN_ID)
         self._fail_job(DAG_RUN_ID)
         run_id = native_run_id(DAG_RUN_ID)
-        self.store.add(run_id, meta={"handoff_sha256": "d" * 64}, delivery=True)
-        delivery = self.store.delivery_dir(run_id) / "reports/structural-team.md"
-        delivery.parent.mkdir(parents=True, exist_ok=True)
-        delivery.write_bytes(b"older delivered copy\n")
-        failed = self.store.run_dir(run_id) / "output.failed/reports/structural-team.md"
-        failed.parent.mkdir(parents=True, exist_ok=True)
-        failed.write_bytes(b"newest failed publish diagnostics\n")
+        urdf = b"<robot name='fixture'/>"
+        document = json.dumps({"passed": False, "subject_sha256": "d" * 64, "checks": []}).encode()
+        digest = hashlib.sha256(document).hexdigest()
+        self.store.add(
+            run_id,
+            meta={"handoff_sha256": "d" * 64},
+            delivery=True,
+            preview={
+                "schema_version": "solidworks-to-urdf.preview/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": run_id,
+                "subject_sha256": "d" * 64,
+                "urdf": "urdf/robot.urdf",
+                "files": {"urdf/robot.urdf": hashlib.sha256(urdf).hexdigest()},
+                "report_files": {"reports/quality.json": digest},
+                "verified": False,
+                "state": "unverified",
+                "reason": "verification_failed",
+            },
+            artifacts={"urdf/robot.urdf": urdf, "reports/quality.json": document},
+        )
+        status, headers, body = self.client.request(
+            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, document)
+        self.assertEqual(headers.get("Content-Type"), "application/json")
+        # The digest rule is unchanged: tampered bytes surface as a stream failure.
+        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b"tampered"
+        status, _, body = self.client.request(
+            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        )
+        self.assertEqual(status, 502)
+        self.assertNotIn(b"tampered", body)
+        # A member outside the bound member maps stays a clear 404.
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/other.json")
+        self.assertEqual(status, 404)
+
+    def test_verified_preview_does_not_expose_report_members(self) -> None:
+        self.client.login()
+        self._seed_passed_job()
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        self.assertEqual(status, 404)
+
+    def test_registered_member_defects_refuse_with_502(self) -> None:
+        """Registration defects and byte edits never self-sign a serving decision."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        document = json.dumps({"passed": False, "subject_sha256": "d" * 64, "checks": []}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": document},
+            verified=False,
+        )
+        route = f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        # Bytes edited before the first read never re-sign the registered digest.
+        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b"edited before first read\n"
+        status, _, body = self.client.request("GET", route)
+        self.assertEqual(status, 502)
+        self.assertNotIn(b"edited", body)
+        # A malformed registration (no digest) refuses with the incomplete-registration 502.
+        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = document
+        preview = self.store.runs[run_id]["preview"]
+        preview["report_files"]["reports/quality.json"] = None
+        status, _, body = self.client.request("GET", route)
+        self.assertEqual(status, 502)
+        self.assertNotIn(document, body)
+        # A member with no registration at all stays a clear 404.
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/other.json")
+        self.assertEqual(status, 404)
+
+    def test_edited_evidence_refuses_the_preview_like_the_download(self) -> None:
+        """The diagnostic preview parses the registered bytes: an edit before the first
+        read refuses with the same 502 class as the download, never empty findings."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        # Replaced before the first read: the preview refuses exactly like the download.
+        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b'{"checks":[]}'
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 502, body)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        self.assertEqual(status, 502, body)
+
+    def test_incomplete_evidence_registration_refuses_the_preview(self) -> None:
+        """A member whose digest is missing is an incomplete registration: the preview
+        refuses before any parse instead of reporting zero failing checks."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        self.store.runs[run_id]["preview"]["report_files"]["reports/quality.json"] = None
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 502, body)
+
+    def test_registered_report_parse_defects_refuse_the_preview(self) -> None:
+        """A registered report that cannot be consumed as an object refuses (502) instead
+        of silently reporting zero failing checks; its bytes still download unchanged."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        route = f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        for payload in (b"{", b"[]", b'{"passed":false,"checks":"invalid"}'):
+            with self.subTest(payload=payload):
+                self._rebind_attempt_member(run_id, "reports/quality.json", payload)
+                status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+                self.assertEqual(status, 502, body)
+                # The changed bytes are correctly registered: the refusal is the parse side.
+                status, _, body = self.client.request("GET", route)
+                self.assertEqual(status, 200)
+                self.assertEqual(body, payload)
+
+    def test_registered_warning_source_parse_defect_refuses_the_preview(self) -> None:
+        """A registered warning source that cannot be parsed refuses (502), never a
+        silently empty warning list."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        handoff = json.dumps({"warnings": [{"code": "fixture_warning", "message": "kept"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {
+                "urdf/robot.urdf": b"<robot name='fixture'/>",
+                "reports/quality.json": quality,
+                "input/handoff.json": handoff,
+            },
+            verified=False,
+        )
+        self._rebind_attempt_member(run_id, "input/handoff.json", b"{")
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 502, body)
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/input/handoff.json")
+        self.assertEqual(status, 200)
+
+    def test_undeclared_optional_warning_source_is_not_an_error(self) -> None:
+        """A warning source the registration does not carry stays absent: no error, and
+        the registered report still serves its failing-check count."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
+        self._register_attempt(
+            run_id,
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            verified=False,
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["failing_checks_total"], 1)
+        self.assertEqual(payload["warnings_total"], 0)
+
+    def test_registered_run_state_and_events_outrank_the_native_job(self) -> None:
+        """The DB registration owns the run state and the recorded events; the endpoint
+        only supplements display detail and never overrides them."""
+
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID, status="running", events=[{"stage": "capture", "state": "running", "at": "t0"}])
+        run_id = native_run_id(DAG_RUN_ID)
+        recorded = protocol_events(failed_stage="verify", subject="a" * 64)
+        self.store.add(
+            run_id,
+            meta={"handoff_sha256": "d" * 64},
+            merged={"status": "failed", "events": recorded},
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        # The registered run state outranks the native job's "running".
+        self.assertEqual(payload["job"]["status"], "failed")
+        # The recorded events - not the native-only capture event - drive the stage view.
+        self.assertEqual(payload["report"]["failure"]["stage"], "verify")
+
+    def test_registered_diagnostics_are_the_only_servable_copy(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(DAG_RUN_ID)
+        self._fail_job(DAG_RUN_ID)
+        run_id = native_run_id(DAG_RUN_ID)
+        newest = b"newest failed publish diagnostics\n"
+        self._register_attempt(run_id, {"reports/structural-team.md": newest}, verified=False)
+        # An older copy on disk is never a substitute: without a registration it
+        # establishes no member identity.
+        older = self.store.run_dir(run_id) / "output.failed/reports/structural-team.md"
+        older.parent.mkdir(parents=True, exist_ok=True)
+        older.write_bytes(b"older delivered copy\n")
 
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
         self.assertEqual(status, 200, body)
-        self.assertEqual(body, failed.read_bytes())
+        self.assertEqual(body, newest)
+        self.assertNotEqual(body, older.read_bytes())
 
     def test_stage_view_exposes_contract_evidence_and_only_verified_assets_are_linkable(self) -> None:
         from description_pipeline.stages import CONTRACT, STAGE_IDS
@@ -1980,7 +2367,8 @@ class PortalTests(unittest.TestCase):
             },
             events=protocol_events(subject=subject, failed_stage="publish"),
         )
-        self.store.add(native_run_id(DAG_RUN_ID), meta={"handoff_sha256": "d" * 64}, delivery=True, preview=None)
+        # Registered members exist but carry no qualified robot member: the preview refuses.
+        self._register_attempt(native_run_id(DAG_RUN_ID), {"meshes/only.stl": b"member\n"}, verified=True)
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         payload = json.loads(body)

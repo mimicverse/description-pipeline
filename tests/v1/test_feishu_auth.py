@@ -462,7 +462,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
             "freeze": "success",
             "discover": "success",
             "capture": "failed",
-            "publish": "upstream_failed",
+            "generate": "upstream_failed",
         }
         self._record_run(
             "run-own",
@@ -547,10 +547,12 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-other"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-legacy"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-damaged"))
-        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-resolve-failed"))
-        # A failed discover is retryable only with a positively successful resolution.
+        # A failed admission retries the frozen intake alone (idempotent); the portal
+        # narrows it further with the endpoint authority.
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-resolve-failed"))
+        # A failed native discovery pokes the same job the run UUID already created.
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-failed"))
-        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-mapped"))
         self.assertEqual(
             run_ownership.retry_assessment_for_run(auth.ALLOWED_DAG_ID, "missing-run").reason,

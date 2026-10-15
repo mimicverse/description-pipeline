@@ -15,6 +15,7 @@ import uuid
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import (
@@ -24,6 +25,7 @@ from description_pipeline.orchestration.airflow_client import (
     _validate_activity,
 )
 from description_pipeline.orchestration.linux_store import LinuxStore
+from tests.v1.portal_read_support import StoreProjection
 from description_pipeline.orchestration.windows import handler
 from description_pipeline.sources.solidworks.discovery import _guarded_sink
 from description_pipeline.stages import activity_view, merge_activity, normalize_activity
@@ -416,13 +418,36 @@ class ActivityClientValidationTests(unittest.TestCase):
 
 
 class PortalActivityExposureTests(unittest.TestCase):
+    def test_registered_reads_use_the_bound_default_store(self):
+        """``config.platform_store=None`` binds the deploy factory once; the readers
+        consume that one instance instead of re-reading the config."""
+
+        with TemporaryDirectory() as tmp:
+            store = LinuxStore(Path(tmp) / "store")
+            run_id = str(uuid.uuid4())
+            store.update_meta(run_id, state="running", handoff_sha256="b" * 64)
+            projection = StoreProjection(store)
+            app = portal_module.PortalApp(
+                portal_module.PortalConfig(airflow=object(), endpoint=lambda: None, platform_store=None)
+            )
+            with mock.patch.object(
+                portal_module.PlatformStore, "from_environment", return_value=projection
+            ) as factory:
+                self.assertIs(app._platform(), projection)
+                self.assertEqual(factory.call_count, 1)
+                record = app._read_projection(run_id)
+            self.assertIsNotNone(record)
+            self.assertEqual(record["run"]["run_id"], run_id)
+
     def test_job_snapshot_keeps_activity_and_the_final_observation(self):
         with TemporaryDirectory() as tmp:
             store = LinuxStore(Path(tmp) / "store")
             run_id = str(uuid.uuid4())
             store.update_meta(run_id, state="running", handoff_sha256="b" * 64)
             app = portal_module.PortalApp(
-                portal_module.PortalConfig(airflow=object(), endpoint=lambda: None, pipeline_store_root=store.root)
+                portal_module.PortalConfig(
+                    airflow=object(), endpoint=lambda: None, platform_store=StoreProjection(store)
+                )
             )
             native = {
                 "status": "running",
