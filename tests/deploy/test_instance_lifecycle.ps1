@@ -58,10 +58,15 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
+# In-process refusal cases need the script's top-level Die to throw instead of exiting the
+# harness; every existing check exercises throwing interpreters, never Die itself.
+function Die { param([string]$code, [string]$message) throw ($code + ': ' + $message) }
+
 # ---- harness: stub only the OS boundary -------------------------------------
 $script:TaskMissing = $false
 $script:TaskState = 'Ready'
 $script:ProcScenario = 'missing'
+$script:AccountEnv = @{}
 $script:ProbeScenario = 'refused'
 $script:SettleOutcomes = @()
 $script:Starts = 0
@@ -127,6 +132,8 @@ function Write-Receipt {
   if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
   [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 8 -Compress))
 }
+function Get-AccountEnvironment { param([string]$Name) return [string]$script:AccountEnv[$Name] }
+function Set-AccountEnvironment { param([string]$Name, [string]$Value) $script:AccountEnv[$Name] = $Value }
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("il-settle-" + [guid]::NewGuid().ToString('N'))
 $generation = Join-Path $root 'generation'
@@ -151,6 +158,7 @@ function Reset-State {
   $script:Starts = 0
   $script:Sleeps.Clear()
   $script:CallLog.Clear()
+  $script:AccountEnv.Clear()
   $script:OldHealthOk = $true
   $script:HealthProbes.Clear()
   [System.IO.File]::WriteAllText(
@@ -176,6 +184,42 @@ Check 'early.targets_known_removable' ((@($legacyProblems.unknown).Count -eq 0) 
 Check 'early.clean_config' ((@((Get-EndpointConfigEarlyProblems $cleanConfig).unknown).Count -eq 0))
 Check 'early.unknown_reported' ((@((Get-EndpointConfigEarlyProblems $unknownConfig).unknown) -contains 'bogus_key'))
 Check 'early.duplicate_reported' ((@((Get-EndpointConfigEarlyProblems $duplicateConfig).duplicates) -contains 'port'))
+
+# ---- account domain pins: restate-only, set on switch, survive restart ------
+Reset-State
+$canonical = Join-Path $root 'cad-ownership.json'
+$pins = Assert-DomainPins $root $generation
+Check 'pins.unbound_plan' (($pins.canonical -eq $canonical) -and ($pins.previous_ownership -eq '') -and
+  ($pins.previous_root -eq ''))
+Set-DomainPins $root $generation
+Check 'pins.set_canonical' (($script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] -eq $generation) -and
+  ($script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] -eq $canonical))
+# An equal pin only restates the bound domain.
+$pins = Assert-DomainPins $root $generation
+Check 'pins.equal_restates' ($pins.canonical -eq $canonical)
+# A divergent ownership pin is refused: a second domain is never created silently.
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = (Join-Path $root 'other/cad-ownership.json')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.divergent_ownership_refused' ($message -match 'cad_domain_override_refused')
+# A changed state root cannot slip in as a new domain.
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical
+$message = ''
+try { $null = Assert-DomainPins (Join-Path $root 'other-state') $generation } catch { $message = $_.Exception.Message }
+Check 'pins.state_root_change_refused' ($message -match 'cad_domain_override_refused')
+# A divergent endpoint-root pin is refused: the served generation may only be restated.
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = (Join-Path $root 'somewhere-else')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.divergent_root_refused' ($message -match 'cad_domain_override_refused')
+# The binding survives a service restart: the pins are read again, unchanged.
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation
+Stop-ScheduledTask -TaskName $binding.task_name | Out-Null
+Start-ScheduledTask -TaskName $binding.task_name | Out-Null
+Check 'pins.survive_restart' (($script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] -eq $generation) -and
+  ($script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] -eq $canonical))
+# An independent default call (no override) resolves the pinned domain.
+Check 'pins.independent_default_call' ((Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE') -eq $canonical)
 
 Reset-State
 $facts = Get-OwnershipRefusalFacts $generation $binding

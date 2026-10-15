@@ -495,6 +495,35 @@ function Stop-Endpoint([object]$binding) {
   Die 'stop_failed' 'the old endpoint still listens or leaves a writing process under the generation/state root; refusing to switch'
 }
 
+# The execution account's canonical domain pins: the endpoint service and same-host independent
+# calls resolve the one CAD domain through these; an existing pin may only restate the bound
+# canonical path - never create a second domain or silently re-point the served generation.
+function Get-AccountEnvironment([string]$Name) {
+  return [string][Environment]::GetEnvironmentVariable($Name, 'User')
+}
+function Set-AccountEnvironment([string]$Name, [string]$Value) {
+  [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
+}
+function Domain-OwnershipPath([string]$StateRoot) {
+  return (Join-Path $StateRoot 'cad-ownership.json')
+}
+function Assert-DomainPins([string]$StateRoot, [string]$ServedGeneration) {
+  $canonical = Domain-OwnershipPath $StateRoot
+  $pinned = [string](Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE')
+  if ($pinned -and ($pinned -ne $canonical)) {
+    Die 'cad_domain_override_refused' ('the bound CAD domain does not match this installation: ' + $pinned)
+  }
+  $pinnedRoot = [string](Get-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT')
+  if ($pinnedRoot -and $ServedGeneration -and ($pinnedRoot -ne $ServedGeneration)) {
+    Die 'cad_domain_override_refused' ('the endpoint-root pin does not restate the served generation: ' + $pinnedRoot)
+  }
+  return @{ canonical=$canonical; previous_ownership=$pinned; previous_root=$pinnedRoot }
+}
+function Set-DomainPins([string]$StateRoot, [string]$Generation) {
+  Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $Generation
+  Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' (Domain-OwnershipPath $StateRoot)
+}
+
 function Invoke-Main {
 # (Body intentionally kept unindented so this refactor's diff stays reviewable.)
 $binding = Read-Json $Binding
@@ -555,6 +584,9 @@ if ($Verb -eq 'stage') {
       'schema does not define: ' + ($early.unknown -join ', ') + ' in ' + $runningConfig +
       '; remove them under change control and re-run stage')
   }
+  # The canonical domain pins are validated now (an existing pin may only restate the canonical
+  # path and the served generation); stage only plans them - promote performs the switch.
+  $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $runningConfig)
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
   New-Item -ItemType Directory -Path $StageDir | Out-Null
@@ -606,7 +638,8 @@ if ($Verb -eq 'stage') {
     source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
   Write-Receipt (Join-Path $StageDir 'stage-receipt.json') @{
     passed=$true; verb='stage'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-    version=$binding.version; source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
+    version=$binding.version; source_commit=$binding.source_commit; source_sha256=$binding.source_sha256;
+    pins=@{ endpoint_root=$StageDir; ownership=$pins.canonical }}
   Emit @{passed=$true; verb='stage'; generation=$StageDir; receipt=(Join-Path $StageDir 'stage-receipt.json')}
   exit 0
 }
@@ -635,6 +668,9 @@ if ($Verb -eq 'promote') {
   if ((Sha256 $previousConfig) -ne [string]$candidate.source_config_sha256) {
     Die 'candidate_source_mismatch' ('the staged candidate belongs to another running configuration: ' + $previousConfig)
   }
+  # The equality check runs before any disruption: a pin that is not the canonical domain, or an
+  # endpoint-root pin that does not restate the served generation, refuses the promotion.
+  $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $previousConfig)
   $sourceExecute = $task.Actions[0].Execute
   $sourceConfig = $previousConfig
   Stop-Endpoint $binding
@@ -652,6 +688,9 @@ if ($Verb -eq 'promote') {
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
     -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
+  # The service reads the pins at start: set them for the execution account before starting the
+  # new generation; a failed promotion restores the previous values below.
+  Set-DomainPins $binding.state_root $StageDir
   try {
     $started = Start-OrRefuse (Config-Path $StageDir) $binding $StageDir $promotions
     $settled = $started.settled
@@ -670,6 +709,8 @@ if ($Verb -eq 'promote') {
     Emit @{passed=$true; verb='promote'; generation=$StageDir; previous=$previous}
     exit 0
   } catch {
+    Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $pins.previous_root
+    Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' $pins.previous_ownership
     $restore = Restore-PreviousEndpoint $binding $previous $previousConfig $StageDir $sourceExecute
     $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
@@ -691,6 +732,10 @@ if ($Verb -eq 'rollback') {
   if (-not $Previous) { Die 'previous_required' 'rollback needs -Previous (the bound previous generation directory)' }
   if (-not (Test-Path -LiteralPath (Join-Path $Previous 'task.xml'))) { Die 'previous_missing' "the bound previous generation carries no task snapshot: $Previous" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  # The pin must restate the generation being served right now; the rollback then re-points the
+  # pins to the restored generation - a legitimate switch, never a divergent override.
+  $servingConfig = Action-Config $task
+  $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $servingConfig)
   Stop-Endpoint $binding
   Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $Previous 'task.xml') -Raw) -Force | Out-Null
   # The restored task names the previous generation's own configuration; that file is the one
@@ -698,6 +743,7 @@ if ($Verb -eq 'rollback') {
   $restored = Get-ScheduledTask -TaskName $binding.task_name
   $previousConfig = Action-Config $restored
   Copy-Item -LiteralPath (Join-Path $Previous 'endpoint-before.json') -Destination $previousConfig -Force
+  Set-DomainPins $binding.state_root (Split-Path -Parent $previousConfig)
   Start-ScheduledTask -TaskName $binding.task_name
   try { $health = Health-Probe $previousConfig $binding } catch {
     Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{

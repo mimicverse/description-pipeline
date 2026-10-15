@@ -70,7 +70,10 @@ $script:OldAction = [pscustomobject]@{
 $script:CurrentAction = $script:OldAction
 $script:Calls = [System.Collections.Generic.List[string]]::new()
 $script:Sleeps = [System.Collections.Generic.List[int]]::new()
+$script:AccountEnv = @{}
 
+function Get-AccountEnvironment { param([string]$Name) return [string]$script:AccountEnv[$Name] }
+function Set-AccountEnvironment { param([string]$Name, [string]$Value) $script:AccountEnv[$Name] = $Value }
 function Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
   [pscustomobject]@{ State='Ready'; Actions=@($script:CurrentAction) }
