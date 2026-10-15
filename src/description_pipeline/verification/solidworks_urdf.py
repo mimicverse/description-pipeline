@@ -959,6 +959,28 @@ def _joint_sample(joint, sign):
     return middle + sign * quarter
 
 
+def _signed_axis_line(joint, record, components):
+    """The native line with the evidenced signed joint convention.
+
+    A record that explicitly declares ``direction_semantics =
+    undirected_axis_line`` fixes a line, not a direction: exchanging its two
+    measured endpoints keeps the same geometric object.  For those records the
+    signed positive-motion convention is the delivered authored axis (the
+    shafts gate reports the same ``author_axis_in_child_datum`` convention),
+    so the returned direction is aligned to it and the endpoint order can
+    never decide the physical sign.  A genuinely directed record keeps its own
+    direction, and an unexplained sign mismatch under a directed source still
+    diverges as before.
+    """
+
+    point, direction = _axis_line(joint, record, components)
+    if record.get("direction_semantics") == "undirected_axis_line":
+        authored_axis = np.asarray(_unit_axis(joint.get("axis")), float)
+        if float(np.dot(np.asarray(direction, float), authored_axis)) < 0:
+            direction = -np.asarray(direction, float)
+    return point, direction
+
+
 def _reference_axis_line(reference, record, components):
     """Re-derive the native undirected RefAxis from its two measured endpoints."""
     _require(
@@ -1047,7 +1069,7 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
     from .motion import axis_rotation, evaluate_motion
 
     name, child = authored["name"], authored["child"]
-    point, direction = _axis_line(authored, record, components)
+    point, direction = _signed_axis_line(authored, record, components)
     limits = authored["limits"]
     samples = (_joint_sample(authored, 1.0), _joint_sample(authored, -1.0))
     parents = {joint["child"]: joint for joint in joints}
@@ -1092,7 +1114,7 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
         else:
             other = (native_axes or {}).get(joint["name"])
             if other is not None:
-                other_point, other_direction = _axis_line(joint, other, components)
+                other_point, other_direction = _signed_axis_line(joint, other, components)
                 axis_point, axis_dir = other_point.tolist(), other_direction.tolist()
             else:
                 child_datum = body_datums.get(joint["child"])

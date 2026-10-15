@@ -504,6 +504,62 @@ class MotionFixtureTests(unittest.TestCase):
         self.assertEqual(details["combined_worst_translation_m"], 0.0)
         self.assertEqual(details["combined_worst_rotation_rad"], 0.0)
 
+    def test_motion_takes_the_signed_axis_from_the_declaration_not_the_endpoint_order(self):
+        # G06: an explicitly undirected native reference axis fixes a line, not
+        # a direction - exchanging its endpoints must not change motion
+        # validity; the signed convention is the delivered authored axis.
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        base = np.eye(4)
+        tool = np.eye(4)
+        tool[:3, 3] = (0.2, 0.0, 0.5)
+        datums = {"base_link": base, "tool": tool}
+        components = {"part0": base.copy(), "part1": tool.copy()}
+        bodies = [
+            {"name": "base_link", "components": ["part0"]},
+            {"name": "tool", "components": ["part1"]},
+        ]
+        reference = {"kind": "reference_axis", "component": "part0", "feature_name": "Axis1"}
+        authored = {
+            "name": "hinge",
+            "type": "revolute",
+            "parent": "base_link",
+            "child": "tool",
+            "axis": [0.0, 0.0, -1.0],
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+            "axis_reference": reference,
+        }
+
+        def record(start, end):
+            start = np.asarray(start, float)
+            end = np.asarray(end, float)
+            direction = (end - start) / np.linalg.norm(end - start)
+            return {
+                "kind": "reference_axis",
+                "selector": reference,
+                "component": "part0",
+                "direction_semantics": "undirected_axis_line",
+                "used_api": "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams",
+                "coordinate_frame": "assembly",
+                "raw_endpoints_m": [*start.tolist(), *end.tolist()],
+                "axis_point_m": start.tolist(),
+                "axis_direction": direction.tolist(),
+            }
+
+        forward = record((0.2, 0.0, 0.5), (0.2, 0.0, 1.5))
+        reversed_endpoints = record((0.2, 0.0, 1.5), (0.2, 0.0, 0.5))
+        results = [
+            _motion(authored, [authored], components, datums, bodies, entry)
+            for entry in (forward, reversed_endpoints)
+        ]
+        for entry in results:
+            self.assertEqual(entry["worst_m"], 0.0)
+            self.assertEqual(entry["worst_translation_m"], 0.0)
+            self.assertEqual(entry["worst_rotation_rad"], 0.0)
+        self.assertLess(
+            float(np.dot(forward["axis_direction"], reversed_endpoints["axis_direction"])), 0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
