@@ -36,6 +36,7 @@ from description_pipeline.orchestration.airflow_client import (
     config_from_airflow_connection,
     drive_staging,
     native_run_id,
+    normalize_change_summary,
     resolved_routing,
     submission_identity,
     validate_main_assembly,
@@ -204,7 +205,9 @@ def _submission_frame(context) -> tuple[dict, dict]:
     conf = getattr(context["dag_run"], "conf", None)
     conf = conf if isinstance(conf, dict) else {}
     target = str(conf.get("target_hardware") or context["params"].get("target_hardware") or "").strip()
-    summary = str(conf.get("change_summary") or context["params"].get("change_summary") or "").strip()
+    summary = normalize_change_summary(
+        str(conf.get("change_summary") or context["params"].get("change_summary") or "")
+    ).strip()
     if not target:
         raise AirflowFailException(
             "target_hardware is required: the run carries no configured publication target to publish to"

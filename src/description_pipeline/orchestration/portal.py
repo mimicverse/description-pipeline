@@ -54,6 +54,7 @@ from .airflow_client import (
     _linux_targets,
     check_result,
     native_run_id,
+    normalize_change_summary,
     validate_artifact_name,
     verified_result,
 )
@@ -1188,7 +1189,11 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请选择发布目标后重试")
         if target_hardware not in (self.config.pipeline_targets or {}):
             raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再提交")
-        change_summary = receipt.change_summary.strip() if isinstance(receipt.change_summary, str) else ""
+        change_summary = (
+            normalize_change_summary(receipt.change_summary).strip()
+            if isinstance(receipt.change_summary, str)
+            else ""
+        )
         if not change_summary:
             raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请填写后重试")
         handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
@@ -1996,6 +2001,11 @@ class PortalApp:
                     overrides["change_summary"]
                     if "change_summary" in overrides
                     else _optional_str(parent_conf.get("change_summary"))
+                )
+                change_summary = (
+                    normalize_change_summary(change_summary).strip()
+                    if isinstance(change_summary, str)
+                    else ""
                 )
                 if not change_summary:
                     raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")

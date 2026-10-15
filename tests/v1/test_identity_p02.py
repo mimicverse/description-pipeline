@@ -201,6 +201,33 @@ class IdentitySynthesisTests(unittest.TestCase):
         self.assertIn("discovery.revision_missing", findings)
         self.assertFalse(findings["discovery.identity_missing"].get("blocking", True))
 
+    def test_multiline_submission_summary_is_admitted(self) -> None:
+        submission = discovery.SubmissionIdentity(
+            hardware_id="m3.0",
+            owner="portal-user",
+            change_summary="第一行\n第二行",
+            as_of="20261015",
+            inventory_digest=DIGEST,
+        )
+        identity, sources, findings = self._identity({}, submission)
+        self.assertNotIn("discovery.summary_invalid", findings)
+        self.assertEqual(identity["change_summary"], "第一行\n第二行")
+        self.assertEqual(sources["change_summary"], "submission")
+
+    def test_submission_summary_still_rejects_non_line_break_controls(self) -> None:
+        for value in ("第一行\t第二行", "第一行\r第二行", "bad\x00end", "bad\x7fend"):
+            with self.subTest(value=value):
+                submission = discovery.SubmissionIdentity(
+                    hardware_id="m3.0",
+                    change_summary=value,
+                    as_of="20261015",
+                    inventory_digest=DIGEST,
+                )
+                identity, _sources, findings = self._identity({}, submission)
+                self.assertIn("discovery.summary_invalid", findings)
+                self.assertTrue(findings["discovery.summary_invalid"].get("blocking", True))
+                self.assertEqual(identity["change_summary"], value)
+
 
 class TransferWhitelistTests(unittest.TestCase):
     def test_identity_evidence_is_a_transfer_member(self) -> None:

@@ -91,6 +91,24 @@ class UploadUiContractTests(unittest.TestCase):
         missing = [name for name in used if f'id="{name}"' not in html]
         self.assertEqual(missing, [], f"ids referenced by app.js but missing in index.html: {missing}")
 
+    def test_change_summary_is_a_required_multiline_textarea(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<textarea id="change-summary" rows="3"', html)
+        self.assertIn('placeholder="变更说明（必填）"', html)
+        self.assertNotIn('maxlength="120"', html)
+        self.assertNotIn('id="change-summary" class="muted small"', html)
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        self.assertIn('form.append("change_summary", summaryInput.value.trim())', app)
+        self.assertIn('$("change-summary")', app)
+
+    def test_targets_fetch_failure_is_distinct_from_an_unconfigured_platform(self) -> None:
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        self.assertIn("平台未配置发布目标", app)
+        self.assertIn("发布目标加载失败", app)
+        self.assertIn("会话已失效", app)
+        self.assertIn("state.targetsRetryPick", app)
+        self.assertIn("if (state.targetsRetryPick) void loadTargets(state.targetsRetryPick);", app)
+
     def test_layout_switches_between_upload_and_run_views(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
         for element in (
