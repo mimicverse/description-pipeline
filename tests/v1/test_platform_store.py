@@ -59,7 +59,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
     for name in ("input", "evidence", "model", "urdf", "meshes", "reports"):
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
-    (root / "evidence" / "native-meshes").mkdir()
+    (root / "evidence" / "geometry").mkdir()
     write_json(root / "input" / "source.json", {"source": "fixture"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
     (root / "input" / "cad" / "cad").mkdir(parents=True)
@@ -89,7 +89,7 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
     write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
     write_json(root / "evidence" / "capture.json", {"capture": "fixture"})
     write_json(root / "evidence" / "native-runtime.json", {"runtime": "fixture"})
-    (root / "evidence" / "native-meshes" / "part.stl").write_bytes(b"native-stl")
+    (root / "evidence" / "geometry" / "part.stl").write_bytes(b"native-stl")
     write_json(root / "model" / "robot.json", {"model": "fixture"})
     (root / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
     (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")
