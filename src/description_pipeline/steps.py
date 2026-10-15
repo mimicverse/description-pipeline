@@ -322,7 +322,7 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
     environment) and the frozen discovery record with its capture additions.
     """
 
-    from .sources.solidworks.discovery import DISCOVERY_FILE
+    from .sources.solidworks.discovery import DISCOVERY_FILE, PLAN_FILE
 
     evidence = staging / "evidence"
     blocks = {
@@ -346,6 +346,9 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
         {"name": str(name), "matrix": matrix}
         for name, matrix in sorted((read_data(evidence / "raw/coordinate_systems.json") or {}).items())
     ]
+    # The sealed plan travels verbatim into the delivery: the same bytes the
+    # Linux derivation sealed before acquisition and Windows consumed above.
+    (evidence / PLAN_FILE).write_bytes((package / PLAN_FILE).read_bytes())
     write_json(evidence / "capture.json", capture)
     write_json(evidence / "native-runtime.json", read_data(evidence / "evidence/environment.json"))
     payload = read_data(package / DISCOVERY_FILE)
@@ -366,7 +369,7 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
     manifest_path = evidence / "manifest.json"
     manifest = read_data(manifest_path)
     files = dict(manifest.get("files") or {})
-    for name in ("capture.json", "discovery.json", "native-runtime.json"):
+    for name in ("capture-plan.json", "capture.json", "discovery.json", "native-runtime.json"):
         files[name] = file_digest(evidence / name)
     manifest["files"] = dict(sorted(files.items()))
     write_json(manifest_path, manifest)
@@ -391,6 +394,62 @@ def _snapshot_details(staging, manifest):
     }
 
 
+def _consume_sealed_definition(package: Path) -> dict:
+    """Consume the sealed Linux-origin definition of one prepared package.
+
+    The capture reads the derived content identity (``source.json``) and the
+    minimal pre-acquisition capture plan sealed by the Linux derivation; it
+    refuses when the plan does not bind the sealed discovery bytes, the frozen
+    inventory, the recorded project entry or the recorded saved configuration,
+    or when it carries no usable native object selectors.  No structural
+    rederivation happens on the Windows side.
+    """
+
+    from .sources.solidworks.discovery import DISCOVERY_FILE, PLAN_FILE, PLAN_SCHEMA, SOURCE_FILE
+
+    discovery_path = package / DISCOVERY_FILE
+    source_path = package / SOURCE_FILE
+    plan_path = package / PLAN_FILE
+    if not discovery_path.is_file():
+        raise PipelineError("The prepared package carries no sealed discovery record")
+    if not source_path.is_file():
+        raise PipelineError("The prepared package carries no sealed source identity")
+    if not plan_path.is_file():
+        raise PipelineError("The prepared package carries no sealed capture plan")
+    source = read_data(source_path)
+    if not isinstance(source, dict) or not source:
+        raise PipelineError("The sealed source identity is not a usable record")
+    plan = read_data(plan_path)
+    if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA:
+        raise PipelineError("The sealed capture plan has an unexpected schema")
+    payload = read_data(discovery_path)
+    if not isinstance(payload, dict):
+        raise PipelineError("The sealed discovery record is not a usable record")
+    if plan.get("discovery_sha256") != hashlib.sha256(discovery_path.read_bytes()).hexdigest():
+        raise PipelineError("The sealed capture plan does not bind the sealed discovery")
+    native_files = payload.get("native_files") if isinstance(payload.get("native_files"), dict) else {}
+    expected_files = {str(key): str(value) for key, value in native_files.items()}
+    if plan.get("handoff_sha256") != digest(expected_files):
+        raise PipelineError("The sealed capture plan does not bind the frozen inventory")
+    selection = plan.get("selection")
+    files = selection.get("files") if isinstance(selection, dict) else None
+    if not isinstance(files, dict) or {str(key): str(value) for key, value in files.items()} != expected_files:
+        raise PipelineError("The sealed capture plan selection differs from the frozen inventory")
+    derivation = payload.get("derivation") if isinstance(payload.get("derivation"), dict) else {}
+    if plan.get("main_assembly") != derivation.get("main_assembly"):
+        raise PipelineError("The sealed capture plan names another project entry than the sealed discovery")
+    record = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    saved = record.get("saved_configuration")
+    if isinstance(saved, str) and saved and plan.get("configuration") != saved:
+        raise PipelineError("The sealed capture plan configuration disagrees with the recorded saved configuration")
+    objects = plan.get("objects")
+    if not isinstance(objects, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"] for item in objects
+    ):
+        raise PipelineError("The sealed capture plan carries no usable native object selectors")
+    return source
+
+
 def capture_evidence(
     package: Path,
     staging: Path,
@@ -406,7 +465,13 @@ def capture_evidence(
     ``on_activity`` optionally observes best-effort capture progress records for the
     live-activity view; it never changes the snapshot, its checks or a failure path.
     """
-    from .sources.solidworks.discovery import source_definition
+    from .sources.solidworks.discovery import (
+        DISCOVERY_FILE,
+        PLAN_FILE,
+        PLAN_SCHEMA,
+        SOURCE_FILE,
+        source_definition,
+    )
     from .sources.solidworks.freeze import freeze
     from .sources.solidworks.input import native_source_closure
 
@@ -421,6 +486,10 @@ def capture_evidence(
             error = PipelineError("The CAD package does not meet the input specification")
             error.details = {"errors": report.get("errors", [])}
             raise error
+        # Interim: the sealed plan is consumed and qualified first; the capture
+        # configuration still rebuilds its carriers from the sealed record until
+        # the platform-side carrier migration lands.
+        _consume_sealed_definition(package)
         source = source_definition(package)
         source["closure"] = native_source_closure(package)
         definition = {"source": source}

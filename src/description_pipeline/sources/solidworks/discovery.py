@@ -81,6 +81,8 @@ SOURCE_FILE = "source.json"
 DISCOVERY_FILE = "discovery/native-discovery.json"
 FINDINGS_FILE = "discovery/findings.json"
 IDENTITY_FILE = "discovery/identity-resolution.json"
+PLAN_FILE = "capture-plan.json"
+PLAN_SCHEMA = "solidworks-to-urdf.capture-plan/v1"
 IDENTITY_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"
 RECORD_DIR = "records"
 #: The one native contract: a fixed property namespace and one record version.
@@ -4138,7 +4140,7 @@ def derive_native_package(
             },
         )
     checks, budget_entry = _budgets(record, settings, findings)
-    _bodies, joints, _frames, derived_names = _derive_carriers(record, identity, settings, findings)
+    _bodies, joints, frames, derived_names = _derive_carriers(record, identity, settings, findings)
     blocking = [item for item in findings if item["blocking"]]
     output.mkdir(parents=True, exist_ok=True)
     discovery_path = output / DISCOVERY_FILE
@@ -4205,6 +4207,45 @@ def derive_native_package(
     # A partial content identity cannot name the frozen revision.  The prepared
     # package still proceeds so measurement and inspection continue; publication
     # readiness stays deferred with the nonblocking findings above.
+    # The minimal pre-acquisition plan: selectors, selection, datums and the
+    # requested evidence items, bound to the sealed discovery bytes.  It is the
+    # only plan traveling to Windows; the full engineering representation is
+    # never copied into it.
+    plan_objects = []
+    for component in record.get("components") or ():
+        if not isinstance(component, dict):
+            continue
+        name = component.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        selector = {"name": name}
+        for key in ("document", "instance", "path", "state"):
+            value = component.get(key)
+            if isinstance(value, str) and value:
+                selector[key] = value
+        plan_objects.append(selector)
+    write_json(
+        output / PLAN_FILE,
+        {
+            "schema_version": PLAN_SCHEMA,
+            "run_id": str(run_id),
+            "handoff_sha256": handoff_sha256,
+            "discovery_sha256": discovery_sha256,
+            "main_assembly": recorded_main,
+            "configuration": recorded_configuration,
+            "identity": {"hardware_id": identity.get("hardware_id"), "revision": identity.get("revision")},
+            "selection": {"files": {str(key): str(value) for key, value in sorted(native_files.items())}},
+            "objects": plan_objects,
+            "datums": [
+                str(item["name"]) for item in frames if isinstance(item, dict) and isinstance(item.get("name"), str)
+            ],
+            "evidence_requests": [
+                "evidence/capture.json",
+                "evidence/geometry/",
+                "evidence/native-runtime.json",
+            ],
+        },
+    )
     source_record = _source_record(identity, identity_sources, handoff_sha256, records)
     if source_record is not None:
         write_json(output / SOURCE_FILE, source_record)
