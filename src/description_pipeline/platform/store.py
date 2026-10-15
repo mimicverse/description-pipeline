@@ -162,24 +162,38 @@ _SET_RUN_OUTCOME = (
     "UPDATE run SET state = %s, updated_at = now()"
     " WHERE run_id = %s AND state NOT IN ('succeeded', 'failed', 'cancelled')"
 )
+_SET_RUN_UNRESOLVED = (
+    "UPDATE run SET state = 'unresolved', updated_at = now() WHERE run_id = %s AND state = 'running'"
+)
+_RESTORE_RUN_RUNNING = (
+    "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'unresolved'"
+)
 _SETTLE_OPERATIONS = (
     "UPDATE operation SET state = CASE WHEN kind = 'cancel' THEN 'succeeded' ELSE %s END,"
     " updated_at = now()"
-    " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile'"
+    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
     " AND state IN ('queued', 'running', 'unresolved')"
 )
 _SETTLE_UNKNOWN = (
     "UPDATE operation SET state = 'unresolved', updated_at = now()"
-    " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'running'"
+    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
+    " AND state = 'running'"
 )
 _SETTLE_RECONCILE = (
     "UPDATE operation SET state = 'succeeded', updated_at = now()"
     " WHERE operation_id = %s AND run_id = %s AND stage = %s AND kind = 'reconcile'"
     " AND state <> 'succeeded'"
 )
+_SETTLE_CACHE_RELEASE = (
+    "UPDATE operation SET state = %s, updated_at = now()"
+    " WHERE operation_key = %s AND run_id = %s AND stage = %s AND kind = 'cache_release'"
+    " AND state = 'running'"
+    " RETURNING operation_id, state, operation_key, params_digest, run_id, stage, kind"
+)
 _READ_RUN_RECORD = (
     "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
 )
+_READ_RUN_PARENT = "SELECT parent_run_id FROM run WHERE run_id = %s"
 _READ_STAGE_RECORDS = (
     "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
     " FROM stage WHERE run_id = %s"
@@ -437,7 +451,7 @@ class PlatformStore:
                 return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
             if stage not in STAGE_IDS:
                 raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
-            self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind)
+            self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind, claiming=False)
             _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
             return self._insert_operation(
                 connection,
@@ -475,7 +489,7 @@ class PlatformStore:
             record = OperationRecord(*existing)
             if record.run_id != run_id or record.stage != stage:
                 raise OperationConflictError("The operation key belongs to a different run or stage")
-            self._guard_domain(connection, run_id=run_id, stage=stage, kind=record.kind)
+            self._guard_domain(connection, run_id=run_id, stage=stage, kind=record.kind, claiming=True)
             cursor.execute(_CLAIM_OPERATION, (operation_key, run_id, stage))
             row = cursor.fetchone()
             if row is not None:
@@ -489,7 +503,53 @@ class PlatformStore:
                 return OperationClaim(record=fresh, granted=False)
             raise PlatformStoreError(f"The operation is {fresh.state!r}; it cannot be claimed again")
 
-    def _guard_domain(self, connection, *, run_id: str, stage: str, kind: str) -> None:
+    def settle_cache_release(
+        self, *, run_id: str, stage: str, operation_key: str, receipt: dict, state: str = "succeeded"
+    ) -> OperationRecord:
+        """Close a claimed cache release on its own recorded release receipt.
+
+        A cleanup's terminal state is never inferred from a stage outcome: it
+        binds the receipt of the actual release call, recorded with the
+        transition in one short transaction.  Only a claimed (``running``)
+        ``cache_release`` may settle; repeating the same settled state returns
+        the recorded result without re-recording the receipt.
+        """
+
+        if state not in {"succeeded", "failed"}:
+            raise PlatformStoreError(f"A cache release settles as succeeded or failed: {state!r}")
+        if not isinstance(receipt, dict) or not receipt:
+            raise PlatformStoreError("A cache release must bind the release receipt it executed with")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            existing = cursor.fetchone()
+            if existing is None:
+                raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
+            record = OperationRecord(*existing)
+            if record.run_id != run_id or record.stage != stage:
+                raise OperationConflictError("The operation key belongs to a different run or stage")
+            if record.kind != "cache_release":
+                raise PlatformStoreError("Only a registered cache release settles through its release receipt")
+            if record.state in {"succeeded", "failed"}:
+                if record.state == state:
+                    return record
+                raise PlatformStoreError(f"The cache release is already terminal ({record.state})")
+            cursor.execute(_SETTLE_CACHE_RELEASE, (state, operation_key, run_id, stage))
+            row = cursor.fetchone()
+            if row is None:
+                raise PlatformStoreError(f"The cache release is {record.state!r}; claim it before it settles")
+            settled = OperationRecord(*row)
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                stage=stage,
+                kind="cache_release",
+                operation_id=settled.operation_id,
+                payload={"state": state, "receipt": receipt},
+            )
+            return settled
+
+    def _guard_domain(self, connection, *, run_id: str, stage: str, kind: str, claiming: bool) -> None:
         """One stage's side-effect domain: terminal and unknown states freeze it.
 
         Runs inside the write transaction (run and stage rows locked in the
@@ -504,6 +564,25 @@ class PlatformStore:
         """
 
         if kind in _TERMINAL_KINDS:
+            return
+        if kind == "cache_release":
+            # The controlled same-identity cleanup: the intent may be registered
+            # before the import confirms, but it may run only for the stage whose
+            # import a confirmed record already binds - and it never re-does the
+            # engineering side effect itself.
+            if not claiming:
+                return
+            cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            cursor.execute(_LOCK_STAGE, (run_id, stage))
+            stage_row = cursor.fetchone()
+            current = stage_row[0] if stage_row else None
+            if current != "completed":
+                raise PlatformStoreError(
+                    f"A cache release requires the confirmed {stage!r} stage of run {run_id!r}"
+                )
             return
         cursor = connection.cursor()
         cursor.execute(_LOCK_RUN, (run_id,))
@@ -674,6 +753,11 @@ class PlatformStore:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
         definition = None
         sealed_root = None
+        reuse_binding = None
+        if reused_from_run is not None:
+            reuse_binding = self._verify_reuse_source(
+                run_id=run_id, stage=stage, checkpoint_uri=checkpoint_uri, reused_from_run=reused_from_run
+            )
         self._verify_checkpoint_scope(
             checkpoint_uri, run_id=run_id, stage=stage, reused_from_run=reused_from_run
         )
@@ -709,6 +793,20 @@ class PlatformStore:
                     raise PlatformStoreError("Reconciliation only confirms an unresolved stage")
             elif reconcile is not None:
                 raise PlatformStoreError("Reconciliation requires the unresolved stage record of this run")
+            if reused_from_run is not None:
+                cursor.execute(_READ_RUN_PARENT, (run_id,))
+                parent_row = cursor.fetchone()
+                if parent_row is None or parent_row[0] != reused_from_run:
+                    raise PlatformStoreError("Reuse requires the registered parent run of this linked attempt")
+                cursor.execute(_READ_STAGE, (reused_from_run, stage))
+                source_row = cursor.fetchone()
+                if (
+                    source_row is None
+                    or source_row[0] != "completed"
+                    or source_row[2] != checkpoint_uri
+                    or digest(source_row[1]) != reuse_binding["receipt_digest"]
+                ):
+                    raise PlatformStoreError("The registered reuse source changed; retry the confirmation")
             if reconcile is not None:
                 operation_id = reconcile.get("operation_id")
                 if not isinstance(operation_id, str) or not operation_id:
@@ -749,6 +847,12 @@ class PlatformStore:
                 )
                 self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
                 cursor.execute(_SETTLE_RECONCILE, (operation_id, run_id, stage))
+                if state == "completed" and stage != "publish":
+                    # The definite outcome lifts the whole run out of unresolved:
+                    # a completed non-publication stage continues as running
+                    # (the publication completion and the failed/cancelled
+                    # outcomes already settled the run in _stage_outcome).
+                    cursor.execute(_RESTORE_RUN_RUNNING, (run_id,))
                 return
             cursor.execute(
                 _INSERT_STAGE,
@@ -799,6 +903,7 @@ class PlatformStore:
         cursor = connection.cursor()
         if outcome == "unresolved":
             cursor.execute(_SETTLE_UNKNOWN, (run_id, stage))
+            cursor.execute(_SET_RUN_UNRESOLVED, (run_id,))
             return
         cursor.execute(_SETTLE_OPERATIONS, (outcome, run_id, stage))
         if run_outcome is not None:
@@ -838,6 +943,43 @@ class PlatformStore:
             raise PlatformStoreError(
                 "The sealed checkpoint names a run that is neither the current run nor its declared reuse source"
             )
+
+    def _verify_reuse_source(
+        self, *, run_id: str, stage: str, checkpoint_uri, reused_from_run: str
+    ) -> dict:
+        """A linked attempt may reuse only the registered source stage of its own parent run.
+
+        The caller's string never grants consumption: the source must be the
+        run's registered ``parent_run_id``, its stage record must be the
+        confirmed completion whose registered checkpoint is exactly the
+        reference being confirmed, and that registered receipt must re-verify
+        against the sealed bytes.  The locked transaction re-checks only the
+        same identity and receipt digest.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_RUN_PARENT, (run_id,))
+            parent_row = cursor.fetchone()
+            cursor.execute(_READ_STAGE, (reused_from_run, stage))
+            source_row = cursor.fetchone()
+        if parent_row is None or parent_row[0] != reused_from_run:
+            raise PlatformStoreError("Reuse requires the registered parent run of this linked attempt")
+        if source_row is None or source_row[0] != "completed":
+            raise PlatformStoreError("Reuse names no confirmed source stage of that run and stage")
+        if source_row[2] != checkpoint_uri:
+            raise PlatformStoreError("The reused checkpoint is not the source stage's registered reference")
+        definition, sealed_root = self._verify_sealed(source_row[2], source_row[1])
+        _sealed_receipt(
+            source_row[1],
+            run_id=reused_from_run,
+            stage=stage,
+            state="completed",
+            checkpoint_uri=source_row[2],
+            definition=definition,
+            root=sealed_root,
+        )
+        return {"checkpoint_uri": source_row[2], "receipt_digest": digest(source_row[1])}
 
     def _verify_sealed(self, checkpoint_uri, receipt) -> tuple[dict | None, Path]:
         """Rebind the real sealed delivery for any stage before any registration.

@@ -164,11 +164,21 @@ class FakeCursor:
             world.run_from_stage[params[0]] = params[3]
             self._rows = []
         elif normalized.startswith("UPDATE run SET state = 'running'"):
-            if world.run_states.get(params[0]) == "queued":
+            if "state = 'unresolved'" in normalized:
+                if world.run_states.get(params[0]) == "unresolved":
+                    world.run_states[params[0]] = "running"
+                    self._rows = [("running",)]
+                else:
+                    self._rows = []
+            elif world.run_states.get(params[0]) == "queued":
                 world.run_states[params[0]] = "running"
                 self._rows = [("running",)]
             else:
                 self._rows = []
+        elif normalized.startswith("UPDATE run SET state = 'unresolved'"):
+            if world.run_states.get(params[0]) == "running":
+                world.run_states[params[0]] = "unresolved"
+            self._rows = []
         elif normalized.startswith("UPDATE run SET state = %s"):
             outcome, run_id = params
             if world.run_states.get(run_id) not in {"succeeded", "failed", "cancelled", None}:
@@ -317,7 +327,7 @@ class FakeCursor:
                 if (
                     record[4] == run_id
                     and record[5] == stage
-                    and record[6] != "reconcile"
+                    and record[6] not in {"reconcile", "cache_release"}
                     and record[1] in {"queued", "running", "unresolved"}
                 ):
                     settled = "succeeded" if record[6] == "cancel" else outcome
@@ -326,7 +336,12 @@ class FakeCursor:
         elif normalized.startswith("UPDATE operation SET state = 'unresolved'"):
             run_id, stage = params
             for key, record in list(world.operations.items()):
-                if record[4] == run_id and record[5] == stage and record[6] != "reconcile" and record[1] == "running":
+                if (
+                    record[4] == run_id
+                    and record[5] == stage
+                    and record[6] not in {"reconcile", "cache_release"}
+                    and record[1] == "running"
+                ):
                     world.operations[key] = (record[0], "unresolved", *record[2:])
             self._rows = []
         elif normalized.startswith("UPDATE operation SET state = 'succeeded'"):
@@ -341,6 +356,21 @@ class FakeCursor:
                 ):
                     world.operations[key] = (record[0], "succeeded", *record[2:])
             self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = %s, updated_at = now() WHERE operation_key"):
+            state, key, run_id, stage = params
+            record = world.operations.get(key)
+            if (
+                record is not None
+                and record[6] == "cache_release"
+                and record[4] == run_id
+                and record[5] == stage
+                and record[1] == "running"
+            ):
+                updated = (record[0], state, *record[2:])
+                world.operations[key] = updated
+                self._rows = [updated]
+            else:
+                self._rows = []
         elif normalized.startswith("SELECT seq, at, kind, stage, operation_id, payload FROM run_event"):
             run_id, after_seq, limit = params
             self._rows = [
@@ -355,6 +385,9 @@ class FakeCursor:
                 for item in world.events
                 if item[0] == run_id and item[1] > after_seq
             ][:limit]
+        elif normalized.startswith("SELECT parent_run_id FROM run WHERE run_id = %s"):
+            entry = next((row for row in world.runs if row[0] == params[0]), None)
+            self._rows = [(entry[2],)] if entry is not None else []
         elif "FROM lifecycle_projection" in normalized:
             self.description = tuple(
                 (name,) for name in ("object_kind", "object_id", "run_id", "state", "bucket", "updated_at")
@@ -876,6 +909,124 @@ class PlatformStoreTests(unittest.TestCase):
             receipt=self._native_receipt("freeze"),
         )
         self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
+
+    def test_capture_completion_does_not_settle_an_unexecuted_cache_release(self) -> None:
+        self._running_run(from_stage="capture")
+        self.store.register_operation(
+            run_id="r-1", stage="capture", kind="cache_release", operation_key="r-1/release:0", params_digest="c" * 64
+        )
+        self.assertEqual(self.world.operations["r-1/release:0"][1], "queued")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("capture"),
+        )
+        self.assertEqual(self.world.operations["r-1/release:0"][1], "queued")
+
+    def test_confirmed_capture_allows_a_bound_cache_release(self) -> None:
+        self._running_run(from_stage="capture")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("capture"),
+        )
+        self.store.register_operation(
+            run_id="r-1",
+            stage="capture",
+            kind="cache_release",
+            operation_key="r-1/release:1",
+            params_digest="e" * 64,
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "claim it before it settles"):
+            self.store.settle_cache_release(
+                run_id="r-1", stage="capture", operation_key="r-1/release:1", receipt={"released": True}
+            )
+        self.store.register_operation(
+            run_id="r-1", stage="capture", kind="cache_release", operation_key="r-1/release:0", params_digest="d" * 64
+        )
+        claim = self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/release:0")
+        self.assertTrue(claim.granted)
+        settled = self.store.settle_cache_release(
+            run_id="r-1",
+            stage="capture",
+            operation_key="r-1/release:0",
+            receipt={"released": True, "url": "smb://cache"},
+        )
+        self.assertEqual(settled.state, "succeeded")
+        self.assertEqual(self.world.operations["r-1/release:0"][1], "succeeded")
+        recorded = [event for event in self.world.events if event[2] == "cache_release"]
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(json.loads(recorded[0][5])["receipt"], {"released": True, "url": "smb://cache"})
+
+    def test_declared_reuse_requires_the_registered_source_stage(self) -> None:
+        self._running_run()
+        with self.assertRaisesRegex(PlatformStoreError, "registered parent run"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="completed",
+                checkpoint_uri="store://sealed/source-with-no-db-row/freeze",
+                receipt=self._native_receipt("freeze"),
+                reused_from_run="source-with-no-db-row",
+            )
+
+    def test_registered_reuse_source_stage_is_accepted(self) -> None:
+        self.admit(
+            run_id="r-0",
+            request_id="q-0",
+            dispatch={"stage": "capture", "operation_key": "r-0/capture:0", "params_digest": "a" * 64},
+        )
+        self.world.stages[("r-0", "capture")] = (
+            "completed",
+            self._native_receipt("capture", run_id="r-0"),
+            "store://sealed/r-0/capture",
+        )
+        self.admit(run_id="r-1", parent_run_id="r-0")
+        self.world.run_states["r-1"] = "running"
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri="store://sealed/r-0/capture",
+            receipt=self._native_receipt("capture"),
+            reused_from_run="r-0",
+        )
+        self.assertEqual(self.world.stages[("r-1", "capture")][0], "completed")
+
+    def test_unresolved_moves_the_run_and_reconciliation_restores_it(self) -> None:
+        self._running_run(from_stage="capture")
+        self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/capture:0")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="unresolved",
+            receipt={
+                "schema_version": store_module.BUNDLE_SCHEMA,
+                "run_id": "r-1",
+                "stage": "capture",
+                "state": "unresolved",
+            },
+        )
+        self.assertEqual(self.world.run_states["r-1"], "unresolved")
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="capture", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/reconcile:0").granted
+        )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("capture"),
+            reconcile={"operation_id": reconcile_op.operation_id},
+        )
+        self.assertEqual(self.world.run_states["r-1"], "running")
 
     def test_run_events_reads_a_bounded_ordered_window(self) -> None:
         self._running_run()
