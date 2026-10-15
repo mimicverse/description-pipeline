@@ -675,6 +675,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         robot = _Doc(
             str(stage / "robot.SLDASM"), children=(arm,), configuration="默认", properties=dict(DECLARED)
         )
+        get_save_calls: list = []
+        robot.GetSaveFlag = lambda: (get_save_calls.append(1), False)[1]
+        robot.Extension.NeedsRebuild2 = 0
 
         class FakeApp:
             RevisionNumber = "34.0.0"
@@ -744,11 +747,23 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.assertTrue(readings["session"]["sealed"])
         self.assertTrue(readings["session"]["closed"])
         self.assertEqual(readings["stored_references_phase"], "preopen")
+        self.assertEqual(readings["saved_configuration"], "默认")
+        state = readings["document_state"]
+        self.assertEqual(state["before"]["save_flag"], False)
+        self.assertEqual(state["after"]["save_flag"], False)
+        self.assertEqual(state["before"]["needs_rebuild2_value"], 0)
+        self.assertEqual(state["after"]["configuration"], "默认")
+        self.assertEqual(state["before"]["read_only"], True)
+        self.assertIn("used_api", state)
+        # Two saved-state samples: one at open and one after the native walk.
+        self.assertGreaterEqual(len(get_save_calls), 2)
 
         payload = NativeSelectionReader(
             walker=lambda stage_root, main, index: readings, reader_sha256=READER
         ).observe(stage, "robot.SLDASM", files)
         self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["arm.SLDPRT"])
+        self.assertEqual(payload["saved_configuration"], "默认")
+        self.assertIn("document_state", payload)
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
         self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])

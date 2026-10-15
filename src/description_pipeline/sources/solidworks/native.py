@@ -4729,6 +4729,7 @@ class SolidWorksBackend(CadBackend):
                         "the staged main assembly could not be opened read-only in the owned session",
                         {"main_assembly": str(main_assembly), "open": readings["open"]},
                     )
+                document_state_before = _discovery_document_state(doc)
                 _manager, configuration = _active_configuration_view(doc)
                 # CU pre-verification input: the main document's declared delivery
                 # identity (dp.*), read-only with the primitive configuration name.
@@ -4748,6 +4749,13 @@ class SolidWorksBackend(CadBackend):
                 else:
                     readings["identity_properties_error"] = None
                 readings["identity_properties"] = identity_properties
+                # Delivery-configuration evidence in the same shape as the native
+                # discovery record: the actual saved configuration name plus the
+                # before/after saved-state observations of the opened document.
+                # Persisted as read - unknowns and read errors stay explicit.
+                # The "after" snapshot is taken when the native walk below has
+                # completed and before the document is closed.
+                readings["saved_configuration"] = str(configuration_name or "") or None
                 root = _component(_member(configuration, "GetRootComponent3", True))
                 occurrences = []
                 stack = [
@@ -4818,6 +4826,11 @@ class SolidWorksBackend(CadBackend):
                         )
                 readings["occurrences"] = occurrences
                 readings["documents_after"] = int(_member(app, "GetDocumentCount"))
+                readings["document_state"] = {
+                    "before": document_state_before,
+                    "after": _discovery_document_state(doc),
+                    "used_api": "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
+                }
             finally:
                 try:
                     _member(

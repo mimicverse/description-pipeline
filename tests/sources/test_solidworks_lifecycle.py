@@ -500,6 +500,10 @@ class RemnantSweepTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ledger = Path(self.tmp.name) / "cad-ownership.json"
+        # The resolver only restates a bound domain: pin this test's ledger.
+        pin = patch.dict(os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(self.ledger)})
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def _record(self, pid, *, creation=100, boot=None, owner="earlier-owner", owner_pid=999, owner_creation=555):
         record = {

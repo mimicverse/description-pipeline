@@ -21,11 +21,33 @@ class PipelineError(ValueError):
     diagnostic_path: str | None = None
 
 
-def acquire_process_lock(path: Path) -> int:
-    """Hold a kernel lock until its descriptor closes, including on process exit.
+def _lock_contention(error: OSError) -> bool:
+    """Whether this platform's lock call failed BECAUSE another owner holds it.
 
-    Keep the lock file in place: unlinking would let another process lock a
-    different inode while the first owner still runs. Its PID is diagnostic.
+    Only the platform's documented contention result counts, by ACTUAL errno:
+    a POSIX non-blocking ``flock`` reports EAGAIN/EWOULDBLOCK, while
+    ``msvcrt.locking`` reports a held region as EACCES (EDEADLK on a
+    deadlock).  The exception class alone is not enough on POSIX -
+    ``EINPROGRESS`` and ``EALREADY`` are also ``BlockingIOError`` instances
+    but are not contention.  Every other lock-call failure is an observation
+    error.
+    """
+
+    import errno
+
+    if os.name == "nt":
+        return error.errno in (errno.EACCES, errno.EDEADLK)
+    return error.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+
+
+def try_acquire_process_lock(path: Path) -> int | None:
+    """Try to hold a kernel lock; ``None`` means another actor holds it now.
+
+    Opening failures (missing rights, IO errors, a symlinked lock) stay loud
+    and propagate, and so does every lock-call failure other than a proven
+    platform contention result: they are observation errors, never evidence
+    of a lock holder.  On success the lock file keeps this process's pid for
+    diagnostics, and the caller owns closing the returned descriptor.
     """
     if path.is_symlink() or path.is_junction():
         raise PipelineError("Ownership lock must be a real file")
@@ -39,12 +61,32 @@ def acquire_process_lock(path: Path) -> int:
             import fcntl
 
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(handle)
+        if not _lock_contention(error):
+            raise
+        return None
+    try:
         owner = str(os.getpid()).encode("ascii")
         os.write(handle, owner)
         os.ftruncate(handle, len(owner))
     except BaseException:
         os.close(handle)
         raise
+    return handle
+
+
+def acquire_process_lock(path: Path) -> int:
+    """Hold a kernel lock until its descriptor closes, including on process exit.
+
+    Competitors refuse loudly (``OSError``) instead of waiting.  Keep the lock
+    file in place: unlinking would let another process lock a different inode
+    while the first owner still runs. Its PID is diagnostic.
+    """
+
+    handle = try_acquire_process_lock(path)
+    if handle is None:
+        raise OSError(f"the ownership lock is already held by another process: {path}")
     return handle
 
 

@@ -18,9 +18,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _PROBE = r"""
+import json
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import description_pipeline.orchestration.windows as windows
 
@@ -57,9 +59,48 @@ with tempfile.TemporaryDirectory(prefix="windows-closure-") as state_root:
     windows.Jobs({"state_root": Path(state_root)})
 after_construct = leaks()
 
+# Runtime path: configuration intake, job admission, plan and snapshot must
+# also stay inside the capture closure (import-time cleanliness alone is not
+# enough).
+with tempfile.TemporaryDirectory(prefix="windows-runtime-") as root_text:
+    root = Path(root_text)
+    (root / "packages").mkdir()
+    token = root / "token"
+    token.write_text("t" * 64, encoding="utf-8")
+    config_path = root / "endpoint.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "solidworks-to-urdf.endpoint/v1",
+                "package_root": str(root / "packages"),
+                "output_root": str(root / "outputs"),
+                "state_root": str(root / "state"),
+                "token_file": str(token),
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = windows.read_config(config_path)
+    files = {"cad/robot.SLDASM": "ab" * 32}
+    runtime_run = "00000000-0000-4000-8000-000000000001"
+    request = {
+        "run_id": runtime_run,
+        "upload_files": files,
+        "upload_sha256": windows.digest(files),
+        "main_assembly": "cad/robot.SLDASM",
+    }
+    with patch.object(windows.Jobs, "_tool_identity", return_value={"source_sha256": "cd" * 32}):
+        jobs = windows.Jobs(config)
+        jobs.create(request)
+        jobs.snapshot(runtime_run)
+        jobs.plan(runtime_run)
+        jobs.close()
+after_runtime = leaks()
+
 print("WINDOWS_LOADED=" + str("description_pipeline.orchestration.windows" in sys.modules))
 print("LEAKS_IMPORT=" + ",".join(after_import))
 print("LEAKS_CONSTRUCT=" + ",".join(after_construct))
+print("LEAKS_RUNTIME=" + ",".join(after_runtime))
 """
 
 
@@ -90,6 +131,9 @@ class WindowsImportBoundaryTests(unittest.TestCase):
         self.assertEqual(fields.get("LEAKS_IMPORT"), "", msg=f"import leaked: {fields.get('LEAKS_IMPORT')}")
         self.assertEqual(
             fields.get("LEAKS_CONSTRUCT"), "", msg=f"JobStore construction leaked: {fields.get('LEAKS_CONSTRUCT')}"
+        )
+        self.assertEqual(
+            fields.get("LEAKS_RUNTIME"), "", msg=f"runtime path leaked: {fields.get('LEAKS_RUNTIME')}"
         )
 
 

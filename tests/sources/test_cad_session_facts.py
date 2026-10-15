@@ -19,6 +19,10 @@ class CadSessionFactsTests(unittest.TestCase):
         self.directory = TemporaryDirectory(prefix="cad-facts-")
         self.addCleanup(self.directory.cleanup)
         self.ledger = Path(self.directory.name) / "cad-ownership.json"
+        # The resolver only restates a bound domain: pin this test's ledger.
+        pin = mock.patch.dict(os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(self.ledger)})
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def _record(
         self,
@@ -56,13 +60,26 @@ class CadSessionFactsTests(unittest.TestCase):
             ownership_file=self.ledger,
         )
 
-    def test_a_proven_own_launch_is_one_owned_lease(self) -> None:
+    def test_a_proven_own_launch_is_one_owned_session(self) -> None:
         self._record(7)
         facts = self._facts(table=[(7, EXE)])
         self.assertEqual(facts["owned_sessions"], 1)
-        self.assertTrue(facts["lease_held"])
+        # lease_held reflects the actual domain lease, never the owned count.
+        self.assertFalse(facts["lease_held"])
         self.assertFalse(facts["external_session_detected"])
         self.assertEqual(facts["problems"], [])
+
+    def test_lease_held_reflects_the_domain_lease_not_the_owned_count(self) -> None:
+        lease = isolation.domain_lease(self.ledger)
+        lease.acquire()
+        self.addCleanup(lease.release)
+        self._record(7)
+        with_lease = self._facts(table=[(7, EXE)])
+        self.assertEqual(with_lease["owned_sessions"], 1)
+        self.assertTrue(with_lease["lease_held"])
+        without_launch = self._facts(table=[])
+        self.assertEqual(without_launch["owned_sessions"], 0)
+        self.assertTrue(without_launch["lease_held"])
 
     def test_pid_reuse_is_never_counted_as_owned(self) -> None:
         self._record(7, creation=100)
@@ -84,6 +101,62 @@ class CadSessionFactsTests(unittest.TestCase):
         self.assertEqual(facts["owned_sessions"], 0)
         self.assertTrue(facts["external_session_detected"])
         self.assertIn("cad_identity_unverified", facts["problems"])
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+        "real POSIX permission boundary",
+    )
+    def test_an_unreadable_lease_file_is_unknown_never_a_proven_holder(self) -> None:
+        # A chmod-000 lease file makes the kernel probe raise (open EACCES):
+        # that is an observation error, not evidence of a lock holder - the
+        # fact stays unknown and the health identity says why.
+        lease_path = Path(str(self.ledger) + ".lease")
+        lease_path.write_text("diagnostic-only", encoding="utf-8")
+        lease_path.chmod(0)
+        try:
+            facts = isolation.domain_lease_facts(self.ledger)
+            cad = self._facts(table=[])
+        finally:
+            lease_path.chmod(0o600)
+        self.assertIsNone(facts.get("held"), facts)
+        self.assertTrue(facts.get("error"), facts)
+        self.assertFalse(cad["lease_held"])
+        self.assertIn("cad_lease_unreadable", cad["problems"])
+
+    @unittest.skipUnless(os.name == "posix", "fcntl.flock boundary")
+    def test_only_proven_flock_contention_reads_held(self) -> None:
+        # By ACTUAL errno: only EAGAIN/EWOULDBLOCK are proven contention.
+        # EINPROGRESS/EALREADY are BlockingIOError instances too, and every
+        # other flock failure is an observation error: the fact stays unknown
+        # and the health identity says why.  (Synthetic OS results only.)
+        import errno
+
+        from description_pipeline import io
+
+        lease_path = Path(str(self.ledger) + ".lease")
+        lease_path.write_text("no-real-holder", encoding="utf-8")
+        for label in ("EINPROGRESS", "EALREADY", "EIO", "EACCES", "ENOLCK"):
+            with self.subTest(errno=label):
+                with (
+                    mock.patch("fcntl.flock", side_effect=OSError(getattr(errno, label), f"injected flock {label}")),
+                    self.assertRaises(OSError),
+                ):
+                    io.try_acquire_process_lock(lease_path)
+                with mock.patch(
+                    "fcntl.flock", side_effect=OSError(getattr(errno, label), f"injected flock {label}")
+                ):
+                    facts = isolation.domain_lease_facts(self.ledger)
+                    cad = self._facts(table=[])
+                self.assertIsNone(facts.get("held"), facts)
+                self.assertTrue(facts.get("error"), facts)
+                self.assertFalse(cad["lease_held"])
+                self.assertIn("cad_lease_unreadable", cad["problems"])
+        with mock.patch("fcntl.flock", side_effect=OSError(errno.EAGAIN, "injected flock EAGAIN")):
+            facts = isolation.domain_lease_facts(self.ledger)
+            cad = self._facts(table=[])
+        self.assertTrue(facts.get("held") is True and not facts.get("error"), facts)
+        self.assertTrue(cad["lease_held"])
+        self.assertNotIn("cad_lease_unreadable", cad["problems"])
 
     def test_unrecorded_matching_processes_are_external(self) -> None:
         facts = self._facts(table=[(9, EXE)])

@@ -1,6 +1,7 @@
 # R13 非零逐叶/组合运动 + 错误父图/跨组错配限定负例 — 中性夹具包（D，rev2）
 
-**目的/边界**：为未来 `motion.{joint}` 门（当前未落地）预置**数据夹具 + 解析解**。本包
+**目的/边界**：为 `motion.{joint}` 门（已落地：`verification.motion.evaluate_motion` 与产品桥
+`solidworks_urdf._motion`）提供**数据夹具 + 解析解**。本包
 **不含 checker/验证器代码**（不新增第二验收器/第二模型；`d.motion-fixture` 仅资料）；不替代
 最终验收；真实 native 见证留最终窗口。B 落地 motion/IF-14 后，D 按派单对**实现**执行复验。
 **产品 motion 断言必须逐条实际执行**（见各夹具 `assertions[]`），不得以“前置失败后总 false”

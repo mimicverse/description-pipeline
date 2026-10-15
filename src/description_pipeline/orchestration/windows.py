@@ -1,8 +1,8 @@
 """Authenticated, persistent, serial Windows execution endpoint for Airflow.
 
-The API freezes native engineering folders and routes their discovered hardware
-identity through platform configuration. It cannot execute shell commands or
-accept arbitrary output/repository paths. Job identity is
+The API freezes native engineering folders and executes the native engineering
+stages; model publication routing is owned by the Linux side. It cannot
+execute shell commands or accept arbitrary output/repository paths. Job identity is
 stable across network retries; an interrupted native run fails explicitly and
 is never silently replayed after a process restart.
 
@@ -82,25 +82,11 @@ from .recovery import stage_reruns, start_plan
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
-_HARDWARE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
-# A publication base may be any well-formed git branch name (the release pins
-# `main`; feature branches stay valid).  The pattern keeps the documented
-# check-ref-format shape and the extra checks below reject `..`, trailing dots
-# and `.lock` components, which the pattern alone would let through.
-_BASE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*")
 
 
 #: Distinguishes "the runner already returned" from "the runner has not run yet"
 #: when a terminal publication is deferred to the one atomic critical section.
 _UNSET = object()
-
-
-def _valid_base_branch(value: object) -> bool:
-    if not isinstance(value, str) or value != value.strip() or not value:
-        return False
-    if _BASE_BRANCH.fullmatch(value) is None or ".." in value or value.endswith("."):
-        return False
-    return all(not part.lower().endswith(".lock") for part in value.split("/"))
 
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
@@ -215,7 +201,6 @@ def read_config(path):
             "package_root",
             "output_root",
             "state_root",
-            "targets",
             "token_file",
             "host",
             "port",
@@ -228,30 +213,7 @@ def read_config(path):
     for key in ("package_root", "output_root", "state_root"):
         config[key] = _root(config[key])
     _require(config["package_root"].is_dir(), "Package root does not exist")
-    #: Model-repository routing belongs to the Linux side; the endpoint accepts
-    #: the documented minimal configuration without targets and never requires
-    #: one to exist.
-    targets = config.get("targets") or {}
-    _require(isinstance(targets, dict), "Endpoint targets must be a mapping")
     roots = [config[key] for key in ("package_root", "output_root", "state_root")]
-    for hardware, target in targets.items():
-        _require(
-            isinstance(hardware, str)
-            and _HARDWARE.fullmatch(hardware) is not None
-            and isinstance(target, dict)
-            and set(target) == {"repository_slug", "base"},
-            "Each hardware identity needs a repository slug and base",
-        )
-        _require(
-            isinstance(target["repository_slug"], str)
-            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", target["repository_slug"])
-            is not None,
-            "Target repository slug must be owner/name",
-        )
-        _require(
-            _valid_base_branch(target["base"]),
-            "Model PR base must be a well-formed git branch name",
-        )
     for index, first in enumerate(roots):
         for second in roots[index + 1 :]:
             _require(
@@ -267,7 +229,6 @@ def read_config(path):
     )
     config["token"] = token
     config.pop("token_file")
-    config["targets"] = targets
     config["config_digest"] = config_digest
     config.setdefault("host", "127.0.0.1")
     config.setdefault("port", SOLIDWORKS_ENDPOINT_PORT)
@@ -481,8 +442,10 @@ class Jobs:
         self.native_reader = native_reader
         self.backend_factory = backend_factory or self._sealed_backend
         #: Every endpoint-side owned launch (selection and capture) records
-        #: into this one ledger.
-        self.cad_ownership_file = config["state_root"] / "cad-ownership.json"
+        #: into the one canonical CAD domain; resolved lazily so endpoint
+        #: construction keeps its import boundary and a bound host cannot be
+        #: diverted by a changed state root.  See ``cad_ownership_file``.
+        self._cad_domain = None
         self._plans = {}
         self.directory = config["state_root"] / "jobs"
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -529,6 +492,22 @@ class Jobs:
         except BaseException:
             os.close(self.handle)
             raise
+
+    @property
+    def cad_ownership_file(self):
+        """The canonical CAD domain ledger for every endpoint-side launch.
+
+        Resolution goes through the one canonical binding (the operational pin
+        or the installed endpoint configuration, validated by its formal
+        parser); a host with no binding at all raises ``DomainUnbound`` - an
+        endpoint never invents a domain of its own.
+        """
+
+        if self._cad_domain is None:
+            from ..sources.solidworks import isolation
+
+            self._cad_domain = isolation._ownership_path()
+        return self._cad_domain
 
     def _save(self, job):
         write_json(self.directory / (job["run_id"] + ".json"), job)
@@ -823,17 +802,11 @@ class Jobs:
         # Linux owns derivation dependencies. Native reuse depends on the sealed
         # source graph, installed reader, and exact prepared checkpoint bytes.
         probe["dependency"] = "ok" if probe["source"] == "ok" and self._tool_state(job) == "ok" else "changed"
-        target = self.config["targets"].get(job.get("hardware_id"))
-        if (
-            isinstance(target, dict)
-            and isinstance(job.get("repository_slug"), str)
-            and isinstance(job.get("repository_base"), str)
-        ):
-            probe["target"] = (
-                "ok"
-                if target.get("repository_slug") == job["repository_slug"] and target["base"] == job["repository_base"]
-                else "changed"
-            )
+        #: Publication routing belongs to the Linux side; the native probe has no
+        #: routing to compare, so the not-applicable fact is recorded.  The
+        #: recovery gate still reads this field and moves out separately
+        #: (``orchestration/recovery.py``, recovery stream).
+        probe["target"] = "ok"
         return probe
 
     def _tool_state(self, job):
@@ -879,8 +852,6 @@ class Jobs:
                 "hardware_id",
                 "revision",
                 "main_assembly",
-                "repository_slug",
-                "repository_base",
                 "prepared_files",
                 "prepared_dir",
             )
@@ -1021,7 +992,7 @@ class Jobs:
             }
             if spec is not None:
                 if spec["from_stage"] not in NATIVE_STAGES:
-                    raise _refusal("linux_owned", "Portable reruns belong to the Linux host")
+                    raise _refusal("linux_owned", "Linked reruns of Linux-owned stages belong to the Linux host")
                 parent = self.jobs.get(spec["parent_run"])
                 _require(parent is not None and parent["run_id"] != identifier, "The parent native run is unknown")
                 _require(parent.get("native_tool") == tool, "Native reader changed; start a fresh source selection")
@@ -1590,7 +1561,9 @@ class Jobs:
             record = self.native_reader(frozen, settings, on_activity=activity)
         record = {**record, "source_selection": copy.deepcopy(job["selection"]["manifest"])}
         prepared = self._record_and_await_definition(identifier, record)
-        package, target, prepared, files = discover_structure(
+        # The discover stage binds the platform-derived prepared package; the
+        # endpoint holds no publication routing (that authority is Linux-side).
+        package, _target, prepared, files = discover_structure(
             frozen,
             self.config["state_root"] / "prepared" / identifier,
             identifier,
@@ -1598,7 +1571,7 @@ class Jobs:
             expected_files=job["package_files"],
             main_assembly=selection,
             configuration={},
-            targets=self.config["targets"],
+            targets={},
             prepared=prepared,
             on_event=lambda item: self._event(identifier, item),
             on_activity=lambda item: self._activity(identifier, item),
@@ -1607,13 +1580,11 @@ class Jobs:
             job.update(
                 hardware_id=prepared.hardware_id,
                 revision=prepared.revision,
-                repository_slug=(target or {}).get("repository_slug"),
-                repository_base=(target or {}).get("base"),
                 prepared_files=files,
                 prepared_dir=str(package),
             )
             self._save(job)
-        return package, target
+        return package
 
     def _sealed_backend(self, package, files):
         from ..runtime import native_readiness
@@ -1714,20 +1685,14 @@ class Jobs:
                         on_event=lambda item, identifier=identifier: self._event(identifier, item),
                     )
                 if from_stage in {None, "freeze", "discover"}:
-                    package, target = self._prepare_native(identifier, package, selection)
+                    package = self._prepare_native(identifier, package, selection)
                 else:
                     # A capture rerun reuses the parent's retained freeze+discover
                     # checkpoints; the linked-run gate already refused the
                     # Linux-owned stages before enqueue.
                     package = self._prepared_dir(job)
                     _require(package is not None, "The retained discovery checkpoint is no longer available")
-                    target = self.config["targets"].get(job.get("hardware_id"))
                 selection = job.get("main_assembly")
-                _require(
-                    job.get("repository_slug") == (target or {}).get("repository_slug")
-                    and job.get("repository_base") == (target or {}).get("base"),
-                    "Persisted publication routing changed; review it and use a new run_id",
-                )
                 result = self.runner(
                     package,
                     self.config["output_root"] / identifier,
@@ -1961,6 +1926,10 @@ def serve(config_path):
     with contextlib.ExitStack() as stack:
         jobs = Jobs(config)
         stack.callback(jobs.close)
+        # Pin the canonical domain for everything this service spawns (child
+        # tools and watchers resolve the very same ledger instead of a
+        # default of their own); an existing pin wins.
+        os.environ.setdefault("DESCRIPTION_CAD_OWNERSHIP_FILE", str(jobs.cad_ownership_file))
         server = ThreadingHTTPServer((config["host"], config["port"]), handler(jobs, config["token"]))
         stack.callback(server.server_close)
         print(
