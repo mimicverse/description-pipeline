@@ -476,6 +476,61 @@ class PhysicsTests(unittest.TestCase):
         self.masses["a"]["reference"]["material_assignment"].pop("part")
         self.assertIn("physics.authority", self.failures())
 
+    def _rebuilt_source(self):
+        """``rebuilt_definition`` for the synthetic bundle with the heavy native
+        rebuilds stubbed: the shape under test is the source binding itself."""
+
+        with (
+            mock.patch.object(
+                quality.evidence,
+                "discovery",
+                return_value={
+                    "schema_version": "solidworks-to-urdf.discovery/v1",
+                    "robot_name": "robot",
+                    "raw": {},
+                },
+            ),
+            mock.patch.object(
+                quality.evidence,
+                "rebuild_rigid_bodies",
+                return_value=copy.deepcopy(self.source["bodies"]),
+            ),
+            mock.patch.object(quality.evidence, "rebuild_joint_facts", return_value=[]),
+            mock.patch.object(quality.evidence, "rebuild_interface_frames", return_value=[]),
+        ):
+            return quality.rebuilt_definition(self.bundle)["source"]
+
+    def test_rebuilt_source_binds_material_source_and_passes_authority(self):
+        # The material authority is the sealed capture config's own value; with
+        # the CAD table empty and the evidence absent the authority gate passes
+        # (the historical None -> {} coercion failed exactly here).
+        self._record_clean_provenance()
+        self.write()
+        source = self._rebuilt_source()
+        self.assertEqual(source["material_source"], "cad")
+        self.assertIsNone(source["mass_evidence"])
+        checks = {check["id"]: check for check in verify_physics(self.root, source, self.model)}
+        self.assertTrue(checks["physics.authority"]["passed"], checks["physics.authority"])
+
+    def test_rebuilt_source_missing_material_source_fails_closed_without_a_default(self):
+        self._record_clean_provenance()
+        self.write()
+        write_json(self.bundle / "evidence/raw/source_config.json", {})
+        with self.assertRaises(PipelineError) as raised:
+            self._rebuilt_source()
+        self.assertIn("material_source", str(raised.exception))
+        self.assertNotIsInstance(raised.exception, KeyError)
+
+    def test_rebuilt_mass_evidence_fidelity_keeps_null_and_dicts_verbatim(self):
+        # No ``or {}`` upgrade: null stays absent and a recorded binding is
+        # passed through byte-for-byte to the authority comparison.
+        self._record_clean_provenance()
+        self.write()
+        self.assertIsNone(self._rebuilt_source()["mass_evidence"])
+        binding = {"reference": "vendor table", "file": "docs/masses.json", "sha256": "0" * 64}
+        self.store_block("declared_masses", {"items": {}, "evidence": binding})
+        self.assertEqual(self._rebuilt_source()["mass_evidence"], binding)
+
     def _record_clean_provenance(self) -> None:
         """The canonical records a current CAD capture seals with every material verified."""
 

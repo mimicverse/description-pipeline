@@ -220,6 +220,23 @@ def require_qualified_report(report, definition, root=None):
     return report
 
 
+def _frozen_source_config(root) -> dict:
+    """The sealed capture config read verbatim from the raw evidence.
+
+    The material authority is a fact of the native capture
+    (``evidence/raw/source_config.json``); the verifier reads the value exactly
+    as sealed - never derived from other blocks and never defaulted - so a
+    capture that carries no usable authority fails closed here instead of a
+    bare ``KeyError`` inside the physics gate.
+    """
+
+    delivery = Path(root).resolve()
+    delivery = delivery.parent if delivery.name == "evidence" else delivery
+    config = read_data(confined(delivery, "evidence/raw/source_config.json"))
+    _require(isinstance(config, dict), "The frozen source config is not an object")
+    return config
+
+
 def rebuilt_definition(root) -> dict:
     """The independently rebuilt definition a quality report's inventory binds to."""
 
@@ -277,6 +294,11 @@ def _input(root, diagnostics=None):
     robot_name = discovery_record.get("robot_name")
     _require(isinstance(robot_name, str) and robot_name, "Discovery record carries no robot name")
     declared = evidence.declared_masses(root)
+    material_source = _frozen_source_config(root).get("material_source")
+    _require(
+        isinstance(material_source, str) and material_source.strip() != "",
+        "The frozen source config carries no usable material_source",
+    )
     recorded = (handoff.get("input_receipt") or {}).get("inventory")
     if isinstance(recorded, dict) and recorded:
         archived = inventory(root / "input/cad")
@@ -319,8 +341,9 @@ def _input(root, diagnostics=None):
             "bodies": bodies,
             "joints": joints,
             "frames": frames,
+            "material_source": material_source,
             "documented_masses": declared.get("items") or {},
-            "mass_evidence": declared.get("evidence") or {},
+            "mass_evidence": declared.get("evidence"),
         },
         "checks": checks,
     }

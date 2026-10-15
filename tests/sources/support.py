@@ -839,6 +839,7 @@ def write_target_delivery(
     tool: dict | None = None,
     originals: dict[str, str] | None = None,
     records: dict[str, str] | None = None,
+    raw_source_config: dict | None = None,
 ) -> Path:
     """Create a minimal target-tree delivery holding the given capture blocks."""
 
@@ -846,7 +847,17 @@ def write_target_delivery(
     from description_pipeline.schemas import TOOL_SCHEMA
 
     root = Path(root)
-    for name in ("input", "input/cad", "input/records", "evidence", "model", "urdf", "meshes", "reports"):
+    for name in (
+        "input",
+        "input/cad",
+        "input/records",
+        "evidence",
+        "evidence/raw",
+        "model",
+        "urdf",
+        "meshes",
+        "reports",
+    ):
         (root / name).mkdir(parents=True, exist_ok=True)
     source = source or default_source_record()
     selection = source["selection"]
@@ -870,6 +881,12 @@ def write_target_delivery(
     write_json(root / "evidence/discovery.json", discovery or {})
     write_json(root / "evidence/capture.json", capture)
     write_json(root / "evidence/native-runtime.json", runtime or {})
+    # The native capture seals its own config as raw evidence; the delivery
+    # fixture mirrors that shape (the verifier reads material_source verbatim).
+    write_json(
+        root / "evidence/raw/source_config.json",
+        {"material_source": "cad"} if raw_source_config is None else raw_source_config,
+    )
     write_json(root / "model/robot.json", {})
     (root / "urdf/robot.urdf").write_text("<robot name='m3.0'/>\n", encoding="utf-8")
     (root / "meshes/part.stl").write_text("solid\n", encoding="utf-8")
