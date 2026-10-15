@@ -75,6 +75,26 @@ class SettlementCheckerTests(unittest.TestCase):
         rows["events"].append({"seq": 2, "kind": "stage", "stage": "verify", "payload": {"state": "completed"}})
         self.assertFalse(self.compare(rows)["run_event_identity"]["passed"])
 
+    def test_legitimate_stage_history_is_accepted(self) -> None:
+        """The verified-history case: verify recorded running then failed."""
+
+        rows = self.rows()
+        rows["events"] = [
+            {"seq": 1, "kind": "stage", "stage": "verify", "payload": {"state": "running"}},
+            {"seq": 2, "kind": "stage", "stage": "verify", "payload": {"state": "failed"}},
+        ]
+        self.assertTrue(self.compare(rows)["run_event_identity"]["passed"])
+
+    def test_a_stage_event_for_a_nonexistent_stage_is_rejected(self) -> None:
+        rows = self.rows()
+        rows["events"].append({"seq": 2, "kind": "stage", "stage": "nonexistent-stage", "payload": {}})
+        self.assertFalse(self.compare(rows)["run_event_identity"]["passed"])
+
+    def test_a_stage_event_without_a_state_is_rejected(self) -> None:
+        rows = self.rows()
+        rows["events"].append({"seq": 2, "kind": "stage", "stage": "verify", "payload": {}})
+        self.assertFalse(self.compare(rows)["run_event_identity"]["passed"])
+
     def test_a_queued_dispatch_operation_is_rejected(self) -> None:
         rows = self.rows()
         rows["operations"][0][3] = "queued"

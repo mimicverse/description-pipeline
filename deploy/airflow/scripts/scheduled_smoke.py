@@ -683,12 +683,27 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
         }
     )
     events = [dict(item) for item in rows["events"]]
+    legal_states = {"pending", "running", "completed", "failed", "cancelled", "unresolved", "blocked"}
     identity_ok = True
+    latest_by_stage: dict[str, tuple[int, str]] = {}
     for event in events:
         if event.get("kind") != "stage":
             continue
+        stage = str(event.get("stage"))
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        if stages.get(str(event.get("stage"))) != payload.get("state"):
+        state = payload.get("state")
+        if stage not in stages or state not in legal_states:
+            # An event must describe a real stage and carry a real state; a
+            # nonexistent stage or a missing state is an identity failure.
+            identity_ok = False
+            continue
+        # History is legitimate: the latest event per stage must match the
+        # current row; earlier transitions (running before failed) are kept.
+        seq = event.get("seq") if isinstance(event.get("seq"), int) else 0
+        if stage not in latest_by_stage or seq >= latest_by_stage[stage][0]:
+            latest_by_stage[stage] = (seq, str(state))
+    for stage, (_seq, state) in latest_by_stage.items():
+        if stages.get(stage) != state:
             identity_ok = False
     comparisons.append(
         {
