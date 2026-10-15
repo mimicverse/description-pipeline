@@ -9,6 +9,12 @@ is never silently replayed after a process restart.
 One run may name its delivered assembly explicitly (``main_assembly``); the
 endpoint verifies the value against the frozen upload and binds it to the run's
 checkpoints, so a linked attempt can never reuse a different selection.
+
+The only deletion path is the sanctioned release of one terminal run's staged
+imported cache (IF-10): the caller binds an operation identity and its closed
+imported inventory, the endpoint verifies both against the staged bytes, and
+answers an immutable receipt.  Refusals and interrupted calls never partially
+delete, and replaying one operation returns its original receipt.
 """
 
 from __future__ import annotations
@@ -50,7 +56,16 @@ from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import SelectionError
 from ..runtime import tool_record
-from ..interface_records import HEALTH_SCHEMA, RESOURCE_POLICY_SCHEMA, resource_policy_v1_digest
+from ..interface_records import (
+    HEALTH_SCHEMA,
+    RESOURCE_POLICY_SCHEMA,
+    cache_release_params_digest,
+    cache_release_receipt_digest,
+    resource_policy_v1_digest,
+    validate_cache_release_receipt,
+    validate_cache_release_request,
+)
+from ..schemas import CACHE_RELEASE_RECEIPT_SCHEMA
 from ..stages import (
     ACTIVITY_HISTORY_LIMIT,
     CONTRACT,
@@ -90,6 +105,11 @@ def _valid_base_branch(value: object) -> bool:
 
 JOB_SCHEMA = "solidworks-to-urdf.job/v1"
 CONFIG_SCHEMA = "solidworks-to-urdf.endpoint/v1"
+
+#: The staged per-run cache root and its release journal: releasing one terminal
+#: run's imported cache is the endpoint's only deletion path (IF-10).
+CACHE_RELEASE_SELECTED = "selected"
+CACHE_RELEASE_JOURNAL_SCHEMA = "solidworks-to-urdf.cache-release-journal/v1"
 
 #: Stages the Windows endpoint owns; generation, verification and publication run on Linux.
 NATIVE_STAGES = tuple(STAGE_IDS[:3])
@@ -406,6 +426,31 @@ def health_payload(jobs) -> dict:
         # same schema owner refuses it, and the handler answers the stable 500.
         raise PipelineError(f"The endpoint cannot read its complete IF-09 identity: {error}") from error
     return payload
+
+
+def _native_release_identity() -> dict:
+    """The endpoint's installed identity as a native-role release triple."""
+
+    record = tool_record()
+    embedded = record.get("release") if isinstance(record.get("release"), dict) else None
+    if embedded is None:
+        raise PipelineError("The endpoint has no installed release identity; the cache release cannot bind one")
+    return {
+        "version": str(record.get("version") or ""),
+        "source_commit": str(embedded.get("source_commit") or ""),
+        "source_sha256": str(record.get("source_sha256") or ""),
+        "role": "native",
+    }
+
+
+def _staged_manifest(root: Path) -> list[dict]:
+    """The closed staged-cache inventory (path, bytes, SHA-256); native locks excluded."""
+
+    locked = package_inventory(root)
+    return [
+        {"path": relative, "bytes": (root / relative).stat().st_size, "sha256": locked[relative]}
+        for relative in sorted(locked)
+    ]
 
 
 def _default_runner(*args, **kwargs):
@@ -1249,6 +1294,204 @@ class Jobs:
             self.condition.notify_all()
         return self.snapshot(identifier)
 
+    def _release_refusal(self, reason, message, **detail):
+        """One uniform precondition refusal: 409 plus the stable code and reason."""
+
+        return RequestError(
+            message,
+            status=409,
+            payload={"error_code": "cache_release_refused", "reason": reason, "detail": detail},
+        )
+
+    def _release_receipt(self, *, status, operation_id, params_sha256, import_block, released, released_at):
+        """The immutable release receipt, validated by its frozen record owner."""
+
+        receipt = {
+            "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
+            "status": status,
+            "operation_id": operation_id,
+            "params_sha256": params_sha256,
+            "import": import_block,
+            "released": dict(released),
+            "retained": ["terminal_state", "import_confirmation"],
+            "released_at": released_at,
+            "identity": _native_release_identity(),
+            "receipt_sha256": "",
+        }
+        receipt["receipt_sha256"] = cache_release_receipt_digest(receipt)
+        validate_cache_release_receipt(receipt)
+        return receipt
+
+    def release_cache(self, identifier, request):
+        """Release one terminal run's staged imported cache (IF-10).
+
+        Every precondition is checked before anything is deleted: the run is
+        terminal, no active job references the cache, the caller's closed
+        imported inventory equals the staged bytes exactly, and the cache is
+        confined to the package root.  The release journal makes replays and
+        interrupted calls safe: one operation id with the same parameters
+        returns its original receipt, an interrupted release resumes on the
+        next call, and a refusal never partially deletes.
+        """
+
+        identifier = _job_id(identifier)
+        validate_cache_release_request(request)
+        import_block = request["import"]
+        if import_block["production"]["run_id"] != identifier:
+            raise self._release_refusal(
+                "production_run_mismatch",
+                "The import block names another production run",
+                run_id=import_block["production"]["run_id"],
+            )
+        own = _native_release_identity()
+        if request["binding"]["release"] != {key: own[key] for key in ("version", "source_commit", "source_sha256")}:
+            raise self._release_refusal(
+                "release_identity_mismatch",
+                "The binding release differs from the installed endpoint identity",
+            )
+        if request["binding"]["contract"] != {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256}:
+            raise self._release_refusal("contract_mismatch", "The binding contract differs from the staged contract")
+        params_sha256 = cache_release_params_digest(import_block)
+        with self.mutex:
+            job = self.jobs.get(identifier)
+            if job is None:
+                raise RequestError("Unknown run_id", 404)
+            if job.get("status") not in _HEALTH_TERMINAL_JOB_STATES:
+                raise self._release_refusal(
+                    "job_not_terminal",
+                    "The native run is not terminal; its imports may still be pending",
+                    status=job.get("status"),
+                )
+            owner = _job_id(job.get("source_run_id") or identifier)
+            for other in self.jobs.values():
+                if other.get("run_id") == identifier:
+                    continue
+                if (
+                    _job_id(other.get("source_run_id") or other.get("run_id")) == owner
+                    and other.get("status") not in _HEALTH_TERMINAL_JOB_STATES
+                ):
+                    raise self._release_refusal(
+                        "cache_in_use",
+                        "Another active run references this staged cache",
+                        run_id=other.get("run_id"),
+                    )
+            if job.get("activity") is not None:
+                raise self._release_refusal("resources_not_released", "The run still reports live native activity")
+            try:
+                cache_dir = confined(self.config["package_root"], CACHE_RELEASE_SELECTED + "/" + owner, exists=False)
+            except PipelineError as error:
+                raise self._release_refusal("path_outside_cache_root", str(error)) from error
+            if cache_dir.is_symlink() or cache_dir.is_junction():
+                raise self._release_refusal("path_outside_cache_root", "The staged cache is a link")
+            journal_path = self.config["state_root"] / "releases" / (owner + ".json")
+            journal = read_data(journal_path) if journal_path.is_file() else None
+            if journal is not None:
+                if journal.get("operation_id") != request["operation_id"]:
+                    if journal.get("state") != "done":
+                        raise self._release_refusal(
+                            "release_in_progress",
+                            "Another release operation is unfinished for this cache",
+                            operation_id=journal.get("operation_id"),
+                        )
+                    return self._release_receipt(
+                        status="already_released",
+                        operation_id=request["operation_id"],
+                        params_sha256=params_sha256,
+                        import_block=import_block,
+                        released={"files": 0, "bytes": 0},
+                        released_at=journal["started_at"],
+                    )
+                if journal.get("params_sha256") != params_sha256:
+                    raise RequestError(
+                        "operation_id is already bound to a different request",
+                        409,
+                        payload={"error_code": "cache_release_conflict"},
+                    )
+                if journal.get("state") == "done":
+                    return journal["receipt"]
+            if journal is None:
+                if not cache_dir.is_dir():
+                    raise self._release_refusal(
+                        "cache_absent", "The staged cache is absent and no release is on record"
+                    )
+                try:
+                    staged = _staged_manifest(cache_dir)
+                except PipelineError as error:
+                    raise self._release_refusal("path_outside_cache_root", str(error)) from error
+                if not staged:
+                    raise self._release_refusal("cache_empty", "The staged cache carries no releasable files")
+                if staged != import_block["confirmation"]["imported"]:
+                    raise self._release_refusal(
+                        "imported_manifest_mismatch",
+                        "The imported inventory differs from the staged cache bytes",
+                        staged=[entry["path"] for entry in staged][:20],
+                        imported=[entry["path"] for entry in import_block["confirmation"]["imported"]][:20],
+                        staged_sha256=digest(staged),
+                        imported_sha256=digest(import_block["confirmation"]["imported"]),
+                    )
+                journal = {
+                    "schema_version": CACHE_RELEASE_JOURNAL_SCHEMA,
+                    "run_id": identifier,
+                    "owner": owner,
+                    "operation_id": request["operation_id"],
+                    "params_sha256": params_sha256,
+                    "state": "started",
+                    "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "released": {"files": len(staged), "bytes": sum(entry["bytes"] for entry in staged)},
+                    "manifest": staged,
+                    "import": import_block,
+                    "receipt": None,
+                }
+                journal_path.parent.mkdir(parents=True, exist_ok=True)
+                write_json(journal_path, journal)
+            else:
+                # Resumed after an interrupted call: every remaining file must
+                # still be a recorded member, byte for byte.
+                recorded = {entry["path"]: entry for entry in journal.get("manifest") or []}
+                if cache_dir.is_dir():
+                    try:
+                        remaining = _staged_manifest(cache_dir)
+                    except PipelineError as error:
+                        raise self._release_refusal("path_outside_cache_root", str(error)) from error
+                    if any(recorded.get(entry["path"]) != entry for entry in remaining):
+                        raise self._release_refusal(
+                            "cache_changed_since_release",
+                            "The staged cache changed after the release began",
+                        )
+        # The single deletion: only the confined staged root, only after every
+        # precondition passed; a failure here leaves the journal started for a
+        # safe resume and never reports a partial release as complete.
+        if cache_dir.exists():
+            try:
+                shutil.rmtree(cache_dir)
+            except OSError as error:
+                raise RequestError(
+                    "The cache release could not complete; retry the same operation",
+                    500,
+                    payload={
+                        "error_code": "cache_release_incomplete",
+                        "detail": {"error": f"{type(error).__name__}: {error}"[:300]},
+                    },
+                ) from error
+        if cache_dir.exists():
+            raise RequestError(
+                "The cache release could not complete; retry the same operation",
+                500,
+                payload={"error_code": "cache_release_incomplete"},
+            )
+        with self.mutex:
+            receipt = self._release_receipt(
+                status="released",
+                operation_id=journal["operation_id"],
+                params_sha256=journal["params_sha256"],
+                import_block=journal["import"],
+                released=journal["released"],
+                released_at=journal["started_at"],
+            )
+            journal.update(state="done", receipt=receipt)
+            write_json(journal_path, journal)
+            return receipt
+
     def snapshot(self, identifier):
         identifier = _job_id(identifier)
         with self.mutex:
@@ -1657,7 +1900,7 @@ def handler(jobs, token):
         def do_POST(self):
             if not self._authorized():
                 return
-            match = re.fullmatch(r"/v1/jobs/([0-9a-f-]+)/(files|definition|abort)", self.path)
+            match = re.fullmatch(r"/v1/jobs/([0-9a-f-]+)/(files|definition|abort|cache/release)", self.path)
             if self.path != "/v1/jobs" and match is None:
                 self._reply(404, {"error": "Unknown API route"})
                 return
@@ -1699,7 +1942,9 @@ def handler(jobs, token):
                 _require(0 < size <= 8 * 1024**2 and not self.headers.get("Transfer-Encoding"), "Invalid request size")
                 self.connection.settimeout(10)
                 request = json.loads(self.rfile.read(size))
-                if operation == "abort":
+                if operation == "cache/release":
+                    self._reply(200, jobs.release_cache(identifier, request))
+                elif operation == "abort":
                     self._reply(200, jobs.abort(identifier, request))
                 else:
                     result, created = jobs.create(request)
