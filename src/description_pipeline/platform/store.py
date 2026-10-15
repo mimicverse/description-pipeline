@@ -92,23 +92,23 @@ class RunDisplay:
 
 
 _LOCK_ADMISSION = (
-    "SELECT state, reason, actor, changed_at, revision FROM platform.admission WHERE id = 1 FOR UPDATE"
+    "SELECT state, reason, actor, changed_at, revision FROM admission WHERE id = 1 FOR UPDATE"
 )
-_READ_ADMISSION = "SELECT state, reason, actor, changed_at, revision FROM platform.admission_projection"
+_READ_ADMISSION = "SELECT state, reason, actor, changed_at, revision FROM admission_projection"
 _UPDATE_ADMISSION = (
-    "UPDATE platform.admission SET state = %s, reason = %s, actor = %s, changed_at = now(),"
+    "UPDATE admission SET state = %s, reason = %s, actor = %s, changed_at = now(),"
     " revision = revision + 1 WHERE id = 1 RETURNING state, reason, actor, changed_at, revision"
 )
 _INSERT_REQUEST = (
-    "INSERT INTO platform.request (request_id, principal, target_hardware, main_assembly, configuration, baseline)"
+    "INSERT INTO request (request_id, principal, target_hardware, main_assembly, configuration, baseline)"
     " VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb)"
 )
 _INSERT_RUN = (
-    "INSERT INTO platform.run (run_id, request_id, parent_run_id, from_stage, state, tool_identity)"
+    "INSERT INTO run (run_id, request_id, parent_run_id, from_stage, state, tool_identity)"
     " VALUES (%s, %s, %s, %s, 'queued', %s::jsonb)"
 )
 _INSERT_OPERATION = (
-    "INSERT INTO platform.operation"
+    "INSERT INTO operation"
     " (operation_id, run_id, stage, kind, state, operation_key, params_digest, dag_id, dag_run_id, task_id, map_index)"
     " VALUES (%s, %s, %s, %s, 'queued', %s, %s, %s, %s, %s, %s)"
     " ON CONFLICT (operation_key) DO NOTHING"
@@ -116,87 +116,103 @@ _INSERT_OPERATION = (
 )
 _FIND_OPERATION = (
     "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
-    " FROM platform.operation WHERE operation_key = %s"
+    " FROM operation WHERE operation_key = %s"
 )
-_LOCK_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UPDATE"
-_READ_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s"
+_LOCK_RUN = "SELECT state, from_stage FROM run WHERE run_id = %s FOR UPDATE"
+_READ_RUN = "SELECT state, from_stage FROM run WHERE run_id = %s"
 _READ_RUN_DISPLAY = (
-    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run WHERE run_id = %s"
+    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run WHERE run_id = %s"
 )
 _READ_RUN_DISPLAYS = (
-    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run"
+    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run"
     " WHERE display_name IS NOT NULL OR hidden_at IS NOT NULL"
 )
 _SET_RUN_DISPLAY = (
-    "UPDATE platform.run SET display_name = %s, updated_at = now() WHERE run_id = %s"
+    "UPDATE run SET display_name = %s, updated_at = now() WHERE run_id = %s"
     " RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
 _SET_RUN_HIDDEN = (
-    "UPDATE platform.run SET hidden_at = COALESCE(hidden_at, now()),"
+    "UPDATE run SET hidden_at = COALESCE(hidden_at, now()),"
     " hidden_reason = COALESCE(hidden_reason, %s), updated_at = now()"
     " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
 _RESTORE_RUN = (
-    "UPDATE platform.run SET hidden_at = NULL, hidden_reason = NULL, updated_at = now()"
+    "UPDATE run SET hidden_at = NULL, hidden_reason = NULL, updated_at = now()"
     " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
 _START_RUN = (
-    "UPDATE platform.run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'queued'"
+    "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'queued'"
     " RETURNING state"
 )
+_CLAIM_OPERATION = (
+    "UPDATE operation SET state = 'running', updated_at = now()"
+    " WHERE operation_key = %s AND run_id = %s AND stage = %s AND state = 'queued'"
+    " RETURNING operation_id, state, operation_key, params_digest, run_id, stage, kind"
+)
 _SET_RUN_OUTCOME = (
-    "UPDATE platform.run SET state = %s, updated_at = now()"
+    "UPDATE run SET state = %s, updated_at = now()"
     " WHERE run_id = %s AND state NOT IN ('succeeded', 'failed', 'cancelled')"
 )
+_SETTLE_OPERATIONS = (
+    "UPDATE operation SET state = %s, updated_at = now()"
+    " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile'"
+    " AND state IN ('running', 'unresolved')"
+)
 _READ_RUN_RECORD = (
-    "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM platform.run WHERE run_id = %s"
+    "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
 )
 _READ_STAGE_RECORDS = (
     "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
-    " FROM platform.stage WHERE run_id = %s"
+    " FROM stage WHERE run_id = %s"
 )
 _CONFIRMED_PUBLISH = (
-    "SELECT 1 FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
+    "SELECT 1 FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
-_READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
-_READ_STAGE = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
-_LOCK_STAGE = "SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"
+_READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri FROM stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE = "SELECT state, receipt, checkpoint_uri FROM stage WHERE run_id = %s AND stage = %s"
+_LOCK_STAGE = "SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"
 _FIND_RECONCILE = (
-    "SELECT 1 FROM platform.operation"
+    "SELECT 1 FROM operation"
     " WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s LIMIT 1"
 )
 _FIND_UNKNOWN_ORIGIN = (
-    "SELECT 1 FROM platform.operation"
+    "SELECT 1 FROM operation"
     " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'unresolved' LIMIT 1"
 )
 _INSERT_STAGE = (
-    "INSERT INTO platform.stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
+    "INSERT INTO stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
     " ON CONFLICT (run_id, stage) DO UPDATE SET"
     " state = EXCLUDED.state, receipt = EXCLUDED.receipt, checkpoint_uri = EXCLUDED.checkpoint_uri,"
     " reused_from_run = EXCLUDED.reused_from_run, original_executed_at = EXCLUDED.original_executed_at,"
     " updated_at = now()"
-    " WHERE platform.stage.state NOT IN ('completed','failed','cancelled','blocked','unresolved')"
+    " WHERE stage.state NOT IN ('completed','failed','cancelled','blocked','unresolved')"
     " RETURNING run_id, stage, state"
 )
 _RECONCILE_STAGE = (
-    "INSERT INTO platform.stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
+    "INSERT INTO stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
     " ON CONFLICT (run_id, stage) DO UPDATE SET"
     " state = EXCLUDED.state, receipt = EXCLUDED.receipt, checkpoint_uri = EXCLUDED.checkpoint_uri,"
     " reused_from_run = EXCLUDED.reused_from_run, original_executed_at = EXCLUDED.original_executed_at,"
     " updated_at = now()"
-    " WHERE platform.stage.state = 'unresolved'"
+    " WHERE stage.state = 'unresolved'"
     " RETURNING run_id, stage, state"
 )
 _READ_LIFECYCLE = (
-    "SELECT object_kind, object_id, run_id, state, bucket, updated_at FROM platform.lifecycle_projection"
+    "SELECT object_kind, object_id, run_id, state, bucket, updated_at FROM lifecycle_projection"
 )
-_NEXT_EVENT_SEQ = "SELECT COALESCE(MAX(seq), 0) + 1 FROM platform.run_event WHERE run_id = %s"
+_NEXT_EVENT_SEQ = "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_event WHERE run_id = %s"
 _INSERT_EVENT = (
-    "INSERT INTO platform.run_event (run_id, seq, kind, stage, operation_id, payload)"
+    "INSERT INTO run_event (run_id, seq, kind, stage, operation_id, payload)"
     " VALUES (%s, %s, %s, %s, %s, %s::jsonb)"
 )
+_READ_EVENTS = (
+    "SELECT seq, at, kind, stage, operation_id, payload FROM run_event"
+    " WHERE run_id = %s AND seq > %s ORDER BY seq LIMIT %s"
+)
+#: One events read can never pull an unbounded history; the portal asks for windows.
+_EVENTS_LIMIT_CAP = 1000
 
 #: Operation kinds that may continue on a terminal run (the reconciliation and
 #: cancellation commands); every other kind needs a non-terminal run.
@@ -411,6 +427,37 @@ class PlatformStore:
                 dispatch=dispatch or {},
             )
 
+    def claim_operation(self, *, run_id: str, stage: str, operation_key: str) -> OperationRecord:
+        """Claim a registered operation as ``running`` (queued -> running; idempotent).
+
+        This is the only transition into ``running``: the driver asserts that it
+        is about to execute the side effect the intent named.  Re-claiming the
+        same key keeps the first claim; a terminal or unknown operation is never
+        restarted - its outcome settles on this same operation.
+        """
+
+        if stage not in STAGE_IDS:
+            raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+        row = None
+        existing = None
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_CLAIM_OPERATION, (operation_key, run_id, stage))
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(_FIND_OPERATION, (operation_key,))
+                existing = cursor.fetchone()
+        if row is not None:
+            return OperationRecord(*row)
+        if existing is None:
+            raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
+        record = OperationRecord(*existing)
+        if record.run_id != run_id or record.stage != stage:
+            raise OperationConflictError("The operation key belongs to a different run or stage")
+        if record.state == "running":
+            return record
+        raise PlatformStoreError(f"The operation is {record.state!r}; it cannot be claimed again")
+
     def _identity_operation(
         self, *, run_id: str, stage: str, kind: str, operation_key: str, params_digest: str
     ) -> OperationRecord | None:
@@ -534,7 +581,7 @@ class PlatformStore:
     ) -> None:
         """Register one stage record: canonical state plus optional sealed receipt/checkpoint.
 
-        This is the store path that writes ``platform.stage`` rows on the
+        This is the store path that writes ``stage`` rows on the
         platform side.  A sealed ``completed`` row is immutable - a later
         confirmation for the same (run, stage) is an explicit refusal instead
         of a rewrite (a redo is a linked run, not an overwrite).
@@ -649,17 +696,28 @@ class PlatformStore:
         A failed or cancelled stage ends its run; the confirmed publication
         ends it successfully.  The guarded update keeps the first terminal
         outcome: a later record never rewrites a succeeded, failed or
-        cancelled run.
+        cancelled run.  The same transaction settles the stage's claimed
+        operation (``running``/``unresolved``) to the confirmed outcome; an
+        unresolved stage only sets its operation unknown and leaves the run in
+        place until the evidenced reconciliation.
         """
 
-        if state == "completed" and stage == "publish":
+        run_outcome: str | None = None
+        if state == "completed":
             outcome = "succeeded"
+            if stage == "publish":
+                run_outcome = "succeeded"
         elif state in {"failed", "cancelled"}:
             outcome = state
+            run_outcome = state
+        elif state == "unresolved":
+            outcome = "unresolved"
         else:
             return
         cursor = connection.cursor()
-        cursor.execute(_SET_RUN_OUTCOME, (outcome, run_id))
+        cursor.execute(_SETTLE_OPERATIONS, (outcome, run_id, stage))
+        if run_outcome is not None:
+            cursor.execute(_SET_RUN_OUTCOME, (run_outcome, run_id))
 
     def _insert_event(self, connection, *, run_id: str, stage: str, kind: str, operation_id, payload) -> None:
         """Append one run event in the same transaction as the state change it describes."""
@@ -843,6 +901,34 @@ class PlatformStore:
             self._insert_event(
                 connection, run_id=run_id, stage=stage, kind=kind, operation_id=None, payload=payload or {}
             )
+
+    def run_events(self, run_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict]:
+        """One run's recorded events, strictly ordered and bounded (the event read API).
+
+        ``after_seq`` pages forward only; ``limit`` is capped so one read never
+        pulls an unbounded history.
+        """
+
+        if not isinstance(after_seq, int) or after_seq < 0:
+            raise PlatformStoreError("after_seq must be a non-negative integer")
+        if not isinstance(limit, int) or limit < 1:
+            raise PlatformStoreError("limit must be a positive integer")
+        bounded = min(limit, _EVENTS_LIMIT_CAP)
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_EVENTS, (run_id, after_seq, bounded))
+            rows = cursor.fetchall()
+        return [
+            {
+                "seq": row[0],
+                "at": row[1],
+                "kind": row[2],
+                "stage": row[3],
+                "operation_id": row[4],
+                "payload": row[5],
+            }
+            for row in rows
+        ]
 
     def run_record(self, run_id: str) -> dict | None:
         """One run's identity and lineage (no display fields, no receipts)."""

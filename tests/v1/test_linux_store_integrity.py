@@ -172,7 +172,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         job["result"]["capture_archive"]["sha256"] = declared_sha256
         return job
 
-    def test_fetch_capture_enforces_the_declared_archive_digest(self) -> None:
+    def test_import_native_capture_enforces_the_declared_archive_digest(self) -> None:
         """The runner must enforce the declared digest independently of its client."""
 
         source = capture_root(self.tmp / "fresh", run_id=FRESH, handoff=HANDOFF)
@@ -188,9 +188,9 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         endpoint = FakeEndpoint(fresh_archive.read_bytes())
         job = self._job(FRESH, fresh_archive, declared_sha256="d" * 64)
         with self.assertRaises(PipelineError):
-            linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
+            linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
 
-    def test_fetch_capture_accepts_matching_bytes(self) -> None:
+    def test_import_native_capture_accepts_matching_bytes(self) -> None:
         source = capture_root(self.tmp / "fresh-ok", run_id=FRESH, handoff=HANDOFF)
         fresh_archive = self.tmp / "fresh-ok.zip"
         seal_capture(
@@ -204,7 +204,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         digest = hashlib.sha256(fresh_archive.read_bytes()).hexdigest()
         endpoint = FakeEndpoint(fresh_archive.read_bytes())
         job = self._job(FRESH, fresh_archive, declared_sha256=digest)
-        result = linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
+        result = linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
         self.assertEqual(result["state"], "capture_admitted")
         self.assertEqual((self.store.meta(FRESH) or {}).get("handoff_sha256"), HANDOFF)
         self.assertNotEqual(job["request"]["upload_sha256"], HANDOFF)
@@ -228,16 +228,16 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
                 job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
                 mutate(job)
                 with self.assertRaises(PipelineError):
-                    linux_runner.fetch_capture(self.store, endpoint, RUN, job)
+                    linux_runner.import_native_capture(self.store, endpoint, RUN, job)
                 self.assertEqual(endpoint.calls, 0)
 
     def test_fetch_retry_preserves_the_recorded_selection(self) -> None:
         endpoint = FakeEndpoint(self.archive.read_bytes())
         job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-        linux_runner.fetch_capture(self.store, endpoint, RUN, job)
+        linux_runner.import_native_capture(self.store, endpoint, RUN, job)
         self.store.update_meta(RUN, selection_sha256="0" * 64)
         with self.assertRaisesRegex(PipelineError, "recorded admission"):
-            linux_runner.fetch_capture(self.store, endpoint, RUN, job)
+            linux_runner.import_native_capture(self.store, endpoint, RUN, job)
         self.assertEqual(endpoint.calls, 0)
 
     def test_fetch_refuses_a_resealed_capture_with_another_native_inventory(self) -> None:
@@ -262,7 +262,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         job = self._job(FRESH, archive, declared_sha256=file_digest(archive))
         endpoint = FakeEndpoint(archive.read_bytes())
         with self.assertRaisesRegex(PipelineError, "native inventory differs"):
-            linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
+            linux_runner.import_native_capture(self.store, endpoint, FRESH, job)
 
     def test_manifest_receipt_mismatch_is_refused_before_import_and_on_retry(self) -> None:
         endpoint = FakeEndpoint(self.archive.read_bytes())
@@ -271,7 +271,7 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
         fresh = LinuxStore(self.tmp / "manifest-mismatch")
         for store in (fresh, self.store):
             with self.subTest(admitted=store is self.store), self.assertRaisesRegex(PipelineError, "manifest"):
-                linux_runner.fetch_capture(store, endpoint, RUN, job)
+                linux_runner.import_native_capture(store, endpoint, RUN, job)
         self.assertFalse(fresh.capture_dir(RUN).exists())
 
     # ------------------------------------------------------------ run lock

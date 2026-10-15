@@ -652,13 +652,13 @@ def main() -> int:
             except Exception:  # noqa: BLE001 - the run may not be visible for a moment
                 live = []
             if any(
-                str(item.get("task_id")) == "start_job" and str(item.get("state")) == "up_for_reschedule"
+                str(item.get("task_id")) == "discover" and str(item.get("state")) == "up_for_reschedule"
                 for item in live
             ):
                 reschedule_observed.append(
                     {
                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "task_id": "start_job",
+                        "task_id": "discover",
                         "state": "up_for_reschedule",
                     }
                 )
@@ -681,16 +681,16 @@ def main() -> int:
         if dag_state != "failed":
             problems.append(f"DAG run state is {dag_state!r}, expected the documented rejection (failed)")
         for task_id, expected_state in (
-            ("resolve_handoff", "success"),
-            ("start_job", "success"),
-            ("fetch_capture", "success"),
-            ("run_generate", "success"),
-            ("run_verify", "failed"),
+            ("freeze", "success"),
+            ("discover", "success"),
+            ("capture", "success"),
+            ("generate", "success"),
+            ("verify", "failed"),
         ):
             actual = task_states.get(task_id, {}).get("state")
             if actual != expected_state:
                 problems.append(f"task {task_id} is {actual!r}, expected {expected_state!r}")
-        for task_id in ("run_publish",):
+        for task_id in ("publish",):
             # Blocked without execution: the scheduler marked the task upstream_failed/skipped and
             # it never entered a running attempt, so a publish that started and failed early can
             # never be mistaken for a prevention proof.
@@ -704,16 +704,16 @@ def main() -> int:
         # observed up_for_reschedule state on that task.  Counts, other tasks and the configured
         # mode string are not evidence.
         reschedule_query = (
-            f"TaskReschedule(dag_id={DAG_ID!r}, run_id={run_id!r}, task_id='start_job') "
+            f"TaskReschedule(dag_id={DAG_ID!r}, run_id={run_id!r}, task_id='discover') "
             "via the isolated home's Airflow ORM"
         )
-        reschedule_rows, reschedule_error = _task_reschedule_evidence(args.venv, env, DAG_ID, run_id, "start_job")
+        reschedule_rows, reschedule_error = _task_reschedule_evidence(args.venv, env, DAG_ID, run_id, "discover")
         if reschedule_error is not None:
             problems.append(f"the TaskReschedule evidence could not be read: {reschedule_error}")
         if not reschedule_rows:
-            problems.append("no TaskReschedule rows exist for start_job; the native wait's slot release is not proven")
+            problems.append("no TaskReschedule rows exist for discover; the native wait's slot release is not proven")
         if not reschedule_observed:
-            problems.append("start_job was never observed in up_for_reschedule; its slot release is not proven")
+            problems.append("discover was never observed in up_for_reschedule; its slot release is not proven")
 
         store = LinuxStore(store_root)
         generated = _read_json(store.receipt_path(native_id, "generate"))

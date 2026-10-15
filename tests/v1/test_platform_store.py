@@ -147,35 +147,35 @@ class FakeCursor:
         normalized = " ".join(sql.split())
         world = self.world
         world.statements.append(normalized)
-        if "FROM platform.admission WHERE id = 1 FOR UPDATE" in normalized:
+        if "FROM admission WHERE id = 1 FOR UPDATE" in normalized:
             self._rows = [world.admission] if world.admission is not None else []
-        elif "UPDATE platform.admission" in normalized:
+        elif "UPDATE admission" in normalized:
             state, reason, actor = params
             world.admission = (state, reason, actor, NOW, world.admission[4] + 1)
             self._rows = [world.admission]
-        elif "FROM platform.admission_projection" in normalized:
+        elif "FROM admission_projection" in normalized:
             self._rows = [world.admission] if world.admission is not None else []
-        elif normalized.startswith("INSERT INTO platform.request"):
+        elif normalized.startswith("INSERT INTO request"):
             world.requests.append(tuple(params))
             self._rows = []
-        elif normalized.startswith("INSERT INTO platform.run ("):
+        elif normalized.startswith("INSERT INTO run ("):
             world.runs.append(tuple(params))
             world.run_states[params[0]] = "queued"
             world.run_from_stage[params[0]] = params[3]
             self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET state = 'running'"):
+        elif normalized.startswith("UPDATE run SET state = 'running'"):
             if world.run_states.get(params[0]) == "queued":
                 world.run_states[params[0]] = "running"
                 self._rows = [("running",)]
             else:
                 self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET state = %s"):
+        elif normalized.startswith("UPDATE run SET state = %s"):
             outcome, run_id = params
             if world.run_states.get(run_id) not in {"succeeded", "failed", "cancelled", None}:
                 world.run_states[run_id] = outcome
             self._rows = []
         elif normalized.startswith(
-            "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM platform.run WHERE run_id = %s"
+            "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
         ):
             entry = next((row for row in world.runs if row[0] == params[0]), None)
             if entry is None:
@@ -185,14 +185,14 @@ class FakeCursor:
                 self._rows = [(state, entry[1], entry[2], entry[3], entry[4])]
         elif normalized.startswith(
             "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
-            " FROM platform.stage WHERE run_id = %s"
+            " FROM stage WHERE run_id = %s"
         ):
             self._rows = [
                 (stage, record[0], record[1], record[2], None, None)
                 for (run_id, stage), record in world.stages.items()
                 if run_id == params[0]
             ]
-        elif normalized.startswith("INSERT INTO platform.operation"):
+        elif normalized.startswith("INSERT INTO operation"):
             key = params[4]
             if key in world.operations:
                 self._rows = []
@@ -202,18 +202,18 @@ class FakeCursor:
                 self._rows = [record]
         elif normalized.startswith(
             "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
-            " FROM platform.operation WHERE operation_key"
+            " FROM operation WHERE operation_key"
         ):
             record = world.operations.get(params[0])
             if world.hidden_finds:
                 world.hidden_finds -= 1
                 record = None
             self._rows = [record] if record else []
-        elif "SELECT state, from_stage FROM platform.run WHERE run_id = %s" in normalized:
+        elif "SELECT state, from_stage FROM run WHERE run_id = %s" in normalized:
             state = world.run_states.get(params[0])
             self._rows = [(state, world.run_from_stage.get(params[0]))] if state is not None else []
         elif normalized.startswith(
-            "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run"
+            "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run"
         ):
             if "WHERE run_id = %s" in normalized:
                 row = world.run_display_rows.get(params[0])
@@ -224,7 +224,7 @@ class FakeCursor:
                     for run_id, row in world.run_display_rows.items()
                     if row[0] is not None or row[1] is not None
                 ]
-        elif normalized.startswith("UPDATE platform.run SET display_name"):
+        elif normalized.startswith("UPDATE run SET display_name"):
             row = world.run_display_rows.get(params[1])
             if row is not None:
                 row[0] = params[0]
@@ -232,7 +232,7 @@ class FakeCursor:
                 self._rows = [(params[1], *row)]
             else:
                 self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET hidden_at = COALESCE"):
+        elif normalized.startswith("UPDATE run SET hidden_at = COALESCE"):
             row = world.run_display_rows.get(params[1])
             if row is not None:
                 if row[1] is None:
@@ -243,7 +243,7 @@ class FakeCursor:
                 self._rows = [(params[1], *row)]
             else:
                 self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET hidden_at = NULL"):
+        elif normalized.startswith("UPDATE run SET hidden_at = NULL"):
             row = world.run_display_rows.get(params[0])
             if row is not None:
                 row[1] = None
@@ -252,10 +252,10 @@ class FakeCursor:
                 self._rows = [(params[0], *row)]
             else:
                 self._rows = []
-        elif "FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
+        elif "FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
             self._rows = [(1,)] if (params[0], "publish") in world.confirmed_publishes else []
         elif (
-            "FROM platform.operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s"
+            "FROM operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s"
             in normalized
         ):
             found = any(
@@ -264,7 +264,7 @@ class FakeCursor:
             )
             self._rows = [(1,)] if found else []
         elif (
-            "FROM platform.operation WHERE run_id = %s AND stage = %s AND kind <> 'reconcile'"
+            "FROM operation WHERE run_id = %s AND stage = %s AND kind <> 'reconcile'"
             " AND state = 'unresolved'"
         ) in normalized:
             found = any(
@@ -272,15 +272,15 @@ class FakeCursor:
                 for item in world.operations.values()
             )
             self._rows = [(1,)] if found else []
-        elif normalized.startswith("SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
+        elif normalized.startswith("SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
             record = world.stages.get((params[0], params[1]))
             self._rows = [(record[0],)] if record else []
         elif normalized.startswith(
-            "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
+            "SELECT state, receipt, checkpoint_uri FROM stage WHERE run_id = %s AND stage = %s"
         ):
             record = world.stages.get((params[0], params[1]))
             self._rows = [record] if record else []
-        elif normalized.startswith("INSERT INTO platform.stage"):
+        elif normalized.startswith("INSERT INTO stage"):
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
             checkpoint = params[4]
@@ -296,13 +296,47 @@ class FakeCursor:
             else:
                 world.stages[(run_id, stage)] = (state, receipt, checkpoint)
                 self._rows = [(run_id, stage, state)]
-        elif normalized.startswith("SELECT COALESCE(MAX(seq), 0) + 1 FROM platform.run_event"):
+        elif normalized.startswith("SELECT COALESCE(MAX(seq), 0) + 1 FROM run_event"):
             highest = max((item[1] for item in world.events if item[0] == params[0]), default=0)
             self._rows = [(highest + 1,)]
-        elif normalized.startswith("INSERT INTO platform.run_event"):
+        elif normalized.startswith("INSERT INTO run_event"):
             world.events.append(tuple(params))
             self._rows = []
-        elif "FROM platform.lifecycle_projection" in normalized:
+        elif normalized.startswith("UPDATE operation SET state = 'running'"):
+            key = params[0]
+            record = world.operations.get(key)
+            if record is not None and record[1] == "queued" and record[4] == params[1] and record[5] == params[2]:
+                updated = (record[0], "running", record[2], record[3], record[4], record[5], record[6])
+                world.operations[key] = updated
+                self._rows = [updated]
+            else:
+                self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = %s"):
+            outcome, run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[4] == run_id
+                    and record[5] == stage
+                    and record[6] != "reconcile"
+                    and record[1] in {"running", "unresolved"}
+                ):
+                    world.operations[key] = (record[0], outcome, record[2], record[3], record[4], record[5], record[6])
+            self._rows = []
+        elif normalized.startswith("SELECT seq, at, kind, stage, operation_id, payload FROM run_event"):
+            run_id, after_seq, limit = params
+            self._rows = [
+                (
+                    item[1],
+                    NOW,
+                    item[2],
+                    item[3],
+                    item[4],
+                    json.loads(item[5]) if isinstance(item[5], str) else item[5],
+                )
+                for item in world.events
+                if item[0] == run_id and item[1] > after_seq
+            ][:limit]
+        elif "FROM lifecycle_projection" in normalized:
             self.description = tuple(
                 (name,) for name in ("object_kind", "object_id", "run_id", "state", "bucket", "updated_at")
             )
@@ -688,6 +722,55 @@ class PlatformStoreTests(unittest.TestCase):
                 self.assertEqual(self.world.stages[("r-1", stage)][0], "completed")
                 self.assertIsNotNone(self.store.confirmed_stage("r-1", stage))
         self.rebuilt.assert_not_called()
+
+    def test_claim_settles_with_the_stage_confirmation_in_one_transaction(self) -> None:
+        self._running_run()
+        record = self.store.register_operation(
+            run_id="r-1",
+            stage="freeze",
+            kind="dispatch",
+            operation_key="r-1/freeze:0",
+            params_digest="a" * 64,
+        )
+        self.assertEqual(record.state, "queued")
+        claimed = self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        self.assertEqual(claimed.state, "running")
+        self.assertEqual(
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0").state,
+            "running",
+        )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("freeze"),
+        )
+        self.assertEqual(self.world.operations["r-1/freeze:0"][1], "succeeded")
+        self.assertEqual(self.world.open_transactions, 0)
+        with self.assertRaisesRegex(PlatformStoreError, "cannot be claimed"):
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        with self.assertRaisesRegex(PlatformStoreError, "not registered"):
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/missing:0")
+        with self.assertRaisesRegex(OperationConflictError, "different run or stage"):
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/freeze:0")
+
+    def test_run_events_reads_a_bounded_ordered_window(self) -> None:
+        self._running_run()
+        self.store.append_event("r-1", stage="freeze", kind="observed", payload={"step": 1})
+        self.store.append_event("r-1", stage="freeze", kind="observed", payload={"step": 2})
+        events = self.store.run_events("r-1")
+        self.assertEqual(
+            [(event["seq"], event["kind"], event["payload"]) for event in events],
+            [(1, "observed", {"step": 1}), (2, "observed", {"step": 2})],
+        )
+        window = self.store.run_events("r-1", after_seq=1, limit=1)
+        self.assertEqual([event["seq"] for event in window], [2])
+        self.assertEqual(self.store.run_events("r-1", after_seq=9), [])
+        with self.assertRaisesRegex(PlatformStoreError, "limit must be a positive integer"):
+            self.store.run_events("r-1", limit=0)
+        with self.assertRaisesRegex(PlatformStoreError, "after_seq"):
+            self.store.run_events("r-1", after_seq=-1)
 
     def test_native_receipts_without_their_bindings_are_refused(self) -> None:
         self._running_run()

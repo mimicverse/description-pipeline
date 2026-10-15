@@ -247,13 +247,15 @@ class MockAirflow:
                                 "task_instances": outer.task_states.get(
                                     dag_run_id,
                                     [
-                                        {"task_id": "resolve_handoff", "state": "success"},
-                                        {"task_id": "start_job", "state": "success"},
-                                        {"task_id": "wait_for_job", "state": "success"},
-                                        {"task_id": "confirm_job", "state": "success"},
+                                        {"task_id": "freeze", "state": "success"},
+                                        {"task_id": "discover", "state": "success"},
+                                        {"task_id": "capture", "state": "success"},
+                                        {"task_id": "generate", "state": "success"},
+                                        {"task_id": "verify", "state": "success"},
+                                        {"task_id": "publish", "state": "success"},
                                     ],
                                 ),
-                                "total_entries": 4,
+                                "total_entries": 6,
                             },
                         )
                         return
@@ -836,10 +838,10 @@ class PortalTests(unittest.TestCase):
         self._seed_passed_job()
         self.airflow.dag_runs[DAG_RUN_ID]["state"] = "failed"
         self.airflow.task_states[DAG_RUN_ID] = [
-            {"task_id": "resolve_handoff", "state": "success"},
-            {"task_id": "start_job", "state": "success"},
-            {"task_id": "wait_for_job", "state": "failed"},
-            {"task_id": "confirm_job", "state": "upstream_failed"},
+            {"task_id": "freeze", "state": "success"},
+            {"task_id": "discover", "state": "success"},
+            {"task_id": "capture", "state": "failed"},
+            {"task_id": "publish", "state": "upstream_failed"},
         ]
 
     def test_retry_capability_uses_current_profile_and_recorded_actor(self) -> None:
@@ -870,7 +872,7 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 200, body)
                 self.assertEqual(
                     json.loads(body),
-                    {"dag_run_id": DAG_RUN_ID, "state": "queued", "cleared_tasks": ["confirm_job", "wait_for_job"]},
+                    {"dag_run_id": DAG_RUN_ID, "state": "queued", "cleared_tasks": ["capture", "publish"]},
                 )
                 self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], conf_before)
                 self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
@@ -925,12 +927,12 @@ class PortalTests(unittest.TestCase):
         self._seed_retryable_run()
         self.client.login()
         for selected in [
-            [{"task_id": "resolve_handoff", "state": "failed"}],
-            [{"task_id": "wait_for_job", "state": "success"}],
-            [{"task_id": "wait_for_job", "state": "failed"}],
-            [{"task_id": "wait_for_job", "state": "failed", "dag_run_id": "another-run"}],
-            [{"task_id": "wait_for_job", "state": "failed", "map_index": 0}],
-            [{"task_id": "wait_for_job", "state": "failed"}] * 2,
+            [{"task_id": "freeze", "state": "failed"}],
+            [{"task_id": "capture", "state": "success"}],
+            [{"task_id": "capture", "state": "failed"}],
+            [{"task_id": "capture", "state": "failed", "dag_run_id": "another-run"}],
+            [{"task_id": "capture", "state": "failed", "map_index": 0}],
+            [{"task_id": "capture", "state": "failed"}] * 2,
         ]:
             with self.subTest(selected=selected):
                 self.airflow.clear_selection = selected
@@ -949,7 +951,7 @@ class PortalTests(unittest.TestCase):
         self.airflow.task_states[DAG_RUN_ID][2]["state"] = "upstream_failed"
         status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["cleared_tasks"], ["confirm_job", "start_job", "wait_for_job"])
+        self.assertEqual(json.loads(body)["cleared_tasks"], ["capture", "discover", "publish"])
         self._seed_retryable_run()
         self.airflow.task_states[DAG_RUN_ID][0]["state"] = "failed"
         self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
@@ -1634,7 +1636,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(
             [task["task_id"] for task in payload["tasks"]],
-            ["resolve_handoff", "start_job", "wait_for_job", "confirm_job"],
+            ["freeze", "discover", "wait_for_job", "confirm_job"],
         )
         self.assertEqual(payload["job"]["status"], "passed")
 

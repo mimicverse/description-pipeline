@@ -273,11 +273,11 @@ class SubmissionIdentityHelperTests(unittest.TestCase):
 
     def test_unconfigured_target_fails_closed(self) -> None:
         with self.assertRaises(EndpointProtocolError) as caught:
-            submission_identity(target_hardware="ghost", config=self._config(), as_of="20261013")
+            submission_identity(target_hardware="ghost", config=self._config())
         self.assertIn("not a configured publication target", str(caught.exception))
 
     def test_absent_target_returns_none(self) -> None:
-        self.assertIsNone(submission_identity(target_hardware="", config=self._config(), as_of="20261013"))
+        self.assertIsNone(submission_identity(target_hardware="", config=self._config()))
 
     def test_payload_carries_owner_summary_and_parent(self) -> None:
         payload = submission_identity(
@@ -285,14 +285,13 @@ class SubmissionIdentityHelperTests(unittest.TestCase):
             change_summary="one line",
             principal="cli_app:tenant-a:ou_worker",
             config=self._config(),
-            as_of="20261013",
             published_revision=lambda repository, hardware: {"revision": "m3.0-20261001-deadbeef"},
         )
         self.assertEqual(payload["hardware_id"], "m3.0")
         self.assertEqual(payload["owner"], "cli_app:tenant-a:ou_worker")
         self.assertEqual(payload["change_summary"], "one line")
         self.assertEqual(payload["parent_revision"], "m3.0-20261001-deadbeef")
-        self.assertEqual(payload["as_of"], "20261013")
+        self.assertNotIn("as_of", payload)
 
     def test_reader_failure_is_best_effort_with_a_warning(self) -> None:
         warnings: list[str] = []
@@ -303,7 +302,6 @@ class SubmissionIdentityHelperTests(unittest.TestCase):
         payload = submission_identity(
             target_hardware="m3.0",
             config=self._config(),
-            as_of="20261013",
             published_revision=boom,
             warn=warnings.append,
         )

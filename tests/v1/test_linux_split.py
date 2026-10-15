@@ -472,7 +472,7 @@ class LinuxSplitTests(unittest.TestCase):
         endpoint = mock.Mock()
         endpoint.stream_capture_archive.side_effect = AssertionError("must not re-download")
         job = capture_job(self.run_id, self.archive, self.tool)
-        binding = linux_runner.fetch_capture(self.store, endpoint, self.run_id, job)
+        binding = linux_runner.import_native_capture(self.store, endpoint, self.run_id, job)
         self.assertEqual(binding["state"], "capture_admitted")
         self.assertEqual(binding["capture_dir"], str(self.store.capture_dir(self.run_id)))
         self.assertEqual(self.store.meta(self.run_id)["selection"], job["selection"]["manifest"])

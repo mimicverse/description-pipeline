@@ -752,7 +752,7 @@ def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_e
         # An authoritative 404 permits the first submission to resume from the saved resolution.
         return (
             assessment
-            if states.get("start_job") == "failed"
+            if states.get("discover") == "failed"
             else RetryAssessment(False, "endpoint_evidence_unavailable", ())
         )
     if job.get("status") == "failed":

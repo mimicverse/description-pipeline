@@ -269,7 +269,7 @@ def _check_selected_capture(store: LinuxStore, run_id: str, selection: dict) -> 
             raise PipelineError(f"The captured source differs from the selected bytes: {name}")
 
 
-def fetch_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
+def import_native_capture(store: LinuxStore, endpoint, run_id: str, job: dict) -> dict:
     """Download the sealed native capture and admit it into the Linux store."""
     run_id = validate_run_id(run_id)
     result = job.get("result") if isinstance(job.get("result"), dict) else {}

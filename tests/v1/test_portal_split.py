@@ -19,14 +19,12 @@ RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
 CHILD = "3f6a5c2e-6c41-4a1e-9c2a-2a1f7a1d0c33"
 SUBJECT = "a" * 64
 TASK_IDS = (
-    "resolve_handoff",
-    "start_job",
-    "wait_for_job",
-    "fetch_capture",
-    "run_generate",
-    "run_verify",
-    "run_publish",
-    "confirm_job",
+    "freeze",
+    "discover",
+    "capture",
+    "generate",
+    "verify",
+    "publish",
 )
 
 
@@ -159,19 +157,17 @@ class PortalSplitTests(unittest.TestCase):
         job = {"status": "native_complete", "result": {"native_complete": True}}
         self.windows.job = job
         tasks = [
-            {"task_id": "resolve_handoff", "state": "success"},
-            {"task_id": "start_job", "state": "success"},
-            {"task_id": "wait_for_job", "state": "failed"},
-            {"task_id": "fetch_capture", "state": "upstream_failed"},
-            {"task_id": "run_generate", "state": "upstream_failed"},
-            {"task_id": "run_verify", "state": "upstream_failed"},
-            {"task_id": "run_publish", "state": "upstream_failed"},
-            {"task_id": "confirm_job", "state": "upstream_failed"},
+            {"task_id": "freeze", "state": "success"},
+            {"task_id": "discover", "state": "failed"},
+            {"task_id": "capture", "state": "upstream_failed"},
+            {"task_id": "generate", "state": "upstream_failed"},
+            {"task_id": "verify", "state": "upstream_failed"},
+            {"task_id": "publish", "state": "upstream_failed"},
         ]
         assessment = portal_module._retry_assessment({"state": "failed"}, tasks, job, None)
         self.assertTrue(assessment.eligible)
         self.assertEqual(assessment.reason, "transport_recovery")
-        self.assertIn("wait_for_job", assessment.cleared_tasks)
+        self.assertIn("discover", assessment.cleared_tasks)
         self.assertEqual(portal_module._automatic_summary(job)["state"], "running")
 
         session = portal_module.PortalSession(

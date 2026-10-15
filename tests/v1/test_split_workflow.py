@@ -88,9 +88,9 @@ class SplitWorkflowTests(unittest.TestCase):
         self.assertFalse(bag.import_errors, bag.import_errors)
         dag = bag.dags["solidworks_to_urdf"]
         for task_id, predecessor in (
-            ("run_generate", "fetch_capture"),
-            ("run_verify", "run_generate"),
-            ("run_publish", "run_verify"),
+            ("generate", "capture"),
+            ("verify", "generate"),
+            ("publish", "verify"),
         ):
             with self.subTest(stage=task_id):
                 task = dag.get_task(task_id)
@@ -263,9 +263,9 @@ class SplitWorkflowTests(unittest.TestCase):
             patch.object(module, "_linux_store", return_value=object()),
             patch.object(module, "run_portable_stage", return_value=_failed_verify_receipt()),
         ):
-            run_verify = module.dag.get_task("run_verify").python_callable
+            verify = module.dag.get_task("verify").python_callable
             with self.assertRaises(AirflowFailException):
-                run_verify(generated, ti=ti)
+                verify(generated, ti=ti)
         pushed = ti.values["engineering_stages"]
         self.assertEqual(next(item for item in pushed["stages"] if item["id"] == "verify")["state"], "failed")
 
@@ -323,8 +323,8 @@ class SplitWorkflowTests(unittest.TestCase):
                 patch.object(module, "run_portable_stage", return_value=_passing_publish_receipt()),
                 patch.object(module, "config_from_airflow_connection", return_value=config),
             ):
-                run_publish = module.dag.get_task("run_publish").python_callable
-                result = run_publish(verified, ti=ti)
+                publish = module.dag.get_task("publish").python_callable
+                result = publish(verified, ti=ti)
         self.assertEqual(result["submission"]["state"], "published")
         self.assertEqual(result["submission"]["url"], "https://github.com/example/robot/pull/1")
         pushed = ti.values["engineering_stages"]

@@ -23,12 +23,12 @@ from tests.v1.test_airflow_dag import migrated_airflow_home
 ROOT = Path(__file__).resolve().parents[2]
 #: The split transport graph the scheduler must serialize for one run.
 TASK_IDS = {
-    "resolve_handoff",
-    "start_job",
-    "fetch_capture",
-    "run_generate",
-    "run_verify",
-    "run_publish",
+    "freeze",
+    "discover",
+    "capture",
+    "generate",
+    "verify",
+    "publish",
 }
 
 
@@ -64,18 +64,18 @@ class ScheduledSmokeTests(unittest.TestCase):
         self.assertEqual(report["dag_state"], "failed")
         tasks = report["task_states"]
         self.assertEqual(set(tasks), TASK_IDS)
-        for task_id in ("resolve_handoff", "start_job", "fetch_capture", "run_generate"):
+        for task_id in ("freeze", "discover", "capture", "generate"):
             self.assertEqual(tasks[task_id]["state"], "success", task_id)
-        self.assertEqual(tasks["run_verify"]["state"], "failed")
-        self.assertGreaterEqual(tasks["run_verify"]["try_number"], 1)
+        self.assertEqual(tasks["verify"]["state"], "failed")
+        self.assertGreaterEqual(tasks["verify"]["try_number"], 1)
         # Slot release is proven by the run's own raw records: TaskReschedule rows for the native
         # wait task plus the observed up_for_reschedule state on that same task.  Counts and the
         # sensor-mode string are not evidence.
         evidence = report["reschedule_evidence"]
         self.assertIsNone(evidence["error"])
-        self.assertTrue(evidence["rows"], "TaskReschedule rows for start_job must exist")
-        self.assertTrue(evidence["observed"], "start_job must be observed in up_for_reschedule")
-        for task_id in ("run_publish",):
+        self.assertTrue(evidence["rows"], "TaskReschedule rows for discover must exist")
+        self.assertTrue(evidence["observed"], "discover must be observed in up_for_reschedule")
+        for task_id in ("publish",):
             # Blocked without execution: the scheduler marked it upstream_failed (or skipped) and
             # it never entered a running attempt, so publication starting and failing early can
             # never be mistaken for a prevention proof.

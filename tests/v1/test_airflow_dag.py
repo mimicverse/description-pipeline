@@ -61,7 +61,7 @@ except Exception:  # pragma: no cover - exercised only without Airflow installed
 class DagTests(unittest.TestCase):
     def test_submission_frame_requires_a_configured_target_and_summary(self) -> None:
         bag = DagBag(str(DAG_DIR))
-        resolve = bag.dags["solidworks_to_urdf"].task_dict["resolve_handoff"].python_callable
+        resolve = bag.dags["solidworks_to_urdf"].task_dict["freeze"].python_callable
         module = sys.modules[resolve.__module__]
         config = EndpointConfig(
             "http://127.0.0.1:1",
@@ -94,7 +94,7 @@ class DagTests(unittest.TestCase):
         self.assertIsNone(identity["parent_revision"])
         self.assertEqual(multiline["change_summary"], "第一行\n第二行\n第三行")
 
-    def test_resolve_handoff_fails_before_any_endpoint_contact(self) -> None:
+    def test_freeze_fails_before_any_endpoint_contact(self) -> None:
         from types import SimpleNamespace
 
         from airflow.sdk.exceptions import AirflowFailException
@@ -116,7 +116,7 @@ class DagTests(unittest.TestCase):
         ):
             for conf in ({}, {"target_hardware": "m3.0"}, {"change_summary": "x"}):
                 with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
-                    dag.task_dict["resolve_handoff"].python_callable(**context(conf))
+                    dag.task_dict["freeze"].python_callable(**context(conf))
 
     def test_dag_parses(self) -> None:
         bag = DagBag(str(DAG_DIR))
@@ -126,20 +126,20 @@ class DagTests(unittest.TestCase):
         self.assertEqual(
             set(dag.task_ids),
             {
-                "resolve_handoff",
-                "start_job",
-                "fetch_capture",
-                "run_generate",
-                "run_verify",
-                "run_publish",
+                "freeze",
+                "discover",
+                "capture",
+                "generate",
+                "verify",
+                "publish",
             },
         )
         edges = {task_id: set(task.upstream_task_ids) for task_id, task in dag.task_dict.items()}
-        self.assertEqual(edges["start_job"], {"resolve_handoff"})
-        self.assertEqual(edges["fetch_capture"], {"resolve_handoff", "start_job"})
-        self.assertEqual(edges["run_generate"], {"fetch_capture"})
-        self.assertEqual(edges["run_verify"], {"run_generate"})
-        self.assertEqual(edges["run_publish"], {"run_verify"})
+        self.assertEqual(edges["discover"], {"freeze"})
+        self.assertEqual(edges["capture"], {"freeze", "discover"})
+        self.assertEqual(edges["generate"], {"capture"})
+        self.assertEqual(edges["verify"], {"generate"})
+        self.assertEqual(edges["publish"], {"verify"})
         self.assertEqual(
             set(dag.params), {"handoff_path", "main_assembly", "target_hardware", "change_summary"}
         )
@@ -259,7 +259,7 @@ class DagTests(unittest.TestCase):
                 "conn_id": "solidworks_windows",
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
-                started = dag.task_dict["start_job"].python_callable(request)
+                started = dag.task_dict["discover"].python_callable(request)
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
                 polled = False
                 for _ in range(8):
@@ -270,7 +270,7 @@ class DagTests(unittest.TestCase):
                 with self.assertRaises(AirflowFailException):
                     # The portable half only starts from the native_complete boundary;
                     # the full split is covered by test_split_workflow/test_linux_split.
-                    dag.task_dict["fetch_capture"].python_callable(request)
+                    dag.task_dict["capture"].python_callable(request)
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
             self.assertEqual(
@@ -347,7 +347,7 @@ class DagTests(unittest.TestCase):
                 "conn_id": "solidworks_windows",
             }
             with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
-                started = dag.task_dict["start_job"].python_callable(request)
+                started = dag.task_dict["discover"].python_callable(request)
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
@@ -386,7 +386,7 @@ class DagTests(unittest.TestCase):
         class Stub:
             def get_job(self, run_id):
                 if run_id == parent_run_id:
-                    # resolve_handoff reads the retained parent selection first.
+                    # freeze reads the retained parent selection first.
                     return parent_job
                 raise module.EndpointNotFound("child job is not created yet")
 
@@ -415,12 +415,12 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
         ):
-            request = dag.task_dict["resolve_handoff"].python_callable(**context)
+            request = dag.task_dict["freeze"].python_callable(**context)
             self.assertEqual(request["upload_files"], upload)
             self.assertEqual(request["upload_sha256"], digest(upload))
             self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
-            started = dag.task_dict["start_job"].python_callable(request)
+            started = dag.task_dict["discover"].python_callable(request)
         self.assertFalse(started)  # submission happened; the reschedule poll continues
         self.assertEqual(
             submitted,
@@ -436,7 +436,7 @@ class DagTests(unittest.TestCase):
             patch.object(module, "config_from_airflow_connection", return_value=config),
             self.assertRaises(AirflowFailException),
         ):
-            dag.task_dict["resolve_handoff"].python_callable(
+            dag.task_dict["freeze"].python_callable(
                 **{**context, "params": {"handoff_path": "", "main_assembly": "other.SLDASM"}}
             )
 
@@ -449,7 +449,7 @@ class DagTests(unittest.TestCase):
             patch.object(module, "config_from_airflow_connection", return_value=config),
             self.assertRaises(AirflowFailException),
         ):
-            dag.task_dict["resolve_handoff"].python_callable(**context)
+            dag.task_dict["freeze"].python_callable(**context)
 
     def test_linked_publish_rebinds_routing_from_conf_over_null_parent_meta(self) -> None:
         from types import SimpleNamespace
@@ -490,11 +490,11 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_root_capture", return_value=Path("/srv/capture")),
             patch.object(module, "_root_identity", return_value=("m3.0", "r1")),
         ):
-            request = dag.task_dict["resolve_handoff"].python_callable(**context)
+            request = dag.task_dict["freeze"].python_callable(**context)
             self.assertTrue(request["linux_owned"])
             self.assertEqual(request["repository_slug"], "mimicverse/description")
             self.assertEqual(request["repository_base"], "main")
-            binding = dag.task_dict["fetch_capture"].python_callable(request)
+            binding = dag.task_dict["capture"].python_callable(request)
         self.assertEqual(binding["repository_slug"], "mimicverse/description")
         self.assertEqual(binding["repository_base"], "main")
         self.assertEqual(binding["handoff_sha256"], "d" * 64)

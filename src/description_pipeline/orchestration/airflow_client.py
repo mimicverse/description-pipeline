@@ -297,7 +297,6 @@ def submission_identity(
     change_summary=None,
     principal=None,
     config: EndpointConfig,
-    as_of: str,
     published_revision=None,
     warn=None,
 ) -> dict | None:
@@ -335,7 +334,6 @@ def submission_identity(
         "owner": owner,
         "change_summary": summary or None,
         "parent_revision": parent,
-        "as_of": as_of,
         "resource_policy": {
             "schema_version": RESOURCE_POLICY_V1["schema_version"],
             "digest": resource_policy_v1_digest(),

@@ -459,10 +459,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
         )
         allowed = auth.DagDetails(id=auth.ALLOWED_DAG_ID)
         transport_failure = {
-            "resolve_handoff": "success",
-            "start_job": "success",
-            "wait_for_job": "failed",
-            "confirm_job": "upstream_failed",
+            "freeze": "success",
+            "discover": "success",
+            "capture": "failed",
+            "publish": "upstream_failed",
         }
         self._record_run(
             "run-own",
@@ -479,29 +479,29 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self._record_run(
             "run-resolve-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "failed", "start_job": "upstream_failed"},
+            tasks={"freeze": "failed", "discover": "upstream_failed"},
         )
         self._record_run(
             "run-start-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "success", "start_job": "failed"},
+            tasks={"freeze": "success", "discover": "failed"},
         )
         self._record_run(
             "run-start-unproven",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"start_job": "failed"},
+            tasks={"discover": "failed"},
         )
         self._record_run(
             "run-mapped",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "success", "wait_for_job": "failed"},
+            tasks={"freeze": "success", "discover": "failed"},
         )
         with self.sessions() as session:
             session.execute(
                 TaskInstance.__table__.insert().values(
                     dag_id=auth.ALLOWED_DAG_ID,
                     run_id="run-mapped",
-                    task_id="wait_for_job",
+                    task_id="discover",
                     map_index=0,
                     state="success",
                     pool="default_pool",
@@ -519,12 +519,12 @@ class FeishuAuthManagerTests(unittest.TestCase):
             "run-running",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
             state="running",
-            tasks={"wait_for_job": "failed"},
+            tasks={"discover": "failed"},
         )
         self._record_run(
             "run-no-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "success"},
+            tasks={"freeze": "success"},
         )
 
         def decide(
@@ -548,7 +548,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-legacy"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-damaged"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-resolve-failed"))
-        # A failed start_job is retryable only with a positively successful resolution.
+        # A failed discover is retryable only with a positively successful resolution.
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-failed"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-mapped"))
@@ -609,41 +609,41 @@ class FeishuAuthManagerTests(unittest.TestCase):
         eligible = classify(
             "failed",
             {
-                "resolve_handoff": "success",
-                "start_job": "success",
-                "wait_for_job": "failed",
-                "confirm_job": "upstream_failed",
+                "freeze": "success",
+                "discover": "success",
+                "capture": "failed",
+                "publish": "upstream_failed",
             },
         )
         self.assertTrue(eligible.eligible)
         self.assertEqual(eligible.reason, "transport_recovery")
-        self.assertEqual(eligible.cleared_tasks, ("confirm_job", "wait_for_job"))
+        self.assertEqual(eligible.cleared_tasks, ("capture", "publish"))
         for state, tasks, reason in (
-            ("running", {"wait_for_job": "failed"}, "run_active"),
-            ("success", {"wait_for_job": "failed"}, "run_succeeded"),
+            ("running", {"discover": "failed"}, "run_active"),
+            ("success", {"discover": "failed"}, "run_succeeded"),
             ("failed", {}, "no_failed_transport_task"),
-            ("failed", {"resolve_handoff": "failed"}, "resolution_or_capture_failed"),
-            ("failed", {"start_job": "failed"}, "resolution_not_success"),
+            ("failed", {"freeze": "failed"}, "resolution_or_capture_failed"),
+            ("failed", {"discover": "failed"}, "resolution_not_success"),
             (
                 "failed",
-                {"resolve_handoff": "success", "confirm_job": "failed"},
+                {"freeze": "success", "publish": "failed"},
                 "publication_failed",
             ),
             (
                 "failed",
-                {"resolve_handoff": "success", "other_task": "failed"},
+                {"freeze": "success", "other_task": "failed"},
                 "unknown_failed_task",
             ),
             (
                 "failed",
-                {"resolve_handoff": "success", "confirm_job": "upstream_failed"},
+                {"freeze": "success", "publish": "upstream_failed"},
                 "no_failed_transport_task",
             ),
             (
                 "failed",
                 {
-                    "resolve_handoff": "success",
-                    "wait_for_job": run_ownership.AMBIGUOUS_TASK_STATE,
+                    "freeze": "success",
+                    "discover": run_ownership.AMBIGUOUS_TASK_STATE,
                 },
                 "unknown_failed_task",
             ),
@@ -653,21 +653,21 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 self.assertFalse(assessment.eligible)
                 self.assertEqual(assessment.reason, reason)
         start_retry = classify(
-            "failed", {"resolve_handoff": "success", "start_job": "failed", "wait_for_job": "upstream_failed"}
+            "failed", {"freeze": "success", "discover": "failed", "capture": "upstream_failed"}
         )
         self.assertTrue(start_retry.eligible)
-        self.assertEqual(start_retry.cleared_tasks, ("start_job", "wait_for_job"))
+        self.assertEqual(start_retry.cleared_tasks, ("capture", "discover"))
 
     def test_split_transport_retry_preserves_the_engineering_boundary(self) -> None:
         classify = run_ownership.classify_transport_retry
         tasks = dict.fromkeys(run_ownership.KNOWN_TASKS, "upstream_failed")
-        tasks.update(resolve_handoff="success", start_job="success", wait_for_job="failed")
+        tasks.update(freeze="success", discover="failed")
         self.assertTrue(classify("failed", tasks).eligible)
-        tasks.update(wait_for_job="success", fetch_capture="failed")
+        tasks.update(discover="success", capture="failed")
         self.assertTrue(classify("failed", tasks).eligible)
-        for stage in ("run_generate", "run_verify", "run_publish"):
+        for stage in ("generate", "verify", "publish"):
             with self.subTest(stage=stage):
-                changed = {**tasks, "fetch_capture": "success", stage: "failed"}
+                changed = {**tasks, "capture": "success", stage: "failed"}
                 self.assertFalse(classify("failed", changed).eligible)
 
     def test_clear_body_candidate_matrix_and_replay(self) -> None:

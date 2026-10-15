@@ -19,7 +19,7 @@ import logging
 import os
 import shutil
 import tempfile
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from airflow.sdk import Param, dag, task
@@ -43,7 +43,7 @@ from description_pipeline.orchestration.airflow_client import (
     submission_identity,
     validate_main_assembly,
 )
-from description_pipeline.orchestration.linux_runner import fetch_capture as fetch_native_capture
+from description_pipeline.orchestration.linux_runner import import_native_capture
 from description_pipeline.orchestration.linux_runner import run_portable_stage
 from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.stages import (
@@ -231,7 +231,6 @@ def _submission_frame(context) -> tuple[dict, dict]:
             change_summary=summary,
             principal=principal,
             config=config,
-            as_of=datetime.now(UTC).strftime("%Y%m%d"),
             published_revision=published_revision,
             warn=lambda message: log.warning("%s", message),
         )
@@ -458,10 +457,6 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
                 control_reference=(
                     handoff_digest if isinstance(handoff_digest, str) else identity_block.get("control_reference")
                 ),
-                as_of=identity_block.get("as_of"),
-                inventory_digest=(
-                    handoff_digest if isinstance(handoff_digest, str) else request.get("upload_sha256")
-                ),
             )
         admission = admit_raw_record_bundle(
             bundle,
@@ -571,7 +566,7 @@ def _poke(request: dict, **context) -> bool:
     stages = stage_view(job)
     ti = context.get("ti")
     progress = digest(compact_view(stages))
-    if ti is None or ti.xcom_pull(task_ids="start_job", key="engineering_progress") != progress:
+    if ti is None or ti.xcom_pull(task_ids="discover", key="engineering_progress") != progress:
         for stage in stages["stages"]:
             log.info(
                 "engineering stage=%s state=%s input_qc=%s output_qc=%s",
@@ -687,16 +682,16 @@ def _confirm_delivery(published: dict) -> dict:
         "## Read a run in the grid\n\n"
         "| Task | Stage | What it means |\n"
         "|---|---|---|\n"
-        "| `resolve_handoff` | freeze | Admitted folder, file inventory and handoff digest |\n"
-        "| `start_job` | discover | Windows native half: submission, reference resolution, definition "
+        "| `freeze` | freeze | Admitted folder, file inventory and handoff digest |\n"
+        "| `discover` | discover | Windows native half: submission, reference resolution, definition "
         "exchange and capture; native stage checks appear in these logs |\n"
-        "| `fetch_capture` | capture | Sealed native capture imported into the Linux attempt store |\n"
-        "| `run_generate`, `run_verify`, `run_publish` | generate, verify, publish | Linux URDF generation, "
+        "| `capture` | capture | Sealed native capture imported into the Linux attempt store |\n"
+        "| `generate`, `verify`, `publish` | generate, verify, publish | Linux URDF generation, "
         "independent verification, review PR and the final six-stage delivery receipt |\n\n"
         "## Stage contract\n\n" + contract_markdown() + "\n\n## Where results live\n\n"
-        "- Task logs: native stage checks in `start_job`; Linux results "
-        "(`portable stage=... state=... checks=n/m`) in `run_generate` / `run_verify` / `run_publish`; "
-        "the delivery summary in `run_publish`.\n"
+        "- Task logs: native stage checks in `discover`; Linux results "
+        "(`portable stage=... state=... checks=n/m`) in `generate` / `verify` / `publish`; "
+        "the delivery summary in `publish`.\n"
         "- Per-run XCom `engineering_stages`; detailed receipt at `reports/stages.json`; delivered or "
         "failed native runs also retain the structural-team report at `reports/structural-team.md` and "
         "`reports/structural-team.json`.\n"
@@ -747,7 +742,7 @@ def solidworks_to_urdf():
             "Freeze stage: admit the sealed folder, bind its file inventory and handoff digest for the engineering job."
         )
     )
-    def resolve_handoff(**context) -> dict:
+    def freeze(**context) -> dict:
         identity, routing = _submission_frame(context)
         linked = _linked_conf(context)
         if linked is not None:
@@ -849,7 +844,7 @@ def solidworks_to_urdf():
             "never replay CAD."
         ),
     )
-    def start_job(request: dict, **context) -> bool:
+    def discover(request: dict, **context) -> bool:
         if request.get("linux_owned"):
             log.info(
                 "linked attempt run_id=%s from_stage=%s is linux-owned; no Windows job",
@@ -874,7 +869,7 @@ def solidworks_to_urdf():
     @task(
         doc_md=("Capture stage: import the sealed native capture into the Linux store and bind routing for generation.")
     )
-    def fetch_capture(request: dict) -> dict:
+    def capture(request: dict) -> dict:
         store = _linux_store(request["conn_id"])
         run_id = request["run_id"]
         resume = request.get("resume") or {}
@@ -902,7 +897,7 @@ def solidworks_to_urdf():
             if job.get("status") != "native_complete":
                 raise AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
             capture_archive_metadata(job)
-            binding = fetch_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
+            binding = import_native_capture(store, _endpoint(request["conn_id"]), run_id, job)
             binding["repository_slug"] = job.get("repository_slug")
             binding["repository_base"] = job.get("repository_base")
             binding["hardware_id"], binding["revision"] = _root_identity(store, run_id)
@@ -929,7 +924,7 @@ def solidworks_to_urdf():
         return {"request": request, **binding}
 
     @task(doc_md="Generate stage: build the URDF on Linux; this checkpoint is intentionally unverified.")
-    def run_generate(binding: dict, **context) -> dict:
+    def generate(binding: dict, **context) -> dict:
         if binding.get("from_stage") in {"verify", "publish"}:
             # The linked attempt resumes past generation: reuse the parent checkpoint.
             store = _linux_store(binding["request"]["conn_id"])
@@ -941,7 +936,7 @@ def solidworks_to_urdf():
         return {**binding, "generate": _portable_summary(receipt, stage="generate")}
 
     @task(doc_md="Verify stage: independent verification on Linux, including the MuJoCo consumer.")
-    def run_verify(generated: dict, **context) -> dict:
+    def verify(generated: dict, **context) -> dict:
         if generated.get("from_stage") == "publish":
             # The linked attempt resumes past verification: reuse the parent checkpoint.
             store = _linux_store(generated["request"]["conn_id"])
@@ -966,7 +961,7 @@ def solidworks_to_urdf():
             "Publish stage: publish the verified delivery as the review PR from Linux; no repository work on Windows."
         )
     )
-    def run_publish(verified: dict, **context) -> dict:
+    def publish(verified: dict, **context) -> dict:
         subject = (verified.get("verify") or {}).get("subject_sha256")
         if not subject:
             raise AirflowFailException("verify produced no subject to publish")
@@ -988,14 +983,14 @@ def solidworks_to_urdf():
         published = {**verified, "publish": _portable_summary(receipt, stage="publish")}
         return _confirm_delivery(published)
 
-    request = resolve_handoff()
-    started = start_job(request)
+    request = freeze()
+    started = discover(request)
     # The poll follows the submission even where op_kwargs XCom resolution is not
     # inferred as a dependency edge.
-    fetched = fetch_capture(request)
-    generated = run_generate(fetched)
-    verified = run_verify(generated)
-    published = run_publish(verified)
+    fetched = capture(request)
+    generated = generate(fetched)
+    verified = verify(generated)
+    published = publish(verified)
     started >> fetched
     fetched >> generated >> verified >> published
 
