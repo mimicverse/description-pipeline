@@ -197,11 +197,15 @@ class MotionFixtureTests(unittest.TestCase):
             "axis_point_m": [0.0, 0.0, 0.5],
             "axis_direction": [0.0, 0.0, 1.0],
         }
-        details = _motion(authored, joints, components, datums, bodies, record)
-        self.assertLessEqual(details["worst_m"], 5e-5)
+        native = {joints[0]["name"]: record}
+        details = _motion(authored, joints, components, datums, bodies, record, native_axes=native)
+        self.assertLessEqual(details["worst_matrix_element_delta"], 5e-5)
         flipped = {**record, "axis_direction": [0.0, 0.0, -1.0]}
         with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
-            _motion(authored, joints, components, datums, bodies, flipped)
+            _motion(
+                authored, joints, components, datums, bodies, flipped,
+                native_axes={joints[0]["name"]: flipped},
+            )
 
     def test_product_gate_rejects_a_wrong_parent_on_the_delivered_graph(self):
         # G06 dependency boundary: with the native hinge line off the child
@@ -239,11 +243,17 @@ class MotionFixtureTests(unittest.TestCase):
             "axis_point_m": list(point),
             "axis_direction": [0.0, 0.0, 1.0],
         }
-        details = _motion(authored, [authored], components, datums, bodies, record)
-        self.assertLessEqual(details["worst_m"], 5e-5)
+        details = _motion(
+            authored, [authored], components, datums, bodies, record,
+            native_axes={authored["name"]: record},
+        )
+        self.assertLessEqual(details["worst_matrix_element_delta"], 5e-5)
         swapped = {**authored, "parent": "tool", "child": "base"}
         with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
-            _motion(swapped, [swapped], components, datums, bodies, record)
+            _motion(
+                swapped, [swapped], components, datums, bodies, record,
+                native_axes={swapped["name"]: record},
+            )
 
     @staticmethod
     def _serial_joint(name, parent, child, owner):
@@ -308,13 +318,14 @@ class MotionFixtureTests(unittest.TestCase):
             captured.append(dict(kwargs["poses"]))
             return real_evaluate(**kwargs)
 
+        native = {joint["name"]: record for joint, record in zip(joints, records, strict=True)}
         with patch("description_pipeline.verification.motion.evaluate_motion", side_effect=trace):
-            upstream = _motion(joints[0], joints, components, datums, bodies, records[0])
-            terminal = _motion(joints[1], joints, components, datums, bodies, records[1])
-        self.assertLessEqual(upstream["worst_m"], 5e-5)
+            upstream = _motion(joints[0], joints, components, datums, bodies, records[0], native_axes=native)
+            terminal = _motion(joints[1], joints, components, datums, bodies, records[1], native_axes=native)
+        self.assertLessEqual(upstream["worst_matrix_element_delta"], 5e-5)
         self.assertLessEqual(upstream["worst_translation_m"], 5e-5)
         self.assertLessEqual(upstream["worst_rotation_rad"], 5e-5)
-        self.assertLessEqual(terminal["worst_m"], 5e-5)
+        self.assertLessEqual(terminal["worst_matrix_element_delta"], 5e-5)
         # The product bridge itself must sample a combined non-zero pose; every
         # combined value comes from that joint's own evidence, never a zero or
         # default filler.
@@ -385,12 +396,19 @@ class MotionFixtureTests(unittest.TestCase):
         from description_pipeline.verification.solidworks_urdf import _motion
 
         datums, components, bodies, joints, records = self._serial_setup()
+        native = {joint["name"]: record for joint, record in zip(joints, records, strict=True)}
         reversed_first = {**joints[0], "parent": "link1", "child": "base_link"}
         with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
-            _motion(reversed_first, [reversed_first, joints[1]], components, datums, bodies, records[0])
+            _motion(
+                reversed_first, [reversed_first, joints[1]], components, datums, bodies, records[0],
+                native_axes=native,
+            )
         wrong_axis = {**joints[0], "axis": [1.0, 0.0, 0.0]}
         with self.assertRaisesRegex(PipelineError, "diverges from the re-derived motion"):
-            _motion(wrong_axis, [wrong_axis, joints[1]], components, datums, bodies, records[0])
+            _motion(
+                wrong_axis, [wrong_axis, joints[1]], components, datums, bodies, records[0],
+                native_axes=native,
+            )
         spanning = [
             {"id": "base_link", "group": "shared", "frame": datums["base_link"].tolist(), "leaves": []},
             {"id": "link1", "group": "shared", "frame": datums["link1"].tolist(), "leaves": []},
@@ -497,9 +515,12 @@ class MotionFixtureTests(unittest.TestCase):
             "axis_point_m": [0.2, 0.0, 0.5],
             "axis_direction": [0.0, 0.0, 1.0],
         }
-        details = _motion(authored, [authored], components, datums, bodies, record)
+        details = _motion(
+            authored, [authored], components, datums, bodies, record,
+            native_axes={authored["name"]: record},
+        )
         self.assertEqual([abs(value) for value in details["samples"]], [0.5, 0.5])
-        self.assertLessEqual(details["worst_m"], 5e-5)
+        self.assertLessEqual(details["worst_matrix_element_delta"], 5e-5)
         self.assertIn("combined_worst_translation_m", details)
         self.assertEqual(details["combined_worst_translation_m"], 0.0)
         self.assertEqual(details["combined_worst_rotation_rad"], 0.0)
@@ -549,16 +570,140 @@ class MotionFixtureTests(unittest.TestCase):
         forward = record((0.2, 0.0, 0.5), (0.2, 0.0, 1.5))
         reversed_endpoints = record((0.2, 0.0, 1.5), (0.2, 0.0, 0.5))
         results = [
-            _motion(authored, [authored], components, datums, bodies, entry)
+            _motion(
+                authored, [authored], components, datums, bodies, entry,
+                native_axes={authored["name"]: entry},
+            )
             for entry in (forward, reversed_endpoints)
         ]
         for entry in results:
-            self.assertEqual(entry["worst_m"], 0.0)
+            self.assertEqual(entry["worst_matrix_element_delta"], 0.0)
             self.assertEqual(entry["worst_translation_m"], 0.0)
             self.assertEqual(entry["worst_rotation_rad"], 0.0)
         self.assertLess(
             float(np.dot(forward["axis_direction"], reversed_endpoints["axis_direction"])), 0
         )
+
+    def test_product_gate_samples_nonzero_combined_under_asymmetric_limits(self):
+        # G06: valid asymmetric limits still yield combined NON-ZERO samples -
+        # each value comes from the joint's own interval, stays inside it, and
+        # a zero-width range never claims motion.
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        datums, components, bodies, joints, records = self._serial_setup()
+        joints = [
+            {**joints[0], "limits": {"lower": -3.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0}},
+            {**joints[1], "limits": {"lower": -1.0, "upper": 3.0, "effort": 1.0, "velocity": 1.0}},
+        ]
+        native = {joint["name"]: record for joint, record in zip(joints, records, strict=True)}
+        captured = []
+        real = evaluate_motion
+
+        def trace(**kwargs):
+            result = real(**kwargs)
+            captured.append((dict(kwargs["poses"]), result))
+            return result
+
+        with patch("description_pipeline.verification.motion.evaluate_motion", side_effect=trace):
+            details = _motion(joints[0], joints, components, datums, bodies, records[0], native_axes=native)
+        self.assertEqual(details["samples"], [0.0, -2.0])
+        combined = [(poses, result) for poses, result in captured if len(poses) == 2]
+        self.assertEqual(len(combined), 2)
+        for poses, _result in combined:
+            for joint in joints:
+                value = float(poses[joint["name"]])
+                self.assertGreater(abs(value), 1e-12)
+                self.assertLessEqual(joint["limits"]["lower"], value)
+                self.assertLessEqual(value, joint["limits"]["upper"])
+        # Closed-form forward kinematics agrees on every sampled combined pose.
+        for poses, result in combined:
+            q1, q2 = float(poses["J1"]), float(poses["J2"])
+            expected = np.eye(4)
+            expected[:3, :3] = [
+                [math.cos(q1 + q2), -math.sin(q1 + q2), 0.0],
+                [math.sin(q1 + q2), math.cos(q1 + q2), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+            expected[:3, 3] = (0.2 + 0.2 * math.cos(q1), 0.2 * math.sin(q1), 0.5)
+            got = np.asarray(result["world"]["part2"], float)
+            self.assertLessEqual(float(np.max(np.abs(got - expected))), 1e-9)
+        degenerate = {**joints[0], "limits": {"lower": 0.0, "upper": 0.0, "effort": 1.0, "velocity": 1.0}}
+        with patch("description_pipeline.verification.motion.evaluate_motion", side_effect=trace):
+            captured.clear()
+            _motion(
+                degenerate, [degenerate, joints[1]], components, datums, bodies, records[0],
+                native_axes=native,
+            )
+        self.assertIn(
+            0.0,
+            [float(poses[degenerate["name"]]) for poses, _result in captured if len(poses) == 2],
+        )
+
+    def test_product_gate_requires_the_complete_native_axis_map(self):
+        # The final bridge consumes the complete native axis map; the old
+        # single-record call shape and a partial map refuse.
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        datums, components, bodies, joints, records = self._serial_setup()
+        with self.assertRaisesRegex(PipelineError, "complete native axis map"):
+            _motion(joints[0], joints, components, datums, bodies, records[0], native_axes={})
+        with self.assertRaises(TypeError):
+            _motion(joints[0], joints, components, datums, bodies, records[0])
+
+    def test_motion_aligns_an_undirected_axis_in_the_child_datum_frame(self):
+        # G06: with the child datum rotated R_x(pi), the authored local +Z is
+        # assembly -Z; both endpoint orders of the undirected native RefAxis
+        # accept with zero error (the sign comparison happens in one frame).
+        from description_pipeline.verification.solidworks_urdf import _motion
+
+        base = np.eye(4)
+        tool = np.eye(4)
+        tool[:3, :3] = np.diag([1.0, -1.0, -1.0])
+        tool[:3, 3] = (0.2, 0.0, 0.5)
+        datums = {"base_link": base, "tool": tool}
+        components = {"part0": base.copy(), "part1": tool.copy()}
+        bodies = [
+            {"name": "base_link", "components": ["part0"]},
+            {"name": "tool", "components": ["part1"]},
+        ]
+        reference = {"kind": "reference_axis", "component": "part0", "feature_name": "Axis1"}
+        authored = {
+            "name": "hinge",
+            "type": "revolute",
+            "parent": "base_link",
+            "child": "tool",
+            "axis": [0.0, 0.0, 1.0],
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+            "axis_reference": reference,
+        }
+
+        def record(start, end):
+            start = np.asarray(start, float)
+            end = np.asarray(end, float)
+            direction = (end - start) / np.linalg.norm(end - start)
+            return {
+                "kind": "reference_axis",
+                "selector": reference,
+                "component": "part0",
+                "direction_semantics": "undirected_axis_line",
+                "used_api": "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams",
+                "coordinate_frame": "assembly",
+                "raw_endpoints_m": [*start.tolist(), *end.tolist()],
+                "axis_point_m": start.tolist(),
+                "axis_direction": direction.tolist(),
+            }
+
+        entries = (
+            record((0.2, 0.0, 0.5), (0.2, 0.0, 1.5)),
+            record((0.2, 0.0, 1.5), (0.2, 0.0, 0.5)),
+        )
+        for entry in entries:
+            details = _motion(
+                authored, [authored], components, datums, bodies, entry,
+                native_axes={authored["name"]: entry},
+            )
+            self.assertEqual(details["worst_matrix_element_delta"], 0.0)
+            self.assertEqual(details["worst_rotation_rad"], 0.0)
 
 
 if __name__ == "__main__":

@@ -959,23 +959,61 @@ def _joint_sample(joint, sign):
     return middle + sign * quarter
 
 
-def _signed_axis_line(joint, record, components):
+def _joint_combined_sample(joint, sign):
+    """A deterministic in-range NON-ZERO pose for the combined sample.
+
+    The value comes from the joint's own ordered-limits interval (never
+    outside its authored limits): the quarter point, or - when that quarter
+    point sits at zero - the half-quarter point on the same side, both
+    strictly inside the range.  A zero-width range has no motion to claim: it
+    contributes the zero pose when zero is admissible, and a degenerate range
+    that excludes its zero refuses instead of fabricating a pose.
+    """
+
+    if joint["type"] == "continuous":
+        return 0.3 if sign > 0 else -0.4
+    limits = joint.get("limits") or {}
+    lower, upper = limits.get("lower"), limits.get("upper")
+    _require(
+        isinstance(lower, (int, float))
+        and isinstance(upper, (int, float))
+        and math.isfinite(float(lower))
+        and math.isfinite(float(upper))
+        and float(lower) <= float(upper),
+        f"Joint {joint['name']} has no usable ordered limits",
+    )
+    lower, upper = float(lower), float(upper)
+    middle = (lower + upper) / 2
+    quarter = (upper - lower) / 4
+    if quarter == 0:
+        _require(lower <= 0.0 <= upper, f"Joint {joint['name']} has a zero-width range that excludes its zero")
+        return 0.0
+    value = middle + sign * quarter
+    if abs(value) <= 1e-12:
+        value = middle + sign * quarter / 2
+    return value
+
+
+def _signed_axis_line(joint, record, components, body_datums):
     """The native line with the evidenced signed joint convention.
 
     A record that explicitly declares ``direction_semantics =
     undirected_axis_line`` fixes a line, not a direction: exchanging its two
     measured endpoints keeps the same geometric object.  For those records the
-    signed positive-motion convention is the delivered authored axis (the
-    shafts gate reports the same ``author_axis_in_child_datum`` convention),
-    so the returned direction is aligned to it and the endpoint order can
-    never decide the physical sign.  A genuinely directed record keeps its own
+    signed positive-motion convention is the delivered authored axis carried
+    into the SAME frame as the native direction through the evidenced native
+    child datum (the shafts gate reports the same
+    ``author_axis_in_child_datum`` convention); the endpoint order can never
+    decide the physical sign.  A genuinely directed record keeps its own
     direction, and an unexplained sign mismatch under a directed source still
     diverges as before.
     """
 
     point, direction = _axis_line(joint, record, components)
     if record.get("direction_semantics") == "undirected_axis_line":
-        authored_axis = np.asarray(_unit_axis(joint.get("axis")), float)
+        child_datum = body_datums.get(joint["child"])
+        _require(child_datum is not None, f"Joint {joint['name']} names no delivered child datum")
+        authored_axis = child_datum[:3, :3] @ np.asarray(_unit_axis(joint.get("axis")), float)
         if float(np.dot(np.asarray(direction, float), authored_axis)) < 0:
             direction = -np.asarray(direction, float)
     return point, direction
@@ -1039,7 +1077,7 @@ def _cylinder_axis_line(reference, record, components):
     return point, direction
 
 
-def _motion(authored, joints, components, body_datums, bodies, record, native_axes=None):
+def _motion(authored, joints, components, body_datums, bodies, record, native_axes):
     """The motion.{joint} gate: non-zero follow re-derived from the native shaft line.
 
     The motion owner re-derives, from the shaft evidence alone, where every
@@ -1048,31 +1086,36 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
     at its zero pose (or a fixed weld) still carries its descendants exactly
     as the delivered graph does.  Besides the per-joint samples, a combined
     sample poses ALL delivered moving joints at once - each value derived
-    from that joint's own evidence (its ordered limits / continuous
-    convention), never a zero or default filler - and the delivered graph is
-    forward-kinematicked from its own datums and signed axes (a
-    revolute/continuous joint rotates about its axis, a prismatic joint
-    translates along it without rotating).  A statically green delivery whose
-    parent chain, axis binding or frame relations are wrong diverges as soon
-    as a pose is non-zero.
+    from that joint's own ordered-limits interval (a deterministic in-range
+    NON-ZERO value; a zero-width range never claims motion) - and the
+    delivered graph is forward-kinematicked from its own datums and signed
+    axes (a revolute/continuous joint rotates about its axis, a prismatic
+    joint translates along it without rotating).  A statically green delivery
+    whose parent chain, axis binding or frame relations are wrong diverges as
+    soon as a pose is non-zero.
 
-    ``native_axes`` carries every joint's native shaft record (the production
-    call passes the full map), so the combined sample's expected side uses
-    each moving joint's own native line; a caller that passes only the
-    sampled joint's record falls back to the other joints' delivered
-    declarations (their child datum and authored axis) - never a zero or
-    default filler.  Reported errors separate the translation (m) from the
-    rotation (rad); the acceptance threshold still applies to the established
-    element-wise consistency metric.
+    ``native_axes`` is REQUIRED and must carry every moving joint's native
+    shaft record (the production call passes the full map): the expected side
+    of every sample uses each moving joint's own native line, and there is no
+    single-record fallback.  Reported errors separate the translation (m)
+    from the rotation (rad); the acceptance threshold still applies to the
+    established element-wise consistency metric.
     """
 
     from .motion import axis_rotation, evaluate_motion
 
     name, child = authored["name"], authored["child"]
-    point, direction = _signed_axis_line(authored, record, components)
+    point, direction = _signed_axis_line(authored, record, components, body_datums)
     limits = authored["limits"]
     samples = (_joint_sample(authored, 1.0), _joint_sample(authored, -1.0))
     parents = {joint["child"]: joint for joint in joints}
+    moving = [joint for joint in joints if joint["type"] != "fixed"]
+    missing = [joint["name"] for joint in moving if not (native_axes or {}).get(joint["name"])]
+    _require(
+        isinstance(native_axes, dict) and not missing,
+        "The motion bridge requires the complete native axis map"
+        + (f"; missing {missing}" if missing else ""),
+    )
     doc_bodies = [
         {
             "id": body["name"],
@@ -1112,15 +1155,10 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
             axis_point, axis_dir = point.tolist(), direction.tolist()
             joint_limits = limits
         else:
-            other = (native_axes or {}).get(joint["name"])
-            if other is not None:
-                other_point, other_direction = _signed_axis_line(joint, other, components)
-                axis_point, axis_dir = other_point.tolist(), other_direction.tolist()
-            else:
-                child_datum = body_datums.get(joint["child"])
-                _require(child_datum is not None, f"Joint {joint['name']} names no delivered child frame")
-                axis_point = child_datum[:3, 3].tolist()
-                axis_dir = _unit_axis(joint.get("axis"))
+            other_point, other_direction = _signed_axis_line(
+                joint, native_axes[joint["name"]], components, body_datums
+            )
+            axis_point, axis_dir = other_point.tolist(), other_direction.tolist()
             joint_limits = joint.get("limits") or {}
         doc_joints.append(
             {
@@ -1147,11 +1185,10 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
         "axis_dir": direction.tolist(),
     }
 
-    moving = [joint for joint in joints if joint["type"] != "fixed"]
     checks = [({name: value}, f"{value:g}") for value in samples]
     if len(moving) > 1:
         for sign, label in ((1.0, "combined+"), (-1.0, "combined-")):
-            checks.append(({joint["name"]: _joint_sample(joint, sign) for joint in moving}, label))
+            checks.append(({joint["name"]: _joint_combined_sample(joint, sign) for joint in moving}, label))
 
     def model_transform(body_name, poses, memo):
         if body_name in memo:
@@ -1204,12 +1241,12 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
     _require(
         worst <= POSITION_TOL_M,
         f"{name}: the delivered graph diverges from the re-derived motion by {worst:.9g} "
-        f"(numerical element max; worst translation {worst_translation:.9g} m, "
+        f"(matrix-element delta; worst translation {worst_translation:.9g} m, "
         f"worst rotation {worst_rotation:.9g} rad)",
     )
     return {
         "samples": list(samples),
-        "worst_m": worst,
+        "worst_matrix_element_delta": worst,
         "worst_translation_m": worst_translation,
         "worst_rotation_rad": worst_rotation,
         "combined_worst_translation_m": combined_worst_translation,
