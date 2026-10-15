@@ -14,6 +14,7 @@ import json
 import math
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -300,10 +301,30 @@ class MotionFixtureTests(unittest.TestCase):
         from description_pipeline.verification.solidworks_urdf import _motion
 
         datums, components, bodies, joints, records = self._serial_setup()
-        upstream = _motion(joints[0], joints, components, datums, bodies, records[0])
+        captured = []
+        real_evaluate = evaluate_motion
+
+        def trace(**kwargs):
+            captured.append(dict(kwargs["poses"]))
+            return real_evaluate(**kwargs)
+
+        with patch("description_pipeline.verification.motion.evaluate_motion", side_effect=trace):
+            upstream = _motion(joints[0], joints, components, datums, bodies, records[0])
+            terminal = _motion(joints[1], joints, components, datums, bodies, records[1])
         self.assertLessEqual(upstream["worst_m"], 5e-5)
-        terminal = _motion(joints[1], joints, components, datums, bodies, records[1])
+        self.assertLessEqual(upstream["worst_translation_m"], 5e-5)
+        self.assertLessEqual(upstream["worst_rotation_rad"], 5e-5)
         self.assertLessEqual(terminal["worst_m"], 5e-5)
+        # The product bridge itself must sample a combined non-zero pose; every
+        # combined value comes from that joint's own evidence, never a zero or
+        # default filler.
+        combined = [
+            poses for poses in captured if sum(abs(float(value)) > 1e-12 for value in poses.values()) >= 2
+        ]
+        self.assertTrue(combined, "the product bridge never sampled a combined non-zero pose")
+        for poses in combined:
+            for value in poses.values():
+                self.assertGreater(abs(float(value)), 1e-12)
         doc_bodies = [
             {
                 "id": body["name"],
@@ -337,7 +358,8 @@ class MotionFixtureTests(unittest.TestCase):
             "axis_point": [0.4, 0.0, 0.5],
             "axis_dir": [0.0, 0.0, 1.0],
         }
-        q1, q2 = 0.5, -0.3
+        sampled = combined[0]
+        q1, q2 = float(sampled["J1"]), float(sampled["J2"])
 
         def line(angle, point):
             cosine, sine = math.cos(angle), math.sin(angle)
@@ -478,6 +500,9 @@ class MotionFixtureTests(unittest.TestCase):
         details = _motion(authored, [authored], components, datums, bodies, record)
         self.assertEqual([abs(value) for value in details["samples"]], [0.5, 0.5])
         self.assertLessEqual(details["worst_m"], 5e-5)
+        self.assertIn("combined_worst_translation_m", details)
+        self.assertEqual(details["combined_worst_translation_m"], 0.0)
+        self.assertEqual(details["combined_worst_rotation_rad"], 0.0)
 
 
 if __name__ == "__main__":

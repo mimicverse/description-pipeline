@@ -939,6 +939,26 @@ def _unit_axis(value):
     return (vector / norm).tolist()
 
 
+def _joint_sample(joint, sign):
+    """One pose value for a delivered moving joint, from its own evidence only."""
+
+    if joint["type"] == "continuous":
+        return 0.3 if sign > 0 else -0.4
+    limits = joint.get("limits") or {}
+    lower, upper = limits.get("lower"), limits.get("upper")
+    _require(
+        isinstance(lower, (int, float))
+        and isinstance(upper, (int, float))
+        and math.isfinite(float(lower))
+        and math.isfinite(float(upper))
+        and float(lower) <= float(upper),
+        f"Joint {joint['name']} has no usable ordered limits",
+    )
+    middle = (float(lower) + float(upper)) / 2
+    quarter = (float(upper) - float(lower)) / 4
+    return middle + sign * quarter
+
+
 def _reference_axis_line(reference, record, components):
     """Re-derive the native undirected RefAxis from its two measured endpoints."""
     _require(
@@ -997,18 +1017,31 @@ def _cylinder_axis_line(reference, record, components):
     return point, direction
 
 
-def _motion(authored, joints, components, body_datums, bodies, record):
+def _motion(authored, joints, components, body_datums, bodies, record, native_axes=None):
     """The motion.{joint} gate: non-zero follow re-derived from the native shaft line.
 
     The motion owner re-derives, from the shaft evidence alone, where every
     driven occurrence must be under positive and negative poses inside the
     authored limits - over the WHOLE delivered chain: a further moving joint
     at its zero pose (or a fixed weld) still carries its descendants exactly
-    as the delivered graph does.  The delivered graph is forward-kinematicked
-    from its own datums and signed axes - a revolute/continuous joint rotates
-    about its axis, a prismatic joint translates along it without rotating.
-    A statically green delivery whose parent chain, axis binding or frame
-    relations are wrong diverges as soon as a pose is non-zero.
+    as the delivered graph does.  Besides the per-joint samples, a combined
+    sample poses ALL delivered moving joints at once - each value derived
+    from that joint's own evidence (its ordered limits / continuous
+    convention), never a zero or default filler - and the delivered graph is
+    forward-kinematicked from its own datums and signed axes (a
+    revolute/continuous joint rotates about its axis, a prismatic joint
+    translates along it without rotating).  A statically green delivery whose
+    parent chain, axis binding or frame relations are wrong diverges as soon
+    as a pose is non-zero.
+
+    ``native_axes`` carries every joint's native shaft record (the production
+    call passes the full map), so the combined sample's expected side uses
+    each moving joint's own native line; a caller that passes only the
+    sampled joint's record falls back to the other joints' delivered
+    declarations (their child datum and authored axis) - never a zero or
+    default filler.  Reported errors separate the translation (m) from the
+    rotation (rad); the acceptance threshold still applies to the established
+    element-wise consistency metric.
     """
 
     from .motion import axis_rotation, evaluate_motion
@@ -1016,12 +1049,7 @@ def _motion(authored, joints, components, body_datums, bodies, record):
     name, child = authored["name"], authored["child"]
     point, direction = _axis_line(authored, record, components)
     limits = authored["limits"]
-    if authored["type"] == "continuous":
-        samples = (0.3, -0.4)
-    else:
-        middle = (float(limits["lower"]) + float(limits["upper"])) / 2
-        quarter = (float(limits["upper"]) - float(limits["lower"])) / 4
-        samples = (middle + quarter, middle - quarter)
+    samples = (_joint_sample(authored, 1.0), _joint_sample(authored, -1.0))
     parents = {joint["child"]: joint for joint in joints}
     doc_bodies = [
         {
@@ -1062,7 +1090,15 @@ def _motion(authored, joints, components, body_datums, bodies, record):
             axis_point, axis_dir = point.tolist(), direction.tolist()
             joint_limits = limits
         else:
-            axis_point, axis_dir = [0.0, 0.0, 0.0], _unit_axis(joint.get("axis"))
+            other = (native_axes or {}).get(joint["name"])
+            if other is not None:
+                other_point, other_direction = _axis_line(joint, other, components)
+                axis_point, axis_dir = other_point.tolist(), other_direction.tolist()
+            else:
+                child_datum = body_datums.get(joint["child"])
+                _require(child_datum is not None, f"Joint {joint['name']} names no delivered child frame")
+                axis_point = child_datum[:3, 3].tolist()
+                axis_dir = _unit_axis(joint.get("axis"))
             joint_limits = joint.get("limits") or {}
         doc_joints.append(
             {
@@ -1089,7 +1125,13 @@ def _motion(authored, joints, components, body_datums, bodies, record):
         "axis_dir": direction.tolist(),
     }
 
-    def model_transform(body_name, pose, memo):
+    moving = [joint for joint in joints if joint["type"] != "fixed"]
+    checks = [({name: value}, f"{value:g}") for value in samples]
+    if len(moving) > 1:
+        for sign, label in ((1.0, "combined+"), (-1.0, "combined-")):
+            checks.append(({joint["name"]: _joint_sample(joint, sign) for joint in moving}, label))
+
+    def model_transform(body_name, poses, memo):
         if body_name in memo:
             return memo[body_name]
         if body_name not in parents:
@@ -1097,38 +1139,60 @@ def _motion(authored, joints, components, body_datums, bodies, record):
         else:
             joint = parents[body_name]
             offset = np.linalg.inv(body_datums[joint["parent"]]) @ body_datums[body_name]
-            if joint["name"] == name:
+            if joint["name"] in poses:
                 offset = offset.copy()
                 unit = np.asarray(_unit_axis(joint.get("axis")), float)
+                value_pose = float(poses[joint["name"]])
                 if joint["type"] == "prismatic":
-                    offset[:3, 3] = offset[:3, 3] + offset[:3, :3] @ (unit * pose)
+                    offset[:3, 3] = offset[:3, 3] + offset[:3, :3] @ (unit * value_pose)
                 else:
-                    offset[:3, :3] = offset[:3, :3] @ axis_rotation(unit, pose)
-            value = model_transform(joint["parent"], pose, memo) @ offset
+                    offset[:3, :3] = offset[:3, :3] @ axis_rotation(unit, value_pose)
+            value = model_transform(joint["parent"], poses, memo) @ offset
         memo[body_name] = value
         return value
 
     worst = 0.0
-    for pose in samples:
+    worst_translation = 0.0
+    worst_rotation = 0.0
+    combined_worst_translation = 0.0
+    combined_worst_rotation = 0.0
+    for poses, label in checks:
         result = evaluate_motion(
-            bodies=doc_bodies, joints=doc_joints, interface=interface, poses={name: pose}
+            bodies=doc_bodies, joints=doc_joints, interface=interface, poses=poses
         )
         _require(
             result["interface"]["line_distance_m"] <= 1e-9 and result["interface"]["parallelism"] >= 1 - 1e-6,
-            f"{name}: the re-derived interface loses continuity at {pose:g}",
+            f"{name}: the re-derived interface loses continuity at {label}",
         )
         memo = {}
         for body in bodies:
-            transform = model_transform(body["name"], pose, memo)
+            transform = model_transform(body["name"], poses, memo)
             for component in body["components"]:
                 candidate = transform @ np.linalg.inv(body_datums[body["name"]]) @ components[component]
                 expected = np.asarray(result["world"][component], float)
                 worst = max(worst, float(np.max(np.abs(candidate - expected))))
+                translation = float(np.linalg.norm(candidate[:3, 3] - expected[:3, 3]))
+                rotation = candidate[:3, :3].T @ expected[:3, :3]
+                angle = math.acos(float(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0)))
+                worst_translation = max(worst_translation, translation)
+                worst_rotation = max(worst_rotation, angle)
+                if label.startswith("combined"):
+                    combined_worst_translation = max(combined_worst_translation, translation)
+                    combined_worst_rotation = max(combined_worst_rotation, angle)
     _require(
         worst <= POSITION_TOL_M,
-        f"{name}: the delivered graph diverges from the re-derived motion by {worst:.9g} m",
+        f"{name}: the delivered graph diverges from the re-derived motion by {worst:.9g} "
+        f"(numerical element max; worst translation {worst_translation:.9g} m, "
+        f"worst rotation {worst_rotation:.9g} rad)",
     )
-    return {"samples": list(samples), "worst_m": worst}
+    return {
+        "samples": list(samples),
+        "worst_m": worst,
+        "worst_translation_m": worst_translation,
+        "worst_rotation_rad": worst_rotation,
+        "combined_worst_translation_m": combined_worst_translation,
+        "combined_worst_rotation_rad": combined_worst_rotation,
+    }
 
 
 def _tree(document, base_pose):
@@ -1544,7 +1608,13 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             gates.add(
                 "motion." + name,
                 lambda a=authored: _motion(
-                    a, source["joints"], components, body_datums, source["bodies"], axis_map[a["name"]]
+                    a,
+                    source["joints"],
+                    components,
+                    body_datums,
+                    source["bodies"],
+                    axis_map[a["name"]],
+                    native_axes=axis_map,
                 ),
             )
     for frame in source.get("frames", []):
