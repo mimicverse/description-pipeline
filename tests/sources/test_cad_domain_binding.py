@@ -124,6 +124,21 @@ class CadDomainBindingTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "cad_domain_override_refused")
             self.assertEqual(caught.exception.detail.get("canonical"), str(pinned))
 
+    def test_an_override_is_only_a_restatement_of_an_existing_binding(self) -> None:
+        # Positive: with a binding, an equal override is accepted.
+        pinned = self.root / "pinned" / "cad-ownership.json"
+        with patch.dict(os.environ, _clean_env(DESCRIPTION_CAD_OWNERSHIP_FILE=str(pinned)), clear=True):
+            self.assertEqual(isolation._ownership_path(pinned), pinned)
+        # Negative: with no binding at all, an explicit path is refused - an
+        # override can never create the first domain.
+        empty = self.root / "no-endpoint"
+        empty.mkdir()
+        with (
+            patch.dict(os.environ, _clean_env(DESCRIPTION_ENDPOINT_ROOT=str(empty)), clear=True),
+            self.assertRaises(isolation.DomainUnbound),
+        ):
+            isolation._ownership_path(self.root / "actor-A" / "cad-ownership.json")
+
     def test_an_unbound_host_refuses_and_keeps_no_user_state_default(self) -> None:
         empty = self.root / "no-endpoint"
         empty.mkdir()

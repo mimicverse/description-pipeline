@@ -313,11 +313,12 @@ def _ownership_path(override=None) -> Path:
     Binding: the operational pin (``DESCRIPTION_CAD_OWNERSHIP_FILE``) or the
     installed endpoint configuration (``DESCRIPTION_ENDPOINT_ROOT`` ->
     ``endpoint.json``, consumed through the formal ``read_config`` validator).
-    Two disagreeing bindings refuse instead of picking one, and an explicit
-    ``override`` that diverges from a bound canonical path refuses as well - a
-    second domain must never be created silently.  With no binding at all the
-    host is unbound and this raises ``DomainUnbound``: there is no fallback
-    domain.  The old per-user state-directory default is gone.
+    Two disagreeing bindings refuse instead of picking one.  An explicit
+    ``override`` may only RESTATE the bound canonical path: it is refused on
+    an unbound host (an override can never create the first domain) and
+    refused when it diverges - a second domain must never be created
+    silently.  With no binding at all this raises ``DomainUnbound``: there is
+    no fallback domain.  The old per-user state-directory default is gone.
     """
 
     pinned = os.environ.get("DESCRIPTION_CAD_OWNERSHIP_FILE") or None
@@ -329,19 +330,19 @@ def _ownership_path(override=None) -> Path:
             {"env": pinned, "endpoint": str(discovered)},
         )
     canonical = Path(pinned) if pinned is not None else discovered
+    if canonical is None:
+        raise DomainUnbound(
+            "the CAD domain is not bound; pin DESCRIPTION_CAD_OWNERSHIP_FILE or install the endpoint configuration"
+        )
     if override is not None:
         candidate = Path(override)
-        if canonical is not None and not _same_path(candidate, canonical):
+        if not _same_path(candidate, canonical):
             raise EnvironmentError_(
                 "cad_domain_override_refused",
                 "a divergent CAD domain override would create a second domain",
                 {"override": str(candidate), "canonical": str(canonical)},
             )
         return candidate
-    if canonical is None:
-        raise DomainUnbound(
-            "the CAD domain is not bound; pin DESCRIPTION_CAD_OWNERSHIP_FILE or install the endpoint configuration"
-        )
     return canonical
 
 

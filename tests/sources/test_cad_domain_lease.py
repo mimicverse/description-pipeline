@@ -68,6 +68,10 @@ class DomainLeaseTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ledger = Path(self.tmp.name) / "cad-ownership.json"
+        # The resolver only restates a bound domain: pin this test's ledger.
+        pin = patch.dict(os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(self.ledger)})
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def test_domain_lease_is_exclusive_across_handles_and_reports_the_holder(self):
         holder = isolation.domain_lease(self.ledger)

@@ -19,6 +19,10 @@ class CadSessionFactsTests(unittest.TestCase):
         self.directory = TemporaryDirectory(prefix="cad-facts-")
         self.addCleanup(self.directory.cleanup)
         self.ledger = Path(self.directory.name) / "cad-ownership.json"
+        # The resolver only restates a bound domain: pin this test's ledger.
+        pin = mock.patch.dict(os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(self.ledger)})
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def _record(
         self,
@@ -114,6 +118,31 @@ class CadSessionFactsTests(unittest.TestCase):
             cad = self._facts(table=[])
         finally:
             lease_path.chmod(0o600)
+        self.assertIsNone(facts.get("held"), facts)
+        self.assertTrue(facts.get("error"), facts)
+        self.assertFalse(cad["lease_held"])
+        self.assertIn("cad_lease_unreadable", cad["problems"])
+
+    @unittest.skipUnless(os.name == "posix", "fcntl.flock boundary")
+    def test_a_lock_call_io_error_is_unknown_never_a_contention(self) -> None:
+        # Only the platform's proven contention result may read as held: a
+        # lock-call IO failure (synthetic OS EIO here, not a real filesystem
+        # fault) is an observation error - the fact stays unknown and the
+        # health identity says why.
+        import errno
+
+        from description_pipeline import io
+
+        lease_path = Path(str(self.ledger) + ".lease")
+        lease_path.write_text("no-real-holder", encoding="utf-8")
+        with (
+            mock.patch("fcntl.flock", side_effect=OSError(errno.EIO, "injected OS lock IO failure")),
+            self.assertRaises(OSError),
+        ):
+            io.try_acquire_process_lock(lease_path)
+        with mock.patch("fcntl.flock", side_effect=OSError(errno.EIO, "injected OS lock IO failure")):
+            facts = isolation.domain_lease_facts(self.ledger)
+            cad = self._facts(table=[])
         self.assertIsNone(facts.get("held"), facts)
         self.assertTrue(facts.get("error"), facts)
         self.assertFalse(cad["lease_held"])

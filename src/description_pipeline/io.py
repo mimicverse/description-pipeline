@@ -21,12 +21,29 @@ class PipelineError(ValueError):
     diagnostic_path: str | None = None
 
 
+def _lock_contention(error: OSError) -> bool:
+    """Whether this platform's lock call failed BECAUSE another owner holds it.
+
+    Only the platform's documented contention result counts: a POSIX
+    non-blocking ``flock`` reports EAGAIN/EWOULDBLOCK (``BlockingIOError``),
+    while ``msvcrt.locking`` reports a held region as EACCES (EDEADLK on a
+    deadlock).  Every other lock-call failure is an observation error.
+    """
+
+    if os.name == "nt":
+        import errno
+
+        return error.errno in (errno.EACCES, errno.EDEADLK)
+    return isinstance(error, BlockingIOError)
+
+
 def try_acquire_process_lock(path: Path) -> int | None:
     """Try to hold a kernel lock; ``None`` means another actor holds it now.
 
     Opening failures (missing rights, IO errors, a symlinked lock) stay loud
-    and propagate: they are observation errors, never evidence of a lock
-    holder.  On success the lock file keeps this process's pid for
+    and propagate, and so does every lock-call failure other than a proven
+    platform contention result: they are observation errors, never evidence
+    of a lock holder.  On success the lock file keeps this process's pid for
     diagnostics, and the caller owns closing the returned descriptor.
     """
     if path.is_symlink() or path.is_junction():
@@ -41,8 +58,10 @@ def try_acquire_process_lock(path: Path) -> int | None:
             import fcntl
 
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as error:
         os.close(handle)
+        if not _lock_contention(error):
+            raise
         return None
     try:
         owner = str(os.getpid()).encode("ascii")
