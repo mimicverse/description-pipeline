@@ -47,17 +47,28 @@ def sealed_resolver(root: str | Path) -> Callable[[str], Path]:
 
     def resolve(uri: str) -> Path:
         run_id, stage = parse_sealed_uri(uri)
-        current = base
-        for part in (SEALED_ROOT_NAME, run_id, stage):
-            current = current / part
-            if current.is_symlink():
-                raise PipelineError("A sealed delivery path may not traverse a symbolic link")
-        target = base.joinpath(SEALED_ROOT_NAME, run_id, stage)
-        if not target.resolve(strict=False).is_relative_to(base):
-            raise PipelineError("The sealed delivery path escapes the configured store root")
-        return target
+        return _guarded_seal_target(base, run_id, stage)
 
     return resolve
+
+
+def _guarded_seal_target(base: Path, run_id: str, stage: str) -> Path:
+    """The one path guard shared by the resolver and the writer.
+
+    Every component below the store root must exist without being a symbolic
+    link, and the joined path must stay confined to the root - the writer never
+    creates a directory outside the root and never follows a planted link.
+    """
+
+    current = base
+    for part in (SEALED_ROOT_NAME, run_id, stage):
+        current = current / part
+        if current.is_symlink():
+            raise PipelineError("A sealed delivery path may not traverse a symbolic link")
+    target = base.joinpath(SEALED_ROOT_NAME, run_id, stage)
+    if not target.resolve(strict=False).is_relative_to(base):
+        raise PipelineError("The sealed delivery path escapes the configured store root")
+    return target
 
 
 def sealed_resolver_from_environment(environ: Mapping[str, str] | None = None) -> Callable[[str], Path]:
@@ -110,10 +121,14 @@ def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path)
     subject = manifest["subject"]["digest"]
 
     base = Path(root).resolve()
-    parent = base / SEALED_ROOT_NAME / run_id
+    target = _guarded_seal_target(base, run_id, stage)
+    parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
-    target = parent / stage
+    _fsync_dir(base / SEALED_ROOT_NAME)
+    _fsync_dir(parent)
     if target.exists():
+        if target.is_symlink():
+            raise PipelineError("A sealed delivery path may not traverse a symbolic link")
         existing = read_delivery_manifest(target)
         if existing["subject"]["digest"] != subject:
             raise PipelineError("The sealed delivery already holds a different subject")
@@ -122,10 +137,10 @@ def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path)
     temporary = Path(tempfile.mkdtemp(prefix=f".{stage}.", dir=parent))
     try:
         shutil.copytree(origin, temporary, dirs_exist_ok=True)
-        for path in sorted(temporary.rglob("*")):
-            if path.is_file():
-                _fsync_path(path)
-        _fsync_dir(temporary)
+        copied = read_delivery_manifest(temporary)
+        if copied["subject"]["digest"] != subject:
+            raise PipelineError("The source changed while it was being sealed")
+        _fsync_tree(temporary)
         os.replace(temporary, target)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -135,6 +150,17 @@ def seal_delivery(root: str | Path, run_id: str, stage: str, source: str | Path)
         raise PipelineError("The sealed delivery does not carry the sealed subject")
     _fsync_dir(parent)
     return uri
+
+
+def _fsync_tree(root: Path) -> None:  # pragma: no cover - durability syscalls
+    """fsync every nested directory and file bottom-up, then the tree root."""
+
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_dir():
+            _fsync_dir(path)
+        elif path.is_file():
+            _fsync_path(path)
+    _fsync_dir(root)
 
 
 def _fsync_path(path: Path) -> None:  # pragma: no cover - durability syscall

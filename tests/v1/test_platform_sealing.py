@@ -76,3 +76,35 @@ class SealDeliveryTests(unittest.TestCase):
         (self.source / "evil").symlink_to(self.source / "urdf" / "robot.urdf")
         with self.assertRaisesRegex(PipelineError, "symbolic links"):
             seal_delivery(self.root, "run-1", "generate", self.source)
+
+    def test_a_source_changed_mid_seal_never_publishes(self) -> None:
+        from unittest import mock
+
+        from description_pipeline import delivery as delivery_module
+
+        real = delivery_module.read_delivery_manifest
+        reads = {"count": 0}
+
+        def flaky(root):
+            reads["count"] += 1
+            if reads["count"] == 2:
+                # The second read validates the copied temporary tree: a source
+                # changed mid-seal must fail there, before any publish.
+                raise PipelineError("Delivery subject files differ from the manifest")
+            return real(root)
+
+        with mock.patch.object(delivery_module, "read_delivery_manifest", side_effect=flaky), self.assertRaises(
+            PipelineError
+        ):
+            seal_delivery(self.root, "run-1", "generate", self.source)
+        run_root = self.root / "sealed" / "run-1"
+        self.assertFalse((run_root / "generate").exists())
+        self.assertEqual(list(run_root.iterdir()), [])
+
+    def test_a_symlinked_sealed_root_refuses_and_writes_nothing_outside(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.root / "sealed").symlink_to(outside)
+        with self.assertRaisesRegex(PipelineError, "symbolic link"):
+            seal_delivery(self.root, "run-1", "generate", self.source)
+        self.assertEqual(list(outside.iterdir()), [])
