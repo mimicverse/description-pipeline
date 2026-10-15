@@ -235,9 +235,10 @@ def _frozen_source_config(root) -> dict:
     delivery = Path(root).resolve()
     delivery = delivery.parent if delivery.name == "evidence" else delivery
     evidence = delivery / "evidence"
-    if not (evidence / "raw/material_provenance.json").is_file():
+    if not (evidence / "capture.json").is_file():
         return {}
-    record = read_data(confined(evidence, "raw/material_provenance.json"))
+    capture = read_data(confined(evidence, "capture.json"))
+    record = capture.get("material_provenance") if isinstance(capture, dict) else None
     if not isinstance(record, dict):
         return {}
     if record.get("schema_version") != "solidworks-to-urdf.material-provenance/v1":
