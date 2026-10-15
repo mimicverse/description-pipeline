@@ -38,7 +38,7 @@ class _Handle:
         self.closed = True
 
 
-def _win32_module_fakes() -> dict:
+def _win32_module_fakes(wait_result: int = 0) -> dict:
     win32api = SimpleNamespace(TerminateProcess=Mock())
     win32job = SimpleNamespace(
         CreateJobObject=Mock(return_value=_Handle()),
@@ -54,7 +54,7 @@ def _win32_module_fakes() -> dict:
         CREATE_SUSPENDED=0x4,
         STARTUPINFO=Mock(return_value=object()),
     )
-    win32event = SimpleNamespace(WaitForSingleObject=Mock(return_value=0))
+    win32event = SimpleNamespace(WaitForSingleObject=Mock(return_value=wait_result))
     return {
         "win32api": win32api,
         "win32job": win32job,
@@ -83,17 +83,23 @@ class DomainLeaseTests(unittest.TestCase):
         freed.acquire()
         freed.release()
 
-    def test_one_lease_object_refcounts_two_sessions(self):
+    def test_second_acquisition_is_refused_in_the_same_process(self):
+        # Strict exclusivity per contract: no refcount sharing, no reentry and
+        # no pid-based bypass - a second handle and a same-object re-acquire
+        # both fail closed while the domain is live.
         lease = isolation.domain_lease(self.ledger)
         lease.acquire()
-        lease.acquire()
-        lease.release()
-        self.assertTrue(lease.receipt()["held"])
+        self.addCleanup(lease.release)
+        self.assertEqual(lease.holders, 1)
         peer = isolation.DomainLease(isolation._lease_path(self.ledger))
-        with self.assertRaises(EnvironmentError_):
+        with self.assertRaises(EnvironmentError_) as caught:
             peer.acquire()
+        self.assertEqual(caught.exception.code, "cad_domain_leased")
+        self.assertEqual(caught.exception.detail.get("holder"), "in-process")
+        with self.assertRaises(EnvironmentError_):
+            lease.acquire()
         lease.release()
-        self.assertFalse(lease.receipt()["held"])
+        self.assertEqual(lease.holders, 0)
         freed = isolation.DomainLease(isolation._lease_path(self.ledger))
         freed.acquire()
         freed.release()
@@ -136,8 +142,9 @@ class DomainLeaseTests(unittest.TestCase):
 
     def test_windows_cad_process_holds_the_domain_lease_until_close(self):
         lease_path = isolation._lease_path(self.ledger)
+        fakes = _win32_module_fakes()
         with (
-            patch.dict(sys.modules, _win32_module_fakes()),
+            patch.dict(sys.modules, fakes),
             patch.object(isolation, "terminate_remnant_processes", return_value=[]),
             patch.object(isolation.WindowsCadProcess, "_creation_time", return_value=4242),
             patch.object(isolation, "_windows_creation_time", return_value=555),
@@ -147,15 +154,42 @@ class DomainLeaseTests(unittest.TestCase):
             receipt = process.lease_receipt()
             self.assertTrue(receipt["held"])
             self.assertEqual(receipt["path"], str(lease_path))
-            peer = isolation.DomainLease(lease_path)
             with self.assertRaises(EnvironmentError_) as caught:
-                peer.acquire()
+                isolation.WindowsCadProcess("D:/SW/SLDWORKS.exe", ownership_file=self.ledger)
             self.assertEqual(caught.exception.code, "cad_domain_leased")
+            # The independent launch is refused before any OS process exists.
+            self.assertEqual(fakes["win32process"].CreateProcess.call_count, 1)
+            self.assertEqual(sorted(isolation.OwnershipStore(self.ledger).load()), [4242])
             process.close()
         self.assertFalse(process.lease_receipt()["held"])
         freed = isolation.DomainLease(lease_path)
         freed.acquire()
         freed.release()
+
+    def test_unconfirmed_exit_keeps_the_domain_claimed(self):
+        lease_path = isolation._lease_path(self.ledger)
+        fakes = _win32_module_fakes(wait_result=258)
+        with (
+            patch.dict(sys.modules, fakes),
+            patch.object(isolation, "terminate_remnant_processes", return_value=[]),
+            patch.object(isolation.WindowsCadProcess, "_creation_time", return_value=4242),
+            patch.object(isolation, "_windows_creation_time", return_value=555),
+            patch.object(isolation, "_windows_boot_epoch", return_value=111.0),
+        ):
+            process = isolation.WindowsCadProcess("D:/SW/SLDWORKS.exe", ownership_file=self.ledger)
+            with self.assertRaises(EnvironmentError_) as caught:
+                process.close()
+            self.assertEqual(caught.exception.code, "cad_process_cleanup_failed")
+            # WAIT_TIMEOUT: the exit is unproven - the lease stays held and the
+            # ownership record stays pending; nothing is announced released.
+            self.assertTrue(process.lease_receipt()["held"])
+            self.assertEqual(sorted(isolation.OwnershipStore(self.ledger).load()), [4242])
+            peer = isolation.DomainLease(lease_path)
+            with self.assertRaises(EnvironmentError_):
+                peer.acquire()
+            self.assertEqual(sorted(isolation.OwnershipStore(self.ledger).load()), [4242])
+            process._lease.release()
+            process._lease_held = False
 
 
 if __name__ == "__main__":

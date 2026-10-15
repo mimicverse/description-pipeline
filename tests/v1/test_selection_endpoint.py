@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import threading
 import time
 import unittest
@@ -639,12 +640,15 @@ class SelectionEndpointTests(unittest.TestCase):
         jobs = self.jobs
         probe = {"native_tool": {"source_sha256": "0" * 64}}
         jobs.jobs["ledger-probe"] = probe
+        pinned = self.root / "canonical-domain" / "cad-ownership.json"
         try:
-            reader = jobs._default_selection_reader("ledger-probe")
+            with patch.dict(os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(pinned)}):
+                reader = jobs._default_selection_reader("ledger-probe")
         finally:
             del jobs.jobs["ledger-probe"]
         backend = reader._walker.__self__
-        self.assertEqual(jobs.cad_ownership_file, jobs.config["state_root"] / "cad-ownership.json")
+        self.assertEqual(jobs.cad_ownership_file, pinned)
+        self.assertNotEqual(pinned, jobs.config["state_root"] / "cad-ownership.json")
         self.assertEqual(backend._cad_ownership_file, jobs.cad_ownership_file)
         self.assertEqual(reader._reader_sha256, "0" * 64)
 
