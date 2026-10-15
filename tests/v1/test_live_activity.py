@@ -24,6 +24,7 @@ from description_pipeline.orchestration.airflow_client import (
     _validate_activity,
 )
 from description_pipeline.orchestration.linux_store import LinuxStore
+from tests.v1.portal_read_support import StoreProjection
 from description_pipeline.orchestration.windows import handler
 from description_pipeline.sources.solidworks.discovery import _guarded_sink
 from description_pipeline.stages import activity_view, merge_activity, normalize_activity
@@ -422,7 +423,9 @@ class PortalActivityExposureTests(unittest.TestCase):
             run_id = str(uuid.uuid4())
             store.update_meta(run_id, state="running", handoff_sha256="b" * 64)
             app = portal_module.PortalApp(
-                portal_module.PortalConfig(airflow=object(), endpoint=lambda: None, pipeline_store_root=store.root)
+                portal_module.PortalConfig(
+                    airflow=object(), endpoint=lambda: None, platform_store=StoreProjection(store)
+                )
             )
             native = {
                 "status": "running",

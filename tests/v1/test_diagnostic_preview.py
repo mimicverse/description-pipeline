@@ -30,6 +30,7 @@ from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import seal_capture
 
 from .test_stage_transfer import HANDOFF, MAIN_ASSEMBLY, capture_root, native_tool
+from .portal_read_support import StoreProjection
 
 DAG_RUN_ID = "portal-20261010T000000-abcdef01"
 RUN = native_run_id(DAG_RUN_ID)
@@ -446,7 +447,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
                 endpoint=lambda: _DownEndpoint(),
-                pipeline_store_root=self.store.root,
+                platform_store=StoreProjection(self.store),
             )
         )
         session = app.sessions.create("user", "token")

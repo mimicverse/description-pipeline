@@ -653,9 +653,10 @@ class FakePlatformStore:
         if entry is None:
             return None
         merged = entry.get("merged") or {}
+        state = merged.get("status")
         return {
             "run_id": run_id,
-            "state": str(merged.get("status") or "queued"),
+            "state": str(state) if isinstance(state, str) and state else None,
             "request_id": None,
             "parent_run_id": None,
             "from_stage": None,
@@ -685,8 +686,18 @@ class FakePlatformStore:
         entry = self._entry(run_id)
         if entry is None:
             return {}
+        stages: dict[str, dict] = {
+            stage: {
+                "stage": stage,
+                "state": "completed",
+                "receipt": {"subject_sha256": None, "artifacts": []},
+                "checkpoint_uri": f"store://sealed/{run_id}/{stage}",
+                "reused_from_run": None,
+                "original_executed_at": None,
+            }
+            for stage in entry.get("checkpoints") or ()
+        }
         preview = entry.get("preview")
-        stages: dict[str, dict] = {}
         if isinstance(preview, dict):
             verified = preview.get("verified") is not False
             stages["verify"] = {
@@ -702,6 +713,11 @@ class FakePlatformStore:
                 "original_executed_at": None,
             }
         return stages
+
+    def run_events(self, run_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict]:
+        entry = self._entry(run_id) or {}
+        events = (entry.get("merged") or {}).get("events")
+        return list(events) if isinstance(events, list) else []
 
     def sealed_path(self, checkpoint_uri: str):
         """Materialize the registered checkpoint members and return their root."""
@@ -764,16 +780,12 @@ class PortalTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.store_root, ignore_errors=True)
         self.store = PreviewStore(self.store_root)
         self.platform.fixtures = self.store
-        store_patch = patch("description_pipeline.orchestration.portal.LinuxStore", lambda root: self.store)
-        store_patch.start()
-        self.addCleanup(store_patch.stop)
         self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         config = PortalConfig(
             airflow=AirflowApi(self.airflow.url),
             endpoint=lambda: self.endpoint,
             static_dir=self.static_dir,
             upload_root=self.upload_root,
-            pipeline_store_root=self.store_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
         )
@@ -800,7 +812,6 @@ class PortalTests(unittest.TestCase):
             endpoint=lambda: self.endpoint,
             static_dir=self.static_dir,
             upload_root=self.upload_root,
-            pipeline_store_root=self.store_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
         )
@@ -1160,6 +1171,7 @@ class PortalTests(unittest.TestCase):
         expected_conf = {
             "handoff_path": str(stored),
             "main_assembly": "model.SLDASM",
+            "request_id": f"portal-{dag_run_id}",
             "target_hardware": TEST_TARGET,
             "change_summary": TEST_SUMMARY,
         }
@@ -1326,6 +1338,7 @@ class PortalTests(unittest.TestCase):
             {
                 "handoff_path": str(stored),
                 "main_assembly": "model.SLDASM",
+                "request_id": f"portal-{json.loads(body)['dag_run_id']}",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
             },
@@ -1368,6 +1381,7 @@ class PortalTests(unittest.TestCase):
             {
                 "handoff_path": str(stored),
                 "main_assembly": "parts/arm.SLDASM",
+                "request_id": f"portal-{dag_run_id}",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
             },

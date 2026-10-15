@@ -51,7 +51,6 @@ from .airflow_client import (
     ResultNotPublishable,
     WindowsEndpoint,
     _linux_repositories,
-    _linux_store_root,
     _linux_targets,
     check_result,
     native_run_id,
@@ -63,7 +62,6 @@ from ..io import PipelineError, digest
 from ..delivery import PIPELINE_ID
 from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
-from .linux_store import LinuxStore
 from .stage_transfer import TEAM_REPORTS
 from .feishu_oauth import (
     TRIGGERING_USER_NAME_DELIMITER,
@@ -165,6 +163,8 @@ _SHA256_TEXT = re.compile(r"\A[0-9a-f]{64}\Z")
 #: Read precedence across the registered stages: the first registration of a member
 #: path wins, so a later stage's sealed copy is never shadowed by an earlier one.
 _STAGE_READ_ORDER = ("publish", "verify", "generate", "capture", "discover", "freeze")
+#: Registered run states projected onto the job-status vocabulary the run page reads.
+_JOB_STATUS_BY_RUN_STATE = {"succeeded": "passed", "cancelled": "failed", "unresolved": "failed"}
 
 
 def _member_class(path: str) -> str:
@@ -498,8 +498,7 @@ class PortalConfig:
     max_body_bytes: int = 64 * 1024
     upload_root: Path | None = None
     upload_concurrency: int = 2
-    #: Split-pipeline routing: the Linux attempt store and model-repository checkouts.
-    pipeline_store_root: Path | None = None
+    #: Split-pipeline routing: the model-repository checkouts.
     pipeline_repositories: dict[str, Path] | None = None
     #: Configured publication targets used by the upload selector and conf validation.
     pipeline_targets: dict[str, dict] | None = None
@@ -572,7 +571,6 @@ def load_portal_config(path: Path) -> PortalConfig:
     if not isinstance(url, str) or not url.strip():
         raise AirflowApiError("portal config needs airflow.url")
     try:
-        pipeline_store_root = _linux_store_root(pipeline_section.get("store_root"))
         pipeline_repositories = _linux_repositories(pipeline_section.get("repositories") or {})
         pipeline_targets = _linux_targets(pipeline_section.get("targets") or {})
     except EndpointProtocolError as error:
@@ -590,7 +588,6 @@ def load_portal_config(path: Path) -> PortalConfig:
         port=int(portal_section.get("port", PORTAL_HTTP_PORT)),
         upload_root=_upload_root(portal_section),
         upload_concurrency=_upload_concurrency(portal_section),
-        pipeline_store_root=pipeline_store_root,
         pipeline_repositories=pipeline_repositories,
         pipeline_targets=pipeline_targets,
     )
@@ -909,7 +906,6 @@ class PortalApp:
         self._lock = threading.Lock()
         self._runs: dict[str, PortalRun] = {}
         self._previews: dict[str, tuple[float, dict]] = {}
-        self._store_cache: LinuxStore | None = None
         self._upload_gate = UploadGate(config.upload_concurrency)
         self._rerun_lock = threading.Lock()
         self._platform_store = config.platform_store
@@ -1400,6 +1396,7 @@ class PortalApp:
         # never carries a client-provided identity claim.
         conf = {
             "handoff_path": handoff_path,
+            "request_id": f"portal-{dag_run_id}",
             "target_hardware": target_hardware,
             "change_summary": change_summary,
         }
@@ -1430,6 +1427,17 @@ class PortalApp:
             return False
 
     # ------------------------------------------------------- run metadata
+    def _platform_read(self, callback):
+        """One registered platform read; an unavailable store fails the surface closed."""
+
+        try:
+            return callback()
+        except PlatformStoreError as error:
+            log.error("run display state unavailable: %s", error)
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+            ) from error
+
     def _metadata_snapshot(self) -> dict[str, dict]:
         """Every display overlay with one platform read; failures fail closed."""
         try:
@@ -1783,15 +1791,17 @@ class PortalApp:
                 rows = None
         if not isinstance(rows, list) or not rows:
             rows = None
-        store = self._store()
-        if store is None or not isinstance(store.meta(native_id), dict):
+        platform = self.config.platform_store
+        record = self._platform_read(lambda: platform.run_record(native_id)) if platform is not None else None
+        if not isinstance(record, dict):
             return rows
+        stages = self._platform_read(lambda: platform.stage_records(native_id))
 
-        def checkpoint(stage: str) -> Path | None:
-            try:
-                return store.checkpoint_dir(native_id, stage)
-            except PipelineError:
-                return None
+        def checkpoint(stage: str) -> str | None:
+            row = stages.get(stage)
+            if isinstance(row, dict) and isinstance(row.get("checkpoint_uri"), str) and row["checkpoint_uri"]:
+                return row["checkpoint_uri"]
+            return None
 
         if rows is None:
             # A linked Linux attempt has no Windows plan of its own: the rows describe the
@@ -2206,10 +2216,10 @@ class PortalApp:
         platform = self.config.platform_store
         if platform is None:
             return None
-        record = platform.run_record(run_id)
+        record = self._platform_read(lambda: platform.run_record(run_id))
         if not isinstance(record, dict):
             return None
-        stages = platform.stage_records(run_id)
+        stages = self._platform_read(lambda: platform.stage_records(run_id))
         stages = stages if isinstance(stages, dict) else {}
         by_stage: dict[str, dict] = {}
         for stage in _STAGE_READ_ORDER:
@@ -2453,33 +2463,36 @@ class PortalApp:
         endpoint = self.config.endpoint
         return endpoint() if callable(endpoint) else endpoint
 
-    def _store(self) -> LinuxStore | None:
-        root = self.config.pipeline_store_root
-        if root is None:
-            return None
-        with self._lock:
-            if self._store_cache is None:
-                self._store_cache = LinuxStore(root)
-            return self._store_cache
-
     def _job_snapshot(self, run_id: str, endpoint: WindowsEndpoint) -> dict | None:
-        """The authoritative run snapshot: the Linux store when the attempt entered it."""
+        """The authoritative run snapshot: the registered platform projection when the attempt
+        entered it, the native endpoint job otherwise."""
         native = None
         try:
             native = endpoint.get_job(run_id)
         except (EndpointNotFound, EndpointError):
-            # An admitted Linux attempt stays readable even when Windows is unreachable.
+            # An admitted attempt stays readable even when Windows is unreachable.
             native = None
-        store = self._store()
-        if store is not None and isinstance(store.meta(run_id), dict):
-            merged = store.merged_job(run_id, native)
+        platform = self.config.platform_store
+        record = self._platform_read(lambda: platform.run_record(run_id)) if platform is not None else None
+        events = (
+            self._platform_read(lambda: platform.run_events(run_id, limit=200)) if isinstance(record, dict) else []
+        )
+        if isinstance(record, dict):
             if isinstance(native, dict):
-                # The native job owns the live record while its half blocks; the
-                # merged store snapshot must not drop it.
-                for key in ("activity", "activity_final", "activity_history"):
-                    if key in native:
-                        merged[key] = native[key]
-            return merged
+                # The native job owns the live record while its half blocks.
+                return native
+            synthesized = {
+                "schema_version": "solidworks-to-urdf.job/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": run_id,
+                "events": events,
+                "result": None,
+                "error": None,
+            }
+            state = record.get("state")
+            if isinstance(state, str) and state:
+                synthesized["status"] = _JOB_STATUS_BY_RUN_STATE.get(state, state)
+            return synthesized
         return native
 
     def _body(self, environ: dict) -> dict:
