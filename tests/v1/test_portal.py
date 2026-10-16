@@ -3559,6 +3559,44 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(self.platform.admits, [])
                 self.assertEqual(self.airflow.trigger_payloads, [])
 
+    def test_freeze_retry_preserved_provenance_carries_to_the_grandchild(self) -> None:
+        self._seed_old_shape_parent()
+        self.client.login()
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 202, body)
+        child = json.loads(body)["dag_run_id"]
+        child_baseline = self.platform.admits[0]["baseline"]
+        self.assertEqual(child_baseline["provenance"]["sha256"], self.log_sha)
+        # The child fails at freeze and becomes the next retry's terminal parent.
+        parent_native = native_run_id(DAG_RUN_ID)
+        child_native = native_run_id(child)
+        self.platform.runs[child_native]["state"] = "failed"
+        self.platform.requests[f"portal-{child}"]["baseline"] = dict(child_baseline)
+        self.platform.stages[child_native] = {
+            "freeze": {"stage": "freeze", "state": "failed", "receipt": {"error": "freeze refused for the child"}}
+        }
+        self.airflow.dag_runs[child]["state"] = "failed"
+        rows_before = {key: dict(self.platform.runs[key]) for key in (parent_native, child_native)}
+        child_stage_before = dict(self.platform.stages[child_native])
+        before_admits = len(self.platform.admits)
+        status, _, body = self.client.request("POST", f"/api/runs/{child}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 202, body)
+        grandchild = json.loads(body)["dag_run_id"]
+        self.assertNotEqual(grandchild, child)
+        self.assertEqual(len(self.platform.admits), before_admits + 1)
+        admit = self.platform.admits[-1]
+        self.assertEqual(admit["parent_run_id"], child_native)
+        self.assertEqual(admit["from_stage"], "freeze")
+        # The preserved provenance flows into the grandchild admission verbatim.
+        self.assertEqual(admit["baseline"], child_baseline)
+        status, _, again = self.client.request("POST", f"/api/runs/{child}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 202, again)
+        self.assertEqual(json.loads(again)["dag_run_id"], grandchild)
+        self.assertEqual(len(self.platform.admits), before_admits + 1)
+        # Parent and child rows stay byte-unchanged.
+        self.assertEqual({key: dict(self.platform.runs[key]) for key in rows_before}, rows_before)
+        self.assertEqual(dict(self.platform.stages[child_native]), child_stage_before)
+
     def test_list_runs_exposes_linked_attempt_lineage(self) -> None:
         self._seed_retryable_run()
         child = "portal-20261009T000000-cafebabe"

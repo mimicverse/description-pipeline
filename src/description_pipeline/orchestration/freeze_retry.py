@@ -62,6 +62,37 @@ def _identity_refusal(detail: str) -> FreezeRetryRefusal:
     return FreezeRetryRefusal("originals_identity_missing", detail)
 
 
+def _validated_provenance(value: object) -> dict:
+    """The legitimate immutable provenance marker carried by an evidence-resolved parent."""
+
+    if not isinstance(value, dict) or set(value) != {"source", "path", "sha256", "parent_run_id"}:
+        raise _identity_refusal("上传身份携带的溯源标记缺失或非法，拒绝从“冻结输入”重跑")
+    path = value.get("path")
+    sha256 = value.get("sha256")
+    parent_run_id = value.get("parent_run_id")
+    if not (
+        value.get("source") == "parent_freeze_failure_log"
+        and isinstance(path, str)
+        and path
+        and Path(path).is_absolute()
+        and isinstance(sha256, str)
+        and _SHA256.fullmatch(sha256) is not None
+        and isinstance(parent_run_id, str)
+        and parent_run_id
+    ):
+        raise _identity_refusal("上传身份携带的溯源标记字段非法，拒绝从“冻结输入”重跑")
+    anchor = Path(path)
+    if anchor.is_symlink() or not anchor.is_file():
+        raise _identity_refusal("溯源证据文件不可用（缺失、符号链接或非普通文件），拒绝从“冻结输入”重跑")
+    try:
+        anchor_bytes = anchor.read_bytes()
+    except OSError as error:
+        raise _identity_refusal("溯源证据无法读取，拒绝从“冻结输入”重跑") from error
+    if hashlib.sha256(anchor_bytes).hexdigest() != sha256:
+        raise _identity_refusal("溯源证据与登记摘要不符，拒绝从“冻结输入”重跑")
+    return {"source": "parent_freeze_failure_log", "path": path, "sha256": sha256, "parent_run_id": parent_run_id}
+
+
 def _safe_intake(candidate: str, intake_root: Path | None, *, context_text: str) -> Path:
     """One portable, non-symlinked intake path, confined to the upload root when given."""
 
@@ -231,15 +262,16 @@ def resolve_freeze_retry_identity(
             and bytes_value >= 0
             and isinstance(folder_value, str)
             and folder_value
-            and "provenance" not in baseline
         ):
             raise _identity_refusal("运行登记的上传身份已损坏（字段缺失或非法），拒绝从“冻结输入”重跑")
+        provenance = (
+            _validated_provenance(baseline["provenance"]) if "provenance" in baseline else None
+        )
         source = "baseline"
         bound_handoff = handoff_value
         expected_files = files_value
         stated_bytes = bytes_value
         folder = folder_value
-        provenance = None
     try:
         upload_files = validate_file_index(package_inventory(given))
     except (PipelineError, OSError, ValueError) as error:

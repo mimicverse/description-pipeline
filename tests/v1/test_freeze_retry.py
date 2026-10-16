@@ -197,3 +197,64 @@ class FreezeRetryResolverTests(unittest.TestCase):
         self.assertEqual(reads["evidence"], 1)
         self.assertEqual(resolved.handoff_sha256, self.upload_sha)
         self.assertEqual(resolved.files, len(self.upload_files))
+
+    def test_preserved_provenance_resolves_for_the_next_retry(self) -> None:
+        provenance = {
+            "source": "parent_freeze_failure_log",
+            "path": str(self.log_path),
+            "sha256": self.log_sha,
+            "parent_run_id": PARENT_RUN_ID,
+        }
+        self.request["baseline"] = {
+            "handoff_sha256": self.upload_sha,
+            "files": len(self.upload_files),
+            "bytes": 64,
+            "folder": "M3.0.3_20261016",
+            "provenance": provenance,
+        }
+        resolved = self._resolve()
+        self.assertEqual(resolved.source, "baseline")
+        self.assertEqual(resolved.handoff_sha256, self.upload_sha)
+        self.assertEqual(resolved.files, len(self.upload_files))
+        self.assertEqual(resolved.provenance, provenance)
+
+    def test_malformed_provenance_never_falls_back_to_the_evidence_path(self) -> None:
+        valid = {
+            "source": "parent_freeze_failure_log",
+            "path": str(self.log_path),
+            "sha256": self.log_sha,
+            "parent_run_id": PARENT_RUN_ID,
+        }
+        other = self.root / "other.log"
+        other.write_bytes(b"other-bytes")
+        link = self.root / "anchor-link.log"
+        link.symlink_to(self.log_path)
+        cases = {
+            "not_a_dict": "provenance-text",
+            "missing_path": {key: value for key, value in valid.items() if key != "path"},
+            "missing_sha256": {key: value for key, value in valid.items() if key != "sha256"},
+            "missing_parent_run_id": {key: value for key, value in valid.items() if key != "parent_run_id"},
+            "missing_source": {key: value for key, value in valid.items() if key != "source"},
+            "extra_key": {**valid, "extra": 1},
+            "unknown_source": {**valid, "source": "other"},
+            "relative_path": {**valid, "path": "logs/freeze.log"},
+            "empty_path": {**valid, "path": ""},
+            "bad_sha256": {**valid, "sha256": "f" * 63},
+            "uppercase_sha256": {**valid, "sha256": self.log_sha.upper()},
+            "empty_parent_run_id": {**valid, "parent_run_id": ""},
+            "anchor_missing": {**valid, "path": str(self.root / "gone.log")},
+            "anchor_tampered": {**valid, "path": str(other)},
+            "anchor_symlink": {**valid, "path": str(link)},
+        }
+        for label, provenance in cases.items():
+            with self.subTest(case=label):
+                self.request["baseline"] = {
+                    "handoff_sha256": self.upload_sha,
+                    "files": len(self.upload_files),
+                    "bytes": 64,
+                    "folder": "M3.0.3_20261016",
+                    "provenance": provenance,
+                }
+                with self.assertRaises(FreezeRetryRefusal) as raised:
+                    self._resolve()
+                self.assertEqual(raised.exception.reason, "originals_identity_missing")
