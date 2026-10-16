@@ -1,14 +1,19 @@
 """Interface-layer reuse fixtures against one real platform PostgreSQL.
 
-Not whole-chain qualification (the driver-level reuse/invalidation branches run
-through linked-run commands after the alpha2 wiring): this fixture drives the
-production store APIs directly and proves the interface-layer contract:
+This is the mandatory real-chain fixture the CI job runs after the
+portal-admission smoke, against the canonical platform schema with the real
+``PlatformStore``: the interface-layer reuse contract, driven directly through
+the production store APIs.
 
-- a linked attempt (same request evidence, registered parent) reuses the
-  parent's confirmed stage checkpoint through ``confirm_stage`` and the DB
-  registers the source run and the original execution time; the attempt has no
-  native operation, so a pure reuse never opens CAD;
-- an unregistered parent and an unregistered checkpoint are refused.
+- a linked attempt (registered parent, same frozen request evidence) reuses the
+  parent's confirmed stage checkpoint through ``confirm_stage``: the source
+  receipt and its registered execution instant are carried verbatim - reuse
+  never re-authors the receipt and never invents a timestamp - the DB registers
+  the source run, and the attempt has no native operation, so a pure reuse
+  never opens CAD;
+- reuse under a run whose parent is not registered, and reuse naming a
+  checkpoint that is not the source stage's registered reference, are refused
+  with the store's specific errors.
 
 The sealed delivery is built with the same builder the platform-store suite
 uses; the store re-verifies the real sealed bytes before registering.
@@ -37,6 +42,7 @@ def main() -> int:
 
     import psycopg2  # noqa: PLC0415
 
+    from description_pipeline.io import digest  # noqa: PLC0415
     from description_pipeline.platform.store import PlatformStore, PlatformStoreError  # noqa: PLC0415
     from tests.v1.test_platform_store import build_sealed_delivery  # noqa: PLC0415
 
@@ -49,16 +55,17 @@ def main() -> int:
         return psycopg2.connect(dsn)
 
     sealed_root = Path(tempfile.mkdtemp(prefix="settlement-fixture-sealed-"))
-    subject, artifacts, handoff = build_sealed_delivery(sealed_root)
-    checkpoint = "store://sealed/fixture-reuse"
+    subject, artifacts, _handoff_full, handoff_native = build_sealed_delivery(sealed_root)
     store = PlatformStore(connect, sealed=lambda _uri: sealed_root)
 
-    suffix = uuid.uuid4().hex[:10]
-    request_id = f"fixture-request-{suffix}"
-    parent = f"fixture-parent-{suffix}"
-    linked = f"fixture-linked-{suffix}"
-    standalone = f"fixture-standalone-{suffix}"
-    executed_at = datetime.now(UTC)
+    # Canonical lowercase UUID run identities; the sealed locator names exactly
+    # one run and one engineering stage.
+    parent = str(uuid.uuid4())
+    linked = str(uuid.uuid4())
+    standalone = str(uuid.uuid4())
+    request_id = f"fixture-request-{uuid.uuid4().hex[:10]}"
+    checkpoint = f"store://sealed/{parent}/generate"
+    source_executed_at = datetime.now(UTC)
 
     def admit(run_id: str, *, parent_run_id: str | None = None, request: str | None = None) -> None:
         store.admit_run(
@@ -76,6 +83,8 @@ def main() -> int:
             },
         )
 
+    # A post-freeze stage binds the sealed native transfer identity (the digest
+    # of the selected native inventory), not the full prepared-package digest.
     receipt = {
         "schema_version": "solidworks-to-urdf.bundle/v1",
         "pipeline_id": "solidworks-to-urdf",
@@ -84,90 +93,123 @@ def main() -> int:
         "state": "generated",
         "passed": False,
         "subject_sha256": subject,
-        "handoff_sha256": handoff,
+        "handoff_sha256": handoff_native,
         "artifacts": [dict(record) for record in artifacts],
     }
     cases: list[dict] = []
-    try:
-        admit(parent)
-        store.confirm_stage(
-            run_id=parent, stage="generate", state="completed", receipt=receipt, checkpoint_uri=checkpoint
+
+    admit(parent)
+    store.confirm_stage(
+        run_id=parent,
+        stage="generate",
+        state="completed",
+        receipt=receipt,
+        checkpoint_uri=checkpoint,
+        original_executed_at=source_executed_at,
+    )
+    source_row = store.stage_records(parent)["generate"]
+    # The reused confirmation carries the source's OWN receipt and the instant
+    # REGISTERED for the source stage - the values are read back from the store,
+    # never re-authored here.
+    admit(linked, parent_run_id=parent, request=f"fixture-linked-request-{uuid.uuid4().hex[:10]}")
+    store.confirm_stage(
+        run_id=linked,
+        stage="generate",
+        state="completed",
+        receipt=source_row["receipt"],
+        checkpoint_uri=checkpoint,
+        reused_from_run=parent,
+        original_executed_at=source_row["original_executed_at"],
+    )
+    reused_receipt = store.confirmed_stage(linked, "generate")
+    with psycopg2.connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT count(*)::int FROM request WHERE request_id=%s", (request_id,))
+        request_rows = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT reused_from_run, original_executed_at FROM stage WHERE run_id=%s AND stage='generate'",
+            (linked,),
         )
-        # One request row per admission is a store invariant; carrying the ORIGINAL
-        # request_id inside the frozen request evidence is a driver branch (alpha2
-        # wiring).  The interface layer proves the checkpoint/source registration.
-        admit(linked, parent_run_id=parent, request=f"fixture-linked-request-{suffix}")
+        reused_from, original_at = cursor.fetchone()
+        cursor.execute("SELECT kind FROM operation WHERE run_id=%s", (linked,))
+        linked_kinds = [row[0] for row in cursor.fetchall()]
+    reused_is_source = bool(
+        reused_receipt is not None
+        and digest(reused_receipt) == digest(source_row["receipt"])
+        and reused_receipt.get("run_id") == parent
+    )
+    cases.append(
+        {
+            "name": "content_reuse_registers_the_source_and_keeps_the_original_evidence",
+            "passed": (
+                request_rows == 1
+                and reused_from == parent
+                and original_at == source_row["original_executed_at"]
+                and "native" not in linked_kinds
+                and reused_is_source
+            ),
+            "observed": {
+                "original_request_rows": request_rows,
+                "reused_from": reused_from,
+                "original_executed_at": original_at.isoformat() if original_at else None,
+                "registered_source_executed_at": (
+                    source_row["original_executed_at"].isoformat()
+                    if source_row["original_executed_at"]
+                    else None
+                ),
+                "operation_kinds": linked_kinds,
+                "reused_receipt_is_the_source_receipt": reused_is_source,
+            },
+        }
+    )
+
+    admit(standalone, request=f"fixture-other-request-{uuid.uuid4().hex[:10]}")
+    try:
+        store.confirm_stage(
+            run_id=standalone,
+            stage="generate",
+            state="completed",
+            receipt=source_row["receipt"],
+            checkpoint_uri=checkpoint,
+            reused_from_run=parent,
+            original_executed_at=source_row["original_executed_at"],
+        )
+        parent_error = None
+    except PlatformStoreError as error:
+        parent_error = str(error)
+    cases.append(
+        {
+            "name": "unregistered_parent_refused",
+            "passed": parent_error == "Reuse requires the registered parent run of this linked attempt",
+            "observed": parent_error,
+        }
+    )
+
+    try:
         store.confirm_stage(
             run_id=linked,
             stage="generate",
             state="completed",
-            receipt={**receipt, "run_id": linked},
-            checkpoint_uri=checkpoint,
+            receipt=source_row["receipt"],
+            checkpoint_uri=f"store://sealed/{linked}/generate",
             reused_from_run=parent,
-            original_executed_at=executed_at,
+            original_executed_at=source_row["original_executed_at"],
         )
-        with psycopg2.connect(dsn) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT count(*)::int FROM request WHERE request_id=%s", (request_id,))
-            request_rows = cursor.fetchone()[0]
-            cursor.execute(
-                "SELECT reused_from_run, original_executed_at FROM stage WHERE run_id=%s AND stage='generate'",
-                (linked,),
-            )
-            reused_from, original_at = cursor.fetchone()
-            cursor.execute("SELECT kind FROM operation WHERE run_id=%s", (linked,))
-            linked_kinds = [row[0] for row in cursor.fetchall()]
-        cases.append(
-            {
-                "name": "content_reuse_registers_the_source_and_keeps_the_original_evidence",
-                "passed": request_rows == 1
-                and reused_from == parent
-                and original_at is not None
-                and "native" not in linked_kinds,
-                "observed": {
-                    "original_request_rows": request_rows,
-                    "reused_from": reused_from,
-                    "original_executed_at": original_at.isoformat() if original_at else None,
-                    "operation_kinds": linked_kinds,
-                },
-            }
-        )
-
-        admit(standalone, request=f"fixture-other-request-{suffix}")
-        refused_parent = False
-        try:
-            store.confirm_stage(
-                run_id=standalone,
-                stage="generate",
-                state="completed",
-                receipt={**receipt, "run_id": standalone},
-                checkpoint_uri=checkpoint,
-                reused_from_run=parent,
-            )
-        except PlatformStoreError:
-            refused_parent = True
-        cases.append({"name": "unregistered_parent_refused", "passed": refused_parent, "observed": refused_parent})
-
-        refused_checkpoint = False
-        try:
-            store.confirm_stage(
-                run_id=linked,
-                stage="capture",
-                state="completed",
-                receipt={**receipt, "run_id": linked, "stage": "capture"},
-                checkpoint_uri="store://sealed/other",
-                reused_from_run=parent,
-            )
-        except PlatformStoreError:
-            refused_checkpoint = True
-        cases.append(
-            {"name": "unregistered_checkpoint_refused", "passed": refused_checkpoint, "observed": refused_checkpoint}
-        )
-    finally:
-        pass
+        checkpoint_error = None
+    except PlatformStoreError as error:
+        checkpoint_error = str(error)
+    cases.append(
+        {
+            "name": "unregistered_checkpoint_refused",
+            "passed": checkpoint_error
+            == "The reused checkpoint is not the source stage's registered reference",
+            "observed": checkpoint_error,
+        }
+    )
 
     report = {
         "scope": "interface-layer production-store fixture on one real platform PostgreSQL; "
-        "not whole-chain reuse qualification (driver branches after the alpha2 wiring)",
+        "the mandatory real-chain reuse contract (registered source receipt and "
+        "registered execution instant carried verbatim, no native operation on pure reuse)",
         "cases": cases,
         "ok": all(case["passed"] for case in cases),
     }
