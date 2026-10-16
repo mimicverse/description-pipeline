@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -22,6 +23,31 @@ from .contract_wheel import write_contract_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
+
+
+_RENDER_MODULE: object | None = None
+
+
+def _render_module():
+    global _RENDER_MODULE
+    if _RENDER_MODULE is None:
+        spec = importlib.util.spec_from_file_location("render_operator_under_test", OPERATOR / "render_operator.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RENDER_MODULE = module
+    return _RENDER_MODULE
+
+
+def decode_env_value(raw: str) -> str:
+    """The canonical env decode (render_operator.encode_env_value's exact inverse)."""
+
+    return _render_module().decode_env_value(raw)
+
+
+def encode_env_value(value: str) -> str:
+    """The canonical env encoding, so fixtures write exactly what the writers would."""
+
+    return _render_module().encode_env_value(value)
 RENDER = OPERATOR / "render_operator.py"
 CONTROL = OPERATOR / "operatorctl.sh"
 HEALTH = OPERATOR / "health.sh"
@@ -59,7 +85,9 @@ def render(state: Path, **overrides: str) -> subprocess.CompletedProcess:
     env = base_env(state, **overrides)
     env_file = state.parent / "operator.env"
     env_file.parent.mkdir(parents=True, exist_ok=True)
-    env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
+    env_file.write_text(
+        "".join(f"{key}={encode_env_value(value)}\n" for key, value in env.items()), encoding="utf-8"
+    )
     return run([sys.executable, str(RENDER), "--env-file", str(env_file)], env)
 
 
@@ -627,7 +655,7 @@ class LifecycleTests(unittest.TestCase):
         for line in (state / "derived" / "gen-1" / "operator.env").read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition("=")
             if key:
-                derived_env[key] = value
+                derived_env[key] = decode_env_value(value.strip())
         bindir = tmp / "bin"
         bindir.mkdir()
         pgbin = state / "airflow-pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
@@ -1256,9 +1284,11 @@ class LifecycleTests(unittest.TestCase):
             env_path = state / "derived" / "gen-1" / "operator.env"
             unit = (target / "description-portal.service").read_text(encoding="utf-8")
             self.assertIn(f"EnvironmentFile={env_path}", unit)
-            # The portal consumes the platform store through the derived DSN (A's U1 slice).
+            # The portal consumes the platform store through the derived DSN (A's U1 slice);
+            # the canonical env encoding single-quotes the value (its "&"/"?" are not
+            # shell-safe), which a `source` and systemd's EnvironmentFile both decode.
             self.assertIn(
-                "PLATFORM_SERVICE_DSN=postgresql://platform_service@/airflow_meta",
+                "PLATFORM_SERVICE_DSN='postgresql://platform_service@/airflow_meta",
                 env_path.read_text(encoding="utf-8"),
             )
 
@@ -1329,7 +1359,15 @@ class InstallOrderingTests(unittest.TestCase):
             "exit 0\n",
         )
         write_stub(
-            release / "airflow" / "install.sh", '#!/usr/bin/env bash\necho "airflow_install" >> "$ORDER_LOG"\nexit 0\n'
+            release / "airflow" / "install.sh",
+            '#!/usr/bin/env bash\necho "airflow_install" >> "$ORDER_LOG"\n'
+            'if [ "${1:-}" = "--stage" ]; then\n'
+            '  mkdir -p "$AIRFLOW_VENV/bin"\n'
+            '  cp "$FIXTURE_STUB_PYTHON" "$AIRFLOW_VENV/bin/python"\n'
+            '  chmod +x "$AIRFLOW_VENV/bin/python"\n'
+            "  printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$AIRFLOW_VENV/bin/airflow\"\n"
+            '  chmod +x "$AIRFLOW_VENV/bin/airflow"\n'
+            "fi\nexit 0\n",
         )
         write_stub(
             release / "airflow" / "scripts" / "install_postgres.sh",
@@ -1504,12 +1542,10 @@ class InstallOrderingTests(unittest.TestCase):
             + 'case "$*" in\n'
             '  *-f*platform/bootstrap.sql*)\n'
             '    echo "psql_platform_bootstrap" >> "$ORDER_LOG"; exit 0 ;;\n'
+            '  *-f*platform/grants-airflow.sql*)\n'
+            '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             '  *-f*platform/schema.sql*|*-f*platform/views.sql*|*-f*platform/roles.sql*)\n'
             '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit 0 ;;\n'
-            '  *-c*platform_migrate*)\n'
-            '    echo "psql_airflow_reader_grant" >> "$ORDER_LOG"; exit 0 ;;\n'
-            '  *-v*ON_ERROR_STOP=1*q*)\n'
-            '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             "esac\n"
             'echo "psql_db_query" >> "$ORDER_LOG"\n'
             'rc="${PSQL_QUERY_RC:-0}"\n'
@@ -1595,6 +1631,7 @@ class InstallOrderingTests(unittest.TestCase):
             "REGISTER_AFTER": "0",
             "UNPAUSE_RC": "0",
             "PAUSE_RC": "0",
+            "FIXTURE_STUB_PYTHON": str(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python"),
             "PROJECTION_FILE": str(tmp / "projection.json"),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
         }
@@ -1635,10 +1672,9 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertLess(lines.index("createdb"), lines.index("psql_platform_bootstrap"))
             self.assertLess(lines.index("psql_platform_bootstrap"), lines.index("airflow_install"))
             self.assertLess(lines.index("createdb"), lines.index("airflow_install"))
-            self.assertLess(lines.index("airflow_install"), lines.index("psql_airflow_reader_grant"))
-            self.assertLess(lines.index("psql_airflow_reader_grant"), lines.index("psql_platform_apply"))
+            self.assertLess(lines.index("airflow_install"), lines.index("psql_airflow_grants"))
+            self.assertLess(lines.index("psql_airflow_grants"), lines.index("psql_platform_apply"))
             self.assertLess(lines.index("airflow_install"), lines.index("psql_platform_apply"))
-            self.assertLess(lines.index("psql_platform_apply"), lines.index("psql_airflow_grants"))
             self.assertEqual(
                 [line for line in lines if line.startswith("pg_isready ")], ["pg_isready 1", "pg_isready 2"]
             )
@@ -1706,7 +1742,9 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertTrue((state / "derived" / "gen-2" / "operator.env").is_file())
             receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
             self.assertEqual(
-                [row["step"] for row in receipt["steps"]], ["linux-generation", "windows-generation"]
+                [row["step"] for row in receipt["steps"]],
+                ["linux-generation", "windows-generation"],
+                "stage performs no schema DDL; the guarded windows own it",
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
             # The bound source is the immutable generation file with its real digest.
@@ -1737,7 +1775,7 @@ class InstallOrderingTests(unittest.TestCase):
     def _derived_value(state: Path, generation: str, key: str) -> str:
         for line in (state / "derived" / generation / "operator.env").read_text(encoding="utf-8").splitlines():
             if line.startswith(key + "="):
-                return line.split("=", 1)[1]
+                return decode_env_value(line.split("=", 1)[1].strip())
         raise AssertionError(f"the derived environment carries no {key}")
 
     def _clone_generation_stubs(self, state: Path) -> None:
@@ -1775,6 +1813,270 @@ class InstallOrderingTests(unittest.TestCase):
         health_file.write_text(json.dumps({"passed": True, "verb": "health", "health": health}), encoding="utf-8")
         env["FIXTURE_HEALTH_FILE"] = str(health_file)
 
+    def test_maintenance_reconcile_verifies_the_candidate_before_any_ddl(self) -> None:
+        """A tampered staged snapshot refuses with zero live-DDL calls."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            snapshot = Path(receipt["to"])
+            snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+            refused = run(
+                [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                    "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                    "--evidence", "receipt.json",
+                ],
+                control_env,
+            )
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertIn("snapshot", refused.stderr)
+            self.assertEqual(
+                order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                before,
+                "no live DDL may run before the staged identity verifies",
+            )
+
+    def test_maintenance_reconcile_refuses_an_undefined_candidate_value(self) -> None:
+        """A candidate env that cannot define a value never falls back to the running generation."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            candidate_env = state / "derived" / "gen-2" / "operator.env"
+            original = candidate_env.read_text(encoding="utf-8")
+            dsn_line = next(line for line in original.splitlines() if line.startswith("PLATFORM_SERVICE_DSN="))
+            foreign = "postgresql://platform_service@/airflow_meta?host=/elsewhere&port=1"
+            cases = {
+                # A missing key, an empty candidate and a defeated (unquoted "&") assignment are
+                # all three "the file does not define it": never the inherited running value,
+                # always a fail-closed refusal at the read, before any DDL or recovery step.
+                "missing_key": (
+                    "PLATFORM_SERVICE_DSN",
+                    "\n".join(
+                        line for line in original.splitlines() if not line.startswith("PLATFORM_SERVICE_DSN=")
+                    )
+                    + "\n",
+                ),
+                "empty_file": ("AIRFLOW_VENV", ""),
+                "defeated_unquoted_assignment": (
+                    "PLATFORM_SERVICE_DSN",
+                    original.replace(dsn_line, f"PLATFORM_SERVICE_DSN={foreign}"),
+                ),
+            }
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            for label, (key, document) in cases.items():
+                with self.subTest(label):
+                    candidate_env.write_text(document, encoding="utf-8")
+                    receipt_before = receipt_path.read_bytes()
+                    before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+                    refused = run(
+                        [
+                            "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                            "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                            "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                            "--evidence", "receipt.json",
+                        ],
+                        control_env,
+                    )
+                    self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                    self.assertIn("derived environment", refused.stderr)
+                    self.assertIn(key, refused.stderr)
+                    self.assertEqual(
+                        order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                        before,
+                        f"{label}: no live DDL may run for an undefined candidate value",
+                    )
+                    self.assertEqual(
+                        receipt_path.read_bytes(), receipt_before, f"{label}: the receipt is untouched"
+                    )
+                    self.assertFalse(
+                        (state / "promotions" / "gen-2" / "reconcile-schema-migration.out").exists(),
+                        f"{label}: the guarded migration never ran",
+                    )
+            candidate_env.write_text(original, encoding="utf-8")
+
+    def test_maintenance_reconcile_reads_a_legacy_running_environment(self) -> None:
+        """A pre-contract running generation (bare, unsourceable DSN lines) must not block the
+        route: the running side of the authority check comes from its canonical rendering."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            # Degrade the running generation's derived env to the pre-contract writer's shape:
+            # bare DSN values whose "&" no shell can source (the running deployment's canonical
+            # rendering, resolved.env, is untouched and stays the route's running authority).
+            running_env = state / "derived" / "gen-1" / "operator.env"
+            legacy_lines = []
+            for line in running_env.read_text(encoding="utf-8").splitlines():
+                key = line.split("=", 1)[0]
+                if "=" in line and key.endswith(("_DSN", "_DB_URL")):
+                    legacy_lines.append(f"{key}={decode_env_value(line.split('=', 1)[1].strip())}")
+                else:
+                    legacy_lines.append(line)
+            running_env.write_text("\n".join(legacy_lines) + "\n", encoding="utf-8")
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            snapshot = Path(receipt["to"])
+            snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+            refused = run(
+                [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                    "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                    "--evidence", "receipt.json",
+                ],
+                control_env,
+            )
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            # The route passed the environment reads (the legacy running side included) and
+            # reached the staged-identity guard - the same failure point as with a canonical
+            # running environment.
+            self.assertIn("snapshot", refused.stderr)
+            self.assertNotIn("does not declare", refused.stderr)
+
+    def test_maintenance_reconcile_refuses_a_corrupt_running_environment(self) -> None:
+        """The running side is decoded as data: missing, empty, malformed and foreign
+        declarations all refuse explicitly, with nothing inherited and no live DDL."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            running_env = state / "derived" / "gen-1" / "operator.env"
+            original = running_env.read_text(encoding="utf-8")
+            dsn_line = next(line for line in original.splitlines() if line.startswith("PLATFORM_SERVICE_DSN="))
+            foreign = decode_env_value(dsn_line.split("=", 1)[1].strip()).replace("airflow_meta", "another_meta")
+            cases = {
+                "missing_key": (
+                    "does not declare PLATFORM_SERVICE_DSN",
+                    "\n".join(
+                        line for line in original.splitlines() if not line.startswith("PLATFORM_SERVICE_DSN=")
+                    )
+                    + "\n",
+                ),
+                "empty_file": ("does not declare PLATFORM_SERVICE_DSN", ""),
+                "malformed": (
+                    "not one shell word",
+                    original.replace(dsn_line, "PLATFORM_SERVICE_DSN=one two"),
+                ),
+                "foreign_authority": (
+                    "another database authority",
+                    original.replace(dsn_line, f"PLATFORM_SERVICE_DSN={shlex.quote(foreign)}"),
+                ),
+                "duplicate_conflict": (
+                    "conflicting duplicate declaration",
+                    original + "PLATFORM_SERVICE_DSN=" + shlex.quote(foreign) + "\n",
+                ),
+            }
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            for label, (message, document) in cases.items():
+                with self.subTest(label):
+                    running_env.write_text(document, encoding="utf-8")
+                    receipt_before = receipt_path.read_bytes()
+                    before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+                    refused = run(
+                        [
+                            "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                            "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                            "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                            "--evidence", "receipt.json",
+                        ],
+                        control_env,
+                    )
+                    self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                    self.assertIn(message, refused.stderr)
+                    self.assertEqual(
+                        order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                        before,
+                        f"{label}: no live DDL may run for a corrupt running declaration",
+                    )
+                    self.assertEqual(
+                        receipt_path.read_bytes(), receipt_before, f"{label}: the receipt is untouched"
+                    )
+                    self.assertFalse(
+                        (state / "promotions" / "gen-2" / "reconcile-schema-migration.out").exists(),
+                        f"{label}: the guarded migration never ran",
+                    )
+            running_env.write_text(original, encoding="utf-8")
+
+    def test_maintenance_reconcile_reads_identical_duplicate_declarations(self) -> None:
+        """Identical duplicates decode to the same bytes the canonical readers see and are
+        accepted; only conflicting duplicates refuse (never first-wins)."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            running_env = state / "derived" / "gen-1" / "operator.env"
+            original = running_env.read_text(encoding="utf-8")
+            dsn_line = next(line for line in original.splitlines() if line.startswith("PLATFORM_SERVICE_DSN="))
+            running_env.write_text(original + dsn_line + "\n", encoding="utf-8")
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            snapshot = Path(receipt["to"])
+            snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+            refused = run(
+                [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                    "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                    "--evidence", "receipt.json",
+                ],
+                control_env,
+            )
+            running_env.write_text(original, encoding="utf-8")
+            # The route passed the environment reads (identical duplicates accepted) and reached
+            # the staged-identity guard, exactly like the canonical single-declaration case.
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertIn("snapshot", refused.stderr)
+            self.assertNotIn("duplicate", refused.stderr)
+            self.assertNotIn("does not declare", refused.stderr)
+
     def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
@@ -1802,12 +2104,18 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(
                 [row["step"] for row in receipt["steps"]],
                 [
-                    "linux-generation", "windows-generation", "close-admission", "drain", "backup",
-                    "stop-services", "windows-switch", "endpoint-identity", "switch-pointer",
-                    "start-services", "verify", "open-admission",
+                    "linux-generation", "windows-generation",
+                    "close-admission", "drain", "backup",
+                    "stop-services", "schema-migration", "windows-switch", "endpoint-identity",
+                    "switch-pointer", "start-services", "verify", "open-admission",
                 ],
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
+            # The candidate's verified migrations run after both ends stopped and before
+            # either pointer moves (deployment.md).
+            steps = [row["step"] for row in receipt["steps"] if row["verb"] == "promote"]
+            self.assertLess(steps.index("stop-services"), steps.index("schema-migration"))
+            self.assertLess(steps.index("schema-migration"), steps.index("windows-switch"))
             backup_manifest = json.loads(
                 (state / "promotions" / "gen-2" / "evidence" / "backup-manifest.json").read_text(encoding="utf-8")
             )

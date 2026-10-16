@@ -16,10 +16,21 @@ def derive_scene(root: Path, manifest: dict) -> dict:
     from .scene import build_scene
 
     raw = read_data(confined(root, manifest["scene"]))
-    config = read_data(confined(root, manifest["source_config"]))
+    from .discovery import source_definition
+
+    delivery = Path(root)
+    delivery = delivery.parent if delivery.name == "evidence" else delivery
+    payload = read_data(confined(delivery, "evidence/discovery.json"))
+    main = str((payload.get("derivation") or {}).get("main_assembly") or "")
+    config = source_definition(
+        delivery, discovery_name="evidence/discovery.json", cad_prefix="input/cad/", records_prefix="input/records/"
+    )
     if not isinstance(raw, dict) or not isinstance(config, dict):
         raise PipelineError("Captured readings and source configuration must be objects")
-    if config.get("assembly") != manifest["identity"].get("assembly"):
+    if not main or config.get("assembly") != str(confined(delivery.resolve(), "input/cad/" + main)):
+        raise PipelineError("Captured source configuration names another assembly")
+    admitted = str(manifest["identity"].get("assembly") or "").replace("\\", "/")
+    if not admitted.endswith("/" + main):
         raise PipelineError("Captured source configuration names another assembly")
     if config.get("configuration") != manifest["identity"].get("configuration"):
         raise PipelineError("Captured source configuration names another configuration")

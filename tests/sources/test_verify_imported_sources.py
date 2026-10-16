@@ -177,10 +177,13 @@ class ImportedSourceTests(unittest.TestCase):
             "contract": "native-discovery/v1",
             "run_id": "imported-source-test",
             "namespace": "dp",
+            "handoff_sha256": "0" * 64,
             "raw": {
                 "components": components,
                 "files": dict(native if raw_files is None else raw_files),
                 "identity": {},
+                "saved_configuration": "Default",
+                "document_state": support.saved_document_state(),
                 **(extra_raw or {}),
             },
             "identity": {},

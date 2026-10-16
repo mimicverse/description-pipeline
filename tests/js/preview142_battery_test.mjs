@@ -22,8 +22,11 @@ const {
   infoPanelRows,
   interactionEffect,
   jointRows,
+  qualificationRows,
   linkRows,
   previewExpansion,
+  purposeLabel,
+  statusLabel,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
@@ -68,7 +71,10 @@ const {
     subjectSha256: "a".repeat(64),
     tool,
     qualitySchema: "solidworks-to-urdf.quality/v1",
-    qualificationStates: [{ fact_id: "motion.waist", state: "not_applicable" }],
+    qualificationStates: [
+      { fact_id: "drive_sizing", status: "unqualified" },
+      { fact_id: "machine_qualification", status: "out_of_scope" },
+    ],
   });
   const keys = rows.map((row) => row.key);
   for (const required of MACHINE_FIELD_KEYS) assert.ok(keys.includes(required), required);
@@ -76,7 +82,43 @@ const {
   assert.equal(byKey.get("run_id"), "portal-20261015T000000-aa11bb22");
   assert.equal(byKey.get("subject_sha256"), "a".repeat(64));
   assert.ok(byKey.get("tool_identity").includes(tool.source_sha256), "tool_identity must carry the machine digest");
+  assert.equal(byKey.get("qualification_states"), "drive_sizing=未建立, machine_qualification=不适用");
+  assert.equal(byKey.get("purpose"), "未记录");
+  assert.equal(purposeLabel("engineering"), "engineering");
+  assert.equal(purposeLabel("inspection_preview"), "inspection_preview");
+  assert.equal(purposeLabel("unknown"), "未记录");
   assert.equal(infoPanelRows({ runId: "", subjectSha256: "", tool: null }).length, MACHINE_FIELD_KEYS.length + 2);
+  // Every (fact_id, scope, object_id) identity renders independently in a stable
+  // order: flipping the input order cannot flip a conclusion.
+  {
+    const rows = (items) =>
+      qualificationRows(items).map((row) => `${row.label}=${statusLabel(row.status)}`);
+    const established = { fact_id: "drive_sizing", object_id: "arm-a", status: "established" };
+    const missing = { fact_id: "drive_sizing", object_id: "arm-b", status: "unqualified" };
+    assert.deepEqual(rows([missing, established]), ["drive_sizing[arm-a]=已建立", "drive_sizing[arm-b]=未建立"]);
+    assert.deepEqual(rows([established, missing]), rows([missing, established]));
+    const panel = (items) =>
+      infoPanelRows({ qualificationStates: items }).find((row) => row.key === "qualification_states").value;
+    assert.equal(panel([missing, established]), panel([established, missing]));
+    assert.equal(panel([missing, established]), "drive_sizing[arm-a]=已建立, drive_sizing[arm-b]=未建立");
+  }
+}
+
+// Static display seams (no browser): missing drive stays absent and labelled, the
+// preview window is labelled as an analysis window, and the tool identity is the
+// delivery-root tool.json.
+{
+  const staticDir = path.join(here, "..", "..", "src", "description_pipeline", "orchestration", "static");
+  const viewer = readFileSync(path.join(staticDir, "viewer.js"), "utf8");
+  const app = readFileSync(path.join(staticDir, "app.js"), "utf8");
+  assert.ok(viewer.includes('parseNumber(limit.getAttribute("effort"), null)'));
+  assert.ok(!viewer.includes('parseNumber(limit.getAttribute("effort"), 0)'));
+  assert.ok(app.includes("未提供（未建立驱动能力）"));
+  assert.ok(app.includes("检查/预览分析窗口，非机械限位"));
+  assert.ok(app.includes('loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal)'));
+  assert.ok(app.includes('["用途", purposeLabel(run.purpose)]'));
+  assert.ok(app.includes("purpose: preview.purpose"));
+  assert.ok(!app.includes('"reports/tool.json"'));
 }
 
 // P4 summary.bound (fixture case-04-summary-binding.json):

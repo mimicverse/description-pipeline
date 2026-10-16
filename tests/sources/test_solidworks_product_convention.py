@@ -6,7 +6,6 @@ qualify a SolidWorks API or a hardware model.
 
 from __future__ import annotations
 
-import copy
 import json
 import tempfile
 import unittest
@@ -19,12 +18,24 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.io import file_digest  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import freeze  # noqa: E402
+from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
-from description_pipeline.sources.solidworks.scene import normalize_scene as canonical_for  # noqa: E402
-from description_pipeline.sources.solidworks.verify import verify_normalization  # noqa: E402
 
 from . import support  # noqa: E402
+
+
+def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
+    return _freeze(support.capture_requests(config), *args, **kwargs)
+
+
+def _Backend(document, components, **kwargs):  # fixture plumbing: supported native datum names
+    """The fixture backend carrying this module's supported native datum names."""
+
+    kwargs.setdefault(
+        "coordinate_systems",
+        {"CS_base_link": support.placement()},
+    )
+    return support.FixtureCadBackend(document, components, **kwargs)
 
 #: 审阅记录里公布的解析张量（零件轴向、质心处，kg·m²）
 BENCHMARK: dict[str, dict[str, Any]] = {
@@ -75,6 +86,39 @@ def _cuboid_tensor(mass: float, dims: tuple[float, float, float], rpy: tuple[flo
     return rotation @ principal @ rotation.T
 
 
+def _native_record(*, files: dict[str, str]) -> dict:
+    """The synthetic discovery record matching this module's freeze fixture.
+
+    The single body owns its ``CS_base_link`` datum; link names come from that
+    datum name alone.
+    """
+
+    return support.native_record(
+        hardware_id="product_convention_fixture",
+        change_summary="product convention module fixture",
+        control_reference="product-convention-run",
+        components=[support.native_component("base-1", document="base.SLDPRT")],
+        datums=[support.native_datum("CS_base_link", "base-1", support.placement())],
+        masses=[{"component": "base-1", "mass_kg": float(BENCHMARK["base-1"]["mass"]), "material": "Alloy Steel"}],
+        files=files,
+    )
+
+
+def _compose_scene_inputs(destination: Path, cad_root: Path) -> None:
+    """Seal the consumer inputs the Linux scene rebuild reads (fixture plumbing)."""
+
+    names = ["robot.SLDASM", "base.SLDPRT"]
+    files = support.native_files(cad_root, names)
+    record = _native_record(files=files)
+    support.seal_scene_inputs(
+        destination,
+        cad_root=cad_root,
+        cad_names=names,
+        record=record,
+        controlled={"budget.json": support.native_budget_record(record)},
+    )
+
+
 class ProductConventionTests(unittest.TestCase):
     tmp: Path
     backend: support.FixtureCadBackend
@@ -86,7 +130,7 @@ class ProductConventionTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-convention-"))
         self.assembly = support.make_cad_tree(self.tmp / "cad")
         self.payload = self._benchmark_payload("base-1")
-        self.backend = support.FixtureCadBackend(
+        self.backend = _Backend(
             self.assembly,
             [{"name": "base-1", "transform": support.placement(), "mass": self.payload}],
             dependencies=[self.tmp / "cad" / "base.SLDPRT"],
@@ -97,12 +141,13 @@ class ProductConventionTests(unittest.TestCase):
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": False},
+            "coordinate_systems": ["CS_base_link"],
             "bodies": [
                 {
                     "id": "base",
                     "name": "base_link",
                     "components": ["base-1"],
-                    "frame": {"coordinate_system": "base_datum"},
+                    "frame": {"coordinate_system": "CS_base_link"},
                 }
             ],
             "joints": [],
@@ -151,6 +196,7 @@ class ProductConventionTests(unittest.TestCase):
 
     def test_scene_preserves_the_standard_signed_tensor(self) -> None:
         snapshot = self._freeze()
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         scene = load_scene(snapshot)
         link = scene["links"][0]
         inertia = np.array([link["inertial"]["inertia"][index] for index in (0, 1, 2, 3, 4, 5)], dtype=float)
@@ -178,6 +224,7 @@ class ProductConventionTests(unittest.TestCase):
         )
         snapshot = self.tmp / "scaled"
         freeze(config, snapshot, backend=self.backend)
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         scene = load_scene(snapshot)
         inertia = scene["links"][0]["inertial"]["inertia"]
         expected = BENCHMARK["base-1"]["tensor"] * 2.0
@@ -190,6 +237,7 @@ class ProductConventionTests(unittest.TestCase):
     def test_native_reading_without_a_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention=None)
         snapshot = self._freeze("no-convention")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError) as raised:
             load_scene(snapshot)
         self.assertIn("product_convention", str(raised.exception))
@@ -199,43 +247,23 @@ class ProductConventionTests(unittest.TestCase):
         payload["reference"].pop("product_convention")
         self.backend.components[0]["mass"] = payload
         snapshot = self._freeze("no-convention")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError):
             load_scene(snapshot)
 
     def test_positive_product_convention_is_rejected(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="solidworks_positive")
         snapshot = self._freeze("unsupported-convention")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError):
             load_scene(snapshot)
 
     # --- 独立校验端 ---------------------------------------------------
 
-    def test_verifier_agrees_with_the_signed_tensor(self) -> None:
-        snapshot = self._freeze("oracle-ok")
-        raw_scene = support.read_scene(snapshot)
-        definition = self._definition()
-        canonical = canonical_for(raw_scene, definition, snapshot)
-        results = verify_normalization(raw_scene, definition, snapshot, canonical)
-        link = next(entry for entry in results if entry["id"].endswith("base_link"))
-        self.assertEqual(link["status"], "passed", link["details"])
-
-    def test_verifier_rejects_a_model_with_flipped_cross_terms(self) -> None:
-        snapshot = self._freeze("oracle-tamper")
-        raw_scene = support.read_scene(snapshot)
-        definition = self._definition()
-        canonical = canonical_for(raw_scene, definition, snapshot)
-        tampered = copy.deepcopy(canonical)
-        inertia = tampered["links"][0]["inertial"]["inertia"]
-        for index in (1, 2, 4):  # ixy / ixz / iyz
-            inertia[index] = -inertia[index]
-        results = verify_normalization(raw_scene, definition, snapshot, tampered)
-        link = next(entry for entry in results if entry["id"].endswith("base_link"))
-        self.assertEqual(link["status"], "failed")
-        self.assertFalse(link["details"]["inertia_ok"])
-
     def test_unsupported_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="ansys_tensor")
         snapshot = self._freeze("unsupported")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError) as raised:
             load_scene(snapshot)
         self.assertIn("product_convention", str(raised.exception))

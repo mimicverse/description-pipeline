@@ -357,6 +357,7 @@ def fixture():
             "pid_bindings": [],
         },
         "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
         "selection": {"main_assembly": "robot.SLDASM"},
         "components": [
             component("base_part"),
@@ -452,6 +453,7 @@ def lock(left, right, *, error=0, kind="lock"):
         "type": kind,
         "suppressed": False,
         "error_code": error,
+        "limits": None,
         "entities": [{"component": left, "point": [0, 0, 0]}, {"component": right, "point": [0, 0, 0]}],
     }
 
@@ -1112,6 +1114,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                     "schema_version": "solidworks-to-urdf.native-discovery/v1",
                     "run_id": "test",
                     "contract": "native-discovery/v1",
+                    "handoff_sha256": "0" * 64,
                     "raw": raw,
                     "identity": copy.deepcopy(raw["identity"]),
                 },
@@ -1123,6 +1126,10 @@ class NativeDeclarationsTests(unittest.TestCase):
                 hardware_id="fixture",
                 revision="r1",
             )
+            # The sealed record carries the authored CAD summary; keep the
+            # fixture's source record coherent with the raw reading.
+            source["metadata"]["change_summary"] = raw["identity"]["change_summary"]
+            source["metadata"]["change_summary_source"] = "cad"
             support.write_target_delivery(
                 package,
                 capture={},

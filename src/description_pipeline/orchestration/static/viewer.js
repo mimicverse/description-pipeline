@@ -332,8 +332,10 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
       axis: axisVector,
       lower: type === "continuous" ? -Math.PI : lower,
       upper: type === "continuous" ? Math.PI : upper,
-      effort: limit ? parseNumber(limit.getAttribute("effort"), 0) : null,
-      velocity: limit ? parseNumber(limit.getAttribute("velocity"), 0) : null,
+      effort:
+        limit && limit.getAttribute("effort") !== null ? parseNumber(limit.getAttribute("effort"), null) : null,
+      velocity:
+        limit && limit.getAttribute("velocity") !== null ? parseNumber(limit.getAttribute("velocity"), null) : null,
       value: 0,
       set(value) {
         this.value = value;
@@ -422,16 +424,17 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
     const origin = inertial ? originOf(inertial) : null;
     linkRecords.push({
       name,
-      mass_kg: massNode ? parseNumber(massNode.getAttribute("value"), 0) : null,
+      mass_kg:
+        massNode && massNode.getAttribute("value") !== null ? parseNumber(massNode.getAttribute("value"), null) : null,
       com_m: origin ? [origin.position.x, origin.position.y, origin.position.z] : null,
       inertia_kg_m2: inertiaNode
         ? {
-            ixx: parseNumber(inertiaNode.getAttribute("ixx"), 0),
-            ixy: parseNumber(inertiaNode.getAttribute("ixy"), 0),
-            ixz: parseNumber(inertiaNode.getAttribute("ixz"), 0),
-            iyy: parseNumber(inertiaNode.getAttribute("iyy"), 0),
-            iyz: parseNumber(inertiaNode.getAttribute("iyz"), 0),
-            izz: parseNumber(inertiaNode.getAttribute("izz"), 0),
+            ixx: inertiaNode.getAttribute("ixx") !== null ? parseNumber(inertiaNode.getAttribute("ixx"), null) : null,
+            ixy: inertiaNode.getAttribute("ixy") !== null ? parseNumber(inertiaNode.getAttribute("ixy"), null) : null,
+            ixz: inertiaNode.getAttribute("ixz") !== null ? parseNumber(inertiaNode.getAttribute("ixz"), null) : null,
+            iyy: inertiaNode.getAttribute("iyy") !== null ? parseNumber(inertiaNode.getAttribute("iyy"), null) : null,
+            iyz: inertiaNode.getAttribute("iyz") !== null ? parseNumber(inertiaNode.getAttribute("iyz"), null) : null,
+            izz: inertiaNode.getAttribute("izz") !== null ? parseNumber(inertiaNode.getAttribute("izz"), null) : null,
           }
         : null,
     });

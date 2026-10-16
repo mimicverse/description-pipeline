@@ -527,7 +527,18 @@ class PhysicsTests(unittest.TestCase):
     def test_rebuilt_source_missing_material_source_fails_closed_without_a_default(self):
         self._record_clean_provenance()
         self.write()
-        write_json(self.bundle / "evidence/raw/source_config.json", {})
+        # The negative mutates the actual bound authority the verifier consumes:
+        # the sealed capture provenance block loses its declared material source.
+        self.store_block(
+            "material_provenance",
+            {
+                "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                "assembly": self.captured_identity["assembly"],
+                "configuration": self.source["configuration"],
+                "measured_source": "cad_api",
+                "warnings": [],
+            },
+        )
         with self.assertRaises(PipelineError) as raised:
             self._rebuilt_source()
         self.assertIn("material_source", str(raised.exception))
@@ -2112,6 +2123,20 @@ class QualificationItemTests(unittest.TestCase):
         write_json(root / "input/handoff.json", {"probe": "sealed input"})
         write_json(root / "model/robot.json", {"probe": "model"})
         (root / "urdf/robot.urdf").write_text("<robot/>", encoding="utf-8")
+        from description_pipeline.request_evidence import build_request_evidence, write_request_evidence
+
+        write_request_evidence(
+            root / "input" / "request.json",
+            build_request_evidence(
+                purpose="engineering",
+                request_id="fixture-quality",
+                target_hardware="nd_fixture",
+                change_summary="fixture",
+                main_assembly="cad/robot.SLDASM",
+                handoff_digest="a" * 64,
+                platform_config_digest="c" * 64,
+            ),
+        )
         return root
 
     @staticmethod

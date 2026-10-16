@@ -2,7 +2,9 @@
 -- It creates the roles, the two schemas and the per-role search_path; everything else
 -- (schema objects, views, grants to the platform consumers) runs as the platform migration
 -- identity (platform_migrate), which owns only the platform schema.  Run through
--- apply.sh --bootstrap; idempotent.
+-- apply.sh --bootstrap; idempotent.  Both schema names arrive as psql variables (apply.sh:
+-- --platform-schema / --airflow-schema; defaults `platform` / `airflow`), so CI can isolate a
+-- run in `platform_ci_<run>` without touching the production defaults.
 
 DO $$
 BEGIN
@@ -30,15 +32,16 @@ ALTER ROLE platform_service LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
 ALTER ROLE operator_ro LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
 ALTER ROLE airflow_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
 
-CREATE SCHEMA IF NOT EXISTS platform AUTHORIZATION platform_migrate;
-ALTER SCHEMA platform OWNER TO platform_migrate;
+CREATE SCHEMA IF NOT EXISTS :"platform_schema" AUTHORIZATION platform_migrate;
+ALTER SCHEMA :"platform_schema" OWNER TO platform_migrate;
 CREATE SCHEMA IF NOT EXISTS :"airflow_schema" AUTHORIZATION airflow_migrate;
 ALTER SCHEMA :"airflow_schema" OWNER TO airflow_migrate;
 
 -- Unqualified metadata names (including the migration ledger) resolve inside each role's own
 -- schema; nothing crosses schemas implicitly.
-ALTER ROLE platform_migrate IN DATABASE :"platform_database" SET search_path = platform, pg_catalog;
-ALTER ROLE platform_service IN DATABASE :"platform_database" SET search_path = platform, pg_catalog;
+ALTER ROLE platform_migrate IN DATABASE :"platform_database" SET search_path = :"platform_schema", pg_catalog;
+ALTER ROLE platform_service IN DATABASE :"platform_database" SET search_path = :"platform_schema", pg_catalog;
+ALTER ROLE operator_ro IN DATABASE :"platform_database" SET search_path = :"platform_schema", pg_catalog;
 ALTER ROLE airflow_migrate IN DATABASE :"platform_database" SET search_path = :"airflow_schema", pg_catalog;
 ALTER ROLE airflow_runtime IN DATABASE :"platform_database" SET search_path = :"airflow_schema", pg_catalog;
 

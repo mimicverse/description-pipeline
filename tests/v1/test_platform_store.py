@@ -9,6 +9,7 @@ side's battery, not claimed by these unit tests.
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from datetime import UTC, datetime
@@ -16,11 +17,21 @@ from pathlib import Path
 from unittest import mock
 
 from description_pipeline.delivery import PIPELINE_ID, read_delivery_manifest, write_delivery_manifest
-from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, CHECK_POLICY_V1, check_policy_digest
+from description_pipeline.interface_records import (
+    CACHE_IMPORT_CONFIRMATION_SCHEMA,
+    CACHE_RELEASE_RECEIPT_SCHEMA,
+    CHECK_POLICY_SCHEMA,
+    CHECK_POLICY_V1,
+    cache_import_confirmation_digest,
+    cache_release_params_digest,
+    cache_release_receipt_digest,
+    check_policy_digest,
+)
 from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
 from description_pipeline.platform import store as store_module
 from description_pipeline.platform.store import (
     AdmissionClosedError,
+    OpenAttemptConflictError,
     OperationConflictError,
     PlatformStore,
     PlatformStoreError,
@@ -37,31 +48,50 @@ CHECKPOINT = "store://sealed/run-r-1"
 NATIVE_STAGE_STATES = {"freeze": "frozen", "discover": "discovered", "capture": "native_complete"}
 
 
-def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
+def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
     """One real sealed delivery: manifest record-for-record plus its digests.
 
     The tree covers the declared evidence of all six stages, so the same
-    delivery serves the portable and the native confirmations; the third
-    return value is the sealed ``input/handoff.json`` digest every receipt
-    must bind.
+    delivery serves the portable and the native confirmations. The digests
+    mirror the stage identity domains: the full prepared-index digest that
+    freeze binds, and the selected native transfer digest bound by every
+    later stage.
     """
 
     for name in ("input", "evidence", "model", "urdf", "meshes", "reports"):
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
-    (root / "evidence" / "native-meshes").mkdir()
+    (root / "evidence" / "geometry").mkdir()
     write_json(root / "input" / "source.json", {"source": "fixture"})
     write_json(root / "input" / "records" / "arm.json", {"record": "fixture"})
+    (root / "input" / "cad" / "cad").mkdir(parents=True)
+    (root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(b"fixture-native")
     package_files = {
         "source.json": file_digest(root / "input" / "source.json"),
         "records/arm.json": file_digest(root / "input" / "records" / "arm.json"),
+        "cad/cad/robot.SLDASM": file_digest(root / "input" / "cad" / "cad" / "robot.SLDASM"),
     }
-    write_json(root / "input" / "handoff.json", {"passed": True, "package_files": package_files})
-    write_json(root / "evidence" / "discovery.json", {"discovery": "fixture"})
+    native_inventory = {"cad/robot.SLDASM": package_files["cad/cad/robot.SLDASM"]}
+    write_json(
+        root / "input" / "handoff.json",
+        {
+            "passed": True,
+            "package_files": package_files,
+            "input_receipt": {"inventory": native_inventory},
+        },
+    )
+    write_json(
+        root / "evidence" / "discovery.json",
+        {
+            "discovery": "fixture",
+            "handoff_sha256": digest(native_inventory),
+            "native_files": native_inventory,
+        },
+    )
     write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
     write_json(root / "evidence" / "capture.json", {"capture": "fixture"})
     write_json(root / "evidence" / "native-runtime.json", {"runtime": "fixture"})
-    (root / "evidence" / "native-meshes" / "part.stl").write_bytes(b"native-stl")
+    (root / "evidence" / "geometry" / "part.stl").write_bytes(b"native-stl")
     write_json(root / "model" / "robot.json", {"model": "fixture"})
     (root / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
     (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")
@@ -77,6 +107,21 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
             "runtime": {"role": "native"},
         },
     )
+    write_json(root / "transfer-manifest.json", {"handoff_sha256": digest(native_inventory)})
+    from description_pipeline.request_evidence import build_request_evidence, write_request_evidence
+
+    write_request_evidence(
+        root / "input" / "request.json",
+        build_request_evidence(
+            purpose="engineering",
+            request_id="fixture-sealed-delivery",
+            target_hardware="nd",
+            change_summary="fixture",
+            main_assembly="cad/robot.SLDASM",
+            handoff_digest=digest(package_files),
+            platform_config_digest="c" * 64,
+        ),
+    )
     write_delivery_manifest(
         root,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -84,12 +129,39 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str]:
     )
     manifest = read_delivery_manifest(root)
     artifacts = [dict(record) for record in manifest["subject"]["files"]]
-    handoff = digest(package_files)
-    return manifest["subject"]["digest"], artifacts, handoff
+    handoff_full = digest(package_files)
+    handoff_native = digest(native_inventory)
+    return manifest["subject"]["digest"], artifacts, handoff_full, handoff_native
 
 
 class FakeWorld:
     """A tiny in-memory stand-in for the deploy side's schema and two views."""
+
+    _ROLLBACK_FIELDS = (
+        "admission",
+        "requests",
+        "runs",
+        "run_states",
+        "run_from_stage",
+        "operations",
+        "operation_bindings",
+        "task_instances",
+        "dag_runs",
+        "stages",
+        "events",
+        "confirmed_publishes",
+        "lifecycle_rows",
+        "run_display_rows",
+    )
+
+    def snapshot_state(self) -> dict:
+        import copy as _copy
+
+        return {name: _copy.deepcopy(getattr(self, name)) for name in self._ROLLBACK_FIELDS}
+
+    def restore_state(self, state: dict) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
 
     def __init__(self, *, admission=("open", "window", "operator", NOW, 1)):
         self.admission = admission
@@ -98,6 +170,12 @@ class FakeWorld:
         self.run_states: dict[str, str] = {}
         self.run_from_stage: dict[str, str | None] = {}
         self.operations: dict[str, tuple] = {}
+        #: operation_id -> (dag_id, dag_run_id, task_id, map_index); the view's join key.
+        self.operation_bindings: dict[str, tuple] = {}
+        #: (dag_id, task_id, dag_run_id, map_index) -> task_instance state.
+        self.task_instances: dict[tuple[str, str, str, int], str] = {}
+        #: (dag_id, dag_run_id) -> dag_run state; the view's DagRun-settled source.
+        self.dag_runs: dict[tuple[str, str], str] = {}
         self.stages: dict[tuple[str, str], tuple] = {}
         self.events: list[tuple] = []
         self.confirmed_publishes: set[tuple[str, str]] = set()
@@ -130,10 +208,15 @@ class FakeConnection:
     def __enter__(self):
         self.world.transactions += 1
         self.world.open_transactions += 1
+        self._undo = self.world.snapshot_state()
         return self
 
     def __exit__(self, *exc):
         self.world.open_transactions -= 1
+        if exc[0] is not None:
+            # A refused transaction rolls back exactly like the real database: the
+            # world is restored and only the statement log and test instruments stay.
+            self.world.restore_state(self._undo)
         return False
 
 
@@ -147,35 +230,75 @@ class FakeCursor:
         normalized = " ".join(sql.split())
         world = self.world
         world.statements.append(normalized)
-        if "FROM platform.admission WHERE id = 1 FOR UPDATE" in normalized:
+        if "FROM admission WHERE id = 1 FOR UPDATE" in normalized:
             self._rows = [world.admission] if world.admission is not None else []
-        elif "UPDATE platform.admission" in normalized:
+        elif "UPDATE admission" in normalized:
             state, reason, actor = params
             world.admission = (state, reason, actor, NOW, world.admission[4] + 1)
             self._rows = [world.admission]
-        elif "FROM platform.admission_projection" in normalized:
+        elif "FROM admission_projection" in normalized:
             self._rows = [world.admission] if world.admission is not None else []
-        elif normalized.startswith("INSERT INTO platform.request"):
+        elif normalized.startswith("INSERT INTO request"):
             world.requests.append(tuple(params))
             self._rows = []
-        elif normalized.startswith("INSERT INTO platform.run ("):
+        elif normalized.startswith("INSERT INTO run ("):
             world.runs.append(tuple(params))
             world.run_states[params[0]] = "queued"
             world.run_from_stage[params[0]] = params[3]
             self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET state = 'running'"):
-            if world.run_states.get(params[0]) == "queued":
+        elif normalized.startswith("UPDATE run SET state = 'running'"):
+            if "state = 'unresolved'" in normalized:
+                if world.run_states.get(params[0]) == "unresolved":
+                    world.run_states[params[0]] = "running"
+                    self._rows = [("running",)]
+                else:
+                    self._rows = []
+            elif world.run_states.get(params[0]) == "queued":
                 world.run_states[params[0]] = "running"
                 self._rows = [("running",)]
             else:
                 self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET state = %s"):
+        elif normalized.startswith("UPDATE run SET state = 'unresolved'"):
+            if world.run_states.get(params[0]) == "running":
+                world.run_states[params[0]] = "unresolved"
+            self._rows = []
+        elif normalized.startswith("UPDATE run SET state = %s"):
             outcome, run_id = params
             if world.run_states.get(run_id) not in {"succeeded", "failed", "cancelled", None}:
                 world.run_states[run_id] = outcome
             self._rows = []
+        elif normalized.startswith("SELECT run_id, request_id FROM run WHERE parent_run_id"):
+            parent = params[0]
+            open_child = next(
+                (
+                    row
+                    for row in world.runs
+                    if row[2] == parent
+                    and world.run_states.get(row[0]) not in {"succeeded", "failed", "cancelled"}
+                ),
+                None,
+            )
+            self._rows = [(open_child[0], open_child[1])] if open_child is not None else []
+        elif normalized.startswith("SELECT principal, target_hardware, main_assembly"):
+            entry = next((row for row in world.requests if row[0] == params[0]), None)
+            if entry is None:
+                self._rows = []
+            else:
+                run_ids = {row[0] for row in world.runs if row[1] == entry[0]}
+                dispatch_digest = next(
+                    (
+                        record[3]
+                        for record in world.operations.values()
+                        if record[4] in run_ids and record[6] == "dispatch"
+                    ),
+                    None,
+                )
+                configuration = entry[4]
+                if isinstance(configuration, str):
+                    configuration = json.loads(configuration)
+                self._rows = [(entry[1], entry[2], entry[3], NOW, dispatch_digest, configuration)]
         elif normalized.startswith(
-            "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM platform.run WHERE run_id = %s"
+            "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
         ):
             entry = next((row for row in world.runs if row[0] == params[0]), None)
             if entry is None:
@@ -185,35 +308,155 @@ class FakeCursor:
                 self._rows = [(state, entry[1], entry[2], entry[3], entry[4])]
         elif normalized.startswith(
             "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
-            " FROM platform.stage WHERE run_id = %s"
+            " FROM stage WHERE run_id = %s"
         ):
             self._rows = [
-                (stage, record[0], record[1], record[2], None, None)
+                (
+                    stage,
+                    record[0],
+                    record[1],
+                    record[2],
+                    record[3] if len(record) > 3 else None,
+                    record[4] if len(record) > 4 else None,
+                )
                 for (run_id, stage), record in world.stages.items()
                 if run_id == params[0]
             ]
-        elif normalized.startswith("INSERT INTO platform.operation"):
+        elif normalized.startswith("INSERT INTO operation"):
             key = params[4]
             if key in world.operations:
                 self._rows = []
             else:
                 record = (params[0], "queued", key, params[5], params[1], params[2], params[3])
                 world.operations[key] = record
+                world.operation_bindings[params[0]] = (params[6], params[7], params[8], params[9])
                 self._rows = [record]
+        elif normalized.startswith("SELECT dag_id, dag_run_id FROM operation WHERE operation_id"):
+            operation_id, run_id = params
+            bound = None
+            for record in world.operations.values():
+                if record[0] != operation_id or record[4] != run_id:
+                    continue
+                dag_id, dag_run_id = world.operation_bindings.get(operation_id, (None, None))[:2]
+                bound = (dag_id, dag_run_id)
+                break
+            self._rows = [bound] if bound is not None else []
+        elif normalized.startswith(
+            "SELECT stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+            " FROM operation WHERE operation_id"
+        ):
+            operation_id, run_id = params
+            bound = None
+            for key, record in world.operations.items():
+                if record[0] != operation_id or record[4] != run_id:
+                    continue
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    operation_id, (None, None, None, None)
+                )
+                bound = (record[5], record[6], record[1], dag_id, dag_run_id, task_id, map_index, key)
+                break
+            self._rows = [bound] if bound is not None else []
+        elif normalized.startswith("UPDATE operation SET task_id = %s, map_index = %s"):
+            task_id, map_index, operation_id, run_id = params
+            updated = None
+            for record in world.operations.values():
+                if record[0] != operation_id or record[4] != run_id:
+                    continue
+                dag_id, dag_run_id, current_task, current_map = world.operation_bindings.get(
+                    operation_id, (None, None, None, None)
+                )
+                if current_task is None and current_map is None:
+                    world.operation_bindings[operation_id] = (dag_id, dag_run_id, task_id, map_index)
+                    updated = (operation_id,)
+                break
+            self._rows = [updated] if updated is not None else []
+        elif normalized.startswith(
+            "SELECT object_kind, state, bucket FROM lifecycle_projection"
+            " WHERE (object_kind = 'scheduling'"
+        ):
+            # The one statement that carries every lifecycle fact of an orphan acceptance.
+            operation_id, dag_run_object = params
+            rows = []
+            state = None
+            for record in world.operations.values():
+                if record[0] != operation_id:
+                    continue
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    operation_id, (None, None, None, None)
+                )
+                if None not in (dag_id, dag_run_id, task_id, map_index):
+                    state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
+                break
+            if state in {
+                "queued",
+                "running",
+                "scheduled",
+                "deferred",
+                "up_for_retry",
+                "up_for_reschedule",
+                "restarting",
+            }:
+                bucket = "in_flight"
+            elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
+                bucket = "terminal"
+            else:
+                bucket = "unknown"
+            rows.append(("scheduling", state, bucket))
+            for (dag_id, dag_run_id), dag_state in world.dag_runs.items():
+                if f"{dag_id}/{dag_run_id}" != dag_run_object:
+                    continue
+                if dag_state in {"success", "failed"}:
+                    dag_bucket = "terminal"
+                elif dag_state in {"queued", "running"}:
+                    dag_bucket = "in_flight"
+                else:
+                    dag_bucket = "unknown"
+                rows.append(("dag_run", dag_state, dag_bucket))
+                break
+            self._rows = rows
+        elif normalized.startswith("SELECT state, bucket FROM lifecycle_projection"):
+            (object_id,) = params
+            state = None
+            found = False
+            for record in world.operations.values():
+                if record[0] != object_id:
+                    continue
+                found = True
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    object_id, (None, None, None, None)
+                )
+                if None not in (dag_id, dag_run_id, task_id, map_index):
+                    state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
+                break
+            if state in {
+                "queued",
+                "running",
+                "scheduled",
+                "deferred",
+                "up_for_retry",
+                "up_for_reschedule",
+                "restarting",
+            }:
+                bucket = "in_flight"
+            elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
+                bucket = "terminal"
+            else:
+                bucket = "unknown"
+            self._rows = [(state, bucket)] if found else []
         elif normalized.startswith(
             "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
-            " FROM platform.operation WHERE operation_key"
+            " FROM operation WHERE operation_key"
         ):
             record = world.operations.get(params[0])
             if world.hidden_finds:
                 world.hidden_finds -= 1
                 record = None
             self._rows = [record] if record else []
-        elif "SELECT state, from_stage FROM platform.run WHERE run_id = %s" in normalized:
+        elif "SELECT state, from_stage FROM run WHERE run_id = %s" in normalized:
             state = world.run_states.get(params[0])
             self._rows = [(state, world.run_from_stage.get(params[0]))] if state is not None else []
         elif normalized.startswith(
-            "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run"
+            "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run"
         ):
             if "WHERE run_id = %s" in normalized:
                 row = world.run_display_rows.get(params[0])
@@ -224,7 +467,7 @@ class FakeCursor:
                     for run_id, row in world.run_display_rows.items()
                     if row[0] is not None or row[1] is not None
                 ]
-        elif normalized.startswith("UPDATE platform.run SET display_name"):
+        elif normalized.startswith("UPDATE run SET display_name"):
             row = world.run_display_rows.get(params[1])
             if row is not None:
                 row[0] = params[0]
@@ -232,7 +475,7 @@ class FakeCursor:
                 self._rows = [(params[1], *row)]
             else:
                 self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET hidden_at = COALESCE"):
+        elif normalized.startswith("UPDATE run SET hidden_at = COALESCE"):
             row = world.run_display_rows.get(params[1])
             if row is not None:
                 if row[1] is None:
@@ -243,7 +486,7 @@ class FakeCursor:
                 self._rows = [(params[1], *row)]
             else:
                 self._rows = []
-        elif normalized.startswith("UPDATE platform.run SET hidden_at = NULL"):
+        elif normalized.startswith("UPDATE run SET hidden_at = NULL"):
             row = world.run_display_rows.get(params[0])
             if row is not None:
                 row[1] = None
@@ -252,10 +495,10 @@ class FakeCursor:
                 self._rows = [(params[0], *row)]
             else:
                 self._rows = []
-        elif "FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
+        elif "FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded'" in normalized:
             self._rows = [(1,)] if (params[0], "publish") in world.confirmed_publishes else []
         elif (
-            "FROM platform.operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s"
+            "FROM operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s"
             in normalized
         ):
             found = any(
@@ -264,7 +507,7 @@ class FakeCursor:
             )
             self._rows = [(1,)] if found else []
         elif (
-            "FROM platform.operation WHERE run_id = %s AND stage = %s AND kind <> 'reconcile'"
+            "FROM operation WHERE run_id = %s AND stage = %s AND kind <> 'reconcile'"
             " AND state = 'unresolved'"
         ) in normalized:
             found = any(
@@ -272,37 +515,146 @@ class FakeCursor:
                 for item in world.operations.values()
             )
             self._rows = [(1,)] if found else []
-        elif normalized.startswith("SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
+        elif normalized.startswith("SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
             record = world.stages.get((params[0], params[1]))
             self._rows = [(record[0],)] if record else []
         elif normalized.startswith(
-            "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
+            "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
         ):
             record = world.stages.get((params[0], params[1]))
-            self._rows = [record] if record else []
-        elif normalized.startswith("INSERT INTO platform.stage"):
+            self._rows = [
+                (record[0], record[1], record[2], record[3] if len(record) > 3 else None)
+            ] if record else []
+        elif normalized.startswith(
+            "SELECT original_executed_at FROM stage WHERE run_id = %s AND stage = %s"
+        ):
+            record = world.stages.get((params[0], params[1]))
+            self._rows = [(record[4] if len(record) > 4 else None,)] if record else []
+        elif normalized.startswith("INSERT INTO stage"):
             run_id, stage, state = params[0], params[1], params[2]
             receipt = json.loads(params[3]) if params[3] is not None else None
             checkpoint = params[4]
             existing = world.stages.get((run_id, stage))
             if "= 'unresolved'" in normalized:  # the reconciliation statement
                 if existing is not None and existing[0] == "unresolved":
-                    world.stages[(run_id, stage)] = (state, receipt, checkpoint)
+                    world.stages[(run_id, stage)] = (
+                        state,
+                        receipt,
+                        checkpoint,
+                        params[5] if len(params) > 5 else None,
+                        params[6] if len(params) > 6 else None,
+                    )
                     self._rows = [(run_id, stage, state)]
                 else:
                     self._rows = []
             elif existing is not None and existing[0] in {"completed", "failed", "cancelled", "blocked", "unresolved"}:
                 self._rows = []
             else:
-                world.stages[(run_id, stage)] = (state, receipt, checkpoint)
+                world.stages[(run_id, stage)] = (
+                    state,
+                    receipt,
+                    checkpoint,
+                    params[5] if len(params) > 5 else None,
+                    params[6] if len(params) > 6 else None,
+                )
                 self._rows = [(run_id, stage, state)]
-        elif normalized.startswith("SELECT COALESCE(MAX(seq), 0) + 1 FROM platform.run_event"):
+        elif normalized.startswith("SELECT COALESCE(MAX(seq), 0) + 1 FROM run_event"):
             highest = max((item[1] for item in world.events if item[0] == params[0]), default=0)
             self._rows = [(highest + 1,)]
-        elif normalized.startswith("INSERT INTO platform.run_event"):
+        elif normalized.startswith("INSERT INTO run_event"):
             world.events.append(tuple(params))
             self._rows = []
-        elif "FROM platform.lifecycle_projection" in normalized:
+        elif normalized.startswith("UPDATE operation SET state = 'running'"):
+            key = params[0]
+            record = world.operations.get(key)
+            if record is not None and record[1] == "queued" and record[4] == params[1] and record[5] == params[2]:
+                updated = (record[0], "running", record[2], record[3], record[4], record[5], record[6])
+                world.operations[key] = updated
+                self._rows = [updated]
+            else:
+                self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = CASE WHEN kind = 'cancel'"):
+            outcome, run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[4] == run_id
+                    and record[5] == stage
+                    and record[6] not in {"reconcile", "cache_release"}
+                    and record[1] in {"queued", "running", "unresolved"}
+                ):
+                    settled = "succeeded" if record[6] == "cancel" else outcome
+                    world.operations[key] = (record[0], settled, *record[2:])
+            self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = 'unresolved'"):
+            run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[4] == run_id
+                    and record[5] == stage
+                    and record[6] not in {"reconcile", "cache_release"}
+                    and record[1] == "running"
+                ):
+                    world.operations[key] = (record[0], "unresolved", *record[2:])
+            self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = 'succeeded'"):
+            operation_id, run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[0] == operation_id
+                    and record[4] == run_id
+                    and record[5] == stage
+                    and record[6] == "reconcile"
+                    and record[1] != "succeeded"
+                ):
+                    world.operations[key] = (record[0], "succeeded", *record[2:])
+            self._rows = []
+        elif normalized.startswith(
+            "UPDATE operation SET state = %s, updated_at = now() WHERE operation_id = %s AND run_id = %s"
+        ):
+            settled, operation_id, run_id = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[0] == operation_id
+                    and record[4] == run_id
+                    and record[1] == "queued"
+                    and record[6] not in {"reconcile", "cache_release"}
+                ):
+                    world.operations[key] = (record[0], settled, *record[2:])
+                    break
+            self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = %s, updated_at = now() WHERE operation_key"):
+            state, key, run_id, stage = params
+            record = world.operations.get(key)
+            if (
+                record is not None
+                and record[6] == "cache_release"
+                and record[4] == run_id
+                and record[5] == stage
+                and record[1] == "running"
+            ):
+                updated = (record[0], state, *record[2:])
+                world.operations[key] = updated
+                self._rows = [updated]
+            else:
+                self._rows = []
+        elif normalized.startswith("SELECT seq, at, kind, stage, operation_id, payload FROM run_event"):
+            run_id, after_seq, limit = params
+            self._rows = [
+                (
+                    item[1],
+                    NOW,
+                    item[2],
+                    item[3],
+                    item[4],
+                    json.loads(item[5]) if isinstance(item[5], str) else item[5],
+                )
+                for item in world.events
+                if item[0] == run_id and item[1] > after_seq
+            ][:limit]
+        elif normalized.startswith("SELECT parent_run_id FROM run WHERE run_id = %s"):
+            entry = next((row for row in world.runs if row[0] == params[0]), None)
+            self._rows = [(entry[2],)] if entry is not None else []
+        elif "FROM lifecycle_projection" in normalized:
             self.description = tuple(
                 (name,) for name in ("object_kind", "object_id", "run_id", "state", "bucket", "updated_at")
             )
@@ -333,8 +685,12 @@ class PlatformStoreTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.delivery = Path(self.directory.name) / "sealed"
         self.delivery.mkdir()
-        self.subject, self.artifacts, self.handoff = build_sealed_delivery(self.delivery)
+        self.subject, self.artifacts, self.handoff_full, self.handoff_native = build_sealed_delivery(self.delivery)
         self.definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+        # The sealed delivery's own report is the qualified payload the receipts
+        # carry inline: the completed agreement gate compares the two, so the
+        # fixture must pair them (reports/ stays outside the manifest subject).
+        write_json(self.delivery / "reports" / "quality.json", self.qualified_quality())
         self.rebuilt = mock.Mock(return_value=self.definition)
         definition_patch = mock.patch.object(solidworks_urdf, "rebuilt_definition", new=self.rebuilt)
         definition_patch.start()
@@ -377,7 +733,7 @@ class PlatformStoreTests(unittest.TestCase):
             "state": "generated",
             "passed": False,
             "subject_sha256": self.subject,
-            "handoff_sha256": self.handoff,
+            "handoff_sha256": self.handoff_native,
             "artifacts": [dict(record) for record in self.artifacts],
         }
         payload.update(overrides)
@@ -392,12 +748,23 @@ class PlatformStoreTests(unittest.TestCase):
             "state": "verified",
             "passed": True,
             "subject_sha256": self.subject,
-            "handoff_sha256": self.handoff,
+            "handoff_sha256": self.handoff_native,
             "artifacts": [dict(record) for record in self.artifacts],
             "quality": self.qualified_quality(),
         }
         payload.update(overrides)
         return payload
+
+    def sealed_report_member(self) -> dict:
+        """The registered byte-bound report member of this fixture's sealed tree."""
+
+        path = self.delivery / "reports" / "quality.json"
+        return {"path": "reports/quality.json", "bytes": path.stat().st_size, "sha256": file_digest(path)}
+
+    def registered_verify_receipt(self, **overrides) -> dict:
+        payload = {"artifacts": [*self.artifacts, self.sealed_report_member()]}
+        payload.update(overrides)
+        return self.verify_receipt(**payload)
 
     def admit(self, **overrides):
         payload = {
@@ -411,7 +778,11 @@ class PlatformStoreTests(unittest.TestCase):
         self.admit(from_stage=from_stage)
         self.world.run_states["r-1"] = "running"
         if verify_done:
-            self.world.stages[("r-1", "verify")] = ("completed", self.verify_receipt(), CHECKPOINT)
+            self.world.stages[("r-1", "verify")] = (
+                "completed",
+                self.registered_verify_receipt(),
+                CHECKPOINT,
+            )
 
     def _publish_registration(self, **overrides):
         payload = {
@@ -436,12 +807,49 @@ class PlatformStoreTests(unittest.TestCase):
         return self.store.confirm_stage(**payload)
 
     def _unresolved_original(self):
-        record = self.store.register_operation(
-            run_id="r-1", stage="generate", kind="native", operation_key="r-1/native:0", params_digest="e" * 64
-        )
-        stored = self.world.operations["r-1/native:0"]
-        self.world.operations["r-1/native:0"] = (stored[0], "unresolved", *stored[2:])
-        return record
+        """One pre-existing original operation that already went unknown.
+
+        The row is seeded directly: a production run registers its intent
+        before the side effect, so a fresh registration after the stage is
+        already unresolved is refused by the store guard - exactly what the
+        real write path enforces.
+        """
+
+        key = "r-1/native:0"
+        self.world.operations[key] = ("op-native-0", "unresolved", key, "e" * 64, "r-1", "generate", "native")
+
+    @staticmethod
+    def _release_import_block(name: str) -> dict:
+        production = {"run_id": "native-" + name, "operation_id": "production-" + name}
+        confirmation = {
+            "schema_version": CACHE_IMPORT_CONFIRMATION_SCHEMA,
+            "imported": [{"path": "cad/synthetic.SLDASM", "bytes": 1, "sha256": "e" * 64}],
+            "production": production,
+            "sealed": {"confirmed_at": "2026-10-15T17:00:00Z", "receipt_sha256": "f" * 64},
+        }
+        confirmation["digest"] = cache_import_confirmation_digest(confirmation)
+        return {"linux_run_id": name, "production": production, "confirmation": confirmation}
+
+    @staticmethod
+    def _release_receipt(operation_id: str, imported: dict) -> dict:
+        value = {
+            "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
+            "status": "released",
+            "operation_id": operation_id,
+            "params_sha256": cache_release_params_digest(imported),
+            "import": imported,
+            "released": {"files": 1, "bytes": 1},
+            "retained": ["terminal_state", "import_confirmation"],
+            "released_at": "2026-10-15T17:00:01Z",
+            "identity": {
+                "version": "1.4.0",
+                "source_commit": "a" * 40,
+                "source_sha256": "b" * 64,
+                "role": "native",
+            },
+        }
+        value["receipt_sha256"] = cache_release_receipt_digest(value)
+        return value
 
     # ------------------------------------------------------------- admission
 
@@ -466,6 +874,61 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(
             self.world.transactions - transactions, 1, "request+run+intent share one admission transaction"
         )
+
+    def test_request_record_reads_the_sealed_admission_identity(self) -> None:
+        self.admit(configuration={"purpose": "engineering"})
+        self.assertEqual(
+            self.store.request_record("q-1"),
+            {
+                "request_id": "q-1",
+                "principal": "portal",
+                "target_hardware": "nd",
+                "main_assembly": "cad/robot.SLDASM",
+                "sealed_at": NOW,
+                "dispatch_digest": "a" * 64,
+                "purpose": "engineering",
+            },
+        )
+        self.assertIsNone(self.store.request_record("q-missing"))
+
+    def test_a_parent_holds_at_most_one_open_linked_attempt(self) -> None:
+        self.admit()  # the parent r-1
+
+        def child(run_id: str, request_id: str, digest: str) -> None:
+            self.admit(
+                run_id=run_id,
+                request_id=request_id,
+                parent_run_id="r-1",
+                from_stage="capture",
+                dispatch={"stage": "capture", "operation_key": f"{run_id}/capture:0", "params_digest": digest},
+            )
+
+        child("r-child-1", "q-child-1", "c" * 64)
+        with self.assertRaises(OpenAttemptConflictError) as raised:
+            child("r-child-2", "q-child-2", "d" * 64)
+        self.assertEqual(raised.exception.parent_run_id, "r-1")
+        self.assertEqual(raised.exception.run_id, "r-child-1")
+        self.assertEqual(raised.exception.request_id, "q-child-1")
+        # The refused admission left nothing behind.
+        self.assertIsNone(self.store.run_record("r-child-2"))
+        self.assertIsNone(self.store.request_record("q-child-2"))
+        # A different parent stays free.
+        self.admit(
+            run_id="r-other",
+            request_id="q-other",
+            dispatch={"stage": "capture", "operation_key": "r-other/capture:0", "params_digest": "e" * 64},
+        )
+        # Only a non-terminal child reserves the parent: once it is terminal, a new
+        # linked attempt is admitted.
+        self.store.confirm_stage(
+            run_id="r-child-1",
+            stage="generate",
+            state="failed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self.generate_receipt(run_id="r-child-1", state="failed", passed=False),
+        )
+        child("r-child-3", "q-child-3", "f" * 64)
+        self.assertIsNotNone(self.store.run_record("r-child-3"))
 
     def test_a_missing_dispatch_intent_is_refused_and_writes_nothing(self) -> None:
         with self.assertRaises(PlatformStoreError):
@@ -538,7 +1001,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.world.stages[("r-1", "verify")] = ("completed", {"run_id": "r-1", "stage": "verify"}, CHECKPOINT)
         with self.assertRaisesRegex(PlatformStoreError, "sealed"):
             self._publish_registration()
-        self.world.stages[("r-1", "verify")] = ("completed", self.verify_receipt(), CHECKPOINT)
+        self.world.stages[("r-1", "verify")] = ("completed", self.registered_verify_receipt(), CHECKPOINT)
         self.assertEqual(self._publish_registration().stage, "publish")
 
     def test_terminal_runs_only_continue_via_cancel_or_reconcile(self) -> None:
@@ -663,7 +1126,7 @@ class PlatformStoreTests(unittest.TestCase):
             "stage": stage,
             "state": NATIVE_STAGE_STATES[stage],
             "passed": False,
-            "handoff_sha256": self.handoff,
+            "handoff_sha256": self.handoff_full if stage == "freeze" else self.handoff_native,
             "artifacts": [dict(record) for record in self.artifacts],
         }
         if stage == "freeze":
@@ -688,6 +1151,437 @@ class PlatformStoreTests(unittest.TestCase):
                 self.assertEqual(self.world.stages[("r-1", stage)][0], "completed")
                 self.assertIsNotNone(self.store.confirmed_stage("r-1", stage))
         self.rebuilt.assert_not_called()
+
+    def test_claim_settles_with_the_stage_confirmation_in_one_transaction(self) -> None:
+        self._running_run()
+        record = self.store.register_operation(
+            run_id="r-1",
+            stage="freeze",
+            kind="dispatch",
+            operation_key="r-1/freeze:0",
+            params_digest="a" * 64,
+        )
+        self.assertEqual(record.state, "queued")
+        claimed = self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        self.assertTrue(claimed.granted)
+        self.assertEqual(claimed.record.state, "running")
+        replay = self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        self.assertFalse(replay.granted)
+        self.assertEqual(replay.record.state, "running")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("freeze"),
+        )
+        self.assertEqual(self.world.operations["r-1/freeze:0"][1], "succeeded")
+        self.assertEqual(self.world.open_transactions, 0)
+        with self.assertRaisesRegex(PlatformStoreError, "only reconcile/cancel"):
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        with self.assertRaisesRegex(PlatformStoreError, "not registered"):
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/missing:0")
+        with self.assertRaisesRegex(OperationConflictError, "different run or stage"):
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/freeze:0")
+
+    def test_unknown_outcome_cannot_be_bypassed_with_a_new_key(self) -> None:
+        self._running_run()
+        self.store.register_operation(
+            run_id="r-1", stage="freeze", kind="dispatch", operation_key="r-1/freeze:0", params_digest="a" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0").granted
+        )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="unresolved",
+            receipt={
+                "schema_version": store_module.BUNDLE_SCHEMA,
+                "run_id": "r-1",
+                "stage": "freeze",
+                "state": "unresolved",
+            },
+        )
+        self.assertEqual(self.world.operations["r-1/freeze:0"][1], "unresolved")
+        with self.assertRaisesRegex(PlatformStoreError, "unresolved"):
+            self.store.register_operation(
+                run_id="r-1", stage="freeze", kind="dispatch", operation_key="r-1/freeze:1", params_digest="a" * 64
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "unresolved"):
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/freeze:0")
+        # The evidenced reconciliation stays the one controlled continuation and
+        # settles both the original operation and its own reconcile operation.
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="freeze", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="freeze", operation_key="r-1/reconcile:0").granted
+        )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("freeze"),
+            reconcile={"operation_id": reconcile_op.operation_id},
+        )
+        self.assertEqual(self.world.operations["r-1/freeze:0"][1], "succeeded")
+        self.assertEqual(self.world.operations["r-1/reconcile:0"][1], "succeeded")
+
+    def test_terminal_run_refuses_claiming_a_queued_side_effect(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="failed",
+            receipt={
+                "schema_version": store_module.BUNDLE_SCHEMA,
+                "run_id": "r-1",
+                "stage": "capture",
+                "state": "failed",
+                "passed": False,
+            },
+        )
+        self.assertEqual(self.world.run_states["r-1"], "failed")
+        self.assertEqual(self.world.operations["r-1/capture:0"][1], "failed")
+        with self.assertRaisesRegex(PlatformStoreError, "failed"):
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/capture:0")
+        # Reconciliation stays the controlled continuation on a terminal run.
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="capture", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/reconcile:0").granted
+        )
+        self.assertEqual(self.world.operations[reconcile_op.operation_key][1], "running")
+
+    def test_completed_confirmation_refuses_a_foreign_sealed_scope(self) -> None:
+        self._running_run()
+        with self.assertRaisesRegex(PlatformStoreError, "another stage"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="completed",
+                checkpoint_uri="store://sealed/r-1/generate",
+                receipt=self._native_receipt("freeze"),
+            )
+        with self.assertRaisesRegex(PlatformStoreError, "neither the current run"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="completed",
+                checkpoint_uri="store://sealed/run-9/freeze",
+                receipt=self._native_receipt("freeze"),
+            )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri="store://sealed/r-1/freeze",
+            receipt=self._native_receipt("freeze"),
+        )
+        self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
+
+    def test_report_members_are_byte_verified_with_the_subject_untouched(self) -> None:
+        self._running_run()
+        report_file = self.delivery / "reports" / "quality.json"
+        record = {
+            "path": "reports/quality.json",
+            "bytes": report_file.stat().st_size,
+            "sha256": file_digest(report_file),
+        }
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("freeze", artifacts=[*self.artifacts, record]),
+        )
+        self.assertEqual(self.world.stages[("r-1", "freeze")][0], "completed")
+        report_file.write_text('{"tampered": true}\n', encoding="utf-8")
+        with self.assertRaisesRegex(PlatformStoreError, "report inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="capture",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self._native_receipt("capture", artifacts=[*self.artifacts, record]),
+            )
+
+    def test_failed_diagnostics_verify_report_bytes_too(self) -> None:
+        self._running_run()
+        report_file = self.delivery / "reports" / "quality.json"
+        record = {
+            "path": "reports/quality.json",
+            "bytes": report_file.stat().st_size,
+            "sha256": file_digest(report_file),
+        }
+        report_file.write_text('{"tampered": true}\n', encoding="utf-8")
+        failed_receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "run_id": "r-1",
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "artifacts": [*self.artifacts, record],
+        }
+        with self.assertRaisesRegex(PlatformStoreError, "report inventory"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="failed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=failed_receipt,
+            )
+        self.assertNotIn(("r-1", "freeze"), self.world.stages)
+
+    def test_failed_registration_verifies_declared_subject_bytes_without_reports(self) -> None:
+        self._running_run()
+        subject_artifacts = [dict(record) for record in self.artifacts]
+        evidence = self.delivery / "evidence" / "capture.json"
+        evidence.write_text('{"tampered": true}\n', encoding="utf-8")
+        failed_receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "run_id": "r-1",
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "artifacts": subject_artifacts,
+        }
+        with self.assertRaisesRegex(PipelineError, "differ from manifest|bind the sealed delivery"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="failed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=failed_receipt,
+            )
+        self.assertNotIn(("r-1", "freeze"), self.world.stages)
+
+    def test_a_failed_registration_lists_only_the_real_products(self) -> None:
+        self._running_run()
+        failed_receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "run_id": "r-1",
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "artifacts": [dict(record) for record in self.artifacts],
+        }
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="failed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=failed_receipt,
+        )
+        self.assertEqual(self.world.stages[("r-1", "freeze")][0], "failed")
+
+    def test_capture_completion_does_not_settle_an_unexecuted_cache_release(self) -> None:
+        self._running_run(from_stage="capture")
+        self.store.register_operation(
+            run_id="r-1", stage="capture", kind="cache_release", operation_key="r-1/release:0", params_digest="c" * 64
+        )
+        self.assertEqual(self.world.operations["r-1/release:0"][1], "queued")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("capture"),
+        )
+        self.assertEqual(self.world.operations["r-1/release:0"][1], "queued")
+
+    def test_confirmed_capture_allows_a_bound_cache_release(self) -> None:
+        self._running_run(from_stage="capture")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("capture"),
+        )
+        imported = self._release_import_block("r-1")
+        unclaimed = self.store.register_operation(
+            run_id="r-1",
+            stage="capture",
+            kind="cache_release",
+            operation_key="r-1/release:1",
+            params_digest=cache_release_params_digest(imported),
+        )
+        with self.assertRaisesRegex(PlatformStoreError, "claim it before it settles"):
+            self.store.settle_cache_release(
+                run_id="r-1",
+                stage="capture",
+                operation_key="r-1/release:1",
+                receipt=self._release_receipt(unclaimed.operation_id, imported),
+            )
+        operation = self.store.register_operation(
+            run_id="r-1",
+            stage="capture",
+            kind="cache_release",
+            operation_key="r-1/release:0",
+            params_digest=cache_release_params_digest(imported),
+        )
+        claim = self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/release:0")
+        self.assertTrue(claim.granted)
+        # A caller's dict is never a success report: malformed, foreign-operation
+        # and foreign-run receipts are refused and the operation stays running.
+        for label, receipt, expected in (
+            ("malformed", {"released": False}, "canonical IF-10 release receipt"),
+            (
+                "other-operation",
+                self._release_receipt("different-release-operation", imported),
+                "names another operation",
+            ),
+            (
+                "other-run",
+                self._release_receipt(operation.operation_id, self._release_import_block("different-linux-run")),
+                "does not bind this operation's parameters",
+            ),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(PlatformStoreError, expected):
+                    self.store.settle_cache_release(
+                        run_id="r-1", stage="capture", operation_key="r-1/release:0", receipt=receipt
+                    )
+                self.assertEqual(self.world.operations["r-1/release:0"][1], "running")
+        before = len(self.world.statements)
+        settled = self.store.settle_cache_release(
+            run_id="r-1",
+            stage="capture",
+            operation_key="r-1/release:0",
+            receipt=self._release_receipt(operation.operation_id, imported),
+        )
+        self.assertEqual(settled.state, "succeeded")
+        self.assertEqual(self.world.operations["r-1/release:0"][1], "succeeded")
+        # The same-run lock order: run row first, then the operation transition,
+        # then the event - the one short transaction every event writer shares.
+        tail = self.world.statements[before:]
+        lock_index = next(i for i, text in enumerate(tail) if "FROM run" in text and "FOR UPDATE" in text)
+        settle_index = next(i for i, text in enumerate(tail) if text.startswith("UPDATE operation SET state = %s"))
+        event_index = next(i for i, text in enumerate(tail) if text.startswith("INSERT INTO run_event"))
+        self.assertLess(lock_index, settle_index)
+        self.assertLess(settle_index, event_index)
+        recorded = [event for event in self.world.events if event[2] == "cache_release"]
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(json.loads(recorded[0][5])["receipt"]["operation_id"], operation.operation_id)
+
+    def test_declared_reuse_requires_the_registered_source_stage(self) -> None:
+        self._running_run()
+        with self.assertRaisesRegex(PlatformStoreError, "registered parent run"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="freeze",
+                state="completed",
+                checkpoint_uri="store://sealed/source-with-no-db-row/freeze",
+                receipt=self._native_receipt("freeze"),
+                reused_from_run="source-with-no-db-row",
+            )
+
+    def test_registered_reuse_source_stage_is_accepted(self) -> None:
+        from datetime import timedelta
+
+        self.admit(
+            run_id="r-0",
+            request_id="q-0",
+            dispatch={"stage": "capture", "operation_key": "r-0/capture:0", "params_digest": "a" * 64},
+        )
+        instant = datetime(2026, 10, 15, 9, 30, tzinfo=UTC)
+        source_receipt = self._native_receipt("capture", run_id="r-0")
+        self.world.stages[("r-0", "capture")] = (
+            "completed",
+            source_receipt,
+            "store://sealed/r-0/capture",
+            None,
+            instant,
+        )
+        self.admit(run_id="r-1", parent_run_id="r-0")
+        self.world.run_states["r-1"] = "running"
+        # The payload must BE the confirmed source: a rewritten producer, a
+        # shifted instant and a dropped instant all refuse before any write.
+        for label, receipt, when, expected in (
+            ("rewritten", {**source_receipt, "run_id": "r-1"}, instant, "not the confirmed source receipt"),
+            ("shifted", {**source_receipt}, instant + timedelta(seconds=1), "not the confirmed source instant"),
+            ("dropped", {**source_receipt}, None, "not the confirmed source instant"),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(PlatformStoreError, expected):
+                self.store.confirm_stage(
+                    run_id="r-1",
+                    stage="capture",
+                    state="completed",
+                    checkpoint_uri="store://sealed/r-0/capture",
+                    receipt=receipt,
+                    reused_from_run="r-0",
+                    original_executed_at=when,
+                )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri="store://sealed/r-0/capture",
+            receipt={**source_receipt},
+            reused_from_run="r-0",
+            original_executed_at=instant,
+        )
+        row = self.world.stages[("r-1", "capture")]
+        self.assertEqual(row[0], "completed")
+        self.assertEqual(row[1]["run_id"], "r-0")
+        self.assertEqual(row[4], instant)
+
+    def test_unresolved_moves_the_run_and_reconciliation_restores_it(self) -> None:
+        self._running_run(from_stage="capture")
+        self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/capture:0")
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="unresolved",
+            receipt={
+                "schema_version": store_module.BUNDLE_SCHEMA,
+                "run_id": "r-1",
+                "stage": "capture",
+                "state": "unresolved",
+            },
+        )
+        self.assertEqual(self.world.run_states["r-1"], "unresolved")
+        reconcile_op = self.store.register_operation(
+            run_id="r-1", stage="capture", kind="reconcile", operation_key="r-1/reconcile:0", params_digest="c" * 64
+        )
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/reconcile:0").granted
+        )
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="capture",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self._native_receipt("capture"),
+            reconcile={"operation_id": reconcile_op.operation_id},
+        )
+        self.assertEqual(self.world.run_states["r-1"], "running")
+
+    def test_run_events_reads_a_bounded_ordered_window(self) -> None:
+        self._running_run()
+        before = len(self.world.statements)
+        self.store.append_event("r-1", stage="freeze", kind="observed", payload={"step": 1})
+        tail = self.world.statements[before:]
+        lock_index = next(i for i, text in enumerate(tail) if "FROM run" in text and "FOR UPDATE" in text)
+        event_index = next(i for i, text in enumerate(tail) if text.startswith("INSERT INTO run_event"))
+        self.assertLess(lock_index, event_index)
+        self.store.append_event("r-1", stage="freeze", kind="observed", payload={"step": 2})
+        events = self.store.run_events("r-1")
+        self.assertEqual(
+            [(event["seq"], event["kind"], event["payload"]) for event in events],
+            [(1, "observed", {"step": 1}), (2, "observed", {"step": 2})],
+        )
+        window = self.store.run_events("r-1", after_seq=1, limit=1)
+        self.assertEqual([event["seq"] for event in window], [2])
+        self.assertEqual(self.store.run_events("r-1", after_seq=9), [])
+        with self.assertRaisesRegex(PlatformStoreError, "limit must be a positive integer"):
+            self.store.run_events("r-1", limit=0)
+        with self.assertRaisesRegex(PlatformStoreError, "after_seq"):
+            self.store.run_events("r-1", after_seq=-1)
 
     def test_native_receipts_without_their_bindings_are_refused(self) -> None:
         self._running_run()
@@ -799,7 +1693,7 @@ class PlatformStoreTests(unittest.TestCase):
             stage="verify",
             state="completed",
             checkpoint_uri=CHECKPOINT,
-            receipt=self.verify_receipt(),
+            receipt=self.registered_verify_receipt(),
         )
         self.assertEqual(self.world.stages[("r-1", "verify")][0], "completed")
 
@@ -1007,7 +1901,7 @@ class PlatformStoreTests(unittest.TestCase):
 
     def test_a_confirmed_publication_ends_its_run_successfully(self) -> None:
         self._running_run()
-        receipt = self.verify_receipt(
+        receipt = self.registered_verify_receipt(
             stage="publish",
             state="published",
             passed=True,
@@ -1022,6 +1916,100 @@ class PlatformStoreTests(unittest.TestCase):
             run_id="r-1", stage="publish", state="completed", checkpoint_uri=CHECKPOINT, receipt=receipt
         )
         self.assertEqual(self.world.run_states["r-1"], "succeeded")
+
+    # -------------------------------------- completed report binding (owned)
+
+    def test_completed_verify_accepts_the_matching_registered_report(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="verify",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self.registered_verify_receipt(),
+        )
+        self.assertEqual(self.store.confirmed_stage("r-1", "verify")["quality"]["passed"], True)
+
+    def test_completed_publish_accepts_the_matching_registered_report(self) -> None:
+        self._running_run()
+        receipt = self.registered_verify_receipt(
+            stage="publish",
+            state="published",
+            passed=True,
+            submission={
+                "passed": True,
+                "state": "published",
+                "url": "https://example.test/repo/pull/1",
+                "subject_sha256": self.subject,
+            },
+        )
+        self.store.confirm_stage(
+            run_id="r-1", stage="publish", state="completed", checkpoint_uri=CHECKPOINT, receipt=receipt
+        )
+        self.assertEqual(self.world.run_states["r-1"], "succeeded")
+
+    def test_completed_verify_refuses_a_changed_check_detail(self) -> None:
+        import copy
+
+        self._running_run()
+        report = copy.deepcopy(self.qualified_quality())
+        report["checks"][0]["details"] = {"observation": "different report evidence statement"}
+        write_json(self.delivery / "reports" / "quality.json", report)
+        with self.assertRaisesRegex(PlatformStoreError, "contradicts the receipt"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self.registered_verify_receipt(),
+            )
+        self.assertNotIn(("r-1", "verify"), self.world.stages)
+
+    def test_completed_verify_refuses_an_unregistered_report_member(self) -> None:
+        self._running_run()
+        with self.assertRaisesRegex(PlatformStoreError, "lack the byte-bound"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self.verify_receipt(),
+            )
+        self.assertNotIn(("r-1", "verify"), self.world.stages)
+
+    def test_completed_verify_refuses_a_sealed_passed_flip(self) -> None:
+        import copy
+
+        self._running_run()
+        report = copy.deepcopy(self.qualified_quality())
+        report["passed"] = False
+        write_json(self.delivery / "reports" / "quality.json", report)
+        with self.assertRaisesRegex(PlatformStoreError, "no qualified reports/quality.json"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self.registered_verify_receipt(),
+            )
+        self.assertNotIn(("r-1", "verify"), self.world.stages)
+
+    def test_confirmed_stage_rechecks_the_report_after_registration(self) -> None:
+        import copy
+
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="verify",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self.registered_verify_receipt(),
+        )
+        report = copy.deepcopy(self.qualified_quality())
+        report["checks"][0]["details"] = {"observation": "tampered after registration"}
+        write_json(self.delivery / "reports" / "quality.json", report)
+        with self.assertRaisesRegex(PlatformStoreError, "does not bind|contradicts the receipt"):
+            self.store.confirmed_stage("r-1", "verify")
 
     def test_append_event_sequences_observed_events_and_refuses_unknown_runs(self) -> None:
         with self.assertRaisesRegex(PlatformStoreError, "not admitted"):
@@ -1091,6 +2079,20 @@ class PlatformStoreTests(unittest.TestCase):
         )
         self.assertIsInstance(store, PlatformStore)
 
+    def test_the_environment_factory_carries_the_deploy_sealed_resolver(self) -> None:
+        """The one official instance always has a real sealed resolver: no production
+        path reads registered rows and then cannot resolve their checkpoints."""
+
+        dsn = "postgresql://service@/platform?host=/sock"
+        with self.assertRaisesRegex(PlatformStoreError, "PIPELINE_STORE_ROOT"):
+            PlatformStore.from_environment({"PLATFORM_SERVICE_DSN": dsn})
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PlatformStore.from_environment({"PLATFORM_SERVICE_DSN": dsn, "PIPELINE_STORE_ROOT": tmp})
+            self.assertEqual(
+                store.sealed_path("store://sealed/run-1/verify"),
+                Path(tmp).resolve() / "sealed/run-1/verify",
+            )
+
     def test_missing_admission_row_is_refused_without_typing_it_closed(self) -> None:
         self.world.admission = None
         with self.assertRaises(PlatformStoreError) as caught:
@@ -1099,6 +2101,555 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, AdmissionClosedError)
         with self.assertRaises(PlatformStoreError):
             self.admit()
+
+
+RUN_A = "portal-20261015T144524-c89993da"
+RUN_B = "portal-20261015T145141-ff63fddc"
+#: The real 1.4.3 task_instance facts of both runs (4090 raw evidence, sha a7c7867a…).
+REAL_TIS = {
+    "resolve_handoff": "success",
+    "start_job": "failed",
+    "fetch_capture": "upstream_failed",
+    "run_generate": "upstream_failed",
+    "run_verify": "upstream_failed",
+    "run_publish": "upstream_failed",
+}
+NATIVE_RUNS = {
+    RUN_A: "1eae5a3b-01f8-5d57-8385-8877018105c9",
+    RUN_B: "f9f328cd-ab28-5a33-9f4d-518a2b64f6f1",
+}
+
+
+class OrphanReconcileTests(unittest.TestCase):
+    """G-1 controlled orphan recovery through the one canonical reconcile entry."""
+
+    def setUp(self) -> None:
+        self.world = FakeWorld()
+        self.store = PlatformStore(self.world.connect)
+
+    # ------------------------------------------------------------------ fixtures
+    def _legacy_orphan(self, run_id: str, *, dag_run_id: str | None = None) -> str:
+        """One never-started 1.4.3-shaped attempt; returns its dispatch operation id."""
+        dispatch = {
+            "stage": "capture",
+            "operation_key": f"portal-{run_id}/capture:0",
+            "params_digest": "a" * 64,
+            "dag_id": "solidworks_to_urdf",
+            "dag_run_id": dag_run_id if dag_run_id is not None else run_id,
+        }
+        self.store.admit_run(
+            request_id=f"portal-{run_id}",
+            run_id=run_id,
+            principal="portal",
+            target_hardware="m3.0",
+            main_assembly="3.0 总装.SLDASM",
+            dispatch=dispatch,
+        )
+        for task, state in REAL_TIS.items():
+            self.world.task_instances[("solidworks_to_urdf", task, run_id, -1)] = state
+        self.world.dag_runs[("solidworks_to_urdf", run_id)] = "failed"
+        return self.world.operations[f"portal-{run_id}/capture:0"][0]
+
+    def _registered_reconcile(self, run_id: str, state: str = "failed") -> str:
+        """A pre-registered maintenance intent, as the schema shows it before the action."""
+
+        operation = self.store.register_operation(
+            run_id=run_id,
+            stage="freeze",
+            kind="reconcile",
+            operation_key=f"operatorctl-reconcile:{run_id}:freeze:{state}",
+            params_digest=digest({"outcome": state}),
+        )
+        return operation.operation_id
+
+    def _call(
+        self,
+        run_id: str,
+        dispatch_id: str,
+        *,
+        reconcile_operation_id: str | None = None,
+        task: str = "start_job",
+        map_index: int = -1,
+        state: str = "failed",
+        evidence: str | None = None,
+        extra_evidence: str | None = None,
+        claimed_sha: str | None = None,
+        native_run: str | None = None,
+        native_document: dict | None = None,
+        native_path: str | None = None,
+        with_binding: bool = True,
+        with_receipt_inputs: bool = True,
+        formed_receipt: dict | None = None,
+    ) -> str:
+        """One whole reconcile action through the one canonical entry.
+
+        The action carries only the raw inputs (the original file and the bound
+        endpoint job UUID); the Store action itself loads and validates the
+        bytes - this helper holds no acceptance rules of its own.  It returns
+        the receipt path so callers can compute the expected byte digest.
+        Without ``reconcile_operation_id`` the action carries its own
+        registration (key plus parameter digest): the maintenance registration,
+        the binding and the settlement commit or roll back as one short unit.
+        With it, the schema-visible pre-registered intent is named by id.
+        """
+
+        binding_native = native_run if native_run is not None else NATIVE_RUNS[run_id]
+        if not hasattr(self, "_receipt_dir_path"):
+            self._receipt_dir_path = Path(tempfile.mkdtemp(prefix="orphan-native-"))
+            self.addCleanup(shutil.rmtree, self._receipt_dir_path, ignore_errors=True)
+        receipt_path = self._receipt_dir_path / "native-failed-receipt.json"
+        document = native_document if native_document is not None else {
+            "schema_version": "solidworks-to-urdf.job/v1",
+            "pipeline_id": PIPELINE_ID,
+            "run_id": binding_native,
+            "request": {"run_id": binding_native, "main_assembly": "3.0 总装.SLDASM"},
+            "status": "failed",
+            "events": [{"stage": "freeze", "state": "failed", "error": "SelectionError: two open errors"}],
+            "error": "SelectionError: two open errors",
+            "error_code": "selection_open_errors",
+        }
+        receipt_path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+        named_path = Path(native_path) if native_path is not None else receipt_path
+        if evidence is not None:
+            # A raw evidence entry names the original it binds: its path is the raw input.
+            named_path = Path(evidence.split("#", 1)[0])
+        action_evidence = [extra_evidence] if extra_evidence is not None else []
+        if evidence is not None:
+            action_evidence.append(evidence)
+        if claimed_sha is not None:
+            action_evidence.append(f"{named_path}#sha256={claimed_sha}")
+        reconcile: dict = {"evidence": action_evidence}
+        if reconcile_operation_id is None:
+            reconcile["operation_key"] = f"operatorctl-reconcile:{run_id}:freeze:{state}"
+            reconcile["params_digest"] = digest(
+                {
+                    "outcome": state,
+                    "evidence": action_evidence,
+                    "operation": dispatch_id,
+                    "task": task,
+                    "map_index": map_index,
+                }
+            )
+        else:
+            reconcile["operation_id"] = reconcile_operation_id
+        if with_binding:
+            reconcile["binding"] = {"operation_id": dispatch_id, "task_id": task, "map_index": map_index}
+        if with_receipt_inputs:
+            reconcile["native_receipt"] = {"path": str(named_path), "native_run_id": binding_native}
+        self.store.confirm_stage(
+            run_id=run_id, stage="freeze", state=state, receipt=formed_receipt, reconcile=reconcile
+        )
+        return str(named_path)
+
+    def _snapshot(self):
+        """The complete world state (rows, bindings, events) for zero-change proofs."""
+
+        return self.world.snapshot_state()
+
+    # ------------------------------------------------------------------ positive
+    def test_an_orphan_reconciliation_binds_the_real_key_and_records_the_failure(self) -> None:
+        for run_id in (RUN_A, RUN_B):
+            with self.subTest(run_id=run_id):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(run_id)
+                receipt_path = self._call(run_id, dispatch_id)
+                loaded_sha = file_digest(Path(receipt_path))
+                self.assertEqual(
+                    self.world.operation_bindings[dispatch_id],
+                    ("solidworks_to_urdf", run_id, "start_job", -1),
+                )
+                self.assertEqual(self.world.run_states[run_id], "failed")
+                stage = self.world.stages[(run_id, "freeze")]
+                self.assertEqual(stage[0], "failed")
+                self.assertEqual(stage[1]["error"], "SelectionError: two open errors")
+                self.assertEqual(stage[1]["reconciliation"]["binding"]["task_id"], "start_job")
+                self.assertEqual(stage[1]["native_run_id"], NATIVE_RUNS[run_id])
+                self.assertEqual(stage[1]["native_receipt_sha256"], loaded_sha)
+                self.assertEqual(
+                    stage[1]["reconciliation"]["evidence"],
+                    [f"{receipt_path}#sha256={loaded_sha}"],
+                )
+                self.assertEqual(
+                    stage[1]["reconciliation"]["native_receipt"],
+                    {"path": receipt_path, "native_run_id": NATIVE_RUNS[run_id]},
+                )
+                self.assertEqual(
+                    self.world.operations[f"portal-{run_id}/capture:0"][1], "failed", "the intent settles"
+                )
+                reconcile_key = f"operatorctl-reconcile:{run_id}:freeze:failed"
+                self.assertEqual(self.world.operations[reconcile_key][1], "succeeded")
+                kinds = [row[2] for row in self.world.events if row[0] == run_id]
+                self.assertEqual(kinds, ["binding", "stage"])
+                binding_payload = json.loads(self.world.events[0][5])
+                self.assertEqual(binding_payload["task_id"], "start_job")
+                self.assertEqual(binding_payload["map_index"], -1)
+                self.assertEqual(binding_payload["operation_key"], f"portal-{run_id}/capture:0")
+                self.assertEqual(binding_payload["intent_stage"], "capture")
+                self.assertEqual(binding_payload["reconciled_stage"], "freeze")
+                self.assertEqual(binding_payload["reconciled_state"], "failed")
+                self.assertEqual(binding_payload["dag_id"], "solidworks_to_urdf")
+                self.assertEqual(binding_payload["dag_run_id"], run_id)
+                self.assertEqual(binding_payload["native_run_id"], NATIVE_RUNS[run_id])
+                self.assertEqual(binding_payload["native_receipt_sha256"], loaded_sha)
+
+    def test_a_repeat_of_the_same_whole_action_changes_nothing(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
+        self._call(RUN_A, dispatch_id)
+        self.assertEqual(self._snapshot(), before, "the identical whole action repeats as a no-op")
+
+    # ------------------------------------------------------------------ refusals
+    def test_unprovable_or_conflicting_bindings_change_nothing(self) -> None:
+        cases = {
+            "ghost_task": {"task": "ghost_task"},
+            # upstream_failed never executed: the sibling's existence is not intent binding.
+            "unexecuted_sibling": {"task": "run_publish"},
+            "live_task": {"task": "fetch_capture"},
+            "green_task": {"task": "resolve_handoff"},
+            "wrong_map_index": {"map_index": 0},
+            "foreign_native_uuid": {"native_run": "deadbeef-0000-4000-8000-000000000000"},
+            "foreign_receipt_digest": {"claimed_sha": "0" * 64},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                if name == "live_task":
+                    self.world.task_instances[("solidworks_to_urdf", "fetch_capture", RUN_A, -1)] = "running"
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, dispatch_id, **overrides)
+                self.assertEqual(self._snapshot(), before, "a refused whole action leaves zero change")
+                self.assertNotIn(
+                    f"operatorctl-reconcile:{RUN_A}:freeze:failed",
+                    self.world.operations,
+                    "the maintenance registration rolls back with the refused action",
+                )
+
+    def test_a_foreign_native_uuid_never_settles_the_run(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(
+                RUN_A,
+                dispatch_id,
+                native_run="deadbeef-0000-4000-8000-000000000000",
+            )
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self.world.run_states.get(RUN_A), "queued")
+        self.assertEqual(self.world.events, [])
+        self.assertEqual(
+            self.world.operation_bindings[dispatch_id],
+            ("solidworks_to_urdf", RUN_A, None, None),
+            "the intent stays unbound and queued",
+        )
+
+    def test_the_original_receipt_bytes_are_the_only_evidence_source(self) -> None:
+        def job_document(**overrides) -> dict:
+            document = {
+                "schema_version": "solidworks-to-urdf.job/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": NATIVE_RUNS[RUN_A],
+                "request": {"run_id": NATIVE_RUNS[RUN_A]},
+                "status": "failed",
+                "events": [
+                    {"stage": "freeze", "state": "failed", "error": "SelectionError: two open errors"}
+                ],
+                "error": "SelectionError: two open errors",
+                "error_code": "selection_open_errors",
+            }
+            document.update(overrides)
+            return document
+
+        cases = {
+            # A shaped digest string over a file that does not exist proves nothing.
+            "missing_file": {"native_path": "/nonexistent/review/native.json"},
+            "empty_document": {"native_document": {}},
+            "report_shaped_document": {
+                "native_document": {"schema_version": "solidworks-to-urdf.structural-report/v1", "passed": True}
+            },
+            "completed_receipt": {
+                "native_document": job_document(status="passed", events=[{"stage": "freeze", "state": "passed"}])
+            },
+            "passed_terminal_event": {
+                "native_document": job_document(
+                    events=[
+                        {"stage": "freeze", "state": "passed", "error": None},
+                        {"stage": "capture", "state": "failed"},
+                    ]
+                )
+            },
+            "no_terminal_event": {"native_document": job_document(events=[])},
+            "ambiguous_terminal_events": {
+                "native_document": job_document(
+                    events=[
+                        {"stage": "freeze", "state": "failed"},
+                        {"stage": "capture", "state": "failed"},
+                    ]
+                )
+            },
+            "foreign_receipt_run": {
+                "native_document": job_document(
+                    run_id="deadbeef-0000-4000-8000-000000000000",
+                    request={"run_id": "deadbeef-0000-4000-8000-000000000000"},
+                )
+            },
+            "foreign_receipt_stage": {
+                "native_document": job_document(events=[{"stage": "capture", "state": "failed"}])
+            },
+            "foreign_receipt_job": {
+                "native_document": job_document(
+                    run_id=NATIVE_RUNS[RUN_B], request={"run_id": NATIVE_RUNS[RUN_B]}
+                )
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, dispatch_id, **overrides)
+                self.assertEqual(self._snapshot(), before, "the refused bytes changed nothing")
+                self.assertEqual(self.world.run_states.get(RUN_A), "queued")
+
+    def test_the_native_identity_must_derive_from_the_runs_own_dag_run(self) -> None:
+        for name, overrides in {
+            "empty": {"native_run": ""},
+            "not_a_uuid": {"native_run": "not-a-uuid"},
+            "another_runs_job": {"native_run": NATIVE_RUNS[RUN_B]},
+        }.items():
+            with self.subTest(name=name):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, dispatch_id, **overrides)
+                self.assertEqual(self._snapshot(), before)
+        with self.subTest(name="dag_run_id_belongs_to_another_attempt"):
+            self.setUp()
+            dispatch_id = self._legacy_orphan(RUN_A, dag_run_id=RUN_B)
+            before = self._snapshot()
+            with self.assertRaises(PlatformStoreError):
+                self._call(RUN_A, dispatch_id)
+            self.assertEqual(self._snapshot(), before)
+
+    def test_the_failed_receipt_digest_must_be_the_evidence_bound_one(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        before = self._snapshot()
+        # A caller-supplied digest that contradicts the original bytes is never normalized away.
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, claimed_sha="0" * 64)
+        # A formed receipt with matching digest strings never substitutes for the raw inputs.
+        with self.assertRaises(PlatformStoreError):
+            self._call(
+                RUN_A,
+                dispatch_id,
+                with_receipt_inputs=False,
+                formed_receipt={
+                    "schema_version": store_module.BUNDLE_SCHEMA,
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": RUN_A,
+                    "stage": "freeze",
+                    "state": "failed",
+                    "passed": False,
+                    "native_run_id": NATIVE_RUNS[RUN_A],
+                    "native_receipt_sha256": "f" * 64,
+                },
+            )
+        self.assertEqual(self._snapshot(), before)
+
+    def test_a_formed_receipt_at_the_direct_store_boundary_proves_nothing(self) -> None:
+        """The direct Store boundary: a formed receipt plus matching digest strings refuses.
+
+        These four predicates mirror the design side's independent direct-store probe:
+        a missing original, an empty document, a successful ("passed") document and a
+        foreign-run document, each presented as a ready-made platform receipt with a
+        matching ``#sha256=`` evidence entry and no raw inputs.
+        """
+
+        variants = {
+            "missing_original": ("/nonexistent/review/native.json", "f" * 64, None),
+            "empty_original": (None, None, {}),
+            "successful_original": (
+                None,
+                None,
+                {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": NATIVE_RUNS[RUN_A],
+                    "request": {"run_id": NATIVE_RUNS[RUN_A]},
+                    "status": "passed",
+                    "events": [{"stage": "freeze", "state": "passed"}],
+                },
+            ),
+            "foreign_original": (
+                None,
+                None,
+                {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": "deadbeef-0000-4000-8000-000000000000",
+                    "request": {"run_id": "deadbeef-0000-4000-8000-000000000000"},
+                    "status": "failed",
+                    "events": [{"stage": "freeze", "state": "failed"}],
+                },
+            ),
+        }
+        for name, (path_override, sha_override, document) in variants.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="native-bytes-direct-") as directory:
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                if path_override is not None:
+                    path = Path(path_override)
+                    sha = sha_override
+                else:
+                    path = Path(directory) / "original.json"
+                    path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+                    sha = file_digest(path)
+                receipt = {
+                    "schema_version": store_module.BUNDLE_SCHEMA,
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": RUN_A,
+                    "stage": "freeze",
+                    "state": "failed",
+                    "passed": False,
+                    "native_run_id": NATIVE_RUNS[RUN_A],
+                    "native_receipt_sha256": sha,
+                }
+                evidence = [f"{path}#sha256={sha}"]
+                binding = {"operation_id": dispatch_id, "task_id": "start_job", "map_index": -1}
+                reconcile = {
+                    "operation_key": f"operatorctl-reconcile:{RUN_A}:freeze:failed",
+                    "params_digest": digest({"outcome": "failed", "evidence": evidence, "binding": binding}),
+                    "evidence": evidence,
+                    "binding": binding,
+                }
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self.store.confirm_stage(
+                        run_id=RUN_A, stage="freeze", state="failed", receipt=receipt, reconcile=reconcile
+                    )
+                self.assertEqual(self._snapshot(), before, "the refused direct call changed nothing")
+                self.assertEqual(self.world.run_states.get(RUN_A), "queued")
+
+    def test_the_lifecycle_facts_travel_in_one_statement(self) -> None:
+        """One query carries the task and the DagRun: two separate reads are never a snapshot."""
+
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self.world.dag_runs[("solidworks_to_urdf", RUN_A)] = "running"
+        self.world.statements.clear()
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id)
+        self.assertEqual(self._snapshot(), before)
+        reads = [row for row in self.world.statements if "FROM lifecycle_projection" in row]
+        self.assertEqual(len(reads), 1, f"the acceptance read the lifecycle association {len(reads)} times")
+        self.assertIn("object_kind = 'scheduling'", reads[0])
+        self.assertIn("object_kind = 'dag_run'", reads[0])
+
+    def test_a_live_or_unknown_dag_run_never_authorizes_recovery(self) -> None:
+        for name, dag_state in (("live", "running"), ("green", "success")):
+            with self.subTest(name=name):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                self.world.dag_runs[("solidworks_to_urdf", RUN_A)] = dag_state
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, dispatch_id)
+                self.assertEqual(self._snapshot(), before)
+        with self.subTest(name="unreadable"):
+            self.setUp()
+            dispatch_id = self._legacy_orphan(RUN_A)
+            del self.world.dag_runs[("solidworks_to_urdf", RUN_A)]
+            before = self._snapshot()
+            with self.assertRaises(PlatformStoreError):
+                self._call(RUN_A, dispatch_id)
+            self.assertEqual(self._snapshot(), before)
+
+    def test_a_repeat_that_renames_the_native_identity_changes_nothing(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(
+                RUN_A,
+                dispatch_id,
+                native_run="deadbeef-0000-4000-8000-000000000000",
+            )
+        self.assertEqual(self._snapshot(), before, "a conflicting native identity is never an idempotent repeat")
+
+    def test_a_repeat_that_conflicts_with_the_recorded_outcome_changes_nothing(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
+        recorded = self.world.operations[f"operatorctl-reconcile:{RUN_A}:freeze:failed"][0]
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, reconcile_operation_id=recorded, state="cancelled")
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, state="cancelled")
+        with self.assertRaises(PlatformStoreError):
+            # The same native fact under a second, different evidence identity is a conflict.
+            self._call(RUN_A, dispatch_id, extra_evidence="reports/other.json#sha256=" + "0" * 64)
+        self.assertEqual(self._snapshot(), before, "a conflicting outcome or evidence is never a repeat")
+
+    def test_a_registered_intent_refuses_the_same_conflicts_with_zero_change(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        registered = self._registered_reconcile(RUN_A)
+        before = self._snapshot()
+        for overrides in (
+            {"native_run": "deadbeef-0000-4000-8000-000000000000"},
+            {"task": "run_publish"},
+        ):
+            with self.assertRaises(PlatformStoreError):
+                self._call(RUN_A, dispatch_id, reconcile_operation_id=registered, **overrides)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_structurally_invalid_intents_change_nothing(self) -> None:
+        for name, setup in (
+            ("foreign_operation", None),
+            ("missing_dag_run_evidence", "missing"),
+            ("already_bound_conflict", "conflict"),
+            ("started_intent", "started"),
+        ):
+            with self.subTest(name=name):
+                self.setUp()
+                if setup == "missing":
+                    dispatch_id = self._legacy_orphan(RUN_A, dag_run_id="")
+                else:
+                    dispatch_id = self._legacy_orphan(RUN_A)
+                if setup == "conflict":
+                    self.world.operation_bindings[dispatch_id] = (
+                        "solidworks_to_urdf",
+                        RUN_A,
+                        "start_job",
+                        -1,
+                    )
+                if setup == "started":
+                    key = f"portal-{RUN_A}/capture:0"
+                    record = self.world.operations[key]
+                    self.world.operations[key] = (*record[:1], "running", *record[2:])
+                before = self._snapshot()
+                target = "deadbeef-0000-0000-0000-000000000000" if name == "foreign_operation" else dispatch_id
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, target)
+                self.assertEqual(self._snapshot(), before, "refused binding leaves zero change")
+
+    def test_non_failed_or_unbound_reconciles_keep_the_classic_rules(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, state="completed")
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, with_binding=False)
+        self.assertEqual(self._snapshot(), before)
+        # A recorded orphan stage never takes a different binding later.
+        self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, task="ghost_task")
+        self.assertEqual(self._snapshot(), before)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import threading
 import time
 import unittest
@@ -108,6 +109,14 @@ class SelectionEndpointTests(unittest.TestCase):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        #: The deployment pins the one canonical CAD domain; this fixture's
+        #: state root is that pin, so endpoint suites never resolve an unbound
+        #: host (and never invent a domain of their own).
+        pin = patch.dict(
+            os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(self.root / "state" / "cad-ownership.json")}
+        )
+        pin.start()
+        self.addCleanup(pin.stop)
         self.packages = self.root / "packages"
         self.engineering = self.root / "engineering"
         for path in (self.packages, self.engineering, self.root / "outputs", self.root / "state"):
@@ -123,7 +132,6 @@ class SelectionEndpointTests(unittest.TestCase):
                 "output_root": str(self.root / "outputs"),
                 "state_root": str(self.root / "state"),
                 "token_file": str(token),
-                "targets": {"arm": {"repository_slug": "a/b", "base": "feature/arm"}},
             },
         )
         self.config_path = config_path
@@ -544,7 +552,7 @@ class SelectionEndpointTests(unittest.TestCase):
             },
         )
         config = read_config(minimal)
-        self.assertEqual(config["targets"], {})
+        self.assertNotIn("targets", config)
         self.assertEqual(config["config_digest"], digest(read_data(minimal)))
 
     def test_the_health_producer_satisfies_the_real_consumer(self) -> None:
@@ -639,12 +647,15 @@ class SelectionEndpointTests(unittest.TestCase):
         jobs = self.jobs
         probe = {"native_tool": {"source_sha256": "0" * 64}}
         jobs.jobs["ledger-probe"] = probe
+        pinned = self.root / "canonical-domain" / "cad-ownership.json"
         try:
-            reader = jobs._default_selection_reader("ledger-probe")
+            with patch.dict(os.environ, {"DESCRIPTION_CAD_OWNERSHIP_FILE": str(pinned)}):
+                reader = jobs._default_selection_reader("ledger-probe")
         finally:
             del jobs.jobs["ledger-probe"]
         backend = reader._walker.__self__
-        self.assertEqual(jobs.cad_ownership_file, jobs.config["state_root"] / "cad-ownership.json")
+        self.assertEqual(jobs.cad_ownership_file, pinned)
+        self.assertNotEqual(pinned, jobs.config["state_root"] / "cad-ownership.json")
         self.assertEqual(backend._cad_ownership_file, jobs.cad_ownership_file)
         self.assertEqual(reader._reader_sha256, "0" * 64)
 

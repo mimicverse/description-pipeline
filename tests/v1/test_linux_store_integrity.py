@@ -1,20 +1,23 @@
-"""Adversarial integrity tests for the Linux store and portable runner (independent).
+"""Adversarial integrity tests for the split-capture chain (independent).
 
-These tests pin the capture-transfer and portable-execution contracts:
+Wave-2 port of the legacy Linux-store integrity suite onto ``platform/flow`` +
+``platform/capture`` + ``PlatformStore``.  The store is the only authority this
+suite attacks: the registered frozen original anchors both mutable request
+copies, every portable stage rechecks the admitted capture and the portable
+runtime identity before consuming anything, a committed admission is never
+silently re-downloaded, and a tampered (even self-consistently resealed)
+in-flight tree is refused against the recorded admission.
 
-* the portable runtime identity is enforced for every stage (verify included);
-* generate re-validates the admitted capture before consuming it;
-* a raising portable run records a failed receipt and keeps it visible;
-* the downloaded capture archive must match the declared digest even if the client did not;
-* overlapping portable runs for one attempt are refused by the run lock;
-* malformed store state is refused, never silently emptied.
-
+The legacy file-state cases (crash windows between the install and the meta
+write, malformed meta/events JSON, rollback of an advanced meta state) have no
+file-state subject here - cross-restart durability is the deploy side's
+real-PostgreSQL battery and the store's own confirmation rules - and the
+preview/open_artifact streaming cases have no subject on the platform read
+face yet; both are mapped in the wave-2 deletion/gap report.
 """
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
 import json
 import shutil
 import tempfile
@@ -22,60 +25,37 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from packaging.utils import canonicalize_name
-
 from description_pipeline import solidworks
-from description_pipeline.io import PipelineError, canonical, file_digest, write_json
-from description_pipeline.orchestration import linux_runner
-from description_pipeline.orchestration.linux_store import STORE_SCHEMA, LinuxStore
+from description_pipeline.io import PipelineError, file_digest, read_data, write_json
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST, seal_capture
-from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
+from description_pipeline.platform import capture as platform_capture
+from description_pipeline.platform import flow
+from description_pipeline.platform import storage as platform_storage
+from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 
-from .test_linux_split import HANDOFF, SELECTED, UPLOAD, capture_job
+from .linux_split_support import HANDOFF, SplitAdmissionMixin, capture_job, portable_record
+from .test_platform_store import FakeWorld
 from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
 RUN = "0b1f2c33-1f1e-4b0e-9d6a-2f9a5c7e1d20"
 FRESH = "4c2d3e44-2a2f-4c1f-8e7b-3a0b6d8f2e31"
 
 
-def portable_twin(native: dict, *, source_sha256: str | None = None, mujoco: str | None = None) -> dict:
-    """A portable twin of a fixture native tool record, carrying the pinned closure."""
-
-    record = json.loads(json.dumps(native))
-    packages = {canonicalize_name(name): RUNTIME_VERSIONS[name] for name in required_packages("portable")}
-    if mujoco is not None:
-        packages[canonicalize_name("mujoco")] = mujoco
-    record["runtime"] = {
-        **record.get("runtime", {}),
-        "role": "portable",
-        "system": "Linux",
-        "packages": packages,
-    }
-    if source_sha256 is not None:
-        record["source_sha256"] = source_sha256
-    return record
-
-
-class FakeEndpoint:
-    """A deliberately unverifying artifact client; the runner must not trust it."""
-
-    def __init__(self, payload: bytes):
-        self.payload = payload
-        self.calls = 0
-
-    def stream_capture_archive(self, run_id, archive, destination, **kwargs):
-        self.calls += 1
-        destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(self.payload)
-        return destination
-
-
-class LinuxStoreIntegrityTests(unittest.TestCase):
+class LinuxStoreIntegrityTests(SplitAdmissionMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="linux-store-integrity-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.store = LinuxStore(self.tmp / "store")
+        self.store_root = self.tmp / "store"
+        self.world = FakeWorld()
+        self.store = PlatformStore(self.world.connect, sealed=platform_storage.sealed_resolver(self.store_root))
+        self.store.admit_run(
+            request_id="q-integrity",
+            run_id=RUN,
+            principal="portal",
+            target_hardware="nd",
+            main_assembly=MAIN_ASSEMBLY,
+            dispatch={"stage": "capture", "operation_key": f"{RUN}/capture:0", "params_digest": "a" * 64},
+        )
         self.tool = native_tool()
         source = capture_root(self.tmp, run_id=RUN, handoff=HANDOFF)
         self.archive = self.tmp / "native-evidence.zip"
@@ -87,69 +67,135 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             main_assembly=MAIN_ASSEMBLY,
             native_tool=self.tool,
         )
-        self.store.import_capture(
-            RUN,
-            self.archive,
-            expected_handoff_sha256=HANDOFF,
-            expected_main_assembly=MAIN_ASSEMBLY,
-            expected_native_tool=self.tool,
+
+    def _revalidate(self, run_id: str = RUN) -> None:
+        paths = self._paths(run_id)
+        flow.revalidate_capture(self.store, run_id, paths.capture_dir, paths.run_dir / "input" / "request.json")
+
+    # ---------------------------------------------------- frozen request anchoring
+
+    def test_a_carried_frozen_original_revalidates_without_touching_the_native_manifest(self) -> None:
+        self.admit(RUN)
+        paths = self._paths(RUN)
+        manifest = paths.capture_dir / "transfer-manifest.json"
+        original = manifest.read_bytes()
+        self._revalidate()
+        self.assertEqual(manifest.read_bytes(), original)
+        self.assertEqual(
+            (paths.run_dir / "input" / "request.json").read_bytes(),
+            (paths.capture_dir / "input" / "request.json").read_bytes(),
         )
+
+    def test_a_tampered_carried_original_is_refused(self) -> None:
+        self.admit(RUN)
+        carried = self._paths(RUN).capture_dir / "input" / "request.json"
+        carried.write_bytes(b'{"tampered": true}')
+        with self.assertRaisesRegex(PipelineError, "carried input/request.json differs from the registered original"):
+            self._revalidate()
+
+    def test_mutable_request_copies_are_anchored_to_the_registered_original(self) -> None:
+        self.admit(RUN)
+        paths = self._paths(RUN)
+        frozen = paths.run_dir / "input" / "request.json"
+        carried = paths.capture_dir / "input" / "request.json"
+        carried.write_bytes(b'{"tampered": true}')
+        with self.assertRaisesRegex(PipelineError, "carried input/request.json differs from the registered original"):
+            self._revalidate()
+        # Copies that drifted together but away from the registration refuse too.
+        carried.write_bytes(b'{"tampered": true}')
+        frozen.write_bytes(b'{"tampered": true}')
+        with self.assertRaisesRegex(PipelineError, "frozen input/request.json differs from the registered original"):
+            self._revalidate()
+        # Missing mutable copies refuse loudly; there is no file fallback.
+        frozen.unlink()
+        carried.unlink()
+        with self.assertRaisesRegex(PipelineError, "missing the registered frozen input/request.json"):
+            self._revalidate()
+        # A run whose freeze stage was never registered has no fallback original either.
+        self.store.admit_run(
+            request_id="q-fresh",
+            run_id=FRESH,
+            principal="portal",
+            target_hardware="nd",
+            main_assembly=MAIN_ASSEMBLY,
+            dispatch={"stage": "capture", "operation_key": f"{FRESH}/capture:0", "params_digest": "a" * 64},
+        )
+        with self.assertRaisesRegex(PipelineError, "no registered frozen original"):
+            self._revalidate(FRESH)
+        # An unconfigured sealed storage refuses instead of degrading to file reads.
+        unsealed = PlatformStore(self.world.connect)
+        with self.assertRaisesRegex(PlatformStoreError, "Sealed storage is not configured"):
+            flow.revalidate_capture(
+                unsealed, RUN, paths.capture_dir, paths.run_dir / "input" / "request.json"
+            )
+        # A damaged registration refuses through the store's own sealed re-verification.
+        freeze_uri = self.store.stage_records(RUN)["freeze"]["checkpoint_uri"]
+        (self.store.sealed_path(freeze_uri) / "input" / "handoff.json").unlink()
+        with self.assertRaisesRegex(PipelineError, "manifest"):
+            self._revalidate()
 
     # ------------------------------------------------------------ roles / drift
 
     def test_verify_refuses_a_runtime_that_drifted_from_the_native_capture(self) -> None:
         """A drifted host must not re-verify a retained checkpoint."""
 
-        drifted = portable_twin(self.tool, source_sha256="0" * 64)
+        self.admit(RUN)
+        drifted = portable_record(self.tool, source_sha256="0" * 64)
         with (
-            mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-            mock.patch.object(linux_runner.solidworks, "verify", side_effect=AssertionError("must not run")),
-            self.assertRaises(PipelineError),
+            mock.patch.object(flow, "tool_record", return_value=drifted),
+            mock.patch.object(flow.solidworks, "verify", side_effect=AssertionError("must not run")),
+            self.assertRaisesRegex(PipelineError, "differs from the native capture"),
         ):
-            linux_runner.run_portable_stage(self.store, RUN, "verify", expected_subject="a" * 64)
+            flow.run_stage(self.store, self.store_root, RUN, "verify", expected_subject="a" * 64)
 
     def test_generate_gate_control_refuses_the_same_drift(self) -> None:
-        drifted = portable_twin(self.tool, source_sha256="0" * 64)
+        self.admit(RUN)
+        drifted = portable_record(self.tool, source_sha256="0" * 64)
         with (
-            mock.patch.object(linux_runner, "tool_record", return_value=drifted),
-            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
-            self.assertRaises(PipelineError),
+            mock.patch.object(flow, "tool_record", return_value=drifted),
+            mock.patch.object(flow.solidworks, "generate", side_effect=AssertionError("must not run")),
+            self.assertRaisesRegex(PipelineError, "differs from the native capture"),
         ):
-            linux_runner.run_portable_stage(self.store, RUN, "generate")
+            flow.run_stage(self.store, self.store_root, RUN, "generate")
 
     # ------------------------------------------------------------ frozen source
 
     def test_generate_refuses_a_capture_tampered_after_admission(self) -> None:
         """Revalidate admitted capture before consuming it."""
 
-        (self.store.capture_dir(RUN) / "input/robot.yaml").write_text('{"hardware_id": "tampered"}\n', encoding="utf-8")
+        self.admit(RUN)
+        capture = self._paths(RUN).capture_dir
+        (capture / "input" / "robot.yaml").write_text('{"hardware_id": "tampered"}\n', encoding="utf-8")
         with (
-            mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
-            self.assertRaises(PipelineError),
+            mock.patch.object(flow, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(flow.solidworks, "generate", side_effect=AssertionError("must not run")),
+            self.assertRaisesRegex(PipelineError, "inventory differs from the transfer manifest"),
         ):
-            linux_runner.run_portable_stage(self.store, RUN, "generate")
+            flow.run_stage(self.store, self.store_root, RUN, "generate")
 
     # ------------------------------------------------------------ failed runs
 
     def test_raised_stage_is_recorded_as_a_visible_failure(self) -> None:
-        """A raising delegate must leave a failed receipt and metadata entry."""
+        """A raising delegate leaves failure products in the work tree and no completion."""
 
+        self.admit(RUN)
         with (
-            mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "generate", side_effect=PipelineError("boom")),
-            self.assertRaises(PipelineError),
+            mock.patch.object(flow, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(flow.solidworks, "generate", side_effect=PipelineError("boom")),
+            self.assertRaisesRegex(PipelineError, "boom"),
         ):
-            linux_runner.run_portable_stage(self.store, RUN, "generate")
-        receipt_path = self.store.receipt_path(RUN, "generate")
-        self.assertTrue(receipt_path.is_file(), "a failed portable stage left no receipt")
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        self.assertIn("boom", str(receipt.get("error")))
-        meta = self.store.meta(RUN) or {}
-        self.assertEqual(meta.get("state"), "failed")
-        self.assertIn("boom", str(meta.get("error")))
+            flow.run_stage(self.store, self.store_root, RUN, "generate")
+        self.assertNotIn((RUN, "generate"), self.world.stages)
+        products = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in self._paths(RUN).run_dir.rglob("*.json")
+        ]
+        self.assertTrue(any("boom" in json.dumps(payload) for payload in products), "the failure is not visible")
 
-    def test_failed_receipt_from_the_runner_is_persisted(self) -> None:
+    def test_failed_receipt_from_the_runner_is_surfaced_not_registered(self) -> None:
+        """A failed delegate receipt surfaces to the caller and never becomes a completion."""
+
+        self.admit(RUN)
         failed = {
             "state": "failed",
             "passed": False,
@@ -157,314 +203,86 @@ class LinuxStoreIntegrityTests(unittest.TestCase):
             "events": [{"stage": "generate", "state": "failed", "at": "2026-10-10T05:00:00+00:00"}],
         }
         with (
-            mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "generate", return_value=failed),
+            mock.patch.object(flow, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(flow.solidworks, "generate", return_value=failed),
         ):
-            linux_runner.run_portable_stage(self.store, RUN, "generate")
-        meta = self.store.meta(RUN) or {}
-        self.assertEqual(meta.get("state"), "failed")
-        self.assertIn("verification failed", str(meta.get("error")))
+            receipt = flow.run_stage(self.store, self.store_root, RUN, "generate")
+        self.assertEqual(receipt["state"], "failed")
+        self.assertNotIn((RUN, "generate"), self.world.stages)
 
     # ------------------------------------------------------------ transfer stream
 
-    def _job(self, run_id: str, archive: Path, *, declared_sha256: str) -> dict:
-        job = capture_job(run_id, archive, self.tool)
-        job["result"]["capture_archive"]["sha256"] = declared_sha256
-        return job
-
-    def test_fetch_capture_enforces_the_declared_archive_digest(self) -> None:
-        """The runner must enforce the declared digest independently of its client."""
-
-        source = capture_root(self.tmp / "fresh", run_id=FRESH, handoff=HANDOFF)
-        fresh_archive = self.tmp / "fresh.zip"
-        seal_capture(
-            source,
-            fresh_archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        endpoint = FakeEndpoint(fresh_archive.read_bytes())
-        job = self._job(FRESH, fresh_archive, declared_sha256="d" * 64)
-        with self.assertRaises(PipelineError):
-            linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
-
-    def test_fetch_capture_accepts_matching_bytes(self) -> None:
-        source = capture_root(self.tmp / "fresh-ok", run_id=FRESH, handoff=HANDOFF)
-        fresh_archive = self.tmp / "fresh-ok.zip"
-        seal_capture(
-            source,
-            fresh_archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        digest = hashlib.sha256(fresh_archive.read_bytes()).hexdigest()
-        endpoint = FakeEndpoint(fresh_archive.read_bytes())
-        job = self._job(FRESH, fresh_archive, declared_sha256=digest)
-        result = linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
-        self.assertEqual(result["state"], "capture_admitted")
-        self.assertEqual((self.store.meta(FRESH) or {}).get("handoff_sha256"), HANDOFF)
-        self.assertNotEqual(job["request"]["upload_sha256"], HANDOFF)
-        self.assertEqual(self.store.meta(FRESH)["upload_files"], UPLOAD)
-        self.assertEqual(self.store.meta(FRESH)["selected_files"], SELECTED)
-        self.assertEqual(self.store.meta(FRESH)["selection_sha256"], job["selection"]["manifest"]["selection_sha256"])
-
-    def test_fetch_refuses_changed_selection_before_downloading(self) -> None:
-        mutations = (
-            lambda job: job["request"].update(upload_sha256="0" * 64),
-            lambda job: job.update(handoff_sha256=job["request"]["upload_sha256"]),
-            lambda job: job["selection"]["manifest"].update(selection_sha256="0" * 64),
-            lambda job: job["request"].update(main_assembly="another.SLDASM"),
-            lambda job: job.update(package_files=UPLOAD),
-            lambda job: job["selection"].update(state="ready"),
-            lambda job: job["request"].update(run_id=FRESH),
-        )
-        for index, mutate in enumerate(mutations):
-            with self.subTest(mutation=index):
-                endpoint = FakeEndpoint(self.archive.read_bytes())
-                job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-                mutate(job)
-                with self.assertRaises(PipelineError):
-                    linux_runner.fetch_capture(self.store, endpoint, RUN, job)
-                self.assertEqual(endpoint.calls, 0)
-
     def test_fetch_retry_preserves_the_recorded_selection(self) -> None:
-        endpoint = FakeEndpoint(self.archive.read_bytes())
-        job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-        linux_runner.fetch_capture(self.store, endpoint, RUN, job)
-        self.store.update_meta(RUN, selection_sha256="0" * 64)
-        with self.assertRaisesRegex(PipelineError, "recorded admission"):
-            linux_runner.fetch_capture(self.store, endpoint, RUN, job)
-        self.assertEqual(endpoint.calls, 0)
+        """An admitted retry reuses the recorded selection and never re-downloads."""
 
-    def test_fetch_refuses_a_resealed_capture_with_another_native_inventory(self) -> None:
-        source = capture_root(self.tmp / "foreign-inventory", run_id=FRESH, handoff=HANDOFF)
-        record_path = source / "evidence/discovery.json"
-        record = json.loads(record_path.read_text())
-        record["native_files"]["stray.SLDPRT"] = "0" * 64
-        write_json(record_path, record)
-        manifest_path = source / "evidence" / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-        manifest["files"]["discovery.json"] = file_digest(record_path)
-        write_json(manifest_path, manifest)
-        archive = self.tmp / "foreign-inventory.zip"
-        seal_capture(
-            source,
-            archive,
-            run_id=FRESH,
-            handoff_sha256=HANDOFF,
-            main_assembly=MAIN_ASSEMBLY,
-            native_tool=self.tool,
-        )
-        job = self._job(FRESH, archive, declared_sha256=file_digest(archive))
-        endpoint = FakeEndpoint(archive.read_bytes())
-        with self.assertRaisesRegex(PipelineError, "native inventory differs"):
-            linux_runner.fetch_capture(self.store, endpoint, FRESH, job)
-
-    def test_manifest_receipt_mismatch_is_refused_before_import_and_on_retry(self) -> None:
-        endpoint = FakeEndpoint(self.archive.read_bytes())
-        job = self._job(RUN, self.archive, declared_sha256=file_digest(self.archive))
-        job["result"]["capture_archive"]["manifest_sha256"] = "e" * 64
-        fresh = LinuxStore(self.tmp / "manifest-mismatch")
-        for store in (fresh, self.store):
-            with self.subTest(admitted=store is self.store), self.assertRaisesRegex(PipelineError, "manifest"):
-                linux_runner.fetch_capture(store, endpoint, RUN, job)
-        self.assertFalse(fresh.capture_dir(RUN).exists())
+        self.admit(RUN)
+        endpoint = mock.Mock()
+        endpoint.stream_capture_archive.side_effect = AssertionError("must not re-download")
+        job = capture_job(RUN, self.archive, self.tool)
+        binding = platform_capture.import_native_capture(self.store, self._paths(RUN), RUN, job, endpoint)
+        self.assertEqual(binding["state"], "capture_admitted")
+        self.assertEqual(binding["selection"], job["selection"]["manifest"])
+        drifted = capture_job(RUN, self.archive, self.tool)
+        drifted["selection"]["staged_files"] = {**drifted["selection"]["staged_files"], "extra.txt": "0" * 64}
+        with self.assertRaisesRegex(PipelineError, "sealed source selection"):
+            platform_capture.import_native_capture(self.store, self._paths(RUN), RUN, drifted, endpoint)
+        endpoint.stream_capture_archive.assert_not_called()
 
     # ------------------------------------------------------------ run lock
 
     def test_overlapping_portable_runs_for_one_attempt_are_refused(self) -> None:
-        """The store-level run lock must refuse a second portable stage for the same attempt."""
+        """The attempt-level lock must refuse a second portable stage for the same attempt."""
 
+        self.admit(RUN)
         with (
-            solidworks.output_lock(self.store.run_dir(RUN)),
-            mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
-            self.assertRaises(PipelineError),
+            solidworks.output_lock(self._paths(RUN).run_dir),
+            mock.patch.object(flow, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(flow.solidworks, "generate", side_effect=AssertionError("must not run")),
+            self.assertRaisesRegex(PipelineError, "Another run owns"),
         ):
-            linux_runner.run_portable_stage(self.store, RUN, "generate")
-
-    # ------------------------------------------------------------ malformed state
-
-    def test_malformed_state_is_refused_not_silently_emptied(self) -> None:
-        """Reject malformed events instead of treating them as an empty stream."""
-
-        write_json(self.store.events_path(RUN), {"stage": "generate", "state": "running"})
-        with self.assertRaises(PipelineError):
-            self.store.events(RUN)
-
-        self.store.meta_path(RUN).write_text("{not json", encoding="utf-8")
-        with self.assertRaises(PipelineError):
-            self.store.meta(RUN)
-
-    # ------------------------------------------------------------ admission retries
-
-    def _provisional(self) -> dict:
-        return {
-            "schema_version": STORE_SCHEMA,
-            "run_id": RUN,
-            "state": "importing",
-            "handoff_sha256": HANDOFF,
-            "main_assembly": MAIN_ASSEMBLY,
-            "native_tool": self.tool,
-        }
-
-    def test_retry_after_an_early_crash_recovers_the_identical_import(self) -> None:
-        """Recover an interrupted import with the same capture binding."""
-
-        other = LinuxStore(self.tmp / "store-retry")
-        write_json(other.meta_path(RUN), self._provisional())
-        meta = other.import_capture(
-            RUN,
-            self.archive,
-            expected_handoff_sha256=HANDOFF,
-            expected_main_assembly=MAIN_ASSEMBLY,
-            expected_native_tool=self.tool,
-        )
-        self.assertEqual(meta["state"], "capture_admitted")
-        self.assertTrue((other.capture_dir(RUN) / "transfer-manifest.json").is_file())
-
-    def test_retry_after_a_crash_before_the_meta_write_finalizes_the_transfer(self) -> None:
-        """Recover metadata after an atomic capture install."""
-
-        other = LinuxStore(self.tmp / "store-finalize")
-        other.import_capture(
-            RUN,
-            self.archive,
-            expected_handoff_sha256=HANDOFF,
-            expected_main_assembly=MAIN_ASSEMBLY,
-            expected_native_tool=self.tool,
-        )
-        write_json(other.meta_path(RUN), self._provisional())  # crash between install and meta write
-        meta = other.import_capture(
-            RUN,
-            self.archive,
-            expected_handoff_sha256=HANDOFF,
-            expected_main_assembly=MAIN_ASSEMBLY,
-            expected_native_tool=self.tool,
-        )
-        self.assertEqual(meta["state"], "capture_admitted")
-        transfer = meta.get("transfer")
-        self.assertIsInstance(transfer, dict, "finalized admission lacks the transfer manifest")
-        self.assertIn("files", transfer)
-
-    def test_retry_never_rolls_back_an_advanced_state(self) -> None:
-        """Repeated admission must preserve a later publication state."""
-
-        meta = self.store.meta(RUN) or {}
-        meta["state"] = "published"
-        write_json(self.store.meta_path(RUN), meta)
-        again = self.store.import_capture(
-            RUN,
-            self.archive,
-            expected_handoff_sha256=HANDOFF,
-            expected_main_assembly=MAIN_ASSEMBLY,
-            expected_native_tool=self.tool,
-        )
-        self.assertEqual(again["state"], "published")
-        self.assertEqual((self.store.meta(RUN) or {}).get("state"), "published")
+            flow.run_stage(self.store, self.store_root, RUN, "generate")
 
     # ------------------------------------------------------------ recorded-digest binding
 
     def test_generate_refuses_a_self_consistent_manifest_tamper(self) -> None:
-        """Bind the entire admitted digest map even when the replacement manifest is internally consistent."""
+        """Bind the entire recorded admission even when the replacement manifest is internally consistent."""
 
-        capture = self.store.capture_dir(RUN)
-        report_path = capture / "input/handoff.json"
-        target = capture / "input/cad" / MAIN_ASSEMBLY
-        tampered = b"CAD-TAMPERED-AFTER-ADMISSION\n"
-        target.write_bytes(tampered)
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
-        report["package_files"]["cad/" + MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
+        self.admit(RUN)
+        capture = self._paths(RUN).capture_dir
+        report_path = capture / "input" / "handoff.json"
+        discovery_path = capture / "evidence" / "discovery.json"
+        evidence_manifest = capture / "evidence" / "manifest.json"
+        target = capture / "input" / "cad" / MAIN_ASSEMBLY
+        target.write_bytes(b"CAD-TAMPERED-AFTER-ADMISSION\n")
+        report = read_data(report_path)
+        report["input_receipt"]["inventory"][MAIN_ASSEMBLY] = file_digest(target)
+        report["package_files"]["cad/" + MAIN_ASSEMBLY] = file_digest(target)
         write_json(report_path, report)
+        discovery = read_data(discovery_path)
+        discovery["native_files"][MAIN_ASSEMBLY] = file_digest(target)
+        write_json(discovery_path, discovery)
+        snapshot = read_data(evidence_manifest)
+        snapshot["files"]["discovery.json"] = file_digest(discovery_path)
+        write_json(evidence_manifest, snapshot)
         manifest_path = capture / CAPTURE_MANIFEST
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["files"]["input/cad/" + MAIN_ASSEMBLY] = hashlib.sha256(tampered).hexdigest()
-        manifest["files"]["input/handoff.json"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        manifest = read_data(manifest_path)
+        for name, path in (
+            ("input/cad/" + MAIN_ASSEMBLY, target),
+            ("input/handoff.json", report_path),
+            ("evidence/discovery.json", discovery_path),
+            ("evidence/manifest.json", evidence_manifest),
+        ):
+            manifest["files"][name] = file_digest(path)
+        manifest["main_assembly_sha256"] = file_digest(target)
         manifest["file_count"] = len(manifest["files"])
         manifest["total_bytes"] = sum((capture / name).stat().st_size for name in manifest["files"])
-        manifest_path.write_bytes(canonical(manifest))
-
+        write_json(manifest_path, manifest)
         with (
-            mock.patch.object(linux_runner, "tool_record", return_value=portable_twin(self.tool)),
-            mock.patch.object(linux_runner.solidworks, "generate", side_effect=AssertionError("must not run")),
-            self.assertRaises(PipelineError),
+            mock.patch.object(flow, "tool_record", return_value=portable_record(self.tool)),
+            mock.patch.object(flow.solidworks, "generate", side_effect=AssertionError("must not run")),
+            self.assertRaisesRegex(PipelineError, "differs from the recorded admission"),
         ):
-            linux_runner.run_portable_stage(self.store, RUN, "generate")
-
-    # ------------------------------------------------------------ preview cache freshness
-
-    def _verified_delivery(self) -> Path:
-        verify = self.store.stage_dir(RUN, "verify")
-        shutil.copytree(self.store.capture_dir(RUN), verify)
-        for name in ("model", "meshes", "urdf"):
-            (verify / name).mkdir(exist_ok=True)
-        (verify / "reports/tool.json").write_text("{}\n", encoding="utf-8")
-        (verify / "tool.json").write_text("{}\n", encoding="utf-8")
-        (verify / "README.md").write_text("fixture\n", encoding="utf-8")
-        (verify / "urdf/robot.urdf").write_text('<robot name="probe"/>\n', encoding="utf-8")
-        return verify
-
-    def test_preview_revalidates_in_place_report_edits(self) -> None:
-        """An in-place quality-report edit must invalidate the cached preview."""
-
-        from description_pipeline.delivery import subject_digest
-        from description_pipeline.orchestration import linux_store as store_module
-
-        delivery = self._verified_delivery()
-        calls = {"count": 0}
-
-        def check_bundle(_delivery):
-            calls["count"] += 1
-            if calls["count"] > 1:
-                raise PipelineError("report bytes changed after the first verification")
-            return {"passed": True, "subject_sha256": subject_digest(delivery)}
-
-        quality = delivery / "reports/quality.json"
-        write_json(quality, {"passed": True, "subject_sha256": subject_digest(delivery)})
-        with (
-            mock.patch.object(store_module, "check_bundle", side_effect=check_bundle),
-            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
-            mock.patch.object(
-                store_module,
-                "require_qualified_report",
-                side_effect=lambda report, definition, root=None: report,
-            ),
-        ):
-            first = self.store.preview(RUN)
-            self.assertEqual(first["subject_sha256"], subject_digest(delivery))
-            quality.write_text(
-                '{"passed": false, "subject_sha256": "' + first["subject_sha256"] + '"}\n', encoding="utf-8"
-            )
-            with self.assertRaises(PipelineError):
-                self.store.preview(RUN)
-
-    def test_preview_revalidates_in_place_member_edits(self) -> None:
-        """An in-place member edit must invalidate the preview."""
-
-        from description_pipeline.delivery import subject_digest
-        from description_pipeline.orchestration import linux_store as store_module
-
-        delivery = self._verified_delivery()
-        report = {"passed": True, "subject_sha256": subject_digest(delivery)}
-        with (
-            mock.patch.object(store_module, "check_bundle", return_value=report),
-            mock.patch.object(store_module, "rebuilt_definition", return_value={}),
-            mock.patch.object(store_module, "require_qualified_report", return_value=report),
-        ):
-            preview = self.store.preview(RUN)
-            stale_digest = preview["files"]["urdf/robot.urdf"]
-            (delivery / "urdf/robot.urdf").write_text('<robot name="changed"/>\n', encoding="utf-8")
-            stream, _size = self.store.open_artifact(RUN, "urdf/robot.urdf", sha256=stale_digest)
-            with self.assertRaises(PipelineError), contextlib.closing(stream):
-                while stream.read(65536):
-                    pass
-            with self.assertRaises(PipelineError):
-                self.store.preview(RUN)
+            flow.run_stage(self.store, self.store_root, RUN, "generate")
 
 
 if __name__ == "__main__":

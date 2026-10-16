@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from . import _paths  # noqa: F401
+from . import support  # noqa: E402
 from .test_solidworks_discovery import IDENTITY, FakeBackend
 from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
@@ -121,6 +122,7 @@ def raw_record() -> dict:
             "robot_name": "wire_test",
         },
         "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
         # The exporter fixture's frozen bytes are the deterministic placeholder
         # written by the preparation test; the derive contract binds them.
         "files": {
@@ -361,6 +363,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "cover_lock",
                 "type": "lock",
+                "limits": None,
                 "error_code": 0,
                 "suppressed": False,
                 "entities": [{"component": "base-1"}, {"component": "cover-1"}],
@@ -382,6 +385,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": kind,
                 "type": kind,
+                "limits": None,
                 "error_code": 0,
                 "entities": [
                     {"component": "base-1", shape: geometry},
@@ -397,6 +401,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": name,
                 "type": "lock",
+                "limits": None,
                 "error_code": 0,
                 "entities": [{"component": name}, {"component": "washer-1"}],
             }
@@ -433,6 +438,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "saved_pose_lock",
                 "type": "lock",
+                "limits": None,
                 "error_code": 0,
                 "entities": [{"component": "base-1"}, {"component": "arm-1"}],
             }
@@ -451,6 +457,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 "name": name,
                 "scope": "",
                 "type": "parallel",
+                "limits": None,
                 "error_code": 0,
                 "entities": [
                     {"component": component, "plane": {"point": [0, 0, 0], "normal": normal}}
@@ -487,6 +494,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                     {
                         "name": "nearly_axial",
                         "type": "parallel",
+                        "limits": None,
                         "error_code": 0,
                         "entities": [
                             {"component": component, "plane": {"point": [0, 0, 0], "normal": [deviation, 0, 1]}}
@@ -517,12 +525,14 @@ class ExporterDiscoveryTests(unittest.TestCase):
                     {
                         "name": "recorded_lock",
                         "type": "lock",
+                        "limits": None,
                         "error_code": 0,
                         "entities": [{"component": "base-1"}, {"component": "cover-1"}],
                     },
                     {
                         "name": "incomplete_constraint",
                         "type": kind,
+                        "limits": None,
                         "error_code": error,
                         "entities": [
                             {
@@ -551,6 +561,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 "name": "valid_pose_hold",
                 "scope": "",
                 "type": "parallel",
+                "limits": None,
                 "error_code": 0,
                 "entities": [
                     {"component": component, "plane": {"point": [0, 0, 0], "normal": [1, 0, 0]}}
@@ -560,6 +571,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "unread_pose_hold",
                 "type": "lock",
+                "limits": None,
                 "error_code": 1,
                 "entities": [{"component": "base-1"}, {"component": "arm-1"}],
             },
@@ -575,6 +587,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "one_sided_parallel",
                 "type": "parallel",
+                "limits": None,
                 "error_code": 0,
                 "entities": [
                     {"component": "base-1", "cylinder": {"point": [0, 0, 0], "direction": [1, 0, 0], "radius": 1}},

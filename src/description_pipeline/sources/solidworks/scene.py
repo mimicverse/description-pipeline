@@ -790,6 +790,9 @@ def _build_joints(
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
             entry["provenance"]["limits_evidence"] = {str(key): str(value) for key, value in limit_evidence.items()}
+        limit_source = joint.get("limit_source")
+        if isinstance(limit_source, str) and limit_source:
+            entry["limit_source"] = limit_source
         if movable:
             entry["axis"] = [float(value) for value in axis]
         limits = joint.get("limits")
@@ -1011,38 +1014,3 @@ def _apply_declared_masses(scene: dict[str, Any], declared: dict[str, dict[str, 
         link["provenance"] = provenance
 
 
-def normalize_scene(
-    scene: dict[str, Any],
-    definition: dict[str, Any] | None = None,
-    snapshot_root: Path | None = None,
-) -> dict[str, Any]:
-    """Pipeline hook: apply declared author decisions to a *raw* scene.
-
-    The shared pipeline reads ``scene.json`` with the common loader (raw CAD
-    readings) and calls this hook during normalization.  The hook is pure - the
-    caller's raw scene is not modified - and idempotent, and every applied value
-    is recorded per link with raw / used / reason / evidence.
-    """
-
-    import copy
-
-    data = copy.deepcopy(scene)
-    declared_from_definition: dict[str, dict[str, Any]] = {}
-    source = (definition or {}).get("source") or {}
-    raw_table = source.get("documented_masses") or {}
-    if isinstance(raw_table, dict):
-        for name, entry in raw_table.items():
-            if isinstance(entry, dict) and "mass_kg" in entry:
-                declared_from_definition[str(name)] = entry
-            elif isinstance(entry, (int, float)) and not isinstance(entry, bool):
-                declared_from_definition[str(name)] = {
-                    "mass_kg": float(entry),
-                    "reason": "declared by the model author",
-                    "evidence": None,
-                }
-    declared = declared_from_definition
-    if not declared and snapshot_root is not None:
-        declared = _read_declared_masses(Path(snapshot_root))
-    if declared:
-        _apply_declared_masses(data, declared)
-    return data

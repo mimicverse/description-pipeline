@@ -19,6 +19,8 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 from description_pipeline.sources.solidworks.closure import derive_mass_closure  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import _component_context_record  # noqa: E402
 
+from . import support  # noqa: E402
+
 DEV = "board-1/Dev_Board-1"
 EASYEDA = "board-1/EasyEDA PCB Model~Nz70-1"
 
@@ -86,6 +88,82 @@ def _instance(name, *, depth, parent, document_type, mass, overrides, effective=
         "effective_error": error,
     }
     return entry
+
+
+def _carrier_transform(name: str) -> list[float]:
+    """The recorded occurrence transform; EasyEDA's frame sits 0.01 m above the origin."""
+
+    return _placement((0.0, 0.01, 0.0)) if name == EASYEDA else _placement()
+
+
+def _hinge_point(name: str) -> list[float]:
+    """Component-frame geometry that solves the hinge through the child datum origin.
+
+    The assembly-space line runs through (0, 0.01, 0): the child link's datum
+    origin, which the joint frame check requires the axis to pass through.
+    """
+
+    return [0.0, 0.0, 0.0] if name == EASYEDA else [0.0, 0.01, 0.0]
+
+
+def _carrier_record(bodies: list[dict]) -> tuple[dict, dict[str, str]]:
+    """Fixture plumbing: the native record the given bodies are rebuilt from.
+
+    Rigid membership inside one body comes from a solved lock mate; two bodies
+    hang off one solved concentric+coincident hinge so the reduced joint tree
+    stays connected.  The capture always reads its base occurrence, even when
+    a scenario's scene carries no mass-bearing components.
+    """
+
+    names = [str(member) for body in bodies for member in (body.get("components") or [])]
+    if not names:
+        names = [DEV]
+    components = [
+        support.native_component(
+            name, document=name.split("/")[-1].split("~")[0] + ".SLDPRT", transform=_carrier_transform(name)
+        )
+        for name in dict.fromkeys(names)
+    ]
+    datums = [
+        support.native_datum("CS_" + str(body["name"]), str(members[0]), _carrier_transform(str(members[0])))
+        for body in bodies
+        if (members := list(body.get("components") or []))
+    ]
+    if not datums:
+        datums = [support.native_datum("CS_base_link", DEV, _carrier_transform(DEV))]
+    mates: list[dict] = []
+    joint_claims = None
+    controlled: dict[str, str] = {}
+    for body in bodies:
+        members = [str(member) for member in (body.get("components") or [])]
+        if len(members) > 1:
+            mates.append(support.native_lock(members))
+    named = [body for body in bodies if body.get("components")]
+    if len(named) > 1:
+        left, right = str(named[0]["components"][0]), str(named[1]["components"][0])
+        mates += support.native_hinge_mates(
+            left, right, left_point=_hinge_point(left), right_point=_hinge_point(right), radius=0.005
+        )
+        joint_claims = support.native_joint_claims()
+        controlled["joints/hinge.json"] = support.native_joint_record()
+    masses = [
+        {"component": entry["name2"], "mass_kg": 0.035 if entry["name2"] == DEV else 0.026, "material": "FR-4"}
+        for entry in components
+    ]
+    record = support.native_record(
+        hardware_id="closure_fixture",
+        change_summary="closure module fixture",
+        control_reference="closure-run",
+        components=components,
+        datums=datums,
+        masses=masses,
+        mates=mates,
+        joint_claims=joint_claims,
+        budget=False,
+        assembly_mass_kg=0.0632,
+        assembly_extent_m=0.2,
+    )
+    return record, controlled
 
 
 def _hashes(root: Path) -> dict[str, str]:
@@ -246,7 +324,13 @@ class DeriveMassClosureTests(unittest.TestCase):
             native.update(raw_extra)
         self._write("raw/mass_closure.json", native)
         self._write("raw/scene_raw.json", scene)
-        self._write("raw/source_config.json", {"assembly": "C:/source/robot.SLDASM", "bodies": bodies})
+        record, controlled = _carrier_record(bodies)
+        support.stage_discovery_inputs(
+            self.tmp,
+            record=record,
+            controlled=controlled,
+            record_keys={"joints/hinge.json": "limits"} if controlled else None,
+        )
 
     def test_derive_rebuilds_every_approved_derived_key(self):
         self._write_evidence([{"name": "base_link", "components": [DEV, EASYEDA]}])

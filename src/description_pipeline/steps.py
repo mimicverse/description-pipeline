@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import __version__
 from .delivery import PIPELINE_ID, read_source_record, subject_digest, subject_inventory
+from .interface_records import PURPOSE_ENGINEERING, REQUEST_PURPOSES
 from .io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from .runtime import tool_record
 from .sources.snapshot import verify_snapshot
@@ -122,10 +123,21 @@ def discover_structure(
             and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
             "Frozen-name registry must map native identities to interface names",
         )
+        purpose = configuration.get("purpose") if isinstance(configuration, dict) else None
+        if prepared is None:
+            _require(
+                isinstance(purpose, str) and purpose in REQUEST_PURPOSES,
+                "The derivation purpose must come from the frozen request",
+            )
+        else:
+            # The prepared package was already derived under the request-bound
+            # purpose; this echo is inert for the validation-only path.
+            purpose = purpose if isinstance(purpose, str) and purpose in REQUEST_PURPOSES else PURPOSE_ENGINEERING
         return DiscoverySettings(
             record_roots=tuple(record_roots),
             frozen_names=names,
             main_assembly=main_assembly,
+            purpose=str(purpose),
         )
 
     def describe_settings(value):
@@ -159,16 +171,8 @@ def discover_structure(
         "discovery_sha256": prepared.discovery_sha256,
     }
     target = targets.get(prepared.hardware_id)
-    if target is None:
-        discovery["findings"].append(
-            {
-                "code": "discovery.publication_target_missing",
-                "object": "assembly",
-                "message": "No model repository is configured for this CAD identity; publication is unavailable",
-                "blocking": False,
-                "detail": {"hardware_id": prepared.hardware_id, "publication_blocker": "repository_target"},
-            }
-        )
+    # The publication-target decision is the platform request's authority; a
+    # missing native routing entry is no longer a discovery finding.
     _state(on_event, "discover", "running", discovery=discovery)
     checked(on_event, "discover", "output", "discovery.definition", lambda: discovery)
 
@@ -330,7 +334,7 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
     environment) and the frozen discovery record with its capture additions.
     """
 
-    from .sources.solidworks.discovery import DISCOVERY_FILE
+    from .sources.solidworks.discovery import DISCOVERY_FILE, PLAN_FILE
 
     evidence = staging / "evidence"
     blocks = {
@@ -354,6 +358,9 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
         {"name": str(name), "matrix": matrix}
         for name, matrix in sorted((read_data(evidence / "raw/coordinate_systems.json") or {}).items())
     ]
+    # The sealed plan travels verbatim into the delivery: the same bytes the
+    # Linux derivation sealed before acquisition and Windows consumed above.
+    (evidence / PLAN_FILE).write_bytes((package / PLAN_FILE).read_bytes())
     write_json(evidence / "capture.json", capture)
     write_json(evidence / "native-runtime.json", read_data(evidence / "evidence/environment.json"))
     payload = read_data(package / DISCOVERY_FILE)
@@ -374,7 +381,7 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
     manifest_path = evidence / "manifest.json"
     manifest = read_data(manifest_path)
     files = dict(manifest.get("files") or {})
-    for name in ("capture.json", "discovery.json", "native-runtime.json"):
+    for name in ("capture-plan.json", "capture.json", "discovery.json", "native-runtime.json"):
         files[name] = file_digest(evidence / name)
     manifest["files"] = dict(sorted(files.items()))
     write_json(manifest_path, manifest)
@@ -399,6 +406,182 @@ def _snapshot_details(staging, manifest):
     }
 
 
+#: The evidence items a capture plan must request (the capture stage contract).
+_CAPTURE_EVIDENCE_REQUESTS = [
+    "evidence/capture.json",
+    "evidence/geometry/",
+    "evidence/native-runtime.json",
+]
+
+#: The exact field set of one sealed capture plan.
+_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "handoff_sha256",
+        "discovery_sha256",
+        "main_assembly",
+        "configuration",
+        "identity",
+        "selection",
+        "objects",
+        "groups",
+        "axis_requests",
+        "datums",
+        "evidence_requests",
+    }
+)
+
+
+def _require_plan_against_capture(staging: Path, plan: dict) -> None:
+    """The planned selectors, datums and evidence items must match the actual capture."""
+
+    evidence = staging / "evidence"
+    captured = read_data(evidence / "raw" / "mass_properties.json")
+    captured_names = {str(name) for name in (captured or {})}
+    if not {str(item["name"]) for item in plan["objects"]} <= captured_names:
+        raise PipelineError("The capture did not read every planned native instance")
+    if plan["datums"]:
+        systems = read_data(evidence / "raw" / "coordinate_systems.json")
+        known = {str(name) for name in (systems or {})}
+        if not set(map(str, plan["datums"])) <= known:
+            raise PipelineError("The capture did not read every planned datum")
+    for requested in plan["evidence_requests"]:
+        requested = str(requested)
+        target = evidence / requested.removeprefix("evidence/")
+        if requested.endswith("/"):
+            if not target.is_dir():
+                raise PipelineError(f"The capture did not produce a planned evidence item: {requested}")
+        elif not target.is_file():
+            raise PipelineError(f"The capture did not produce a planned evidence item: {requested}")
+
+
+def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
+    """Consume the sealed Linux-origin definition of one prepared package.
+
+    The capture reads the derived content identity (``source.json``) and the
+    minimal pre-acquisition capture plan sealed by the Linux derivation; it
+    refuses when the plan does not bind the sealed discovery bytes, the frozen
+    inventory, the recorded project entry or the recorded saved configuration,
+    or when it carries no usable native object selectors.  No structural
+    rederivation happens on the Windows side.
+    """
+
+    from .io import artifact_path_parts
+    from .sources.solidworks.discovery import DISCOVERY_FILE, PLAN_FILE, PLAN_SCHEMA, SOURCE_FILE
+
+    discovery_path = package / DISCOVERY_FILE
+    source_path = package / SOURCE_FILE
+    plan_path = package / PLAN_FILE
+    if not discovery_path.is_file():
+        raise PipelineError("The prepared package carries no sealed discovery record")
+    if not source_path.is_file():
+        raise PipelineError("The prepared package carries no sealed source identity")
+    if not plan_path.is_file():
+        raise PipelineError("The prepared package carries no sealed capture plan")
+    source = read_data(source_path)
+    if not isinstance(source, dict) or not source:
+        raise PipelineError("The sealed source identity is not a usable record")
+    plan = read_data(plan_path)
+    if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA:
+        raise PipelineError("The sealed capture plan has an unexpected schema")
+    if set(plan) != _PLAN_KEYS:
+        raise PipelineError("The sealed capture plan carries an unknown field")
+    payload = read_data(discovery_path)
+    if not isinstance(payload, dict):
+        raise PipelineError("The sealed discovery record is not a usable record")
+    if plan.get("discovery_sha256") != hashlib.sha256(discovery_path.read_bytes()).hexdigest():
+        raise PipelineError("The sealed capture plan does not bind the sealed discovery")
+    native_files = payload.get("native_files") if isinstance(payload.get("native_files"), dict) else {}
+    expected_files = {str(key): str(value) for key, value in native_files.items()}
+    if plan.get("handoff_sha256") != digest(expected_files):
+        raise PipelineError("The sealed capture plan does not bind the frozen inventory")
+    selection = plan.get("selection")
+    files = selection.get("files") if isinstance(selection, dict) else None
+    if not isinstance(files, dict) or {str(key): str(value) for key, value in files.items()} != expected_files:
+        raise PipelineError("The sealed capture plan selection differs from the frozen inventory")
+    derivation = payload.get("derivation") if isinstance(payload.get("derivation"), dict) else {}
+    if plan.get("main_assembly") != derivation.get("main_assembly"):
+        raise PipelineError("The sealed capture plan names another project entry than the sealed discovery")
+    record = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    saved = record.get("saved_configuration")
+    if isinstance(saved, str) and saved and plan.get("configuration") != saved:
+        raise PipelineError("The sealed capture plan configuration disagrees with the recorded saved configuration")
+    if plan.get("run_id") != payload.get("run_id"):
+        raise PipelineError("The sealed capture plan names another run than the sealed discovery")
+    raw_documents = {
+        str(item.get("instance_id") or item.get("name2")): str(item.get("document") or "").replace("\\", "/")
+        for item in (record.get("components") or [])
+        if isinstance(item, dict)
+        and not item.get("suppressed")
+        and isinstance(item.get("instance_id") or item.get("name2"), str)
+    }
+    registered = set(raw_documents)
+    objects = plan.get("objects")
+    if not isinstance(objects, list) or not objects:
+        raise PipelineError("The sealed capture plan carries no native object selectors")
+    names: list[str] = []
+    for item in objects:
+        if not isinstance(item, dict) or set(item) - {"name", "document", "state"}:
+            raise PipelineError("The sealed capture plan carries an unknown native selector field")
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            raise PipelineError("The sealed capture plan carries no usable native object selectors")
+        document = item.get("document")
+        if document is not None:
+            if not isinstance(document, str) or not document:
+                raise PipelineError("The sealed capture plan carries an unusable selector document")
+            try:
+                artifact_path_parts(document)
+            except PipelineError as error:
+                raise PipelineError("The sealed capture plan carries an unsafe selector document") from error
+            if not document.lower().endswith((".sldprt", ".sldasm")):
+                raise PipelineError("The sealed capture plan carries a non-CAD selector document")
+            recorded_document = raw_documents.get(name, "")
+            if recorded_document and recorded_document != document:
+                raise PipelineError("The sealed capture plan binds another document to a native instance")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise PipelineError("The sealed capture plan repeats a native object selector")
+    if not registered or not set(names) <= registered:
+        raise PipelineError("The sealed capture plan names instances outside the sealed record")
+    datums = plan.get("datums")
+    if (
+        not isinstance(datums, list)
+        or any(not isinstance(item, str) or not item for item in datums)
+        or len(set(datums)) != len(datums)
+    ):
+        raise PipelineError("The sealed capture plan carries unusable datums")
+    if plan.get("evidence_requests") != _CAPTURE_EVIDENCE_REQUESTS:
+        raise PipelineError("The sealed capture plan requests unknown evidence items")
+    groups = plan.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise PipelineError("The sealed capture plan carries no native link-group selections")
+    for item in groups:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "components"}
+            or not isinstance(item["name"], str)
+            or not item["name"]
+            or not isinstance(item["components"], list)
+            or any(not isinstance(member, str) or not member for member in item["components"])
+        ):
+            raise PipelineError("The sealed capture plan carries unusable native link-group selections")
+    axis_requests = plan.get("axis_requests")
+    if not isinstance(axis_requests, list):
+        raise PipelineError("The sealed capture plan carries no native axis requests")
+    for item in axis_requests:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"name", "axis_reference"}
+            or not isinstance(item["name"], str)
+            or not item["name"]
+            or not isinstance(item["axis_reference"], dict)
+        ):
+            raise PipelineError("The sealed capture plan carries unusable native axis requests")
+    return source, plan
+
+
 def capture_evidence(
     package: Path,
     staging: Path,
@@ -414,7 +597,6 @@ def capture_evidence(
     ``on_activity`` optionally observes best-effort capture progress records for the
     live-activity view; it never changes the snapshot, its checks or a failure path.
     """
-    from .sources.solidworks.discovery import source_definition
     from .sources.solidworks.freeze import freeze
     from .sources.solidworks.input import native_source_closure
 
@@ -429,9 +611,32 @@ def capture_evidence(
             error = PipelineError("The CAD package does not meet the input specification")
             error.details = {"errors": report.get("errors", [])}
             raise error
-        source = source_definition(package)
-        source["closure"] = native_source_closure(package)
-        definition = {"source": source}
+        # The capture consumes exactly the sealed plan and the sealed originals:
+        # a minimal capture policy drives the native API, and the plan's native
+        # selectors/datums/evidence requests are enforced against the capture.
+        _sealed_source, plan = _consume_sealed_definition(package)
+        main = str(plan["main_assembly"] or "")
+        assembly = package / main
+        if not assembly.is_file():
+            raise PipelineError("The sealed capture plan names no staged main assembly")
+        configuration = plan.get("configuration")
+        if not isinstance(configuration, str) or not configuration:
+            raise PipelineError("The sealed capture plan carries no saved configuration")
+        source = {
+            "provider": "solidworks",
+            "assembly": str(assembly.resolve()),
+            "configuration": configuration,
+            "require_saved": True,
+            "document_suffixes": [".sldasm", ".sldprt"],
+            "geometry": {"enabled": True, "format": "stl_binary"},
+            "coordinate_systems": [str(name) for name in plan["datums"]],
+            "material_source": "cad",
+            "allowed_roots": [str(package.resolve())],
+            "groups": plan["groups"],
+            "axis_requests": plan["axis_requests"],
+            "closure": native_source_closure(package),
+        }
+        definition = {"source": source, "plan": plan}
         prepared_files = package_inventory(package)
         _archive_input(package, staging)
         report["package_files"] = dict(sorted(inventory(staging / "input").items()))
@@ -481,6 +686,7 @@ def capture_evidence(
         describe=lambda value: _snapshot_details(staging, value),
     )
     _rehome_evidence(staging, package)
+    _require_plan_against_capture(staging, definition["plan"])
 
     def stable_inputs():
         if package_inventory(package) != original_files:
@@ -580,7 +786,8 @@ def publish_model(
 ) -> dict:
     """Recheck and submit the frozen delivery on the Linux publication stage."""
 
-    from .repository.urdf_pr import submit_bundle
+    from .repository.urdf_pr import review_branch, submit_bundle
+    from .request_evidence import read_request_evidence
 
     _state(on_event, "publish", "running")
     # Fail closed on degraded installs: a source/PYTHONPATH checkout carries no
@@ -595,11 +802,13 @@ def publish_model(
     )
     source = read_source_record(bundle)
     hardware = source["identity"]["hardware_id"]
+    record, _request_sha = read_request_evidence(bundle / "input" / "request.json")
+    purpose = str(record.get("purpose") or "")
     result = submit_bundle(
         bundle,
         repository,
         base=base or f"feature/{hardware}",
-        branch=f"work/solidworks/{hardware.lower()}",
+        branch=review_branch(hardware, purpose),
         message=message,
         on_event=on_event,
     )

@@ -16,17 +16,20 @@ closes the connection again; no transaction ever spans an external call.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
-from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, read_data
+from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
+from ..orchestration.airflow_client import JOB_SCHEMA, native_run_id
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -36,6 +39,7 @@ from ..stages import (
     STAGE_STATES,
     TERMINAL_STAGE_STATES,
 )
+from .storage import SEALED_URI_PREFIX, parse_sealed_uri, sealed_resolver_from_environment
 
 
 class PlatformStoreError(PipelineError):
@@ -46,6 +50,25 @@ class AdmissionClosedError(PlatformStoreError):
     """A new admission was attempted while the admission gate is closed."""
 
     code = "admission_closed"
+
+
+class OpenAttemptConflictError(PlatformStoreError):
+    """A parent run already holds a non-terminal linked attempt.
+
+    The reservation is enforced inside the admission transaction (under the
+    admission row lock), so two concurrent submissions can never each admit a
+    child of the same parent.
+    """
+
+    code = "open_attempt_conflict"
+
+    def __init__(self, parent_run_id: str, run_id: str, request_id: str):
+        super().__init__(
+            f"The parent run {parent_run_id!r} already holds the open attempt {run_id!r} ({request_id!r})"
+        )
+        self.parent_run_id = parent_run_id
+        self.run_id = run_id
+        self.request_id = request_id
 
 
 class RunNotAdmittedError(PlatformStoreError):
@@ -81,6 +104,114 @@ class OperationRecord:
 
 
 @dataclass(frozen=True)
+class OperationClaim:
+    """One claim result: the record plus whether this call took the execution grant."""
+
+    record: OperationRecord
+    granted: bool
+
+
+@dataclass(frozen=True)
+class NativeReceiptEvidence:
+    """The immutable, byte-bound native failed-receipt fact a maintenance action carries.
+
+    Produced only by :func:`load_native_failed_receipt`: the original receipt bytes are
+    read once, their SHA-256 is computed from those bytes, and the native identity fields
+    are validated against the bound endpoint-job UUID and stage before this value
+    exists.  The reconcile action consumes exactly this fact; nothing downstream
+    re-derives, fills in or rewrites its terminal state.
+    """
+
+    path: str
+    sha256: str
+    native_run_id: str
+    stage: str
+    state: str
+    error: str | None
+    error_code: str | None
+    detail: object
+
+
+#: The job contract's final states: a terminal event row is one of these, and only a
+#: ``failed`` terminal row authorizes the failure reconciliation.
+NATIVE_TERMINAL_STATES = frozenset({"passed", "failed"})
+
+
+def load_native_failed_receipt(
+    path: object, *, stage: str, native_run_id: str
+) -> NativeReceiptEvidence:
+    """Load and validate one original native failed receipt - the single acceptance source.
+
+    The bytes on disk are the authority: they are read once, the receipt digest is
+    computed from them, and the parsed document must be the bound endpoint job's own
+    terminal failure under the real native job contract (``JOB_SCHEMA``): its identity
+    fields name exactly the bound UUID, its request carries the same UUID, its status is
+    ``failed``, and its events carry exactly one terminal row - ``failed`` at the bound
+    stage.  A missing file, malformed bytes, a report-shaped document or any other
+    identity/state refuses here, before the store transaction is ever entered; every
+    caller (the operator entry and the maintenance route alike) shares this one
+    implementation.
+    """
+
+    receipt_path = Path(str(path))
+    try:
+        raw = receipt_path.read_bytes()
+    except OSError as error:
+        raise PlatformStoreError(f"The native failed receipt is unreadable: {error}") from error
+    sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        document = json.loads(raw)
+    except ValueError as error:
+        raise PlatformStoreError("The native failed receipt is not a JSON document") from error
+    if not isinstance(document, dict):
+        raise PlatformStoreError("The native failed receipt must be a JSON object")
+    if document.get("schema_version") != JOB_SCHEMA:
+        raise PlatformStoreError("The native receipt is not a native job document under the job contract")
+    if document.get("pipeline_id") != PIPELINE_ID:
+        raise PlatformStoreError("The native failed receipt names another pipeline")
+    if not _is_canonical_uuid(native_run_id):
+        raise PlatformStoreError("The bound endpoint job UUID is not canonical")
+    if document.get("run_id") != native_run_id:
+        raise PlatformStoreError("The native failed receipt names another endpoint job")
+    request = document.get("request")
+    if not isinstance(request, dict) or request.get("run_id") != native_run_id:
+        raise PlatformStoreError("The native receipt's request does not carry the bound endpoint job")
+    if document.get("status") != "failed":
+        raise PlatformStoreError("The native receipt is not the bound job's failed terminal fact")
+    events = [event for event in document.get("events") or [] if isinstance(event, dict)]
+    terminal = [event for event in events if event.get("state") in NATIVE_TERMINAL_STATES]
+    if len(terminal) != 1:
+        raise PlatformStoreError("The native receipt must carry exactly one terminal event row")
+    if terminal[0].get("state") != "failed":
+        raise PlatformStoreError("The native receipt's terminal event is not a failure")
+    if terminal[0].get("stage") != stage:
+        raise PlatformStoreError("The native receipt's terminal event names another stage")
+
+    detail = document.get("detail")
+    error = terminal[0].get("error")
+    if not isinstance(error, str) or not error:
+        error = document.get("error")
+    error_code = document.get("error_code")
+
+    return NativeReceiptEvidence(
+        path=str(receipt_path),
+        sha256=sha256,
+        native_run_id=native_run_id,
+        stage=stage,
+        state="failed",
+        error=error if isinstance(error, str) and error else None,
+        error_code=error_code if isinstance(error_code, str) and error_code else None,
+        detail=detail,
+    )
+
+
+def _report_member(path: object) -> bool:
+    """The one class projection: ``reports/**`` members are report-class."""
+
+    return isinstance(path, str) and (path == "reports" or path.startswith("reports/"))
+
+
+@dataclass(frozen=True)
 class RunDisplay:
     """One run's display surface: the name and the reversible tombstone."""
 
@@ -92,23 +223,23 @@ class RunDisplay:
 
 
 _LOCK_ADMISSION = (
-    "SELECT state, reason, actor, changed_at, revision FROM platform.admission WHERE id = 1 FOR UPDATE"
+    "SELECT state, reason, actor, changed_at, revision FROM admission WHERE id = 1 FOR UPDATE"
 )
-_READ_ADMISSION = "SELECT state, reason, actor, changed_at, revision FROM platform.admission_projection"
+_READ_ADMISSION = "SELECT state, reason, actor, changed_at, revision FROM admission_projection"
 _UPDATE_ADMISSION = (
-    "UPDATE platform.admission SET state = %s, reason = %s, actor = %s, changed_at = now(),"
+    "UPDATE admission SET state = %s, reason = %s, actor = %s, changed_at = now(),"
     " revision = revision + 1 WHERE id = 1 RETURNING state, reason, actor, changed_at, revision"
 )
 _INSERT_REQUEST = (
-    "INSERT INTO platform.request (request_id, principal, target_hardware, main_assembly, configuration, baseline)"
+    "INSERT INTO request (request_id, principal, target_hardware, main_assembly, configuration, baseline)"
     " VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb)"
 )
 _INSERT_RUN = (
-    "INSERT INTO platform.run (run_id, request_id, parent_run_id, from_stage, state, tool_identity)"
+    "INSERT INTO run (run_id, request_id, parent_run_id, from_stage, state, tool_identity)"
     " VALUES (%s, %s, %s, %s, 'queued', %s::jsonb)"
 )
 _INSERT_OPERATION = (
-    "INSERT INTO platform.operation"
+    "INSERT INTO operation"
     " (operation_id, run_id, stage, kind, state, operation_key, params_digest, dag_id, dag_run_id, task_id, map_index)"
     " VALUES (%s, %s, %s, %s, 'queued', %s, %s, %s, %s, %s, %s)"
     " ON CONFLICT (operation_key) DO NOTHING"
@@ -116,92 +247,229 @@ _INSERT_OPERATION = (
 )
 _FIND_OPERATION = (
     "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
-    " FROM platform.operation WHERE operation_key = %s"
+    " FROM operation WHERE operation_key = %s"
 )
-_LOCK_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s FOR UPDATE"
-_READ_RUN = "SELECT state, from_stage FROM platform.run WHERE run_id = %s"
+_LOCK_RUN = "SELECT state, from_stage FROM run WHERE run_id = %s FOR UPDATE"
+_READ_RUN = "SELECT state, from_stage FROM run WHERE run_id = %s"
 _READ_RUN_DISPLAY = (
-    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run WHERE run_id = %s"
+    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run WHERE run_id = %s"
 )
 _READ_RUN_DISPLAYS = (
-    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM platform.run"
+    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run"
     " WHERE display_name IS NOT NULL OR hidden_at IS NOT NULL"
 )
 _SET_RUN_DISPLAY = (
-    "UPDATE platform.run SET display_name = %s, updated_at = now() WHERE run_id = %s"
+    "UPDATE run SET display_name = %s, updated_at = now() WHERE run_id = %s"
     " RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
 _SET_RUN_HIDDEN = (
-    "UPDATE platform.run SET hidden_at = COALESCE(hidden_at, now()),"
+    "UPDATE run SET hidden_at = COALESCE(hidden_at, now()),"
     " hidden_reason = COALESCE(hidden_reason, %s), updated_at = now()"
     " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
 _RESTORE_RUN = (
-    "UPDATE platform.run SET hidden_at = NULL, hidden_reason = NULL, updated_at = now()"
+    "UPDATE run SET hidden_at = NULL, hidden_reason = NULL, updated_at = now()"
     " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
 _START_RUN = (
-    "UPDATE platform.run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'queued'"
+    "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'queued'"
     " RETURNING state"
 )
+_CLAIM_OPERATION = (
+    "UPDATE operation SET state = 'running', updated_at = now()"
+    " WHERE operation_key = %s AND run_id = %s AND stage = %s AND state = 'queued'"
+    " RETURNING operation_id, state, operation_key, params_digest, run_id, stage, kind"
+)
 _SET_RUN_OUTCOME = (
-    "UPDATE platform.run SET state = %s, updated_at = now()"
+    "UPDATE run SET state = %s, updated_at = now()"
     " WHERE run_id = %s AND state NOT IN ('succeeded', 'failed', 'cancelled')"
 )
+_SET_RUN_UNRESOLVED = (
+    "UPDATE run SET state = 'unresolved', updated_at = now() WHERE run_id = %s AND state = 'running'"
+)
+_RESTORE_RUN_RUNNING = (
+    "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'unresolved'"
+)
+_SETTLE_OPERATIONS = (
+    "UPDATE operation SET state = CASE WHEN kind = 'cancel' THEN 'succeeded' ELSE %s END,"
+    " updated_at = now()"
+    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
+    " AND state IN ('queued', 'running', 'unresolved')"
+)
+_SETTLE_UNKNOWN = (
+    "UPDATE operation SET state = 'unresolved', updated_at = now()"
+    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
+    " AND state = 'running'"
+)
+_SETTLE_RECONCILE = (
+    "UPDATE operation SET state = 'succeeded', updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND stage = %s AND kind = 'reconcile'"
+    " AND state <> 'succeeded'"
+)
+_SETTLE_CACHE_RELEASE = (
+    "UPDATE operation SET state = %s, updated_at = now()"
+    " WHERE operation_key = %s AND run_id = %s AND stage = %s AND kind = 'cache_release'"
+    " AND state = 'running'"
+    " RETURNING operation_id, state, operation_key, params_digest, run_id, stage, kind"
+)
 _READ_RUN_RECORD = (
-    "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM platform.run WHERE run_id = %s"
+    "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
+)
+_READ_RUN_PARENT = "SELECT parent_run_id FROM run WHERE run_id = %s"
+_OPEN_CHILD_RUN = (
+    "SELECT run_id, request_id FROM run WHERE parent_run_id = %s"
+    " AND state NOT IN ('succeeded', 'failed', 'cancelled')"
+    " ORDER BY created_at, run_id LIMIT 1"
+)
+_READ_REQUEST_RECORD = (
+    "SELECT principal, target_hardware, main_assembly, sealed_at,"
+    " (SELECT o.params_digest FROM operation o"
+    "  JOIN run u ON u.run_id = o.run_id"
+    "  WHERE u.request_id = request.request_id AND o.kind = 'dispatch'"
+    "  ORDER BY o.updated_at, o.operation_id LIMIT 1),"
+    " configuration"
+    " FROM request WHERE request_id = %s"
 )
 _READ_STAGE_RECORDS = (
     "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
-    " FROM platform.stage WHERE run_id = %s"
+    " FROM stage WHERE run_id = %s"
 )
 _CONFIRMED_PUBLISH = (
-    "SELECT 1 FROM platform.operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
+    "SELECT 1 FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 )
-_READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
-_READ_STAGE = "SELECT state, receipt, checkpoint_uri FROM platform.stage WHERE run_id = %s AND stage = %s"
-_LOCK_STAGE = "SELECT state FROM platform.stage WHERE run_id = %s AND stage = %s FOR UPDATE"
+_READ_STAGE_ROW = (
+    "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
+)
+_READ_STAGE = "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
+_READ_STAGE_TIME = "SELECT original_executed_at FROM stage WHERE run_id = %s AND stage = %s"
+_LOCK_STAGE = "SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"
 _FIND_RECONCILE = (
-    "SELECT 1 FROM platform.operation"
+    "SELECT 1 FROM operation"
     " WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s LIMIT 1"
 )
 _FIND_UNKNOWN_ORIGIN = (
-    "SELECT 1 FROM platform.operation"
+    "SELECT 1 FROM operation"
     " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'unresolved' LIMIT 1"
 )
+_READ_ORPHAN_OPERATION = (
+    "SELECT stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+    " FROM operation WHERE operation_id = %s AND run_id = %s FOR UPDATE"
+)
+_BIND_ORPHAN_OPERATION = (
+    "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND task_id IS NULL AND map_index IS NULL"
+    " RETURNING operation_id"
+)
+#: One statement carries every lifecycle fact of the orphan acceptance: a single
+#: query evaluates the view once, so the task's and the DagRun's states are always
+#: the same database snapshot - two separate reads are never a snapshot.
+_READ_ORPHAN_LIFECYCLE = (
+    "SELECT object_kind, state, bucket FROM lifecycle_projection"
+    " WHERE (object_kind = 'scheduling' AND object_id = %s)"
+    "    OR (object_kind = 'dag_run' AND object_id = %s)"
+)
+_SETTLE_ORPHAN_INTENT = (
+    "UPDATE operation SET state = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND state = 'queued'"
+    " AND kind NOT IN ('reconcile', 'cache_release')"
+)
 _INSERT_STAGE = (
-    "INSERT INTO platform.stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
+    "INSERT INTO stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
     " ON CONFLICT (run_id, stage) DO UPDATE SET"
     " state = EXCLUDED.state, receipt = EXCLUDED.receipt, checkpoint_uri = EXCLUDED.checkpoint_uri,"
     " reused_from_run = EXCLUDED.reused_from_run, original_executed_at = EXCLUDED.original_executed_at,"
     " updated_at = now()"
-    " WHERE platform.stage.state NOT IN ('completed','failed','cancelled','blocked','unresolved')"
+    " WHERE stage.state NOT IN ('completed','failed','cancelled','blocked','unresolved')"
     " RETURNING run_id, stage, state"
 )
 _RECONCILE_STAGE = (
-    "INSERT INTO platform.stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
+    "INSERT INTO stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
     " ON CONFLICT (run_id, stage) DO UPDATE SET"
     " state = EXCLUDED.state, receipt = EXCLUDED.receipt, checkpoint_uri = EXCLUDED.checkpoint_uri,"
     " reused_from_run = EXCLUDED.reused_from_run, original_executed_at = EXCLUDED.original_executed_at,"
     " updated_at = now()"
-    " WHERE platform.stage.state = 'unresolved'"
+    " WHERE stage.state = 'unresolved'"
     " RETURNING run_id, stage, state"
 )
 _READ_LIFECYCLE = (
-    "SELECT object_kind, object_id, run_id, state, bucket, updated_at FROM platform.lifecycle_projection"
+    "SELECT object_kind, object_id, run_id, state, bucket, updated_at FROM lifecycle_projection"
 )
-_NEXT_EVENT_SEQ = "SELECT COALESCE(MAX(seq), 0) + 1 FROM platform.run_event WHERE run_id = %s"
+_NEXT_EVENT_SEQ = "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_event WHERE run_id = %s"
 _INSERT_EVENT = (
-    "INSERT INTO platform.run_event (run_id, seq, kind, stage, operation_id, payload)"
+    "INSERT INTO run_event (run_id, seq, kind, stage, operation_id, payload)"
     " VALUES (%s, %s, %s, %s, %s, %s::jsonb)"
 )
+_READ_EVENTS = (
+    "SELECT seq, at, kind, stage, operation_id, payload FROM run_event"
+    " WHERE run_id = %s AND seq > %s ORDER BY seq LIMIT %s"
+)
+#: One events read can never pull an unbounded history; the portal asks for windows.
+_EVENTS_LIMIT_CAP = 1000
 
 #: Operation kinds that may continue on a terminal run (the reconciliation and
 #: cancellation commands); every other kind needs a non-terminal run.
 _TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled"})
 _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
+
+#: The bound on the registered reuse lineage of one attempt; a longer chain is malformed.
+REUSE_LINEAGE_DEPTH = 256
+
+def _stored_receipt(row) -> dict | None:
+    """The parsed receipt of one locked stage row (jsonb arrives as text or a mapping)."""
+
+    receipt = row[1] if row and len(row) > 1 else None
+    if isinstance(receipt, str):
+        try:
+            receipt = json.loads(receipt)
+        except ValueError:
+            return None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _stored_reconciliation(row) -> object:
+    """The recorded reconciliation of one locked stage row, for idempotent repeats."""
+
+    receipt = _stored_receipt(row)
+    return receipt.get("reconciliation") if receipt is not None else None
+
+
+def _native_receipt_identity(receipt: object) -> tuple:
+    """The bound native identity of one receipt: endpoint job UUID plus failed receipt digest.
+
+    A repeat is only the same recorded fact when this identity is unchanged;
+    a receipt that renames the native job or its digest is a conflicting
+    submission, never an idempotent one.
+    """
+
+    if not isinstance(receipt, dict):
+        return (None, None)
+    return (receipt.get("native_run_id"), receipt.get("native_receipt_sha256"))
+
+
+def _evidence_digests(entries: object) -> set:
+    """The ``path#sha256=...`` digest fragments a reconciliation's evidence entries bind."""
+
+    digests = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, str) and "#sha256=" in entry:
+            fragment = entry.split("#sha256=", 1)[1]
+            if _is_sha256(fragment):
+                digests.add(fragment)
+    return digests
+
+
+def _is_canonical_uuid(value: object) -> bool:
+    """One canonical lowercase UUID string, the endpoint job identity shape."""
+
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return value == parsed
 
 
 def _json(value: Any) -> str | None:
@@ -235,13 +503,22 @@ class PlatformStore:
         Install (``platform_env``) exports ``PLATFORM_SERVICE_DSN`` for the
         platform_service role; the driver is imported lazily so the package
         carries no database dependency, and a missing DSN is an explicit
-        refusal - never a silent fallback to another store.
+        refusal - never a silent fallback to another store.  The one official
+        instance also carries the deploy-side sealed resolver derived from the
+        same environment (``PIPELINE_STORE_ROOT``); a missing store root is an
+        explicit refusal too, so no production path exists that reads registered
+        rows but cannot resolve their sealed checkpoints.
         """
 
         source = os.environ if environ is None else environ
         dsn = source.get("PLATFORM_SERVICE_DSN")
         if not dsn:
             raise PlatformStoreError("PLATFORM_SERVICE_DSN is not configured; the platform store is unavailable")
+        if sealed is None:
+            try:
+                sealed = sealed_resolver_from_environment(source)
+            except PipelineError as error:
+                raise PlatformStoreError(str(error)) from error
 
         def connect():
             import psycopg2
@@ -327,6 +604,9 @@ class PlatformStore:
         ``map_index`` (bound later by reconciliation when unknown).  The
         admission row lock is taken inside the same transaction that inserts
         all three rows: a closed gate (or any failure) leaves nothing behind.
+        A linked admission additionally requires that its parent holds no
+        non-terminal child: the reservation check runs under the same lock, so
+        concurrent submissions can never each admit one.
         """
 
         if not isinstance(dispatch, dict):
@@ -338,6 +618,11 @@ class PlatformStore:
         with self._transaction() as connection:
             _require_open(connection)
             cursor = connection.cursor()
+            if parent_run_id is not None:
+                cursor.execute(_OPEN_CHILD_RUN, (parent_run_id,))
+                open_child = cursor.fetchone()
+                if open_child is not None:
+                    raise OpenAttemptConflictError(parent_run_id, open_child[0], open_child[1])
             cursor.execute(
                 _INSERT_REQUEST,
                 (request_id, principal, target_hardware, main_assembly, _json(configuration), _json(baseline)),
@@ -393,15 +678,7 @@ class PlatformStore:
             return existing
         binding = self._rebind_predecessor(run_id=run_id, stage=stage, kind=kind)
         with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute(_FIND_OPERATION, (operation_key,))
-            row = cursor.fetchone()
-            if row is not None:
-                return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
-            if stage not in STAGE_IDS:
-                raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
-            _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
-            return self._insert_operation(
+            return self._register_operation_locked(
                 connection,
                 run_id=run_id,
                 stage=stage,
@@ -409,7 +686,211 @@ class PlatformStore:
                 operation_key=operation_key,
                 params_digest=params_digest,
                 dispatch=dispatch or {},
+                binding=binding,
             )
+
+    def _register_operation_locked(
+        self,
+        connection,
+        *,
+        run_id: str,
+        stage: str,
+        kind: str,
+        operation_key: str,
+        params_digest: str,
+        dispatch: dict,
+        binding: dict | None = None,
+    ) -> OperationRecord:
+        """The in-transaction core of ``register_operation``.
+
+        The same key with the same scope and parameters returns the recorded
+        operation; a conflict refuses without touching anything else.  The
+        reconcile confirmation calls this core inside its own write
+        transaction, so the maintenance registration, the binding backfill and
+        the settlement commit or roll back as one short unit.
+        """
+
+        cursor = connection.cursor()
+        cursor.execute(_FIND_OPERATION, (operation_key,))
+        row = cursor.fetchone()
+        if row is not None:
+            return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
+        if stage not in STAGE_IDS:
+            raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+        self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind, claiming=False)
+        _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
+        return self._insert_operation(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind=kind,
+            operation_key=operation_key,
+            params_digest=params_digest,
+            dispatch=dispatch,
+        )
+
+    def claim_operation(self, *, run_id: str, stage: str, operation_key: str) -> OperationClaim:
+        """Claim a registered operation as ``running`` (queued -> running; idempotent).
+
+        ``granted`` is True only for the call that performed the transition: a
+        driver must execute the side effect exactly once, and a repeat call
+        (``granted`` False) is a query/reconciliation of the already-claimed
+        operation - never a permission to execute again.  A side-effect claim
+        is refused while the run or the stage is terminal/unresolved, or while
+        the stage carries an unresolved operation; the reconcile/cancel kinds
+        stay claimable because reconciling the unknown outcome is the
+        controlled continuation.  Run and stage rows are locked before the
+        transition, so a claim racing a terminal confirmation is settled inside
+        one transaction instead of by a caller-side read.
+        """
+
+        if stage not in STAGE_IDS:
+            raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            existing = cursor.fetchone()
+            if existing is None:
+                raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
+            record = OperationRecord(*existing)
+            if record.run_id != run_id or record.stage != stage:
+                raise OperationConflictError("The operation key belongs to a different run or stage")
+            self._guard_domain(connection, run_id=run_id, stage=stage, kind=record.kind, claiming=True)
+            cursor.execute(_CLAIM_OPERATION, (operation_key, run_id, stage))
+            row = cursor.fetchone()
+            if row is not None:
+                return OperationClaim(record=OperationRecord(*row), granted=True)
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            fresh_row = cursor.fetchone()
+            if fresh_row is None:  # pragma: no cover - the row cannot vanish inside the transaction
+                raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
+            fresh = OperationRecord(*fresh_row)
+            if fresh.state == "running":
+                return OperationClaim(record=fresh, granted=False)
+            raise PlatformStoreError(f"The operation is {fresh.state!r}; it cannot be claimed again")
+
+    def settle_cache_release(self, *, run_id: str, stage: str, operation_key: str, receipt: dict) -> OperationRecord:
+        """Close a claimed cache release on the canonical IF-10 release receipt.
+
+        A cleanup's terminal state is never inferred from a stage outcome: it
+        binds the receipt of the actual release call, validated by the one
+        canonical ``validate_cache_release_receipt`` and bound to this database
+        operation (its operation id and registered parameter digest) and to this
+        Linux run.  Only a claimed (``running``) ``cache_release`` of the
+        confirmed-import stage may settle, inside one short transaction that
+        locks the run before the event sequence is allocated; repeating an
+        already settled operation returns the recorded result.  A failed,
+        unknown, foreign or otherwise non-canonical receipt is refused - never
+        reported as success.
+        """
+
+        from ..interface_records import InterfaceRecordError, validate_cache_release_receipt
+
+        if not isinstance(receipt, dict) or not receipt:
+            raise PlatformStoreError("A cache release must bind its canonical release receipt")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            try:
+                validate_cache_release_receipt(receipt)
+            except InterfaceRecordError as error:
+                raise PlatformStoreError(
+                    "The cache release receipt is not the canonical IF-10 release receipt"
+                ) from error
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            existing = cursor.fetchone()
+            if existing is None:
+                raise PlatformStoreError(f"The operation key {operation_key!r} is not registered")
+            record = OperationRecord(*existing)
+            if record.run_id != run_id or record.stage != stage:
+                raise OperationConflictError("The operation key belongs to a different run or stage")
+            if record.kind != "cache_release":
+                raise PlatformStoreError("Only a registered cache release settles through its release receipt")
+            if receipt["operation_id"] != record.operation_id:
+                raise PlatformStoreError("The release receipt names another operation")
+            if receipt["params_sha256"] != record.params_digest:
+                raise PlatformStoreError("The release receipt does not bind this operation's parameters")
+            if receipt["import"]["linux_run_id"] != run_id:
+                raise PlatformStoreError("The release receipt names another Linux run")
+            if record.state == "succeeded":
+                return record
+            if record.state != "running":
+                raise PlatformStoreError(f"The cache release is {record.state!r}; claim it before it settles")
+            cursor.execute(_SETTLE_CACHE_RELEASE, ("succeeded", operation_key, run_id, stage))
+            row = cursor.fetchone()
+            if row is None:
+                raise PlatformStoreError(f"The cache release is {record.state!r}; claim it before it settles")
+            settled = OperationRecord(*row)
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                stage=stage,
+                kind="cache_release",
+                operation_id=settled.operation_id,
+                payload={"state": "succeeded", "receipt": receipt},
+            )
+            return settled
+
+    def _guard_domain(self, connection, *, run_id: str, stage: str, kind: str, claiming: bool) -> None:
+        """One stage's side-effect domain: terminal and unknown states freeze it.
+
+        Runs inside the write transaction (run and stage rows locked in the
+        same order as every stage confirmation) so a registration or claim
+        racing a terminal confirmation is settled transactionally.  A
+        non-terminal kind is refused for a run that is not running (terminal
+        or unknown), for a terminal or unresolved stage, and while the stage
+        carries an unresolved operation - an unknown outcome only ever permits
+        reconciling that same operation, never a new key or parameter.  The
+        reconcile/cancel kinds skip the guard: they are the controlled
+        continuation.
+        """
+
+        if kind in _TERMINAL_KINDS:
+            return
+        if kind == "cache_release":
+            # The controlled same-identity cleanup: the intent may be registered
+            # before the import confirms, but it may run only for the stage whose
+            # import a confirmed record already binds - and it never re-does the
+            # engineering side effect itself.
+            if not claiming:
+                return
+            cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            cursor.execute(_LOCK_STAGE, (run_id, stage))
+            stage_row = cursor.fetchone()
+            current = stage_row[0] if stage_row else None
+            if current != "completed":
+                raise PlatformStoreError(
+                    f"A cache release requires the confirmed {stage!r} stage of run {run_id!r}"
+                )
+            return
+        cursor = connection.cursor()
+        cursor.execute(_LOCK_RUN, (run_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+        state = row[0]
+        if state in _TERMINAL_RUN_STATES:
+            raise PlatformStoreError(f"The run is terminal ({state}); only cancel/reconcile operations continue")
+        if state != "running":
+            raise PlatformStoreError(
+                f"The run is not running ({state!r}); a side effect of the {stage!r}"
+                " stage may neither register nor claim"
+            )
+        cursor.execute(_LOCK_STAGE, (run_id, stage))
+        stage_row = cursor.fetchone()
+        current = stage_row[0] if stage_row else None
+        if current is not None and (current in TERMINAL_STAGE_STATES or current == "unresolved"):
+            raise PlatformStoreError(
+                f"The {stage!r} stage of run {run_id!r} is {current!r}; only reconcile/cancel continue"
+            )
+        cursor.execute(_FIND_UNKNOWN_ORIGIN, (run_id, stage))
+        if cursor.fetchone() is not None:
+            raise PlatformStoreError("The stage has an unresolved operation; reconcile that same operation instead")
 
     def _identity_operation(
         self, *, run_id: str, stage: str, kind: str, operation_key: str, params_digest: str
@@ -466,6 +947,9 @@ class PlatformStore:
         definition = None
         sealed_root = None
         if predecessor in CONFIRMED_STAGE_STATES:
+            self._verify_checkpoint_scope(
+                predecessor_row[2], run_id=run_id, stage=predecessor, reused_from_run=predecessor_row[3]
+            )
             definition, sealed_root = self._verify_sealed(predecessor_row[2], predecessor_row[1])
         _sealed_receipt(
             predecessor_row[1],
@@ -534,7 +1018,7 @@ class PlatformStore:
     ) -> None:
         """Register one stage record: canonical state plus optional sealed receipt/checkpoint.
 
-        This is the store path that writes ``platform.stage`` rows on the
+        This is the store path that writes ``stage`` rows on the
         platform side.  A sealed ``completed`` row is immutable - a later
         confirmation for the same (run, stage) is an explicit refusal instead
         of a rewrite (a redo is a linked run, not an overwrite).
@@ -551,10 +1035,34 @@ class PlatformStore:
             raise PlatformStoreError("Reconciliation evidence must be a non-empty record")
         if reconcile is not None and state not in {"completed", "failed", "cancelled"}:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
+        if reconcile is not None and isinstance(reconcile.get("binding"), dict):
+            receipt, reconcile = self._byte_bound_orphan_receipt(
+                run_id=run_id, stage=stage, state=state, receipt=receipt, reconcile=reconcile
+            )
         definition = None
         sealed_root = None
+        reuse_binding = None
+        if reused_from_run is not None:
+            reuse_binding = self._verify_reuse_source(
+                run_id=run_id, stage=stage, checkpoint_uri=checkpoint_uri, reused_from_run=reused_from_run
+            )
+            if digest(receipt) != reuse_binding["receipt_digest"]:
+                raise PlatformStoreError(
+                    "The reused receipt is not the confirmed source receipt; reuse never re-authors it"
+                )
+            if original_executed_at != reuse_binding["original_executed_at"]:
+                raise PlatformStoreError("The reused execution instant is not the confirmed source instant")
+        self._verify_checkpoint_scope(
+            checkpoint_uri, run_id=run_id, stage=stage, reused_from_run=reused_from_run
+        )
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
             definition, sealed_root = self._verify_sealed(checkpoint_uri, receipt)
+        elif state == "failed" and (receipt or {}).get("artifacts"):
+            # The failed diagnostic never skips byte verification: every
+            # declared sealed member (subject- or report-class) is rebound to
+            # the sealed bytes, while the success-only qualifications stay
+            # with the completed path.
+            self._verify_sealed(checkpoint_uri, receipt, completed=False)
         _sealed_receipt(
             receipt,
             run_id=run_id,
@@ -567,13 +1075,31 @@ class PlatformStore:
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
-            if cursor.fetchone() is None:
+            run_row = cursor.fetchone()
+            if run_row is None:
                 raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            run_state = run_row[0]
+            if reconcile is not None:
+                reconcile = self._reconcile_operation(
+                    connection, run_id=run_id, stage=stage, reconcile=reconcile
+                )
             cursor.execute(_LOCK_STAGE, (run_id, stage))
             row = cursor.fetchone()
             current = row[0] if row else None
             if current is not None:
                 if current in TERMINAL_STAGE_STATES:
+                    if reconcile is not None:
+                        cursor.execute(_READ_STAGE_ROW, (run_id, stage))
+                        stored = cursor.fetchone()
+                        stored_receipt = _stored_receipt(stored)
+                        if (
+                            current == state
+                            and _stored_reconciliation(stored) == reconcile
+                            and _native_receipt_identity(stored_receipt) == _native_receipt_identity(receipt)
+                        ):
+                            # The same operation, evidence, binding, native identity and outcome
+                            # repeated: return the recorded result and change nothing.
+                            return
                     raise PlatformStoreError(
                         f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
                     )
@@ -584,7 +1110,45 @@ class PlatformStore:
                 if current != "unresolved" and reconcile is not None:
                     raise PlatformStoreError("Reconciliation only confirms an unresolved stage")
             elif reconcile is not None:
+                if isinstance(reconcile.get("binding"), dict):
+                    self._reconcile_orphan_binding(
+                        connection,
+                        cursor,
+                        run_id=run_id,
+                        stage=stage,
+                        state=state,
+                        receipt=receipt,
+                        reconcile=reconcile,
+                        run_state=run_state,
+                        checkpoint_uri=checkpoint_uri,
+                        reused_from_run=reused_from_run,
+                    )
+                    return
                 raise PlatformStoreError("Reconciliation requires the unresolved stage record of this run")
+            if reused_from_run is not None:
+                cursor.execute(_READ_RUN_PARENT, (run_id,))
+                parent_row = cursor.fetchone()
+                if parent_row is None or parent_row[0] != reused_from_run:
+                    raise PlatformStoreError("Reuse requires the registered parent run of this linked attempt")
+                cursor.execute(_READ_STAGE, (reused_from_run, stage))
+                source_row = cursor.fetchone()
+                if (
+                    source_row is None
+                    or source_row[0] != "completed"
+                    or source_row[2] != checkpoint_uri
+                    or digest(source_row[1]) != reuse_binding["receipt_digest"]
+                ):
+                    raise PlatformStoreError("The registered reuse source changed; retry the confirmation")
+                if digest(receipt) != reuse_binding["receipt_digest"]:
+                    raise PlatformStoreError(
+                        "The reused receipt is not the confirmed source receipt; retry the confirmation"
+                    )
+                cursor.execute(_READ_STAGE_TIME, (reused_from_run, stage))
+                time_row = cursor.fetchone()
+                if original_executed_at != (time_row[0] if time_row is not None else None):
+                    raise PlatformStoreError(
+                        "The reused execution instant is not the confirmed source instant; retry the confirmation"
+                    )
             if reconcile is not None:
                 operation_id = reconcile.get("operation_id")
                 if not isinstance(operation_id, str) or not operation_id:
@@ -624,6 +1188,13 @@ class PlatformStore:
                     payload={"state": state},
                 )
                 self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+                cursor.execute(_SETTLE_RECONCILE, (operation_id, run_id, stage))
+                if state == "completed" and stage != "publish":
+                    # The definite outcome lifts the whole run out of unresolved:
+                    # a completed non-publication stage continues as running
+                    # (the publication completion and the failed/cancelled
+                    # outcomes already settled the run in _stage_outcome).
+                    cursor.execute(_RESTORE_RUN_RUNNING, (run_id,))
                 return
             cursor.execute(
                 _INSERT_STAGE,
@@ -643,23 +1214,282 @@ class PlatformStore:
             )
             self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
 
+    def _byte_bound_orphan_receipt(
+        self, *, run_id: str, stage: str, state: str, receipt: dict | None, reconcile: dict
+    ) -> tuple[dict, dict]:
+        """Compose an orphan's failed receipt from the original native bytes - the one rule.
+
+        An orphan recovery never accepts a formed receipt or a digest string: the
+        reconciliation carries the raw inputs (the original file and the bound
+        endpoint job UUID) and this Store action itself loads the bytes, validates
+        the native job document, binds the outcome and identity, derives the digest
+        from those bytes, and normalizes the recorded evidence to that digest.  The
+        caller's layers hold no acceptance rules and cannot bypass the bytes.
+        """
+
+        if state != "failed":
+            raise PlatformStoreError("An orphan reconciliation records the observed failure")
+        if receipt is not None:
+            raise PlatformStoreError(
+                "An orphan recovery carries its original receipt inputs, never a formed receipt"
+            )
+        inputs = reconcile.get("native_receipt")
+        if not isinstance(inputs, dict):
+            raise PlatformStoreError(
+                "An orphan reconciliation must carry its original native receipt (path and endpoint job UUID)"
+            )
+        path = inputs.get("path")
+        native_run_id = inputs.get("native_run_id")
+        if not isinstance(path, str) or not path or not isinstance(native_run_id, str) or not native_run_id:
+            raise PlatformStoreError("The orphan receipt inputs name their original file and endpoint job UUID")
+        loaded = load_native_failed_receipt(path, stage=stage, native_run_id=native_run_id)
+        digest_entry = f"{loaded.path}#sha256={loaded.sha256}"
+        entries = reconcile.get("evidence")
+        entries = list(entries) if isinstance(entries, list) else []
+        contradicting = [
+            item
+            for item in entries
+            if isinstance(item, str)
+            and item.startswith(f"{loaded.path}#sha256=")
+            and item.split("#sha256=", 1)[1] != loaded.sha256
+        ]
+        if contradicting:
+            raise PlatformStoreError(f"The evidence entry contradicts the original receipt bytes: {contradicting[0]}")
+        normalized_evidence = [
+            item
+            for item in entries
+            if not (isinstance(item, str) and (item == loaded.path or item.startswith(f"{loaded.path}#")))
+        ] + [digest_entry]
+        composed = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "stage": loaded.stage,
+            "state": loaded.state,
+            "passed": False,
+            "native_run_id": loaded.native_run_id,
+            "native_receipt_sha256": loaded.sha256,
+        }
+        for key in ("error", "error_code", "detail"):
+            value = getattr(loaded, key)
+            if value is not None:
+                composed[key] = value
+        resolved = {key: value for key, value in reconcile.items() if key != "evidence"}
+        resolved["evidence"] = normalized_evidence
+        return composed, resolved
+
+    def _reconcile_operation(self, connection, *, run_id: str, stage: str, reconcile: dict) -> dict:
+        """Resolve the reconciliation's registered operation inside the write transaction.
+
+        The caller either names an already-registered reconcile operation, or
+        carries the registration itself (its key plus parameter digest); the
+        registration then travels in the same short locked transaction as the
+        binding and the settlement, so a refused reconciliation leaves no
+        maintenance row behind and a retry reuses the same operation identity.
+        """
+
+        operation_id = reconcile.get("operation_id")
+        operation_key = reconcile.get("operation_key")
+        params_digest = reconcile.get("params_digest")
+        if operation_id is not None and (operation_key is not None or params_digest is not None):
+            raise PlatformStoreError("A reconciliation names its operation or its registration, not both")
+        if operation_id is not None:
+            return reconcile
+        if not (
+            isinstance(operation_key, str)
+            and operation_key
+            and isinstance(params_digest, str)
+            and params_digest
+        ):
+            raise PlatformStoreError(
+                "A reconciliation must name its registered reconcile operation or carry its registration key"
+            )
+        record = self._register_operation_locked(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="reconcile",
+            operation_key=operation_key,
+            params_digest=params_digest,
+            dispatch={},
+        )
+        resolved = {key: value for key, value in reconcile.items() if key not in {"operation_key", "params_digest"}}
+        resolved["operation_id"] = record.operation_id
+        return resolved
+
+    def _reconcile_orphan_binding(
+        self,
+        connection,
+        cursor,
+        *,
+        run_id: str,
+        stage: str,
+        state: str,
+        receipt: dict | None,
+        reconcile: dict,
+        run_state: object,
+        checkpoint_uri,
+        reused_from_run,
+    ) -> None:
+        """Controlled orphan recovery: bind a queued intent's missing Airflow key, then confirm.
+
+        The one reconcile entry may fill only the missing binding columns of a
+        never-started queued intent (the 1.4.3 pre-candidate shape) from the
+        real Airflow full key the caller evidences.  The receipt must name this
+        run's own endpoint job - checked against the one canonical
+        ``native_run_id`` derivation from the operation's recorded DagRun -
+        and its failed-receipt digest must be the digest the reconciliation's
+        evidence entries bind.  The binding is accepted only after the lifecycle
+        view itself shows the bound task actually failed (never an unexecuted
+        ``upstream_failed`` sibling); the action's own pre-transaction check
+        refuses a DagRun that is not the settled failed fact before this
+        transaction opens.  Conflict, foreign, missing, ambiguous, live or
+        success facts refuse with zero change (the tentative binding rolls back
+        with the transaction), and no unresolved intermediate state is ever
+        fabricated.
+        """
+
+        if state != "failed":
+            raise PlatformStoreError("An orphan reconciliation records the observed failure")
+        if run_state != "queued":
+            raise PlatformStoreError("Orphan recovery requires the never-started queued run")
+        if checkpoint_uri is not None or reused_from_run is not None:
+            raise PlatformStoreError("An orphan reconciliation carries no checkpoint or reuse binding")
+        if not isinstance(receipt, dict):
+            raise PlatformStoreError("An orphan reconciliation carries its failed receipt")
+        binding = reconcile.get("binding")
+        operation_id = binding.get("operation_id") if isinstance(binding, dict) else None
+        task_id = binding.get("task_id") if isinstance(binding, dict) else None
+        map_index = binding.get("map_index") if isinstance(binding, dict) else None
+        if (
+            not isinstance(operation_id, str)
+            or not operation_id
+            or not isinstance(task_id, str)
+            or not task_id
+            or type(map_index) is not int
+            or map_index < -1
+        ):
+            raise PlatformStoreError("An orphan binding names its operation, task id and integer map index")
+        native_run = receipt.get("native_run_id")
+        native_sha = receipt.get("native_receipt_sha256")
+        if not _is_canonical_uuid(native_run) or not _is_sha256(native_sha):
+            raise PlatformStoreError("An orphan reconciliation binds its native run UUID and failed receipt digest")
+        if native_sha not in _evidence_digests(reconcile.get("evidence")):
+            raise PlatformStoreError(
+                "The failed receipt digest must be the one the reconciliation evidence entries bind"
+            )
+        reconcile_operation = reconcile.get("operation_id")
+        cursor.execute(_FIND_RECONCILE, (reconcile_operation, run_id, stage))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError(
+                "The reconciliation names no registered reconcile operation of this run and stage"
+            )
+        cursor.execute(_READ_ORPHAN_OPERATION, (operation_id, run_id))
+        row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError("The orphan binding names no operation of this run")
+        op_stage, kind, op_state, dag_id, dag_run_id, bound_task, bound_map, operation_key = row
+        if kind not in {"dispatch", "native"}:
+            raise PlatformStoreError("Only a queued dispatch intent may be recovered as an orphan")
+        if op_state != "queued" or bound_task is not None or bound_map is not None:
+            raise PlatformStoreError("The named operation is not an unstarted unbound orphan; refused")
+        if not (isinstance(dag_id, str) and dag_id and isinstance(dag_run_id, str) and dag_run_id):
+            raise PlatformStoreError("The operation lacks its recorded Airflow DagRun identity evidence")
+        if native_run != native_run_id(dag_run_id):
+            # The endpoint job identity is fixed by the run's own recorded DagRun id
+            # through the one canonical derivation: a foreign, copied or merely
+            # UUID-shaped value never authorizes recovery.
+            raise PlatformStoreError("The native receipt names another run's endpoint job; refused")
+        cursor.execute(_BIND_ORPHAN_OPERATION, (task_id, map_index, operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The orphan binding lost its operation to another writer")
+        # One statement carries every lifecycle fact of this acceptance: a single query
+        # evaluates the view once, so the task's and the DagRun's states are the same
+        # database snapshot - a schedule that flips between two reads is never two
+        # separately-read terminal facts.
+        cursor.execute(_READ_ORPHAN_LIFECYCLE, (operation_id, f"{dag_id}/{dag_run_id}"))
+        lifecycle = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        scheduling = lifecycle.get("scheduling")
+        if scheduling != ("failed", "terminal"):
+            # A fabricated or ambiguous key joins nothing (unknown), an unexecuted
+            # upstream_failed sibling never sent the native request, a live task is in
+            # flight and a green task contradicts the failure: all refuse, and the
+            # tentative binding rolls back with this transaction.
+            raise PlatformStoreError("The bound Airflow task does not prove its own failed fact; refused")
+        dag_run = lifecycle.get("dag_run")
+        if dag_run != ("failed", "terminal"):
+            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact; refused")
+        payload_receipt = {**receipt, "reconciliation": reconcile}
+        cursor.execute(_INSERT_STAGE, (run_id, stage, state, _json(payload_receipt), None, None, None))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The orphan stage record lost its run to another writer")
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="binding",
+            operation_id=operation_id,
+            payload={
+                "operation_key": operation_key,
+                "intent_stage": op_stage,
+                "reconciled_stage": stage,
+                "reconciled_state": state,
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": task_id,
+                "map_index": map_index,
+                "native_run_id": native_run,
+                "native_receipt_sha256": native_sha,
+            },
+        )
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="stage",
+            operation_id=reconcile_operation,
+            payload={"state": state},
+        )
+        self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+        cursor.execute(_SETTLE_ORPHAN_INTENT, (state, operation_id, run_id))
+        cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, stage))
+
     def _stage_outcome(self, connection, *, run_id: str, stage: str, state: str) -> None:
         """The run-terminal transition a stage record concludes, in the same transaction.
 
         A failed or cancelled stage ends its run; the confirmed publication
         ends it successfully.  The guarded update keeps the first terminal
         outcome: a later record never rewrites a succeeded, failed or
-        cancelled run.
+        cancelled run.  The same transaction settles the stage's operations:
+        every decided outcome closes the stage's non-reconcile operations -
+        claimed and never-claimed alike - to the mapped terminal state (a
+        ``cancel`` command closes as ``succeeded``: whether it actually
+        cancelled is the stage record's business), so no queued/running shadow
+        is left for maintenance.  An unresolved outcome freezes only the
+        claimed operation as unknown and leaves the run in place until the
+        evidenced reconciliation, which then settles the rest.
         """
 
-        if state == "completed" and stage == "publish":
+        run_outcome: str | None = None
+        if state == "completed":
             outcome = "succeeded"
+            if stage == "publish":
+                run_outcome = "succeeded"
         elif state in {"failed", "cancelled"}:
             outcome = state
+            run_outcome = state
+        elif state == "unresolved":
+            outcome = "unresolved"
         else:
             return
         cursor = connection.cursor()
-        cursor.execute(_SET_RUN_OUTCOME, (outcome, run_id))
+        if outcome == "unresolved":
+            cursor.execute(_SETTLE_UNKNOWN, (run_id, stage))
+            cursor.execute(_SET_RUN_UNRESOLVED, (run_id,))
+            return
+        cursor.execute(_SETTLE_OPERATIONS, (outcome, run_id, stage))
+        if run_outcome is not None:
+            cursor.execute(_SET_RUN_OUTCOME, (run_outcome, run_id))
 
     def _insert_event(self, connection, *, run_id: str, stage: str, kind: str, operation_id, payload) -> None:
         """Append one run event in the same transaction as the state change it describes."""
@@ -670,7 +1500,121 @@ class PlatformStore:
         sequence = row[0] if row else 1
         cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
 
-    def _verify_sealed(self, checkpoint_uri, receipt) -> tuple[dict | None, Path]:
+    def _verify_checkpoint_scope(
+        self, checkpoint_uri, *, run_id: str, stage: str, reused_from_run: str | None
+    ) -> None:
+        """A parseable sealed locator must name this run or the proven origin of its reuse chain.
+
+        Being able to parse a locator is not a consumption right: a reference
+        that reads as the standard ``store://sealed/<run_id>/<stage>`` locator
+        is refused unless it names this run, or the direct parent's stage row
+        proves the chain up to the original producer the locator names - every
+        link explicit in ``reused_from_run``, every intermediate row completed
+        and carrying the same locator, bounded and never walking a cycle.
+        Run ancestry alone is never stage lineage.  Non-locator references
+        stay opaque here and fail closed at their own resolver contract.
+        """
+
+        if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith(SEALED_URI_PREFIX):
+            return
+        try:
+            uri_run, uri_stage = parse_sealed_uri(checkpoint_uri)
+        except PipelineError:
+            # Not a standard locator: the deploy-side resolver contract decides.
+            return
+        if uri_stage != stage:
+            raise PlatformStoreError("The sealed checkpoint names another stage than the confirmation")
+        if uri_run == run_id:
+            return
+        if reused_from_run is not None and uri_run == self._stage_reuse_origin(reused_from_run, stage):
+            return
+        raise PlatformStoreError(
+            "The sealed checkpoint names a run that is neither the current run nor the proven origin "
+            "of its registered stage reuse chain"
+        )
+
+    def _stage_reuse_origin(self, run_id: str, stage: str) -> str | None:
+        """The original producer one stage row's registered reuse chain resolves to, or ``None``.
+
+        Every link must be explicit: the row names its direct source in
+        ``reused_from_run``, every intermediate row is completed and carries
+        the same locator, and the first row without a reuse declaration must
+        name its own run.  The walk is bounded and never walks a cycle.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_STAGE, (run_id, stage))
+            row = cursor.fetchone()
+        if row is None or row[0] != "completed" or not row[2]:
+            return None
+        locator = row[2]
+        seen = {run_id}
+        current = run_id
+        while row[3] is not None:
+            reused = row[3]
+            if reused in seen or len(seen) >= REUSE_LINEAGE_DEPTH:
+                return None
+            seen.add(reused)
+            with self._transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute(_READ_STAGE, (reused, stage))
+                row = cursor.fetchone()
+            if row is None or row[0] != "completed" or row[2] != locator:
+                return None
+            current = reused
+        if not isinstance(locator, str) or not locator.startswith(SEALED_URI_PREFIX):
+            return None
+        with suppress(PipelineError):
+            origin_run, origin_stage = parse_sealed_uri(locator)
+            if origin_stage == stage and origin_run == current:
+                return origin_run
+        return None
+
+    def _verify_reuse_source(
+        self, *, run_id: str, stage: str, checkpoint_uri, reused_from_run: str
+    ) -> dict:
+        """A linked attempt may reuse only the registered source stage of its own parent run.
+
+        The caller's string never grants consumption: the source must be the
+        run's registered ``parent_run_id``, its stage record must be the
+        confirmed completion whose registered checkpoint is exactly the
+        reference being confirmed, and that registered receipt must re-verify
+        against the sealed bytes.  The locked transaction re-checks only the
+        same identity and receipt digest.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_RUN_PARENT, (run_id,))
+            parent_row = cursor.fetchone()
+            cursor.execute(_READ_STAGE, (reused_from_run, stage))
+            source_row = cursor.fetchone()
+            cursor.execute(_READ_STAGE_TIME, (reused_from_run, stage))
+            source_time = cursor.fetchone()
+        if parent_row is None or parent_row[0] != reused_from_run:
+            raise PlatformStoreError("Reuse requires the registered parent run of this linked attempt")
+        if source_row is None or source_row[0] != "completed":
+            raise PlatformStoreError("Reuse names no confirmed source stage of that run and stage")
+        if source_row[2] != checkpoint_uri:
+            raise PlatformStoreError("The reused checkpoint is not the source stage's registered reference")
+        definition, sealed_root = self._verify_sealed(source_row[2], source_row[1])
+        _sealed_receipt(
+            source_row[1],
+            run_id=reused_from_run,
+            stage=stage,
+            state="completed",
+            checkpoint_uri=source_row[2],
+            definition=definition,
+            root=sealed_root,
+        )
+        return {
+            "checkpoint_uri": source_row[2],
+            "receipt_digest": digest(source_row[1]),
+            "original_executed_at": source_time[0] if source_time is not None else None,
+        }
+
+    def _verify_sealed(self, checkpoint_uri, receipt, *, completed: bool = True) -> tuple[dict | None, Path]:
         """Rebind the real sealed delivery for any stage before any registration.
 
         One owner for all six stages: the receipt's URI and inventory are
@@ -691,7 +1635,7 @@ class PlatformStore:
         manifest = read_delivery_manifest(root)
         subject = manifest.get("subject") or {}
         stage = receipt.get("stage")
-        if stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
+        if completed and stage in DELIVERY_STAGES and subject.get("digest") != receipt.get("subject_sha256"):
             raise PlatformStoreError("The sealed delivery subject does not match the receipt")
         records = subject.get("files") or []
         artifacts = receipt.get("artifacts")
@@ -705,8 +1649,28 @@ class PlatformStore:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery") from error
         stamped = {record["path"]: (record["bytes"], record["sha256"]) for record in records}
         received = {record["path"]: (record["bytes"], record["sha256"]) for record in artifacts}
-        if received != stamped:
+        subject_stamped = {path: value for path, value in stamped.items() if not _report_member(path)}
+        subject_received = {path: value for path, value in received.items() if not _report_member(path)}
+        if subject_received != subject_stamped:
             raise PlatformStoreError("The receipt's artifact inventory does not bind the sealed delivery")
+        for path, (size, checksum) in received.items():
+            if not _report_member(path):
+                continue
+            # Report members (class projected from the path) are verified
+            # against the actual sealed bytes; the subject stays report-free.
+            try:
+                member = confined(root, path)
+            except PipelineError as error:
+                raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes") from error
+            if not member.is_file() or member.stat().st_size != size or file_digest(member) != checksum:
+                raise PlatformStoreError("The receipt's report inventory does not bind the sealed bytes")
+        if not completed:
+            # Byte binding only: every declared member was just verified against
+            # the sealed bytes.  The handoff index, tool identities, the stage
+            # contract's declared evidence and the rebuilt definition are
+            # success qualifications and are never required to register a real
+            # failure - and never granted by one.
+            return None, root
         # The handoff identity is the sealed admission index's inventory digest
         # (the same owner as describe_handoff); the index file's own sha stays
         # an ordinary manifest artifact record, never conflated with it.
@@ -729,10 +1693,57 @@ class PlatformStore:
             record = stamped.get("input/" + name)
             if record is None or record[1] != checksum:
                 raise PlatformStoreError("The receipt's handoff binding does not match the sealed original bytes")
-        if digest(files) != receipt.get("handoff_sha256"):
-            raise PlatformStoreError(
-                "The receipt's handoff binding does not match the sealed input/handoff.json inventory"
-            )
+        # The prepared index must be complete: every staged input member except the
+        # carried request and the index itself has to appear in its inventory.
+        indexed = {path[len("input/"):] for path in stamped if path.startswith("input/")}
+        missing = sorted(indexed - set(files) - {"request.json", "handoff.json"})
+        if missing:
+            raise PlatformStoreError(f"The sealed input/handoff.json index is incomplete: {missing}")
+        expected_handoff = digest(files)
+        if stage != "freeze":
+            # Freeze binds the full admitted upload; every later stage binds the
+            # selected native transfer identity, byte-bound to the native discovery
+            # record.  A missing or self-declared-only identity refuses; the prepared
+            # index above stays member-for-member and completeness validated.
+            transfer_path = root / "transfer-manifest.json"
+            if not transfer_path.is_file():
+                raise PlatformStoreError("The sealed stage tree carries no native transfer identity")
+            transfer = read_data(transfer_path)
+            transfer_handoff = transfer.get("handoff_sha256") if isinstance(transfer, dict) else None
+            if not _is_sha256(transfer_handoff):
+                raise PlatformStoreError("The sealed transfer manifest carries no handoff identity")
+            try:
+                discovery = read_data(confined(root, "evidence/discovery.json"))
+            except (PipelineError, OSError) as error:
+                raise PlatformStoreError("The sealed tree carries no readable native discovery record") from error
+            if not isinstance(discovery, dict) or discovery.get("handoff_sha256") != transfer_handoff:
+                raise PlatformStoreError("The native transfer identity is not byte-bound to the sealed discovery")
+            receipt_index = index.get("input_receipt")
+            inventory = receipt_index.get("inventory") if isinstance(receipt_index, dict) else None
+            if not isinstance(inventory, dict) or not inventory:
+                raise PlatformStoreError("The sealed handoff index carries no native input inventory")
+            natives = {path[len("input/cad/"):] for path in stamped if path.startswith("input/cad/")}
+            if set(inventory) != natives:
+                raise PlatformStoreError(
+                    "The native input inventory does not match the sealed native originals: "
+                    f"missing={sorted(natives - set(inventory))} extra={sorted(set(inventory) - natives)}"
+                )
+            for name, checksum in inventory.items():
+                record = stamped.get("input/cad/" + str(name))
+                if record is None or record[1] != checksum:
+                    raise PlatformStoreError(
+                        "The native input inventory is not byte-bound to the sealed originals"
+                    )
+            native_files = discovery.get("native_files")
+            if not isinstance(native_files, dict) or native_files != inventory:
+                raise PlatformStoreError("The native input inventory differs from the sealed discovery record")
+            if digest(inventory) != transfer_handoff:
+                raise PlatformStoreError(
+                    "The native transfer identity is not the digest of the sealed native inventory"
+                )
+            expected_handoff = transfer_handoff
+        if expected_handoff != receipt.get("handoff_sha256"):
+            raise PlatformStoreError("The receipt's handoff binding does not match the sealed identity for this stage")
         if stage == "freeze":
             try:
                 sealed_tool = read_data(confined(root, "tool.json"))
@@ -786,6 +1797,7 @@ class PlatformStore:
         if row is None or row[0] != "completed":
             return None
         receipt = row[1]
+        self._verify_checkpoint_scope(row[2], run_id=run_id, stage=stage, reused_from_run=row[3])
         definition, sealed_root = self._verify_sealed(row[2], receipt)
         _sealed_receipt(
             receipt,
@@ -844,6 +1856,34 @@ class PlatformStore:
                 connection, run_id=run_id, stage=stage, kind=kind, operation_id=None, payload=payload or {}
             )
 
+    def run_events(self, run_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict]:
+        """One run's recorded events, strictly ordered and bounded (the event read API).
+
+        ``after_seq`` pages forward only; ``limit`` is capped so one read never
+        pulls an unbounded history.
+        """
+
+        if not isinstance(after_seq, int) or after_seq < 0:
+            raise PlatformStoreError("after_seq must be a non-negative integer")
+        if not isinstance(limit, int) or limit < 1:
+            raise PlatformStoreError("limit must be a positive integer")
+        bounded = min(limit, _EVENTS_LIMIT_CAP)
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_EVENTS, (run_id, after_seq, bounded))
+            rows = cursor.fetchall()
+        return [
+            {
+                "seq": row[0],
+                "at": row[1],
+                "kind": row[2],
+                "stage": row[3],
+                "operation_id": row[4],
+                "payload": row[5],
+            }
+            for row in rows
+        ]
+
     def run_record(self, run_id: str) -> dict | None:
         """One run's identity and lineage (no display fields, no receipts)."""
 
@@ -860,6 +1900,30 @@ class PlatformStore:
             "parent_run_id": row[2],
             "from_stage": row[3],
             "tool_identity": row[4],
+        }
+
+    def request_record(self, request_id: str) -> dict | None:
+        """One admitted request's immutable identity and its initial dispatch digest.
+
+        ``principal``/``target_hardware``/``main_assembly`` are the sealed acceptance
+        facts; ``dispatch_digest`` is the initial dispatch intent's parameter digest,
+        so an uncertain retry can prove the requested frame equals the immutable
+        admission before re-triggering.  ``None`` means the request row is absent.
+        """
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_REQUEST_RECORD, (request_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "request_id": request_id,
+            "principal": row[0],
+            "target_hardware": row[1],
+            "main_assembly": row[2],
+            "sealed_at": row[3],
+            "dispatch_digest": row[4],
+            "purpose": row[5].get("purpose") if isinstance(row[5], dict) else None,
         }
 
     def stage_records(self, run_id: str) -> dict[str, dict]:
@@ -994,8 +2058,11 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
 
     A terminal confirmation must bind its receipt completely, and the reuse
     query runs exactly the same validation - downstream can never trust the
-    state string alone.  ``blocked`` records an unexecuted stage and carries
-    no receipt requirements; native stages validate the bindings they carry.
+    state string alone.  A receipt produced by a reused stage keeps its
+    original producer's identity: it must name either this run or the run of
+    the locator it was carried under.  ``blocked`` records an unexecuted
+    stage and carries no receipt requirements; native stages validate the
+    bindings they carry.
     """
 
     if state == "blocked":
@@ -1006,7 +2073,11 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
         raise PlatformStoreError("A sealed stage confirmation must carry its bound receipt")
     if receipt.get("schema_version") != BUNDLE_SCHEMA:
         raise PlatformStoreError("The sealed receipt uses an unknown schema")
-    if receipt.get("run_id") != run_id or receipt.get("stage") != stage:
+    named = {run_id}
+    if isinstance(checkpoint_uri, str) and checkpoint_uri.startswith(SEALED_URI_PREFIX):
+        with suppress(PipelineError):
+            named.add(parse_sealed_uri(checkpoint_uri)[0])
+    if receipt.get("run_id") not in named or receipt.get("stage") != stage:
         raise PlatformStoreError("The sealed receipt names another run or stage")
     if state == "unresolved":
         if receipt.get("state") != "unresolved":
@@ -1054,6 +2125,42 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
             raise PlatformStoreError(str(error)) from error
         if quality.get("subject_sha256") != subject:
             raise PlatformStoreError("The sealed receipt's quality payload is bound to another subject")
+        if root is not None:
+            # The sealed report bytes are the delivery's own record: the file in
+            # the sealed tree must itself be a qualified report for this
+            # subject, its full deterministic payload (every check and detail)
+            # must equal the inline quality payload, and the report member must
+            # be registered with byte binding.  A sealed passed-bit flip, a
+            # changed check detail or an unregistered report member refuses
+            # instead of registering a contradictory success; the read-back and
+            # reuse paths run this same check.
+            try:
+                sealed_quality = require_qualified_report(
+                    read_data(confined(root, "reports/quality.json")), definition, root=root
+                )
+            except (PipelineError, OSError) as error:
+                raise PlatformStoreError("The sealed tree carries no qualified reports/quality.json") from error
+            if canonical(sealed_quality) != canonical(quality):
+                raise PlatformStoreError("The sealed quality report contradicts the receipt's quality payload")
+            artifacts = receipt.get("artifacts")
+            members = (
+                [
+                    record
+                    for record in artifacts
+                    if isinstance(record, dict) and record.get("path") == "reports/quality.json"
+                ]
+                if isinstance(artifacts, list)
+                else []
+            )
+            if not members:
+                raise PlatformStoreError("The registered objects lack the byte-bound reports/quality.json member")
+            report_path = root / "reports" / "quality.json"
+            if not any(
+                record.get("bytes") == report_path.stat().st_size
+                and record.get("sha256") == file_digest(report_path)
+                for record in members
+            ):
+                raise PlatformStoreError("The registered reports/quality.json member does not bind the sealed bytes")
     if stage == "publish":
         submission = receipt.get("submission")
         if (

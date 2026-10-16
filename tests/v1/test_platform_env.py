@@ -30,6 +30,7 @@ def _load_from_path(name: str, path: Path):
 
 
 platform_config = _load_from_path("deploy_platform_config_env", OPERATOR / "platform_config.py")
+render_operator = _load_from_path("deploy_render_operator_env", OPERATOR / "render_operator.py")
 platform_env = _load_from_path("deploy_platform_env", OPERATOR / "platform_env.py")
 install_record = _load_from_path("deploy_install_record_env", OPERATOR / "install_record.py")
 
@@ -181,8 +182,56 @@ class PlatformEnvTests(unittest.TestCase):
         env_file = Path(result["env_path"])
         self.assertEqual(stat.S_IMODE(env_file.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(env_file.parent.stat().st_mode), 0o700)
-        parsed = dict(line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if line)
+        # The file carries the one canonical encoding; reading it back with the canonical
+        # decoder must reproduce every value byte-for-byte (shell-safety quoting included).
+        parsed = {
+            key: render_operator.decode_env_value(raw.strip())
+            for key, raw in (
+                line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if line
+            )
+        }
         self.assertEqual(parsed, env)
+
+    def test_the_env_encoding_round_trips_every_boundary_value(self) -> None:
+        """One contract: encode -> decode -> bash source reproduce the exact bytes."""
+
+        import subprocess
+
+        samples = {
+            "plain": "m3.0",
+            "ampersand_dsn": "postgresql://role@/db?host=/srv/socket&port=5433",
+            "spaces": "two words and more",
+            "single_quote": "it's quoted",
+            "double_quote": 'with "double" quotes',
+            "dollar_and_backtick": "$HOME `date` $(id)",
+            "semicolons_and_stars": "a;b*c|d>e",
+            "backslash": "back\\slash",
+            "comma_list": "tenant-a,tenant-b",
+            "space_only": " ",
+        }
+        lines = render_operator.encode_env_lines(
+            (f"VALUE_{key.upper()}", value) for key, value in samples.items()
+        )
+        env_file = self.root / "boundary.env"
+        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        decoded = {
+            key: render_operator.decode_env_value(raw)
+            for key, raw in (line.split("=", 1) for line in lines)
+        }
+        self.assertEqual(decoded, {f"VALUE_{key.upper()}": value for key, value in samples.items()})
+        # A clean bash source (no inherited environment) observes the same bytes.
+        # The format stays single-quoted: an unquoted \0 is quote-removed to a literal "0".
+        reads = " ; ".join(f"printf '%s\\0' \"${{VALUE_{key.upper()}}}\"" for key in samples)
+        result = subprocess.run(
+            ["env", "-i", "bash", "-c", 'set -a ; source "$1" ; set +a ; ' + reads, "boundary", str(env_file)],
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sourced = [item.decode("utf-8") for item in result.stdout.split(b"\x00")[:-1]]
+        self.assertEqual(sourced, list(samples.values()))
+        # A line break cannot be represented in this one-line format: the encoder refuses it.
+        with self.assertRaises(ValueError):
+            render_operator.encode_env_value("a\nb")
 
     def test_wheel_selection_is_bound_to_the_release(self):
         second = self.tree / "another.whl"

@@ -101,6 +101,19 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn('form.append("change_summary", summaryInput.value.trim())', app)
         self.assertIn('$("change-summary")', app)
 
+    def test_purpose_is_a_required_select_without_a_default(self) -> None:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<label for="purpose-select" class="muted small">用途（必填）</label>', html)
+        self.assertIn('<select id="purpose-select">', html)
+        self.assertIn('<option value="">请选择用途</option>', html)
+        self.assertIn('<option value="engineering">工程交付</option>', html)
+        self.assertIn('<option value="inspection_preview">检查预览</option>', html)
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
+        self.assertIn('form.append("purpose", purposeSelect.value)', app)
+        self.assertIn("用途为必填：请选择用途后重试", app)
+        # The select feeds the start gate and the submit body from the same id.
+        self.assertEqual(app.count('$("purpose-select")'), 3)
+
     def test_targets_fetch_failure_is_distinct_from_an_unconfigured_platform(self) -> None:
         app = (STATIC / "app.js").read_text(encoding="utf-8")
         self.assertIn("平台未配置发布目标", app)

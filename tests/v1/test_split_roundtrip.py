@@ -17,17 +17,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
-from description_pipeline.io import digest, write_json
+from description_pipeline.io import digest
+from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.orchestration import stage_transfer as transfer
-from description_pipeline.orchestration import linux_runner
-from description_pipeline.orchestration.linux_store import LinuxStore
+from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend, record as native_record
-from .test_linux_split import portable_record
 from .test_stage_transfer import native_tool
 
 
@@ -151,7 +150,7 @@ class SplitRoundtripTests(unittest.TestCase):
             expected_digest=self.handoff,
             expected_files=package_inventory(self.handoff_dir),
             main_assembly="cad/robot.SLDASM",
-            configuration={"record_roots": [str(self.records)]},
+            configuration={"record_roots": [str(self.records)], "purpose": PURPOSE_ENGINEERING},
             targets={"nd_fixture": {"repository_slug": "mimicverse/description", "base": "feature/control"}},
             preparer=lambda *args, **kwargs: prepare_native_package(*args, backend=self.discovery_backend, **kwargs),
             on_event=record,
@@ -190,8 +189,25 @@ class SplitRoundtripTests(unittest.TestCase):
         )
 
         # The capture phase runs under the native role; simulate only that environment
-        # fact (the role-aware tool record refuses the portable host).
-        with patch.object(solidworks, "_native_tool_record", return_value=native_tool()):
+        # fact (the role-aware tool record refuses the portable host).  A Windows-rooted
+        # producer root, when the scenario asks for one, enters the handoff BEFORE the
+        # seal so the sealed receipt carries it coherently.
+        windows_root = getattr(self, "_windows_root", None)
+        original_inspect = steps.inspect_prepared_input
+
+        def inspect_with_root(*args, **kwargs):
+            report = original_inspect(*args, **kwargs)
+            if windows_root is not None:
+                report["input_receipt"] = {
+                    **(report.get("input_receipt") or {}),
+                    "resolved_package_root": windows_root,
+                }
+            return report
+
+        with (
+            patch.object(solidworks, "_native_tool_record", return_value=native_tool()),
+            patch.object(steps, "inspect_prepared_input", side_effect=inspect_with_root),
+        ):
             capture = solidworks.capture(
                 prepared_package,
                 self.capture_output,
@@ -210,83 +226,20 @@ class SplitRoundtripTests(unittest.TestCase):
         native_stages = json.loads((self.capture_output / "reports/native-stages.json").read_text(encoding="utf-8"))
         self.assertEqual(native_stages["execution_scope"], ["freeze", "discover", "capture"])
         self.assertTrue(native_stages["events"])
-        return native_stages
-
-    def test_real_freeze_seals_and_the_real_tail_verifies(self) -> None:
-        events: list[dict] = []
-        prepared_package, _target, prepared_files = self._prepare(events)
-        native_stages = self._capture(events, prepared_package, prepared_files)
-
-        # The real Linux boundary: store admission seeds the raw native events, then the
-        # portable runner drives generate and verify as their own staged checkpoints with
-        # the actual generator and verifier (MuJoCo consumer gate included).
-        store = LinuxStore(self.root / "linux-store")
-        admitted = store.import_capture(
-            self.run_id,
-            self.capture_output / transfer.CAPTURE_ARCHIVE,
-            expected_handoff_sha256=self.handoff,
-            expected_main_assembly="cad/robot.SLDASM",
-            expected_native_tool=native_tool(),
+        # The DAG materializes the frozen request into the capture tree; the
+        # generate reader refuses a delivery that does not carry it.
+        request = build_request_evidence(
+            purpose=PURPOSE_ENGINEERING,
+            request_id="fixture-frozen-request",
+            target_hardware="nd_fixture",
+            change_summary="split roundtrip fixture request",
+            main_assembly="cad/robot.SLDASM",
+            handoff_digest=self.handoff,
+            platform_config_digest="c" * 64,
         )
-        self.assertEqual(admitted.get("state"), "capture_admitted")
-        seeded = [
-            event for event in store.events(self.run_id) if event.get("stage") in {"freeze", "discover", "capture"}
-        ]
-        self.assertEqual(seeded, native_stages["events"])
-
-        with patch.object(linux_runner, "tool_record", return_value=portable_record(native_tool())):
-            generated = linux_runner.run_portable_stage(store, self.run_id, "generate")
-            self.assertEqual(generated.get("state"), "generated", generated.get("error"))
-            subject = generated.get("subject_sha256")
-            self.assertTrue(subject)
-            result = linux_runner.run_portable_stage(store, self.run_id, "verify", expected_subject=subject)
-        # The control fixture is explicitly NOT native CAD qualification: the release-only
-        # gates below can never pass on it.  Everything else must, and any drift beyond the
-        # documented control limit set fails this test.
-        control_limits = {
-            "source.native",  # control fixture is not native CAD qualification
-            "source.dependencies",  # fixture closure has no top_level mapping row
-            "physics.mass_closure_equality",  # fixture backend has no assembly_mass_properties
-            "physics.independent",  # fixture inertia payload carries no qualified API receipt
-            "geometry.base_link",
-            "geometry.arm_link",
-            "geometry.assets",
-            "geometry.expected_extent",
-        }
-        diagnostic = Path(result["diagnostic_path"])
-        quality = json.loads((diagnostic / "reports/quality.json").read_text(encoding="utf-8"))
-        failed = {
-            check["id"] for check in quality["checks"] if check.get("passed") is False or check.get("state") == "failed"
-        }
-        offenders = {check["id"]: check for check in quality["checks"] if check["id"] in failed - control_limits}
-        self.assertTrue(failed <= control_limits, json.dumps(offenders, ensure_ascii=False)[:2400])
-        gates = {check.get("id"): check for check in quality["checks"]}
-        for required in (
-            "bundle.subject",
-            "input.valid",
-            "source.native_discovery",
-            "frames.native",
-            "urdf.syntax_names",
-            "joints.shoulder_pitch_joint",
-            "urdf.topology",
-            "consumer.urdf",
-            "verification.complete",
-        ):
-            self.assertTrue(gates[required].get("passed"), gates[required])
-        self.assertEqual(quality["subject_sha256"], gates["bundle.subject"]["details"]["sha256"])
-        self.assertEqual(quality["subject_sha256"], subject)
-        self.assertEqual(result["state"], "failed")
-        self.assertIn("URDF verification failed", result["error"])
-        self.assertEqual(store.receipt_path(self.run_id, "generate").is_file(), True)
-        stored_verify = json.loads(store.receipt_path(self.run_id, "verify").read_text(encoding="utf-8"))
-        self.assertEqual(stored_verify["state"], "failed")
-
-        # The real generator ran and the transfer provenance survived the portable tail.
-        self.assertTrue((diagnostic / "urdf/robot.urdf").is_file())
-        self.assertTrue((diagnostic / "transfer-manifest.json").is_file())
-        self.assertTrue((diagnostic / "reports/native-tool.json").is_file())
-        carried = json.loads((diagnostic / "reports/native-stages.json").read_text(encoding="utf-8"))
-        self.assertEqual(carried["events"], native_stages["events"])
+        (self.capture_output / "input").mkdir(parents=True, exist_ok=True)
+        (self.capture_output / "input" / "request.json").write_bytes(request_evidence_bytes(request))
+        return native_stages
 
     def _windows_resume_seed(
         self, events: list[dict], prepared_package: Path, prepared_files: dict
@@ -298,15 +251,20 @@ class SplitRoundtripTests(unittest.TestCase):
         genuine native capture records, while the archived Linux inputs stay identical.
         """
 
-        self._capture(events, prepared_package, prepared_files)
+        self._windows_root = rf"C:\description-v1-review\acceptance-review\state\prepared\{self.run_id}"
+        try:
+            self._capture(events, prepared_package, prepared_files)
+        finally:
+            del self._windows_root
         seed = self.root / "resume-seed"
         shutil.copytree(self.capture_output, seed)
         sealed_receipt = seed / "input/handoff.json"
-        report = json.loads(sealed_receipt.read_text(encoding="utf-8"))
-        report["input_receipt"]["resolved_package_root"] = (
-            rf"C:\description-v1-review\acceptance-review\state\prepared\{self.run_id}"
+        # The Windows producer root is part of the sealed receipt itself - nothing is
+        # edited after the seal.
+        self.assertIn(
+            "resolved_package_root",
+            json.loads(sealed_receipt.read_text(encoding="utf-8"))["input_receipt"],
         )
-        write_json(sealed_receipt, report)
         return seed, sealed_receipt
 
     def test_windows_rooted_receipt_resumes_from_the_local_archived_input(self) -> None:

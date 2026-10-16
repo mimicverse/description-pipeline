@@ -96,7 +96,6 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     (evidence / "source").mkdir(parents=True)
     (evidence / "source/base.SLDPRT").write_bytes(b"PART-BYTES")
     write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
-    write_json(evidence / "raw/source_config.json", {})
     (evidence / "evidence").mkdir()
     identity = {
         "provider": "solidworks",
@@ -117,6 +116,13 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
             },
         },
     )
+    # The capture stage declares evidence/capture.json, evidence/geometry/ and
+    # evidence/native-runtime.json as native outputs; the synthetic tree carries
+    # them so a sealed capture delivery covers its stage contract.
+    write_json(evidence / "capture.json", {"main_assembly": main, "instances": [], "states": []})
+    write_json(evidence / "native-runtime.json", {"api": "synthetic", "session": {}})
+    (evidence / "geometry").mkdir()
+    (evidence / "geometry/base.stl").write_bytes(b"STL-BYTES")
     write_manifest(
         evidence,
         kind="solidworks",
@@ -669,7 +675,10 @@ class StageTransferTests(unittest.TestCase):
                 "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "imu_datum"}],
             }
             snapshot = work / "snapshot"
-            freeze(config, snapshot, backend=backend, worker_version="test-worker")
+            # The fixture keeps its authoring carriers; the retired keys are
+            # dropped at the call boundary and only groups/axis_requests reach
+            # the product.
+            freeze(support.capture_requests(config), snapshot, backend=backend, worker_version="test-worker")
 
             capture = self.base / "real-capture"
             (capture / "input" / "cad").mkdir(parents=True)

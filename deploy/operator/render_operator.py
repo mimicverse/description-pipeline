@@ -76,6 +76,43 @@ def die(message: str) -> None:
     raise SystemExit(f"render_operator: {message}")
 
 
+#: The one env-file encoding: a value stays bare only when every byte is in this shell-safe
+#: set; anything else (the libpq DSNs' ``&``/``?``, lists' ``,``, quoted paths) is single-quoted
+#: by shlex so that BOTH readers of this file - a shell ``source`` and the KEY=VALUE parser
+#: below - observe the identical bytes.  Every writer (this module's resolved.env and
+#: platform_env's operator.env) and every reader share these helpers; no consumer parses the
+#: file with its own quoting assumptions.
+ENV_SAFE = re.compile(r"^[A-Za-z0-9._/:=@%+-]*$")
+
+
+def encode_env_value(value: str) -> str:
+    """The canonical on-disk encoding of one env value.
+
+    The format is one line per key=value, so a value carrying a line break cannot be
+    represented: the encoder refuses it (the writer fails closed) instead of emitting a
+    file that every reader would misparse.
+    """
+
+    if "\n" in value or "\r" in value:
+        raise ValueError("an env value cannot carry a line break")
+    return value if ENV_SAFE.fullmatch(value) else shlex.quote(value)
+
+
+def encode_env_lines(pairs) -> list[str]:
+    """Sorted ``KEY=value`` lines with the canonical encoding; empty values are omitted."""
+
+    return [f"{key}={encode_env_value(value)}" for key, value in sorted(pairs) if value != ""]
+
+
+def decode_env_value(raw: str) -> str:
+    """The exact inverse of :func:`encode_env_value` for one KEY=VALUE's value part."""
+
+    parts = shlex.split(raw, comments=False, posix=True)
+    if len(parts) != 1:
+        raise ValueError(f"the env value is not one shell word: {raw!r}")
+    return parts[0]
+
+
 def load_env(path: Path | None) -> dict[str, str]:
     values: dict[str, str] = {}
     if path is not None:
@@ -85,10 +122,13 @@ def load_env(path: Path | None) -> dict[str, str]:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            key, separator, value = stripped.partition("=")
+            key, separator, raw = stripped.partition("=")
             if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
                 die(f"{path}:{number}: expected KEY=VALUE")
-            values[key.strip()] = value.strip()
+            try:
+                values[key.strip()] = decode_env_value(raw.strip())
+            except ValueError as error:
+                die(f"{path}:{number}: {error}")
     else:
         values = {key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)}
     for required in (
@@ -524,13 +564,7 @@ def main() -> int:
         (args.units_dir / "description-operator-proxy.service").write_text(proxy_unit, encoding="utf-8")
         print(f"OPERATOR_UNITS={args.units_dir}")
 
-    safe = re.compile(r"^[A-Za-z0-9._/:=@%+-]*$")
-    resolved_lines = [
-        f"{key}={value if safe.fullmatch(value) else shlex.quote(value)}"
-        for key, value in sorted(resolved.items())
-        if value != ""
-    ]
-    write_private(state / "resolved.env", "\n".join(resolved_lines) + "\n")
+    write_private(state / "resolved.env", "\n".join(encode_env_lines(resolved.items())) + "\n")
 
     if args.dry_run:
         for relative in ("portal.json", "nginx/nginx.conf", "resolved.env", "feishu.env"):

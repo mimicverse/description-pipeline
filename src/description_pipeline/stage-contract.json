@@ -9,8 +9,8 @@
       "name": "Freeze inputs",
       "name_zh": "冻结输入",
       "doc": {
-        "input": "已完成上传、认证主体、主装配及配置目标；路径、文件类型、大小和选择有效",
-        "output": "不可变请求、上传清单与原件；清单闭合、字节及摘要一致"
+        "input": "已完成上传、认证主体、主装配、配置目标、用途及必填提交说明；路径、文件类型、大小和选择有效",
+        "output": "不可变请求、上传清单与原件；清单闭合、字节及摘要一致；不启动 CAD"
       },
       "inputs": [
         {
@@ -113,7 +113,7 @@
       "name": "Capture evidence",
       "name_zh": "采集证据",
       "doc": {
-        "input": "封存计划及同一工程副本；工具、计划摘要、配置和实例身份一致；选择段先核对 CAD 声明的交付身份（dp.*）完整性，必需声明缺失即拒绝，提交值不替代声明",
+        "input": "封存计划及同一工程副本；工具、计划摘要、已保存配置和实例身份一致；身份按逐字段规则核对，不设置全部 `dp.*` 齐备的前置门",
         "output": "完整原生证据；重建、原生状态读取、临时选择/配置恢复、几何覆盖和源文件稳定检查通过，传输闭合"
       },
       "inputs": [
@@ -141,7 +141,7 @@
         },
         {
           "label": "Native meshes",
-          "path": "evidence/native-meshes/",
+          "path": "evidence/geometry/",
           "class": "frozen"
         },
         {
@@ -162,7 +162,7 @@
       ],
       "evidence": [
         "evidence/capture.json",
-        "evidence/native-meshes/",
+        "evidence/geometry/",
         "evidence/native-runtime.json"
       ]
     },

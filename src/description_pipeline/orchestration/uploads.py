@@ -56,6 +56,7 @@ MAIN_ASSEMBLY_FIELD = "main_assembly"
 MAX_MAIN_ASSEMBLY_BYTES = 1024
 TARGET_HARDWARE_FIELD = "target_hardware"
 CHANGE_SUMMARY_FIELD = "change_summary"
+PURPOSE_FIELD = "purpose"
 MAX_TARGET_HARDWARE_BYTES = 128
 MAX_CHANGE_SUMMARY_BYTES = 1024
 MAX_FILES = 4096
@@ -95,6 +96,7 @@ class UploadReceipt:
     main_assembly: str | None = None
     target_hardware: str | None = None
     change_summary: str | None = None
+    purpose: str | None = None
 
 
 class UploadGate:
@@ -260,8 +262,10 @@ class _Receiver:
         self._assembly: str | None = None
         self._target_seen = False
         self._summary_seen = False
+        self._purpose_seen = False
         self._target: str | None = None
         self._summary: str | None = None
+        self._purpose: str | None = None
 
     def callbacks(self) -> dict[str, Any]:
         return {
@@ -310,22 +314,33 @@ class _Receiver:
             self._assembly_seen = True
             self._text_field = MAIN_ASSEMBLY_FIELD
             return
-        if field in {TARGET_HARDWARE_FIELD.encode("ascii"), CHANGE_SUMMARY_FIELD.encode("ascii")}:
+        if field in {
+            TARGET_HARDWARE_FIELD.encode("ascii"),
+            CHANGE_SUMMARY_FIELD.encode("ascii"),
+            PURPOSE_FIELD.encode("ascii"),
+        }:
             name = bytes(field).decode("ascii")
             if params.get(b"filename"):
                 raise UploadRejected(400, "发布身份字段不能作为文件上传")
-            if (name == TARGET_HARDWARE_FIELD and self._target_seen) or (
-                name == CHANGE_SUMMARY_FIELD and self._summary_seen
-            ):
+            seen = {
+                TARGET_HARDWARE_FIELD: self._target_seen,
+                CHANGE_SUMMARY_FIELD: self._summary_seen,
+                PURPOSE_FIELD: self._purpose_seen,
+            }[name]
+            if seen:
                 raise UploadRejected(400, "上传包含重复的发布身份字段")
             if name == TARGET_HARDWARE_FIELD:
                 self._target_seen = True
-            else:
+            elif name == CHANGE_SUMMARY_FIELD:
                 self._summary_seen = True
+            else:
+                self._purpose_seen = True
             self._text_field = name
             return
         if field != UPLOAD_FIELD.encode("ascii"):
-            raise UploadRejected(400, "只接受 files 文件部分与 main_assembly/target_hardware/change_summary 选择")
+            raise UploadRejected(
+                400, "只接受 files 文件部分与 main_assembly/target_hardware/change_summary/purpose 选择"
+            )
         raw_name = params.get(b"filename")
         if not raw_name:
             raise UploadRejected(400, "上传分片缺少文件名")
@@ -440,6 +455,9 @@ class _Receiver:
         if field == CHANGE_SUMMARY_FIELD:
             self._summary = value.strip() or None
             return
+        if field == PURPOSE_FIELD:
+            self._purpose = value.strip() or None
+            return
         raise UploadRejected(400, "未知的上传文本字段")
 
     def _validate_main_assembly(self) -> str | None:
@@ -488,6 +506,7 @@ class _Receiver:
             main_assembly=self._validate_main_assembly(),
             target_hardware=self._target,
             change_summary=self._summary,
+            purpose=self._purpose,
         )
 
     def close(self) -> None:

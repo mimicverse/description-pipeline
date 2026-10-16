@@ -14,11 +14,95 @@ from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
     _relative_document_name,
     _source_inputs,
-    freeze,
+    freeze as _freeze,
 )
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
 from . import support  # noqa: E402
+
+
+def _Backend(document, components, **kwargs):  # fixture plumbing: supported native datum names
+    """The fixture backend carrying this module's supported native datum names."""
+
+    kwargs.setdefault(
+        "coordinate_systems",
+        {
+            "CS_base_link": support.placement(),
+            "CS_arm_link": support.placement((0.0, 0.0, 0.2)),
+            "TCP_imu": support.placement((0.01, 0.0, 0.03)),
+        },
+    )
+    return support.FixtureCadBackend(document, components, **kwargs)
+
+
+def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
+    """Freeze with the fixture's carriers translated into the native request sets."""
+
+    return _freeze(support.capture_requests(config), *args, **kwargs)
+
+
+def _native_record(*, with_arm: bool, with_joint: bool, files: dict[str, str]) -> dict:
+    """The synthetic discovery record matching this module's freeze fixture.
+
+    Carriers use the supported native semantics: a body owns its ``CS_<link>``
+    datum, the released interface datum uses the ``TCP_`` prefix, and the
+    hinge joint is a solved concentric+coincident mate pair whose name and
+    limits travel through ``dp.joint.*`` claims and controlled records.
+    """
+
+    components = [support.native_component("base-1", document="base.SLDPRT")]
+    datums = [
+        support.native_datum("CS_base_link", "base-1", support.placement()),
+        support.native_datum("TCP_imu", "base-1", support.placement((0.01, 0.0, 0.03))),
+    ]
+    masses = [{"component": "base-1", "mass_kg": 1.0, "material": "Alloy Steel"}]
+    mates: list[dict] = []
+    joint_claims = None
+    if with_arm:
+        components.append(
+            support.native_component(
+                "arm-1", document="arm.SLDPRT", transform=support.placement((0.0, 0.0, 0.2)), fixed=False
+            )
+        )
+        datums.append(support.native_datum("CS_arm_link", "arm-1", support.placement((0.0, 0.0, 0.2))))
+        masses.append({"component": "arm-1", "mass_kg": 0.5, "material": "Alloy Steel"})
+    if with_joint:
+        mates = support.native_hinge_mates(
+            "base-1", "arm-1", left_point=(0.0, 0.0, 0.2), right_point=(0.0, 0.0, 0.0), radius=0.006
+        )
+        joint_claims = support.native_joint_claims()
+    return support.native_record(
+        hardware_id="freeze_fixture",
+        change_summary="freeze module fixture",
+        control_reference="freeze-run",
+        components=components,
+        datums=datums,
+        masses=masses,
+        mates=mates,
+        joint_claims=joint_claims,
+        files=files,
+    )
+
+
+def _compose_scene_inputs(destination: Path, cad_root: Path, *, with_arm: bool, with_joint: bool) -> None:
+    """Seal the consumer inputs the Linux scene rebuild reads (fixture plumbing)."""
+
+    names = ["robot.SLDASM", "base.SLDPRT"] + (["arm.SLDPRT"] if with_arm else [])
+    files = support.native_files(cad_root, names)
+    record = _native_record(with_arm=with_arm, with_joint=with_joint, files=files)
+    controlled = {"budget.json": support.native_budget_record(record)}
+    record_keys = None
+    if with_joint:
+        controlled["joints/hinge.json"] = support.native_joint_record()
+        record_keys = {"joints/hinge.json": "limits"}
+    support.seal_scene_inputs(
+        destination,
+        cad_root=cad_root,
+        cad_names=names,
+        record=record,
+        controlled=controlled,
+        record_keys=record_keys,
+    )
 
 
 class FreezeTests(unittest.TestCase):
@@ -26,7 +110,7 @@ class FreezeTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-freeze-"))
         self.assembly = support.make_cad_tree(self.tmp / "cad")
         self.parts = [self.tmp / "cad" / "base.SLDPRT", self.tmp / "cad" / "arm.SLDPRT"]
-        self.backend = support.FixtureCadBackend(
+        self.backend = _Backend(
             self.assembly,
             [
                 {
@@ -51,19 +135,19 @@ class FreezeTests(unittest.TestCase):
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": True, "format": "stl_binary"},
-            "coordinate_systems": ["base_datum", "arm_datum", "imu_datum"],
+            "coordinate_systems": ["CS_base_link", "CS_arm_link", "TCP_imu"],
             "bodies": [
                 {
                     "id": "base",
                     "name": "base_link",
                     "components": ["base-1"],
-                    "frame": {"coordinate_system": "base_datum"},
+                    "frame": {"coordinate_system": "CS_base_link"},
                 },
                 {
                     "id": "arm",
                     "name": "arm_link",
                     "components": ["arm-1"],
-                    "frame": {"coordinate_system": "arm_datum"},
+                    "frame": {"coordinate_system": "CS_arm_link"},
                 },
             ],
             "joints": [
@@ -77,7 +161,7 @@ class FreezeTests(unittest.TestCase):
                     "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                 }
             ],
-            "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "imu_datum"}],
+            "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "TCP_imu"}],
         }
         self.destination = self.tmp / "snapshot"
 
@@ -99,11 +183,15 @@ class FreezeTests(unittest.TestCase):
             ],
             "suppressed": [],
         }
-        validated = validate_source_config(json.loads(json.dumps({**self.config, "closure": closure})))
+        validated = validate_source_config(
+            support.capture_requests(json.loads(json.dumps({**self.config, "closure": closure})))
+        )
         self.assertEqual(validated["closure"], closure)
         for bad in ("nope", {"schema_version": "other"}, {"graph": 3}):
             with self.assertRaises(ConfigError):
-                validate_source_config(json.loads(json.dumps({**self.config, "closure": bad})))
+                validate_source_config(
+                    support.capture_requests(json.loads(json.dumps({**self.config, "closure": bad})))
+                )
 
     def test_freeze_retains_the_closure_carrier_evidence(self) -> None:
         config = json.loads(json.dumps(self.config))
@@ -131,6 +219,7 @@ class FreezeTests(unittest.TestCase):
 
     def test_freeze_records_the_direct_link_group_read(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         record = json.loads(
             (self.destination / "raw" / "link_group_mass_properties.json").read_text(encoding="utf-8")
         )
@@ -297,8 +386,11 @@ class FreezeTests(unittest.TestCase):
         self.assertTrue((self.destination / "manifest.json").is_file())
         self.assertFalse((self.destination / "scene.json").exists())
         self.assertEqual(manifest["scene"], "raw/scene_raw.json")
-        self.assertEqual(manifest["source_config"], "raw/source_config.json")
-        self.assertIn("raw/source_config.json", manifest["files"])
+        # The full raw/source_config.json carrier is retired (356baed): the
+        # snapshot binds its captured identity and keeps raw readings only.
+        self.assertNotIn("raw/source_config.json", manifest["files"])
+        self.assertEqual(manifest["identity"]["capture"]["evidence_class"], "fixture")
+        self.assertIn("raw/material_provenance.json", manifest["files"])
         self.assertIn("raw/scene_raw.json", manifest["files"])
         self.assertTrue(any(name.startswith("geometry/") for name in manifest["files"]))
 
@@ -316,6 +408,7 @@ class FreezeTests(unittest.TestCase):
             ),
         ):
             freeze(self.config, self.destination, backend=self.backend)
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         before = inventory(self.destination)
         scene = load_scene(self.destination)
         self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
@@ -323,21 +416,22 @@ class FreezeTests(unittest.TestCase):
         self.assertNotIn("scene.json", before)
 
     def test_resealed_source_configuration_cannot_change_capture_identity(self) -> None:
-        from description_pipeline.io import write_json
-        from description_pipeline.sources.snapshot import verify_snapshot, write_manifest
+        # The sealed capture identity replaced the retired raw/source_config.json
+        # carrier (356baed): re-sealing a tampered assembly identity still refuses.
+        from description_pipeline.io import read_data
+        from description_pipeline.sources.snapshot import write_manifest
 
-        manifest = freeze(self.config, self.destination, backend=self.backend)
-        path = self.destination / "raw/source_config.json"
-        config = json.loads(path.read_text(encoding="utf-8"))
-        config["assembly"] = "another-assembly.SLDASM"
-        write_json(path, config)
+        freeze(self.config, self.destination, backend=self.backend)
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
+        manifest = read_data(self.destination / "manifest.json")
+        identity = dict(manifest["identity"])
+        identity["assembly"] = "another-assembly.SLDASM"
         write_manifest(
             self.destination,
-            kind="solidworks",
-            identity=manifest["identity"],
+            kind=manifest["kind"],
+            identity=identity,
             evidence_class=manifest["evidence_class"],
         )
-        verify_snapshot(self.destination)
         with self.assertRaisesRegex(ValueError, "names another assembly"):
             load_scene(self.destination)
 
@@ -346,6 +440,7 @@ class FreezeTests(unittest.TestCase):
         from description_pipeline.sources.snapshot import write_manifest
 
         manifest = freeze(self.config, self.destination, backend=self.backend)
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         path = self.destination / "raw/mass_properties.json"
         masses = json.loads(path.read_text(encoding="utf-8"))
         masses["base-1"]["mass"] *= 2
@@ -378,6 +473,7 @@ class FreezeTests(unittest.TestCase):
 
     def test_scene_carries_combined_mass_and_geometry(self) -> None:
         freeze(self.config, self.destination, backend=self.backend, worker_version="test-worker")
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(self.destination)
         self.assertEqual(scene["schema_version"], "solidworks-to-urdf.scene/v1")
         self.assertEqual(scene["units"], "SI")
@@ -398,8 +494,8 @@ class FreezeTests(unittest.TestCase):
         config = json.loads(json.dumps(self.config))
         # rotate the arm link frame 90 degrees about Z: the COM rotates with it,
         # and the inertia tensor has to be re-expressed in the rotated axes
-        config["bodies"][1]["frame"] = {"coordinate_system": "arm_datum"}
-        backend = support.FixtureCadBackend(
+        config["bodies"][1]["frame"] = {"coordinate_system": "CS_arm_link"}
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -418,10 +514,11 @@ class FreezeTests(unittest.TestCase):
             ],
             dependencies=self.parts,
         )
-        backend.coordinate_system_matrices["arm_datum"] = support.placement(
+        backend.coordinate_system_matrices["CS_arm_link"] = support.placement(
             (-0.2, 0.0, 0.0), (0.0, 0.0, 1.5707963267948966)
         )
         freeze(config, self.destination, backend=backend)
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(self.destination)
         arm = next(link for link in scene["links"] if link["name"] == "arm_link")
         inertial = arm["inertial"]
@@ -467,7 +564,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "destination_is_symlink")
 
     def test_copy_missing_a_component_document_blocks_freeze(self) -> None:
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -488,8 +585,13 @@ class FreezeTests(unittest.TestCase):
         backend.pack_drop_files = {self.parts[1].name}
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            },
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
         ]
 
         with self.assertRaises(BridgeError) as raised:
@@ -499,7 +601,7 @@ class FreezeTests(unittest.TestCase):
         self.assertFalse(self.destination.exists())
 
     def test_empty_resolution_blocks_freeze(self) -> None:
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -514,7 +616,12 @@ class FreezeTests(unittest.TestCase):
         backend.resolve_returns_empty = True
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -525,7 +632,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "dependency_resolution_unverified")
 
     def test_component_count_mismatch_blocks_freeze(self) -> None:
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -540,7 +647,12 @@ class FreezeTests(unittest.TestCase):
         backend.copy_extra_components = 1
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -551,7 +663,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "dependency_collection_incomplete")
 
     def test_collector_without_a_top_level_blocks_freeze(self) -> None:
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -572,7 +684,12 @@ class FreezeTests(unittest.TestCase):
         backend.collect_dependencies = broken_pack  # type: ignore[method-assign]
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -603,7 +720,7 @@ class FreezeTests(unittest.TestCase):
     def test_dependency_outside_allowed_roots_blocks_freeze(self) -> None:
         outside = self.tmp / "outside.SLDPRT"
         outside.write_bytes(b"outside")
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [{"name": "base-1", "transform": support.placement(), "mass": support.mass_payload(1.0)}],
             dependencies=[outside],
@@ -623,15 +740,18 @@ class FreezeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "cad_configuration_missing")
 
-    def test_joint_with_authored_origin_is_refused(self) -> None:
+    def test_authored_origin_is_not_a_kinematic_carrier(self) -> None:
+        # The direct-config authored origin carrier is retired: the delivered
+        # kinematics come from the sealed native record (groups/axis_requests),
+        # so a stray xyz neither refuses the capture nor reaches the scene.
         config = json.loads(json.dumps(self.config))
         config["joints"][0]["xyz"] = [0.0, 0.0, 0.2]
 
         freeze(config, self.destination, backend=self.backend)
-        with self.assertRaises(ConfigError) as raised:
-            load_scene(self.destination)
-
-        self.assertEqual(raised.exception.code, "invalid_config")
+        _compose_scene_inputs(self.destination, self.tmp / "cad", with_arm=True, with_joint=True)
+        scene = load_scene(self.destination)
+        self.assertEqual(scene["joints"][0]["name"], "hinge_joint")
+        self.assertEqual(scene["joints"][0]["axis"], [0.0, 0.0, 1.0])
 
     def test_tampered_snapshot_is_rejected(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
@@ -653,7 +773,7 @@ class FreezeTests(unittest.TestCase):
     def _two_component_backend(self) -> tuple[support.FixtureCadBackend, dict]:
         """A readable two-component model whose components are real files."""
 
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -674,8 +794,13 @@ class FreezeTests(unittest.TestCase):
         )
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            },
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
         ]
         return backend, config
 
@@ -977,7 +1102,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "dependency_configuration_mismatch")
 
     def test_requesting_a_configuration_that_is_not_active_blocks_freeze(self) -> None:
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -1001,8 +1126,13 @@ class FreezeTests(unittest.TestCase):
         # switching the user's document is not this adapter's job
         config["configuration"] = "Other"
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}},
-            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            },
+            {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
         ]
 
         with self.assertRaises(BridgeError) as raised:
@@ -1072,7 +1202,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "dependency_instance_identity_ambiguous")
 
     def test_suppressed_instances_are_carried_not_treated_as_escapes(self) -> None:
-        backend = support.FixtureCadBackend(
+        backend = _Backend(
             self.assembly,
             [
                 {
@@ -1094,7 +1224,12 @@ class FreezeTests(unittest.TestCase):
         )
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "base_datum"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -1400,7 +1535,7 @@ class SharedModelContractTests(unittest.TestCase):
         self.robot_cls = Robot
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-contract-"))
         self.assembly = support.make_cad_tree(self.tmp / "cad")
-        self.backend = support.FixtureCadBackend(
+        self.backend = _Backend(
             self.assembly,
             [
                 {
@@ -1429,9 +1564,14 @@ class SharedModelContractTests(unittest.TestCase):
                     "id": "base",
                     "name": "base_link",
                     "components": ["base-1"],
-                    "frame": {"coordinate_system": "base_datum"},
+                    "frame": {"coordinate_system": "CS_base_link"},
                 },
-                {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
+                {
+                    "id": "arm",
+                    "name": "arm_link",
+                    "components": ["arm-1"],
+                    "frame": {"coordinate_system": "CS_arm_link"},
+                },
             ],
             "joints": [
                 {
@@ -1452,6 +1592,7 @@ class SharedModelContractTests(unittest.TestCase):
     def test_scene_satisfies_the_shared_model_schema(self) -> None:
         destination = self.tmp / "snapshot"
         freeze(self.config, destination, backend=self.backend)
+        _compose_scene_inputs(destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(destination)
 
         robot = self.robot_cls.from_dict(scene)
@@ -1465,6 +1606,7 @@ class SharedModelContractTests(unittest.TestCase):
     def test_expected_entities_cover_the_assembly(self) -> None:
         destination = self.tmp / "snapshot"
         freeze(self.config, destination, backend=self.backend)
+        _compose_scene_inputs(destination, self.tmp / "cad", with_arm=True, with_joint=True)
         scene = load_scene(destination)
 
         self.assertEqual(scene["provenance"]["expected_entities"], ["arm-1", "base-1"])
@@ -1478,7 +1620,7 @@ class DocumentedMassTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-mass-"))
         self.assembly = support.make_cad_tree(self.tmp / "cad")
-        self.backend = support.FixtureCadBackend(
+        self.backend = _Backend(
             self.assembly,
             [
                 {
@@ -1509,7 +1651,7 @@ class DocumentedMassTests(unittest.TestCase):
                     "id": "base",
                     "name": "base_link",
                     "components": ["base-1"],
-                    "frame": {"coordinate_system": "base_datum"},
+                    "frame": {"coordinate_system": "CS_base_link"},
                 }
             ],
             "joints": [],
@@ -1520,6 +1662,7 @@ class DocumentedMassTests(unittest.TestCase):
 
     def test_documented_mass_is_applied_at_load_time_and_records_raw_used(self) -> None:
         freeze(self.config, self.tmp / "snapshot", backend=self.backend)
+        _compose_scene_inputs(self.tmp / "snapshot", self.tmp / "cad", with_arm=False, with_joint=False)
         raw_scene = json.loads((self.tmp / "snapshot" / "raw/scene_raw.json").read_text(encoding="utf-8"))
         # the snapshot keeps the CAD reading: nothing is replaced on disk
         self.assertAlmostEqual(raw_scene["mass_properties"]["base-1"]["mass"], 1.0, places=9)

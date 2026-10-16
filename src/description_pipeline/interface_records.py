@@ -48,10 +48,31 @@ SCHEMA_VERSIONS = frozenset(
     value for name, value in vars(_schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
 )
 
+#: The bound finite preview-range declaration of an inspection-preview prismatic
+#: joint: one schema id and exact key set, owned with the other single-owner
+#: schemas so the release schema digest (IF-15) covers the structural shape.
+#: The semantic reconstruction stays in the discovery/verification modules: they
+#: consume these definitions and never re-type them.
+PREVIEW_RANGE_SCHEMA = "solidworks-to-urdf.preview-range/v1"
+PREVIEW_RANGE_KEYS = frozenset(
+    {
+        "schema_version",
+        "joint",
+        "instance",
+        "configuration",
+        "unit",
+        "zero",
+        "direction",
+        "purpose",
+        "lower",
+        "upper",
+    }
+)
+
 #: Every machine schema version this release knows: the single-owner schema ids
-#: plus the stage contract.  Unknown versions are refused wherever a record
-#: quotes one (call bindings, manifests, ...).
-KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
+#: plus the stage contract and the preview-range declaration.  Unknown versions
+#: are refused wherever a record quotes one (call bindings, manifests, ...).
+KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"], PREVIEW_RANGE_SCHEMA}
 
 #: The shipped schema definition sources the schema digest covers: the model
 #: document schema (structure and field rules of produced documents) and the two
@@ -349,6 +370,21 @@ CHECK_POLICY_V1 = {
     "schema_version": CHECK_POLICY_SCHEMA,
     "fixed_checks": sorted(FIXED_REQUIRED_CHECKS),
     "dynamic_expansions": [dict(rule) for rule in CHECK_POLICY_EXPANSIONS],
+    # The one owner of the inspection-preview window: value, applicability and
+    # the analytical sampling rule all live here, inside the same policy digest.
+    "preview": {
+        "revolute_window_rad": math.pi,
+        "applies_when": "inspection_preview_and_engineering_range_proven_missing_and_revolute",
+        "sampling": {"interval_fraction": 1.0},
+    },
+    # The engineering-qualification facts (distinct from model-consistency facts):
+    # per-joint range authority and drive sizing, plus the per-subject machine
+    # qualification.  Only authoritative native/controlled evidence can establish
+    # them; a passing consistency check never does.
+    "engineering_facts": {
+        "per_joint": ["engineering_position_range", "drive_sizing"],
+        "per_subject": ["machine_qualification"],
+    },
 }
 
 
@@ -356,7 +392,12 @@ def validate_check_policy(policy) -> dict:
     """Shape of the frozen check strategy (fixed gates + expansion rules)."""
 
     code = "check_policy_invalid"
-    _exact_keys(policy, {"schema_version", "fixed_checks", "dynamic_expansions"}, code, "policy")
+    _exact_keys(
+        policy,
+        {"schema_version", "fixed_checks", "dynamic_expansions", "preview", "engineering_facts"},
+        code,
+        "policy",
+    )
     _require(policy["schema_version"] == CHECK_POLICY_SCHEMA, code, {"where": "schema_version"})
     fixed = policy["fixed_checks"]
     _require(
@@ -376,10 +417,57 @@ def validate_check_policy(policy) -> dict:
             _require(isinstance(rule.get(key), str) and rule[key], code, {"where": f"{where}.{key}"})
         if "when" in rule:
             _require(isinstance(rule["when"], str) and rule["when"], code, {"where": f"{where}.when"})
+    preview = policy["preview"]
+    _exact_keys(preview, {"revolute_window_rad", "applies_when", "sampling"}, code, "preview")
+    radius = preview["revolute_window_rad"]
+    _require(
+        isinstance(radius, (int, float)) and not isinstance(radius, bool) and math.isfinite(radius) and radius > 0.0,
+        code,
+        {"where": "preview.revolute_window_rad"},
+    )
+    _require(
+        isinstance(preview["applies_when"], str) and preview["applies_when"].strip() != "",
+        code,
+        {"where": "preview.applies_when"},
+    )
+    _exact_keys(preview["sampling"], {"interval_fraction"}, code, "preview.sampling")
+    fraction = preview["sampling"]["interval_fraction"]
+    _require(
+        isinstance(fraction, (int, float))
+        and not isinstance(fraction, bool)
+        and math.isfinite(fraction)
+        and fraction > 0.0,
+        code,
+        {"where": "preview.sampling.interval_fraction"},
+    )
+    facts = policy["engineering_facts"]
+    _exact_keys(facts, {"per_joint", "per_subject"}, code, "engineering_facts")
+    for key in ("per_joint", "per_subject"):
+        values = facts[key]
+        _require(
+            isinstance(values, list)
+            and values
+            and all(isinstance(name, str) and name for name in values)
+            and len(set(values)) == len(values),
+            code,
+            {"where": f"engineering_facts.{key}"},
+        )
     return policy
 
 
 validate_check_policy(CHECK_POLICY_V1)
+
+
+def preview_revolute_window_rad() -> float:
+    """The finite canonical inspection-preview window radius, read from the one policy."""
+
+    return float(CHECK_POLICY_V1["preview"]["revolute_window_rad"])
+
+
+def preview_sampling_interval_fraction() -> float:
+    """The analytical sampling fraction of the preview window, from the same policy."""
+
+    return float(CHECK_POLICY_V1["preview"]["sampling"]["interval_fraction"])
 
 
 def check_policy_digest() -> str:
@@ -490,6 +578,17 @@ def qualification_facts(definition) -> list:
                 add(family.split(".", 1)[0], family.format(frame=frame["name"]), frame["name"])
         else:
             raise PipelineError(f"Unknown check-policy selector: {selector}")
+    # The engineering facts (B family) are appended beside the check-driven
+    # facts: no consistency gate feeds their conclusion, so ``check`` is None
+    # and only authoritative evidence may establish them downstream.
+    engineering = CHECK_POLICY_V1["engineering_facts"]
+    for fact_id in engineering["per_joint"]:
+        for joint in source.get("joints", []):
+            if joint["type"] == "fixed":
+                continue
+            add(fact_id, None, joint["name"])
+    for fact_id in engineering["per_subject"]:
+        add(fact_id, None)
     return facts
 
 
@@ -1345,6 +1444,73 @@ def validate_source_record(record) -> dict:
         code,
         {"where": "metadata.change_summary_source"},
     )
+    return record
+
+
+REQUEST_RECORD_SCHEMA = "solidworks-to-urdf.request/v2"
+
+#: The only two purposes an admitted request may declare.  The frozen request
+#: record is the single purpose authority; the freeze writer and every reader
+#: carry the value explicitly and never default it.
+PURPOSE_ENGINEERING = "engineering"
+PURPOSE_INSPECTION_PREVIEW = "inspection_preview"
+REQUEST_PURPOSES = (PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW)
+
+_REQUEST_RECORD_KEYS = {
+    "schema_version",
+    "purpose",
+    "request_id",
+    "target_hardware",
+    "change_summary",
+    "main_assembly",
+    "handoff_digest",
+    "platform_config_digest",
+}
+
+
+def validate_request_record(record) -> dict:
+    """``input/request.json``: the v2 freeze-formed request record, before the generator ran.
+
+    One strict shape shared by the freeze writer and the offline verifier: all
+    eight fields required, no unknown keys (the foundation reader additionally
+    rejects duplicate keys and non-finite numbers while parsing), no null
+    values, strict types - ``purpose`` is required and must be one of
+    ``engineering``/``inspection_preview`` (a v1 record refuses on its version
+    field: there is no lenient or mixed parsing) - ``request_id`` is non-empty
+    text carried unchanged
+    across reuse and never compared with the current run UUID,
+    ``main_assembly`` is an engineering-relative portable path (the one
+    ``artifact_path_parts`` rule; absolute, UNC and escaping paths refuse), and
+    both digests are lowercase SHA-256.
+    """
+
+    code = "request_record_invalid"
+    _exact_keys(record, _REQUEST_RECORD_KEYS, code, "request")
+    _require(record["schema_version"] == REQUEST_RECORD_SCHEMA, code, {"where": "schema_version"})
+    _require(
+        isinstance(record["purpose"], str) and record["purpose"] in REQUEST_PURPOSES,
+        code,
+        {"where": "purpose", "values": list(REQUEST_PURPOSES)},
+    )
+    for key in ("request_id", "target_hardware"):
+        value = _text(record[key], code, key)
+        _require(value.strip() != "", code, {"where": key})
+    main = _text(record["main_assembly"], code, "main_assembly")
+    _require(main.strip() != "", code, {"where": "main_assembly"})
+    try:
+        artifact_path_parts(main)
+    except PipelineError as error:
+        raise InterfaceRecordError(code, {"where": "main_assembly", "reason": str(error)}) from error
+    summary = record["change_summary"]
+    _require(
+        isinstance(summary, str)
+        and summary.strip() != ""
+        and not any((ord(char) < 32 and char != "\n") or ord(char) == 127 for char in summary),
+        code,
+        {"where": "change_summary"},
+    )
+    for key in ("handoff_digest", "platform_config_digest"):
+        _hex64(record[key], code, key)
     return record
 
 

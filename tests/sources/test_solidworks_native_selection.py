@@ -15,7 +15,7 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
     read_search_folders,
 )
 from description_pipeline.sources.solidworks.native_selection import (  # noqa: E402
-    REQUIRED_DECLARATIONS,
+    IDENTITY_DECLARATIONS,
     NativeSelectionReader,
 )
 from description_pipeline.sources.solidworks.selection import (  # noqa: E402
@@ -675,6 +675,9 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         robot = _Doc(
             str(stage / "robot.SLDASM"), children=(arm,), configuration="默认", properties=dict(DECLARED)
         )
+        get_save_calls: list = []
+        robot.GetSaveFlag = lambda: (get_save_calls.append(1), False)[1]
+        robot.Extension.NeedsRebuild2 = 0
 
         class FakeApp:
             RevisionNumber = "34.0.0"
@@ -744,11 +747,23 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.assertTrue(readings["session"]["sealed"])
         self.assertTrue(readings["session"]["closed"])
         self.assertEqual(readings["stored_references_phase"], "preopen")
+        self.assertEqual(readings["saved_configuration"], "默认")
+        state = readings["document_state"]
+        self.assertEqual(state["before"]["save_flag"], False)
+        self.assertEqual(state["after"]["save_flag"], False)
+        self.assertEqual(state["before"]["needs_rebuild2_value"], 0)
+        self.assertEqual(state["after"]["configuration"], "默认")
+        self.assertEqual(state["before"]["read_only"], True)
+        self.assertIn("used_api", state)
+        # Two saved-state samples: one at open and one after the native walk.
+        self.assertGreaterEqual(len(get_save_calls), 2)
 
         payload = NativeSelectionReader(
             walker=lambda stage_root, main, index: readings, reader_sha256=READER
         ).observe(stage, "robot.SLDASM", files)
         self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["arm.SLDPRT"])
+        self.assertEqual(payload["saved_configuration"], "默认")
+        self.assertIn("document_state", payload)
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
         self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
@@ -888,16 +903,26 @@ class CuPreverifyTests(unittest.TestCase):
         self.assertEqual(preverify["declarations"]["dp.hardware_id"], "m3.0")
         self.assertEqual(preverify["declarations"]["dp.delivery_configuration"], "3.0 总装")
 
-    def test_missing_declarations_refuse_before_native_work(self) -> None:
+    def test_missing_declarations_are_recorded_and_never_refuse(self) -> None:
+        payload = self.observe(identity_properties={"dp.hardware_id": "m3.0"})
+        preverify = payload["preverify"]
+        self.assertEqual(preverify["verdict"], "pass")
+        self.assertEqual(set(preverify["declarations_missing"]), set(IDENTITY_DECLARATIONS) - {"dp.hardware_id"})
+        self.assertEqual(preverify["declarations"]["dp.hardware_id"], "m3.0")
+
+    def test_absent_delivery_configuration_keeps_the_native_saved_configuration(self) -> None:
+        payload = self.observe(identity_properties={"dp.hardware_id": "m3.0"})
+        recorded = payload["preverify"]["delivery_configuration"]
+        self.assertIsNone(recorded["declared"])
+        self.assertEqual(recorded["source"], "native_saved_configuration")
+
+    def test_unusable_delivery_configuration_refuses(self) -> None:
         with self.assertRaises(SelectionError) as raised:
-            self.observe(identity_properties={"dp.hardware_id": "m3.0"})
+            self.observe(identity_properties={"dp.hardware_id": "m3.0", "dp.delivery_configuration": "   "})
         error = raised.exception
-        self.assertEqual(error.code, "selection_declarations_missing")
-        problems = error.detail["problems"]
-        problem = next(item for item in problems if item["code"] == "selection_declarations_missing")
-        self.assertEqual(set(problem["missing"]), set(REQUIRED_DECLARATIONS) - {"dp.hardware_id"})
-        self.assertEqual(problem["document"], "robot.SLDASM")
-        self.assertEqual(problem["declarations"]["dp.hardware_id"], "m3.0")
+        self.assertEqual(error.code, "selection_configuration_invalid")
+        problem = next(item for item in error.detail["problems"] if item["code"] == "selection_configuration_invalid")
+        self.assertEqual(problem["configuration"], "   ")
 
     def test_unreadable_declaration_set_refuses_with_the_reason(self) -> None:
         with self.assertRaises(SelectionError) as raised:
@@ -906,10 +931,9 @@ class CuPreverifyTests(unittest.TestCase):
                 identity_properties_error="CadError: custom properties unreadable",
             )
         error = raised.exception
-        self.assertEqual(error.code, "selection_declarations_missing")
-        problem = next(item for item in error.detail["problems"] if item["code"] == "selection_declarations_missing")
+        self.assertEqual(error.code, "selection_identity_unreadable")
+        problem = next(item for item in error.detail["problems"] if item["code"] == "selection_identity_unreadable")
         self.assertEqual(problem["declarations_error"], "CadError: custom properties unreadable")
-        self.assertEqual(set(problem["missing"]), set(REQUIRED_DECLARATIONS))
 
 
 if __name__ == "__main__":

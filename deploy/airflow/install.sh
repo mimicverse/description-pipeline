@@ -78,6 +78,10 @@ AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" db migrate
 # The native stage waits on this pool (six-stage contract / IF-02): create it
 # idempotently so the first run cannot fail on a missing pool.
 AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/scripts/ensure_pool.py"
+# The sign-in state table is created inside this migration window by the one canonical owner
+# (the same module entry the CI migration step runs); the runtime identity that takes over
+# below owns no CREATE privilege and never attempts DDL.
+AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.feishu_auth
 # The migration above ran under the install identity (DDL inside the airflow schema only);
 # the persisted service configuration carries the least-privilege runtime identity.
 AIRFLOW_DB_URL="$AIRFLOW_RUNTIME_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \

@@ -2,10 +2,9 @@
   "type": "object",
   "properties": {
     "schema_version": {
-      "$comment": "One current id per document kind; the retired description.* v1 ids are refused.",
+      "$comment": "One current id per document: the shared solidworks-to-urdf.scene/v1 structure; the retired robot id is refused.",
       "enum": [
-        "solidworks-to-urdf.scene/v1",
-        "solidworks-to-urdf.robot/v1"
+        "solidworks-to-urdf.scene/v1"
       ]
     },
     "name": {
@@ -434,6 +433,14 @@
             },
             "required": [],
             "additionalProperties": false
+          },
+          "limit_source": {
+            "enum": [
+              "native",
+              "controlled",
+              "policy_preview_window",
+              "declared_preview_window"
+            ]
           },
           "dynamics": {
             "type": "object",

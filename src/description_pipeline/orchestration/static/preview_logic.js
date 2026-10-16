@@ -3,7 +3,39 @@
 // consume the same functions, so the battery measures production behaviour.
 
 //: Machine keys the information panel must show verbatim (display names never substitute).
-export const MACHINE_FIELD_KEYS = ["run_id", "subject_sha256", "tool_identity"];
+export const MACHINE_FIELD_KEYS = ["run_id", "subject_sha256", "tool_identity", "purpose"];
+
+export function purposeLabel(value) {
+  return value === "engineering" || value === "inspection_preview" ? value : "未记录";
+}
+
+export function statusLabel(status) {
+  return status === "unqualified"
+    ? "未建立"
+    : status === "established"
+      ? "已建立"
+      : status === "out_of_scope"
+        ? "不适用"
+        : "?";
+}
+
+export function qualificationRows(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((item) => item && typeof item.fact_id === "string")
+    .map((item) => {
+      const objectId = typeof item.object_id === "string" ? item.object_id : "";
+      return {
+        fact_id: item.fact_id,
+        scope: typeof item.scope === "string" ? item.scope : "",
+        object_id: objectId,
+        status: item.status,
+        label: objectId ? `${item.fact_id}[${objectId}]` : item.fact_id,
+      };
+    })
+    .sort((a, b) =>
+      a.object_id === b.object_id ? a.fact_id.localeCompare(b.fact_id) : a.object_id.localeCompare(b.object_id),
+    );
+}
 
 // ----------------------------------------------------------------------------- interaction
 
@@ -98,16 +130,17 @@ export function summaryIdentity({ runId, subjectSha256 }) {
   };
 }
 
-export function infoPanelRows({ runId, subjectSha256, tool, qualitySchema, qualificationStates }) {
+export function infoPanelRows({ runId, subjectSha256, purpose, tool, qualitySchema, qualificationStates }) {
   const toolIdentity = tool
     ? [tool.version, tool.source_sha256].filter((value) => typeof value === "string" && value).join(" / ")
     : "";
-  const states = Array.isArray(qualificationStates)
-    ? qualificationStates.map((item) => `${item?.fact_id || "?"}=${item?.state || "?"}`).join(", ")
-    : "";
+  const states = qualificationRows(qualificationStates)
+    .map((row) => `${row.label}=${row.status ? statusLabel(row.status) : "?"}`)
+    .join(", ");
   return [
     { key: "run_id", value: typeof runId === "string" ? runId : "" },
     { key: "subject_sha256", value: typeof subjectSha256 === "string" ? subjectSha256 : "" },
+    { key: "purpose", value: purposeLabel(purpose) },
     { key: "tool_identity", value: toolIdentity },
     { key: "quality_schema", value: typeof qualitySchema === "string" ? qualitySchema : "" },
     { key: "qualification_states", value: states },
@@ -126,7 +159,9 @@ export function jointRows(records) {
       upper: Number.isFinite(record.upper) ? record.upper : null,
       effort: Number.isFinite(record.effort) ? record.effort : null,
       velocity: Number.isFinite(record.velocity) ? record.velocity : null,
-      axis: Array.isArray(record.axis) ? record.axis.map((value) => Number(value) || 0) : null,
+      axis: Array.isArray(record.axis)
+        ? record.axis.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        : null,
     }));
 }
 
@@ -136,7 +171,9 @@ export function linkRows(records) {
     .map((record) => ({
       name: record.name,
       mass_kg: Number.isFinite(record.mass_kg) ? record.mass_kg : null,
-      com_m: Array.isArray(record.com_m) ? record.com_m.map((value) => Number(value) || 0) : null,
+      com_m: Array.isArray(record.com_m)
+        ? record.com_m.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        : null,
       inertia_kg_m2: record.inertia_kg_m2 && typeof record.inertia_kg_m2 === "object" ? record.inertia_kg_m2 : null,
     }));
 }
@@ -147,8 +184,12 @@ export function frameRows(frames) {
     .map((frame) => ({
       name: frame.name,
       parent: typeof frame.parent === "string" ? frame.parent : null,
-      xyz: Array.isArray(frame.xyz) ? frame.xyz.map((value) => Number(value) || 0) : null,
-      rpy: Array.isArray(frame.rpy) ? frame.rpy.map((value) => Number(value) || 0) : null,
+      xyz: Array.isArray(frame.xyz)
+        ? frame.xyz.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        : null,
+      rpy: Array.isArray(frame.rpy)
+        ? frame.rpy.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        : null,
     }));
 }
 

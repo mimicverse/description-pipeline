@@ -34,6 +34,7 @@ Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -45,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from platform_config import atomic_write_once, extract_contract_closure, load_contract_owner  # noqa: E402  (single owners)
 from install_record import release_identity, wheel_binding  # noqa: E402  (single release/asset binding)
-from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
+from render_operator import PORT_DEFAULTS, encode_env_lines  # noqa: E402  (single deploy-layer owners, DEP-01)
 
 
 def die(message: str) -> None:
@@ -258,6 +259,9 @@ def derive(
         "PLATFORM_OPERATOR_DSN": (
             f"postgresql://operator_ro@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
         ),
+        # The runtime freeze reads the platform configuration identity from the same snapshot
+        # bytes the install record digests; this is the same source, never a parallel copy.
+        "PLATFORM_CONFIG_DIGEST": hashlib.sha256(snapshot_bytes).hexdigest(),
         "PIPELINE_WHEEL": str(wheel_path),
         "PIPELINE_STORE_ROOT": store_root,
         "SOLIDWORKS_SSH_HOST": ssh_host,
@@ -272,7 +276,10 @@ def derive(
         "MODEL_TARGETS_FILE": str(targets_file),
         "DISCOVERY_SETTINGS_FILE": str(discovery_file),
     }
-    lines = [f"{key}={value}" for key, value in sorted(env.items())]
+    # The one env encoding (render_operator.encode_env_lines): values that are not shell-safe
+    # - the libpq DSNs' "&" and "?" above all - are single-quoted so that a shell `source`
+    # and the KEY=VALUE parser read the identical bytes.
+    lines = encode_env_lines(env.items())
     atomic_write_once(repositories_file, contract.canonical(repositories))
     atomic_write_once(targets_file, contract.canonical(targets))
     atomic_write_once(discovery_file, contract.canonical(discovery))

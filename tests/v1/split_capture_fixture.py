@@ -74,7 +74,12 @@ def native_twin() -> dict:
 
 
 def build_fixture_capture(
-    root: Path, *, run_id: str, main_assembly: str = "cad/robot.SLDASM", runner=None
+    root: Path,
+    *,
+    run_id: str,
+    main_assembly: str = "cad/robot.SLDASM",
+    purpose: str = "engineering",
+    runner=None,
 ) -> dict:
     """Run the real producer over the control fixture and return the sealed transfer."""
 
@@ -116,7 +121,7 @@ def build_fixture_capture(
         expected_digest=handoff,
         expected_files=package_inventory(handoff_dir),
         main_assembly=main_assembly,
-        configuration={"record_roots": [str(records)]},
+        configuration={"record_roots": [str(records)], "purpose": purpose},
         targets={"nd_fixture": {"repository_slug": "example/m3.0", "base": "feature/m3.0"}},
         preparer=lambda *args, **kwargs: prepare_native_package(*args, backend=FakeBackend(capture_record()), **kwargs),
         on_event=record,

@@ -120,6 +120,9 @@ class FeishuAuthManagerTests(unittest.TestCase):
             engine=cls.engine,
         )
         cls._settings.start()
+        # The migration-window owner creates the sign-in state table; the runtime manager and
+        # every request path below are DDL-free and use this pre-created table.
+        auth.initialize_metadata_state(cls.sessions)
         conf.set("api_auth", "jwt_secret", JWT_SECRET)
         cls._clear_token_caches()
 
@@ -459,10 +462,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
         )
         allowed = auth.DagDetails(id=auth.ALLOWED_DAG_ID)
         transport_failure = {
-            "resolve_handoff": "success",
-            "start_job": "success",
-            "wait_for_job": "failed",
-            "confirm_job": "upstream_failed",
+            "freeze": "success",
+            "discover": "success",
+            "capture": "failed",
+            "generate": "upstream_failed",
         }
         self._record_run(
             "run-own",
@@ -479,29 +482,29 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self._record_run(
             "run-resolve-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "failed", "start_job": "upstream_failed"},
+            tasks={"freeze": "failed", "discover": "upstream_failed"},
         )
         self._record_run(
             "run-start-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "success", "start_job": "failed"},
+            tasks={"freeze": "success", "discover": "failed"},
         )
         self._record_run(
             "run-start-unproven",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"start_job": "failed"},
+            tasks={"discover": "failed"},
         )
         self._record_run(
             "run-mapped",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "success", "wait_for_job": "failed"},
+            tasks={"freeze": "success", "discover": "failed"},
         )
         with self.sessions() as session:
             session.execute(
                 TaskInstance.__table__.insert().values(
                     dag_id=auth.ALLOWED_DAG_ID,
                     run_id="run-mapped",
-                    task_id="wait_for_job",
+                    task_id="discover",
                     map_index=0,
                     state="success",
                     pool="default_pool",
@@ -519,12 +522,12 @@ class FeishuAuthManagerTests(unittest.TestCase):
             "run-running",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
             state="running",
-            tasks={"wait_for_job": "failed"},
+            tasks={"discover": "failed"},
         )
         self._record_run(
             "run-no-failed",
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
-            tasks={"resolve_handoff": "success"},
+            tasks={"freeze": "success"},
         )
 
         def decide(
@@ -547,10 +550,12 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-other"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-legacy"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-damaged"))
-        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-resolve-failed"))
-        # A failed start_job is retryable only with a positively successful resolution.
+        # A failed admission retries the frozen intake alone (idempotent); the portal
+        # narrows it further with the endpoint authority.
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-resolve-failed"))
+        # A failed native discovery pokes the same job the run UUID already created.
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-failed"))
-        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
+        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-start-unproven"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-mapped"))
         self.assertEqual(
             run_ownership.retry_assessment_for_run(auth.ALLOWED_DAG_ID, "missing-run").reason,
@@ -603,72 +608,67 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertEqual(seen, [True, False])
         self.assertIsNone(request_context.bound_request())
 
-    def test_transport_retry_classification_matrix(self) -> None:
-        classify = run_ownership.classify_transport_retry
+    def test_recovery_classification_matrix(self) -> None:
+        classify = run_ownership.classify_recovery
 
-        eligible = classify(
+        # (2) evidence corruption: the capture is sealed; only the import re-reads.
+        sealed = classify(
             "failed",
-            {
-                "resolve_handoff": "success",
-                "start_job": "success",
-                "wait_for_job": "failed",
-                "confirm_job": "upstream_failed",
-            },
+            {"freeze": "success", "discover": "success", "capture": "failed"},
+            "native_complete",
         )
-        self.assertTrue(eligible.eligible)
-        self.assertEqual(eligible.reason, "transport_recovery")
-        self.assertEqual(eligible.cleared_tasks, ("confirm_job", "wait_for_job"))
-        for state, tasks, reason in (
-            ("running", {"wait_for_job": "failed"}, "run_active"),
-            ("success", {"wait_for_job": "failed"}, "run_succeeded"),
-            ("failed", {}, "no_failed_transport_task"),
-            ("failed", {"resolve_handoff": "failed"}, "resolution_or_capture_failed"),
-            ("failed", {"start_job": "failed"}, "resolution_not_success"),
-            (
-                "failed",
-                {"resolve_handoff": "success", "confirm_job": "failed"},
-                "publication_failed",
-            ),
-            (
-                "failed",
-                {"resolve_handoff": "success", "other_task": "failed"},
-                "unknown_failed_task",
-            ),
-            (
-                "failed",
-                {"resolve_handoff": "success", "confirm_job": "upstream_failed"},
-                "no_failed_transport_task",
-            ),
-            (
-                "failed",
-                {
-                    "resolve_handoff": "success",
-                    "wait_for_job": run_ownership.AMBIGUOUS_TASK_STATE,
-                },
-                "unknown_failed_task",
-            ),
+        self.assertTrue(sealed.eligible)
+        self.assertEqual(sealed.classification, run_ownership.RECOVERY_EVIDENCE_CORRUPTION)
+        self.assertEqual(sealed.reason, "sealed_evidence_reimport")
+        self.assertEqual(sealed.cleared_tasks, ("capture",))
+        # (1) temporary disconnection: the same native job is still in flight.
+        in_flight = classify("failed", {"freeze": "success", "discover": "failed"}, "running")
+        self.assertTrue(in_flight.eligible)
+        self.assertEqual(in_flight.classification, run_ownership.RECOVERY_TEMPORARY_DISCONNECTION)
+        self.assertEqual(in_flight.cleared_tasks, ("discover",))
+        for state, tasks, status, reason in (
+            ("running", {"discover": "failed"}, None, "run_active"),
+            ("success", {"discover": "failed"}, None, "run_succeeded"),
+            ("failed", {}, None, "unknown_failed_task"),
+            ("failed", {"other_task": "failed"}, None, "unknown_failed_task"),
+            ("failed", {"discover": run_ownership.AMBIGUOUS_TASK_STATE}, None, "unknown_failed_task"),
+            ("failed", {"discover": "failed"}, "failed", "native_terminal_failure"),
+            ("failed", {"publish": "failed"}, "native_complete", "publication_response_unknown"),
         ):
-            with self.subTest(state=state, tasks=tasks):
-                assessment = classify(state, tasks)
+            with self.subTest(state=state, tasks=tasks, status=status):
+                assessment = classify(state, tasks, status)
                 self.assertFalse(assessment.eligible)
                 self.assertEqual(assessment.reason, reason)
-        start_retry = classify(
-            "failed", {"resolve_handoff": "success", "start_job": "failed", "wait_for_job": "upstream_failed"}
-        )
-        self.assertTrue(start_retry.eligible)
-        self.assertEqual(start_retry.cleared_tasks, ("start_job", "wait_for_job"))
 
-    def test_split_transport_retry_preserves_the_engineering_boundary(self) -> None:
-        classify = run_ownership.classify_transport_retry
-        tasks = dict.fromkeys(run_ownership.KNOWN_TASKS, "upstream_failed")
-        tasks.update(resolve_handoff="success", start_job="success", wait_for_job="failed")
-        self.assertTrue(classify("failed", tasks).eligible)
-        tasks.update(wait_for_job="success", fetch_capture="failed")
-        self.assertTrue(classify("failed", tasks).eligible)
-        for stage in ("run_generate", "run_verify", "run_publish"):
-            with self.subTest(stage=stage):
-                changed = {**tasks, "fetch_capture": "success", stage: "failed"}
-                self.assertFalse(classify("failed", changed).eligible)
+    def test_split_recovery_preserves_the_engineering_boundary(self) -> None:
+        classify = run_ownership.classify_recovery
+        portable = classify(
+            "failed",
+            {
+                "freeze": "success",
+                "discover": "success",
+                "capture": "success",
+                "generate": "upstream_failed",
+                "verify": "failed",
+            },
+            "native_complete",
+        )
+        self.assertTrue(portable.eligible)
+        self.assertEqual(portable.classification, run_ownership.RECOVERY_TEMPORARY_DISCONNECTION)
+        self.assertEqual(portable.cleared_tasks, ("generate", "verify"))
+        # An attempted publication is never retried in place; an unattempted one is untouched.
+        attempted = classify(
+            "failed",
+            {
+                "freeze": "success",
+                "discover": "success",
+                "capture": "success",
+                "publish": "failed",
+            },
+            "native_complete",
+        )
+        self.assertFalse(attempted.eligible)
+        self.assertEqual(attempted.classification, run_ownership.RECOVERY_UNKNOWN_PUBLICATION)
 
     def test_clear_body_candidate_matrix_and_replay(self) -> None:
         evaluate = request_context.evaluate_clear_candidate
@@ -928,6 +928,9 @@ class FeishuAuthManagerTests(unittest.TestCase):
     # -- state store ------------------------------------------------------
 
     def test_metadata_state_is_single_use_expired_and_shared_across_workers(self) -> None:
+        # The table is created only by the migration-window owner; the runtime constructors
+        # below are DDL-free and use the pre-created table (exactly the api-server path).
+        auth.initialize_metadata_state()
         first = auth.MetadataStateStore()
         second = auth.MetadataStateStore()
         state, challenge = first.issue(60.0)
@@ -944,6 +947,57 @@ class FeishuAuthManagerTests(unittest.TestCase):
             stored = [str(row[0]) for row in session.execute(text("SELECT state_hash FROM feishu_auth_state"))]
         self.assertNotIn(state, stored)
         self.assertNotIn(state_digest(state), stored)
+
+    def test_runtime_store_probes_readiness_ddl_free_and_the_initializer_owns_the_create(self) -> None:
+        recorded: list[str] = []
+
+        class _RecordingSession:
+            def execute(self, statement, parameters=None):
+                recorded.append(str(statement))
+                return None
+
+            def commit(self) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                return False
+
+        auth.MetadataStateStore(_RecordingSession)
+        # Exactly one no-DDL readiness probe: the runtime verifies it can read the table and
+        # its required columns instead of assuming the registration worked.
+        self.assertEqual(len(recorded), 1)
+        probe = str(recorded[0]).lstrip().upper()
+        self.assertTrue(probe.startswith("SELECT"))
+        self.assertFalse(probe.startswith(("CREATE", "ALTER", "DROP")))
+        recorded.clear()
+        auth.initialize_metadata_state(_RecordingSession)
+        self.assertEqual(len(recorded), 1)
+        self.assertTrue(
+            str(recorded[0]).lstrip().upper().startswith("CREATE TABLE IF NOT EXISTS FEISHU_AUTH_STATE")
+        )
+
+    def test_runtime_store_fails_closed_on_an_unreadable_probe_without_fallback_ddl(self) -> None:
+        recorded: list[str] = []
+
+        class _DeniedSession:
+            def execute(self, statement, parameters=None):
+                recorded.append(str(statement))
+                raise RuntimeError("permission denied for table feishu_auth_state")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                return False
+
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            auth.MetadataStateStore(_DeniedSession)
+        # The refusal stays DDL-free: no repair or creation is attempted after the failure.
+        self.assertEqual(len(recorded), 1)
+        self.assertFalse(str(recorded[0]).lstrip().upper().startswith(("CREATE", "ALTER", "DROP")))
 
 
 if __name__ == "__main__":

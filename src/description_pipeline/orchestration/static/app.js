@@ -11,6 +11,7 @@ import {
   jointRows,
   linkRows,
   previewExpansion,
+  purposeLabel,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
@@ -71,11 +72,13 @@ const TASK_STATES = {
   none: "待执行",
   completed: "完成",
 };
-const TRANSPORT = {
-  resolve_handoff: "接收目录",
-  start_job: "提交作业",
-  wait_for_job: "查询作业",
-  confirm_job: "确认交付",
+const TASK_LABELS = {
+  freeze: "冻结输入",
+  discover: "解析结构",
+  capture: "采集证据",
+  generate: "生成 URDF",
+  verify: "独立验证",
+  publish: "提交评审 PR",
 };
 const CHECK_STATES = { passed: "通过", failed: "失败", not_run: "未执行", unsupported: "不支持" };
 const STAGE_STATES = { not_run: "未执行", running: "执行中", completed: "完成", failed: "失败", blocked: "上游阻断" };
@@ -91,18 +94,22 @@ const AUTOMATIC_STATES = {
   running: "检查中",
 };
 const RETRY_REASONS = {
-  transport_recovery: "继续原作业，不重新采集 CAD。",
+  temporary_disconnection: "继续原作业，不重新采集 CAD。",
+  evidence_corruption: "捕获证据已封存：恢复只重读封存证据，不重采 CAD。",
+  engineering_terminal_failure: "工程阶段已终态失败：请按检查结果修复后新建关联运行。",
+  publication_response_unknown: "发布响应未知：请先完成结果对账，不可原地重试。",
   run_active: "运行尚未结束。",
   run_succeeded: "运行已成功。",
   run_missing: "该运行已不存在，请刷新运行列表。",
-  resolution_not_success: "原输入未完成冻结，请查看问题并新建运行。",
+  admission_failed: "原输入未完成冻结，请查看问题并新建运行。",
   unknown_failed_task: "无法确认可恢复的任务，请联系平台维护人员。",
-  resolution_or_capture_failed: "请修正工程目录或采集问题，再新建运行。",
-  publication_failed: "发布失败，请修正问题后新建运行。",
-  deleted: "此运行已删除：请先恢复后再重试或重跑。",
-  native_terminal_failure: "原作业已终止；可在阶段页选择重新运行。",
-  no_failed_transport_task: "没有可恢复的任务，请查看问题与发现。",
+  no_failed_operation: "没有失败的操作可恢复，请查看问题与发现。",
+  native_terminal_failure: "原作业已终止；可查看检查结果后新建关联运行。",
+  native_evidence_unavailable: "无法确认原生作业证据，稍后再试。",
+  sealed_evidence_reimport: "捕获证据已封存：恢复只重读封存证据，不重采 CAD。",
+  portable_retry: "继续无副作用阶段，不重新采集 CAD。",
   endpoint_evidence_unavailable: "无法确认原作业状态，稍后再试。",
+  deleted: "此运行已删除：请先恢复后再重试或重跑。",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -304,12 +311,15 @@ async function loadTargets(pick) {
   }
   select.onchange = updateStartEnabled;
   if (summary) summary.oninput = updateStartEnabled;
+  const purpose = $("purpose-select");
+  if (purpose) purpose.onchange = updateStartEnabled;
   updateStartEnabled();
 }
 
 function updateStartEnabled() {
   const target = $("target-select");
   const summary = $("change-summary");
+  const purpose = $("purpose-select");
   $("start-button").disabled = !(
     state.folderPick &&
     !state.blockedPick &&
@@ -317,6 +327,8 @@ function updateStartEnabled() {
     state.assemblyChoice &&
     target &&
     target.value &&
+    purpose &&
+    purpose.value &&
     summary &&
     summary.value.trim()
   );
@@ -333,6 +345,12 @@ function submitRun(pick, { onProgress } = {}) {
       return;
     }
     form.append("target_hardware", targetSelect.value);
+    const purposeSelect = $("purpose-select");
+    if (!purposeSelect || !purposeSelect.value) {
+      reject(new Error("用途为必填：请选择用途后重试"));
+      return;
+    }
+    form.append("purpose", purposeSelect.value);
     const summaryInput = $("change-summary");
     if (!summaryInput || !summaryInput.value.trim()) {
       reject(new Error("变更说明为必填：请填写后重试"));
@@ -1504,7 +1522,7 @@ function fillPanelTable(host, headers, rows) {
 async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   const data = {
     robot: await loadPreviewArtifactJson(artifactUrl, preview.files, "model/robot.json", signal),
-    tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/tool.json", signal),
+    tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal),
     quality: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/quality.json", signal),
   };
   state.previewData = data;
@@ -1514,6 +1532,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   for (const row of infoPanelRows({
     runId: identity.run_id,
     subjectSha256: identity.subject_sha256,
+    purpose: preview.purpose,
     tool: data.tool,
     qualitySchema: data.quality ? data.quality.schema_version : null,
     qualificationStates: data.quality ? data.quality.qualifications : null,
@@ -1525,18 +1544,30 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     info.append(key, value);
   }
   const limits = jointRows(records ? records.joints : []);
+  const fmt = (value, digits) => (Number.isFinite(value) ? value.toFixed(digits) : "未提供");
+  const modelJoints = new Map(((data.robot && data.robot.joints) || []).map((joint) => [joint.name, joint]));
+  const windowLabel = "检查/预览分析窗口，非机械限位";
+  const absentDrive = "未提供（未建立驱动能力）";
+  const sourceLabel = (source) =>
+    source === "policy_preview_window" || source === "declared_preview_window"
+      ? `${source}（${windowLabel}）`
+      : source || "未记录";
   fillPanelTable(
     $("panel-limits"),
-    ["关节", "类型", "下限", "上限", "力矩", "速度", "轴 (xyz)"],
-    limits.map((row) => [
-      row.name,
-      row.type,
-      row.lower === null ? null : row.lower.toFixed(4),
-      row.upper === null ? null : row.upper.toFixed(4),
-      row.effort,
-      row.velocity,
-      row.axis ? row.axis.map((value) => value.toFixed(3)).join(", ") : null,
-    ]),
+    ["关节", "类型", "下限", "上限", "力矩", "速度", "轴 (xyz)", "限位来源"],
+    limits.map((row) => {
+      const source = modelJoints.get(row.name) && modelJoints.get(row.name).limit_source;
+      return [
+        row.name,
+        row.type,
+        row.lower === null ? null : row.lower.toFixed(4),
+        row.upper === null ? null : row.upper.toFixed(4),
+        row.effort === null || row.effort === undefined ? absentDrive : row.effort,
+        row.velocity === null || row.velocity === undefined ? absentDrive : row.velocity,
+        row.axis ? row.axis.map((value) => fmt(value, 3)).join(", ") : null,
+        sourceLabel(source),
+      ];
+    }),
   );
   $("limits-title").textContent = `限位 / 轴读数（${limits.length}）`;
   const links = linkRows(records ? records.links : []);
@@ -1545,10 +1576,10 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     ["链接", "质量 kg", "质心 m", "惯量 (kg·m²)"],
     links.map((row) => [
       row.name,
-      row.mass_kg === null ? null : row.mass_kg.toFixed(6),
-      row.com_m ? row.com_m.map((value) => value.toFixed(4)).join(", ") : null,
+      row.mass_kg === null ? "未提供" : row.mass_kg.toFixed(6),
+      row.com_m ? row.com_m.map((value) => fmt(value, 4)).join(", ") : null,
       row.inertia_kg_m2
-        ? `ixx ${row.inertia_kg_m2.ixx.toFixed(6)} · iyy ${row.inertia_kg_m2.iyy.toFixed(6)} · izz ${row.inertia_kg_m2.izz.toFixed(6)}`
+        ? `ixx ${fmt(row.inertia_kg_m2.ixx, 6)} · iyy ${fmt(row.inertia_kg_m2.iyy, 6)} · izz ${fmt(row.inertia_kg_m2.izz, 6)}`
         : null,
     ]),
   );
@@ -1561,8 +1592,8 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     frames.map((row) => [
       row.name,
       row.parent,
-      row.xyz ? row.xyz.map((value) => value.toFixed(4)).join(", ") : null,
-      row.rpy ? row.rpy.map((value) => value.toFixed(4)).join(", ") : null,
+      row.xyz ? row.xyz.map((value) => fmt(value, 4)).join(", ") : null,
+      row.rpy ? row.rpy.map((value) => fmt(value, 4)).join(", ") : null,
     ]),
   );
   fillPanelTable(
@@ -1966,6 +1997,7 @@ function renderRun(run) {
   if (typeof run.main_assembly === "string" && run.main_assembly) {
     rows.splice(1, 0, ["主装配", run.main_assembly]);
   }
+  rows.splice(1, 0, ["用途", purposeLabel(run.purpose)]);
   const measured = report && report.measured ? report.measured : null;
   if (measured) {
     if (measured.subject_sha256) rows.push(["交付摘要", `${String(measured.subject_sha256).slice(0, 12)}…`]);
@@ -2030,7 +2062,7 @@ function renderRun(run) {
   for (const task of run.tasks || []) {
     const chip = document.createElement("span");
     chip.className = `chip ${task.state || ""}`.trim();
-    chip.textContent = `${TRANSPORT[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
+    chip.textContent = `${TASK_LABELS[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
     progress.append(chip);
   }
 

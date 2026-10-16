@@ -69,11 +69,11 @@ def collect_projection() -> dict:
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT object_kind, object_id, run_id, state, bucket, updated_at"
-                " FROM platform.lifecycle_projection"
+                " FROM lifecycle_projection"
             )
             columns = [description[0] for description in cursor.description]
             rows = [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
-            cursor.execute("SELECT state, reason, actor, changed_at, revision FROM platform.admission_projection")
+            cursor.execute("SELECT state, reason, actor, changed_at, revision FROM admission_projection")
             columns = [description[0] for description in cursor.description]
             current = cursor.fetchone()
             admission = dict(zip(columns, current, strict=True)) if current else None

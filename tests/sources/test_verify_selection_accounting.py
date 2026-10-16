@@ -10,6 +10,7 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 from .test_solidworks_closure import (  # noqa: E402
     DEV,
     EASYEDA,
+    _carrier_record,
     _effective_payload,
     _flags,
     _instance,
@@ -136,8 +137,12 @@ def _write_evidence(root: Path, bodies, *, top_mass, clear_parent):
     }
     (root / "raw/mass_closure.json").write_text(json.dumps(native), encoding="utf-8")
     (root / "raw/scene_raw.json").write_text(json.dumps(scene), encoding="utf-8")
-    (root / "raw/source_config.json").write_text(
-        json.dumps({"assembly": "C:/source/robot.SLDASM", "bodies": bodies}), encoding="utf-8"
+    record, controlled = _carrier_record(bodies)
+    support.stage_discovery_inputs(
+        root,
+        record=record,
+        controlled=controlled,
+        record_keys={"joints/hinge.json": "limits"} if controlled else None,
     )
     delivery = root / "delivery"
     return support.write_target_delivery(delivery, capture={"scene": scene, "mass_closure": native})
@@ -152,7 +157,16 @@ class ProducerVerifierSelectionTests(unittest.TestCase):
     def _payloads(self):
         native = json.loads((self.root / "raw/mass_closure.json").read_text(encoding="utf-8"))
         scene = json.loads((self.root / "raw/scene_raw.json").read_text(encoding="utf-8"))
-        config = json.loads((self.root / "raw/source_config.json").read_text(encoding="utf-8"))
+        # The oracle consumes the same rebuilt definition the producer derives
+        # from the sealed discovery payload (the frozen carrier input).
+        from description_pipeline.sources.solidworks.discovery import source_definition  # noqa: PLC0415
+
+        config = source_definition(
+            self.root,
+            discovery_name="evidence/discovery.json",
+            cad_prefix="input/cad/",
+            records_prefix="input/records/",
+        )
         return native, scene, config
 
     def test_unassigned_gap_is_recomputed_exactly_and_bound_to_the_producer(self):

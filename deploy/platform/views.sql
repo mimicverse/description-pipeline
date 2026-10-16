@@ -2,7 +2,7 @@
 -- Run through apply.sh, which supplies :airflow_schema (default: airflow).
 --
 -- lifecycle_projection:
---   object_kind in (request, run, stage, operation, scheduling).  state is the raw source
+--   object_kind in (request, run, stage, operation, scheduling, dag_run).  state is the raw source
 --   value - NULL included, never pre-filtered.  bucket is computed here (the single owner of
 --   the interpretation) from the per-object vocabulary; NULL or an unrecognized value always
 --   becomes unknown.
@@ -14,9 +14,14 @@
 --   unknown (no INNER JOIN, no silent loss).  Only an explicit map_index = -1 (the real
 --   unmapped-task value) can bind.  For a present source row updated_at freezes to
 --   end_date, falling back to start_date.
+--   dag_run rows: one per DagRun referenced by a platform operation (the same binding the
+--   scheduling rows use), carrying the real dag_run.state raw - the settledness evidence of
+--   the actual Airflow schedule on the same association.  A live DagRun is activity for the
+--   gates, so an orphan binding can never claim a settled failure while its own DagRun is
+--   still in flight.
 --   request rows are accepted facts for reports only; the stop/drain gates ignore the kind.
 
-CREATE OR REPLACE VIEW platform.lifecycle_projection AS
+CREATE OR REPLACE VIEW :"platform_schema".lifecycle_projection AS
 SELECT object_kind, object_id, run_id, state, bucket, updated_at
 FROM (
     SELECT 'request'::text AS object_kind,
@@ -25,7 +30,7 @@ FROM (
            'accepted'::text AS state,
            'terminal'::text AS bucket,
            sealed_at AS updated_at
-    FROM platform.request
+    FROM :"platform_schema".request
     UNION ALL
     SELECT 'run'::text,
            run_id,
@@ -38,7 +43,7 @@ FROM (
                ELSE 'unknown'
            END,
            updated_at
-    FROM platform.run
+    FROM :"platform_schema".run
     UNION ALL
     SELECT 'stage'::text,
            run_id || ':' || stage,
@@ -51,7 +56,7 @@ FROM (
                ELSE 'unknown'
            END,
            updated_at
-    FROM platform.stage
+    FROM :"platform_schema".stage
     UNION ALL
     SELECT 'operation'::text,
            operation_id,
@@ -64,7 +69,7 @@ FROM (
                ELSE 'unknown'
            END,
            updated_at
-    FROM platform.operation
+    FROM :"platform_schema".operation
     UNION ALL
     SELECT 'scheduling'::text,
            o.operation_id,
@@ -77,16 +82,33 @@ FROM (
                ELSE 'unknown'
            END,
            COALESCE(ti.end_date, ti.start_date)
-    FROM platform.operation o
+    FROM :"platform_schema".operation o
     LEFT JOIN :"airflow_schema".task_instance ti
            ON ti.dag_id = o.dag_id
           AND ti.task_id = o.task_id
           AND ti.run_id = o.dag_run_id
           AND ti.map_index = o.map_index
     WHERE o.kind IN ('dispatch', 'native', 'publish', 'cancel')
+    UNION ALL
+    SELECT 'dag_run'::text,
+           dr.dag_id || '/' || dr.run_id,
+           dr.run_id,
+           dr.state,
+           CASE
+               WHEN dr.state IN ('success', 'failed') THEN 'terminal'
+               WHEN dr.state IN ('queued', 'running') THEN 'in_flight'
+               ELSE 'unknown'
+           END,
+           COALESCE(dr.end_date, dr.start_date)
+    FROM :"airflow_schema".dag_run dr
+    WHERE EXISTS (
+        SELECT 1
+        FROM :"platform_schema".operation o
+        WHERE o.dag_id = dr.dag_id AND o.dag_run_id = dr.run_id
+    )
 ) AS rows;
 
-CREATE OR REPLACE VIEW platform.admission_projection AS
+CREATE OR REPLACE VIEW :"platform_schema".admission_projection AS
 SELECT state, reason, actor, changed_at, revision
-FROM platform.admission
+FROM :"platform_schema".admission
 WHERE id = 1;

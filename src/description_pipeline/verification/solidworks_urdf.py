@@ -25,7 +25,15 @@ from ..io import PipelineError, confined, digest, file_digest, inventory, read_d
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.snapshot import verify_snapshot
-from ..interface_records import CHECK_POLICY_V1, QUALIFICATION_SCHEMA, qualification_facts, validate_qualification
+from ..interface_records import (
+    CHECK_POLICY_V1,
+    PURPOSE_INSPECTION_PREVIEW,
+    QUALIFICATION_SCHEMA,
+    preview_revolute_window_rad,
+    preview_sampling_interval_fraction,
+    qualification_facts,
+    validate_qualification,
+)
 from ..stages import required_rows_complete
 from . import native_discovery as evidence
 from .consumer import load as load_consumer
@@ -222,26 +230,51 @@ def require_qualified_report(report, definition, root=None):
 
 
 def _frozen_source_config(root) -> dict:
-    """The sealed capture config read verbatim from the raw evidence.
+    """The sealed material authority, read from the canonical capture block.
 
-    The material authority is a fact of the native capture
-    (``evidence/raw/source_config.json``); the verifier reads the value exactly
-    as sealed - never derived from other blocks and never defaulted - so a
-    capture that carries no usable authority fails closed here instead of a
-    bare ``KeyError`` inside the physics gate.
+    The ``material_provenance`` block of the sealed ``capture.json`` states the
+    assembly, configuration and material source; it is the same authority the
+    physics gate consumes.  The verifier reads exactly that block: an unknown
+    schema, missing identity or an absent/unknown material source returns
+    nothing so the reconstruction and the gate fail closed.  Nothing is
+    inferred from mass dictionaries, no raw side copy is preferred over a
+    diverging canonical block, and no generator-side rebuild is invoked.
     """
 
     delivery = Path(root).resolve()
     delivery = delivery.parent if delivery.name == "evidence" else delivery
-    config = read_data(confined(delivery, "evidence/raw/source_config.json"))
-    _require(isinstance(config, dict), "The frozen source config is not an object")
-    return config
+    evidence = delivery / "evidence"
+    if not (evidence / "capture.json").is_file():
+        return {}
+    capture = read_data(confined(evidence, "capture.json"))
+    record = capture.get("material_provenance") if isinstance(capture, dict) else None
+    if not isinstance(record, dict):
+        return {}
+    if record.get("schema_version") != "solidworks-to-urdf.material-provenance/v1":
+        return {}
+    if not isinstance(record.get("assembly"), str) or not record["assembly"].strip():
+        return {}
+    if not isinstance(record.get("configuration"), str) or not record["configuration"].strip():
+        return {}
+    source = record.get("material_source")
+    if source not in ("cad", "documented_table"):
+        return {}
+    return {"material_source": source}
 
 
 def rebuilt_definition(root) -> dict:
     """The independently rebuilt definition a quality report's inventory binds to."""
 
     return _input(root)
+
+
+def _request_purpose(root) -> str:
+    """The frozen request's declared purpose: the single purpose authority."""
+
+    from ..request_evidence import read_request_evidence
+
+    record, _digest = read_request_evidence(Path(root) / "input" / "request.json")
+    return str(record["purpose"])
 
 
 def _input(root, diagnostics=None):
@@ -279,7 +312,7 @@ def _input(root, diagnostics=None):
         frames = rebuild_interface_frames(raw, bodies=bodies, base=base, expansion=carrier.get("expansion"))
     else:
         bodies = rebuild_rigid_bodies(discovery_record)
-        joints = rebuild_joint_facts(discovery_record, root)
+        joints = rebuild_joint_facts(discovery_record, root, purpose=_request_purpose(root))
         frames = rebuild_interface_frames(discovery_record)
     source = read_source_record(root)
     handoff = evidence.handoff(root)
@@ -873,15 +906,27 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics):
     )
     limits = {key: float(value) for key, value in _one(node, "limit").attrib.items()}
     _require(limits == authored["limits"] == canonical["limits"], "Joint limits differ from author inputs")
+    _require(all(math.isfinite(value) for value in limits.values()), "Invalid joint limits")
     _require(
-        all(math.isfinite(value) for value in limits.values()) and limits["effort"] >= 0 and limits["velocity"] >= 0,
+        all(limits.get(key, 0.0) >= 0 for key in ("effort", "velocity")),
         "Invalid joint limits",
     )
+    _require(
+        canonical.get("limit_source") == authored.get("limit_source"),
+        "Joint limit source changed between author inputs and the canonical model",
+    )
     if authored["type"] in {"revolute", "prismatic"}:
+        _require("lower" in limits and "upper" in limits, "Missing position limits")
         _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
-    unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
+    if authored.get("limit_source") == "policy_preview_window":
+        radius = preview_revolute_window_rad()
+        _require(
+            authored["type"] == "revolute" and limits.get("lower") == -radius and limits.get("upper") == radius,
+            "The inspection-preview window does not equal the frozen policy radius",
+        )
+    unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
         unqualified.append("degenerate_position_range")
     if unqualified:
@@ -925,6 +970,104 @@ def _axis_line(authored, record, components):
     if reference.get("kind") == "reference_axis":
         return _reference_axis_line(reference, record, components)
     return _cylinder_axis_line(reference, record, components)
+
+
+def _unit_axis(value):
+    """The unit direction of one delivered joint axis; an unusable axis refuses."""
+
+    try:
+        vector = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        vector = np.zeros(0)
+    norm = float(np.linalg.norm(vector)) if vector.shape == (3,) else 0.0
+    _require(np.isfinite(norm) and norm > 0, "A delivered joint axis has no usable direction")
+    return (vector / norm).tolist()
+
+
+def _joint_sample(joint, sign):
+    """One pose value for a delivered moving joint, from its own evidence only.
+
+    The offset inside the joint's ordered interval is the canonical policy's
+    analytical sampling fraction of the quarter-interval point (the frozen
+    policy fixes 1.0 today); a missing-drive joint samples identically - this
+    is an analysis pose, not an engineering claim.
+    """
+
+    if joint["type"] == "continuous":
+        return 0.3 if sign > 0 else -0.4
+    limits = joint.get("limits") or {}
+    lower, upper = limits.get("lower"), limits.get("upper")
+    _require(
+        isinstance(lower, (int, float))
+        and isinstance(upper, (int, float))
+        and math.isfinite(float(lower))
+        and math.isfinite(float(upper))
+        and float(lower) <= float(upper),
+        f"Joint {joint['name']} has no usable ordered limits",
+    )
+    middle = (float(lower) + float(upper)) / 2
+    quarter = (float(upper) - float(lower)) / 4 * preview_sampling_interval_fraction()
+    return middle + sign * quarter
+
+
+def _joint_combined_sample(joint, sign):
+    """A deterministic in-range NON-ZERO pose for the combined sample.
+
+    The value comes from the joint's own ordered-limits interval (never
+    outside its authored limits): the quarter point, or - when that quarter
+    point sits at zero - the half-quarter point on the same side, both
+    strictly inside the range.  A zero-width range has no motion to claim: it
+    contributes the zero pose when zero is admissible, and a degenerate range
+    that excludes its zero refuses instead of fabricating a pose.
+    """
+
+    if joint["type"] == "continuous":
+        return 0.3 if sign > 0 else -0.4
+    limits = joint.get("limits") or {}
+    lower, upper = limits.get("lower"), limits.get("upper")
+    _require(
+        isinstance(lower, (int, float))
+        and isinstance(upper, (int, float))
+        and math.isfinite(float(lower))
+        and math.isfinite(float(upper))
+        and float(lower) <= float(upper),
+        f"Joint {joint['name']} has no usable ordered limits",
+    )
+    lower, upper = float(lower), float(upper)
+    middle = (lower + upper) / 2
+    quarter = (upper - lower) / 4 * preview_sampling_interval_fraction()
+    if quarter == 0:
+        _require(lower <= 0.0 <= upper, f"Joint {joint['name']} has a zero-width range that excludes its zero")
+        return 0.0
+    value = middle + sign * quarter
+    if abs(value) <= 1e-12:
+        value = middle + sign * quarter / 2
+    return value
+
+
+def _signed_axis_line(joint, record, components, body_datums):
+    """The native line with the evidenced signed joint convention.
+
+    A record that explicitly declares ``direction_semantics =
+    undirected_axis_line`` fixes a line, not a direction: exchanging its two
+    measured endpoints keeps the same geometric object.  For those records the
+    signed positive-motion convention is the delivered authored axis carried
+    into the SAME frame as the native direction through the evidenced native
+    child datum (the shafts gate reports the same
+    ``author_axis_in_child_datum`` convention); the endpoint order can never
+    decide the physical sign.  A genuinely directed record keeps its own
+    direction, and an unexplained sign mismatch under a directed source still
+    diverges as before.
+    """
+
+    point, direction = _axis_line(joint, record, components)
+    if record.get("direction_semantics") == "undirected_axis_line":
+        child_datum = body_datums.get(joint["child"])
+        _require(child_datum is not None, f"Joint {joint['name']} names no delivered child datum")
+        authored_axis = child_datum[:3, :3] @ np.asarray(_unit_axis(joint.get("axis")), float)
+        if float(np.dot(np.asarray(direction, float), authored_axis)) < 0:
+            direction = -np.asarray(direction, float)
+    return point, direction
 
 
 def _reference_axis_line(reference, record, components):
@@ -985,29 +1128,45 @@ def _cylinder_axis_line(reference, record, components):
     return point, direction
 
 
-def _motion(authored, joints, components, body_datums, bodies, record):
+def _motion(authored, joints, components, body_datums, bodies, record, native_axes):
     """The motion.{joint} gate: non-zero follow re-derived from the native shaft line.
 
     The motion owner re-derives, from the shaft evidence alone, where every
     driven occurrence must be under positive and negative poses inside the
-    authored limits; the delivered graph is forward-kinematicked from its own
-    datums and signed axes.  A statically green delivery whose parent chain,
-    axis binding or frame relations are wrong diverges as soon as a pose is
-    non-zero.
+    authored limits - over the WHOLE delivered chain: a further moving joint
+    at its zero pose (or a fixed weld) still carries its descendants exactly
+    as the delivered graph does.  Besides the per-joint samples, a combined
+    sample poses ALL delivered moving joints at once - each value derived
+    from that joint's own ordered-limits interval (a deterministic in-range
+    NON-ZERO value; a zero-width range never claims motion) - and the
+    delivered graph is forward-kinematicked from its own datums and signed
+    axes (a revolute/continuous joint rotates about its axis, a prismatic
+    joint translates along it without rotating).  A statically green delivery
+    whose parent chain, axis binding or frame relations are wrong diverges as
+    soon as a pose is non-zero.
+
+    ``native_axes`` is REQUIRED and must carry every moving joint's native
+    shaft record (the production call passes the full map): the expected side
+    of every sample uses each moving joint's own native line, and there is no
+    single-record fallback.  Reported errors separate the translation (m)
+    from the rotation (rad); the acceptance threshold still applies to the
+    established element-wise consistency metric.
     """
 
     from .motion import axis_rotation, evaluate_motion
 
     name, child = authored["name"], authored["child"]
-    point, direction = _axis_line(authored, record, components)
+    point, direction = _signed_axis_line(authored, record, components, body_datums)
     limits = authored["limits"]
-    if authored["type"] == "continuous":
-        samples = (0.3, -0.4)
-    else:
-        middle = (float(limits["lower"]) + float(limits["upper"])) / 2
-        quarter = (float(limits["upper"]) - float(limits["lower"])) / 4
-        samples = (middle + quarter, middle - quarter)
+    samples = (_joint_sample(authored, 1.0), _joint_sample(authored, -1.0))
     parents = {joint["child"]: joint for joint in joints}
+    moving = [joint for joint in joints if joint["type"] != "fixed"]
+    missing = [joint["name"] for joint in moving if not (native_axes or {}).get(joint["name"])]
+    _require(
+        isinstance(native_axes, dict) and not missing,
+        "The motion bridge requires the complete native axis map"
+        + (f"; missing {missing}" if missing else ""),
+    )
     doc_bodies = [
         {
             "id": body["name"],
@@ -1020,18 +1179,55 @@ def _motion(authored, joints, components, body_datums, bodies, record):
         }
         for body in bodies
     ]
-    doc_joint = {
-        "id": name,
-        "type": authored["type"],
-        "parent": authored["parent"],
-        "child": child,
-        "axis_point": point.tolist(),
-        "axis_dir": direction.tolist(),
-        "stored_direction": direction.tolist(),
-        "limits": dict(limits),
-        "drive": {"effort": float(limits["effort"]), "velocity": float(limits["velocity"])},
-        "origin_parent_child": np.eye(4).ravel().tolist(),
-    }
+    #: The expected side carries the full delivered chain: the sampled joint
+    #: uses its native shaft line; every other delivered edge (a further
+    #: moving joint at its zero pose, or a fixed weld) contributes no motion
+    #: but still inherits and passes on its parent's transform, exactly like
+    #: the delivered graph's forward kinematics below.
+    doc_joints = []
+    for joint in joints:
+        if joint["type"] == "fixed":
+            doc_joints.append(
+                {
+                    "id": joint["name"],
+                    "type": "fixed",
+                    "parent": joint["parent"],
+                    "child": joint["child"],
+                    "axis_point": [0.0, 0.0, 0.0],
+                    "axis_dir": [0.0, 0.0, 1.0],
+                    "stored_direction": [0.0, 0.0, 1.0],
+                    "limits": {},
+                    "drive": {},
+                    "origin_parent_child": np.eye(4).ravel().tolist(),
+                }
+            )
+            continue
+        if joint["name"] == name:
+            axis_point, axis_dir = point.tolist(), direction.tolist()
+            joint_limits = limits
+        else:
+            other_point, other_direction = _signed_axis_line(
+                joint, native_axes[joint["name"]], components, body_datums
+            )
+            axis_point, axis_dir = other_point.tolist(), other_direction.tolist()
+            joint_limits = joint.get("limits") or {}
+        doc_joints.append(
+            {
+                "id": joint["name"],
+                "type": joint["type"],
+                "parent": joint["parent"],
+                "child": joint["child"],
+                "axis_point": axis_point,
+                "axis_dir": axis_dir,
+                "stored_direction": axis_dir,
+                "limits": dict(joint_limits),
+                "drive": {
+                    "effort": joint_limits.get("effort"),
+                    "velocity": joint_limits.get("velocity"),
+                },
+                "origin_parent_child": np.eye(4).ravel().tolist(),
+            }
+        )
     interface = {
         "name": "IF-" + name,
         "on_parent": authored["parent"],
@@ -1040,7 +1236,12 @@ def _motion(authored, joints, components, body_datums, bodies, record):
         "axis_dir": direction.tolist(),
     }
 
-    def model_transform(body_name, pose, memo):
+    checks = [({name: value}, f"{value:g}") for value in samples]
+    if len(moving) > 1:
+        for sign, label in ((1.0, "combined+"), (-1.0, "combined-")):
+            checks.append(({joint["name"]: _joint_combined_sample(joint, sign) for joint in moving}, label))
+
+    def model_transform(body_name, poses, memo):
         if body_name in memo:
             return memo[body_name]
         if body_name not in parents:
@@ -1048,34 +1249,60 @@ def _motion(authored, joints, components, body_datums, bodies, record):
         else:
             joint = parents[body_name]
             offset = np.linalg.inv(body_datums[joint["parent"]]) @ body_datums[body_name]
-            if joint["name"] == name:
+            if joint["name"] in poses:
                 offset = offset.copy()
-                offset[:3, :3] = offset[:3, :3] @ axis_rotation(_vector(joint["axis"]), pose)
-            value = model_transform(joint["parent"], pose, memo) @ offset
+                unit = np.asarray(_unit_axis(joint.get("axis")), float)
+                value_pose = float(poses[joint["name"]])
+                if joint["type"] == "prismatic":
+                    offset[:3, 3] = offset[:3, 3] + offset[:3, :3] @ (unit * value_pose)
+                else:
+                    offset[:3, :3] = offset[:3, :3] @ axis_rotation(unit, value_pose)
+            value = model_transform(joint["parent"], poses, memo) @ offset
         memo[body_name] = value
         return value
 
     worst = 0.0
-    for pose in samples:
+    worst_translation = 0.0
+    worst_rotation = 0.0
+    combined_worst_translation = 0.0
+    combined_worst_rotation = 0.0
+    for poses, label in checks:
         result = evaluate_motion(
-            bodies=doc_bodies, joints=[doc_joint], interface=interface, poses={name: pose}
+            bodies=doc_bodies, joints=doc_joints, interface=interface, poses=poses
         )
         _require(
             result["interface"]["line_distance_m"] <= 1e-9 and result["interface"]["parallelism"] >= 1 - 1e-6,
-            f"{name}: the re-derived interface loses continuity at {pose:g}",
+            f"{name}: the re-derived interface loses continuity at {label}",
         )
         memo = {}
         for body in bodies:
-            transform = model_transform(body["name"], pose, memo)
+            transform = model_transform(body["name"], poses, memo)
             for component in body["components"]:
                 candidate = transform @ np.linalg.inv(body_datums[body["name"]]) @ components[component]
                 expected = np.asarray(result["world"][component], float)
                 worst = max(worst, float(np.max(np.abs(candidate - expected))))
+                translation = float(np.linalg.norm(candidate[:3, 3] - expected[:3, 3]))
+                rotation = candidate[:3, :3].T @ expected[:3, :3]
+                angle = math.acos(float(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0)))
+                worst_translation = max(worst_translation, translation)
+                worst_rotation = max(worst_rotation, angle)
+                if label.startswith("combined"):
+                    combined_worst_translation = max(combined_worst_translation, translation)
+                    combined_worst_rotation = max(combined_worst_rotation, angle)
     _require(
         worst <= POSITION_TOL_M,
-        f"{name}: the delivered graph diverges from the re-derived motion by {worst:.9g} m",
+        f"{name}: the delivered graph diverges from the re-derived motion by {worst:.9g} "
+        f"(matrix-element delta; worst translation {worst_translation:.9g} m, "
+        f"worst rotation {worst_rotation:.9g} rad)",
     )
-    return {"samples": list(samples), "worst_m": worst}
+    return {
+        "samples": list(samples),
+        "worst_matrix_element_delta": worst,
+        "worst_translation_m": worst_translation,
+        "worst_rotation_rad": worst_rotation,
+        "combined_worst_translation_m": combined_worst_translation,
+        "combined_worst_rotation_rad": combined_worst_rotation,
+    }
 
 
 def _tree(document, base_pose):
@@ -1401,16 +1628,45 @@ def qualifications(root, definition, checks):
 
     Two objects of one fact stay two identities; an absent optional budget is
     ``out_of_scope``; a fact whose gate did not establish its conclusion is
-    ``unqualified``.  Evidence references bind the sealed records the conclusion
-    is read from; when a required record is absent the item carries no evidence,
-    and the check boundary refuses it as ungrounded rather than downgrading it.
+    ``unqualified``.  The engineering facts (B family) never take a gate's
+    colour: their conclusion is read from authoritative evidence - an
+    inspection-preview delivery states all three explicitly ``unqualified``.
+    Evidence references bind the sealed records the conclusion is read from;
+    when a required record is absent the item carries no evidence, and the
+    check boundary refuses it as ungrounded rather than downgrading it.
     """
 
     rows = {check["id"]: check for check in checks}
     expectations = definition.get("checks") or {}
+    purpose = _request_purpose(root)
+    preview = purpose == PURPOSE_INSPECTION_PREVIEW
+    joints = {joint["name"]: joint for joint in (definition.get("source") or {}).get("joints", [])}
     items = []
     for fact in qualification_facts(definition):
         fact_id = fact["fact_id"]
+        if fact_id in _ENGINEERING_FACTS:
+            status = _engineering_status(fact_id, fact["object_id"], joints, preview)
+            evidence = []
+            if all((root / record).is_file() for record in _ENGINEERING_FACT_RECORDS):
+                evidence = [
+                    {"record": record, "sha256": file_digest(root / record)} for record in _ENGINEERING_FACT_RECORDS
+                ]
+                evidence.extend(
+                    {"record": extra, "sha256": file_digest(root / extra)}
+                    for extra in _ENGINEERING_FACT_EXTRAS
+                    if (root / extra).is_file()
+                )
+            items.append(
+                {
+                    "schema_version": QUALIFICATION_SCHEMA,
+                    "fact_id": fact_id,
+                    "scope": fact["scope"],
+                    "object_id": fact["object_id"],
+                    "status": status,
+                    "evidence": evidence,
+                }
+            )
+            continue
         budget = {
             "physics.expected_mass": "expected_mass_kg",
             "geometry.expected_extent": "expected_extent_m",
@@ -1435,6 +1691,34 @@ def qualifications(root, definition, checks):
             }
         )
     return items
+
+
+#: The engineering qualification facts (IF-14, B family): authoritative-evidence
+#: conclusions only - a passing model-consistency check never establishes them.
+_ENGINEERING_FACTS = frozenset(
+    (*CHECK_POLICY_V1["engineering_facts"]["per_joint"], *CHECK_POLICY_V1["engineering_facts"]["per_subject"])
+)
+_ENGINEERING_FACT_RECORDS = ("input/handoff.json",)
+_ENGINEERING_FACT_EXTRAS = ("input/request.json", "model/robot.json")
+
+
+def _engineering_status(fact_id: str, object_id: str, joints: dict, preview: bool) -> str:
+    """The evidence-grounded state of one engineering fact.
+
+    Inspection-preview deliveries state all three explicitly ``unqualified``;
+    under the engineering purpose the per-joint range is established only by a
+    native/controlled range source and drive sizing only by a present drive
+    specification.  Machine qualification has no establishment channel here:
+    a passing consistency check never grants it.
+    """
+
+    if preview or fact_id == "machine_qualification":
+        return "unqualified"
+    joint = joints.get(object_id) or {}
+    if fact_id == "engineering_position_range":
+        return "established" if joint.get("limit_source") in ("native", "controlled") else "unqualified"
+    limits = joint.get("limits") or {}
+    return "established" if "effort" in limits and "velocity" in limits else "unqualified"
 
 
 def _mass_closure_equality(root, definition=None):
@@ -1491,7 +1775,13 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             gates.add(
                 "motion." + name,
                 lambda a=authored: _motion(
-                    a, source["joints"], components, body_datums, source["bodies"], axis_map[a["name"]]
+                    a,
+                    source["joints"],
+                    components,
+                    body_datums,
+                    source["bodies"],
+                    axis_map[a["name"]],
+                    native_axes=axis_map,
                 ),
             )
     for frame in source.get("frames", []):

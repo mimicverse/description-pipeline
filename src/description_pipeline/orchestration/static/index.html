@@ -59,6 +59,12 @@
             <div id="target-row" class="assembly-row" hidden>
               <label for="target-select" class="muted small">发布目标（必填）</label>
               <select id="target-select" hidden></select>
+              <label for="purpose-select" class="muted small">用途（必填）</label>
+              <select id="purpose-select">
+                <option value="">请选择用途</option>
+                <option value="engineering">工程交付</option>
+                <option value="inspection_preview">检查预览</option>
+              </select>
               <textarea id="change-summary" rows="3" placeholder="变更说明（必填）" hidden></textarea>
               <p id="target-note" class="muted small" hidden></p>
             </div>

@@ -25,6 +25,62 @@ CREATE_BODY_SCOPE_KEY = "description_pipeline_create_body"
 #: authorization still runs on the resolved endpoint and router-populated path parameters.
 _CLEAR_BODY_LIMIT = 4096
 _CLEAR_BODY_FIELDS = frozenset({"dry_run", "only_failed", "only_new", "run_on_latest_version"})
+#: The create body carries exactly the submission frame the DAG understands: the
+#: frozen intake path, the frozen request identity the DAG intake requires, the
+#: optional linked-attempt linkage, the selected main assembly and the publish
+#: target with its multi-line change summary.  The recorded submitter identity is
+#: never a create-body field: ownership comes from the run's stored actor and
+#: the Airflow-authenticated actor, never from a client-provided identity claim.
+_CREATE_FIELDS = frozenset(
+    {
+        "handoff_path",
+        "parent_dag_run_id",
+        "resume_from",
+        "target_hardware",
+        "change_summary",
+        "main_assembly",
+        # The user's declared purpose (engineering / inspection_preview); the
+        # frozen request/v2 carries it and the DAG refuses a run without it.
+        "purpose",
+        # The portal-issued frozen request identity of one submission
+        # (``portal-<dag_run_id>``); the DAG intake refuses a run without it.
+        "request_id",
+    }
+)
+_CREATE_SINGLE_LINE_FIELDS = ("handoff_path", "target_hardware", "main_assembly", "request_id")
+_CREATE_SINGLE_LINE_LIMIT = 1024
+_CREATE_SUMMARY_LIMIT = 2048
+
+
+def _safe_single_line(value: object) -> bool:
+    """One bounded, control-character-free line of submission frame text.
+
+    The text must carry a non-whitespace character and rejects C0 controls and DEL, exactly
+    like the frozen frame contract: an all-whitespace or C0/DEL-carrying field is not a
+    nameable path, identity or target.
+    """
+
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _CREATE_SINGLE_LINE_LIMIT
+        and bool(value.strip())
+        and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+    )
+
+
+def _safe_change_summary(value: object) -> bool:
+    """The frozen identity contract: LF stays inside a summary, every other control character refuses.
+
+    Line endings are folded to LF first, exactly like the portal and the DAG
+    intake fold them, so a CRLF submission keeps its multi-line shape.
+    """
+
+    if not isinstance(value, str):
+        return False
+    folded = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not folded or len(folded) > _CREATE_SUMMARY_LIMIT:
+        return False
+    return all(ord(char) >= 32 or char == "\n" for char in folded)
 
 
 def bound_request() -> Any | None:
@@ -102,6 +158,7 @@ def _selects_create_candidate(scope: dict) -> bool:
 
 def evaluate_create_candidate(raw: bytes, *, oversize: bool) -> dict:
     """Parse a requested lineage selector, never a client-provided owner identity."""
+    from ..interface_records import REQUEST_PURPOSES
     from ..stages import STAGE_IDS
 
     if oversize:
@@ -115,7 +172,14 @@ def evaluate_create_candidate(raw: bytes, *, oversize: bool) -> dict:
     conf = data.get("conf")
     if conf is None:
         conf = {}
-    if not isinstance(conf, dict) or set(conf) - {"handoff_path", "parent_dag_run_id", "resume_from"}:
+    if not isinstance(conf, dict) or set(conf) - _CREATE_FIELDS:
+        return {"safe": False}
+    for name in _CREATE_SINGLE_LINE_FIELDS:
+        if name in conf and not _safe_single_line(conf[name]):
+            return {"safe": False}
+    if "change_summary" in conf and not _safe_change_summary(conf["change_summary"]):
+        return {"safe": False}
+    if conf.get("purpose") not in REQUEST_PURPOSES:
         return {"safe": False}
     if "parent_dag_run_id" not in conf and "resume_from" not in conf:
         return {"safe": True, "parent_dag_run_id": None}

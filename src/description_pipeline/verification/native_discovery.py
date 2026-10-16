@@ -41,7 +41,14 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 from ..delivery import read_delivery_manifest, read_source_record
-from ..io import PipelineError, confined, digest, read_data
+from ..interface_records import (
+    PREVIEW_RANGE_KEYS,
+    PREVIEW_RANGE_SCHEMA,
+    PURPOSE_INSPECTION_PREVIEW,
+    preview_revolute_window_rad,
+    validate_request_record,
+)
+from ..io import PipelineError, confined, digest, parse_data, read_data
 from ..schemas import exporter_declaration_present
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
@@ -115,14 +122,34 @@ def _authored_identity(raw: dict, namespace: str) -> dict:
             if candidate is None:
                 continue
             _require(
-                isinstance(candidate, str)
-                and bool(candidate.strip())
-                and not any(ord(char) < 32 or ord(char) == 127 for char in candidate),
+                isinstance(candidate, str) and bool(candidate.strip()),
                 "discovery.identity",
                 "supplied metadata must be non-empty text",
                 {"field": key},
             )
-            normalized.append(candidate.strip())
+            text = candidate
+            if key == "change_summary":
+                # One line-ending standard with the generation side: LF stays
+                # inside a change summary, and CRLF or a lone CR fold to LF so
+                # equivalent readings never read as a conflict.  Every other
+                # control character still refuses, as it does for every other
+                # field (the independent read keeps its own, not the
+                # generator's, expectation values).
+                text = text.replace("\r\n", "\n").replace("\r", "\n")
+                _require(
+                    not any((ord(char) < 32 and char != "\n") or ord(char) == 127 for char in text),
+                    "discovery.identity",
+                    "supplied metadata must be non-empty text",
+                    {"field": key},
+                )
+            else:
+                _require(
+                    not any(ord(char) < 32 or ord(char) == 127 for char in text),
+                    "discovery.identity",
+                    "supplied metadata must be non-empty text",
+                    {"field": key},
+                )
+            normalized.append(text.strip())
         _require(
             len(set(normalized)) <= 1,
             "discovery.identity",
@@ -172,6 +199,74 @@ def publication_metadata_state(raw: dict, namespace: str) -> dict:
     """Authored publication metadata exactly as the verifier reads it (single contract)."""
 
     return _authored_identity(raw, namespace)
+
+
+def _saved_configuration_observed(raw: dict, name: str) -> bool:
+    """Independent rebuild of the saved-configuration proof from the raw readings.
+
+    The verifier recomputes the qualification the admission gate applied: the
+    native document state must show the document saved (``save_flag`` strictly
+    false) and the active configuration matching on both readings; a recorded
+    name alone never qualifies.
+    """
+
+    state = raw.get("document_state")
+    if not isinstance(state, dict):
+        return False
+    readings = (state.get("before"), state.get("after"))
+    if not all(isinstance(reading, dict) for reading in readings):
+        return False
+    return all(
+        reading.get("save_flag") is False
+        and isinstance(reading.get("configuration"), str)
+        and reading["configuration"].strip() == name
+        for reading in readings
+    )
+
+
+REQUEST_RECORD = "input/request.json"
+
+
+def _sealed_request(package: Path) -> dict:
+    """The strict freeze-formed request record: the only offline evidence of the submission.
+
+    Parsed with the one foundation reader (duplicate and non-finite inputs
+    refuse) and validated by the shared ``validate_request_record`` entry; a
+    missing, escaping, unreadable or malformed record refuses.
+    """
+
+    try:
+        path = confined(Path(package), REQUEST_RECORD, exists=False)
+    except PipelineError as error:
+        raise _Failure(
+            "discovery.request",
+            "the sealed request record is not an immutable artifact",
+            {"file": REQUEST_RECORD, "error": str(error)},
+        ) from error
+    if not path.is_file():
+        raise _Failure("discovery.request", "the sealed request record is missing", {"file": REQUEST_RECORD})
+    try:
+        record = parse_data(path.read_bytes(), path)
+        validate_request_record(record)
+    except PipelineError as error:
+        raise _Failure(
+            "discovery.request",
+            f"the sealed request record is invalid: {error}",
+            {"file": REQUEST_RECORD},
+        ) from error
+    return record
+
+
+def _request_target(record: dict) -> str:
+    """The requested configured target (its text shape is already validated)."""
+
+    return record["target_hardware"].strip()
+
+
+def _request_summary(record: dict) -> str:
+    """The requested change summary under the one LF line-ending standard."""
+
+    return record["change_summary"].replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _digest_files(root: Path) -> dict[str, str]:
@@ -1058,7 +1153,23 @@ def _rows_for(mate: dict, frames) -> dict | None:
     for entity in (first, second):
         if _rejected_entity(entity, frames):
             return None
-    limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
+    # The independent rebuild refuses an incomplete or unusable limits reading
+    # itself: only an intact observation (explicit null or a mapping) may ever
+    # be treated as absence, and no purpose changes that.
+    if "limits" not in mate:
+        raise _Failure(
+            "discovery.mate_limits_observation_incomplete",
+            "the mate observation carries no limits reading; a missing reading cannot prove absence",
+            {"mate": mate.get("name")},
+        )
+    raw_limits = mate["limits"]
+    if raw_limits is not None and not isinstance(raw_limits, dict):
+        raise _Failure(
+            "discovery.mate_limits_observation_invalid",
+            "the mate limits reading is not a usable observation",
+            {"mate": mate.get("name"), "value_type": type(raw_limits).__name__},
+        )
+    limits = raw_limits if isinstance(raw_limits, dict) else None
     axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     if kind == "lock":
         first_frame = _frame_for(first, frames)
@@ -1858,17 +1969,21 @@ def rebuild_interface_frames(
     return frames
 
 
-def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
+def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[dict]:
     """Rebuild the movable-joint carrier from the raw capture alone (IF-17, in memory).
 
     ``record`` is the discovery payload (its ``raw`` block, ``frozen_names``,
     ``namespace`` and controlled-record entries); ``package`` resolves the
-    embedded record bytes.  The reconstruction mirrors the documented rules on
+    embedded record bytes and the sealed request states the purpose.  The
+    reconstruction mirrors the documented rules on
     the verification side: the raw mate rank/twist proves the freedom and type,
     the recorded shaft and axis sign give the native direction, the child body
     frame gives the local axis, and the controlled records give the position
-    and drive ranges.  Every missing or conflicting witness raises a classified
-    failure - the saved derived definition is never read.
+    and drive ranges.  Under ``inspection_preview`` a proven-missing revolute
+    range is supplied by the one policy window and a proven-missing drive stays
+    absent; a prismatic joint needs the bound finite declaration.  Every missing
+    or conflicting witness otherwise raises a classified failure - the saved
+    derived definition is never read.
     """
 
     payload = record if isinstance(record.get("raw"), dict) else {"raw": record}
@@ -2030,6 +2145,7 @@ def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
         _require(_SNAKE.fullmatch(name) is not None, "discovery.joint_rebuild", "joint name is not snake_case")
         limits: dict | None = None
         limit_evidence = None
+        limit_source = None
         native_limits = group["limits"]
         limits_reference = properties.get(f"{namespace}.joint.limits_record")
         if joint_type == "continuous":
@@ -2048,6 +2164,7 @@ def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
                 {"pair": [left, right], "unit": native_limits.get("unit")},
             )
             limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
+            limit_source = "native"
             if isinstance(limits_reference, str) and limits_reference.strip():
                 entry = _find_record_entry(payload, limits_reference)
                 value = _record_value(package, entry["entry"], entry["key"])
@@ -2062,13 +2179,7 @@ def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
                     "sha256": entry["entry"].get("sha256"),
                     "anchor": entry["entry"].get("anchor"),
                 }
-        else:
-            _require(
-                isinstance(limits_reference, str) and limits_reference.strip(),
-                "discovery.joint_rebuild",
-                "the joint has no native or controlled position range",
-                {"pair": [left, right]},
-            )
+        elif isinstance(limits_reference, str) and limits_reference.strip():
             entry = _find_record_entry(payload, limits_reference)
             value = _record_value(package, entry["entry"], entry["key"])
             limits = {"lower": float(value["lower"]), "upper": float(value["upper"])}
@@ -2077,26 +2188,45 @@ def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
                 "sha256": entry["entry"].get("sha256"),
                 "anchor": entry["entry"].get("anchor"),
             }
+            limit_source = "controlled"
+        elif purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "revolute":
+            radius = preview_revolute_window_rad()
+            limits = {"lower": -radius, "upper": radius}
+            limit_source = "policy_preview_window"
+        elif purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
+            limits, limit_evidence = _declared_preview_range(
+                payload, package, properties, namespace, pair=(left, right), joint=name
+            )
+            limit_source = "declared_preview_window"
+        else:
+            raise _Failure(
+                "discovery.joint_rebuild",
+                "the joint has no native or controlled position range",
+                {"pair": [left, right]},
+            )
         drive_reference = properties.get(f"{namespace}.joint.drive_record")
-        _require(
-            isinstance(drive_reference, str) and drive_reference.strip(),
-            "discovery.joint_rebuild",
-            "the joint has no controlled drive record",
-            {"pair": [left, right]},
-        )
-        entry = _find_record_entry(payload, drive_reference)
-        drive = _record_value(package, entry["entry"], entry["key"])
-        effort = float(drive["effort"])
-        velocity_limit = float(drive["velocity"])
-        _require(
-            math.isfinite(effort) and math.isfinite(velocity_limit) and effort > 0.0 and velocity_limit > 0.0,
-            "discovery.joint_rebuild",
-            "drive record effort/velocity must be finite and positive",
-            {"pair": [left, right]},
-        )
-        limits = dict(limits or {})
-        limits["effort"] = effort
-        limits["velocity"] = velocity_limit
+        if isinstance(drive_reference, str) and drive_reference.strip():
+            entry = _find_record_entry(payload, drive_reference)
+            drive = _record_value(package, entry["entry"], entry["key"])
+            effort = float(drive["effort"])
+            velocity_limit = float(drive["velocity"])
+            _require(
+                math.isfinite(effort) and math.isfinite(velocity_limit) and effort > 0.0 and velocity_limit > 0.0,
+                "discovery.joint_rebuild",
+                "drive record effort/velocity must be finite and positive",
+                {"pair": [left, right]},
+            )
+            limits = dict(limits or {})
+            limits["effort"] = effort
+            limits["velocity"] = velocity_limit
+        else:
+            _require(
+                purpose == PURPOSE_INSPECTION_PREVIEW,
+                "discovery.joint_rebuild",
+                "the joint has no controlled drive record",
+                {"pair": [left, right]},
+            )
+            drive = None
         facts.append(
             {
                 "nodes": (left_body, right_body),
@@ -2109,6 +2239,7 @@ def rebuild_joint_facts(record: dict, package: Path) -> list[dict]:
                     "axis_reference": axis_reference,
                     "limits": limits,
                     "limit_evidence": limit_evidence,
+                    "limit_source": limit_source,
                 },
             }
         )
@@ -2293,6 +2424,95 @@ def _joint_properties(raw: dict, mates: list[dict]) -> tuple[dict, dict]:
     return merged, conflicts
 
 
+def _preview_number(value) -> float:
+    """A finite real declaration number; booleans are not numeric facts."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return math.nan
+    number = float(value)
+    return number if math.isfinite(number) else math.nan
+
+
+def _declared_preview_range(
+    payload: dict,
+    package: Path,
+    properties: dict,
+    namespace: str,
+    *,
+    pair: tuple[str, str],
+    joint: str,
+) -> tuple[dict, dict]:
+    """Resolve the bound finite preview declaration of one prismatic joint.
+
+    The resolved file's digest and the parsed exact semantics (joint, instance
+    among the pair's occurrences, configuration, unit, zero, direction, purpose
+    and a finite ordered range) are all required - a file that merely exists, or
+    an anchor substring that merely matches, never passes.  ``source_sha256`` is
+    not part of the shape: the controlled-record entry already owns and verifies
+    the resolved file digest.
+
+    The declared window is expressed in the declaration's own measure.  ``zero``
+    is the declared value that coincides with the joint's canonical zero and
+    ``direction`` (``+1``/``-1``) orients the declared positive sense against
+    the canonical positive axis, so the canonical window is
+    ``direction * (declared - zero)`` applied to both endpoints and ordered.
+    The mapping is always applied - a descriptor is never silently dropped.
+    """
+
+    reference = properties.get(f"{namespace}.joint.preview_range_record")
+    _require(
+        isinstance(reference, str) and reference.strip(),
+        "discovery.joint_preview_range_missing",
+        "a prismatic joint with a proven-missing engineering range requires a bound finite preview declaration",
+        {"pair": list(pair)},
+    )
+    entry = _find_record_entry(payload, reference)
+    value = _record_value(package, entry["entry"], entry["key"])
+    left, right = pair
+    numbers = isinstance(value, dict)
+    lower = _preview_number(value.get("lower")) if numbers else math.nan
+    upper = _preview_number(value.get("upper")) if numbers else math.nan
+    zero = _preview_number(value.get("zero")) if numbers else math.nan
+    direction = value.get("direction") if numbers else None
+    sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
+    first = sign * (lower - zero)
+    second = sign * (upper - zero)
+    configuration = str((payload.get("raw") or {}).get("saved_configuration") or "")
+    valid = (
+        isinstance(value, dict)
+        and set(value) == PREVIEW_RANGE_KEYS
+        and value.get("schema_version") == PREVIEW_RANGE_SCHEMA
+        and str(value.get("joint")) == joint
+        and str(value.get("instance")) in {str(left), str(right)}
+        and str(value.get("configuration")) == configuration
+        and value.get("unit") == "m"
+        and math.isfinite(sign)
+        and value.get("purpose") == PURPOSE_INSPECTION_PREVIEW
+        and math.isfinite(lower)
+        and math.isfinite(upper)
+        and math.isfinite(zero)
+        and lower < upper
+        # The canonical endpoints the mapping actually produces must stay finite
+        # and strictly ordered: an overflowing or collapsing transform is refused.
+        and math.isfinite(first)
+        and math.isfinite(second)
+        and first != second
+    )
+    _require(
+        valid,
+        "discovery.joint_preview_range_invalid",
+        "preview declaration does not bind this joint, an occurrence of its pair, configuration, unit, "
+        "zero, direction, purpose and a finite ordered range",
+        {"pair": list(pair)},
+    )
+    evidence = {
+        "file": entry["entry"].get("package_file"),
+        "sha256": entry["entry"].get("sha256"),
+        "anchor": entry["entry"].get("anchor"),
+    }
+    return {"lower": min(first, second), "upper": max(first, second)}, evidence
+
+
 def verify_discovery(package: Path) -> dict:
     """Recompute every native-discovery claim from the bound raw record."""
 
@@ -2315,7 +2535,9 @@ def verify_discovery(package: Path) -> dict:
             try:
                 state["carrier"] = {
                     "bodies": rebuild_rigid_bodies(payload),
-                    "joints": rebuild_joint_facts(payload, package),
+                    "joints": rebuild_joint_facts(
+                        payload, package, purpose=str(_sealed_request(package)["purpose"])
+                    ),
                     "frames": rebuild_interface_frames(payload),
                 }
             except Exception as error:  # noqa: BLE001 - memoized and re-raised per consuming check
@@ -2382,12 +2604,26 @@ def verify_discovery(package: Path) -> dict:
             "the discovery record does not match the delivery manifest subject",
         )
         source = read_source_record(package)
+        request = _sealed_request(package)
+        _require(
+            request["main_assembly"] == source["selection"]["main_assembly"],
+            "discovery.request",
+            "the sealed request names another main assembly",
+            {"field": "main_assembly"},
+        )
+        _require(
+            request["handoff_digest"] == payload.get("handoff_sha256"),
+            "discovery.request",
+            "the sealed request was not formed against this frozen upload",
+            {"field": "handoff_digest"},
+        )
+        state["request"] = request
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
         definition = {
             "schema_version": payload.get("schema_version"),
-            # The definition identity must reflect the authored claim the
-            # identity gate compares it against; a missing value stays missing
-            # (readiness), never silently substituted from the selection.
+            # The definition identity carries the generated claim; the identity
+            # gate recomputes the expected value from the raw reading plus the
+            # sealed selection and compares the claim against it.
             "hardware_id": identity.get("hardware_id"),
             "robot_name": payload.get("robot_name"),
             "source": {
@@ -2609,23 +2845,147 @@ def verify_discovery(package: Path) -> dict:
         state["authored_identity"] = authored
         claimed = payload.get("identity")
         _require(isinstance(claimed, dict), "discovery.identity", "generated identity claims are absent")
-        for key in ("hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"):
+        source = read_source_record(package)
+        selection, metadata = source["selection"], source["metadata"]
+
+        request = state["request"]
+
+        for key in ("revision", "parent_revision", "owner", "control"):
             _require(
                 claimed.get(key) == authored[key],
                 "discovery.identity",
                 "generated metadata differs from native evidence",
                 {"field": key},
             )
+
+        # ``hardware_id`` and ``change_summary`` recompute their origin from the
+        # raw reading plus the sealed request record (input/request.json,
+        # formed before the generator ran): a CAD reading must be labelled as
+        # such and match the claim, and a claimed value the CAD records do not
+        # carry must come back from the configured target recorded in the
+        # sealed request.  A fallback is allowed only after the authored
+        # property is confirmed missing - a conflicted or unreadable authored
+        # reading refuses inside the independent read.  An absent claim stays
+        # deferred (publication readiness), never granted a value; the claim's
+        # own resolution notes are never trusted.
+        hardware = authored["hardware_id"]
+        if hardware is not None:
+            _require(
+                selection["hardware_source"] == "cad",
+                "discovery.identity",
+                "the sealed selection names a configured target although the CAD records carry the hardware identity",
+                {"field": "hardware_id"},
+            )
+            _require(
+                selection["hardware_id"] == hardware,
+                "discovery.identity",
+                "the sealed selection hardware identity differs from the authored CAD reading",
+                {"field": "hardware_id"},
+            )
+        elif claimed.get("hardware_id") is not None:
+            _require(
+                selection["hardware_source"] == "platform-config",
+                "discovery.identity",
+                "the sealed selection does not record a configured target for the claimed hardware identity",
+                {"field": "hardware_id"},
+            )
+            _require(
+                claimed.get("hardware_id") == selection["hardware_id"],
+                "discovery.identity",
+                "the claimed hardware identity differs from the sealed selection target",
+                {"field": "hardware_id"},
+            )
+            hardware = claimed.get("hardware_id")
         _require(
-            definition.get("hardware_id") == authored["hardware_id"],
+            claimed.get("hardware_id") == hardware,
             "discovery.identity",
-            "the definition hardware_id differs from authored native metadata",
+            "generated metadata differs from native evidence",
+            {"field": "hardware_id"},
+        )
+        if claimed.get("hardware_id") is not None:
+            _require(
+                claimed.get("hardware_id") == _request_target(request),
+                "discovery.identity",
+                "the hardware identity does not match the sealed request target",
+                {"field": "hardware_id"},
+            )
+
+        summary = authored["change_summary"]
+        if summary is not None:
+            _require(
+                metadata["change_summary_source"] == "cad",
+                "discovery.identity",
+                "the sealed metadata names a non-CAD summary origin although the CAD records carry the change summary",
+                {"field": "change_summary"},
+            )
+            _require(
+                metadata["change_summary"] == summary,
+                "discovery.identity",
+                "the sealed change-summary value differs from the authored CAD reading",
+                {"field": "change_summary"},
+            )
+        elif claimed.get("change_summary") is not None:
+            _require(
+                metadata["change_summary_source"] == "submission",
+                "discovery.identity",
+                "the sealed metadata names no submission origin for the claimed change summary",
+                {"field": "change_summary"},
+            )
+            requested_summary = _request_summary(request)
+            _require(
+                claimed.get("change_summary") == requested_summary == metadata["change_summary"],
+                "discovery.identity",
+                "the claimed change summary does not match the sealed request record",
+                {"field": "change_summary"},
+            )
+            summary = claimed.get("change_summary")
+        _require(
+            claimed.get("change_summary") == summary,
+            "discovery.identity",
+            "generated metadata differs from native evidence",
+            {"field": "change_summary"},
+        )
+
+        # The delivery configuration is qualified by native state, not by the
+        # name it carries.  The requirement is derived from the sealed selection
+        # plus the raw observation, so a missing or null generated claim never
+        # skips it: the selection's configuration must be observed as saved and
+        # active on both readings.  A present claim must agree with the sealed
+        # selection; an absent one stays deferred (publication readiness).
+        raw = payload.get("raw") or {}
+        expected_configuration = selection["configuration"]
+        saved_name = raw.get("saved_configuration")
+        _require(
+            saved_name is None or (isinstance(saved_name, str) and saved_name.strip() == expected_configuration),
+            "discovery.configuration",
+            "the recorded saved configuration differs from the sealed selection",
+            {"field": "delivery_configuration"},
+        )
+        _require(
+            _saved_configuration_observed(raw, expected_configuration),
+            "discovery.configuration",
+            "the delivery configuration is not observed as the saved active configuration",
+            {"field": "delivery_configuration"},
+        )
+        configuration = claimed.get("delivery_configuration")
+        if configuration is not None:
+            _require(
+                isinstance(configuration, str) and configuration.strip() == expected_configuration,
+                "discovery.configuration",
+                "the generated delivery configuration differs from the sealed selection",
+                {"field": "delivery_configuration"},
+            )
+
+        _require(
+            definition.get("hardware_id") == hardware,
+            "discovery.identity",
+            "the definition hardware_id differs from the recomputed identity",
         )
         technical_name = authored["robot_name"]
         label_source = "authored_robot_name"
         if technical_name is None:
-            label_source = "hardware_id" if authored["hardware_id"] is not None else "technical_default"
-            technical_name = re.sub(r"[^0-9A-Za-z]+", "_", authored["hardware_id"] or "robot").strip("_").lower()
+            label_source = "hardware_id" if hardware is not None else "technical_default"
+            technical_name = re.sub(r"[^0-9A-Za-z]+", "_", hardware or "robot").strip("_").lower()
         _require(
             (definition.get("source") or {}).get("robot_name") == technical_name,
             "discovery.identity",
@@ -2723,8 +3083,14 @@ def verify_discovery(package: Path) -> dict:
                 "the saved mate reports a native error or an unreadable solve state",
                 {"mate": mate.get("name"), "error_code": error_code},
             )
+            _require(
+                "limits" in mate,
+                "discovery.graph",
+                "the mate observation carries no limits reading; a missing reading cannot prove absence",
+                {"mate": mate.get("name")},
+            )
             kind = str(mate.get("type") or "").strip().lower()
-            limits = mate.get("limits")
+            limits = mate["limits"]
             if kind in {"limitdistance", "limitangle"}:
                 unit = "m" if kind == "limitdistance" else "rad"
                 _require(

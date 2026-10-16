@@ -68,6 +68,14 @@ from typing import Any
 from collections.abc import Mapping, Sequence
 
 from ...io import PipelineError, confined, digest, inventory, parse_data, read_data
+from ...interface_records import (
+    PREVIEW_RANGE_KEYS,
+    PREVIEW_RANGE_SCHEMA,
+    PURPOSE_ENGINEERING,
+    PURPOSE_INSPECTION_PREVIEW,
+    preview_revolute_window_rad,
+)
+from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
@@ -81,6 +89,8 @@ SOURCE_FILE = "source.json"
 DISCOVERY_FILE = "discovery/native-discovery.json"
 FINDINGS_FILE = "discovery/findings.json"
 IDENTITY_FILE = "discovery/identity-resolution.json"
+PLAN_FILE = "capture-plan.json"
+PLAN_SCHEMA = "solidworks-to-urdf.capture-plan/v1"
 IDENTITY_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"
 RECORD_DIR = "records"
 #: The one native contract: a fixed property namespace and one record version.
@@ -139,11 +149,19 @@ def _finding(code: str, obj: str, message: str, detail: Any = None, *, blocking:
 
 @dataclass(frozen=True)
 class DiscoverySettings:
-    """The platform-controlled inputs: records, published names and the explicit entry."""
+    """The platform-controlled inputs: records, published names, the entry and the purpose.
+
+    ``purpose`` mirrors the frozen request solely as in-flight derivation input
+    (the persisted ``input/request.json`` remains the single purpose authority):
+    it selects which joint parameters may be proven missing and whether the
+    policy preview window or a bound preview declaration supplies them.  No
+    consumer may persist it as a second authority.
+    """
 
     record_roots: tuple[Path, ...] = ()
     frozen_names: Mapping[str, str] = field(default_factory=dict)
     main_assembly: str | None = None
+    purpose: str = PURPOSE_ENGINEERING
 
 
 @dataclass(frozen=True)
@@ -199,6 +217,29 @@ def _authored_multiline_text(value: Any) -> bool:
         isinstance(value, str)
         and value.strip() != ""
         and not any((ord(c) < 32 and c != "\n") or ord(c) == 127 for c in value)
+    )
+
+
+def _saved_configuration_observed(record: dict, name: str) -> bool:
+    """The delivery configuration must be observed as the saved active one.
+
+    A recorded name (the dp property or the saved-name string) is not evidence
+    by itself: the native document state must show the document saved
+    (``save_flag`` strictly false, never unknown) and the active configuration
+    matching on both the before and the after reading.
+    """
+
+    state = record.get("document_state")
+    if not isinstance(state, dict):
+        return False
+    readings = (state.get("before"), state.get("after"))
+    if not all(isinstance(reading, dict) for reading in readings):
+        return False
+    return all(
+        reading.get("save_flag") is False
+        and isinstance(reading.get("configuration"), str)
+        and reading["configuration"].strip() == name
+        for reading in readings
     )
 
 
@@ -742,7 +783,31 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
     second = _entity_geometry_view(entities[1], findings, obj)
     if first is None or second is None:
         return None
-    limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
+    # A limits reading is an observation, not a default.  Only an intact reading
+    # (an explicit null, or a mapping) may claim anything; a missing key or a
+    # non-mapping value refuses before either purpose may treat it as absence.
+    if "limits" not in mate:
+        findings.append(
+            _finding(
+                "discovery.mate_limits_observation_incomplete",
+                obj,
+                "the mate observation carries no limits reading; a missing reading cannot prove absence",
+                {"mate": mate.get("name")},
+            )
+        )
+        return None
+    raw_limits = mate["limits"]
+    if raw_limits is not None and not isinstance(raw_limits, dict):
+        findings.append(
+            _finding(
+                "discovery.mate_limits_observation_invalid",
+                obj,
+                "the mate limits reading is not a usable observation",
+                {"mate": mate.get("name"), "value_type": type(raw_limits).__name__},
+            )
+        )
+        return None
+    limits = raw_limits if isinstance(raw_limits, dict) else None
 
     def fail(code: str, message: str, detail: Any = None) -> None:
         findings.append(_finding(code, obj, message, detail))
@@ -1579,6 +1644,102 @@ def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[
     }
 
 
+def _preview_number(value: Any) -> float:
+    """A finite real declaration number; booleans are not numeric facts."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return math.nan
+    number = float(value)
+    return number if math.isfinite(number) else math.nan
+
+
+def _declared_preview_range(
+    record: dict,
+    settings: DiscoverySettings,
+    findings: list[dict],
+    obj: str,
+    *,
+    joint: str,
+    instances: Sequence[str],
+) -> tuple[dict | None, dict | None]:
+    """Resolve one prismatic joint's bound finite preview declaration.
+
+    The declaration reuses the controlled-record reference: the resolved file's
+    digest and the parsed exact semantics (joint, instance, configuration, unit,
+    zero, direction, purpose and a finite ordered range) are all required - a
+    file that merely exists, or an anchor substring that merely matches, never
+    passes.  ``source_sha256`` is not part of the shape: the controlled-record
+    entry already owns and verifies the resolved file digest, so a second inner
+    digest claim would be provenance theatre.
+
+    The declared window is expressed in the declaration's own measure.  ``zero``
+    is the declared value that coincides with the joint's canonical zero and
+    ``direction`` (``+1``/``-1``) orients the declared positive sense against
+    the canonical positive axis, so the canonical window is
+    ``direction * (declared - zero)`` applied to both endpoints and ordered.
+    The mapping is always applied - a descriptor is never silently dropped, and
+    different zero/direction values yield different canonical bounds.
+    """
+
+    reference = (record.get("properties") or {}).get(f"{NAMESPACE}.joint.preview_range_record")
+    if not _text(reference):
+        findings.append(
+            _finding(
+                "discovery.joint_preview_range_missing",
+                obj,
+                "a prismatic joint with a proven-missing engineering range requires a bound finite "
+                "preview declaration",
+            )
+        )
+        return None, None
+    resolved = _resolve_record(settings, str(reference), findings, obj)
+    if resolved is None:
+        return None, None
+    value = resolved["value"]
+    if not isinstance(value, dict) or set(value) != PREVIEW_RANGE_KEYS:
+        findings.append(
+            _finding(
+                "discovery.joint_preview_range_invalid",
+                obj,
+                "preview declaration must carry exactly the bound finite semantics",
+                {"file": resolved["file"]},
+            )
+        )
+        return None, None
+    lower = _preview_number(value["lower"])
+    upper = _preview_number(value["upper"])
+    zero = _preview_number(value["zero"])
+    direction = value["direction"]
+    sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
+    first, second = sign * (lower - zero), sign * (upper - zero)
+    configuration = str(record.get("saved_configuration") or "")
+    if (
+        value["schema_version"] != PREVIEW_RANGE_SCHEMA
+        or str(value["joint"]) != joint
+        or str(value["instance"]) not in {str(member) for member in instances}
+        or str(value["configuration"]) != configuration
+        or value["unit"] != "m"
+        or not math.isfinite(sign)
+        or value["purpose"] != PURPOSE_INSPECTION_PREVIEW
+        or not (math.isfinite(lower) and math.isfinite(upper) and math.isfinite(zero))
+        or not lower < upper
+        # The canonical endpoints the mapping actually produces must stay finite
+        # and strictly ordered: an overflowing or collapsing transform is refused.
+        or not (math.isfinite(first) and math.isfinite(second) and first != second)
+    ):
+        findings.append(
+            _finding(
+                "discovery.joint_preview_range_invalid",
+                obj,
+                "preview declaration does not bind this joint, instance, configuration, unit, zero, "
+                "direction, purpose and a finite ordered range",
+                {"file": resolved["file"]},
+            )
+        )
+        return None, None
+    return {"lower": min(first, second), "upper": max(first, second)}, resolved
+
+
 def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None:
     """The single datum of that name owned by one of ``owners``.
 
@@ -1611,6 +1772,27 @@ def _primary_mate(mates: list[dict], properties: dict) -> dict:
         if any(isinstance(entity.get("cylinder"), dict) for entity in _mate_entities(item)):
             return item
     return mates[0]
+
+
+def _declaration_joint_name(mates: list[dict], settings: DiscoverySettings, fallback: str) -> str:
+    """The canonical joint name a preview declaration must bind.
+
+    The independent rebuild derives it from the shared ``<joint>__<role>`` mate
+    head (with the frozen-name override); the derivation binds the same name so
+    the record can never attach to one naming and be read under another.
+    """
+
+    names = [str(item.get("name") or "") for item in mates]
+    heads: list[str] = []
+    for item in names:
+        head, separator, role = item.partition("__")
+        if not separator or not role:
+            heads = []
+            break
+        heads.append(head)
+    name = heads[0] if heads and len(set(heads)) == 1 else fallback
+    frozen = settings.frozen_names or {}
+    return str(frozen.get(names[0], name)) if names else fallback
 
 
 def _merged_joint_properties(
@@ -1812,6 +1994,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             axis_reference["face_index"] = int(cylinder_entity["face_index"])
         limits = None
         limit_evidence = None
+        limit_source = None
         native = group["limits"]
         if joint_type == "continuous":
             if isinstance(native, dict):
@@ -1841,6 +2024,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     _finding("discovery.joint_limits_invalid", obj, "native mate limits are not finite numbers")
                 )
                 continue
+            limit_source = "native"
             native_record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
             if _text(native_record_ref):
                 declared = _resolve_record(settings, str(native_record_ref), findings, obj)
@@ -1878,61 +2062,100 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
             if _text(record_ref):
                 resolved = _resolve_record(settings, str(record_ref), findings, obj)
-                if resolved is not None:
-                    try:
-                        limits = {
-                            "lower": float(resolved["value"]["lower"]),
-                            "upper": float(resolved["value"]["upper"]),
-                        }
-                    except (KeyError, TypeError, ValueError):
-                        findings.append(
-                            _finding(
-                                "discovery.joint_limits_invalid",
-                                obj,
-                                "controlled record lacks finite lower/upper limits",
-                                {"file": resolved["file"]},
-                            )
+                if resolved is None:
+                    continue
+                try:
+                    lower = float(resolved["value"]["lower"])
+                    upper = float(resolved["value"]["upper"])
+                except (KeyError, TypeError, ValueError):
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_invalid",
+                            obj,
+                            "controlled record lacks finite lower/upper limits",
+                            {"file": resolved["file"]},
                         )
-                        continue
-                    limit_evidence = resolved
+                    )
+                    continue
+                if not (math.isfinite(lower) and math.isfinite(upper)):
+                    findings.append(
+                        _finding("discovery.joint_limits_invalid", obj, "controlled position limits must be finite")
+                    )
+                    continue
+                limits = {"lower": lower, "upper": upper}
+                limit_evidence = resolved
+                limit_source = "controlled"
+            elif settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "revolute":
+                radius = preview_revolute_window_rad()
+                limits = {"lower": -radius, "upper": radius}
+                limit_source = "policy_preview_window"
+            elif settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
+                limits, limit_evidence = _declared_preview_range(
+                    {"properties": properties, "saved_configuration": record.get("saved_configuration")},
+                    settings,
+                    findings,
+                    obj,
+                    joint=_declaration_joint_name(mates, settings, name),
+                    instances=(str(left), str(right)),
+                )
+                if limits is None:
+                    continue
+                limit_source = "declared_preview_window"
         if joint_type != "continuous" and limits is None:
-            findings.append(
-                _finding("discovery.joint_limits_missing", obj, "no native or controlled position range for this joint")
-            )
+            if settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
+                findings.append(
+                    _finding(
+                        "discovery.joint_preview_range_missing",
+                        obj,
+                        "a prismatic joint with a proven-missing engineering range requires a bound finite "
+                        "preview declaration",
+                    )
+                )
+            else:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_missing", obj, "no native or controlled position range for this joint"
+                    )
+                )
             continue
         drive = None
+        drive_source = "absent"
         drive_ref = properties.get(f"{NAMESPACE}.joint.drive_record")
         if _text(drive_ref):
             drive = _resolve_record(settings, str(drive_ref), findings, obj)
-        if drive is None:
+            if drive is None:
+                continue
+            drive_source = "controlled"
+        elif settings.purpose != PURPOSE_INSPECTION_PREVIEW:
             findings.append(
                 _finding("discovery.joint_drive_missing", obj, "no controlled drive specification for this joint")
             )
             continue
-        spec = drive["value"]
-        try:
-            effort = float(spec["effort"])
-            velocity_value = float(spec["velocity"])
-        except (KeyError, TypeError, ValueError):
-            findings.append(
-                _finding(
-                    "discovery.joint_drive_invalid",
-                    obj,
-                    "drive record lacks finite effort/velocity",
-                    {"file": drive["file"]},
+        if drive is not None:
+            spec = drive["value"]
+            try:
+                effort = float(spec["effort"])
+                velocity_value = float(spec["velocity"])
+            except (KeyError, TypeError, ValueError):
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_invalid",
+                        obj,
+                        "drive record lacks finite effort/velocity",
+                        {"file": drive["file"]},
+                    )
                 )
-            )
-            continue
-        if not (math.isfinite(effort) and math.isfinite(velocity_value)) or effort <= 0.0 or velocity_value <= 0.0:
-            findings.append(
-                _finding(
-                    "discovery.joint_drive_invalid",
-                    obj,
-                    "drive record effort/velocity must be finite and positive",
-                    {"file": drive["file"]},
+                continue
+            if not (math.isfinite(effort) and math.isfinite(velocity_value)) or effort <= 0.0 or velocity_value <= 0.0:
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_invalid",
+                        obj,
+                        "drive record effort/velocity must be finite and positive",
+                        {"file": drive["file"]},
+                    )
                 )
-            )
-            continue
+                continue
         joints.append(
             {
                 "mate": name,
@@ -1948,7 +2171,9 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "axis_reference": axis_reference,
                 "limits": limits,
                 "limit_evidence": limit_evidence,
+                "limit_source": limit_source,
                 "drive": drive,
+                "drive_source": drive_source,
                 "properties": dict(properties),
             }
         )
@@ -3520,17 +3745,17 @@ def _identity(
         return str(value).strip() if _text(value) else None
 
     sub_hardware = submitted(submission.hardware_id) if submission is not None else None
-    sub_owner = submitted(submission.owner) if submission is not None else None
     sub_summary = submitted(submission.change_summary) if submission is not None else None
-    sub_control = submitted(submission.control_reference) if submission is not None else None
-    sub_parent = submitted(submission.parent_revision) if submission is not None else None
 
     hardware = _identity_value(record, namespace, "hardware_id")
     hardware = str(hardware).strip() if _text(hardware) else None
     if hardware is None:
         if sub_hardware is not None:
             hardware = sub_hardware
-            sources["hardware_id"] = "submission"
+            # Confirmed-missing CAD identity adopts the configured target (the
+            # admission gate already refused an unread property set), and the
+            # origin stays explicit - never recorded as a CAD value.
+            sources["hardware_id"] = "platform_configuration"
             derived.append("hardware_id")
         else:
             sources["hardware_id"] = "absent"
@@ -3565,39 +3790,15 @@ def _identity(
     if revision is not None:
         sources["revision"] = "cad"
     else:
-        derived_revision = None
-        if submission is not None:
-            as_of = submitted(submission.as_of)
-            digest_source = submitted(submission.inventory_digest) or handoff_sha256
-            if as_of is not None and _DATE_ID.fullmatch(as_of) is None:
-                findings.append(
-                    _finding(
-                        "discovery.identity_invalid",
-                        "assembly",
-                        "the submission date is malformed; the structural revision cannot be derived",
-                        {"value": as_of},
-                    )
-                )
-            elif (
-                as_of is not None
-                and isinstance(digest_source, str)
-                and _SHA256_HEX.fullmatch(digest_source) is not None
-                and hardware is not None
-                and _IDENTITY_ID.fullmatch(hardware) is not None
-            ):
-                derived_revision = f"{hardware}-{as_of}-{digest_source[:8]}"
-        if derived_revision is not None:
-            revision = derived_revision
-            sources["revision"] = "derived"
-            derived.append("revision")
-        else:
-            sources["revision"] = "absent"
-            deferred(
-                "discovery.revision_missing",
-                "revision",
-                "structural revision is not recorded in the CAD records and cannot be derived from the "
-                "submission; publication readiness requires it",
-            )
+        # An absent engineering revision stays absent: it is never derived from a
+        # date, a digest, the authenticated submitter or any platform value.
+        sources["revision"] = "absent"
+        deferred(
+            "discovery.revision_missing",
+            "revision",
+            "structural revision is not recorded in the CAD records; it stays missing and the review "
+            "shows the gap",
+        )
     if revision is not None and _IDENTITY_ID.fullmatch(revision) is None:
         findings.append(
             _finding(
@@ -3611,17 +3812,14 @@ def _identity(
     owner = str(owner).strip() if _text(owner) else None
     if owner is not None:
         sources["owner"] = "cad"
-    elif sub_owner is not None:
-        owner = sub_owner
-        sources["owner"] = "submission"
-        derived.append("owner")
     else:
+        # The authenticated submitter is never substituted for an engineering owner.
         sources["owner"] = "absent"
         deferred(
             "discovery.owner_missing",
             "owner",
-            "revision owner is not recorded in the CAD records and the submission carries none; "
-            "publication readiness requires it",
+            "revision owner is not recorded in the CAD records; it stays missing and the review shows "
+            "the gap",
         )
     if owner is not None and not _authored_text(owner):
         findings.append(
@@ -3636,6 +3834,11 @@ def _identity(
     summary = str(summary).strip() if _text(summary) else None
     if summary is not None:
         sources["change_summary"] = "cad"
+        # One line-ending standard with the independent read: a CAD-authored
+        # summary folds CRLF and a lone CR to LF before it is validated and
+        # recorded, while every other control character still refuses.  The
+        # submission path stays LF-only (the portal already normalizes it).
+        summary = summary.replace("\r\n", "\n").replace("\r", "\n").strip()
     elif sub_summary is not None:
         summary = sub_summary
         sources["change_summary"] = "submission"
@@ -3666,19 +3869,15 @@ def _identity(
     system = str(control["system"]).strip() if _text(control.get("system")) else None
     reference = str(control["reference"]).strip() if _text(control.get("reference")) else None
     if system is None or reference is None:
-        if sub_control is not None:
-            control = {"system": "handoff", "reference": sub_control}
-            sources["control"] = "submission"
-            derived.append("control")
-        else:
-            sources["control"] = "absent"
-            deferred(
-                "discovery.control_missing",
-                "control",
-                "CAD control system/reference are not recorded and the submission carries no handoff "
-                "reference; publication readiness requires both",
-            )
-            control = None
+        # A platform handoff reference is never substituted for a CAD control record.
+        sources["control"] = "absent"
+        deferred(
+            "discovery.control_missing",
+            "control",
+            "CAD control system/reference are not recorded; they stay missing and the review shows "
+            "the gap",
+        )
+        control = None
     elif system not in CONTROL_SYSTEMS:
         sources["control"] = "cad"
         findings.append(
@@ -3714,6 +3913,17 @@ def _identity(
             _finding("discovery.configuration_missing", "assembly", "no saved delivery configuration is recorded")
         )
     delivery = str(delivery).strip() if _text(delivery) else None
+    if delivery is not None and not _saved_configuration_observed(record, delivery):
+        findings.append(
+            _finding(
+                "discovery.configuration_unproven",
+                "assembly",
+                "the delivery configuration is not observed as the saved active configuration; "
+                "a recorded name alone is not evidence",
+                {"configuration": delivery, "document_state": record.get("document_state")},
+            )
+        )
+        delivery = None
     main = assembly or _identity_value(record, namespace, "main_assembly")
     main = str(main).replace("\\", "/") if _text(main) else None
     if main is None or main not in native_files:
@@ -3754,24 +3964,16 @@ def _identity(
         parent_value = str(parent).strip()
         sources["parent_revision"] = "cad"
     else:
+        # An administrative parent linkage is never an engineering parent revision.
         parent_value = None
-        if (
-            sources.get("revision") == "derived"
-            and sub_parent is not None
-            and _IDENTITY_ID.fullmatch(sub_parent) is not None
-        ):
-            parent_value = sub_parent
-            sources["parent_revision"] = "submission"
-            derived.append("parent_revision")
-        else:
-            sources["parent_revision"] = "absent"
+        sources["parent_revision"] = "absent"
     if derived:
         findings.append(
             _finding(
                 "discovery.identity_derived",
                 "assembly",
-                "administrative identity fields were derived from the portal submission; CAD-carried "
-                "values win",
+                "administrative identity fields were taken from the configured target or the "
+                "submission; CAD-carried values win",
                 {"fields": sorted(derived)},
                 blocking=False,
             )
@@ -4138,7 +4340,7 @@ def derive_native_package(
             },
         )
     checks, budget_entry = _budgets(record, settings, findings)
-    _bodies, joints, _frames, derived_names = _derive_carriers(record, identity, settings, findings)
+    bodies, joints, frames, derived_names = _derive_carriers(record, identity, settings, findings)
     blocking = [item for item in findings if item["blocking"]]
     output.mkdir(parents=True, exist_ok=True)
     discovery_path = output / DISCOVERY_FILE
@@ -4205,6 +4407,64 @@ def derive_native_package(
     # A partial content identity cannot name the frozen revision.  The prepared
     # package still proceeds so measurement and inspection continue; publication
     # readiness stays deferred with the nonblocking findings above.
+    # The minimal pre-acquisition plan: selectors, selection, datums and the
+    # requested evidence items, bound to the sealed discovery bytes.  It is the
+    # only plan traveling to Windows; the full engineering representation is
+    # never copied into it.
+    plan_objects = []
+    for component in record.get("components") or ():
+        if not isinstance(component, dict) or component.get("suppressed"):
+            continue
+        name = component.get("instance_id") or component.get("name2")
+        if not isinstance(name, str) or not name:
+            continue
+        selector = {"name": name}
+        document = component.get("document")
+        if isinstance(document, str) and document:
+            selector["document"] = document.replace("\\", "/")
+        state = component.get("state")
+        selector["state"] = int(state) if type(state) is int else 2
+        plan_objects.append(selector)
+    plan_objects.sort(key=lambda item: item["name"])
+    write_json(
+        output / PLAN_FILE,
+        {
+            "schema_version": PLAN_SCHEMA,
+            "run_id": str(run_id),
+            "handoff_sha256": handoff_sha256,
+            "discovery_sha256": discovery_sha256,
+            "main_assembly": recorded_main,
+            "configuration": recorded_configuration,
+            "identity": {"hardware_id": identity.get("hardware_id"), "revision": identity.get("revision")},
+            "selection": {"files": {str(key): str(value) for key, value in sorted(native_files.items())}},
+            "objects": plan_objects,
+            "groups": [
+                {
+                    "name": str(body["name"]),
+                    "components": sorted(str(member) for member in (body.get("components") or [])),
+                }
+                for body in bodies
+            ],
+            "axis_requests": [
+                {"name": str(joint["name"]), "axis_reference": joint["axis_reference"]}
+                for joint in joints
+                if isinstance(joint.get("axis_reference"), dict)
+            ],
+            "datums": sorted(
+                {str(item["datum"]) for item in bodies if item.get("datum")}
+                | {
+                    str(item["coordinate_system"])
+                    for item in frames
+                    if isinstance(item, dict) and item.get("coordinate_system")
+                }
+            ),
+            "evidence_requests": [
+                "evidence/capture.json",
+                "evidence/geometry/",
+                "evidence/native-runtime.json",
+            ],
+        },
+    )
     source_record = _source_record(identity, identity_sources, handoff_sha256, records)
     if source_record is not None:
         write_json(output / SOURCE_FILE, source_record)
@@ -4315,7 +4575,13 @@ def _derive_carriers(
     return bodies, joints, frames, derived_names
 
 
-def source_definition(package: Path) -> dict:
+def source_definition(
+    package: Path,
+    *,
+    discovery_name: str = DISCOVERY_FILE,
+    cad_prefix: str = "",
+    records_prefix: str = "",
+) -> dict:
     """Rebuild one prepared package's in-memory source definition (the freeze/scene ``source``).
 
     The frozen raw record, the recorded derivation settings and the embedded
@@ -4327,7 +4593,7 @@ def source_definition(package: Path) -> dict:
     import tempfile
 
     package = Path(package)
-    payload = read_data(package / DISCOVERY_FILE)
+    payload = read_data(package / discovery_name)
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
     derivation = payload.get("derivation") if isinstance(payload.get("derivation"), dict) else {}
@@ -4340,11 +4606,13 @@ def source_definition(package: Path) -> dict:
                 continue
             target = confined(root, relative, exists=False)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(confined(package, str(entry.get("package_file") or "")), target)
+            shutil.copyfile(confined(package, records_prefix + str(entry.get("package_file") or "")), target)
+        request_record, _request_digest = read_request_evidence(package / "input" / "request.json")
         settings = DiscoverySettings(
             record_roots=(root,),
             frozen_names=dict(derivation.get("frozen_names") or {}),
             main_assembly=derivation.get("main_assembly") or None,
+            purpose=str(request_record["purpose"]),
         )
         findings: list[dict] = []
         view = {
@@ -4358,7 +4626,7 @@ def source_definition(package: Path) -> dict:
         raise PipelineError(
             f"the frozen discovery carriers cannot be rebuilt: {[item['code'] for item in blocking][:5]}"
         )
-    discovery_sha256 = hashlib.sha256((package / DISCOVERY_FILE).read_bytes()).hexdigest()
+    discovery_sha256 = hashlib.sha256((package / discovery_name).read_bytes()).hexdigest()
     by_name = {body["name"]: body for body in bodies}
     joints_out: list[dict] = []
     for joint in sorted(joints, key=lambda item: item.get("name") or ""):
@@ -4416,17 +4684,19 @@ def source_definition(package: Path) -> dict:
                 "anchor": raw["exporter"]["raw_xml_sha256"],
             }
         elif joint["type"] == "continuous":
-            entry["limits"] = {
-                "effort": float(joint["drive"]["value"]["effort"]),
-                "velocity": float(joint["drive"]["value"]["velocity"]),
-            }
+            if joint.get("drive") is not None:
+                entry["limits"] = {
+                    "effort": float(joint["drive"]["value"]["effort"]),
+                    "velocity": float(joint["drive"]["value"]["velocity"]),
+                }
         else:
             entry["limits"] = {
                 "lower": float(joint["limits"]["lower"]),
                 "upper": float(joint["limits"]["upper"]),
-                "effort": float(joint["drive"]["value"]["effort"]),
-                "velocity": float(joint["drive"]["value"]["velocity"]),
             }
+            if joint.get("drive") is not None:
+                entry["limits"]["effort"] = float(joint["drive"]["value"]["effort"])
+                entry["limits"]["velocity"] = float(joint["drive"]["value"]["velocity"])
         if joint.get("limit_evidence") is not None:
             embedded = next(
                 (
@@ -4443,6 +4713,8 @@ def source_definition(package: Path) -> dict:
                     "sha256": embedded["sha256"],
                     "anchor": embedded["anchor"],
                 }
+        if joint.get("limit_source") is not None:
+            entry["limit_source"] = str(joint["limit_source"])
         joints_out.append(entry)
     coordinate_systems = sorted(
         {str(body["datum"]) for body in bodies if body.get("datum")}
@@ -4451,7 +4723,7 @@ def source_definition(package: Path) -> dict:
     source: dict[str, Any] = {
         "provider": "solidworks",
         "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
-        "assembly": str(confined(package.resolve(), str(view["main_assembly"]))),
+        "assembly": str(confined(package.resolve(), cad_prefix + str(view["main_assembly"]))),
         "configuration": view["delivery_configuration"],
         "allowed_roots": [str(package.resolve())],
         "document_suffixes": [".sldasm", ".sldprt"],
@@ -4489,7 +4761,7 @@ def source_definition(package: Path) -> dict:
 
 
 def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, records: list[dict]) -> dict | None:
-    """The archived content identity (IF-06) that replaces robot.yaml and cad-revision.json.
+    """The archived content identity (IF-06) that replaces the retired generated definition documents.
 
     Written only once the content identity is nameable - hardware, main assembly
     and configuration; anything less keeps the package unnamed and publication
@@ -4529,7 +4801,7 @@ def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, 
                 "configuration": content["configuration"],
                 "hardware_id": content["hardware_id"],
                 "hardware_source": "platform-config"
-                if identity_sources.get("hardware_id") == "submission"
+                if identity_sources.get("hardware_id") == "platform_configuration"
                 else "cad",
             },
             "metadata": {

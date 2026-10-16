@@ -124,30 +124,56 @@ class FeishuUser(BaseUser):
         return build_actor_name(self.get_id(), self.name)
 
 
+#: The single DDL statement of the sign-in state table.  It is executed only by the
+#: migration-window initializer below - never by the runtime constructor or a request path.
+STATE_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS feishu_auth_state ("
+    "state_hash VARCHAR(64) PRIMARY KEY, "
+    "verifier VARCHAR(128) NOT NULL, "
+    "expires_at DOUBLE PRECISION NOT NULL)"
+)
+
+
+def initialize_metadata_state(session_factory: Any | None = None) -> None:
+    """Create the sign-in state table as the migration-window owner (idempotent).
+
+    The installer (``deploy/airflow/install.sh``) and the CI migration window run this
+    module (``python -m description_pipeline.orchestration.feishu_auth``) with the migration
+    identity after ``airflow db migrate`` and before the runtime identity takes over.  This is
+    the only place that issues DDL for the sign-in state; the runtime constructor and every
+    request path are DDL-free and fail loudly when the table is missing.
+    """
+
+    if session_factory is None:
+        from airflow.settings import Session
+
+        session_factory = Session
+    with session_factory() as session:
+        session.execute(text(STATE_TABLE_SQL))
+        session.commit()
+
+
 class MetadataStateStore:
     """Single-use OAuth state and its PKCE verifier in the Airflow metadata database.
 
     Every api-server worker and every restart uses this one table on the pinned ``airflow_meta``
-    connection. ``CREATE TABLE IF NOT EXISTS`` is idempotent and needs no migration; consuming a
-    state deletes the row, so a replayed callback can never reuse an authorization code.
+    connection; the table is created once by the migration-window initializer
+    (:func:`initialize_metadata_state`).  Consuming a state deletes the row, so a replayed
+    callback can never reuse an authorization code.
     """
 
     def __init__(self, session_factory: Any | None = None) -> None:
+        # One readiness probe, never DDL: the runtime identity must actually be able to read
+        # the state table and its required columns.  A missing table refuses fail-closed; a
+        # permission or connectivity failure propagates unchanged; there is no repair, no
+        # creation and no error-string classification anywhere.
         if session_factory is None:
             from airflow.settings import Session
 
             session_factory = Session
         self._session = session_factory
         with self._session() as session:
-            session.execute(
-                text(
-                    "CREATE TABLE IF NOT EXISTS feishu_auth_state ("
-                    "state_hash VARCHAR(64) PRIMARY KEY, "
-                    "verifier VARCHAR(128) NOT NULL, "
-                    "expires_at DOUBLE PRECISION NOT NULL)"
-                )
-            )
-            session.commit()
+            session.execute(text("SELECT state_hash, verifier, expires_at FROM feishu_auth_state LIMIT 0"))
 
     def issue(self, ttl: float = STATE_TTL_SECONDS) -> tuple[str, str]:
         state = secrets.token_urlsafe(32)
@@ -455,3 +481,7 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
         if self._is_admin(user):
             return menu_items
         return [item for item in menu_items if item is MenuItem.DAGS]
+
+
+if __name__ == "__main__":  # pragma: no cover - the migration-window installer entry
+    initialize_metadata_state()

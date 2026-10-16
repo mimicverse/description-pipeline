@@ -29,6 +29,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -36,8 +37,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
@@ -55,7 +59,8 @@ DAG_ID = "solidworks_to_urdf"
 PIPELINE_ID = "solidworks-to-urdf"
 #: One relative operator path inside the connection's intake allowlist.
 HANDOFF_PATH = "handoff/m3.0"
-TARGET_HARDWARE = "m3.0"
+#: The control fixture's CAD carries its own hardware identity (``fixture["hardware_id"]``);
+#: the connection, the portal configuration and the submission all name that identity.
 REPOSITORY_SLUG = "example/m3.0"
 REPOSITORY_BASE = "feature/m3.0"
 #: The smoke verifies the contract's slot-release semantics: the native wait must
@@ -85,7 +90,7 @@ def _native_record(fixture_root: Path) -> dict:
 
 
 def _mock_endpoint(
-    fixture: dict, *, run_id: str, upload_files: dict[str, str], record: dict, bundle_dir: Path
+    fixture: dict, *, run_id: str, upload_files: dict[str, str], record: dict, bundle_dir: Path, port: int = 0
 ) -> tuple[ThreadingHTTPServer, dict]:
     """The one-workflow endpoint contract: full-folder staging, raw record, definition, capture."""
 
@@ -281,6 +286,7 @@ def _mock_endpoint(
                 return
             if len(segments) == 2 and segments[1] == "abort":
                 payload = json.loads(body or b"{}")
+                state.setdefault("aborts", []).append(payload)
                 job["status"] = "failed"
                 job["error"] = str(payload.get("error") or "derivation refused")
                 job["events"] = [*job.get("events", []), {"stage": "job", "state": "failed", "at": "t0"}]
@@ -288,7 +294,7 @@ def _mock_endpoint(
                 return
             self._send(404, {"error": "not found"})
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, state
 
@@ -360,6 +366,91 @@ def _feishu_env(home: Path, https_port: int) -> dict[str, str]:
     }
 
 
+def _config_snapshot_environment(
+    args,
+    *,
+    target: str,
+    state_root: Path,
+    handoff_root: Path,
+    workspace_root: Path,
+    record_roots: list[str],
+    endpoint_port: int,
+) -> tuple[dict[str, str], dict]:
+    """The controlled platform-configuration identity that governs THIS smoke run.
+
+    The IF-16 snapshot is built by the deploy-side owner's own mechanism
+    (``validate_platform`` then ``build_snapshot``) from the exact inputs this run
+    consumes - its state/handoff/workspace roots, its record roots, its targets and
+    its real endpoint port - re-validated by the package's IF-16 validator,
+    serialized with the one canonical serializer and digested over exactly those
+    bytes (the same derivation the operator environment and the install record
+    bind).  The package-side snapshot digest must agree, otherwise the smoke
+    refuses instead of fabricating a second identity.  The resolved tree is
+    returned so every consumer below reads the snapshot's declared values.
+    """
+    from description_pipeline import interface_records  # noqa: PLC0415
+    from description_pipeline.io import canonical  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location(
+        "deploy_platform_config", args.root / "deploy/operator/platform_config.py"
+    )
+    platform_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(platform_config)
+    fixture_root = args.airflow_home / "smoke-config"
+    document = {
+        "schema_version": platform_config.PLATFORM_SCHEMA,
+        "operator": {
+            "origin": f"https://127.0.0.1:{_operator_https_port(args.root)}",
+            "certificate_file": str(fixture_root / "secrets/tls.crt"),
+            "private_key_file": str(fixture_root / "secrets/tls.key"),
+        },
+        "storage": {
+            "state_root": str(state_root),
+            "handoff_root": str(handoff_root),
+            "artifact_root": str(args.airflow_home / "smoke-artifacts"),
+            "workspace_root": str(workspace_root),
+            "release_root": str(args.airflow_home / "smoke-releases"),
+        },
+        "database": {"dsn_file": str(fixture_root / "secrets/postgres.dsn")},
+        "windows": {
+            "ssh_host": "smoke-windows",
+            "endpoint_port": endpoint_port,
+            "token_file": str(fixture_root / "secrets/endpoint.token"),
+            "instance": {
+                "task_name": "description-smoke-endpoint",
+                "package_root": "C:/description-smoke/packages",
+                "output_root": "C:/description-smoke/results",
+                "state_root": "C:/description-smoke/state",
+            },
+        },
+        "auth": {
+            "feishu_secret_file": str(args.airflow_home / "feishu.json"),
+            "tenant_keys": [FEISHU_TENANT],
+            "admin_open_ids": [FEISHU_OPERATOR],
+        },
+        "targets": {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
+        "specifications": {"record_roots": list(record_roots)},
+    }
+    resolved = platform_config.validate_platform(document)
+    platform_json_bytes = canonical(document)
+    install_id = f"smoke-{uuid.uuid4().hex[:12]}"
+    snapshot = platform_config.build_snapshot(
+        resolved,
+        platform_json_sha256=hashlib.sha256(platform_json_bytes).hexdigest(),
+        install_id=install_id,
+        generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    interface_records.validate_config_snapshot(snapshot)
+    snapshot_bytes = canonical(snapshot)
+    digest_value = hashlib.sha256(snapshot_bytes).hexdigest()
+    if digest_value != interface_records.config_snapshot_digest(snapshot):
+        raise RuntimeError("the snapshot digest owners disagree; refusing a second identity")
+    fixture_root.mkdir(parents=True, exist_ok=True)
+    (fixture_root / "platform.json").write_bytes(platform_json_bytes)
+    platform_config.atomic_write_once(fixture_root / "snapshots" / f"{install_id}.json", snapshot_bytes)
+    return {"PLATFORM_CONFIG_DIGEST": digest_value}, resolved
+
+
 def _plugin_preflight(venv: Path, env: dict[str, str], home: Path) -> str | None:
     """Ensure the plugin loads from the installed entry point or from this home's plugins folder."""
     code = (
@@ -414,22 +505,24 @@ def _task_reschedule_evidence(
     code = (
         "import json\n"
         "from airflow.models.taskreschedule import TaskReschedule\n"
+        "from airflow.models.taskinstance import TaskInstance\n"
         "from airflow.settings import Session\n"
         f"dag, run, task = {dag_id!r}, {run_id!r}, {task_id!r}\n"
         "def row(record):\n"
         "    return {\n"
         "        name: (None if getattr(record, name, None) is None else str(getattr(record, name)))\n"
-        "        for name in ('id', 'dag_id', 'run_id', 'task_id', 'try_number', 'start_date', 'end_date',\n"
-        "                     'reschedule_date', 'map_index')\n"
+        "        for name in ('id', 'ti_id', 'start_date', 'end_date', 'reschedule_date')\n"
         "    }\n"
         "with Session() as session:\n"
         "    rows = [\n"
         "        row(record)\n"
-        "        for record in session.query(TaskReschedule).filter(\n"
-        "            TaskReschedule.dag_id == dag,\n"
-        "            TaskReschedule.run_id == run,\n"
-        "            TaskReschedule.task_id == task,\n"
-        "        ).all()\n"
+        "        for record in session.query(TaskReschedule).join(\n"
+        "            TaskInstance, TaskReschedule.ti_id == TaskInstance.id\n"
+        "        ).filter(\n"
+        "            TaskInstance.dag_id == dag,\n"
+        "            TaskInstance.run_id == run,\n"
+        "            TaskInstance.task_id == task,\n"
+        "        ).order_by(TaskReschedule.id).all()\n"
         "    ]\n"
         "print(json.dumps({'rows': rows}))\n"
     )
@@ -449,6 +542,378 @@ def _task_reschedule_evidence(
     return (rows if isinstance(rows, list) else []), None
 
 
+def _start_portal_server(
+    root: Path,
+    airflow_base: str,
+    upload_root: Path,
+    repository: Path,
+    targets: dict,
+    dag_id: str,
+    endpoint_holder: dict,
+) -> tuple[object, str]:
+    """Start the real portal in-process (admission through the operator HTTP surface).
+
+    The endpoint is bound lazily: the portal is up before the mocked Windows endpoint exists
+    (admission happens while the DAG is still paused, so no task can call it yet).  The
+    platform store, and with it the sealed store root, derives from the same deploy environment
+    the smoke published (``PLATFORM_SERVICE_DSN`` + ``PIPELINE_STORE_ROOT``) - the portal
+    carries no second store-root channel.
+    """
+
+    from wsgiref.simple_server import make_server  # noqa: PLC0415
+
+    from description_pipeline.orchestration.portal import AirflowApi, PortalApp, PortalConfig  # noqa: PLC0415
+
+    config = PortalConfig(
+        airflow=AirflowApi(airflow_base),
+        endpoint=lambda: endpoint_holder["endpoint"],
+        static_dir=root / "src/description_pipeline/orchestration/static",
+        upload_root=upload_root,
+        pipeline_repositories={REPOSITORY_SLUG: repository},
+        pipeline_targets=targets,
+        dag_id=dag_id,
+    )
+    server = make_server("127.0.0.1", 0, PortalApp(config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def _open_platform_admission() -> dict:
+    """The operator ``start`` step through the same store API the deployment uses.
+
+    Installation seeds the single admission row CLOSED; every submission path refuses until
+    the gate is opened.  The smoke opens it exactly as ``operatorctl start`` does, so the
+    portal admission below exercises the real open-gate path instead of a bypass.
+    """
+
+    from description_pipeline.platform.store import PlatformStore, PlatformStoreError  # noqa: PLC0415
+
+    try:
+        view = PlatformStore.from_environment(os.environ).open_admission(
+            reason="start", actor="scheduled_smoke"
+        )
+    except PlatformStoreError as error:
+        return {"state": "", "error": str(error)}
+    return {"state": view.state, "revision": view.revision, "actor": view.actor}
+
+
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    token: str = "",
+    cookies: str = "",
+    csrf: str = "",
+    data: bytes | None = None,
+    content_type: str = "",
+) -> tuple[int, dict, list[str]]:
+    headers: dict[str, str] = {}
+    cookie = "; ".join(item for item in (f"_token={token}" if token else "", cookies) if item)
+    if cookie:
+        headers["Cookie"] = cookie
+    if csrf:
+        headers["X-CSRF-Token"] = csrf
+    if content_type:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read()
+            payload = json.loads(body) if body else {}
+            return response.status, payload, response.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as error:
+        body = error.read()
+        try:
+            payload = json.loads(body) if body else {}
+        except ValueError:
+            payload = {"error": body[:200].decode("utf-8", "replace")}
+        return error.code, payload, []
+
+
+def _portal_admit(
+    portal_base: str, token: str, intake_dir: Path, folder_name: str, target: str, summary: str, purpose: str
+) -> tuple[str, str, dict]:
+    """Adopt an operator session (Airflow SSO cookie) and submit the folder through the portal.
+
+    ``folder_name`` is the leaf of the handoff root: the portal reconstitutes the upload as
+    ``upload_root/<dag_run_id>/<folder_name>`` and the DAG reads that path as its handoff, so
+    the leaf keeps the fixture-relative file layout intact.
+    """
+
+    from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
+    from tests.v1.test_portal import _upload_body  # noqa: PLC0415
+
+    status, session, set_cookies = _http_json("GET", f"{portal_base}/api/session", token=token)
+    if status != 200:
+        raise RuntimeError(f"portal session failed: {status} {session}")
+    cookie = next(
+        (item.split(";", 1)[0] for item in set_cookies if item.startswith("solidworks_portal_session=")), ""
+    )
+    files = [(name, (intake_dir / name).read_bytes()) for name in sorted(package_inventory(intake_dir))]
+    body = _upload_body(
+        folder=folder_name,
+        files=files,
+        fields=[("target_hardware", target), ("change_summary", summary), ("purpose", purpose)],
+    )
+    status, payload, _ = _http_json(
+        "POST",
+        f"{portal_base}/api/runs",
+        token=token,
+        cookies=cookie,
+        csrf=str(session.get("csrf_token") or ""),
+        data=body,
+        content_type="multipart/form-data; boundary=portal-boundary",
+    )
+    if status != 201 or not payload.get("dag_run_id"):
+        raise RuntimeError(f"portal admission failed: {status} {payload}")
+    return str(payload["dag_run_id"]), cookie, session
+
+
+def _portal_negative_checks(
+    portal_base: str, token: str, cookie: str, csrf: str, top_name: str, run_id: str, target: str
+) -> list[dict]:
+    """The HTTP-driven negative matrix (illegal fields and an illegal rerun stage)."""
+
+    from tests.v1.test_portal import _upload_body  # noqa: PLC0415
+
+    def multipart(fields: list[tuple[str, str]]) -> bytes:
+        return _upload_body(folder=top_name, files=[], fields=fields)
+
+    results = []
+    checks = (
+        ("missing_target", multipart([("change_summary", "x"), ("purpose", "engineering")])),
+        (
+            "unconfigured_target",
+            multipart([("target_hardware", "not-configured"), ("change_summary", "x"), ("purpose", "engineering")]),
+        ),
+        ("missing_summary", multipart([("target_hardware", target), ("purpose", "engineering")])),
+        ("missing_purpose", multipart([("target_hardware", target), ("change_summary", "x")])),
+        ("unknown_purpose", multipart([("target_hardware", target), ("change_summary", "x"), ("purpose", "ghost")])),
+    )
+    for name, body in checks:
+        status, payload, _ = _http_json(
+            "POST",
+            f"{portal_base}/api/runs",
+            token=token,
+            cookies=cookie,
+            csrf=csrf,
+            data=body,
+            content_type="multipart/form-data; boundary=portal-boundary",
+        )
+        results.append({"check": name, "status": status, "expected": 400, "ok": status == 400, "payload": payload})
+    status, payload, _ = _http_json(
+        "POST",
+        f"{portal_base}/api/runs/{run_id}/attempts",
+        token=token,
+        cookies=cookie,
+        csrf=csrf,
+        data=json.dumps({"stage": "bogus"}).encode("utf-8"),
+        content_type="application/json",
+    )
+    results.append(
+        {"check": "illegal_stage", "status": status, "expected": 400, "ok": status == 400, "payload": payload}
+    )
+    return results
+
+
+def _quality_rejection_comparisons(checks: list[dict], preview_failing: set[str]) -> dict:
+    """The documented control rejection: required gates executed and passed, failures
+    confined to the control limits, and both formal views agreeing on the failing set.
+
+    ``REQUIRED_CONTROL_GATES`` (nine checks) must each carry a definite executed
+    ``state == "passed"`` with ``passed is True`` - absent, not_run or failed all
+    refuse.  Failures are allowed only inside ``CONTROL_LIMITS`` (eight classes,
+    disjoint from the required set); anything else refuses.  The quality document
+    and the diagnostic summary must list the same failing identities.
+    """
+
+    from tests.v1.split_capture_fixture import (  # noqa: PLC0415
+        CONTROL_LIMITS,
+        REQUIRED_CONTROL_GATES,
+    )
+
+    by_id = {str(item.get("id")): item for item in checks}
+    executed = bool(checks) and all(
+        item.get("state") in {"passed", "failed"} and isinstance(item.get("passed"), bool)
+        for item in checks
+    )
+    consistent = executed and all(
+        (item.get("passed") is True) == (item.get("state") == "passed") for item in checks
+    )
+    failing = {
+        str(item.get("id")) for item in checks if item.get("passed") is False or item.get("state") == "failed"
+    }
+    required_ok = all(
+        (by_id.get(gate) or {}).get("state") == "passed" and (by_id.get(gate) or {}).get("passed") is True
+        for gate in REQUIRED_CONTROL_GATES
+    )
+    return {
+        "executed": executed,
+        "consistent": consistent,
+        "failing": failing,
+        "unexpected_gates": sorted(failing - set(CONTROL_LIMITS)),
+        "missing_required_gates": [] if required_ok else sorted(REQUIRED_CONTROL_GATES),
+        "views_agree": failing == preview_failing,
+        # The controlled rejection is the documented failure set: required gates pass and
+        # at least one allowed control-limit gate fails.  An all-passing document can never
+        # substantiate a rejection claim.
+        "allowed_failure": bool(failing) and failing <= set(CONTROL_LIMITS),
+    }
+
+
+def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
+    """The strict settlement comparisons: platform rows versus the observed projection.
+
+    Every comparison is unconditional: the run and stage rows must match the portal
+    projection exactly, the run's dispatch and native operations must be in definite
+    terminal states (completed side effects are never left queued, unresolved or
+    running), and the run events must exist and carry the identity of the state
+    changes they describe - never an arbitrary fixed count.
+    """
+
+    terminal_run_states = {"succeeded", "failed", "cancelled"}
+    terminal_operation_states = {"succeeded", "failed", "cancelled"}
+    comparisons = [
+        {"name": "admission_run_row", "passed": len(rows["run_state"]) == 1, "observed": rows["run_state"]},
+        {"name": "admission_request_row", "passed": len(rows["request"]) == 1, "observed": rows["request"]},
+    ]
+    operations = [
+        {"operation_key": row[0], "stage": row[1], "kind": row[2], "state": row[3]} for row in rows["operations"]
+    ]
+    dispatch = [item for item in operations if item["kind"] == "dispatch"]
+    comparisons.append(
+        {
+            "name": "dispatch_operation_terminal",
+            "passed": bool(dispatch) and all(item["state"] in terminal_operation_states for item in dispatch),
+            "observed": operations,
+        }
+    )
+    native = [item for item in operations if item["kind"] == "native"]
+    stages = dict(rows["stages"])
+    capture_settled = stages.get("capture") in {"completed", "failed", "cancelled"}
+    comparisons.append(
+        {
+            "name": "native_operation_terminal",
+            "passed": all(item["state"] in terminal_operation_states for item in native)
+            and (bool(native) or not capture_settled),
+            "observed": {"operations": operations, "capture": stages.get("capture")},
+        }
+    )
+    projected_state = projection.get("state") if isinstance(projection, dict) else None
+    terminal = [state for state in rows["run_state"] if state in terminal_run_states]
+    mapped = {"success": "succeeded", "failed": "failed"}.get(str(projected_state))
+    comparisons.append(
+        {
+            "name": "run_state_matches_projection",
+            "passed": len(terminal) == 1 and terminal[0] == mapped,
+            "observed": [terminal or "no terminal platform run row", projected_state],
+        }
+    )
+    tasks = {str(item.get("task_id")): item.get("state") for item in (projection.get("tasks") or [])}
+    mapping = {"success": "completed", "failed": "failed", "upstream_failed": "blocked", "skipped": "blocked"}
+    expected_stages = {stage: mapping.get(str(state), str(state)) for stage, state in tasks.items()}
+    comparisons.append(
+        {
+            "name": "stage_rows_match_projection",
+            "passed": bool(expected_stages) and stages == expected_stages,
+            "observed": {"sql": stages, "projected": expected_stages},
+        }
+    )
+    events = [dict(item) for item in rows["events"]]
+    legal_states = {"pending", "running", "completed", "failed", "cancelled", "unresolved", "blocked"}
+    identity_ok = True
+    latest_by_stage: dict[str, tuple[int, str]] = {}
+    for event in events:
+        if event.get("kind") != "stage":
+            continue
+        stage = str(event.get("stage"))
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        state = payload.get("state")
+        if stage not in stages or state not in legal_states:
+            # An event must describe a real stage and carry a real state; a
+            # nonexistent stage or a missing state is an identity failure.
+            identity_ok = False
+            continue
+        # History is legitimate: the latest event per stage must match the
+        # current row; earlier transitions (running before failed) are kept.
+        seq = event.get("seq") if isinstance(event.get("seq"), int) else 0
+        if stage not in latest_by_stage or seq >= latest_by_stage[stage][0]:
+            latest_by_stage[stage] = (seq, str(state))
+    missing_transitions = sorted(set(stages) - set(latest_by_stage))
+    mismatched = sorted(stage for stage, (_seq, state) in latest_by_stage.items() if stages.get(stage) != state)
+    comparisons.append(
+        {
+            "name": "run_event_identity",
+            # Every registered stage must carry its own transition event bound to the row it
+            # produced (the latest event wins, so a recorded running->failed history stays
+            # valid); an unrelated event can never stand in for a stage transition, and no
+            # fixed event count is assumed.
+            "passed": bool(stages) and identity_ok and not missing_transitions and not mismatched,
+            "observed": {
+                "events": events,
+                "stages": stages,
+                "missing_transitions": missing_transitions,
+                "mismatched": mismatched,
+            },
+        }
+    )
+    return comparisons
+
+
+def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict, *, request_id: str) -> dict:
+    """The platform rows of this run plus the strict settlement comparisons.
+
+    ``run_id`` is the store's canonical native UUID (the DAG and the admission both
+    write that identity); ``request_id`` is the portal-issued request identity of the
+    same submission (``portal-<dag_run_id>``).
+    """
+
+    import psycopg2  # noqa: PLC0415
+
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*", platform_schema or ""):
+        return {"ok": False, "problems": ["platform schema name is not queryable"], "rows": {}, "comparisons": []}
+    dsn = os.environ.get("PLATFORM_SERVICE_DSN", "")
+    if not dsn:
+        return {"ok": False, "problems": ["PLATFORM_SERVICE_DSN is not set"], "rows": {}, "comparisons": []}
+    rows: dict = {}
+    with psycopg2.connect(dsn) as connection, connection.cursor() as cursor:
+        cursor.execute(f"SELECT state FROM {platform_schema}.run WHERE run_id=%s", (run_id,))
+        rows["run_state"] = [row[0] for row in cursor.fetchall()]
+        cursor.execute(
+            f"SELECT request_id, target_hardware, principal FROM {platform_schema}.request WHERE request_id=%s",
+            (request_id,),
+        )
+        rows["request"] = cursor.fetchall()
+        cursor.execute(
+            f"SELECT operation_key, stage, kind, state FROM {platform_schema}.operation WHERE run_id=%s "
+            "ORDER BY operation_id",
+            (run_id,),
+        )
+        rows["operations"] = cursor.fetchall()
+        cursor.execute(f"SELECT stage, state FROM {platform_schema}.stage WHERE run_id=%s ORDER BY stage", (run_id,))
+        rows["stages"] = cursor.fetchall()
+        cursor.execute(
+            f"SELECT seq, kind, stage, payload FROM {platform_schema}.run_event WHERE run_id=%s ORDER BY seq",
+            (run_id,),
+        )
+        rows["events"] = [
+            {"seq": row[0], "kind": row[1], "stage": row[2], "payload": row[3]} for row in cursor.fetchall()
+        ]
+    comparisons = _settlement_comparisons(rows, projection)
+    problems = [
+        f"platform settlement assertion failed: {item['name']} {item['observed']}"
+        for item in comparisons
+        if not item["passed"]
+    ]
+    return {
+        "ok": not problems,
+        "schema": platform_schema,
+        "rows": rows,
+        "comparisons": comparisons,
+        "problems": problems,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -456,6 +921,21 @@ def main() -> int:
     parser.add_argument("--airflow-home", type=Path, required=True)
     parser.add_argument("--api-port", type=int, default=0, help="loopback api-server port (0 picks a free one)")
     parser.add_argument("--timeout", type=float, default=420)
+    parser.add_argument(
+        "--portal-admission",
+        action="store_true",
+        help="submit through a locally started real portal (HTTP multipart) instead of the client trigger",
+    )
+    parser.add_argument(
+        "--purpose",
+        required=True,
+        choices=["engineering", "inspection_preview"],
+        help="the declared purpose of this smoke run (never defaulted)",
+    )
+    parser.add_argument("--platform-schema", default="", help="platform schema for the SQL evidence queries")
+    parser.add_argument("--airflow-schema", default="", help="the Airflow schema this run's metadata lives in")
+    parser.add_argument("--airflow-db-conn", default="", help="Airflow metadata DSN (PostgreSQL) for this session")
+    parser.add_argument("--report", type=Path, default=None, help="also write the report JSON here")
     args = parser.parse_args()
     ambient_sensor_mode = os.environ.get("SOLIDWORKS_SENSOR_MODE")
     if ambient_sensor_mode not in (None, SENSOR_MODE_REQUIRED):
@@ -473,24 +953,36 @@ def main() -> int:
     sys.path.insert(0, str(args.root / "src"))
     sys.path.insert(0, str(args.root))
     from description_pipeline.orchestration.airflow_client import native_run_id  # noqa: PLC0415
-    from description_pipeline.orchestration.linux_store import LinuxStore  # noqa: PLC0415
     from description_pipeline.orchestration.portal import AirflowApi  # noqa: PLC0415
     from description_pipeline.sources.solidworks.revision import package_inventory  # noqa: PLC0415
     from tests.v1.split_capture_fixture import (  # noqa: PLC0415
-        CONTROL_LIMITS,
         QUALIFICATION,
-        REQUIRED_CONTROL_GATES,
         build_fixture_capture,
     )
 
+    portal_mode = bool(args.portal_admission)
     run_id = f"smoke-{uuid.uuid4().hex[:12]}"
     native_id = native_run_id(run_id)
-    fixture_root = args.airflow_home / "smoke" / f"fixture-{native_id}"
+    # The smoke owns its scratch space inside its own AIRFLOW_HOME: a previous attempt (or an
+    # earlier smoke on a persistent home) must not collide with this run's fixtures, staged
+    # transfer archives or intake folder.
+    shutil.rmtree(args.airflow_home / "smoke", ignore_errors=True)
+    if portal_mode:
+        # The real portal admits the run and its dag_run_id binds the native identity; the
+        # placeholder built below exists only to prepare the uploaded folder before admission.
+        run_id = ""
+        native_id = ""
+    placeholder_native = native_run_id(f"smoke-{uuid.uuid4().hex[:12]}")
+    fixture_root = args.airflow_home / "smoke" / f"fixture-{placeholder_native}"
     try:
-        fixture = build_fixture_capture(fixture_root, run_id=native_id)
+        fixture = build_fixture_capture(fixture_root, run_id=placeholder_native)
     except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
         print(json.dumps({"ok": False, "stage": "control_fixture", "error": f"{type(error).__name__}: {error}"}))
         return 1
+    # The control fixture's CAD carries its own hardware identity; the submission must name
+    # exactly that identity (and the connection must route it), or the derivation refuses the
+    # run as an identity conflict.
+    target = str(fixture["hardware_id"])
 
     api_port = args.api_port or _free_port()
     intake_root = args.airflow_home / "smoke" / "intake"
@@ -498,27 +990,103 @@ def main() -> int:
     shutil.copytree(fixture_root / "native", intake)
     upload_files = package_inventory(intake)
     record = _native_record(fixture_root)
-    server, state = _mock_endpoint(
-        fixture,
-        run_id=native_id,
-        upload_files=upload_files,
-        record=record,
-        bundle_dir=args.airflow_home / "smoke" / "definition",
-    )
-    port = server.server_address[1]
-    store_root = args.airflow_home / "smoke-store"
+    server = None
+    portal_server = None
+    state: dict = {}
+    port = _free_port() if portal_mode else 0
+    if not portal_mode:
+        server, state = _mock_endpoint(
+            fixture,
+            run_id=native_id,
+            upload_files=upload_files,
+            record=record,
+            bundle_dir=args.airflow_home / "smoke" / "definition",
+        )
+        port = server.server_address[1]
+    # The controlled platform-configuration identity of this smoke world: one canonical
+    # IF-16 snapshot built by the deploy-side mechanism from THIS run's exact inputs
+    # (paths, ports, records, targets), published to the child Airflow services through
+    # the environment.  Every consumer below reads the snapshot's resolved values - the
+    # snapshot governs the deployed fixture instead of declaring a parallel one, and
+    # the runtime freeze still refuses a missing or mismatched digest.
+    try:
+        snapshot_env, resolved = _config_snapshot_environment(
+            args,
+            target=target,
+            state_root=args.airflow_home / "smoke-state",
+            handoff_root=intake_root,
+            workspace_root=args.airflow_home / "smoke-workspaces",
+            record_roots=[str(fixture_root / "records")],
+            endpoint_port=port,
+        )
+    except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": f"{type(error).__name__}: {error}"}))
+        if server is not None:
+            server.close()
+        return 1
+    os.environ.update(snapshot_env)
+    # The snapshot's secret references must be the real ones this run uses: the endpoint
+    # token file is materialized (0600) and read back for the connection, and the platform
+    # database reference is the actual PLATFORM_SERVICE_DSN this smoke was given -
+    # materialized as the referenced file and re-published from it.  Nothing secret is
+    # printed or copied into evidence.
+    secrets_dir = args.airflow_home / "smoke-config" / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(secrets_dir, 0o700)
+    token_file = Path(resolved["windows"]["token_file"])
+    token_file.write_text(TOKEN, encoding="utf-8")
+    os.chmod(token_file, 0o600)
+    endpoint_token = token_file.read_text(encoding="utf-8")
+    supplied_dsn = os.environ.get("PLATFORM_SERVICE_DSN", "")
+    if not supplied_dsn:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "stage": "platform_dsn",
+                    "error": (
+                        "PLATFORM_SERVICE_DSN is required: the platform database reference "
+                        "must be the real connection this run uses"
+                    ),
+                }
+            )
+        )
+        if server is not None:
+            server.close()
+        return 1
+    dsn_file = Path(resolved["database"]["dsn_file"])
+    dsn_file.write_text(supplied_dsn, encoding="utf-8")
+    os.chmod(dsn_file, 0o600)
+    os.environ["PLATFORM_SERVICE_DSN"] = dsn_file.read_text(encoding="utf-8")
+    # The one canonical smoke store root: the snapshot's derived store root, created once
+    # here (the operator convention: a dedicated directory under the isolated home, mode
+    # 0700) and published to every consumer of this smoke: the in-process admission and
+    # the lazily bound portal read it from the environment, the scheduler reads the same
+    # path from the connection extra below, and the child processes inherit it through
+    # ``env``.  ``PlatformStore.from_environment`` keeps requiring it - there is no
+    # implicit fallback and no second root.
+    store_root = Path(resolved["derived"]["store_root"])
+    repository_path = Path(resolved["derived"]["repositories"][REPOSITORY_SLUG])
+    if Path(resolved["storage"]["handoff_root"]) != intake_root:
+        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": "the snapshot handoff root diverged"}))
+        if server is not None:
+            server.close()
+        return 1
+    store_root.mkdir(parents=True, exist_ok=True)
+    store_root.chmod(0o700)
+    os.environ["PIPELINE_STORE_ROOT"] = str(store_root)
     connection = json.dumps(
         {
             "conn_type": "http",
             "host": "127.0.0.1",
             "port": port,
-            "password": TOKEN,
+            "password": endpoint_token,
             "extra": {
                 "store_root": str(store_root),
-                "repositories": {REPOSITORY_SLUG: str(args.airflow_home / "smoke-repository")},
-                "targets": {TARGET_HARDWARE: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
-                "handoff_roots": [str(intake_root)],
-                "discovery": {"record_roots": [str(fixture_root / "records")]},
+                "repositories": {REPOSITORY_SLUG: str(repository_path)},
+                "targets": resolved["targets"],
+                "handoff_roots": [resolved["storage"]["handoff_root"]],
+                "discovery": {"record_roots": list(resolved["specifications"]["record_roots"])},
             },
         }
     )
@@ -527,6 +1095,7 @@ def main() -> int:
         AIRFLOW_HOME=str(args.airflow_home),
         PYTHONPATH=os.pathsep.join(filter(None, [str(args.root / "src"), os.environ.get("PYTHONPATH")])),
         AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
+        PIPELINE_STORE_ROOT=str(store_root),
         AIRFLOW__CORE__AUTH_MANAGER="description_pipeline.orchestration.feishu_auth.FeishuAuthManager",
         AIRFLOW__CORE__LOAD_EXAMPLES="false",
         AIRFLOW__API_AUTH__JWT_SECRET=JWT_SECRET,
@@ -538,15 +1107,19 @@ def main() -> int:
         AIRFLOW__CORE__DAGS_FOLDER=str(args.root / "deploy/airflow/dags"),
         AIRFLOW__CORE__EXECUTION_API_SERVER_URL=f"http://127.0.0.1:{api_port}/execution",
     )
+    if args.airflow_db_conn:
+        env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = args.airflow_db_conn
     problem = _plugin_preflight(args.venv, env, args.airflow_home)
     if problem is not None:
         print(json.dumps({"ok": False, "stage": "plugin_missing", "error": problem}))
-        server.close()
+        if server is not None:
+            server.close()
         return 1
     migrate = _run(args.venv, env, "db", "migrate")
     if migrate.returncode != 0:
         print(json.dumps({"ok": False, "stage": "db_migrate", "stderr": migrate.stderr[-500:]}))
-        server.close()
+        if server is not None:
+            server.close()
         return 1
     # The production pool entry (install.sh runs the same script): a freshly migrated home only
     # carries the stock default pool, and the DAG's native stage waits on windows_native; without
@@ -560,7 +1133,8 @@ def main() -> int:
     )
     if pool.returncode != 0:
         print(json.dumps({"ok": False, "stage": "ensure_pool", "stderr": pool.stderr[-500:]}))
-        server.close()
+        if server is not None:
+            server.close()
         return 1
     log_dir = args.airflow_home / "logs" / "smoke"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -611,28 +1185,121 @@ def main() -> int:
                 )
             )
             return 1
-        unpause = _run(args.venv, env, "dags", "unpause", DAG_ID)
-        if unpause.returncode != 0:
-            print(json.dumps({"ok": False, "stage": "unpause", "stderr": unpause.stderr[-500:]}))
-            return 1
-        # Trigger exactly as the operator page does: the portal's client, a real operator JWT and
-        # the pinned strict request model.  A CLI trigger could not catch a body regression.
         airflow = AirflowApi(f"http://127.0.0.1:{api_port}")
         token = _operator_jwt(args.venv, env)
-        try:
-            airflow.trigger_dag_run(
-                token,
+        portal_base = ""
+        portal_cookie = ""
+        portal_csrf = ""
+        projection: dict = {}
+        negatives: list[dict] = []
+        rejection: dict = {}
+        sql_evidence: dict | None = None
+        identity_stable: bool | None = None
+        trigger_kind = "portal-airflow-client"
+        endpoint_holder: dict = {}
+        admission: dict = {}
+        portal_server = None
+        if portal_mode:
+            # The operator "start" half of the workflow: the gate is opened through the store
+            # API before any submission can be admitted.
+            admission = _open_platform_admission()
+            if admission.get("state") != "open":
+                print(json.dumps({"ok": False, "stage": "platform_admission", "admission": admission}))
+                return 1
+            # Admission first, while the DAG is paused: the portal's dag_run_id binds the native
+            # identity, so the fixture and mocked endpoint are built for it afterwards and only
+            # then is scheduling released.
+            portal_server, portal_base = _start_portal_server(
+                args.root,
+                f"http://127.0.0.1:{api_port}",
+                intake_root,
+                repository_path,
+                resolved["targets"],
                 DAG_ID,
-                run_id,
-                {
-                    "handoff_path": str(intake),
-                    "target_hardware": TARGET_HARDWARE,
-                    "change_summary": "scheduled control-fixture smoke",
-                },
+                endpoint_holder,
             )
-        except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
-            print(json.dumps({"ok": False, "stage": "portal_trigger", "error": str(error)}))
-            return 1
+            try:
+                run_id, portal_cookie, portal_session = _portal_admit(
+                    portal_base,
+                    token,
+                    intake,
+                    Path(HANDOFF_PATH).name,
+                    target,
+                    "scheduled control-fixture smoke",
+                    args.purpose,
+                )
+                portal_csrf = str(portal_session.get("csrf_token") or "")
+            except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+                print(json.dumps({"ok": False, "stage": "portal_admission", "error": str(error)}))
+                return 1
+            native_id = native_run_id(run_id)
+            rebuilt_root = args.airflow_home / "smoke" / f"fixture-{native_id}"
+            try:
+                rebuilt = build_fixture_capture(rebuilt_root, run_id=native_id)
+            except Exception as error:  # noqa: BLE001
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "stage": "control_fixture_rebuild",
+                            "error": f"{type(error).__name__}: {error}",
+                        }
+                    )
+                )
+                return 1
+            # The uploaded folder is the frozen handoff: its relative inventory must equal the
+            # rebuilt fixture's native tree and seal the same handoff digest.  The derived
+            # capture archive is bound to the run identity and legitimately differs per build.
+            identity_stable = rebuilt.get("handoff_sha256") == fixture.get("handoff_sha256") and (
+                package_inventory(rebuilt_root / "native") == package_inventory(intake)
+            )
+            fixture = rebuilt
+            fixture_root = rebuilt_root
+            upload_files = package_inventory(intake)
+            record = _native_record(fixture_root)
+            server, state = _mock_endpoint(
+                fixture,
+                run_id=native_id,
+                upload_files=upload_files,
+                record=record,
+                bundle_dir=args.airflow_home / "smoke" / "definition",
+                port=port,
+            )
+            from description_pipeline.orchestration.airflow_client import (  # noqa: PLC0415
+                EndpointConfig,
+                WindowsEndpoint,
+            )
+
+            endpoint_holder["endpoint"] = WindowsEndpoint(
+                EndpointConfig(base_url=f"http://127.0.0.1:{port}", token=TOKEN)
+            )
+            resume = _run(args.venv, env, "dags", "unpause", DAG_ID)
+            if resume.returncode != 0:
+                print(json.dumps({"ok": False, "stage": "unpause", "stderr": resume.stderr[-500:]}))
+                return 1
+            trigger_kind = "portal-http-admission"
+        else:
+            unpause = _run(args.venv, env, "dags", "unpause", DAG_ID)
+            if unpause.returncode != 0:
+                print(json.dumps({"ok": False, "stage": "unpause", "stderr": unpause.stderr[-500:]}))
+                return 1
+            # Trigger exactly as the operator page does: the portal's client, a real operator JWT
+            # and the pinned strict request model.  A CLI trigger could not catch a body regression.
+            try:
+                airflow.trigger_dag_run(
+                    token,
+                    DAG_ID,
+                    run_id,
+                    {
+                        "handoff_path": str(intake),
+                        "target_hardware": target,
+                        "change_summary": "scheduled control-fixture smoke",
+                        "purpose": args.purpose,
+                    },
+                )
+            except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+                print(json.dumps({"ok": False, "stage": "portal_trigger", "error": str(error)}))
+                return 1
         deadline = time.time() + args.timeout
         triggering_user_name = None
         dag_state = None
@@ -652,17 +1319,19 @@ def main() -> int:
             except Exception:  # noqa: BLE001 - the run may not be visible for a moment
                 live = []
             if any(
-                str(item.get("task_id")) == "start_job" and str(item.get("state")) == "up_for_reschedule"
+                str(item.get("task_id")) == "discover" and str(item.get("state")) == "up_for_reschedule"
                 for item in live
             ):
                 reschedule_observed.append(
                     {
                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "task_id": "start_job",
+                        "task_id": "discover",
                         "state": "up_for_reschedule",
                     }
                 )
-            time.sleep(5)
+            # One-second reschedule windows: a looser poll misses the observable state even
+            # though the TaskReschedule rows prove the slot release.
+            time.sleep(1)
         else:
             tails = {c: (log_dir / f"{c}.log").read_text(encoding="utf-8")[-400:] for c in logs}
             print(
@@ -678,19 +1347,139 @@ def main() -> int:
             for item in instances
         }
         problems: list[str] = []
+        if portal_mode:
+            status, projection, _ = _http_json(
+                "GET", f"{portal_base}/api/runs/{run_id}", token=token, cookies=portal_cookie
+            )
+            if status != 200:
+                problems.append(f"the portal projection could not be read: {status}")
+            negatives = _portal_negative_checks(
+                portal_base, token, portal_cookie, portal_csrf, HANDOFF_PATH, run_id, target
+            )
+            for item in negatives:
+                if not item["ok"]:
+                    problems.append(
+                        f"portal negative check {item['check']} answered {item['status']}, "
+                        f"expected {item['expected']}"
+                    )
+            # The expected rejection must be provable from the formal report surface: the
+            # portal's diagnostic preview is digest-bound to the retained verify receipt and
+            # carries the exact failing checks, so a verifier crash can never masquerade as
+            # the documented control rejection.  Bytes are consumed only through this route;
+            # the store is never searched directly.
+            status, preview_payload, _ = _http_json(
+                "GET", f"{portal_base}/api/runs/{run_id}/preview", token=token, cookies=portal_cookie
+            )
+            # The full quality document comes through the artifact route, which binds the
+            # bytes to the digest its own preview declared (no client-supplied digest);
+            # every check must carry definite execution evidence, so "absent from the
+            # failing summary" can never pass for "executed and passed".
+            document_status, quality_doc, _ = _http_json(
+                "GET",
+                f"{portal_base}/api/runs/{run_id}/artifacts/reports/quality.json",
+                token=token,
+                cookies=portal_cookie,
+            )
+            checks = [
+                item for item in (quality_doc.get("checks") or []) if isinstance(item, dict)
+            ] if isinstance(quality_doc, dict) else []
+            preview_failing = {
+                str(item.get("id"))
+                for item in (preview_payload.get("failing_checks") or [])
+                if isinstance(item, dict)
+            }
+            quality = _quality_rejection_comparisons(checks, preview_failing)
+            subject = str(preview_payload.get("subject_sha256") or "")
+            rejection = {
+                "served": status == 200,
+                "reason": preview_payload.get("reason"),
+                "verified": preview_payload.get("verified"),
+                "error": preview_payload.get("error"),
+                "failed_gates": sorted(quality["failing"]),
+                "unexpected_gates": quality["unexpected_gates"],
+                "missing_required_gates": quality["missing_required_gates"],
+                "subject_sha256": subject or None,
+                "urdf": preview_payload.get("urdf"),
+                "quality": {
+                    "document_served": document_status == 200,
+                    "checks": len(checks),
+                    "execution_evidence": quality["executed"],
+                    "consistent": quality["consistent"],
+                    "views_agree": quality["views_agree"],
+                    "allowed_failure": quality["allowed_failure"],
+                    "document_subject_sha256": quality_doc.get("subject_sha256")
+                    if isinstance(quality_doc, dict)
+                    else None,
+                },
+                "subject_binding": "route-bound preview and quality document; platform receipts at wiring",
+            }
+            if status != 200:
+                problems.append(f"the diagnostic preview could not be served: {status}")
+            else:
+                if (
+                    preview_payload.get("reason") != "verification_failed"
+                    or preview_payload.get("verified") is not False
+                ):
+                    problems.append(f"the rejection is not the bound verification failure: {rejection}")
+                if "URDF verification failed" not in str(preview_payload.get("error") or ""):
+                    problems.append(f"the rejection error is not the documented verification failure: {rejection}")
+                if document_status != 200:
+                    problems.append(f"the quality document could not be served: {document_status}")
+                elif not quality["executed"] or not quality["consistent"]:
+                    problems.append(f"quality checks carry no definite execution evidence: {rejection['quality']}")
+                elif not quality["views_agree"]:
+                    problems.append(
+                        f"the quality document and the diagnostic summary disagree on failures: {rejection}"
+                    )
+                if not quality["allowed_failure"]:
+                    problems.append(
+                        "the expected rejection requires a non-empty allowed failure set: "
+                        + str(rejection["quality"])
+                    )
+                if quality["unexpected_gates"]:
+                    problems.append(
+                        f"quality failed outside the documented control limits: {quality['unexpected_gates']}"
+                    )
+                if quality["missing_required_gates"]:
+                    problems.append(
+                        f"required gates are missing or not passed: {quality['missing_required_gates']}"
+                    )
+                document_subject = (
+                    str(quality_doc.get("subject_sha256") or "") if isinstance(quality_doc, dict) else ""
+                )
+                if (
+                    len(subject) != 64
+                    or any(char not in "0123456789abcdef" for char in subject)
+                    or document_subject != subject
+                ):
+                    problems.append(
+                        "the preview and the quality document do not agree on one bound subject digest"
+                    )
+            sql_evidence = _platform_sql_evidence(
+                args.platform_schema,
+                native_id,
+                projection,
+                request_id=f"portal-{run_id}",
+            )
+            problems.extend(sql_evidence.get("problems", []))
+            if identity_stable is False:
+                problems.append(
+                    "the rebuilt fixture differs from the uploaded placeholder fixture; "
+                    "the run identity binding is unstable"
+                )
         if dag_state != "failed":
             problems.append(f"DAG run state is {dag_state!r}, expected the documented rejection (failed)")
         for task_id, expected_state in (
-            ("resolve_handoff", "success"),
-            ("start_job", "success"),
-            ("fetch_capture", "success"),
-            ("run_generate", "success"),
-            ("run_verify", "failed"),
+            ("freeze", "success"),
+            ("discover", "success"),
+            ("capture", "success"),
+            ("generate", "success"),
+            ("verify", "failed"),
         ):
             actual = task_states.get(task_id, {}).get("state")
             if actual != expected_state:
                 problems.append(f"task {task_id} is {actual!r}, expected {expected_state!r}")
-        for task_id in ("run_publish",):
+        for task_id in ("publish",):
             # Blocked without execution: the scheduler marked the task upstream_failed/skipped and
             # it never entered a running attempt, so a publish that started and failed early can
             # never be mistaken for a prevention proof.
@@ -704,51 +1493,17 @@ def main() -> int:
         # observed up_for_reschedule state on that task.  Counts, other tasks and the configured
         # mode string are not evidence.
         reschedule_query = (
-            f"TaskReschedule(dag_id={DAG_ID!r}, run_id={run_id!r}, task_id='start_job') "
+            f"TaskReschedule(dag_id={DAG_ID!r}, run_id={run_id!r}, task_id='discover') "
             "via the isolated home's Airflow ORM"
         )
-        reschedule_rows, reschedule_error = _task_reschedule_evidence(args.venv, env, DAG_ID, run_id, "start_job")
+        reschedule_rows, reschedule_error = _task_reschedule_evidence(args.venv, env, DAG_ID, run_id, "discover")
         if reschedule_error is not None:
             problems.append(f"the TaskReschedule evidence could not be read: {reschedule_error}")
         if not reschedule_rows:
-            problems.append("no TaskReschedule rows exist for start_job; the native wait's slot release is not proven")
+            problems.append("no TaskReschedule rows exist for discover; the native wait's slot release is not proven")
         if not reschedule_observed:
-            problems.append("start_job was never observed in up_for_reschedule; its slot release is not proven")
+            problems.append("discover was never observed in up_for_reschedule; its slot release is not proven")
 
-        store = LinuxStore(store_root)
-        generated = _read_json(store.receipt_path(native_id, "generate"))
-        verified = _read_json(store.receipt_path(native_id, "verify"))
-        meta = store.meta(native_id) or {}
-        if generated.get("state") != "generated":
-            problems.append(f"generate checkpoint is {generated.get('state')!r}, not 'generated'")
-        if verified.get("state") != "failed":
-            problems.append(f"verify receipt is {verified.get('state')!r}, not 'failed'")
-        error = str(verified.get("error") or "")
-        if "URDF verification failed" not in error:
-            problems.append(f"verify receipt error is not the documented verification rejection: {error!r}")
-        diagnostic = Path(str(verified.get("diagnostic_path") or ""))
-        quality = _read_json(diagnostic / "reports/quality.json")
-        checks = [item for item in quality.get("checks") or [] if isinstance(item, dict)]
-        gates = {item.get("id"): item for item in checks}
-        failed_gates = sorted(
-            item.get("id") for item in checks if item.get("passed") is False or item.get("state") == "failed"
-        )
-        unexpected_gates = sorted(set(failed_gates) - set(CONTROL_LIMITS))
-        missing_required = [gate for gate in REQUIRED_CONTROL_GATES if not (gates.get(gate) or {}).get("passed")]
-        if unexpected_gates:
-            problems.append(f"quality failed outside the documented control limits: {unexpected_gates}")
-        if missing_required:
-            problems.append(f"quality skipped required gates: {missing_required}")
-        if quality.get("subject_sha256") != generated.get("subject_sha256"):
-            problems.append("verify quality is not bound to the generated subject")
-        publish_receipt = store.receipt_path(native_id, "publish")
-        pr_json = sorted(
-            path.relative_to(store.run_dir(native_id)).as_posix() for path in store.run_dir(native_id).rglob("pr.json")
-        )
-        if publish_receipt.is_file():
-            problems.append("a publish receipt exists although publication must not execute")
-        if pr_json:
-            problems.append(f"publication evidence exists although publication must not execute: {pr_json}")
         jobs = list(state["jobs"].values())
         if len(jobs) != 1 or jobs[0].get("status") != "native_complete":
             problems.append("the mocked endpoint did not serve exactly one native_complete job")
@@ -758,47 +1513,57 @@ def main() -> int:
             problems.append("the generated text definition was never submitted")
         if len(state["artifact_paths"]) < 2:
             problems.append("the raw record and the sealed capture transfer were not both streamed")
-        if meta.get("last_stage") != "verify":
-            problems.append(f"the attempt advanced past verification: last_stage={meta.get('last_stage')!r}")
-
-        print(
-            json.dumps(
-                {
-                    "ok": not problems,
-                    "qualification": QUALIFICATION,
-                    "run_id": run_id,
-                    "native_run_id": native_id,
-                    "api_port": api_port,
-                    "auth_health": auth_health,
-                    "trigger": "portal-airflow-client",
-                    "triggering_user_name": triggering_user_name,
-                    "dag_state": dag_state,
-                    "reschedule_evidence": {
-                        "query": reschedule_query,
-                        "rows": reschedule_rows,
-                        "observed": reschedule_observed,
-                        "error": reschedule_error,
-                    },
-                    "task_states": task_states,
-                    "selection_uploads": state["uploads"],
-                    "definition_posts": state["definition_posts"],
-                    "artifact_paths": state["artifact_paths"],
-                    "handoff_sha256": fixture["handoff_sha256"],
-                    "generate": {"state": generated.get("state"), "subject_sha256": generated.get("subject_sha256")},
-                    "verify": {
-                        "state": verified.get("state"),
-                        "error": verified.get("error"),
-                        "diagnostic_path": verified.get("diagnostic_path"),
-                        "failed_gates": failed_gates,
-                        "unexpected_gates": unexpected_gates,
-                        "missing_required_gates": missing_required,
-                        "subject_sha256": verified.get("subject_sha256"),
-                    },
-                    "publication": {"executed": bool(publish_receipt.is_file() or pr_json), "pr_json": pr_json or None},
-                    "problems": problems,
-                }
+        report = {
+            "ok": not problems,
+            "qualification": QUALIFICATION,
+            "run_id": run_id,
+            "native_run_id": native_id,
+            "api_port": api_port,
+            "auth_health": auth_health,
+            "trigger": trigger_kind,
+            "native_endpoint": "mock (transport-only)",
+            "scope": {
+                "platform_schema": args.platform_schema or None,
+                "airflow_schema": args.airflow_schema or None,
+                "portal_admission": portal_mode,
+                # Exported by the operator environment from the install snapshot digest;
+                # the run freeze consumes it (conf first, environment second).
+                "platform_config_digest": os.environ.get("PLATFORM_CONFIG_DIGEST") or None,
+            },
+            "triggering_user_name": triggering_user_name,
+            "dag_state": dag_state,
+            "reschedule_evidence": {
+                "query": reschedule_query,
+                "rows": reschedule_rows,
+                "observed": reschedule_observed,
+                "error": reschedule_error,
+            },
+            "task_states": task_states,
+            "selection_uploads": state["uploads"],
+            "definition_posts": state["definition_posts"],
+            "artifact_paths": state["artifact_paths"],
+            "endpoint_aborts": state.get("aborts") or None,
+            "handoff_sha256": fixture["handoff_sha256"],
+            "target_hardware": target,
+            "fixture_identity_stable": identity_stable,
+            "platform_sql": sql_evidence,
+            "platform_admission": admission,
+            "verify_rejection": rejection,
+            "portal_projection": {
+                "dag_run_id": run_id,
+                "state": projection.get("state") if isinstance(projection, dict) else None,
+                "tasks": projection.get("tasks") if isinstance(projection, dict) else None,
+                "handoff_path": projection.get("handoff_path") if isinstance(projection, dict) else None,
+            },
+            "negative_http": negatives,
+            "problems": problems,
+        }
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
-        )
+        print(json.dumps(report))
         return 0 if not problems else 1
     finally:
         stack.close()
@@ -808,8 +1573,10 @@ def main() -> int:
         for proc in procs:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=20)
-        server.shutdown()
-        server.server_close()
+        for httpd in (server, portal_server):
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
 
 
 if __name__ == "__main__":

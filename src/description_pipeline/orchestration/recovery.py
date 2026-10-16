@@ -24,7 +24,7 @@ PREREQUISITES: dict[str, tuple[str, ...]] = {
     "publish": ("freeze", "discover", "capture", "generate", "verify"),
 }
 #: Stages that reuse the parent discovery binding; only they depend on the
-#: parent dependency snapshot and the unchanged publication target.
+#: parent dependency snapshot (the publication target is the platform request's).
 REUSES_DISCOVERY = frozenset({"capture", "generate", "verify", "publish"})
 #: Probe entry that proves each checkpoint's retained bytes; the frozen upload
 #: is already bound by the source probe and the qualified report is the verify output.
@@ -41,7 +41,6 @@ REASON_ZH = {
     "source_changed": "原始上传不可复用，请重新上传后开始新运行",
     "dependency_changed": "解析依赖快照（命名注册表或记录来源）与原始运行不一致或无法验证，最早可从“解析结构”重新开始",
     "tool_changed": "工具版本已变化或无法验证；不能混用不同版本的证据，最早可从“冻结输入”重新开始",
-    "target_changed": "发布目标（仓库或分支）与原始绑定不一致；为避免沿用旧绑定，最早可从“解析结构”重新开始",
 }
 
 
@@ -70,20 +69,17 @@ def _prerequisite_failure(requested: str, job: dict, probe: dict[str, str], tool
         return "tool_changed", "freeze"
     for checkpoint in PREREQUISITES.get(requested, ()):
         # Validate strictly in prerequisite order: completion, retained bytes and
-        # (only when the discovery binding is reused) its dependency and target.
+        # (only when the discovery binding is reused) its dependency snapshot.
         # Any refusal therefore names a checkpoint whose own restart is accepted.
         if not _stage_completed(job, checkpoint):
             return "prerequisite_invalid", checkpoint
         key = AVAILABILITY[checkpoint]
         if key is not None and probe.get(key) != "ok":
             return "prerequisite_invalid", checkpoint
-        if checkpoint == "discover" and requested in REUSES_DISCOVERY:
-            # Reusing the parent discovery binding: its dependency snapshot and the
-            # publication target must still be exactly verifiable.
-            if probe.get("dependency") != "ok":
-                return "dependency_changed", "discover"
-            if probe.get("target") != "ok":
-                return "target_changed", "discover"
+        # Reusing the parent discovery binding: its dependency snapshot must
+        # still be exactly verifiable.
+        if checkpoint == "discover" and requested in REUSES_DISCOVERY and probe.get("dependency") != "ok":
+            return "dependency_changed", "discover"
     return None
 
 
@@ -158,11 +154,9 @@ def stage_reruns(job: dict, *, probe: dict[str, str], tool: str) -> list[dict]:
                     "inputs": probe.get("source", "absent"),
                     "tool": tool,
                     "dependency": probe.get("dependency", "unverifiable"),
-                    "target": probe.get("target", "ok"),
                     "receipt": probe.get("receipt", "absent"),
                     "earliest_required": plan["earliest_required"],
                 },
-                "target_changed": probe.get("target") == "changed",
             }
         )
     return rows
