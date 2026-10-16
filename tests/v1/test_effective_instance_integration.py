@@ -467,7 +467,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         )
         (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
         (raw / "coordinate_systems.json").write_text(json.dumps(self.raw_scene["coordinate_systems"]), encoding="utf-8")
-        (raw / "source_config.json").write_text(json.dumps(self.source), encoding="utf-8")
         (raw / "material_provenance.json").write_text(
             json.dumps(
                 {
@@ -907,7 +906,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         )
         (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
         (raw / "coordinate_systems.json").write_text(json.dumps(scene_payload["coordinate_systems"]), encoding="utf-8")
-        (raw / "source_config.json").write_text(json.dumps(self.source), encoding="utf-8")
         (raw / "material_provenance.json").write_text(
             json.dumps(
                 {
