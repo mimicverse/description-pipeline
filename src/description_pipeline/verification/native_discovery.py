@@ -42,6 +42,8 @@ import yaml
 
 from ..delivery import read_delivery_manifest, read_source_record
 from ..interface_records import (
+    PREVIEW_RANGE_KEYS,
+    PREVIEW_RANGE_SCHEMA,
     PURPOSE_INSPECTION_PREVIEW,
     preview_revolute_window_rad,
     validate_request_record,
@@ -1151,7 +1153,23 @@ def _rows_for(mate: dict, frames) -> dict | None:
     for entity in (first, second):
         if _rejected_entity(entity, frames):
             return None
-    limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
+    # The independent rebuild refuses an incomplete or unusable limits reading
+    # itself: only an intact observation (explicit null or a mapping) may ever
+    # be treated as absence, and no purpose changes that.
+    if "limits" not in mate:
+        raise _Failure(
+            "discovery.mate_limits_observation_incomplete",
+            "the mate observation carries no limits reading; a missing reading cannot prove absence",
+            {"mate": mate.get("name")},
+        )
+    raw_limits = mate["limits"]
+    if raw_limits is not None and not isinstance(raw_limits, dict):
+        raise _Failure(
+            "discovery.mate_limits_observation_invalid",
+            "the mate limits reading is not a usable observation",
+            {"mate": mate.get("name"), "value_type": type(raw_limits).__name__},
+        )
+    limits = raw_limits if isinstance(raw_limits, dict) else None
     axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     if kind == "lock":
         first_frame = _frame_for(first, frames)
@@ -2406,20 +2424,13 @@ def _joint_properties(raw: dict, mates: list[dict]) -> tuple[dict, dict]:
     return merged, conflicts
 
 
-PREVIEW_RANGE_SCHEMA = "solidworks-to-urdf.preview-range/v1"
-_PREVIEW_RANGE_KEYS = {
-    "schema_version",
-    "joint",
-    "instance",
-    "configuration",
-    "unit",
-    "zero",
-    "direction",
-    "purpose",
-    "lower",
-    "upper",
-    "source_sha256",
-}
+def _preview_number(value) -> float:
+    """A finite real declaration number; booleans are not numeric facts."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return math.nan
+    number = float(value)
+    return number if math.isfinite(number) else math.nan
 
 
 def _declared_preview_range(
@@ -2434,9 +2445,18 @@ def _declared_preview_range(
     """Resolve the bound finite preview declaration of one prismatic joint.
 
     The resolved file's digest and the parsed exact semantics (joint, instance
-    among the pair's occurrences, configuration, unit, zero, direction, purpose,
-    finite ordered range and the source digest) are all required - a file that
-    merely exists, or an anchor substring that merely matches, never passes.
+    among the pair's occurrences, configuration, unit, zero, direction, purpose
+    and a finite ordered range) are all required - a file that merely exists, or
+    an anchor substring that merely matches, never passes.  ``source_sha256`` is
+    not part of the shape: the controlled-record entry already owns and verifies
+    the resolved file digest.
+
+    The declared window is expressed in the declaration's own measure.  ``zero``
+    is the declared value that coincides with the joint's canonical zero and
+    ``direction`` (``+1``/``-1``) orients the declared positive sense against
+    the canonical positive axis, so the canonical window is
+    ``direction * (declared - zero)`` applied to both endpoints and ordered.
+    The mapping is always applied - a descriptor is never silently dropped.
     """
 
     reference = properties.get(f"{namespace}.joint.preview_range_record")
@@ -2449,28 +2469,27 @@ def _declared_preview_range(
     entry = _find_record_entry(payload, reference)
     value = _record_value(package, entry["entry"], entry["key"])
     left, right = pair
-    try:
-        lower = float(value["lower"])
-        upper = float(value["upper"])
-        zero = float(value["zero"])
-    except (KeyError, TypeError, ValueError):
-        lower = upper = zero = math.nan
+    numbers = isinstance(value, dict)
+    lower = _preview_number(value.get("lower")) if numbers else math.nan
+    upper = _preview_number(value.get("upper")) if numbers else math.nan
+    zero = _preview_number(value.get("zero")) if numbers else math.nan
+    direction = value.get("direction") if numbers else None
+    sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
     configuration = str((payload.get("raw") or {}).get("saved_configuration") or "")
     valid = (
         isinstance(value, dict)
-        and set(value) == _PREVIEW_RANGE_KEYS
+        and set(value) == PREVIEW_RANGE_KEYS
         and value.get("schema_version") == PREVIEW_RANGE_SCHEMA
         and str(value.get("joint")) == joint
         and str(value.get("instance")) in {str(left), str(right)}
         and str(value.get("configuration")) == configuration
         and value.get("unit") == "m"
-        and str(value.get("direction")) in {"+1", "-1"}
+        and math.isfinite(sign)
         and value.get("purpose") == PURPOSE_INSPECTION_PREVIEW
         and math.isfinite(lower)
         and math.isfinite(upper)
         and math.isfinite(zero)
         and lower < upper
-        and re.fullmatch(r"[0-9a-f]{64}", str(value.get("source_sha256") or "")) is not None
     )
     _require(
         valid,
@@ -2484,7 +2503,8 @@ def _declared_preview_range(
         "sha256": entry["entry"].get("sha256"),
         "anchor": entry["entry"].get("anchor"),
     }
-    return {"lower": lower, "upper": upper}, evidence
+    first, second = sign * (lower - zero), sign * (upper - zero)
+    return {"lower": min(first, second), "upper": max(first, second)}, evidence
 
 
 def verify_discovery(package: Path) -> dict:
@@ -3057,8 +3077,14 @@ def verify_discovery(package: Path) -> dict:
                 "the saved mate reports a native error or an unreadable solve state",
                 {"mate": mate.get("name"), "error_code": error_code},
             )
+            _require(
+                "limits" in mate,
+                "discovery.graph",
+                "the mate observation carries no limits reading; a missing reading cannot prove absence",
+                {"mate": mate.get("name")},
+            )
             kind = str(mate.get("type") or "").strip().lower()
-            limits = mate.get("limits")
+            limits = mate["limits"]
             if kind in {"limitdistance", "limitangle"}:
                 unit = "m" if kind == "limitdistance" else "rad"
                 _require(

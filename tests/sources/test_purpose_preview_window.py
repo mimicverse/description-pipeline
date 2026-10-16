@@ -108,7 +108,6 @@ class DeclaredPreviewRangeTests(unittest.TestCase):
             "purpose": PURPOSE_INSPECTION_PREVIEW,
             "lower": -0.1,
             "upper": 0.2,
-            "source_sha256": "c" * 64,
         }
         value.update(overrides)
         return value
@@ -137,7 +136,10 @@ class DeclaredPreviewRangeTests(unittest.TestCase):
             {"configuration": "Other"},
             {"direction": "both"},
             {"lower": 0.5, "upper": 0.5},
-            {"source_sha256": "xyz"},
+            {"source_sha256": "c" * 64},
+            {"zero": True},
+            {"lower": False},
+            {"direction": True},
             {"extra": 1},
         )
         for overrides in cases:
@@ -158,6 +160,7 @@ class DeclaredPreviewRangeTests(unittest.TestCase):
             ),
             findings,
         )
+
         # A file that merely contains the wording (wrong key shape) never passes.
         (self.tmp / "preview.json").write_text(json.dumps({"note": "range -0.1..0.2"}), encoding="utf-8")
         findings = []
@@ -193,6 +196,99 @@ class DeclaredPreviewRangeTests(unittest.TestCase):
         self.assertIsNone(limits)
         self.assertIsNone(evidence)
         self.assertEqual([finding["code"] for finding in findings], ["discovery.joint_preview_range_missing"])
+
+    def test_zero_and_direction_map_the_declared_window_into_canonical_coordinates(self) -> None:
+        control, _, _ = self._resolve(self._value())
+        shifted, _, _ = self._resolve(self._value(zero=1000.0))
+        reversed_window, _, _ = self._resolve(self._value(direction="-1"))
+        self.assertEqual(control, {"lower": -0.1, "upper": 0.2})
+        self.assertEqual(shifted, {"lower": -1000.1, "upper": -999.8})
+        self.assertEqual(reversed_window, {"lower": -0.2, "upper": 0.1})
+        self.assertNotEqual(control, shifted)
+        self.assertNotEqual(control, reversed_window)
+
+
+def _slider_record() -> dict:
+    """The hinge fixture re-formed as a keyed slider: one axial translation freedom."""
+
+    payload = native_record()
+    locate = payload["mates"][1]
+    locate["name"] = "shoulder_pitch_joint__anti_spin"
+    locate["entities"][0]["plane"]["normal"] = [1.0, 0.0, 0.0]
+    locate["entities"][1]["plane"]["normal"] = [-1.0, 0.0, 0.0]
+    properties = payload["properties"]["mates"].pop("shoulder_pitch_joint__coaxial")
+    properties.pop("dp.joint.limits_record", None)
+    properties.pop("dp.joint.drive_record", None)
+    properties["dp.joint.preview_range_record"] = "preview.json#range"
+    payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"] = properties
+    return payload
+
+
+class DeclaredPrismaticFullFlowTests(unittest.TestCase):
+    """The declared preview window through the actual derivation and independent rebuild."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="prismatic-flow-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _run(self, purpose: str, declaration: dict | None = None):
+        suffix = f"{purpose}-{'default' if declaration is None else 'mutated'}"
+        frozen = self.tmp / f"native-{suffix}"
+        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
+            path = frozen / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"placeholder {name}\n".encode())
+        records = self.tmp / f"records-{suffix}"
+        records.mkdir(exist_ok=True)
+        (records / "budget.json").write_text(
+            json.dumps({"robot": {"expected_mass_kg": [0.28, 0.32], "expected_extent_m": [0.35, 0.5]}}),
+            encoding="utf-8",
+        )
+        value = {
+            "schema_version": "solidworks-to-urdf.preview-range/v1",
+            "joint": "shoulder_pitch_joint",
+            "instance": "arm-1",
+            "configuration": "Default",
+            "unit": "m",
+            "zero": 0.0,
+            "direction": "+1",
+            "purpose": PURPOSE_INSPECTION_PREVIEW,
+            "lower": -0.1,
+            "upper": 0.2,
+        }
+        value.update(declaration or {})
+        (records / "preview.json").write_text(json.dumps({"range": value}), encoding="utf-8")
+        output = self.tmp / f"prepared-{suffix}"
+        prepared = prepare_native_package(
+            frozen,
+            output,
+            f"run-prismatic-{suffix}",
+            backend=FakeBackend(_slider_record()),
+            settings=DiscoverySettings(record_roots=(records,), purpose=purpose),
+        )
+        return prepared, output
+
+    def test_bounded_prismatic_raw_positive_flows_through_both_paths(self) -> None:
+        prepared, output = self._run(PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(prepared.passed, prepared.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        facts = rebuild_joint_facts(payload, output, purpose=PURPOSE_INSPECTION_PREVIEW)
+        joint = facts[0]
+        self.assertEqual(joint["type"], "prismatic")
+        self.assertEqual(joint["limits"], {"lower": -0.1, "upper": 0.2})
+        self.assertEqual(joint["limit_source"], "declared_preview_window")
+
+    def test_engineering_purpose_refuses_the_missing_prismatic_range(self) -> None:
+        prepared, _output = self._run(PURPOSE_ENGINEERING)
+        self.assertFalse(prepared.passed)
+        blocking = {finding["code"] for finding in prepared.findings if finding.get("blocking")}
+        self.assertIn("discovery.joint_limits_missing", blocking)
+
+    def test_boolean_zero_in_the_bound_declaration_is_refused(self) -> None:
+        prepared, _output = self._run(PURPOSE_INSPECTION_PREVIEW, {"zero": True})
+        self.assertFalse(prepared.passed)
+        blocking = {finding["code"] for finding in prepared.findings if finding.get("blocking")}
+        self.assertIn("discovery.joint_preview_range_invalid", blocking)
 
 
 if __name__ == "__main__":

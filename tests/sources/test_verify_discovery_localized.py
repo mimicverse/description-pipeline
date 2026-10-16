@@ -48,7 +48,7 @@ def localized(kind: str, *, frame: str | None = "component-local", error=None, *
 
 
 def mate(kind: str, first: dict, second: dict) -> dict:
-    return {"name": "m1", "type": kind, "entities": [first, second]}
+    return {"name": "m1", "type": kind, "limits": None, "entities": [first, second]}
 
 
 def rows(mate_item: dict, frames=None):

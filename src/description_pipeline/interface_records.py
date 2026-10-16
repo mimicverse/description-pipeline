@@ -48,10 +48,31 @@ SCHEMA_VERSIONS = frozenset(
     value for name, value in vars(_schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
 )
 
+#: The bound finite preview-range declaration of an inspection-preview prismatic
+#: joint: one schema id and exact key set, owned with the other single-owner
+#: schemas so the release schema digest (IF-15) covers the structural shape.
+#: The semantic reconstruction stays in the discovery/verification modules: they
+#: consume these definitions and never re-type them.
+PREVIEW_RANGE_SCHEMA = "solidworks-to-urdf.preview-range/v1"
+PREVIEW_RANGE_KEYS = frozenset(
+    {
+        "schema_version",
+        "joint",
+        "instance",
+        "configuration",
+        "unit",
+        "zero",
+        "direction",
+        "purpose",
+        "lower",
+        "upper",
+    }
+)
+
 #: Every machine schema version this release knows: the single-owner schema ids
-#: plus the stage contract.  Unknown versions are refused wherever a record
-#: quotes one (call bindings, manifests, ...).
-KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
+#: plus the stage contract and the preview-range declaration.  Unknown versions
+#: are refused wherever a record quotes one (call bindings, manifests, ...).
+KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"], PREVIEW_RANGE_SCHEMA}
 
 #: The shipped schema definition sources the schema digest covers: the model
 #: document schema (structure and field rules of produced documents) and the two

@@ -453,6 +453,7 @@ def lock(left, right, *, error=0, kind="lock"):
         "type": kind,
         "suppressed": False,
         "error_code": error,
+        "limits": None,
         "entities": [{"component": left, "point": [0, 0, 0]}, {"component": right, "point": [0, 0, 0]}],
     }
 

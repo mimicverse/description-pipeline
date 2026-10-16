@@ -13,7 +13,7 @@ class ConcentricRotationLockTests(unittest.TestCase):
         self.frames = {name: [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]]
                        for name in ("base", "washer")}
         self.mate = {
-            "name": "coaxial", "type": "concentric", "entities": [
+            "name": "coaxial", "type": "concentric", "limits": None, "entities": [
                 {"component": name, "circle": {"center": [0., 0., 0.], "normal": [0., 0., 1.], "radius": .01}}
                 for name in self.frames
             ],

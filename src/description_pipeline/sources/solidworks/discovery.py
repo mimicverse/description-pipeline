@@ -68,7 +68,13 @@ from typing import Any
 from collections.abc import Mapping, Sequence
 
 from ...io import PipelineError, confined, digest, inventory, parse_data, read_data
-from ...interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
+from ...interface_records import (
+    PREVIEW_RANGE_KEYS,
+    PREVIEW_RANGE_SCHEMA,
+    PURPOSE_ENGINEERING,
+    PURPOSE_INSPECTION_PREVIEW,
+    preview_revolute_window_rad,
+)
 from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
@@ -777,7 +783,31 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
     second = _entity_geometry_view(entities[1], findings, obj)
     if first is None or second is None:
         return None
-    limits = mate.get("limits") if isinstance(mate.get("limits"), dict) else None
+    # A limits reading is an observation, not a default.  Only an intact reading
+    # (an explicit null, or a mapping) may claim anything; a missing key or a
+    # non-mapping value refuses before either purpose may treat it as absence.
+    if "limits" not in mate:
+        findings.append(
+            _finding(
+                "discovery.mate_limits_observation_incomplete",
+                obj,
+                "the mate observation carries no limits reading; a missing reading cannot prove absence",
+                {"mate": mate.get("name")},
+            )
+        )
+        return None
+    raw_limits = mate["limits"]
+    if raw_limits is not None and not isinstance(raw_limits, dict):
+        findings.append(
+            _finding(
+                "discovery.mate_limits_observation_invalid",
+                obj,
+                "the mate limits reading is not a usable observation",
+                {"mate": mate.get("name"), "value_type": type(raw_limits).__name__},
+            )
+        )
+        return None
+    limits = raw_limits if isinstance(raw_limits, dict) else None
 
     def fail(code: str, message: str, detail: Any = None) -> None:
         findings.append(_finding(code, obj, message, detail))
@@ -1614,20 +1644,13 @@ def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[
     }
 
 
-PREVIEW_RANGE_SCHEMA = "solidworks-to-urdf.preview-range/v1"
-_PREVIEW_RANGE_KEYS = {
-    "schema_version",
-    "joint",
-    "instance",
-    "configuration",
-    "unit",
-    "zero",
-    "direction",
-    "purpose",
-    "lower",
-    "upper",
-    "source_sha256",
-}
+def _preview_number(value: Any) -> float:
+    """A finite real declaration number; booleans are not numeric facts."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return math.nan
+    number = float(value)
+    return number if math.isfinite(number) else math.nan
 
 
 def _declared_preview_range(
@@ -1643,9 +1666,19 @@ def _declared_preview_range(
 
     The declaration reuses the controlled-record reference: the resolved file's
     digest and the parsed exact semantics (joint, instance, configuration, unit,
-    zero, direction, purpose, finite ordered range and the source digest) are
-    all required - a file that merely exists, or an anchor substring that merely
-    matches, never passes.
+    zero, direction, purpose and a finite ordered range) are all required - a
+    file that merely exists, or an anchor substring that merely matches, never
+    passes.  ``source_sha256`` is not part of the shape: the controlled-record
+    entry already owns and verifies the resolved file digest, so a second inner
+    digest claim would be provenance theatre.
+
+    The declared window is expressed in the declaration's own measure.  ``zero``
+    is the declared value that coincides with the joint's canonical zero and
+    ``direction`` (``+1``/``-1``) orients the declared positive sense against
+    the canonical positive axis, so the canonical window is
+    ``direction * (declared - zero)`` applied to both endpoints and ordered.
+    The mapping is always applied - a descriptor is never silently dropped, and
+    different zero/direction values yield different canonical bounds.
     """
 
     reference = (record.get("properties") or {}).get(f"{NAMESPACE}.joint.preview_range_record")
@@ -1663,7 +1696,7 @@ def _declared_preview_range(
     if resolved is None:
         return None, None
     value = resolved["value"]
-    if not isinstance(value, dict) or set(value) != _PREVIEW_RANGE_KEYS:
+    if not isinstance(value, dict) or set(value) != PREVIEW_RANGE_KEYS:
         findings.append(
             _finding(
                 "discovery.joint_preview_range_invalid",
@@ -1673,13 +1706,11 @@ def _declared_preview_range(
             )
         )
         return None, None
-    try:
-        lower = float(value["lower"])
-        upper = float(value["upper"])
-        zero = float(value["zero"])
-    except (KeyError, TypeError, ValueError):
-        lower = upper = zero = math.nan
-    source = str(value["source_sha256"])
+    lower = _preview_number(value["lower"])
+    upper = _preview_number(value["upper"])
+    zero = _preview_number(value["zero"])
+    direction = value["direction"]
+    sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
     configuration = str(record.get("saved_configuration") or "")
     if (
         value["schema_version"] != PREVIEW_RANGE_SCHEMA
@@ -1687,11 +1718,10 @@ def _declared_preview_range(
         or str(value["instance"]) not in {str(member) for member in instances}
         or str(value["configuration"]) != configuration
         or value["unit"] != "m"
-        or str(value["direction"]) not in {"+1", "-1"}
+        or not math.isfinite(sign)
         or value["purpose"] != PURPOSE_INSPECTION_PREVIEW
         or not (math.isfinite(lower) and math.isfinite(upper) and math.isfinite(zero))
         or not lower < upper
-        or re.fullmatch(r"[0-9a-f]{64}", source) is None
     ):
         findings.append(
             _finding(
@@ -1703,7 +1733,8 @@ def _declared_preview_range(
             )
         )
         return None, None
-    return {"lower": lower, "upper": upper}, resolved
+    first, second = sign * (lower - zero), sign * (upper - zero)
+    return {"lower": min(first, second), "upper": max(first, second)}, resolved
 
 
 def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None:
@@ -1738,6 +1769,27 @@ def _primary_mate(mates: list[dict], properties: dict) -> dict:
         if any(isinstance(entity.get("cylinder"), dict) for entity in _mate_entities(item)):
             return item
     return mates[0]
+
+
+def _declaration_joint_name(mates: list[dict], settings: DiscoverySettings, fallback: str) -> str:
+    """The canonical joint name a preview declaration must bind.
+
+    The independent rebuild derives it from the shared ``<joint>__<role>`` mate
+    head (with the frozen-name override); the derivation binds the same name so
+    the record can never attach to one naming and be read under another.
+    """
+
+    names = [str(item.get("name") or "") for item in mates]
+    heads: list[str] = []
+    for item in names:
+        head, separator, role = item.partition("__")
+        if not separator or not role:
+            heads = []
+            break
+        heads.append(head)
+    name = heads[0] if heads and len(set(heads)) == 1 else fallback
+    frozen = settings.frozen_names or {}
+    return str(frozen.get(names[0], name)) if names else fallback
 
 
 def _merged_joint_properties(
@@ -2036,7 +2088,12 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 limit_source = "policy_preview_window"
             elif settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
                 limits, limit_evidence = _declared_preview_range(
-                    record, settings, findings, obj, joint=name, instances=(str(left), str(right))
+                    {"properties": properties, "saved_configuration": record.get("saved_configuration")},
+                    settings,
+                    findings,
+                    obj,
+                    joint=_declaration_joint_name(mates, settings, name),
+                    instances=(str(left), str(right)),
                 )
                 if limits is None:
                     continue

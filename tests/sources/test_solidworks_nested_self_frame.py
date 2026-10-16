@@ -61,6 +61,7 @@ def mate(name, mtype, scope, first, second):
         "scope": scope,
         "suppressed": False,
         "error_code": 0,
+        "limits": None,
         "entities": [first, second],
     }
 
