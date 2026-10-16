@@ -117,6 +117,13 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
             },
         },
     )
+    # The capture stage declares evidence/capture.json, evidence/geometry/ and
+    # evidence/native-runtime.json as native outputs; the synthetic tree carries
+    # them so a sealed capture delivery covers its stage contract.
+    write_json(evidence / "capture.json", {"main_assembly": main, "instances": [], "states": []})
+    write_json(evidence / "native-runtime.json", {"api": "synthetic", "session": {}})
+    (evidence / "geometry").mkdir()
+    (evidence / "geometry/base.stl").write_bytes(b"STL-BYTES")
     write_manifest(
         evidence,
         kind="solidworks",

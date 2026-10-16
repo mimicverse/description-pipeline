@@ -1036,7 +1036,7 @@ class LinkedMaterializationTests(unittest.TestCase):
         write_json(self.tree / "input" / "handoff.json", report)
         for name in ("capture-plan", "capture", "native-runtime"):
             write_json(self.tree / f"evidence/{name}.json", {"synthetic": name})
-        (self.tree / "evidence/geometry").mkdir()
+        (self.tree / "evidence/geometry").mkdir(exist_ok=True)
         (self.tree / "evidence/geometry/part.stl").write_bytes(b"synthetic-stl")
         identity = read_data(self.tree / "evidence/evidence/collection.json")["identity"]
         native.write_manifest(self.tree / "evidence", kind="solidworks", identity=identity, evidence_class="cad")
