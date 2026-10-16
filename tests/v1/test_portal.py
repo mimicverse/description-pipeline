@@ -2847,7 +2847,13 @@ class PortalTests(unittest.TestCase):
         self._seed_airflow_run(
             child,
             state="queued",
-            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "generate"},
+            conf={
+                "handoff_path": "/srv/robot-cell",
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "generate",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+            },
         )
         self.client.login()
         rows = self._rerun_rows()
@@ -2859,11 +2865,21 @@ class PortalTests(unittest.TestCase):
             self.assertEqual(len(self.airflow.trigger_payloads), before)
             self.assertEqual(self.platform.admits, [])
             status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "capture"})
-        self.assertEqual(status, 409, body)
-        payload = json.loads(body)
-        self.assertEqual(payload["reason"], "already_active")
-        self.assertEqual(payload["active_dag_run_id"], child)
-        self.assertTrue(payload["reason_zh"])
+            self.assertEqual(status, 409, body)
+            payload = json.loads(body)
+            self.assertEqual(payload["reason"], "already_active")
+            self.assertEqual(payload["active_dag_run_id"], child)
+            self.assertTrue(payload["reason_zh"])
+            # A changed frame (another target) may never ride the existing attempt.
+            status, _, body = self.client.request(
+                "POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate", "target_hardware": "m3.1"}
+            )
+            self.assertEqual(status, 409, body)
+            payload = json.loads(body)
+            self.assertEqual(payload["reason"], "attempt_mismatch", body)
+            self.assertEqual(payload["active_dag_run_id"], child)
+            self.assertEqual(len(self.airflow.trigger_payloads), before)
+            self.assertEqual(self.platform.admits, [])
 
     def test_rerun_attempt_refuses_ineligible_stage_with_earliest_required(self) -> None:
         self._seed_retryable_run()
@@ -2932,7 +2948,13 @@ class PortalTests(unittest.TestCase):
         self._seed_airflow_run(
             child,
             state="queued",
-            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "verify"},
+            conf={
+                "handoff_path": "/srv/robot-cell",
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "verify",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+            },
         )
         self.client.login()
         status, _, body = self.client.request("GET", "/api/runs")
@@ -2979,7 +3001,13 @@ class PortalTests(unittest.TestCase):
         self._seed_airflow_run(
             child,
             state="queued",
-            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "verify"},
+            conf={
+                "handoff_path": "/srv/robot-cell",
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "verify",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+            },
         )
         self.airflow.dag_runs[child]["start_date"] = "2026-10-05T00:00:00Z"
         for index in range(25):
@@ -3083,7 +3111,13 @@ class PortalTests(unittest.TestCase):
         self._seed_airflow_run(
             reserved,
             state="queued",
-            conf={"handoff_path": "/srv/robot-cell", "parent_dag_run_id": DAG_RUN_ID, "resume_from": "generate"},
+            conf={
+                "handoff_path": "/srv/robot-cell",
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "generate",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+            },
         )
         self.client.login()
         before = len(self.airflow.trigger_payloads)

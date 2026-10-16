@@ -704,6 +704,35 @@ def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _attempt_conf_matches(
+    conf: object,
+    *,
+    handoff_path: str,
+    stage: str,
+    target_hardware: str,
+    change_summary: str,
+    parent_assembly: str | None,
+) -> bool:
+    """Whether an existing attempt's recorded conf is exactly this request's frame.
+
+    A retry may only ride an existing attempt when every frame field equals what
+    that attempt recorded: a different target, summary, source or selection names
+    a different request and must never be answered by the other attempt's run.
+    """
+    if not isinstance(conf, dict):
+        return False
+    recorded_summary = conf.get("change_summary")
+    if isinstance(recorded_summary, str):
+        recorded_summary = normalize_change_summary(recorded_summary).strip()
+    return (
+        conf.get("handoff_path") == handoff_path
+        and conf.get("resume_from") == stage
+        and _optional_str(conf.get("target_hardware")) == target_hardware
+        and recorded_summary == change_summary
+        and _optional_str(conf.get("main_assembly")) == parent_assembly
+    )
+
+
 def _stage_name_zh(value: object) -> str | None:
     stage = _optional_str(value)
     return _STAGE_NAMES_ZH.get(stage) if stage is not None else None
@@ -2110,6 +2139,30 @@ class PortalApp:
                 if self._metadata_overlay(dag_run_id)["deleted"]:
                     # Readable evidence, but not a valid starting point until restored.
                     return self._rerun_refusal(start_response, "deleted", "已删除的运行不能重新运行，请先恢复", None)
+                # This request's effective frame, validated once here and reused by the
+                # existing-attempt comparison and by the trigger itself.
+                target_hardware = (
+                    overrides["target_hardware"]
+                    if "target_hardware" in overrides
+                    else _optional_str(parent_conf.get("target_hardware"))
+                )
+                if not target_hardware:
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请在重新运行时选择发布目标")
+                if target_hardware not in (self.config.pipeline_targets or {}):
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再重新运行")
+                change_summary = (
+                    overrides["change_summary"]
+                    if "change_summary" in overrides
+                    else _optional_str(parent_conf.get("change_summary"))
+                )
+                change_summary = (
+                    normalize_change_summary(change_summary).strip()
+                    if isinstance(change_summary, str)
+                    else ""
+                )
+                if not change_summary:
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
+                parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 # The platform admission of the child IS the reservation: an open admitted
                 # child of this parent is the one existing attempt to ride, conflict with
                 # or reconcile - there is no state file and no run-list scan.
@@ -2120,15 +2173,30 @@ class PortalApp:
                     child_run = self._child_run(session, child_id)
                     child_state = _optional_str(child_run.get("state")) if child_run is not None else None
                     if child_run is not None and (child_state is None or child_state in {"queued", "running"}):
-                        if child_stage == stage:
-                            return self._accepted_attempt(start_response, child_id, dag_run_id, stage, child_state)
-                        return self._rerun_refusal(
-                            start_response,
-                            "already_active",
-                            "已有正在执行的关联尝试，请等待其结束",
-                            None,
-                            active_dag_run_id=child_id,
-                        )
+                        if child_stage != stage:
+                            return self._rerun_refusal(
+                                start_response,
+                                "already_active",
+                                "已有正在执行的关联尝试，请等待其结束",
+                                None,
+                                active_dag_run_id=child_id,
+                            )
+                        if not _attempt_conf_matches(
+                            child_run.get("conf"),
+                            handoff_path=handoff_path,
+                            stage=stage,
+                            target_hardware=target_hardware,
+                            change_summary=change_summary,
+                            parent_assembly=parent_assembly,
+                        ):
+                            return self._rerun_refusal(
+                                start_response,
+                                "attempt_mismatch",
+                                "已存在的关联尝试与本次参数不一致，请等待其结束或恢复原参数",
+                                None,
+                                active_dag_run_id=child_id,
+                            )
+                        return self._accepted_attempt(start_response, child_id, dag_run_id, stage, child_state)
                     if child_run is not None:
                         # The scheduler says the attempt ended while the registration is
                         # still open: only reconciliation may decide, never a second run.
@@ -2165,27 +2233,6 @@ class PortalApp:
                         str((row or {}).get("reason_zh") or "当前无法从此步骤重新运行"),
                         _optional_str(prerequisites.get("earliest_required")),
                     )
-                target_hardware = (
-                    overrides["target_hardware"]
-                    if "target_hardware" in overrides
-                    else _optional_str(parent_conf.get("target_hardware"))
-                )
-                if not target_hardware:
-                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请在重新运行时选择发布目标")
-                if target_hardware not in (self.config.pipeline_targets or {}):
-                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再重新运行")
-                change_summary = (
-                    overrides["change_summary"]
-                    if "change_summary" in overrides
-                    else _optional_str(parent_conf.get("change_summary"))
-                )
-                change_summary = (
-                    normalize_change_summary(change_summary).strip()
-                    if isinstance(change_summary, str)
-                    else ""
-                )
-                if not change_summary:
-                    raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
                 new_run_id = reserved_id or f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
                 # The child's initiator is the authenticated actor of THIS request (Airflow
                 # stamps it as the run's triggering user); the parent's original submitter
@@ -2199,7 +2246,6 @@ class PortalApp:
                     "target_hardware": target_hardware,
                     "change_summary": change_summary,
                 }
-                parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 if parent_assembly is not None:
                     conf["main_assembly"] = parent_assembly
                 if reserved_id is None:
