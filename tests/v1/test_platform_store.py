@@ -279,7 +279,10 @@ class FakeCursor:
                     ),
                     None,
                 )
-                self._rows = [(entry[1], entry[2], entry[3], NOW, dispatch_digest)]
+                configuration = entry[4]
+                if isinstance(configuration, str):
+                    configuration = json.loads(configuration)
+                self._rows = [(entry[1], entry[2], entry[3], NOW, dispatch_digest, configuration)]
         elif normalized.startswith(
             "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
         ):
@@ -859,7 +862,7 @@ class PlatformStoreTests(unittest.TestCase):
         )
 
     def test_request_record_reads_the_sealed_admission_identity(self) -> None:
-        self.admit()
+        self.admit(configuration={"purpose": "engineering"})
         self.assertEqual(
             self.store.request_record("q-1"),
             {
@@ -869,6 +872,7 @@ class PlatformStoreTests(unittest.TestCase):
                 "main_assembly": "cad/robot.SLDASM",
                 "sealed_at": NOW,
                 "dispatch_digest": "a" * 64,
+                "purpose": "engineering",
             },
         )
         self.assertIsNone(self.store.request_record("q-missing"))

@@ -39,6 +39,9 @@ _CREATE_FIELDS = frozenset(
         "target_hardware",
         "change_summary",
         "main_assembly",
+        # The user's declared purpose (engineering / inspection_preview); the
+        # frozen request/v2 carries it and the DAG refuses a run without it.
+        "purpose",
         # The portal-issued frozen request identity of one submission
         # (``portal-<dag_run_id>``); the DAG intake refuses a run without it.
         "request_id",
@@ -155,6 +158,7 @@ def _selects_create_candidate(scope: dict) -> bool:
 
 def evaluate_create_candidate(raw: bytes, *, oversize: bool) -> dict:
     """Parse a requested lineage selector, never a client-provided owner identity."""
+    from ..interface_records import REQUEST_PURPOSES
     from ..stages import STAGE_IDS
 
     if oversize:
@@ -174,6 +178,8 @@ def evaluate_create_candidate(raw: bytes, *, oversize: bool) -> dict:
         if name in conf and not _safe_single_line(conf[name]):
             return {"safe": False}
     if "change_summary" in conf and not _safe_change_summary(conf["change_summary"]):
+        return {"safe": False}
+    if conf.get("purpose") not in REQUEST_PURPOSES:
         return {"safe": False}
     if "parent_dag_run_id" not in conf and "resume_from" not in conf:
         return {"safe": True, "parent_dag_run_id": None}

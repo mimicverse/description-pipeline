@@ -404,6 +404,7 @@ class RunMetadataTests(unittest.TestCase):
                 "resume_from": "verify",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
+                "purpose": "engineering",
             },
         )
         status, _, body = self.client.request("DELETE", f"/api/runs/{parent}")

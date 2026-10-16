@@ -290,6 +290,7 @@ jobs:
             --venv "$AIRFLOW_VENV" \
             --airflow-home "$AIRFLOW_HOME" \
             --portal-admission \
+            --purpose engineering \
             --platform-schema "$PLATFORM_SCHEMA" \
             --airflow-schema "$AIRFLOW_SCHEMA" \
             --airflow-db-conn "$AIRFLOW_RUNTIME_DSN" \

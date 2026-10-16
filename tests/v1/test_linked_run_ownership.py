@@ -17,9 +17,12 @@ class LinkedRunOwnershipTests(unittest.TestCase):
         return context.evaluate_create_candidate(json.dumps({"conf": conf}).encode(), oversize=False)
 
     def test_only_canonical_linkage_is_accepted(self):
-        self.assertEqual(self.candidate({"handoff_path": "/input"}), {"safe": True, "parent_dag_run_id": None})
         self.assertEqual(
-            self.candidate({"parent_dag_run_id": "original", "resume_from": "verify"}),
+            self.candidate({"handoff_path": "/input", "purpose": "engineering"}),
+            {"safe": True, "parent_dag_run_id": None},
+        )
+        self.assertEqual(
+            self.candidate({"parent_dag_run_id": "original", "resume_from": "verify", "purpose": "engineering"}),
             {"safe": True, "parent_dag_run_id": "original"},
         )
         for conf in (
@@ -30,6 +33,10 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             {"parent_dag_run_id": "original", "resume_from": "verify", "package": "other"},
             {"parent_dag_run_id": "~", "resume_from": "verify"},
             {"parent_dag_run_id": "original", "resume_from": "verify", "owner": "admin"},
+            # The declared purpose is part of every admitted frame and is never defaulted.
+            {"handoff_path": "/input"},
+            {"handoff_path": "/input", "purpose": "ghost"},
+            {"parent_dag_run_id": "original", "resume_from": "verify"},
         ):
             with self.subTest(conf=conf):
                 self.assertIs(self.candidate(conf)["safe"], False)
@@ -66,7 +73,7 @@ class LinkedRunOwnershipTests(unittest.TestCase):
                 lookup.assert_called_once_with("workflow", "original")
 
     def test_buffer_replays_exact_create_bytes(self):
-        raw = b'{"conf":{"parent_dag_run_id":"original","resume_from":"generate"}}'
+        raw = b'{"conf":{"parent_dag_run_id":"original","resume_from":"generate","purpose":"engineering"}}'
         messages = [
             {"type": "http.request", "body": raw[:15], "more_body": True},
             {"type": "http.request", "body": raw[15:], "more_body": False},
@@ -87,22 +94,45 @@ class LinkedRunOwnershipTests(unittest.TestCase):
 
     def test_submission_frame_fields_are_admitted_for_operators(self):
         self.assertEqual(
-            self.candidate({"handoff_path": "/input", "target_hardware": "m3.0", "change_summary": "第一行\n第二行"}),
+            self.candidate(
+                {
+                    "handoff_path": "/input",
+                    "target_hardware": "m3.0",
+                    "change_summary": "第一行\n第二行",
+                    "purpose": "engineering",
+                }
+            ),
             {"safe": True, "parent_dag_run_id": None},
         )
         self.assertEqual(
-            self.candidate({"handoff_path": "/input", "main_assembly": "model.SLDASM"}),
+            self.candidate({"handoff_path": "/input", "main_assembly": "model.SLDASM", "purpose": "engineering"}),
+            {"safe": True, "parent_dag_run_id": None},
+        )
+        self.assertEqual(
+            self.candidate({"handoff_path": "/input", "purpose": "inspection_preview"}),
             {"safe": True, "parent_dag_run_id": None},
         )
         # The portal-issued frozen request identity is part of the admitted frame: the DAG
         # intake refuses a run without it, so the create validator must admit it.
         self.assertEqual(
-            self.candidate({"handoff_path": "/input", "request_id": "portal-20261016T000000-abcdef12"}),
+            self.candidate(
+                {
+                    "handoff_path": "/input",
+                    "request_id": "portal-20261016T000000-abcdef12",
+                    "purpose": "engineering",
+                }
+            ),
             {"safe": True, "parent_dag_run_id": None},
         )
         # CRLF folds to LF exactly like the portal and the DAG intake fold it.
-        self.assertIs(self.candidate({"change_summary": "a\r\nb\r"})["safe"], True)
+        self.assertIs(self.candidate({"change_summary": "a\r\nb\r", "purpose": "engineering"})["safe"], True)
         for conf in (
+            # The declared purpose is required and is exactly one of the two values.
+            {"handoff_path": "/input"},
+            {"handoff_path": "/input", "purpose": ""},
+            {"handoff_path": "/input", "purpose": "   "},
+            {"handoff_path": "/input", "purpose": "ghost"},
+            {"handoff_path": "/input", "purpose": "engineering "},
             {"target_hardware": ""},
             {"target_hardware": "m3.0\x01"},
             {"change_summary": ""},

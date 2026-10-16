@@ -768,6 +768,28 @@ def _linked_conf(context) -> dict | None:
     return {"parent_run": native_run_id(parent.strip()), "from_stage": stage}
 
 
+def _linked_purpose(context, parent_record: dict) -> str:
+    """The linked attempt's declared purpose, exactly the parent's frozen purpose.
+
+    The purpose is never parsed leniently and never defaulted: the trigger must
+    declare engineering or inspection_preview, and it must equal the purpose of
+    the parent's frozen request - a rerun can never change the inspection class.
+    """
+    conf = getattr(context.get("dag_run"), "conf", None)
+    conf = conf if isinstance(conf, dict) else {}
+    purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
+    if purpose not in REQUEST_PURPOSES:
+        raise AirflowFailException(
+            "A linked attempt must declare its purpose: engineering or inspection_preview"
+        )
+    parent_purpose = parent_record.get("purpose") if isinstance(parent_record, dict) else None
+    if purpose != parent_purpose:
+        raise AirflowFailException(
+            f"A linked attempt must keep the parent's purpose ({parent_purpose!r} != {purpose!r})"
+        )
+    return purpose
+
+
 def _submission_frame(context) -> tuple[dict, dict]:
     """The submission identity and configured target routing of one trigger.
 
@@ -1374,6 +1396,7 @@ def solidworks_to_urdf():
                 parent_record, _ = read_request_evidence(
                     _sealed_stage_tree(platform, linked["parent_run"], "freeze") / "input" / "request.json"
                 )
+                request["purpose"] = _linked_purpose(context, parent_record)
                 carried = carry_request_evidence(
                     _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
                     flow.RunPaths(store_root, request["run_id"]).run_dir,
@@ -1409,6 +1432,10 @@ def solidworks_to_urdf():
             }
             platform, store_root = _platform_binding()
             platform.start_run(request["run_id"])  # the first driver action claims the admitted child
+            parent_record, _ = read_request_evidence(
+                _sealed_stage_tree(platform, linked["parent_run"], "freeze") / "input" / "request.json"
+            )
+            request["purpose"] = _linked_purpose(context, parent_record)
             carried = carry_request_evidence(
                 _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
                 flow.RunPaths(store_root, request["run_id"]).run_dir,
