@@ -64,7 +64,7 @@ def _passing_publish_receipt() -> dict:
             "commit": "c" * 40,
             "base": "feature/robot",
             "repository_slug": "example/robot",
-            "branch": "work/solidworks/robot",
+            "branch": "work/solidworks/robot/engineering",
             "url": "https://github.com/example/robot/pull/1",
         },
         "events": protocol_events(subject=SUBJECT),
