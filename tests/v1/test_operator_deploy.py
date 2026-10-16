@@ -1329,7 +1329,15 @@ class InstallOrderingTests(unittest.TestCase):
             "exit 0\n",
         )
         write_stub(
-            release / "airflow" / "install.sh", '#!/usr/bin/env bash\necho "airflow_install" >> "$ORDER_LOG"\nexit 0\n'
+            release / "airflow" / "install.sh",
+            '#!/usr/bin/env bash\necho "airflow_install" >> "$ORDER_LOG"\n'
+            'if [ "${1:-}" = "--stage" ]; then\n'
+            '  mkdir -p "$AIRFLOW_VENV/bin"\n'
+            '  cp "$FIXTURE_STUB_PYTHON" "$AIRFLOW_VENV/bin/python"\n'
+            '  chmod +x "$AIRFLOW_VENV/bin/python"\n'
+            "  printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$AIRFLOW_VENV/bin/airflow\"\n"
+            '  chmod +x "$AIRFLOW_VENV/bin/airflow"\n'
+            "fi\nexit 0\n",
         )
         write_stub(
             release / "airflow" / "scripts" / "install_postgres.sh",
@@ -1593,6 +1601,7 @@ class InstallOrderingTests(unittest.TestCase):
             "REGISTER_AFTER": "0",
             "UNPAUSE_RC": "0",
             "PAUSE_RC": "0",
+            "FIXTURE_STUB_PYTHON": str(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python"),
             "PROJECTION_FILE": str(tmp / "projection.json"),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
         }
@@ -1703,7 +1712,8 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertTrue((state / "derived" / "gen-2" / "operator.env").is_file())
             receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
             self.assertEqual(
-                [row["step"] for row in receipt["steps"]], ["linux-generation", "windows-generation"]
+                [row["step"] for row in receipt["steps"]],
+                ["linux-generation", "windows-generation", "schema-migration"],
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
             # The bound source is the immutable generation file with its real digest.
@@ -1799,12 +1809,18 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(
                 [row["step"] for row in receipt["steps"]],
                 [
-                    "linux-generation", "windows-generation", "close-admission", "drain", "backup",
-                    "stop-services", "windows-switch", "endpoint-identity", "switch-pointer",
-                    "start-services", "verify", "open-admission",
+                    "linux-generation", "windows-generation", "schema-migration",
+                    "close-admission", "drain", "backup",
+                    "stop-services", "schema-migration", "windows-switch", "endpoint-identity",
+                    "switch-pointer", "start-services", "verify", "open-admission",
                 ],
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
+            # The candidate's verified migrations run after both ends stopped and before
+            # either pointer moves (deployment.md).
+            steps = [row["step"] for row in receipt["steps"] if row["verb"] == "promote"]
+            self.assertLess(steps.index("stop-services"), steps.index("schema-migration"))
+            self.assertLess(steps.index("schema-migration"), steps.index("windows-switch"))
             backup_manifest = json.loads(
                 (state / "promotions" / "gen-2" / "evidence" / "backup-manifest.json").read_text(encoding="utf-8")
             )
