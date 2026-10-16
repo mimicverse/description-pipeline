@@ -46,7 +46,7 @@ def _publish_receipt(*, submission_state: str = "published", quality_subject: st
             "commit": "c" * 40,
             "base": "feature/robot",
             "repository_slug": "example/robot",
-            "branch": "work/solidworks/robot",
+            "branch": "work/solidworks/robot/engineering",
             "url": "https://github.com/example/robot/pull/1",
         },
     }

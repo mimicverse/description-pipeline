@@ -71,7 +71,7 @@ def passed_job() -> dict:
         "publication.inputs": {
             "repository_slug": "example/repo",
             "base": "feature/nd_cfg_gap",
-            "branch": "work/solidworks/nd_cfg_gap",
+            "branch": "work/solidworks/nd_cfg_gap/engineering",
         },
         "publication.git": {"commit": "f" * 40, "copied_staged_committed": "reverified"},
     }

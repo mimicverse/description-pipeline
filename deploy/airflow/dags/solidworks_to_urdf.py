@@ -807,7 +807,7 @@ def _linked_purpose(context, parent_record: dict) -> str:
     return purpose
 
 
-def _submission_frame(context) -> tuple[dict, dict]:
+def _submission_frame(context, purpose: str | None = None) -> tuple[dict, dict]:
     """The submission identity and configured target routing of one trigger.
 
     The publish target and the change summary are required (conf first, then
@@ -816,6 +816,42 @@ def _submission_frame(context) -> tuple[dict, dict]:
     from the model checkout so the derived revision keeps its successor
     linkage; ``routing`` is the same config resolution a linked publish
     rebinds ``repository_slug``/``repository_base`` from.
+    """
+
+    conf, target, summary, principal, config, routing = _submission_basics(context)
+    declared_purpose = str(purpose or conf.get("purpose") or context["params"].get("purpose") or "").strip()
+    if declared_purpose not in REQUEST_PURPOSES:
+        raise AirflowFailException(
+            "purpose is required: the admitted request must declare engineering or inspection_preview"
+        )
+    from description_pipeline.repository.urdf_pr import published_revision
+
+    try:
+        identity = submission_identity(
+            target_hardware=target,
+            change_summary=summary,
+            principal=principal,
+            purpose=declared_purpose,
+            config=config,
+            published_revision=published_revision,
+            warn=lambda message: log.warning("%s", message),
+        )
+    except EndpointProtocolError as error:
+        raise AirflowFailException(str(error)) from error
+    if identity is None:
+        raise AirflowFailException(f"target_hardware {target!r} produced no publication identity")
+    return identity, routing
+
+
+def _submission_basics(context):
+    """The validated target/summary/actor frame of one trigger, without a purpose.
+
+    The target and the change summary are required (conf first, then params): a
+    missing or blank field and an unconfigured target fail the run here - never
+    a deferred publish, and before any handoff path or endpoint contact.  The
+    purpose is *not* resolved here: a fresh run reads it from conf/params after
+    the controlled-config checks, while a linked run takes it from the parent's
+    frozen request, which is the admitted authority.
     """
 
     conf = getattr(context["dag_run"], "conf", None)
@@ -842,22 +878,7 @@ def _submission_frame(context) -> tuple[dict, dict]:
     routing = config.targets.get(target)
     if routing is None:
         raise AirflowFailException(f"target_hardware {target!r} is not a configured publication target")
-    from description_pipeline.repository.urdf_pr import published_revision
-
-    try:
-        identity = submission_identity(
-            target_hardware=target,
-            change_summary=summary,
-            principal=principal,
-            config=config,
-            published_revision=published_revision,
-            warn=lambda message: log.warning("%s", message),
-        )
-    except EndpointProtocolError as error:
-        raise AirflowFailException(str(error)) from error
-    if identity is None:
-        raise AirflowFailException(f"target_hardware {target!r} produced no publication identity")
-    return identity, routing
+    return conf, target, summary, principal, config, routing
 
 
 def _param_selection(context) -> str | None:
@@ -1386,7 +1407,7 @@ def solidworks_to_urdf():
         )
     )
     def freeze(**context) -> dict:
-        identity, routing = _submission_frame(context)
+        _conf, _target, _summary, _principal, _config, routing = _submission_basics(context)
         linked = _linked_conf(context)
         if linked is not None:
             if linked["from_stage"] in DELIVERY_STAGES:
@@ -1470,6 +1491,7 @@ def solidworks_to_urdf():
                 if validate_file_index(package_inventory(intake)) != upload_files:
                     raise AirflowFailException("The linked intake no longer matches the parent's retained selection")
                 request["intake_dir"] = str(intake)
+            identity, routing = _submission_frame(context, purpose=request["purpose"])
             request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
             return request
         handoff_path = str(context["params"]["handoff_path"]).strip()
@@ -1496,7 +1518,6 @@ def solidworks_to_urdf():
             "intake_dir": str(intake),
             "conn_id": CONN_ID,
         }
-        request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
         conf = getattr(context["dag_run"], "conf", None)
         conf = conf if isinstance(conf, dict) else {}
         request_id = str(conf.get("request_id") or context["params"].get("request_id") or "").strip()
@@ -1517,6 +1538,8 @@ def solidworks_to_urdf():
             raise AirflowFailException(
                 "purpose is required: the admitted request must declare engineering or inspection_preview"
             )
+        identity, routing = _submission_frame(context, purpose=purpose)
+        request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
         paths = _work_paths(CONN_ID, run_id)
         evidence = freeze_request_evidence(
             paths.run_dir,

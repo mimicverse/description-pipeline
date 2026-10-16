@@ -13,11 +13,27 @@ from unittest import mock
 from description_pipeline.delivery import read_source_record, subject_digest, write_delivery_manifest
 from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.io import digest
+from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.repository import urdf_pr
 from description_pipeline.schemas import CHECK_POLICY_SCHEMA, SOURCE_RECORD_SCHEMA
 from description_pipeline.stages import CONTRACT
 
-BRANCH = "work/solidworks/m3.0"
+BRANCH = "work/solidworks/m3.0/engineering"
+INSPECTION_BRANCH = "work/solidworks/m3.0/inspection_preview"
+
+
+def _request_text(purpose: str = "engineering") -> str:
+    return request_evidence_bytes(
+        build_request_evidence(
+            purpose=purpose,
+            request_id="fixture-frozen-request",
+            target_hardware="m3.0",
+            change_summary="fixture submission",
+            main_assembly="M3.0.SLDASM",
+            handoff_digest="a" * 64,
+            platform_config_digest="c" * 64,
+        )
+    ).decode("utf-8")
 
 
 def run(*args: str, cwd: Path | None = None) -> str:
@@ -45,6 +61,7 @@ class Fixture:
         for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
             run("git", "config", key, value, cwd=self.repo)
         self.bundle = self.tmp / "bundle"
+        self.purpose = "engineering"
         self.write_bundle("one\n")
         self.seal("r1", None, cad="part-1\n")
 
@@ -97,6 +114,7 @@ class Fixture:
     def write_bundle(self, evidence: str, extra: dict[str, str] | None = None) -> None:
         files = {
             "input/handoff.json": "{}\n",
+            "input/request.json": _request_text(self.purpose),
             "evidence/discovery.json": evidence,
             "model/robot.json": "{}\n",
             "urdf/robot.urdf": "<robot name='m3.0'/>\n",
@@ -136,44 +154,51 @@ class PublishTests(unittest.TestCase):
         self.gh_calls: list[tuple[str, ...]] = []
         self.rest_payloads: list[dict] = []
         self.gh_mode = "ok"
-        self.pr_exists = False
+        self.branch = BRANCH
+        self.prs: dict[str, dict] = {}
 
         def fake_gh(repository: Path, *args: str) -> str:
             self.gh_calls.append(args)
             if self.gh_mode == "fail":
                 raise subprocess.CalledProcessError(1, ["gh", *args], stderr="gh down")
             if args[:2] == ("pr", "list"):
-                if self.pr_exists:
+                entry = self.prs.get(self.branch)
+                if entry is not None:
                     return json.dumps(
                         [
                             {
-                                "url": "https://github.com/example/m3.0/pull/1",
-                                "number": 1,
+                                "url": entry["url"],
+                                "number": entry["number"],
                                 "baseRefName": "feature/m3.0",
-                                "headRefName": BRANCH,
+                                "headRefName": self.branch,
                             }
                         ]
                     )
                 return "[]"
             if args[:2] == ("pr", "create"):
-                self.pr_exists = True
-                return "https://github.com/example/m3.0/pull/1\n"
+                entry = self.prs.setdefault(self.branch, {"number": len(self.prs) + 1})
+                entry["url"] = f"https://github.com/example/m3.0/pull/{entry['number']}"
+                return entry["url"] + "\n"
             if args[0] == "api":
-                self.assertEqual(args[:4], ("api", "--method", "PATCH", "repos/example/m3.0/pulls/1"))
+                entry = self.prs[self.branch]
+                self.assertEqual(
+                    args[:4], ("api", "--method", "PATCH", f"repos/example/m3.0/pulls/{entry['number']}")
+                )
                 self.rest_payloads.append(json.loads(Path(args[args.index("--input") + 1]).read_text(encoding="utf-8")))
                 if self.gh_mode == "fail_update":
                     raise subprocess.CalledProcessError(1, ["gh", *args], stderr="REST update unavailable")
                 return "{}"
             if args[:2] == ("pr", "view"):
+                entry = self.prs[self.branch]
                 if self.gh_mode == "fail_view":
                     raise subprocess.CalledProcessError(1, ["gh", *args], stderr="temporary view failure")
                 return json.dumps(
                     {
-                        "url": "https://github.com/example/m3.0/pull/1",
+                        "url": entry["url"],
                         "state": "OPEN",
                         "baseRefName": "feature/m3.0",
-                        "headRefName": BRANCH,
-                        "headRefOid": "0" * 40 if self.gh_mode == "stale_head" else self.fx.remote_head(),
+                        "headRefName": self.branch,
+                        "headRefOid": "0" * 40 if self.gh_mode == "stale_head" else self.fx.remote_head(self.branch),
                         "isCrossRepository": False,
                     }
                 )
@@ -352,8 +377,10 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(result["commit"], self.fx.remote_head())
         self.assertNotEqual(result["commit"], fixed_head)
 
-    def submit(self, **kwargs):
-        return urdf_pr.submit_bundle(self.fx.bundle, self.fx.repo, base="feature/m3.0", branch=BRANCH, **kwargs)
+    def submit(self, branch: str | None = None, **kwargs):
+        return urdf_pr.submit_bundle(
+            self.fx.bundle, self.fx.repo, base="feature/m3.0", branch=branch or self.branch, **kwargs
+        )
 
     def test_repeat_runs_fast_forward_then_noop(self) -> None:
         base = self.fx.remote_head("feature/m3.0")
@@ -696,14 +723,14 @@ class PublishTests(unittest.TestCase):
         run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
         source = json.loads(run("git", "show", "FETCH_HEAD:input/source.json", cwd=self.fx.repo))
         self.assertIsNone(source["metadata"]["revision"])
-        previous = urdf_pr.published_revision(self.fx.repo, "m3.0")
+        previous = urdf_pr.published_revision(self.fx.repo, "m3.0", "engineering")
         self.assertIsNone(previous["revision"])
         self.assertTrue(previous["source_revision_id"])
 
     def test_published_revision_unknown_is_not_absent(self) -> None:
         # A remote that answers "no such ref" is proven-absent; a transport or
         # read failure is unknown and must not masquerade as absence.
-        self.assertIsNone(urdf_pr.published_revision(self.fx.repo, "m3.0"))
+        self.assertIsNone(urdf_pr.published_revision(self.fx.repo, "m3.0", "engineering"))
         failure = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="network is unreachable")
         real_run = subprocess.run
 
@@ -716,7 +743,7 @@ class PublishTests(unittest.TestCase):
             mock.patch.object(urdf_pr.subprocess, "run", side_effect=fake_run),
             self.assertRaises(urdf_pr.PrError) as raised,
         ):
-            urdf_pr.published_revision(self.fx.repo, "m3.0")
+            urdf_pr.published_revision(self.fx.repo, "m3.0", "engineering")
         self.assertEqual(raised.exception.code, "published_revision_unknown")
 
     def test_w12_probe_1_publisher_accepts_missing_revision(self) -> None:
@@ -725,7 +752,7 @@ class PublishTests(unittest.TestCase):
         source["metadata"]["revision"] = None
         (self.fx.bundle / "input/source.json").write_text(json.dumps(source), encoding="utf-8")
         self.fx.write_manifest()
-        hardware, _, current = urdf_pr._validate(self.fx.bundle)
+        hardware, _purpose, _, current = urdf_pr._validate(self.fx.bundle)
         self.assertEqual(hardware, "m3.0")
         self.assertIsNone(current["revision"])
         self.assertIn(self.submit()["state"], {"published", "updated"})
@@ -753,7 +780,7 @@ class PublishTests(unittest.TestCase):
     def test_w12_probe_4_transport_failure_never_reads_old_fetch_head(self) -> None:
         """W12-4: a failed fetch must not surface a stale FETCH_HEAD identity."""
         self.submit()
-        stale = urdf_pr.published_revision(self.fx.repo, "m3.0")
+        stale = urdf_pr.published_revision(self.fx.repo, "m3.0", "engineering")
         self.assertIsNotNone(stale)
         failure = subprocess.CompletedProcess(
             args=[], returncode=128, stdout="", stderr="review injected transport failure"
@@ -769,15 +796,57 @@ class PublishTests(unittest.TestCase):
             mock.patch.object(urdf_pr.subprocess, "run", side_effect=fail_fetch_only),
             self.assertRaises(urdf_pr.PrError) as raised,
         ):
-            urdf_pr.published_revision(self.fx.repo, "m3.0")
+            urdf_pr.published_revision(self.fx.repo, "m3.0", "engineering")
         self.assertEqual(raised.exception.code, "published_revision_unknown")
 
     def test_w12_probe_5_unavailable_remote_is_not_absent(self) -> None:
         """W12-5: an unreachable origin is unresolved, never a proven absence."""
         run("git", "remote", "set-url", "origin", str(self.fx.tmp / "unavailable.git"), cwd=self.fx.repo)
         with self.assertRaises(urdf_pr.PrError) as raised:
-            urdf_pr.published_revision(self.fx.repo, "m3.0")
+            urdf_pr.published_revision(self.fx.repo, "m3.0", "engineering")
         self.assertEqual(raised.exception.code, "published_revision_unknown")
+
+    def test_missing_frozen_request_refuses_before_any_write(self) -> None:
+        (self.fx.bundle / "input/request.json").unlink()
+        result = self.submit()
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_incomplete")
+        self.assertEqual(self.fx.remote_head(), "")
+
+    def test_an_undeclared_purpose_is_refused(self) -> None:
+        record = json.loads(_request_text())
+        record["purpose"] = "other"
+        (self.fx.bundle / "input/request.json").write_text(json.dumps(record), encoding="utf-8")
+        result = self.submit()
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "bundle_records_invalid")
+        self.assertEqual(self.fx.remote_head(), "")
+
+    def test_a_legacy_hardware_only_branch_is_refused(self) -> None:
+        result = self.submit(branch="work/solidworks/m3.0")
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "branch_not_deterministic")
+        self.assertEqual(self.fx.remote_head(), "")
+
+    def test_dual_purpose_candidates_are_distinct_and_isolated(self) -> None:
+        self.assertEqual(urdf_pr.review_branch("m3.0", "engineering"), BRANCH)
+        self.assertEqual(urdf_pr.review_branch("m3.0", "inspection_preview"), INSPECTION_BRANCH)
+        first = self.submit()
+        self.assertIn(first["state"], {"published", "updated"})
+        engineering_head = self.fx.remote_head(BRANCH)
+        self.fx.purpose = "inspection_preview"
+        self.fx.write_bundle("inspection\n")
+        self.branch = INSPECTION_BRANCH
+        second = self.submit()
+        self.assertIn(second["state"], {"published", "updated"})
+        self.assertEqual(self.fx.remote_head(BRANCH), engineering_head)
+        inspection_head = self.fx.remote_head(INSPECTION_BRANCH)
+        self.assertTrue(inspection_head and inspection_head != engineering_head)
+        self.assertNotEqual(self.prs[BRANCH]["number"], self.prs[INSPECTION_BRANCH]["number"])
+        third = self.submit()
+        self.assertIn(third["state"], {"updated", "noop"})
+        self.assertEqual(self.fx.remote_head(BRANCH), engineering_head)
+        self.assertEqual(self.fx.remote_head(INSPECTION_BRANCH), third["commit"])
 
 
 if __name__ == "__main__":
