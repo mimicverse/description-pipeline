@@ -142,13 +142,13 @@ class SplitAdmissionMixin:
         if not (tree / "tool.json").is_file():
             write_json(tree / "tool.json", tool_record(role="portable"))
 
-    def _register_stage(self, run_id: str, stage: str, tree: Path, *, state: str, **receipt) -> dict:
-        """Seal one stage tree and register the row through the one writer primitive.
+    def _seal_stage(self, run_id: str, stage: str, tree: Path, *, state: str, **receipt) -> tuple[str, dict]:
+        """Seal one stage tree and build its receipt through the one writer primitive.
 
         Mirrors the deploy side's receipt builder: the subject digest and the artifact
         inventory are read back from the sealed bytes, and the handoff binding is the
         frozen package digest (freeze) or the sealed native transfer identity.  The
-        registration re-verifies the sealed delivery before the stage row is written.
+        returned uri and completed receipt are what a caller would confirm with.
         """
         manifest = write_delivery_manifest(
             tree,
@@ -171,7 +171,14 @@ class SplitAdmissionMixin:
             "handoff_sha256": handoff,
             **receipt,
         }
-        uri, completed = platform_storage.seal_stage_confirmation(self.store_root, run_id, stage, tree, payload)
+        return platform_storage.seal_stage_confirmation(self.store_root, run_id, stage, tree, payload)
+
+    def _register_stage(self, run_id: str, stage: str, tree: Path, *, state: str, **receipt) -> dict:
+        """Seal one stage tree and register the row through the one writer primitive.
+
+        The registration re-verifies the sealed delivery before the stage row is written.
+        """
+        uri, completed = self._seal_stage(run_id, stage, tree, state=state, **receipt)
         self.store.confirm_stage(run_id=run_id, stage=stage, state="completed", receipt=completed, checkpoint_uri=uri)
         return completed
 
@@ -192,12 +199,13 @@ class SplitAdmissionMixin:
         self._register_stage(run_id, "freeze", tree, state="frozen", tool=read_data(tree / "tool.json"))
         return payload
 
-    def admit(self, run_id: str):
+    def admit(self, run_id: str, archive: Path | None = None):
         """Admit the sealed native capture through the platform seam (fixture plumbing)."""
         payload = self._register_freeze(run_id)
         paths = self._paths(run_id)
-        job = capture_job(run_id, self.archive, self.tool)
-        endpoint = FakeEndpoint(self.archive.read_bytes())
+        archive = Path(archive) if archive is not None else self.archive
+        job = capture_job(run_id, archive, self.tool)
+        endpoint = FakeEndpoint(archive.read_bytes())
         result = platform_capture.import_native_capture(self.store, paths, run_id, job, endpoint)
         # The DAG materializes both mutable copies of the registered frozen request:
         # the attempt-level original and the copy carried into the capture tree.
