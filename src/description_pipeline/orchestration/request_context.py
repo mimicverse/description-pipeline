@@ -50,12 +50,18 @@ _CREATE_SUMMARY_LIMIT = 2048
 
 
 def _safe_single_line(value: object) -> bool:
-    """One bounded, control-character-free line of submission frame text."""
+    """One bounded, control-character-free line of submission frame text.
+
+    The text must carry a non-whitespace character and rejects C0 controls and DEL, exactly
+    like the frozen frame contract: an all-whitespace or C0/DEL-carrying field is not a
+    nameable path, identity or target.
+    """
 
     return (
         isinstance(value, str)
         and 0 < len(value) <= _CREATE_SINGLE_LINE_LIMIT
-        and all(ord(char) >= 32 for char in value)
+        and bool(value.strip())
+        and all(ord(char) >= 32 and ord(char) != 127 for char in value)
     )
 
 

@@ -111,9 +111,14 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             {"handoff_path": "x" * 5000},
             # The request identity stays a bounded single line.
             {"request_id": ""},
+            {"request_id": "   "},
             {"request_id": "x" * 2000},
             {"request_id": "portal-\x01id"},
+            {"request_id": "portal-\x7fid"},
             {"request_id": "line1\nline2"},
+            # The same bounded-text rule holds for every single-line frame field.
+            {"handoff_path": "   "},
+            {"target_hardware": "m3.0\x7f"},
             # A client-provided identity claim is not a submission frame field.
             {"submission_principal": "forged:tenant-a:ou_attacker"},
             {"target_hardware": "m3.0", "owner": "admin"},
