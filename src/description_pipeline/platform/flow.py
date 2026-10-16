@@ -22,7 +22,7 @@ from ..orchestration.airflow_client import JOB_SCHEMA, validate_run_id
 from ..orchestration.stage_transfer import CAPTURE_MANIFEST, verify_transfer
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..stages import DELIVERY_STAGES, STAGE_IDS
-from .store import PlatformStore
+from .store import PlatformStore, PlatformStoreError
 
 log = logging.getLogger(__name__)
 
@@ -158,10 +158,28 @@ def revalidate_capture(platform: PlatformStore, run_id: str, capture: Path, froz
         raise PipelineError("Admitted capture native tool record differs from the recorded admission")
 
 
+def recorded_events(platform: PlatformStore, run_id: str) -> list[dict]:
+    """Every recorded event row of one run: the one bounded-paging read facility.
+
+    The store pages forward with its own cursor; a fixed single page would
+    truncate a genuine long history, so callers iterate here instead of
+    reading one page each.
+    """
+    run_id = validate_run_id(run_id)
+    rows: list[dict] = []
+    after_seq = 0
+    while True:
+        page = platform.run_events(run_id, after_seq=after_seq)
+        rows.extend(page)
+        if len(page) < 200:
+            return rows
+        after_seq = page[-1].get("seq", after_seq + len(page))
+
+
 def reuse_events(platform: PlatformStore, run_id: str, owner: str, stage: str) -> None:
     """Copy the parent's recorded events for the stages this attempt resumes past, marked reused."""
     prefix = set(STAGE_IDS[: STAGE_IDS.index(stage)])
-    for event in platform.run_events(owner):
+    for event in recorded_events(platform, owner):
         if not isinstance(event, dict) or event.get("stage") not in prefix:
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -181,7 +199,7 @@ def reuse_events(platform: PlatformStore, run_id: str, owner: str, stage: str) -
 
 def _prior_events(platform: PlatformStore, run_id: str) -> list[dict]:
     payloads = []
-    for row in platform.run_events(run_id):
+    for row in recorded_events(platform, run_id):
         payload = row.get("payload") if isinstance(row, dict) else None
         payloads.append(payload if isinstance(payload, dict) else row)
     return payloads
@@ -200,7 +218,7 @@ def _write_failure_products(
         "error": f"{type(error).__name__}: {error}",
         "error_code": getattr(error, "code", None),
         "detail": getattr(error, "detail", None) or getattr(error, "details", None),
-        "events": platform.run_events(run_id),
+        "events": recorded_events(platform, run_id),
     }
     receipt["structural_report"] = write_structural_report(paths.run_dir, receipt)
 
@@ -313,7 +331,7 @@ def registered_delivery_events(platform: PlatformStore, run_id: str) -> list[dic
     """
     run_id = validate_run_id(run_id)
     events: list[dict] = []
-    for row in platform.run_events(run_id):
+    for row in recorded_events(platform, run_id):
         payload = row.get("payload") if isinstance(row, dict) else None
         event = dict(payload) if isinstance(payload, dict) else {}
         if not isinstance(event.get("stage"), str) or not event["stage"]:
@@ -329,11 +347,26 @@ def registered_delivery_events(platform: PlatformStore, run_id: str) -> list[dic
     return events
 
 
-def _registered_capture_identity(platform: PlatformStore, rows: dict[str, dict]) -> tuple[str | None, str | None]:
-    """The hardware/revision identity read back from the registered capture tree."""
+def _registered_capture_identity(
+    platform: PlatformStore, run_id: str, rows: dict[str, dict]
+) -> tuple[str | None, str | None]:
+    """The hardware/revision identity read back from the re-bound registered capture tree.
+
+    The capture identity is only consumed after the sealed rebinding validated
+    the registration against the current bytes (the same validated read the
+    reuse path uses): a damaged or forged tree never grants byte authority, so
+    a raw stage projection can neither supply nor revive an identity.
+    """
     row = rows.get("capture") or {}
     uri = row.get("checkpoint_uri")
-    if not isinstance(uri, str) or not uri:
+    if row.get("state") != "completed" or not isinstance(uri, str) or not uri:
+        return None, None
+    try:
+        confirmed = platform.confirmed_stage(run_id, "capture")
+    except PipelineError:
+        # The sealed rebinding refused (damaged or forged bytes): no identity is granted.
+        return None, None
+    if not isinstance(confirmed, dict):
         return None, None
     from .capture import source_identity
 
@@ -344,11 +377,13 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
     """The job-shaped snapshot of one registered delivery, read from the platform records.
 
     The registered run row, the recorded event stream and the sealed stage
-    receipts are the only sources: the delivery result is the publish receipt's
-    quality and submission bound to the recorded subject, and hardware/revision
-    are read back from the registered capture tree.  A run that never entered
-    the register refuses - there is no working-directory or file fallback and
-    no fabricated snapshot.
+    receipts are the only sources: the registered run outcome is authoritative
+    (a receipt can never flip a failed/cancelled/unresolved/running run into a
+    pass), the delivery result is the publish receipt's quality and submission
+    bound to the recorded subject, and hardware/revision are read back from the
+    re-bound registered capture tree.  A run that never entered the register
+    refuses - there is no working-directory or file fallback and no fabricated
+    snapshot.
     """
     run_id = validate_run_id(run_id)
     record = platform.run_record(run_id)
@@ -365,10 +400,14 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
         and bool(submission.get("url"))
         and submission.get("subject_sha256") == subject
     )
+    state = record.get("state")
     result = {
         "pipeline_id": PIPELINE_ID,
         "passed": bool(
-            submission_bound and quality.get("passed") is True and quality.get("subject_sha256") == subject
+            state == "succeeded"
+            and submission_bound
+            and quality.get("passed") is True
+            and quality.get("subject_sha256") == subject
         ),
         "quality": quality,
         "subject_sha256": subject,
@@ -376,13 +415,16 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
     }
     if submission:
         result["submission"] = submission
-    hardware, revision = _registered_capture_identity(platform, rows)
-    state = record.get("state")
+    hardware, revision = _registered_capture_identity(platform, run_id, rows)
     return {
         "schema_version": JOB_SCHEMA,
         "pipeline_id": PIPELINE_ID,
         "run_id": run_id,
-        "status": "passed" if result["passed"] else ("failed" if state == "failed" else "running"),
+        "status": (
+            "passed"
+            if result["passed"]
+            else ("failed" if state in {"failed", "cancelled", "unresolved"} else "running")
+        ),
         "request": {"handoff_sha256": receipt.get("handoff_sha256")},
         "events": registered_delivery_events(platform, run_id),
         "result": result,

@@ -1080,7 +1080,14 @@ def _confirm_delivery(published: dict) -> dict:
             raise AirflowFailException(f"native job {run_id} failed: {native.get('error')}")
     platform, _store_root = _platform_binding()
     snapshot = flow.registered_delivery_snapshot(platform, run_id)
-    for key in ("hardware_id", "revision", "repository_slug", "repository_base"):
+    if snapshot["status"] == "failed":
+        raise AirflowFailException(
+            f"run {run_id} ended as a failed/cancelled/unresolved delivery; its receipt cannot be confirmed"
+        )
+    # The capture identity (hardware/revision) is the registered, re-bound sealed
+    # fact alone - the chain can never supply or revive it; only the repository
+    # destination, which has no registered record, rides the run's own binding.
+    for key in ("repository_slug", "repository_base"):
         if not isinstance(snapshot.get(key), str) or not snapshot.get(key):
             value = published.get(key)
             if isinstance(value, str) and value:
