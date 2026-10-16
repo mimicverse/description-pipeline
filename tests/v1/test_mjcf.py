@@ -250,7 +250,15 @@ def configuration(**overrides) -> dict:
 class _Source:
     """One in-memory source tree plus its configuration file."""
 
-    def __init__(self, base: Path, *, urdf: str = URDF, config: dict | None = None, meshes: dict | None = None):
+    def __init__(
+        self,
+        base: Path,
+        *,
+        urdf: str = URDF,
+        config: dict | None = None,
+        config_bytes: bytes | None = None,
+        meshes: dict | None = None,
+    ):
         self.root = base / "source"
         (self.root / "urdf").mkdir(parents=True)
         (self.root / "meshes").mkdir()
@@ -261,11 +269,14 @@ class _Source:
         for name, content in payloads.items():
             (self.root / "meshes" / name).write_bytes(content)
         self.config_path = base / "config.json"
-        self.config_path.write_text(json.dumps(configuration() if config is None else config))
+        if config_bytes is not None:
+            self.config_path.write_bytes(config_bytes)
+        else:
+            self.config_path.write_text(json.dumps(configuration() if config is None else config))
 
-    def build(self, output: str = "delivery", urdf: str = "urdf/robot.urdf") -> Path:
+    def build(self, output: str = "delivery", urdf: str = "urdf/robot.urdf", config: bool = True) -> Path:
         target = self.config_path.parent / output
-        mjcf.build(self.root, urdf, self.config_path, target)
+        mjcf.build(self.root, urdf, self.config_path if config else None, target)
         return target
 
 
@@ -342,6 +353,105 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(PipelineError) as caught:
             contract.load_simulation(b'{"simulation": {"timestep": 1e999}}')
         self.assertIn("not finite", str(caught.exception))
+
+
+class MinimalConfigurationTests(unittest.TestCase):
+    def test_omitted_fields_resolve_to_the_versioned_defaults(self):
+        expected = {
+            "schema_version": 1,
+            "base": "floating",
+            "collision": {"source": "urdf", "self_collision": True, "friction": (0.8, 0.005, 0.0001)},
+            "simulation": {"timestep": 0.001, "gravity": (0.0, 0.0, -9.81), "integrator": "implicitfast"},
+            "sites": [],
+            "support_sites": [],
+            "floor": None,
+        }
+        for content in (b"{}", b"{}\n"):
+            with self.subTest(content=content):
+                self.assertEqual(contract.load_simulation(content), expected)
+
+    def test_partial_overrides_keep_their_siblings(self):
+        config = contract.load_simulation(
+            json.dumps(
+                {"collision": {"friction": [0.9, 0.02, 0.002]}, "simulation": {"integrator": "Euler"}}
+            ).encode()
+        )
+        self.assertEqual(
+            config["collision"], {"source": "urdf", "self_collision": True, "friction": (0.9, 0.02, 0.002)}
+        )
+        self.assertEqual(
+            config["simulation"], {"timestep": 0.001, "gravity": (0.0, 0.0, -9.81), "integrator": "Euler"}
+        )
+
+    def test_explicit_nulls_are_never_omissions(self):
+        cases = (
+            b'{"schema_version": null}',
+            b'{"base": null}',
+            b'{"collision": null}',
+            b'{"collision": {"source": null}}',
+            b'{"collision": {"friction": null}}',
+            b'{"simulation": null}',
+            b'{"simulation": {"gravity": null}}',
+            b'{"sites": null}',
+            b'{"sites": [{"name": "a", "link": "b", "xyz": null}]}',
+            b'{"support_sites": null}',
+            b'{"support_sites": [{"link": null}]}',
+            b'{"floor": null}',
+            b'{"floor": {"height": null}}',
+            b'{"floor": {"friction": null}}',
+        )
+        for content in cases:
+            with self.subTest(content=content), self.assertRaises(PipelineError):
+                contract.load_simulation(content)
+
+    def test_bad_types_are_rejected(self):
+        cases = (
+            b'{"sites": {}}',
+            b'{"sites": ["plain"]}',
+            b'{"sites": [{"name": "a", "link": "b", "xyz": "0 0 0"}]}',
+            b'{"sites": [{"name": 1, "link": "b"}]}',
+            b'{"support_sites": {}}',
+            b'{"support_sites": [{"name": "a"}]}',
+            b'{"collision": {"self_collision": "true"}}',
+            b'{"floor": []}',
+            b'{"schema_version": true}',
+        )
+        for content in cases:
+            with self.subTest(content=content), self.assertRaises(PipelineError):
+                contract.load_simulation(content)
+
+    def test_support_names_default_and_conflicts_are_unified(self):
+        config = contract.load_simulation(b'{"support_sites": [{"link": "left_foot"}]}')
+        self.assertEqual(config["support_sites"], [{"name": "left_foot__support", "link": "left_foot"}])
+        clashes = (
+            b'{"sites": [{"name": "left_foot__support", "link": "x"}], "support_sites": [{"link": "left_foot"}]}',
+            b'{"support_sites": [{"link": "left_foot"}, {"link": "left_foot"}]}',
+            b'{"support_sites": [{"link": "left_foot", "name": "sole"}, {"link": "hand", "name": "sole"}]}',
+        )
+        for content in clashes:
+            with self.subTest(content=content), self.assertRaises(PipelineError):
+                contract.load_simulation(content)
+
+    def test_floor_defaults_inherit_and_stay_decoupled(self):
+        config = contract.load_simulation(b'{"floor": {}}')
+        self.assertEqual(
+            config["floor"], {"height": 0.0, "supports": False, "friction": (0.8, 0.005, 0.0001)}
+        )
+        inherited = contract.load_simulation(b'{"floor": {}, "collision": {"friction": [0.9, 0.02, 0.002]}}')
+        self.assertEqual(inherited["floor"]["friction"], (0.9, 0.02, 0.002))
+        supported = contract.load_simulation(b'{"floor": {}, "support_sites": [{"link": "foot"}]}')
+        self.assertTrue(supported["floor"]["supports"])
+        self.assertIsNone(supported["floor"]["height"])
+        self.assertIsNone(contract.load_simulation(b'{"support_sites": [{"link": "foot"}]}')["floor"])
+        with self.assertRaises(PipelineError):
+            contract.load_simulation(b'{"floor": {"height": "supports"}}')
+
+    def test_sites_default_to_the_link_frame(self):
+        config = contract.load_simulation(b'{"sites": [{"name": "mark", "link": "tool"}]}')
+        self.assertEqual(
+            config["sites"],
+            [{"name": "mark", "link": "tool", "xyz": (0.0, 0.0, 0.0), "rpy": (0.0, 0.0, 0.0)}],
+        )
 
 
 class ProjectionTests(unittest.TestCase):
@@ -834,6 +944,16 @@ class AdversarialTests(unittest.TestCase):
         (bundle / "reports/quality.json").write_text(json.dumps(saved, sort_keys=True, separators=(",", ":")))
         self.assert_gate_failed(bundle, "report.binding")
 
+    def test_a_resealed_configuration_tamper_is_still_rejected(self):
+        swapped = self.tamper("config-swap")
+        (swapped / "simulation.json").write_text(json.dumps({"collision": {"source": "urdf"}}))
+        reseal_manifest(swapped)
+        self.assert_gate_failed(swapped, "geometry.shapes")
+        unknown = self.tamper("config-unknown")
+        (unknown / "simulation.json").write_text(json.dumps({"extra": 1}))
+        reseal_manifest(unknown)
+        self.assert_gate_failed(unknown, "identity.closure")
+
     def test_resealed_dynamics_injections_are_refused_before_loading(self):
         injections = {
             "gravcomp": lambda root: body_named(root, "base_link").set("gravcomp", "1"),
@@ -1084,6 +1204,114 @@ class SupportHullTests(unittest.TestCase):
             self.assertTrue(report["passed"], report["checks"])
 
 
+class MinimalDeliveryTests(unittest.TestCase):
+    def test_build_without_a_configuration_seals_the_empty_object(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-minimal-") as directory:
+            source = _Source(Path(directory))
+            bundle = source.build(config=False)
+            self.assertEqual((bundle / "simulation.json").read_bytes(), b"{}\n")
+            report = verifier.check_bundle(bundle)
+            self.assertTrue(report["passed"], report["checks"])
+            facts = report["facts"]
+            self.assertEqual(facts["base"], "floating")
+            self.assertEqual(facts["collision_source"], "urdf")
+            self.assertFalse(facts["floor"])
+            self.assertEqual(
+                facts["effective_simulation"],
+                {
+                    "schema_version": 1,
+                    "base": "floating",
+                    "collision": {"source": "urdf", "self_collision": True, "friction": [0.8, 0.005, 0.0001]},
+                    "simulation": {"timestep": 0.001, "gravity": [0.0, 0.0, -9.81], "integrator": "implicitfast"},
+                    "sites": [],
+                    "support_sites": [],
+                },
+            )
+            self.assertEqual(
+                sorted(path.name for path in bundle.iterdir()),
+                ["input", "manifest.json", "reports", "robot.xml", "simulation.json"],
+            )
+
+    def test_an_explicit_empty_object_keeps_its_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-minimal-") as directory:
+            source = _Source(Path(directory), config_bytes=b"{}")
+            bundle = source.build()
+            self.assertEqual((bundle / "simulation.json").read_bytes(), b"{}")
+            self.assertTrue(verifier.check_bundle(bundle)["passed"])
+
+    def test_partial_overrides_reach_the_scene_and_the_report(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-minimal-") as directory:
+            config_bytes = json.dumps(
+                {
+                    "collision": {"friction": [0.9, 0.02, 0.002]},
+                    "simulation": {"integrator": "Euler"},
+                    "floor": {},
+                }
+            ).encode()
+            source = _Source(Path(directory), config_bytes=config_bytes)
+            bundle = source.build()
+            report = verifier.check_bundle(bundle)
+            self.assertTrue(report["passed"], report["checks"])
+            effective = report["facts"]["effective_simulation"]
+            self.assertEqual(
+                effective["collision"], {"source": "urdf", "self_collision": True, "friction": [0.9, 0.02, 0.002]}
+            )
+            self.assertEqual(
+                effective["simulation"],
+                {"timestep": 0.001, "gravity": [0.0, 0.0, -9.81], "integrator": "Euler"},
+            )
+            self.assertEqual(effective["floor"], {"height": 0.0, "friction": [0.9, 0.02, 0.002]})
+            scene = ET.fromstring((bundle / "scene.xml").read_bytes())
+            floor = next(element for element in scene.iter("geom") if element.get("name") == contract.FLOOR_GEOM_NAME)
+            self.assertEqual([float(value) for value in floor.get("friction").split()], [0.9, 0.02, 0.002])
+            self.assertEqual(floor.get("pos").split(), ["0", "0", "0"])
+
+    def test_floor_friction_override_wins_over_the_inherited_value(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-minimal-") as directory:
+            config_bytes = json.dumps(
+                {
+                    "collision": {"friction": [0.9, 0.02, 0.002]},
+                    "floor": {"friction": [0.7, 0.01, 0.001]},
+                }
+            ).encode()
+            source = _Source(Path(directory), config_bytes=config_bytes)
+            bundle = source.build()
+            scene = ET.fromstring((bundle / "scene.xml").read_bytes())
+            floor = next(element for element in scene.iter("geom") if element.get("name") == contract.FLOOR_GEOM_NAME)
+            self.assertEqual([float(value) for value in floor.get("friction").split()], [0.7, 0.01, 0.001])
+
+    def test_support_default_names_and_zero_coordinate_sites(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-minimal-") as directory:
+            config_bytes = json.dumps(
+                {
+                    "sites": [{"name": "mark", "link": "tool_link"}],
+                    "support_sites": [{"link": "base_link"}],
+                    "floor": {},
+                }
+            ).encode()
+            source = _Source(Path(directory), config_bytes=config_bytes)
+            bundle = source.build()
+            robot = ET.fromstring((bundle / "robot.xml").read_bytes())
+            sites = {element.get("name"): element for element in robot.iter("site")}
+            self.assertIn("base_link__support", sites)
+            self.assertIsNone(sites["mark"].get("pos"))
+            self.assertIsNone(sites["mark"].get("quat"))
+            report = verifier.check_bundle(bundle)
+            self.assertTrue(report["passed"], report["checks"])
+            self.assertEqual(report["facts"]["support_sites"], 1)
+            self.assertTrue(report["facts"]["floor"])
+
+    def test_raw_configuration_bytes_are_sealed_verbatim(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-minimal-") as directory:
+            config_bytes = b'{\n    "floor":    {  "height":  -0.5  }\n}\n'
+            source = _Source(Path(directory), config_bytes=config_bytes)
+            bundle = source.build()
+            self.assertEqual((bundle / "simulation.json").read_bytes(), config_bytes)
+            manifest = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual(manifest["files"]["simulation.json"]["sha256"], hashlib.sha256(config_bytes).hexdigest())
+            self.assertTrue(verifier.check_bundle(bundle)["passed"])
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, *arguments: str, cwd: Path) -> subprocess.CompletedProcess:
         environment = dict(os.environ)
@@ -1124,6 +1352,31 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(refused.returncode, 1)
             self.assertFalse(json.loads(refused.stderr)["passed"])
+
+    def test_build_without_a_configuration_via_the_command_line(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-cli-default-") as directory:
+            source = _Source(Path(directory))
+            output = source.config_path.parent / "cli-default"
+            built = self.run_cli(
+                "mjcf", "build", str(source.root), "--urdf", "urdf/robot.urdf",
+                "--output", str(output),
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            self.assertTrue(json.loads(built.stdout)["passed"])
+            self.assertEqual((output / "simulation.json").read_bytes(), b"{}\n")
+            checked = self.run_cli("mjcf", "check", str(output), cwd=REPO_ROOT)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertTrue(json.loads(checked.stdout)["passed"])
+            missing = self.run_cli(
+                "mjcf", "build", str(source.root), "--urdf", "urdf/robot.urdf",
+                "--config", str(source.config_path.parent / "missing.json"),
+                "--output", str(source.config_path.parent / "cli-missing"),
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn("is not a file", missing.stderr)
+            self.assertFalse((source.config_path.parent / "cli-missing").exists())
 
 
 class IsolationTests(unittest.TestCase):

@@ -40,7 +40,12 @@ def parser() -> argparse.ArgumentParser:
     mjcf_build = mjcf_commands.add_parser("build", help="project a new checked MJCF delivery from a URDF tree")
     mjcf_build.add_argument("root", type=Path, help="directory holding the URDF and every mesh it references")
     mjcf_build.add_argument("--urdf", required=True, help="URDF path relative to the root")
-    mjcf_build.add_argument("--config", type=Path, required=True, help="simulation configuration JSON")
+    mjcf_build.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="optional simulation configuration JSON; omit to use the versioned default policy",
+    )
     mjcf_build.add_argument("--output", type=Path, required=True, help="new output directory (must not exist)")
     mjcf_check = mjcf_commands.add_parser("check", help="independently verify an MJCF delivery")
     mjcf_check.add_argument("bundle", type=Path)

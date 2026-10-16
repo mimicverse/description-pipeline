@@ -40,6 +40,20 @@ INTEGRATORS = ("Euler", "RK4", "implicit", "implicitfast")
 #: The locked MuJoCo enum codes behind those spellings (mjINT_*).
 INTEGRATOR_CODES = {"Euler": 0, "RK4": 1, "implicit": 2, "implicitfast": 3}
 
+#: The schema this projection speaks.  Published defaults of schema 1 are
+#: immutable; any change to the default policy ships as a new schema version.
+CONFIG_SCHEMA_VERSION = 1
+#: The one versioned default policy every optional user field falls back to.
+DEFAULT_POLICY = {
+    "schema_version": CONFIG_SCHEMA_VERSION,
+    "base": "floating",
+    "collision": {"source": "urdf", "self_collision": True, "friction": [0.8, 0.005, 0.0001]},
+    "simulation": {"timestep": 0.001, "gravity": [0.0, 0.0, -9.81], "integrator": "implicitfast"},
+    "floor": {"height": 0.0},
+}
+#: The exact bytes sealed when the caller provides no configuration file.
+EMPTY_CONFIG = b"{}\n"
+
 #: The independent gates, in report order; the checker must produce every one.
 CHECK_IDS = (
     "identity.closure",
@@ -64,6 +78,7 @@ ROLE_GROUPS = {"visual": 2, "collision": 3}
 VISUAL_GEOM_TEMPLATE = "{link}__visual_{index}"
 COLLISION_GEOM_TEMPLATE = "{link}__collision_{index}"
 CONVEX_GEOM_TEMPLATE = "{link}__convex_{index}"
+SUPPORT_SITE_TEMPLATE = "{link}__support"
 CONTACT_CONDIM = 3
 #: Contact masks: (contype, conaffinity).  A solo robot geom still touches the
 #: floor because the floor contributes the reverse mask.
@@ -297,47 +312,75 @@ def _mapping(value: Any, where: str) -> dict:
     return value
 
 
-def _required(mapping: dict, key: str, where: str) -> Any:
+def _optional(mapping: dict, key: str, default: Any, where: str) -> Any:
+    """Omitted fields fall back to the default policy; an explicit null never does."""
+
     if key not in mapping:
-        raise PipelineError(f"Invalid simulation configuration: missing {key!r} at {where}")
-    return mapping[key]
+        return default
+    value = mapping[key]
+    if value is None:
+        raise PipelineError(
+            f"Invalid simulation configuration: {where}.{key} cannot be null; "
+            "omit it to use the default policy"
+        )
+    return value
+
+
+def _optional_mapping(mapping: dict, key: str, where: str) -> dict:
+    return _mapping(_optional(mapping, key, {}, where), f"{where}.{key}")
 
 
 def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
-    """Parse and strictly validate the one supported simulation configuration."""
+    """Resolve one user override document against the versioned default policy.
+
+    Every field, object and list may be omitted; an explicit ``null`` is an
+    error, never a shortcut back to the default.
+    """
 
     data = parse_data(content, Path(label))
     root = _mapping(data, "the configuration")
     _unknown(
         root, {"schema_version", "base", "collision", "simulation", "sites", "support_sites", "floor"}, "root"
     )
-    version = _required(root, "schema_version", "root")
-    if isinstance(version, bool) or version != 1:
-        raise PipelineError(f"Invalid simulation configuration: schema_version must be 1, got {version!r}")
+    version = _optional(root, "schema_version", CONFIG_SCHEMA_VERSION, "root")
+    if isinstance(version, bool) or version != CONFIG_SCHEMA_VERSION:
+        raise PipelineError(
+            f"Invalid simulation configuration: schema_version must be {CONFIG_SCHEMA_VERSION}, got {version!r}"
+        )
 
-    base = _required(root, "base", "root")
+    base = _optional(root, "base", DEFAULT_POLICY["base"], "root")
     if base not in BASE_MODES:
         raise PipelineError(f"Invalid simulation configuration: base must be one of {BASE_MODES}, got {base!r}")
 
-    collision = _mapping(_required(root, "collision", "root"), "collision")
+    collision = _optional_mapping(root, "collision", "root")
     _unknown(collision, {"source", "self_collision", "friction"}, "collision")
-    source = _required(collision, "source", "collision")
+    source = _optional(collision, "source", DEFAULT_POLICY["collision"]["source"], "collision")
     if source not in COLLISION_SOURCES:
         raise PipelineError(
             f"Invalid simulation configuration: collision.source must be one of {COLLISION_SOURCES}, got {source!r}"
         )
-    self_collision = _required(collision, "self_collision", "collision")
+    self_collision = _optional(
+        collision, "self_collision", DEFAULT_POLICY["collision"]["self_collision"], "collision"
+    )
     if not isinstance(self_collision, bool):
         raise PipelineError("Invalid simulation configuration: collision.self_collision must be true or false")
-    contact_friction = friction(_required(collision, "friction", "collision"), "collision.friction")
+    contact_friction = friction(
+        _optional(collision, "friction", DEFAULT_POLICY["collision"]["friction"], "collision"), "collision.friction"
+    )
 
-    simulation = _mapping(_required(root, "simulation", "root"), "simulation")
+    simulation = _optional_mapping(root, "simulation", "root")
     _unknown(simulation, {"timestep", "gravity", "integrator"}, "simulation")
-    timestep = number(_required(simulation, "timestep", "simulation"), "simulation.timestep")
+    timestep = number(
+        _optional(simulation, "timestep", DEFAULT_POLICY["simulation"]["timestep"], "simulation"),
+        "simulation.timestep",
+    )
     if timestep <= 0:
         raise PipelineError(f"Invalid simulation configuration: simulation.timestep must be positive, got {timestep!r}")
-    gravity = triple(_required(simulation, "gravity", "simulation"), "simulation.gravity")
-    integrator = _required(simulation, "integrator", "simulation")
+    gravity = triple(
+        _optional(simulation, "gravity", DEFAULT_POLICY["simulation"]["gravity"], "simulation"),
+        "simulation.gravity",
+    )
+    integrator = _optional(simulation, "integrator", DEFAULT_POLICY["simulation"]["integrator"], "simulation")
     if integrator not in INTEGRATORS:
         raise PipelineError(
             f"Invalid simulation configuration: simulation.integrator must be one of {INTEGRATORS}, got {integrator!r}"
@@ -353,8 +396,8 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
             where = f"sites[{index}]"
             site = _mapping(raw, where)
             _unknown(site, {"name", "link", "xyz", "rpy"}, where)
-            name = _required(site, "name", where)
-            link = _required(site, "link", where)
+            name = site.get("name")
+            link = site.get("link")
             if not isinstance(name, str) or not name:
                 raise PipelineError(f"Invalid simulation configuration: {where}.name must be a non-empty string")
             if not isinstance(link, str) or not link:
@@ -366,8 +409,8 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
                 {
                     "name": name,
                     "link": link,
-                    "xyz": triple(_required(site, "xyz", where), f"{where}.xyz"),
-                    "rpy": triple(_required(site, "rpy", where), f"{where}.rpy"),
+                    "xyz": triple(_optional(site, "xyz", (0.0, 0.0, 0.0), where), f"{where}.xyz"),
+                    "rpy": triple(_optional(site, "rpy", (0.0, 0.0, 0.0), where), f"{where}.rpy"),
                 }
             )
 
@@ -380,14 +423,16 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
             where = f"support_sites[{index}]"
             site = _mapping(raw, where)
             _unknown(site, {"name", "link"}, where)
-            name = _required(site, "name", where)
-            link = _required(site, "link", where)
-            if not isinstance(name, str) or not name:
-                raise PipelineError(f"Invalid simulation configuration: {where}.name must be a non-empty string")
+            link = site.get("link")
             if not isinstance(link, str) or not link:
                 raise PipelineError(f"Invalid simulation configuration: {where}.link must be a non-empty string")
+            name = _optional(site, "name", SUPPORT_SITE_TEMPLATE.format(link=link), where)
+            if not isinstance(name, str) or not name:
+                raise PipelineError(f"Invalid simulation configuration: {where}.name must be a non-empty string")
             if name in site_names:
-                raise PipelineError(f"Invalid simulation configuration: site name {name!r} appears twice")
+                raise PipelineError(
+                    f"Invalid simulation configuration: site name {name!r} is used by more than one site"
+                )
             site_names.add(name)
             support_sites.append({"name": name, "link": link})
     if support_sites and source == "none":
@@ -397,9 +442,14 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
 
     floor = None
     if "floor" in root:
-        raw_floor = _mapping(root["floor"], "floor")
+        raw_floor = _optional_mapping(root, "floor", "root")
         _unknown(raw_floor, {"height", "friction"}, "floor")
-        raw_height = _required(raw_floor, "height", "floor")
+        raw_height = _optional(
+            raw_floor,
+            "height",
+            FLOOR_HEIGHT_SUPPORTS if support_sites else DEFAULT_POLICY["floor"]["height"],
+            "floor",
+        )
         if raw_height == FLOOR_HEIGHT_SUPPORTS:
             if not support_sites:
                 raise PipelineError(
@@ -411,11 +461,11 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
         floor = {
             "height": height,
             "supports": supports,
-            "friction": friction(_required(raw_floor, "friction", "floor"), "floor.friction"),
+            "friction": friction(_optional(raw_floor, "friction", contact_friction, "floor"), "floor.friction"),
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": CONFIG_SCHEMA_VERSION,
         "base": base,
         "collision": {"source": source, "self_collision": self_collision, "friction": contact_friction},
         "simulation": {"timestep": timestep, "gravity": gravity, "integrator": integrator},

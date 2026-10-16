@@ -26,11 +26,11 @@ Linux 负责上传冻结、受控规格、结构推导、模型生成、独立�
 
 ```sh
 description mjcf build /path/to/source --urdf urdf/robot.urdf \
-  --config /path/to/simulation.json --output /path/to/new-mjcf
+  --output /path/to/new-mjcf
 description mjcf check /path/to/new-mjcf
 ```
 
-URDF 是机械事实的唯一来源；`simulation.json` 只提供基座模式、碰撞来源与接触参数、显式 `sites` 或由几何推导的 `support_sites`（显式选择 link，结果不明确时报错），以及数值或 `"supports"`（贴地）的地面高度。构建只写入新目录，并在提交前由独立进程重新加载实际 MJCF 完成全部检查；领域契约、支持边界与验收判据见 [URDF 转 MJCF](docs/mjcf.md)。
+常规转换不需要配置文件：省略 `--config` 等价于空对象，由 `mjcf_contract.py` 中版本化的默认策略（`floating` 基座、`urdf` 碰撞、`0.001`/`[0,0,-9.81]`/`implicitfast`）补全；仅需覆盖时提供 `--config`，显式 `null` 不是省略。交付只保留一份原始覆盖项 `simulation.json`，质量报告的 `facts.effective_simulation` 展示实际生效选项。支撑 link 经 `{"support_sites":[{"link":"left_foot_link"}]}` 显式选择（名称默认为 `<link>__support`，不猜脚名），`"floor": {}` 请求地面与灯光、有支撑 link 时自动贴地。构建只写入新目录，并在提交前由独立进程重新加载实际 MJCF 完成全部检查；领域契约、支持边界与验收判据见 [URDF 转 MJCF](docs/mjcf.md)。
 
 ## 文档
 

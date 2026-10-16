@@ -1086,12 +1086,11 @@ def _commit_directory(temporary: Path, output: Path) -> None:
         raise PipelineError(f"the output directory could not be committed atomically: {os.strerror(error)}")
 
 
-def build(root: Path, urdf: str, config_path: Path, output: Path) -> dict:
+def build(root: Path, urdf: str, config_path: Path | None, output: Path) -> dict:
     """Freeze the closure, project the robot and scene, check them and commit a new directory."""
 
     root = Path(root)
     output = Path(output)
-    config_path = Path(config_path)
     if not root.is_dir():
         raise PipelineError(f"The input root {root} is not an existing directory")
     if output.exists() or output.is_symlink():
@@ -1103,12 +1102,16 @@ def build(root: Path, urdf: str, config_path: Path, output: Path) -> dict:
         raise PipelineError("The output directory must lie outside the input root")
     artifact_path_parts(urdf)
     confined(root, urdf)
-    if not config_path.is_file():
-        raise PipelineError(f"The simulation configuration {config_path} is not a file")
-
-    config_bytes = config_path.read_bytes()
-    config_digest = hashlib.sha256(config_bytes).hexdigest()
-    config = contract.load_simulation(config_bytes, label=str(config_path))
+    if config_path is None:
+        config_bytes, config_digest, config_label = contract.EMPTY_CONFIG, None, contract.CONFIG_NAME
+    else:
+        config_path = Path(config_path)
+        if not config_path.is_file():
+            raise PipelineError(f"The simulation configuration {config_path} is not a file")
+        config_bytes = config_path.read_bytes()
+        config_digest = hashlib.sha256(config_bytes).hexdigest()
+        config_label = str(config_path)
+    config = contract.load_simulation(config_bytes, label=config_label)
     urdf_bytes = confined(root, urdf).read_bytes()
     document = _read_urdf(urdf_bytes, urdf)
     _validate_mobility(document["links"], document["joints"], config["base"], urdf)
@@ -1174,7 +1177,7 @@ def build(root: Path, urdf: str, config_path: Path, output: Path) -> dict:
             actual = hashlib.sha256(confined(root, relative).read_bytes()).hexdigest()
             if actual != expected:
                 raise PipelineError(f"The source {relative} changed while the delivery was built")
-        if hashlib.sha256(config_path.read_bytes()).hexdigest() != config_digest:
+        if config_digest is not None and hashlib.sha256(config_path.read_bytes()).hexdigest() != config_digest:
             raise PipelineError("The simulation configuration changed while the delivery was built")
         _commit_directory(temporary, output)
     finally:

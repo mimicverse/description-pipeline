@@ -244,7 +244,19 @@ def _friction(value, where: str) -> tuple[float, float, float]:
     return result
 
 
+def _default(mapping: dict, key: str, fallback, where: str):
+    """Omitted fields fall back to the policy default; an explicit null never does."""
+
+    if key not in mapping:
+        return fallback
+    value = mapping[key]
+    if value is None:
+        _fail("simulation", f"{where}.{key} cannot be null; omit it to use the default policy")
+    return value
+
+
 def _read_simulation(content: bytes, policy: dict) -> dict:
+    defaults = policy["defaults"]
     data = _parse_json(content, policy["config_name"])
     if not isinstance(data, dict):
         _fail("simulation", "the configuration must be an object")
@@ -253,34 +265,42 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
     )
     if unknown:
         _fail("simulation", f"unknown key {unknown[0]!r}")
-    if isinstance(data.get("schema_version"), bool) or data.get("schema_version") != 1:
-        _fail("simulation", "schema_version must be 1")
-    base = data.get("base")
+    version = _default(data, "schema_version", defaults["schema_version"], "root")
+    if isinstance(version, bool) or version != defaults["schema_version"]:
+        _fail("simulation", f"schema_version must be {defaults['schema_version']}")
+    base = _default(data, "base", defaults["base"], "root")
     if base not in policy["base_modes"]:
         _fail("simulation", f"base must be one of {policy['base_modes']}")
-    collision = data.get("collision")
+    collision = _default(data, "collision", {}, "root")
     if not isinstance(collision, dict):
         _fail("simulation", "collision must be an object")
     unknown = sorted(set(collision) - {"source", "self_collision", "friction"})
     if unknown:
         _fail("simulation", f"unknown key {unknown[0]!r} at collision")
-    source = collision.get("source")
+    source = _default(collision, "source", defaults["collision"]["source"], "collision")
     if source not in policy["collision_sources"]:
         _fail("simulation", f"collision.source must be one of {policy['collision_sources']}")
-    self_collision = collision.get("self_collision")
+    self_collision = _default(collision, "self_collision", defaults["collision"]["self_collision"], "collision")
     if not isinstance(self_collision, bool):
         _fail("simulation", "collision.self_collision must be true or false")
-    simulation = data.get("simulation")
+    contact_friction = _friction(
+        _default(collision, "friction", defaults["collision"]["friction"], "collision"), "collision.friction"
+    )
+    simulation = _default(data, "simulation", {}, "root")
     if not isinstance(simulation, dict):
         _fail("simulation", "simulation must be an object")
     unknown = sorted(set(simulation) - {"timestep", "gravity", "integrator"})
     if unknown:
         _fail("simulation", f"unknown key {unknown[0]!r} at simulation")
-    timestep = _number(simulation.get("timestep"), "simulation.timestep")
+    timestep = _number(
+        _default(simulation, "timestep", defaults["simulation"]["timestep"], "simulation"), "simulation.timestep"
+    )
     if timestep <= 0:
         _fail("simulation", "simulation.timestep must be positive")
-    gravity = _triple(simulation.get("gravity"), "simulation.gravity")
-    integrator = simulation.get("integrator")
+    gravity = _triple(
+        _default(simulation, "gravity", defaults["simulation"]["gravity"], "simulation"), "simulation.gravity"
+    )
+    integrator = _default(simulation, "integrator", defaults["simulation"]["integrator"], "simulation")
     if integrator not in policy["integrators"]:
         _fail("simulation", f"simulation.integrator must be one of {policy['integrators']}")
     sites = []
@@ -305,8 +325,8 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
                 {
                     "name": name,
                     "link": link,
-                    "xyz": _triple(raw.get("xyz"), f"{where}.xyz"),
-                    "rpy": _triple(raw.get("rpy"), f"{where}.rpy"),
+                    "xyz": _triple(_default(raw, "xyz", (0.0, 0.0, 0.0), where), f"{where}.xyz"),
+                    "rpy": _triple(_default(raw, "rpy", (0.0, 0.0, 0.0), where), f"{where}.rpy"),
                 }
             )
     support_sites = []
@@ -320,11 +340,14 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
             unknown = sorted(set(raw) - {"name", "link"})
             if unknown:
                 _fail("simulation", f"unknown key {unknown[0]!r} at {where}")
-            name, link = raw.get("name"), raw.get("link")
-            if not isinstance(name, str) or not name or not isinstance(link, str) or not link:
-                _fail("simulation", f"{where} needs a name and a link")
+            link = raw.get("link")
+            if not isinstance(link, str) or not link:
+                _fail("simulation", f"{where} needs a link")
+            name = _default(raw, "name", policy["names"]["support"].format(link=link), where)
+            if not isinstance(name, str) or not name:
+                _fail("simulation", f"{where}.name must be a non-empty string")
             if name in site_names:
-                _fail("simulation", f"site name {name!r} appears twice")
+                _fail("simulation", f"site name {name!r} is used by more than one site")
             site_names.add(name)
             support_sites.append({"name": name, "link": link})
     if support_sites and source == "none":
@@ -332,12 +355,15 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
     floor = None
     if "floor" in data:
         raw = data["floor"]
+        if raw is None:
+            _fail("simulation", "floor cannot be null; omit it to deliver the robot without a scene")
         if not isinstance(raw, dict):
             _fail("simulation", "floor must be an object")
         unknown = sorted(set(raw) - {"height", "friction"})
         if unknown:
             _fail("simulation", f"unknown key {unknown[0]!r} at floor")
-        raw_height = raw.get("height")
+        default_height = policy["floor_height_supports"] if support_sites else defaults["floor"]["height"]
+        raw_height = _default(raw, "height", default_height, "floor")
         if raw_height == policy["floor_height_supports"]:
             if not support_sites:
                 _fail("simulation", f"floor.height {raw_height!r} requires support_sites")
@@ -347,14 +373,14 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
         floor = {
             "height": height,
             "supports": supports,
-            "friction": _friction(raw.get("friction"), "floor.friction"),
+            "friction": _friction(_default(raw, "friction", contact_friction, "floor"), "floor.friction"),
         }
     return {
         "base": base,
         "collision": {
             "source": source,
             "self_collision": self_collision,
-            "friction": _friction(collision.get("friction"), "collision.friction"),
+            "friction": contact_friction,
         },
         "simulation": {"timestep": timestep, "gravity": gravity, "integrator": integrator},
         "sites": sites,
@@ -2091,6 +2117,34 @@ def _gate_runtime(state: dict) -> dict:
     return details
 
 
+def _effective_projection(config: dict, policy: dict) -> dict:
+    """The resolved options in the same shape as an external configuration."""
+
+    projection = {
+        "schema_version": policy["defaults"]["schema_version"],
+        "base": config["base"],
+        "collision": {
+            "source": config["collision"]["source"],
+            "self_collision": config["collision"]["self_collision"],
+            "friction": list(config["collision"]["friction"]),
+        },
+        "simulation": {
+            "timestep": config["simulation"]["timestep"],
+            "gravity": list(config["simulation"]["gravity"]),
+            "integrator": config["simulation"]["integrator"],
+        },
+        "sites": [
+            {"name": site["name"], "link": site["link"], "xyz": list(site["xyz"]), "rpy": list(site["rpy"])}
+            for site in config["sites"]
+        ],
+        "support_sites": [{"name": site["name"], "link": site["link"]} for site in config["support_sites"]],
+    }
+    if config["floor"] is not None:
+        height = policy["floor_height_supports"] if config["floor"]["supports"] else config["floor"]["height"]
+        projection["floor"] = {"height": height, "friction": list(config["floor"]["friction"])}
+    return projection
+
+
 def _facts(state: dict) -> dict:
     facts: dict = {}
     document = state.get("document")
@@ -2115,6 +2169,7 @@ def _facts(state: dict) -> dict:
         facts["sites"] = len(config["sites"])
         facts["support_sites"] = len(config["support_sites"])
         facts["floor"] = config["floor"] is not None
+        facts["effective_simulation"] = _effective_projection(config, policy)
         if document is not None:
             facts["collision_geoms"] = sum(
                 1 for item in _expected_geoms(document, config, policy) if item["role"] == "collision"
@@ -2223,7 +2278,9 @@ def _policy() -> dict:
             "visual": contract.VISUAL_GEOM_TEMPLATE,
             "collision": contract.COLLISION_GEOM_TEMPLATE,
             "convex": contract.CONVEX_GEOM_TEMPLATE,
+            "support": contract.SUPPORT_SITE_TEMPLATE,
         },
+        "defaults": contract.DEFAULT_POLICY,
         "xml_syntax": {
             project: {
                 "attributes": {
