@@ -22,11 +22,13 @@ from ..orchestration.airflow_client import JOB_SCHEMA, validate_run_id
 from ..orchestration.stage_transfer import CAPTURE_MANIFEST, verify_transfer
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..stages import DELIVERY_STAGES, STAGE_IDS
-from .store import PlatformStore, PlatformStoreError
+from .store import PlatformStore
 
 log = logging.getLogger(__name__)
 
 _SEED_STAGE = {"generate": "capture", "verify": "generate", "publish": "verify"}
+#: Registered run states projected onto the job-status vocabulary the run page reads.
+_JOB_STATUS_BY_RUN_STATE = {"succeeded": "passed", "cancelled": "failed", "unresolved": "failed"}
 
 
 class RunPaths:
@@ -420,11 +422,8 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
         "schema_version": JOB_SCHEMA,
         "pipeline_id": PIPELINE_ID,
         "run_id": run_id,
-        "status": (
-            "passed"
-            if result["passed"]
-            else ("failed" if state in {"failed", "cancelled", "unresolved"} else "running")
-        ),
+        # The registered outcome projects the status; a receipt never rewrites it.
+        "status": _JOB_STATUS_BY_RUN_STATE.get(state, state) if isinstance(state, str) and state else "running",
         "request": {"handoff_sha256": receipt.get("handoff_sha256")},
         "events": registered_delivery_events(platform, run_id),
         "result": result,

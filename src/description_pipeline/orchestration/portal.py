@@ -60,7 +60,7 @@ from .airflow_client import (
 )
 from ..io import PipelineError, digest
 from ..delivery import PIPELINE_ID
-from ..platform.flow import registered_delivery_events
+from ..platform import flow
 from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
 from .stage_transfer import TEAM_REPORTS
@@ -164,8 +164,9 @@ _SHA256_TEXT = re.compile(r"\A[0-9a-f]{64}\Z")
 #: Read precedence across the registered stages: the first registration of a member
 #: path wins, so a later stage's sealed copy is never shadowed by an earlier one.
 _STAGE_READ_ORDER = ("publish", "verify", "generate", "capture", "discover", "freeze")
-#: Registered run states projected onto the job-status vocabulary the run page reads.
-_JOB_STATUS_BY_RUN_STATE = {"succeeded": "passed", "cancelled": "failed", "unresolved": "failed"}
+#: The one native half of a registered snapshot: live observations that never
+#: carry run/delivery authority (outcome, identity, submission stay registered).
+_OBSERVATION_ONLY_JOB_FIELDS = ("activity", "activity_final", "activity_history", "discovery", "error")
 
 
 def _member_class(path: str) -> str:
@@ -2499,13 +2500,16 @@ class PortalApp:
         return endpoint() if callable(endpoint) else endpoint
 
     def _job_snapshot(self, run_id: str, endpoint: WindowsEndpoint) -> dict | None:
-        """The run snapshot: the registered platform record is the run/event authority.
+        """The run snapshot: the registered delivery is the authority once admitted.
 
-        Once the attempt entered the platform store, its registered run state and
-        recorded events own the snapshot; the native endpoint only supplements
-        non-authoritative display details (activity telemetry, native findings,
-        submission facts) and can never override the registered run state or
-        events. Without a registration the native job is served as-is.
+        Once the attempt entered the platform store, its registered outcome,
+        identity, events and publication submission (each byte-bound at
+        registration and re-bound on the identity read) own the snapshot's
+        authoritative fields; the native endpoint only supplements observation
+        details (activity telemetry, native findings, error text) and can never
+        override or resurrect the registered outcome/submission - a stale or
+        synthetic native result is never displayed over the registered delivery.
+        Without a registration the native job is served as-is.
         """
         native = None
         try:
@@ -2516,22 +2520,23 @@ class PortalApp:
         record = self._platform_read(lambda: self._platform().run_record(run_id))
         if not isinstance(record, dict):
             return native
-        events = self._platform_read(lambda: registered_delivery_events(self._platform(), run_id))
-        detail = dict(native) if isinstance(native, dict) else {}
-        state = record.get("state")
-        status = (
-            _JOB_STATUS_BY_RUN_STATE.get(state, state) if isinstance(state, str) and state else detail.get("status")
+        registered = self._platform_read(
+            lambda: flow.registered_delivery_snapshot(self._platform(), run_id)
         )
-        return {
-            **detail,
-            "schema_version": "solidworks-to-urdf.job/v1",
-            "pipeline_id": PIPELINE_ID,
-            "run_id": run_id,
-            "status": status,
-            "events": events,
-            "result": detail.get("result"),
-            "error": detail.get("error"),
+        observation = {
+            key: native[key]
+            for key in _OBSERVATION_ONLY_JOB_FIELDS
+            if isinstance(native, dict) and key in native
         }
+        snapshot = {**observation, **registered}
+        # The registered publication carries its own repository identity; the
+        # displayed PR is validated against exactly that, never the native claim.
+        submission = registered.get("result", {}).get("submission") or {}
+        if isinstance(submission.get("repository_slug"), str):
+            snapshot["repository_slug"] = submission["repository_slug"]
+        if isinstance(submission.get("base"), str):
+            snapshot["repository_base"] = submission["base"]
+        return snapshot
 
     def _body(self, environ: dict) -> dict:
         try:
