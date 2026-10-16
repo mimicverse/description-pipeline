@@ -153,7 +153,7 @@ reports/quality.json       # 独立重算的确定性报告
 | 清理对象 | 最终状态与检索证据 |
 |---|---|
 | 旧 MJCF 脚本、旧入口与兼容层 | 本仓库基线没有旧 MJCF 实现；未复制参考仓库脚本。模块范围内 `rg 'generate_mjcf'` 无匹配 |
-| 草稿中未使用的格式接口和反向旋转工具 | 已移除 `CONFIG_SCHEMA`、`read_manifest`、`matrix_from_quaternion`；模块范围内同名检索无匹配 |
+| 草稿中未使用的格式接口和反向旋转工具 | 已移除未用的旧 `CONFIG_SCHEMA`、`read_manifest`、`matrix_from_quaternion`；模块范围内精确标识符检索无匹配。当前 `CONFIG_SCHEMA_VERSION` 专门拥有有效 schema 与默认策略版本 |
 | 引擎完整数据的第二份表示与低精度导出链 | 模块范围内 `rg 'base64|pickle|to_xml|saveLastXML|robot\.json'` 无匹配；`MjModel.from_xml_path` 仅在独立验证器装载机器人与场景 |
 | 重复调度、状态和机器人参数配置 | 没有新增；机械事实只读 URDF，原始文件只封存在 `input/`，报告不充当机械或调度状态权威 |
 
