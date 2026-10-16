@@ -646,7 +646,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         from description_pipeline.delivery import read_delivery_manifest
         from description_pipeline.io import digest as io_digest
 
-        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
         (run_dir / "input").mkdir(parents=True)
         (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
         intake = Path(self.temporary.name) / "intake"
@@ -656,8 +656,8 @@ class PlatformRegistrationTests(unittest.TestCase):
         upload_files = {"assembly.sldasm": "a" * 64, "cad/part.sldprt": "b" * 64}
         from description_pipeline.platform import flow
 
-        paths = flow.RunPaths(run_dir.parent, "run-1")
-        self.module._register_freeze_stage(paths, "run-1", intake=intake, upload_files=upload_files)
+        paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
+        self.module._register_freeze_stage(paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files)
         call = self.calls[0]
         self.assertEqual(call["stage"], "freeze")
         self.assertEqual(call["state"], "completed")
@@ -671,7 +671,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertIn("input/assembly.sldasm", {record["path"] for record in manifest["subject"]["files"]})
 
     def test_the_freeze_stage_starts_the_admitted_run(self) -> None:
-        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
         (run_dir / "input").mkdir(parents=True)
         (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
         intake = Path(self.temporary.name) / "intake-start"
@@ -679,11 +679,11 @@ class PlatformRegistrationTests(unittest.TestCase):
         (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
         from description_pipeline.platform import flow
 
-        paths = flow.RunPaths(run_dir.parent, "run-1")
+        paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
         self.module._register_freeze_stage(
-            paths, "run-1", intake=intake, upload_files={"assembly.sldasm": "a" * 64}
+            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files={"assembly.sldasm": "a" * 64}
         )
-        self.assertEqual(self.started, ["run-1"])
+        self.assertEqual(self.started, ["0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"])
 
     def test_stage_events_are_mirrored_into_the_live_platform_stream(self) -> None:
         from description_pipeline.delivery import read_delivery_manifest
@@ -918,7 +918,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertTrue((self.root / "sealed" / "run-1" / "capture").is_dir())
 
     def test_a_repeated_freeze_confirmation_consumes_the_confirmed_fact(self) -> None:
-        run_dir = Path(self.temporary.name) / "runs" / "run-1"
+        run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
         (run_dir / "input").mkdir(parents=True)
         (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
         intake = Path(self.temporary.name) / "intake-retry"
@@ -927,7 +927,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         upload_files = {"assembly.sldasm": "a" * 64}
         from description_pipeline.platform import flow
 
-        paths = flow.RunPaths(run_dir.parent, "run-1")
+        paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
 
         records: dict[tuple[str, str], dict] = {}
         confirmations: list[str] = []
@@ -945,8 +945,8 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         platform = _RetainingPlatform()
         with patch.object(self.module, "_platform_binding", return_value=(platform, self.root)):
-            self.module._register_freeze_stage(paths, "run-1", intake=intake, upload_files=upload_files)
-            self.module._register_freeze_stage(paths, "run-1", intake=intake, upload_files=upload_files)
+            self.module._register_freeze_stage(paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files)
+            self.module._register_freeze_stage(paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files)
         self.assertEqual(confirmations, ["freeze"])
 
     def test_a_failed_registration_tolerates_a_malformed_handoff(self) -> None:
