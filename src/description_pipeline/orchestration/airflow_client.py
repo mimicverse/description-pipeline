@@ -45,6 +45,7 @@ from urllib import request as urlrequest
 from ..delivery import PIPELINE_ID
 from ..io import PipelineError, artifact_path_parts, digest
 from ..interface_records import (
+    REQUEST_PURPOSES,
     cache_import_confirmation_digest,
     validate_cache_release_request,
 )
@@ -71,7 +72,7 @@ NATIVE_RECORD_ARCHIVE = "raw-record.zip"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _PULL_URL = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9]\d*\Z")
-_REVIEW_BRANCH = re.compile(r"work/solidworks/[a-z0-9_.-]+\Z")
+_REVIEW_BRANCH = re.compile(r"work/solidworks/[a-z0-9_.-]+/(?:engineering|inspection_preview)\Z")
 _HARDWARE_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 SUBMISSION_STATES = {"published", "updated", "noop"}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -294,6 +295,7 @@ def submission_identity(
     target_hardware,
     change_summary=None,
     principal=None,
+    purpose,
     config: EndpointConfig,
     published_revision=None,
     warn=None,
@@ -310,6 +312,9 @@ def submission_identity(
     summary = str(change_summary or "").strip()
     if not target:
         return None
+    declared_purpose = str(purpose or "").strip()
+    if declared_purpose not in REQUEST_PURPOSES:
+        raise EndpointProtocolError(f"purpose {declared_purpose!r} is not a declared submission purpose")
     routing = config.targets.get(target)
     if routing is None:
         raise EndpointProtocolError(f"target_hardware {target!r} is not a configured publication target")
@@ -317,7 +322,7 @@ def submission_identity(
     repository = config.repositories.get(str(routing["repository_slug"]))
     if repository is not None and published_revision is not None:
         try:
-            previous = published_revision(repository, target)
+            previous = published_revision(repository, target, declared_purpose)
         except Exception as error:  # noqa: BLE001 - identity derivation stays best-effort
             if warn is not None:
                 warn(f"previous revision unavailable for {target}: {error}")
@@ -1418,7 +1423,9 @@ def check_result(result: dict | None, *, expected_slug: str, expected_base: str)
     if submission.get("base") != expected_base:
         raise ResultNotPublishable("submission.base does not match the expected base branch")
     if not isinstance(submission.get("branch"), str) or _REVIEW_BRANCH.fullmatch(submission["branch"]) is None:
-        raise ResultNotPublishable("submission.branch must be the deterministic work/solidworks/<hardware> branch")
+        raise ResultNotPublishable(
+            "submission.branch must be the deterministic work/solidworks/<hardware>/<purpose> branch"
+        )
     return result
 
 

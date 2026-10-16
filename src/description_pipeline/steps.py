@@ -786,7 +786,8 @@ def publish_model(
 ) -> dict:
     """Recheck and submit the frozen delivery on the Linux publication stage."""
 
-    from .repository.urdf_pr import submit_bundle
+    from .repository.urdf_pr import review_branch, submit_bundle
+    from .request_evidence import read_request_evidence
 
     _state(on_event, "publish", "running")
     # Fail closed on degraded installs: a source/PYTHONPATH checkout carries no
@@ -801,11 +802,13 @@ def publish_model(
     )
     source = read_source_record(bundle)
     hardware = source["identity"]["hardware_id"]
+    record, _request_sha = read_request_evidence(bundle / "input" / "request.json")
+    purpose = str(record.get("purpose") or "")
     result = submit_bundle(
         bundle,
         repository,
         base=base or f"feature/{hardware}",
-        branch=f"work/solidworks/{hardware.lower()}",
+        branch=review_branch(hardware, purpose),
         message=message,
         on_event=on_event,
     )

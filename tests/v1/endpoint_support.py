@@ -360,7 +360,7 @@ class EndpointFixture:
                 "url": "https://github.com/a/b/pull/1",
                 "repository_slug": "a/b",
                 "base": "feature/arm",
-                "branch": "work/solidworks/arm",
+                "branch": "work/solidworks/arm/engineering",
                 "state": "published",
                 "commit": "b" * 40,
             },

@@ -96,19 +96,22 @@ class DagTests(unittest.TestCase):
 
         with patch.object(module, "config_from_airflow_connection", return_value=config):
             for conf in (
-                {"target_hardware": "m4.0", "change_summary": "x"},
-                {"change_summary": "x"},
-                {"target_hardware": "   ", "change_summary": "x"},
+                {"target_hardware": "m4.0", "change_summary": "x", "purpose": "engineering"},
+                {"change_summary": "x", "purpose": "engineering"},
+                {"target_hardware": "   ", "change_summary": "x", "purpose": "engineering"},
                 {"target_hardware": "m3.0"},
-                {"target_hardware": "m3.0", "change_summary": "  "},
+                {"target_hardware": "m3.0", "change_summary": "  ", "purpose": "engineering"},
+                {"target_hardware": "m3.0", "change_summary": "x"},
             ):
                 with self.subTest(conf=str(conf)), self.assertRaises(module.AirflowFailException):
                     module._submission_frame(context(conf))
             identity, routing = module._submission_frame(
-                context({"target_hardware": "m3.0", "change_summary": "rebind"})
+                context({"target_hardware": "m3.0", "change_summary": "rebind", "purpose": "engineering"})
             )
             multiline, _routing = module._submission_frame(
-                context({"target_hardware": "m3.0", "change_summary": "第一行\r\n第二行\r第三行"})
+                context(
+                    {"target_hardware": "m3.0", "change_summary": "第一行\r\n第二行\r第三行", "purpose": "engineering"}
+                )
             )
         self.assertEqual(routing, {"repository_slug": "mimicverse/description", "base": "main"})
         self.assertEqual(identity["hardware_id"], "m3.0")
@@ -130,6 +133,7 @@ class DagTests(unittest.TestCase):
         forged = {
             "target_hardware": "m3.0",
             "change_summary": "x",
+            "purpose": "engineering",
             # A client-shaped conf claim must never name the submitter.
             "submission_principal": "cli_forged:tenant-a:ou_attacker",
         }

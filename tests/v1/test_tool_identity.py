@@ -80,12 +80,26 @@ class ToolIdentityTests(unittest.TestCase):
     def _publishable_bundle(root: Path) -> Path:
         """A minimal delivery whose inputs pass before the publication identity gate."""
 
+        from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
         from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
 
         bundle = root / "bundle"
         inputs = bundle / "input"
         inputs.mkdir(parents=True)
         (inputs / "arm.SLDASM").write_bytes(b"release-identity fixture\n")
+        (inputs / "request.json").write_bytes(
+            request_evidence_bytes(
+                build_request_evidence(
+                    purpose="engineering",
+                    request_id="fixture-frozen-request",
+                    target_hardware="arm",
+                    change_summary="release identity fixture",
+                    main_assembly="arm.SLDASM",
+                    handoff_digest="a" * 64,
+                    platform_config_digest="c" * 64,
+                )
+            )
+        )
         identity = {
             "kind": "source-revision",
             "handoff_digest": digest({"fixture": "arm"}),
@@ -151,6 +165,7 @@ class ToolIdentityTests(unittest.TestCase):
             ):
                 result = steps.publish_model(bundle, root / "repository")
             publish.assert_called_once()
+            self.assertEqual(publish.call_args.kwargs["branch"], "work/solidworks/arm/engineering")
             self.assertTrue(result["passed"])
             self.assertEqual(result["subject_sha256"], "a" * 64)
             self.assertEqual(read_data(bundle / "reports/pr.json")["url"], submission["url"])

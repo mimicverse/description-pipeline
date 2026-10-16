@@ -26,8 +26,9 @@ import time
 from pathlib import Path
 
 from ..delivery import check_layout, read_delivery_manifest, read_source_record, subject_digest
-from ..interface_records import validate_source_record
+from ..interface_records import REQUEST_PURPOSES, validate_source_record
 from ..io import PipelineError, acquire_process_lock, confined, file_digest
+from ..request_evidence import read_request_evidence
 from ..stages import record_check
 
 #: The target delivery tree (contracts §交付格式与摘要): manifest.json is the
@@ -51,6 +52,7 @@ REPORTS_FILES = ("quality.json",)
 REQUIRED_FILES = (
     "manifest.json",
     "input/handoff.json",
+    "input/request.json",
     "input/source.json",
     "model/robot.json",
     "urdf/robot.urdf",
@@ -58,7 +60,7 @@ REQUIRED_FILES = (
     "reports/quality.json",
 )
 REQUIRED_DIRS = ("input", "evidence", "model", "urdf", "meshes")
-REVIEW_BRANCH = "work/solidworks/{hardware}"
+REVIEW_BRANCH = "work/solidworks/{hardware}/{purpose}"
 PUBLISHER_MARKER = "Urdf-Publisher: description-pipeline"
 log = logging.getLogger(__name__)
 
@@ -84,6 +86,14 @@ def _slug_hardware(value: str) -> str:
     if not slug or slug.startswith("-"):
         raise PrError("hardware_id_invalid", value)
     return slug
+
+
+def review_branch(hardware: str, purpose: str) -> str:
+    """The one managed review branch of a (repository, hardware, purpose) candidate."""
+
+    if purpose not in REQUEST_PURPOSES:
+        raise PrError("purpose_not_supported", {"hardware": hardware, "purpose": purpose})
+    return REVIEW_BRANCH.format(hardware=_slug_hardware(hardware), purpose=purpose)
 
 
 def _origin_slug(repository: Path) -> str:
@@ -181,7 +191,20 @@ def _check_successor(previous: dict, current: dict) -> None:
         raise PrError("cad_revision_conflict", "CAD hardware identity changed across the review branch")
 
 
-def _validate(bundle: Path) -> tuple[str, dict, dict]:
+def _bundle_purpose(bundle: Path) -> str:
+    """The frozen request's submission purpose: the one read-only identity source."""
+
+    try:
+        record, _sha = read_request_evidence(bundle / "input" / "request.json")
+    except PipelineError as error:
+        raise PrError("bundle_records_invalid", str(error)) from error
+    purpose = str(record.get("purpose") or "")
+    if purpose not in REQUEST_PURPOSES:
+        raise PrError("bundle_records_invalid", {"purpose": purpose})
+    return purpose
+
+
+def _validate(bundle: Path) -> tuple[str, str, dict, dict]:
     for name in REQUIRED_FILES:
         if not (bundle / name).is_file():
             raise PrError("bundle_incomplete", name)
@@ -207,11 +230,12 @@ def _validate(bundle: Path) -> tuple[str, dict, dict]:
         source = read_source_record(bundle)
     except PipelineError as error:
         raise PrError("bundle_records_invalid", str(error)) from error
+    purpose = _bundle_purpose(bundle)
     hardware = _slug_hardware(str(source["selection"]["hardware_id"]))
     current = _identity_of(source)
     # The CAD/PDM revision label is optional engineering metadata: a missing
     # value stays missing and is never a publication rejection reason.
-    return hardware, manifest, current
+    return hardware, purpose, manifest, current
 
 
 def _previous_revision(worktree: Path, hardware: str) -> dict | None:
@@ -226,7 +250,7 @@ def _previous_revision(worktree: Path, hardware: str) -> dict | None:
     return _identity_of(source)
 
 
-def published_revision(repository: Path, hardware: str) -> dict | None:
+def published_revision(repository: Path, hardware: str, purpose: str) -> dict | None:
     """Read the published input/source.json of one hardware review branch (read-only).
 
     Best-effort identity resolution for the submission lane: it fetches the
@@ -237,7 +261,7 @@ def published_revision(repository: Path, hardware: str) -> dict | None:
     deciding gate.
     """
 
-    branch = REVIEW_BRANCH.format(hardware=hardware)
+    branch = review_branch(hardware, purpose)
     _validate_ref(repository, branch, branch=True)
     try:
         fetched = subprocess.run(
@@ -592,8 +616,8 @@ def submit_bundle(
         )
 
     try:
-        hardware, _, current_revision = _validate(bundle)
-        expected = REVIEW_BRANCH.format(hardware=hardware)
+        hardware, purpose, _manifest, current_revision = _validate(bundle)
+        expected = review_branch(hardware, purpose)
         if branch != expected:
             raise PrError("branch_not_deterministic", {"expected": expected})
         _validate_ref(repository, base, branch=False)

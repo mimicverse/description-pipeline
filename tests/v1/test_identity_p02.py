@@ -286,19 +286,29 @@ class SubmissionIdentityHelperTests(unittest.TestCase):
 
     def test_unconfigured_target_fails_closed(self) -> None:
         with self.assertRaises(EndpointProtocolError) as caught:
-            submission_identity(target_hardware="ghost", config=self._config())
+            submission_identity(target_hardware="ghost", purpose="engineering", config=self._config())
         self.assertIn("not a configured publication target", str(caught.exception))
 
     def test_absent_target_returns_none(self) -> None:
-        self.assertIsNone(submission_identity(target_hardware="", config=self._config()))
+        self.assertIsNone(submission_identity(target_hardware="", purpose="engineering", config=self._config()))
+
+    def test_an_undeclared_purpose_is_refused(self) -> None:
+        with self.assertRaises(EndpointProtocolError):
+            submission_identity(
+                target_hardware="m3.0",
+                purpose="other",
+                config=self._config(),
+                published_revision=lambda repository, hardware, purpose: None,
+            )
 
     def test_payload_carries_owner_summary_and_parent(self) -> None:
         payload = submission_identity(
             target_hardware="m3.0",
             change_summary="one line",
             principal="cli_app:tenant-a:ou_worker",
+            purpose="engineering",
             config=self._config(),
-            published_revision=lambda repository, hardware: {"revision": "m3.0-20261001-deadbeef"},
+            published_revision=lambda repository, hardware, purpose: {"revision": "m3.0-20261001-deadbeef"},
         )
         self.assertEqual(payload["hardware_id"], "m3.0")
         self.assertEqual(payload["owner"], "cli_app:tenant-a:ou_worker")
@@ -309,11 +319,12 @@ class SubmissionIdentityHelperTests(unittest.TestCase):
     def test_reader_failure_is_best_effort_with_a_warning(self) -> None:
         warnings: list[str] = []
 
-        def boom(repository, hardware):
+        def boom(repository, hardware, purpose):
             raise subprocess.TimeoutExpired("git fetch", 60)
 
         payload = submission_identity(
             target_hardware="m3.0",
+            purpose="engineering",
             config=self._config(),
             published_revision=boom,
             warn=warnings.append,
@@ -331,5 +342,5 @@ class PublishedRevisionTimeoutTests(unittest.TestCase):
             patch.object(urdf_pr.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 60)),
             self.assertRaises(urdf_pr.PrError) as raised,
         ):
-            urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0")
+            urdf_pr.published_revision(Path("/srv/models/arm"), "m3.0", "engineering")
         self.assertEqual(raised.exception.code, "published_revision_unknown")
