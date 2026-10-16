@@ -113,19 +113,6 @@ def _work_paths(conn_id: str, run_id: str) -> flow.RunPaths:
     return flow.RunPaths(config.store_root, run_id)
 
 
-class _FreezePaths:
-    """The legacy freezer path signature over the flow layout; carries no business state."""
-
-    def __init__(self, root: str | Path) -> None:
-        self._root = Path(root)
-
-    def stage_dir(self, run_id: str, stage: str) -> Path:
-        return flow.RunPaths(self._root, run_id).stage_dir(stage)
-
-    def run_dir(self, run_id: str) -> Path:
-        return flow.RunPaths(self._root, run_id).run_dir
-
-
 def _platform_binding() -> tuple[PlatformStore, Path]:
     """The platform registration binding: service DSN plus the sealed resolver over the store root."""
     config = config_from_airflow_connection(CONN_ID)
@@ -435,11 +422,11 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
     return receipt
 
 
-def _register_freeze_stage(store: _FreezePaths, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
+def _register_freeze_stage(paths: flow.RunPaths, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
     """Seal the admitted originals with the frozen request evidence and confirm the freeze stage."""
     platform, store_root = _platform_binding()
     platform.start_run(run_id)  # the first driver action claims the admitted run
-    tree = store.stage_dir(run_id, "freeze")
+    tree = paths.stage_dir("freeze")
     try:
         if not (tree / "manifest.json").is_file():
             _ensure_subject_layout(tree)
@@ -448,7 +435,7 @@ def _register_freeze_stage(store: _FreezePaths, run_id: str, *, intake: Path, up
                 target = confined(tree, f"input/{name}", exists=False)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
-            request = store.run_dir(run_id) / "input" / "request.json"
+            request = paths.run_dir / "input" / "request.json"
             if not request.is_file():
                 raise AirflowFailException("The freeze stage carries no frozen input/request.json")
             shutil.copy2(request, tree / "input" / "request.json")
@@ -1346,9 +1333,9 @@ def solidworks_to_urdf():
             raise AirflowFailException(
                 "conf platform_config_digest does not match the controlled platform configuration identity"
             )
-        store = _FreezePaths(_work_paths(CONN_ID, run_id).root)
+        paths = _work_paths(CONN_ID, run_id)
         evidence = freeze_request_evidence(
-            store.run_dir(run_id),
+            paths.run_dir,
             request_id=request_id,
             target_hardware=identity["hardware_id"],
             change_summary=identity.get("change_summary") or "",
@@ -1358,7 +1345,7 @@ def solidworks_to_urdf():
         )
         request["request_evidence"] = str(evidence)
         request["request_id"] = request_id
-        _register_freeze_stage(store, run_id, intake=intake, upload_files=upload_files)
+        _register_freeze_stage(paths, run_id, intake=intake, upload_files=upload_files)
         return request
 
     @task.sensor(
