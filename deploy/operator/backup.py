@@ -4,6 +4,12 @@
 The key file lives under the state root (0600) and never leaves it; the sealed archive is the
 single artifact the promotion manifest binds, and ``open`` reproduces the sealed bytes exactly.
 
+``clean-staging`` is the one owner of private-staging cleanup: it removes exactly
+``<receipt dir>/backup`` - the tree ``seal`` and ``manifest`` bind - and never a source root,
+the sealed archive, the manifest, the key reference or the recorded evidence; a non-canonical
+receipt path (a ``.`` or ``..`` component, or a symlinked component) is refused before
+anything is touched.
+
 Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 """
 
@@ -13,6 +19,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tarfile
@@ -23,6 +30,7 @@ import install_record
 
 MANIFEST_SCHEMA = "solidworks-to-urdf.promote-backup/v1"
 CIPHER = "aes-256-cbc"
+STAGING_DIRNAME = "backup"
 
 
 def die(message: str) -> None:
@@ -177,6 +185,77 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
     require(not extras, f"the archive carries members outside the manifest: {extras[:3]}")
 
 
+def _remove_staging_tree(root: Path) -> None:
+    """Depth-first removal of one real directory strictly inside the private staging.
+
+    Only this subtree is ever modified: every real directory has its mode normalized u+rwx
+    before its entries are removed (the staging copies carry the source roots' read-only
+    modes, which block unlink and rmdir), and symlinks are unlinked as leaves - never
+    followed - so no chmod or unlink ever reaches a symlink target or any path outside root.
+    """
+
+    os.chmod(root, stat.S_IMODE(os.stat(root).st_mode) | 0o700)
+    for entry in os.scandir(root):
+        if entry.is_symlink():
+            os.unlink(entry.path)
+        elif entry.is_dir(follow_symlinks=False):
+            _remove_staging_tree(Path(entry.path))
+        else:
+            os.unlink(entry.path)
+    os.rmdir(root)
+
+
+def _require_canonical_receipt_path(receipt: Path) -> None:
+    """The receipt path must provably name the directory it spells, before anything is touched.
+
+    A ``.`` or ``..`` component, or a symlinked component anywhere in the chain, would let the
+    cleanup resolve to another real location than the argument reads as (the PR #61 boundary
+    probes).  The raw input must equal its non-strict resolve, and every component of the chain
+    must be a real directory entry - never a symlink.  Either refusal happens ahead of any
+    chmod or unlink, so the whole target stays untouched.
+    """
+
+    require(
+        str(receipt) == os.path.realpath(receipt),
+        f"the receipt directory must be a canonical path (no '.' or '..' or symbolic link components); "
+        f"refused: {receipt}",
+    )
+    chain = Path(receipt.anchor)
+    for part in receipt.parts[1:]:
+        chain = chain / part
+        require(
+            not chain.is_symlink(),
+            f"the receipt path must not contain a symbolic link component; refused: {chain}",
+        )
+
+
+def remove_private_staging(receipt_dir: Path) -> bool:
+    """The one owner of private-staging cleanup: remove ``<receipt_dir>/backup``, nothing else.
+
+    The promotion flow copies the running deployment's roots into that staging with their
+    original modes (``cp -a`` / ``copytree`` preserve 0555 directories and 0444 files), so a
+    plain ``rm -rf`` cannot remove it and a retry's ``rmtree`` fails the same way.  The guards
+    make the target provable: the receipt path must be canonical (no '.'/'..' and no symlinked
+    component, refused ahead of any mutation), the receipt directory must carry
+    ``receipt.json``, and the staging root itself must be a real directory - a symlink is
+    refused, never followed.  Returns whether the staging existed.
+    """
+
+    receipt = Path(receipt_dir)
+    require(receipt.is_absolute(), "clean-staging requires an absolute receipt directory")
+    _require_canonical_receipt_path(receipt)
+    marker = receipt / "receipt.json"
+    require(marker.is_file() and not marker.is_symlink(), f"not a promotion receipt directory: {receipt}")
+    root = receipt / STAGING_DIRNAME
+    if root.is_symlink():
+        die(f"the private staging is a symbolic link; refused: {root}")
+    if not root.exists():
+        return False
+    require(root.is_dir(), f"the private staging is not a directory; refused: {root}")
+    _remove_staging_tree(root)
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="backup.py", description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -196,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
     manifest_parser.add_argument("--sealed", type=Path, required=True)
     manifest_parser.add_argument("--key", type=Path, required=True)
     manifest_parser.add_argument("--out", type=Path, required=True)
+    clean_parser = subparsers.add_parser("clean-staging")
+    clean_parser.add_argument("--receipt-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.action == "key":
         ensure_key(args.path)
@@ -214,6 +295,10 @@ def main(argv: list[str] | None = None) -> int:
         manifest = write_manifest(args.source, args.sealed, args.key, args.out)
         print(f"manifest={args.out}")
         print(f"sealed_sha256={manifest['encrypted']['sha256']}")
+        return 0
+    if args.action == "clean-staging":
+        removed = remove_private_staging(args.receipt_dir)
+        print("staging=removed" if removed else "staging=absent")
         return 0
     return 2
 

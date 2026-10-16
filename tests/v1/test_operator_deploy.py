@@ -2729,6 +2729,175 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(steps["stop-services"], "failed")
             self.assertNotIn("windows-switch", steps)
 
+    def test_promote_seals_readonly_roots_without_changing_them(self) -> None:
+        """The backup step copies the running roots with their modes (0555 directories, 0444
+        files - the W5 v8 R2 stop): the copy is sealed, the single staging owner removes the
+        read-only staging, and the source roots keep their bytes and modes untouched."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            roots = [Path(tmp) / name for name in ("handoffs", "specifications", "artifacts")]
+            for root in roots:
+                (root / "sealed-entry").mkdir(parents=True)
+                frozen = root / "sealed-entry" / "frozen.dat"
+                frozen.write_bytes(f"frozen-{root.name}".encode())
+                frozen.chmod(0o444)
+                (root / "sealed-entry").chmod(0o555)
+            digests_before = self._digest_tree(*roots)
+            modes_before = {
+                str(path): stat.S_IMODE(path.lstat().st_mode) for root in roots for path in sorted(root.rglob("*"))
+            }
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertEqual(self._digest_tree(*roots), digests_before, "source bytes must not change")
+            self.assertEqual(
+                {
+                    str(path): stat.S_IMODE(path.lstat().st_mode)
+                    for root in roots
+                    for path in sorted(root.rglob("*"))
+                },
+                modes_before,
+                "source modes must not change; nothing outside the private staging is ever chmod-ed",
+            )
+            receipt_dir = state / "promotions" / "gen-2"
+            self.assertFalse((receipt_dir / "backup").exists(), "the plaintext staging must be gone")
+            sealed = receipt_dir / "backup.tar.enc"
+            manifest = json.loads((receipt_dir / "evidence" / "backup-manifest.json").read_text(encoding="utf-8"))
+            archive_bytes = sealed.read_bytes()
+            self.assertEqual(hashlib.sha256(archive_bytes).hexdigest(), manifest["encrypted"]["sha256"])
+            self.assertIn("handoff/sealed-entry/frozen.dat", manifest["files"])
+            self.assertIn("specifications/root-0/sealed-entry/frozen.dat", manifest["files"])
+            self.assertIn("artifacts/sealed-entry/frozen.dat", manifest["files"])
+            again = run(
+                [
+                    "python3", str(release / "operator" / "backup.py"),
+                    "clean-staging", "--receipt-dir", str(receipt_dir),
+                ],
+                {},
+            )
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+            self.assertEqual(again.stdout.strip(), "staging=absent")
+            self.assertEqual(sealed.read_bytes(), archive_bytes, "the sealed archive stays byte-identical")
+            self.assertEqual(
+                (receipt_dir / "evidence" / "backup-staging-clean.out").read_text(encoding="utf-8").strip(),
+                "staging=absent",
+            )
+            rows = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))["steps"]
+            backup_rows = [row for row in rows if row["step"] == "backup"]
+            self.assertEqual([row["status"] for row in backup_rows], ["completed"])
+            self.assertTrue(
+                any(str(path).endswith("backup-staging-removed.out") for path in backup_rows[0]["evidence"])
+            )
+            self.assertEqual(
+                (receipt_dir / "evidence" / "backup-staging-removed.out").read_text(encoding="utf-8").strip(),
+                "staging=removed",
+            )
+
+    def test_promote_retry_cleans_a_readonly_partial_staging(self) -> None:
+        """A failed attempt's leftover staging - copied read-only modes, a stale marker and the
+        cp -a target already in place - is removed before the rebuild: the retry succeeds with
+        fresh non-nested copies and no stale content in the sealed closure."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            handoffs = Path(tmp) / "handoffs"
+            handoffs.mkdir(exist_ok=True)
+            (handoffs / "kept.dat").write_bytes(b"kept")
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            receipt_dir = state / "promotions" / "gen-2"
+            leftover = receipt_dir / "backup"
+            (leftover / "handoff" / "sealed").mkdir(parents=True)
+            (leftover / "handoff" / "sealed" / "frozen.dat").write_bytes(b"leftover")
+            (leftover / "handoff" / "sealed" / "frozen.dat").chmod(0o444)
+            (leftover / "stale-leftover.dat").write_bytes(b"stale")
+            (leftover / "stale-leftover.dat").chmod(0o444)
+            (leftover / "state" / "install-records").mkdir(parents=True)
+            (leftover / "state" / "install-records" / "nested-decoy.json").write_bytes(b"decoy")
+            (leftover / "state" / "install-records" / "nested-decoy.json").chmod(0o444)
+            (leftover / "state" / "install-records").chmod(0o555)
+            (leftover / "handoff" / "sealed").chmod(0o555)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertFalse((receipt_dir / "backup").exists(), "no leftover staging may survive the retry")
+            manifest = json.loads((receipt_dir / "evidence" / "backup-manifest.json").read_text(encoding="utf-8"))
+            files = manifest["files"]
+            self.assertIn("state/install-records/gen-1.json", files)
+            self.assertIn("handoff/kept.dat", files)
+            self.assertNotIn("handoff/sealed/frozen.dat", files)
+            self.assertFalse([name for name in files if "install-records/install-records" in name])
+            self.assertFalse([name for name in files if "stale" in name or "decoy" in name])
+            self.assertEqual(
+                (receipt_dir / "evidence" / "backup-staging-clean.out").read_text(encoding="utf-8").strip(),
+                "staging=removed",
+            )
+            archive = receipt_dir / "backup.tar.enc"
+            self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), manifest["encrypted"]["sha256"])
+            rows = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))["steps"]
+            self.assertEqual({row["status"] for row in rows}, {"completed"})
+
+    def test_promote_refuses_a_symlinked_staging_and_records_backup_failed(self) -> None:
+        """Forced cleanup failure: a symlinked staging root is refused, the failure is recorded
+        under the backup step with its evidence, the run stops before stop-services, and both
+        the admission and the active generation stay untouched."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            receipt_dir = state / "promotions" / "gen-2"
+            outside = Path(tmp) / "outside-target"
+            outside.mkdir()
+            (outside / "keep.dat").write_bytes(b"keep")
+            (receipt_dir / "backup").symlink_to(outside, target_is_directory=True)
+            order.write_text("", encoding="utf-8")
+            refused = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("could not be cleaned", refused.stderr)
+            rows = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))["steps"]
+            self.assertEqual(
+                [(row["step"], row["status"]) for row in rows],
+                [
+                    ("linux-generation", "completed"),
+                    ("windows-generation", "completed"),
+                    ("close-admission", "completed"),
+                    ("drain", "completed"),
+                    ("backup", "failed"),
+                ],
+            )
+            failed_row = rows[-1]
+            self.assertEqual(failed_row["verb"], "promote")
+            evidence = Path(failed_row["evidence"][0])
+            self.assertEqual(evidence.name, "backup-staging-clean.out")
+            self.assertTrue(evidence.is_file())
+            self.assertIn("symbolic link; refused", evidence.read_text(encoding="utf-8"))
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+            self.assertEqual(
+                json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
+            )
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("services_stop", lines)
+            self.assertFalse([line for line in lines if line.startswith("scp ") or "psql_platform_apply" in line])
+            self.assertFalse((receipt_dir / "backup.tar.enc").exists(), "no sealed artifact may exist")
+            self.assertTrue((receipt_dir / "backup").is_symlink(), "the refusal never touches the link")
+            self.assertEqual((outside / "keep.dat").read_bytes(), b"keep")
+
     def test_promote_start_failure_stays_closed_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
@@ -2978,6 +3147,159 @@ class InstallOrderingTests(unittest.TestCase):
                 )
                 self.assertFalse((state / "install-record.json").exists())
                 self.assertFalse(order.exists(), "no installation leg may run")
+
+
+class BackupStagingCleanupUnitTests(unittest.TestCase):
+    """backup.py clean-staging (unit-level): the single private-staging cleanup owner.
+
+    The scripted end-to-end promote paths that consume it live in InstallOrderingTests."""
+
+    CONTROL = OPERATOR / "backup.py"
+
+    @staticmethod
+    def _snapshot(root: Path) -> dict[str, object]:
+        snapshot: dict[str, object] = {}
+        for current, dirnames, filenames in os.walk(root, followlinks=False):
+            for name in sorted(dirnames + filenames):
+                path = Path(current) / name
+                relative = path.relative_to(root).as_posix()
+                mode = stat.S_IMODE(path.lstat().st_mode)
+                if path.is_symlink():
+                    snapshot[relative] = (mode, "link", os.readlink(path))
+                elif path.is_dir():
+                    snapshot[relative] = (mode, "dir")
+                else:
+                    snapshot[relative] = (mode, "file", hashlib.sha256(path.read_bytes()).hexdigest())
+        return snapshot
+
+    def _clean(self, receipt: Path) -> subprocess.CompletedProcess:
+        return run([sys.executable, str(self.CONTROL), "clean-staging", "--receipt-dir", str(receipt)], {})
+
+    def _fixture(self, tmp: Path) -> tuple[Path, Path]:
+        """A promotion receipt directory with a read-only private staging (0555/0444 copies,
+        a zero-mode nested directory and a symlink entry) and an outside tree the symlink
+        points at."""
+
+        receipt = tmp / "receipt"
+        (receipt / "evidence").mkdir(parents=True)
+        (receipt / "receipt.json").write_text('{"fixture": true}\n', encoding="utf-8")
+        (receipt / "backup.tar.enc").write_bytes(b"sealed-archive-bytes")
+        (receipt / "evidence" / "backup-manifest.json").write_bytes(b"manifest-bytes")
+        outside = tmp / "outside"
+        (outside / "keep").mkdir(parents=True)
+        (outside / "keep" / "keep.dat").write_bytes(b"keep-me")
+        (outside / "keep" / "keep.dat").chmod(0o444)
+        (outside / "keep").chmod(0o555)
+        staging = receipt / "backup"
+        (staging / "sealed" / "deeper").mkdir(parents=True)
+        (staging / "sealed" / "frozen.dat").write_bytes(b"frozen")
+        (staging / "sealed" / "deeper" / "nested.dat").write_bytes(b"nested")
+        (staging / "stale.dat").write_bytes(b"stale")
+        (staging / "escape-link").symlink_to(outside, target_is_directory=True)
+        (staging / "sealed" / "frozen.dat").chmod(0o444)
+        (staging / "sealed" / "deeper").chmod(0o000)
+        (staging / "sealed").chmod(0o555)
+        (staging / "stale.dat").chmod(0o444)
+        return receipt, outside
+
+    def test_removes_the_readonly_staging_and_preserves_everything_else(self) -> None:
+        """The read-only staging is removed; the receipt's siblings, the evidence and the
+        symlink's target stay byte- and mode-identical, and a second run is a clean no-op."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt, outside = self._fixture(Path(tmp))
+            tracked = {
+                "receipt": receipt / "receipt.json",
+                "archive": receipt / "backup.tar.enc",
+                "manifest": receipt / "evidence" / "backup-manifest.json",
+            }
+            digests_before = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in tracked.items()}
+            modes_before = {name: stat.S_IMODE(path.lstat().st_mode) for name, path in tracked.items()}
+            outside_before = self._snapshot(outside)
+            cleaned = self._clean(receipt)
+            self.assertEqual(cleaned.returncode, 0, cleaned.stdout + cleaned.stderr)
+            self.assertEqual(cleaned.stdout.strip(), "staging=removed")
+            self.assertFalse((receipt / "backup").exists())
+            self.assertEqual(
+                {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in tracked.items()},
+                digests_before,
+            )
+            self.assertEqual({name: stat.S_IMODE(path.lstat().st_mode) for name, path in tracked.items()}, modes_before)
+            self.assertEqual(self._snapshot(outside), outside_before, "the symlink target must be untouched")
+            second = self._clean(receipt)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertEqual(second.stdout.strip(), "staging=absent")
+
+    def test_refuses_symlinked_mistyped_and_unmarked_targets(self) -> None:
+        """Unsafe roots are refused instead of resolved: a symlinked staging, a non-directory
+        staging, a directory without the receipt marker and a relative receipt path."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            outside = tmp / "outside"
+            outside.mkdir()
+            (outside / "keep.dat").write_bytes(b"keep")
+            receipt = tmp / "receipt"
+            receipt.mkdir()
+            (receipt / "receipt.json").write_text("{}\n", encoding="utf-8")
+            (receipt / "backup").symlink_to(outside, target_is_directory=True)
+            refused = self._clean(receipt)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("symbolic link; refused", refused.stderr)
+            self.assertTrue((receipt / "backup").is_symlink())
+            self.assertEqual((outside / "keep.dat").read_bytes(), b"keep")
+            (receipt / "backup").unlink()
+            (receipt / "backup").write_bytes(b"not-a-staging")
+            refused = self._clean(receipt)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("not a directory; refused", refused.stderr)
+            self.assertEqual((receipt / "backup").read_bytes(), b"not-a-staging")
+            unmarked = tmp / "unmarked"
+            (unmarked / "backup").mkdir(parents=True)
+            (unmarked / "backup" / "content.dat").write_bytes(b"content")
+            refused = self._clean(unmarked)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("not a promotion receipt directory", refused.stderr)
+            self.assertTrue((unmarked / "backup" / "content.dat").is_file())
+            refused = self._clean(Path("relative-receipt"))
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("absolute receipt directory", refused.stderr)
+
+    def test_refuses_symlinked_ancestors_and_traversal_receipts(self) -> None:
+        """The PR #61 boundary probes: <tmp>/alias/receipt (symlinked ancestor), the
+        <receipt>/child/.. traversal form and a self-loop receipt are all refused with the
+        whole target intact, while the canonical spelling still cleans."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            receipt = tmp / "real" / "receipt"
+            (receipt / "backup" / "sealed" / "deeper").mkdir(parents=True)
+            (receipt / "receipt.json").write_text("{}\n", encoding="utf-8")
+            (receipt / "backup" / "sealed" / "deeper" / "frozen.dat").write_bytes(b"frozen")
+            (receipt / "backup" / "sealed" / "deeper" / "frozen.dat").chmod(0o444)
+            (receipt / "backup" / "sealed" / "deeper").chmod(0o555)
+            (receipt / "backup" / "sealed").chmod(0o555)
+            (receipt / "child").mkdir()
+            target_before = self._snapshot(receipt)
+            alias = tmp / "alias"
+            alias.symlink_to(tmp / "real", target_is_directory=True)
+            refused = self._clean(alias / "receipt")
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("canonical", refused.stderr)
+            self.assertEqual(self._snapshot(receipt), target_before, "the aliased target must be untouched")
+            refused = self._clean(receipt / "child" / "..")
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("canonical", refused.stderr)
+            self.assertEqual(self._snapshot(receipt), target_before, "the traversal form must remove nothing")
+            loop = tmp / "loop"
+            loop.symlink_to("loop")
+            refused = self._clean(loop)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("symbolic link component", refused.stderr)
+            self.assertTrue(loop.is_symlink())
+            cleaned = self._clean(receipt)
+            self.assertEqual(cleaned.returncode, 0, cleaned.stdout + cleaned.stderr)
+            self.assertEqual(cleaned.stdout.strip(), "staging=removed")
 
 
 class InstallPostgresBehaviorTests(unittest.TestCase):

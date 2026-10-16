@@ -1006,8 +1006,17 @@ PY
     promotion_step "$CANDIDATE_ID" promote drain completed "$EVIDENCE_DIR/drain.out"
     # 3. a recoverable backup: one consistent PostgreSQL snapshot plus the referenced
     #    configuration closure (records, snapshots, derived files, resolved.env), the frozen
-    #    handoff originals and the artifact roots - bound in one manifest with real digests
+    #    handoff originals and the artifact roots - bound in one manifest with real digests.
+    #    The private staging is removed first and last by its one auditable owner
+    #    (backup.py clean-staging, which normalizes the copied read-only modes inside the
+    #    staging only): a leftover partial staging would otherwise nest under the cp -a
+    #    targets or abort the copy, and the copied 0555 directories would abort a plain rm.
     BACKUP_DIR="$RECEIPT_DIR/backup"
+    if ! python3 "$HERE/backup.py" clean-staging --receipt-dir "$RECEIPT_DIR" \
+        > "$EVIDENCE_DIR/backup-staging-clean.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-staging-clean.out"
+      die "the private backup staging could not be cleaned (the admission stays closed)"
+    fi
     mkdir -p "$BACKUP_DIR/state"
     cp -p "$STATE_ROOT/install-record.json" "$BACKUP_DIR/state/install-record.json"
     cp -a "$STATE_ROOT/install-records" "$BACKUP_DIR/state/install-records"
@@ -1033,8 +1042,6 @@ for name, target in (("handoff_root", "handoff"), ("artifact_root", "artifacts")
     source = Path(storage[name])
     if source.is_dir():
         destination = backup / target
-        if destination.exists():
-            shutil.rmtree(destination)
         shutil.copytree(source, destination, symlinks=False)
         copied[name] = str(destination)
 # The specification library the snapshot references travels with its files too; the diagnostic
@@ -1043,8 +1050,6 @@ for index, root in enumerate(resolved.get("specifications", {}).get("record_root
     source = Path(root)
     if source.is_dir():
         destination = backup / "specifications" / f"root-{index}"
-        if destination.exists():
-            shutil.rmtree(destination)
         shutil.copytree(source, destination, symlinks=False)
         copied[f"record_root_{index}"] = str(destination)
 captured_secrets = {}
@@ -1101,10 +1106,17 @@ PY
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-manifest.out"
       die "the backup manifest could not be written (the admission stays closed)"
     fi
-    promotion_step "$CANDIDATE_ID" promote backup completed "$EVIDENCE_DIR/backup-manifest.json"
     # The sealed archive replaces the plaintext staging: the encrypted artifact plus the
-    # manifest are the only restore inputs that remain.
-    rm -rf "$BACKUP_DIR"
+    # manifest are the only restore inputs that remain.  The same single owner removes the
+    # staging, so a cleanup failure is recorded under this step - before any service stop or
+    # pointer switch - and the step completes only after the removal succeeded.
+    if ! python3 "$HERE/backup.py" clean-staging --receipt-dir "$RECEIPT_DIR" \
+        > "$EVIDENCE_DIR/backup-staging-removed.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-staging-removed.out"
+      die "the sealed backup staging could not be removed (the admission stays closed)"
+    fi
+    promotion_step "$CANDIDATE_ID" promote backup completed \
+      "$EVIDENCE_DIR/backup-manifest.json" "$EVIDENCE_DIR/backup-staging-removed.out"
     # 4. both ends' execution services stop before the pointers move
     if ! {
       airflow_lifecycle stop \
