@@ -20,9 +20,24 @@ RUN_DIR="$(mktemp -d "$EVIDENCE_DIR/run-XXXXXXXX")"
 SUMMARY="$RUN_DIR/summary.txt"
 mkdir -p "$RUN_DIR/attempts"
 
-# Monotonic time in milliseconds: /proc/uptime never jumps backwards.
-now_ms() { awk '{printf "%d", $1 * 1000}' /proc/uptime; }
-to_ms() { awk -v s="$1" 'BEGIN{printf "%d", s * 1000}'; }
+# Monotonic time in milliseconds, in bash 64-bit arithmetic: /proc/uptime never jumps backwards
+# and mawk's %d saturates at 32 bits, so no awk ever touches the millisecond arithmetic.
+uptime_ms() {
+  local int frac
+  int="${1%%.*}"
+  frac="${1#*.}"
+  [ "$frac" = "$1" ] && frac=""
+  case ${#frac} in
+    0) frac=000 ;;
+    1) frac="${frac}00" ;;
+    2) frac="${frac}0" ;;
+    3) : ;;
+    *) frac="${frac:0:3}" ;;
+  esac
+  printf '%d' $(( int * 1000 + 10#$frac ))
+}
+now_ms() { local up _; read -r up _ < /proc/uptime; uptime_ms "$up"; }
+to_ms() { uptime_ms "$1"; }
 min_s() { awk -v a="$1" -v b="$2" 'BEGIN{ x = (a < b) ? a : b; if (x < 0.001) x = 0.001; printf "%.3f", x }'; }
 
 start_ms="$(now_ms)"
