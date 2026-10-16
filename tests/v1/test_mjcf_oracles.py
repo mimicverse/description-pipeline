@@ -1262,5 +1262,74 @@ class SupportOracleTest(unittest.TestCase):
                             "centroid-shift support-site tamper not rejected")
 
 
+class SparseOracleTest(unittest.TestCase):
+    """Sparse defaults -> actual MjModel numeric oracle.
+
+    Complements the XML-text and report-projection assertions in
+    ``tests/v1/test_mjcf.py``: this class verifies the compiled model values of
+    the versioned defaults and the link-only support default name against an
+    independent derivation, without duplicating configuration-field checks.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = FIX["base"]
+        cls.root = FIX["root"]
+        cls.spec = FIX["spec"]
+        cls.no_config = cls.base / "sparse-oracle-no-config"
+        run_cli(["mjcf", "build", str(cls.root), "--urdf", URDF_REL,
+                 "--output", str(cls.no_config)])
+        # Minimal sparse object: base/collision/simulation and the floor
+        # height/friction all fall back to the versioned defaults.
+        config = cls.base / "sparse-oracle-support.json"
+        config.write_text(json.dumps({"support_sites": [{"link": "slider_link"}],
+                                      "floor": {}}), encoding="utf-8")
+        cls.support_delivery = cls.base / "sparse-oracle-support"
+        build_delivery(cls.root, URDF_REL, config, cls.support_delivery)
+
+    def test_sparse_defaults_compile_to_policy_values(self):
+        model = load_model(self.no_config / "robot.xml")
+        free = [i for i in range(model.njnt)
+                if model.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE]
+        self.assertEqual(1, len(free), "default base must be floating")
+        collisions = [g for g in range(model.ngeom) if _geom_role(model, g) == "collision"]
+        expected = sum(len(entry["collisions"]) for entry in self.spec.links.values())
+        self.assertEqual(expected, len(collisions), "default collision.source is urdf")
+        for geom in collisions:
+            self.assertEqual((int(model.geom_contype[geom]), int(model.geom_conaffinity[geom])), (1, 1))
+            self.assertEqual(3, int(model.geom_condim[geom]))
+            self.assertTrue(close_matrix(model.geom_friction[geom], [0.8, 0.005, 0.0001], 1e-12))
+        self.assertAlmostEqual(0.001, float(model.opt.timestep), delta=1e-15)
+        self.assertTrue(close_matrix(model.opt.gravity, [0.0, 0.0, -9.81], 1e-12))
+        self.assertEqual(3, int(model.opt.integrator))
+        self.assertEqual(0, int(model.nsite))
+        self.assertFalse((self.no_config / "scene.xml").exists())
+
+    def test_support_default_name_and_supports_floor_compile(self):
+        self.assertEqual(0, check_delivery(self.support_delivery).returncode)
+        model = load_model(self.support_delivery / "robot.xml")
+        sid = site_id(model, "slider_link__support")
+        self.assertEqual("slider_link", model.body(int(model.site_bodyid[sid])).name)
+        data = zero_kinematics(model)
+        triangles = support_geometry_points(
+            self.spec, "slider_link", "urdf", self.root).reshape(-1, 3, 3)
+        centroid, z_world, x_world = derive_support(triangles)
+        self.assertTrue(close_matrix(data.site_xpos[sid], centroid, 1e-9),
+                        "the default-named support site must match the independent derivation")
+        expected_rot = np.column_stack([x_world, np.cross(z_world, x_world), z_world])
+        self.assertTrue(close_matrix(np.array(data.site_xmat[sid]).reshape(3, 3),
+                                     expected_rot, 1e-9))
+        points = support_geometry_points(self.spec, "slider_link", "urdf", self.root)
+        scene = load_model(self.support_delivery / "scene.xml")
+        planes = [g for g in range(scene.ngeom)
+                  if scene.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE]
+        self.assertEqual(1, len(planes))
+        self.assertTrue(close_matrix(scene.geom_friction[planes[0]],
+                                     [0.8, 0.005, 0.0001], 1e-12),
+                        "floor friction must fall back to the default collision friction")
+        self.assertAlmostEqual(float(np.min(points[:, 2])),
+                               float(scene.geom_pos[planes[0]][2]), delta=1e-12)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
