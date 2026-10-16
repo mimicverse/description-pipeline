@@ -16,6 +16,7 @@ closes the connection again; no transaction ever spans an external call.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections.abc import Callable, Mapping
@@ -221,6 +222,24 @@ _FIND_UNKNOWN_ORIGIN = (
     "SELECT 1 FROM operation"
     " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'unresolved' LIMIT 1"
 )
+_READ_ORPHAN_OPERATION = (
+    "SELECT stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+    " FROM operation WHERE operation_id = %s AND run_id = %s FOR UPDATE"
+)
+_BIND_ORPHAN_OPERATION = (
+    "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND task_id IS NULL AND map_index IS NULL"
+    " RETURNING operation_id"
+)
+_READ_ORPHAN_SCHEDULING = (
+    "SELECT state, bucket FROM lifecycle_projection"
+    " WHERE object_kind = 'scheduling' AND object_id = %s"
+)
+_SETTLE_ORPHAN_INTENT = (
+    "UPDATE operation SET state = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND state = 'queued'"
+    " AND kind NOT IN ('reconcile', 'cache_release')"
+)
 _INSERT_STAGE = (
     "INSERT INTO stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
@@ -263,6 +282,18 @@ _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
 
 #: The bound on the registered reuse lineage of one attempt; a longer chain is malformed.
 REUSE_LINEAGE_DEPTH = 256
+
+
+def _stored_reconciliation(row) -> object:
+    """The recorded reconciliation of one locked stage row, for idempotent repeats."""
+
+    receipt = row[1] if row and len(row) > 1 else None
+    if isinstance(receipt, str):
+        try:
+            receipt = json.loads(receipt)
+        except ValueError:
+            return None
+    return receipt.get("reconciliation") if isinstance(receipt, dict) else None
 
 
 def _json(value: Any) -> str | None:
@@ -824,13 +855,21 @@ class PlatformStore:
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
-            if cursor.fetchone() is None:
+            run_row = cursor.fetchone()
+            if run_row is None:
                 raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            run_state = run_row[0]
             cursor.execute(_LOCK_STAGE, (run_id, stage))
             row = cursor.fetchone()
             current = row[0] if row else None
             if current is not None:
                 if current in TERMINAL_STAGE_STATES:
+                    if reconcile is not None:
+                        cursor.execute(_READ_STAGE_ROW, (run_id, stage))
+                        stored = cursor.fetchone()
+                        if _stored_reconciliation(stored) == reconcile:
+                            # The same identity, evidence and outcome repeated: nothing changes.
+                            return
                     raise PlatformStoreError(
                         f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
                     )
@@ -841,6 +880,20 @@ class PlatformStore:
                 if current != "unresolved" and reconcile is not None:
                     raise PlatformStoreError("Reconciliation only confirms an unresolved stage")
             elif reconcile is not None:
+                if isinstance(reconcile.get("binding"), dict):
+                    self._reconcile_orphan_binding(
+                        connection,
+                        cursor,
+                        run_id=run_id,
+                        stage=stage,
+                        state=state,
+                        receipt=receipt,
+                        reconcile=reconcile,
+                        run_state=run_state,
+                        checkpoint_uri=checkpoint_uri,
+                        reused_from_run=reused_from_run,
+                    )
+                    return
                 raise PlatformStoreError("Reconciliation requires the unresolved stage record of this run")
             if reused_from_run is not None:
                 cursor.execute(_READ_RUN_PARENT, (run_id,))
@@ -930,6 +983,125 @@ class PlatformStore:
                 payload={"state": state},
             )
             self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+
+    def _reconcile_orphan_binding(
+        self,
+        connection,
+        cursor,
+        *,
+        run_id: str,
+        stage: str,
+        state: str,
+        receipt: dict | None,
+        reconcile: dict,
+        run_state: object,
+        checkpoint_uri,
+        reused_from_run,
+    ) -> None:
+        """Controlled orphan recovery: bind a queued intent's missing Airflow key, then confirm.
+
+        The one reconcile entry may fill only the missing binding columns of a
+        never-started queued intent (the 1.4.3 pre-candidate shape), from the
+        caller-provided real Airflow full key; the binding is accepted only
+        after the lifecycle view itself shows that operation's scheduling as a
+        terminal failed fact.  Conflict, foreign, missing, ambiguous, live or
+        success facts refuse with zero change (the tentative binding rolls back
+        with the transaction), and no unresolved intermediate state is ever
+        fabricated.
+        """
+
+        if state != "failed":
+            raise PlatformStoreError("An orphan reconciliation records the observed failure")
+        if run_state != "queued":
+            raise PlatformStoreError("Orphan recovery requires the never-started queued run")
+        if checkpoint_uri is not None or reused_from_run is not None:
+            raise PlatformStoreError("An orphan reconciliation carries no checkpoint or reuse binding")
+        if not isinstance(receipt, dict):
+            raise PlatformStoreError("An orphan reconciliation carries its failed receipt")
+        binding = reconcile.get("binding")
+        operation_id = binding.get("operation_id") if isinstance(binding, dict) else None
+        task_id = binding.get("task_id") if isinstance(binding, dict) else None
+        map_index = binding.get("map_index") if isinstance(binding, dict) else None
+        if (
+            not isinstance(operation_id, str)
+            or not operation_id
+            or not isinstance(task_id, str)
+            or not task_id
+            or type(map_index) is not int
+        ):
+            raise PlatformStoreError("An orphan binding names its operation, task id and integer map index")
+        native_run = receipt.get("native_run_id")
+        native_sha = receipt.get("native_receipt_sha256")
+        if not isinstance(native_run, str) or not native_run or not _is_sha256(native_sha):
+            raise PlatformStoreError(
+                "An orphan reconciliation binds its native run id and failed receipt digest"
+            )
+        reconcile_operation = reconcile.get("operation_id")
+        cursor.execute(_FIND_RECONCILE, (reconcile_operation, run_id, stage))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError(
+                "The reconciliation names no registered reconcile operation of this run and stage"
+            )
+        cursor.execute(_READ_ORPHAN_OPERATION, (operation_id, run_id))
+        row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError("The orphan binding names no operation of this run")
+        op_stage, kind, op_state, dag_id, dag_run_id, bound_task, bound_map, operation_key = row
+        if kind not in {"dispatch", "native"}:
+            raise PlatformStoreError("Only a queued dispatch intent may be recovered as an orphan")
+        if op_state != "queued" or bound_task is not None or bound_map is not None:
+            raise PlatformStoreError("The named operation is not an unstarted unbound orphan; refused")
+        if not (isinstance(dag_id, str) and dag_id and isinstance(dag_run_id, str) and dag_run_id):
+            raise PlatformStoreError("The operation lacks its recorded Airflow binding evidence")
+        cursor.execute(_BIND_ORPHAN_OPERATION, (task_id, map_index, operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The orphan binding lost its operation to another writer")
+        cursor.execute(_READ_ORPHAN_SCHEDULING, (operation_id,))
+        scheduling = cursor.fetchone()
+        if (
+            scheduling is None
+            or scheduling[1] != "terminal"
+            or scheduling[0] not in {"failed", "upstream_failed"}
+        ):
+            # A fabricated or ambiguous key joins nothing (unknown), a live task is in
+            # flight and a green task contradicts the failure: all refuse, and the
+            # tentative binding rolls back with this transaction.
+            raise PlatformStoreError(
+                "The bound Airflow task does not prove a terminal failed scheduling fact; refused"
+            )
+        payload_receipt = {**receipt, "reconciliation": reconcile}
+        cursor.execute(_INSERT_STAGE, (run_id, stage, state, _json(payload_receipt), None, None, None))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The orphan stage record lost its run to another writer")
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage=op_stage if isinstance(op_stage, str) and op_stage else stage,
+            kind="binding",
+            operation_id=operation_id,
+            payload={
+                "operation_key": operation_key,
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": task_id,
+                "map_index": map_index,
+                "reconciled_stage": stage,
+                "reconciled_state": state,
+                "native_run_id": native_run,
+                "native_receipt_sha256": native_sha,
+            },
+        )
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="stage",
+            operation_id=reconcile_operation,
+            payload={"state": state},
+        )
+        self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+        cursor.execute(_SETTLE_ORPHAN_INTENT, (state, operation_id, run_id))
+        cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, stage))
 
     def _stage_outcome(self, connection, *, run_id: str, stage: str, state: str) -> None:
         """The run-terminal transition a stage record concludes, in the same transaction.

@@ -121,6 +121,31 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
 class FakeWorld:
     """A tiny in-memory stand-in for the deploy side's schema and two views."""
 
+    _ROLLBACK_FIELDS = (
+        "admission",
+        "requests",
+        "runs",
+        "run_states",
+        "run_from_stage",
+        "operations",
+        "operation_bindings",
+        "task_instances",
+        "stages",
+        "events",
+        "confirmed_publishes",
+        "lifecycle_rows",
+        "run_display_rows",
+    )
+
+    def snapshot_state(self) -> dict:
+        import copy as _copy
+
+        return {name: _copy.deepcopy(getattr(self, name)) for name in self._ROLLBACK_FIELDS}
+
+    def restore_state(self, state: dict) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+
     def __init__(self, *, admission=("open", "window", "operator", NOW, 1)):
         self.admission = admission
         self.requests: list[tuple] = []
@@ -128,6 +153,10 @@ class FakeWorld:
         self.run_states: dict[str, str] = {}
         self.run_from_stage: dict[str, str | None] = {}
         self.operations: dict[str, tuple] = {}
+        #: operation_id -> (dag_id, dag_run_id, task_id, map_index); the view's join key.
+        self.operation_bindings: dict[str, tuple] = {}
+        #: (dag_id, task_id, dag_run_id, map_index) -> task_instance state.
+        self.task_instances: dict[tuple[str, str, str, int], str] = {}
         self.stages: dict[tuple[str, str], tuple] = {}
         self.events: list[tuple] = []
         self.confirmed_publishes: set[tuple[str, str]] = set()
@@ -160,10 +189,15 @@ class FakeConnection:
     def __enter__(self):
         self.world.transactions += 1
         self.world.open_transactions += 1
+        self._undo = self.world.snapshot_state()
         return self
 
     def __exit__(self, *exc):
         self.world.open_transactions -= 1
+        if exc[0] is not None:
+            # A refused transaction rolls back exactly like the real database: the
+            # world is restored and only the statement log and test instruments stay.
+            self.world.restore_state(self._undo)
         return False
 
 
@@ -246,7 +280,66 @@ class FakeCursor:
             else:
                 record = (params[0], "queued", key, params[5], params[1], params[2], params[3])
                 world.operations[key] = record
+                world.operation_bindings[params[0]] = (params[6], params[7], params[8], params[9])
                 self._rows = [record]
+        elif normalized.startswith(
+            "SELECT stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+            " FROM operation WHERE operation_id"
+        ):
+            operation_id, run_id = params
+            bound = None
+            for key, record in world.operations.items():
+                if record[0] != operation_id or record[4] != run_id:
+                    continue
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    operation_id, (None, None, None, None)
+                )
+                bound = (record[5], record[6], record[1], dag_id, dag_run_id, task_id, map_index, key)
+                break
+            self._rows = [bound] if bound is not None else []
+        elif normalized.startswith("UPDATE operation SET task_id = %s, map_index = %s"):
+            task_id, map_index, operation_id, run_id = params
+            updated = None
+            for record in world.operations.values():
+                if record[0] != operation_id or record[4] != run_id:
+                    continue
+                dag_id, dag_run_id, current_task, current_map = world.operation_bindings.get(
+                    operation_id, (None, None, None, None)
+                )
+                if current_task is None and current_map is None:
+                    world.operation_bindings[operation_id] = (dag_id, dag_run_id, task_id, map_index)
+                    updated = (operation_id,)
+                break
+            self._rows = [updated] if updated is not None else []
+        elif normalized.startswith("SELECT state, bucket FROM lifecycle_projection"):
+            (operation_id,) = params
+            state = None
+            found = False
+            for record in world.operations.values():
+                if record[0] != operation_id:
+                    continue
+                found = True
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    operation_id, (None, None, None, None)
+                )
+                if None not in (dag_id, dag_run_id, task_id, map_index):
+                    state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
+                break
+            if state in {
+                "queued",
+                "running",
+                "scheduled",
+                "deferred",
+                "up_for_retry",
+                "up_for_reschedule",
+                "restarting",
+            }:
+                bucket = "in_flight"
+            elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
+                bucket = "terminal"
+            else:
+                bucket = "unknown"
+            self._rows = [(state, bucket)] if found else []
         elif normalized.startswith(
             "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
             " FROM operation WHERE operation_key"
@@ -411,6 +504,20 @@ class FakeCursor:
                     and record[1] != "succeeded"
                 ):
                     world.operations[key] = (record[0], "succeeded", *record[2:])
+            self._rows = []
+        elif normalized.startswith(
+            "UPDATE operation SET state = %s, updated_at = now() WHERE operation_id = %s AND run_id = %s"
+        ):
+            settled, operation_id, run_id = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[0] == operation_id
+                    and record[4] == run_id
+                    and record[1] == "queued"
+                    and record[6] not in {"reconcile", "cache_release"}
+                ):
+                    world.operations[key] = (record[0], settled, *record[2:])
+                    break
             self._rows = []
         elif normalized.startswith("UPDATE operation SET state = %s, updated_at = now() WHERE operation_key"):
             state, key, run_id, stage = params
@@ -1836,6 +1943,203 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, AdmissionClosedError)
         with self.assertRaises(PlatformStoreError):
             self.admit()
+
+
+RUN_A = "portal-20261015T144524-c89993da"
+RUN_B = "portal-20261015T145141-ff63fddc"
+#: The real 1.4.3 task_instance facts of both runs (4090 raw evidence, sha a7c7867a…).
+REAL_TIS = {
+    "resolve_handoff": "success",
+    "start_job": "failed",
+    "fetch_capture": "upstream_failed",
+    "run_generate": "upstream_failed",
+    "run_verify": "upstream_failed",
+    "run_publish": "upstream_failed",
+}
+NATIVE_RUNS = {
+    RUN_A: "1eae5a3b-01f8-5d57-8385-8877018105c9",
+    RUN_B: "f9f328cd-ab28-5a33-9f4d-518a2b64f6f1",
+}
+
+
+class OrphanReconcileTests(unittest.TestCase):
+    """G-1 controlled orphan recovery through the one canonical reconcile entry."""
+
+    def setUp(self) -> None:
+        self.world = FakeWorld()
+        self.store = PlatformStore(self.world.connect)
+
+    # ------------------------------------------------------------------ fixtures
+    def _legacy_orphan(self, run_id: str, *, dag_run_id: str | None = None) -> str:
+        """One never-started 1.4.3-shaped attempt; returns its dispatch operation id."""
+        dispatch = {
+            "stage": "capture",
+            "operation_key": f"portal-{run_id}/capture:0",
+            "params_digest": "a" * 64,
+            "dag_id": "solidworks_to_urdf",
+            "dag_run_id": dag_run_id if dag_run_id is not None else run_id,
+        }
+        self.store.admit_run(
+            request_id=f"portal-{run_id}",
+            run_id=run_id,
+            principal="portal",
+            target_hardware="m3.0",
+            main_assembly="3.0 总装.SLDASM",
+            dispatch=dispatch,
+        )
+        for task, state in REAL_TIS.items():
+            self.world.task_instances[("solidworks_to_urdf", task, run_id, -1)] = state
+        return self.world.operations[f"portal-{run_id}/capture:0"][0]
+
+    def _registered_reconcile(self, run_id: str, state: str = "failed") -> str:
+        operation = self.store.register_operation(
+            run_id=run_id,
+            stage="freeze",
+            kind="reconcile",
+            operation_key=f"operatorctl-reconcile:{run_id}:freeze:{state}",
+            params_digest=digest({"outcome": state}),
+        )
+        return operation.operation_id
+
+    def _call(
+        self,
+        run_id: str,
+        dispatch_id: str,
+        *,
+        reconcile_operation_id: str | None = None,
+        task: str = "start_job",
+        map_index: int = -1,
+        state: str = "failed",
+        evidence: str = "reports/structural-team.json#sha256=f" + "0" * 63,
+        with_binding: bool = True,
+    ) -> None:
+        if reconcile_operation_id is None:
+            reconcile_operation_id = self._registered_reconcile(run_id, state)
+        reconcile = {"operation_id": reconcile_operation_id, "evidence": [evidence]}
+        if with_binding:
+            reconcile["binding"] = {"operation_id": dispatch_id, "task_id": task, "map_index": map_index}
+        receipt = {
+            "schema_version": store_module.BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "error": "SelectionError: two open errors",
+            "native_run_id": NATIVE_RUNS[run_id],
+            "native_receipt_sha256": "f" * 64,
+        }
+        self.store.confirm_stage(
+            run_id=run_id, stage="freeze", state=state, receipt=receipt, reconcile=reconcile
+        )
+
+    def _snapshot(self):
+        return (
+            dict(self.world.operation_bindings),
+            dict(self.world.run_states),
+            dict(self.world.stages),
+            len(self.world.events),
+            {key: value[1] for key, value in self.world.operations.items()},
+        )
+
+    # ------------------------------------------------------------------ positive
+    def test_an_orphan_reconciliation_binds_the_real_key_and_records_the_failure(self) -> None:
+        for run_id in (RUN_A, RUN_B):
+            with self.subTest(run_id=run_id):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(run_id)
+                self._call(run_id, dispatch_id)
+                self.assertEqual(
+                    self.world.operation_bindings[dispatch_id],
+                    ("solidworks_to_urdf", run_id, "start_job", -1),
+                )
+                self.assertEqual(self.world.run_states[run_id], "failed")
+                stage = self.world.stages[(run_id, "freeze")]
+                self.assertEqual(stage[0], "failed")
+                self.assertEqual(stage[1]["error"], "SelectionError: two open errors")
+                self.assertEqual(stage[1]["reconciliation"]["binding"]["task_id"], "start_job")
+                self.assertEqual(
+                    self.world.operations[f"portal-{run_id}/capture:0"][1], "failed", "the intent settles"
+                )
+                reconcile_key = f"operatorctl-reconcile:{run_id}:freeze:failed"
+                self.assertEqual(self.world.operations[reconcile_key][1], "succeeded")
+                kinds = [row[2] for row in self.world.events if row[0] == run_id]
+                self.assertEqual(kinds, ["binding", "stage"])
+                binding_payload = json.loads(self.world.events[0][5])
+                self.assertEqual(binding_payload["task_id"], "start_job")
+                self.assertEqual(binding_payload["map_index"], -1)
+                self.assertEqual(binding_payload["operation_key"], f"portal-{run_id}/capture:0")
+                self.assertEqual(binding_payload["reconciled_stage"], "freeze")
+
+    def test_a_repeat_of_the_same_reconciliation_changes_nothing(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
+        self._call(RUN_A, dispatch_id)
+        self.assertEqual(self._snapshot(), before, "identical identity/evidence/outcome repeats as a no-op")
+
+    # ------------------------------------------------------------------ refusals
+    def test_unprovable_or_conflicting_bindings_change_nothing(self) -> None:
+        cases = {
+            "tampered_key": dict(task="ghost_task"),
+            "ambiguous_live": dict(task="fetch_capture"),
+            "green_task": dict(task="resolve_handoff"),
+            "wrong_map_index": dict(map_index=0),
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                if name == "ambiguous_live":
+                    self.world.task_instances[("solidworks_to_urdf", "fetch_capture", RUN_A, -1)] = "running"
+                reconcile_id = self._registered_reconcile(RUN_A)
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, dispatch_id, reconcile_operation_id=reconcile_id, **overrides)
+                self.assertEqual(self._snapshot(), before, "refused binding leaves zero change")
+        for name, setup in (
+            ("foreign_operation", None),
+            ("missing_dag_run_evidence", "missing"),
+            ("already_bound_conflict", "conflict"),
+            ("started_intent", "started"),
+        ):
+            with self.subTest(name=name):
+                self.setUp()
+                if setup == "missing":
+                    dispatch_id = self._legacy_orphan(RUN_A, dag_run_id="")
+                else:
+                    dispatch_id = self._legacy_orphan(RUN_A)
+                if setup == "conflict":
+                    self.world.operation_bindings[dispatch_id] = (
+                        "solidworks_to_urdf",
+                        RUN_A,
+                        "start_job",
+                        -1,
+                    )
+                if setup == "started":
+                    key = f"portal-{RUN_A}/capture:0"
+                    record = self.world.operations[key]
+                    self.world.operations[key] = (*record[:1], "running", *record[2:])
+                reconcile_id = self._registered_reconcile(RUN_A)
+                before = self._snapshot()
+                target = "deadbeef-0000-0000-0000-000000000000" if name == "foreign_operation" else dispatch_id
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, target, reconcile_operation_id=reconcile_id)
+                self.assertEqual(self._snapshot(), before, "refused binding leaves zero change")
+
+    def test_non_failed_or_unbound_reconciles_keep_the_classic_rules(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        reconcile_id = self._registered_reconcile(RUN_A)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, reconcile_operation_id=reconcile_id, state="completed")
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, reconcile_operation_id=reconcile_id, with_binding=False)
+        self.assertEqual(self._snapshot(), before)
+        # A recorded orphan stage never takes a different binding later.
+        self._call(RUN_A, dispatch_id)
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, evidence="reports/other.json#sha256=e" + "0" * 63)
 
 
 if __name__ == "__main__":
