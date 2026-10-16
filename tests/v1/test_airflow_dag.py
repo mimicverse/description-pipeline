@@ -223,7 +223,13 @@ class DagTests(unittest.TestCase):
             "change_summary": "x",
             "request_id": "portal-upload-digest",
         }
+        converged = []
         with (
+            patch.object(
+                module,
+                "_converge_early_freeze_failure",
+                side_effect=lambda run_id, error: converged.append((run_id, str(error))),
+            ),
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.dict(os.environ, {}, clear=False),
@@ -236,6 +242,9 @@ class DagTests(unittest.TestCase):
                 patch.dict(os.environ, {"PLATFORM_CONFIG_DIGEST": "a" * 64}),
             ):
                 dag.task_dict["freeze"].python_callable(**context({**base, "platform_config_digest": "b" * 64}))
+        self.assertEqual(len(converged), 2, "both early refusals must converge the admitted run as failed")
+        self.assertIn("PLATFORM_CONFIG_DIGEST is unavailable", converged[0][1])
+        self.assertIn("does not match", converged[1][1])
 
     def test_dag_parses(self) -> None:
         bag = DagBag(str(DAG_DIR))
@@ -1031,6 +1040,80 @@ class PlatformRegistrationTests(unittest.TestCase):
             paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files={"assembly.sldasm": "a" * 64}
         )
         self.assertEqual(self.started, ["0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"])
+
+    def test_an_early_freeze_refusal_converges_the_admitted_run(self) -> None:
+        """A refusal before the first driver action still lands as a terminal failure: the
+        admitted run is claimed once, freeze records its original error, every later stage
+        records blocked - and no CAD or native action is ever triggered."""
+        from airflow.sdk.exceptions import AirflowFailException
+
+        from description_pipeline.orchestration.airflow_client import native_run_id
+
+        intake = Path(self.temporary.name) / "early-intake"
+        intake.mkdir()
+        (intake / "assembly.SLDASM").write_bytes(b"<assembly/>")
+
+        class IntakeDouble:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def authorized_intake_dir(self, path: str) -> Path:
+                self.calls.append(f"authorized_intake_dir:{path}")
+                return intake
+
+        endpoint = IntakeDouble()
+        platform = SimpleNamespace(
+            start_run=lambda run_id: self.started.append(run_id),
+            confirm_stage=lambda **payload: self.calls.append(payload),
+            stage_records=lambda run_id: {},
+        )
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+        dag = self.module.dag
+
+        def refusal(run_id: str, conf: dict, params: dict) -> str:
+            self.started.clear()
+            self.calls.clear()
+            endpoint.calls.clear()
+            with (
+                patch.object(self.module, "_platform_binding", return_value=(platform, self.root)),
+                patch.object(self.module, "_endpoint", return_value=endpoint),
+                patch.object(self.module, "config_from_airflow_connection", return_value=config),
+                patch.dict(os.environ, {}, clear=False),
+            ):
+                os.environ.pop("PLATFORM_CONFIG_DIGEST", None)
+                with self.assertRaises(AirflowFailException) as caught:
+                    dag.task_dict["freeze"].python_callable(
+                        dag_run=SimpleNamespace(
+                            conf=conf,
+                            run_id=run_id,
+                            triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+                        ),
+                        params=params,
+                    )
+            uuid = native_run_id(run_id)
+            self.assertEqual(self.started, [uuid], "the admitted run is claimed exactly once")
+            failed = [call for call in self.calls if call["state"] == "failed"]
+            self.assertEqual([call["stage"] for call in failed], ["freeze"])
+            self.assertIn("AirflowFailException", failed[0]["receipt"]["error"])
+            self.assertEqual(
+                [call["stage"] for call in self.calls if call["state"] == "blocked"],
+                ["discover", "capture", "generate", "verify", "publish"],
+            )
+            return str(caught.exception)
+
+        base = {"target_hardware": "m3.0", "change_summary": "x", "request_id": "portal-early-digest"}
+        message = refusal("portal-early-digest", dict(base), {"handoff_path": str(intake)})
+        self.assertIn("PLATFORM_CONFIG_DIGEST is unavailable", message)
+        self.assertEqual(endpoint.calls, [f"authorized_intake_dir:{intake}"])
+        # An even earlier entry refusal (before any intake contact) converges identically.
+        early = {"change_summary": "x", "request_id": "portal-early-target"}
+        message = refusal("portal-early-target", early, {"handoff_path": str(intake)})
+        self.assertIn("target_hardware is required", message)
+        self.assertEqual(endpoint.calls, [])
 
     def test_stage_events_are_mirrored_into_the_live_platform_stream(self) -> None:
         from description_pipeline.delivery import read_delivery_manifest

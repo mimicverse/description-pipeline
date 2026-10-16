@@ -53,6 +53,12 @@ render_units() {
         -e "s#@AIRFLOW_API_PORT@#$AIRFLOW_API_PORT#g" \
         -e "s#@FEISHU_ENV@#${FEISHU_ENV_FILE:-$AIRFLOW_HOME/feishu.env}#g" \
       "$HERE/systemd/$unit.service" > "$TARGET/$unit.service"
+    # The runtime units consume the one controlled derived environment (the same file the
+    # portal unit loads) so task processes inherit the platform identity values; the renderer
+    # only ever points at the file - it never copies any value into the unit.
+    if [ -n "${OPERATOR_DERIVED_ENV:-}" ]; then
+      sed -i "/^ExecStart=/i EnvironmentFile=$OPERATOR_DERIVED_ENV" "$TARGET/$unit.service"
+    fi
   done
 }
 

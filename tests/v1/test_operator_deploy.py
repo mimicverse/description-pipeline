@@ -711,14 +711,19 @@ class LifecycleTests(unittest.TestCase):
             {"XDG_CONFIG_HOME": str(config_home)},
         )
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self._render_airflow_units(state, config_home, derived_env=True)
+        return config_path, state, config_home, target
+
+    def _render_airflow_units(self, state: Path, config_home: Path, *, derived_env: bool) -> None:
         airflow_env = {"XDG_CONFIG_HOME": str(config_home)}
         for line in (state / "resolved.env").read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition("=")
             if key:
                 airflow_env[key] = value
+        if derived_env:
+            airflow_env["OPERATOR_DERIVED_ENV"] = str(state / "derived" / "gen-1" / "operator.env")
         airflow = run(["bash", str(OPERATOR.parent / "airflow" / "services.sh"), "render"], airflow_env)
         self.assertEqual(airflow.returncode, 0, airflow.stderr)
-        return config_path, state, config_home, target
 
     def _admission_fixture(self, tmp: Path, *, register_after: int = 0, unpause_rc: int = 0, pause_rc: int = 0):
         config_path, state, config_home, _ = self._render_units(tmp)
@@ -1521,14 +1526,82 @@ class LifecycleTests(unittest.TestCase):
                 env_path.read_text(encoding="utf-8"),
             )
 
+
+    def test_airflow_units_load_the_same_derived_environment_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, state, config_home, target = self._render_units(Path(tmp))
+            derived = state / "derived" / "gen-1" / "operator.env"
+            controlled = None
+            for row in derived.read_text(encoding="utf-8").splitlines():
+                key, _, value = row.partition("=")
+                if key == "PLATFORM_CONFIG_DIGEST":
+                    controlled = decode_env_value(value.strip())
+            self.assertIsNotNone(controlled, "the derived environment carries the controlled digest")
+            self.assertRegex(controlled, r"^[0-9a-f]{64}$")
+            for unit in (
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+            ):
+                content = (target / f"{unit}.service").read_text(encoding="utf-8")
+                self.assertIn(f"EnvironmentFile={derived}", content)
+            portal = (target / "description-portal.service").read_text(encoding="utf-8")
+            self.assertIn(f"EnvironmentFile={derived}", portal)
+            unit = target / "description-airflow-dag-processor.service"
+            # Falsifiable negative control: the same renderer without the derived environment
+            # reproduces the incident - the task process inherits no digest at all, the exact
+            # condition freeze refuses with "PLATFORM_CONFIG_DIGEST is unavailable".
+            self._render_airflow_units(state, config_home, derived_env=False)
+            self.assertEqual(self._digest_reaching_task(unit), "")
+            # With the derived environment wired in, the same task process obtains it.
+            self._render_airflow_units(state, config_home, derived_env=True)
+            self.assertEqual(self._digest_reaching_task(unit), controlled)
+
+    @staticmethod
+    def _digest_reaching_task(unit: Path) -> str:
+        """One fresh task process through the unit's own environment; nothing is exported here.
+
+        systemd builds a task's environment from a minimal inherited environment plus the
+        unit's ``Environment=`` lines and ``EnvironmentFile=`` files; this assembles exactly
+        that and proves which controlled values actually reach the process.
+        """
+        environment = {"PATH": os.environ.get("PATH", ""), "HOME": str(Path.home())}
+        for line in unit.read_text(encoding="utf-8").splitlines():
+            if line.startswith("EnvironmentFile="):
+                path = Path(line.split("=", 1)[1].lstrip("-"))
+                if path.is_file():
+                    for row in path.read_text(encoding="utf-8").splitlines():
+                        key, _, value = row.partition("=")
+                        if key and not key.startswith("#"):
+                            environment[key] = decode_env_value(value.strip())
+            elif line.startswith("Environment="):
+                key, _, value = line.split("=", 1)[1].partition("=")
+                if key:
+                    environment[key] = value
+        probe = subprocess.run(
+            [sys.executable, "-c", "import os;print(os.environ.get('PLATFORM_CONFIG_DIGEST', ''))"],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        if probe.returncode != 0:
+            raise AssertionError(probe.stderr)
+        return probe.stdout.strip()
+
     def test_api_server_unit_loads_the_optional_feishu_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _, state, _, target = self._render_units(Path(tmp))
+            derived = state / "derived" / "gen-1" / "operator.env"
             unit = (target / "description-airflow-api-server.service").read_text(encoding="utf-8")
+            self.assertIn(f"EnvironmentFile={derived}", unit)
             self.assertIn(f"EnvironmentFile=-{state}/feishu.env", unit)
             self.assertNotIn("@", unit)
             scheduler = (target / "description-airflow-scheduler.service").read_text(encoding="utf-8")
-            self.assertNotIn("EnvironmentFile", scheduler)
+            # The runtime units load exactly the one controlled derived environment; the
+            # optional Feishu sign-in state stays an api-server-only concern.
+            self.assertEqual(scheduler.count("EnvironmentFile="), 1)
+            self.assertIn(f"EnvironmentFile={derived}", scheduler)
+            self.assertNotIn("feishu.env", scheduler)
             control = CONTROL.read_text(encoding="utf-8")
             self.assertIn('FEISHU_ENV_FILE="${FEISHU_ENV_FILE:-$AIRFLOW_HOME/feishu.env}"', control)
 
