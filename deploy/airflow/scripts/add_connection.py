@@ -15,6 +15,25 @@ from airflow.models.connection import Connection
 from airflow.settings import Session
 
 
+def _json_safe(value):
+    """The serialization boundary for the connection ``extra`` document.
+
+    The endpoint config validates its routing into ``Path`` values (``store_root``,
+    ``repositories``, ``discovery.record_roots`` and the optional frozen-name registry), so
+    every value that lands in ``extra`` is written as its string form - a ``Path`` (or a
+    tuple/list/dict carrying one) is never handed to ``json.dumps``.  Record roots and the
+    registry are kept, only re-encoded: deleting them to serialize is not allowed.
+    """
+
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--conn-id", default="solidworks_windows")
@@ -55,13 +74,15 @@ def main() -> int:
         existing.port = args.port
         existing.password = token
         existing.extra = json.dumps(
-            {
+            _json_safe(
+                {
                 "handoff_roots": [str(Path(root)) for root in args.handoff_root],
                 "store_root": str(config.store_root),
                 "repositories": {slug: str(path) for slug, path in config.repositories.items()},
                 "discovery": config.discovery,
                 "targets": config.targets,
-            }
+                }
+            )
         )
         session.commit()
     os.chmod(Path(args.token_file), 0o600)
