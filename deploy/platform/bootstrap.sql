@@ -38,9 +38,11 @@ CREATE SCHEMA IF NOT EXISTS :"airflow_schema" AUTHORIZATION airflow_migrate;
 ALTER SCHEMA :"airflow_schema" OWNER TO airflow_migrate;
 
 -- Unqualified metadata names (including the migration ledger) resolve inside each role's own
--- schema; nothing crosses schemas implicitly.
+-- schema; the platform service additionally resolves the Airflow schema for the one
+-- write-side reconcile read of the original scheduling facts (column grants only, applied by
+-- grants-airflow.sql) - nothing else crosses schemas implicitly.
 ALTER ROLE platform_migrate IN DATABASE :"platform_database" SET search_path = :"platform_schema", pg_catalog;
-ALTER ROLE platform_service IN DATABASE :"platform_database" SET search_path = :"platform_schema", pg_catalog;
+ALTER ROLE platform_service IN DATABASE :"platform_database" SET search_path = :"platform_schema", :"airflow_schema", pg_catalog;
 ALTER ROLE operator_ro IN DATABASE :"platform_database" SET search_path = :"platform_schema", pg_catalog;
 ALTER ROLE airflow_migrate IN DATABASE :"platform_database" SET search_path = :"airflow_schema", pg_catalog;
 ALTER ROLE airflow_runtime IN DATABASE :"platform_database" SET search_path = :"airflow_schema", pg_catalog;

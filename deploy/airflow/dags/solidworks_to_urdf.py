@@ -332,6 +332,21 @@ def _converge_failed_stage(
         log.exception("failed-stage registration unavailable run=%s stage=%s", run_id, stage)
 
 
+def _converge_early_freeze_failure(run_id: str, error: Exception) -> None:
+    """An admitted request that fails before the first driver action still lands as failed.
+
+    The run is claimed and converged exactly once; any convergence problem is swallowed so the
+    original exception (with its message) stays the reportable cause and no file authority is
+    invented when the platform database is unreachable.
+    """
+    try:
+        platform, _store_root = _platform_binding()
+        platform.start_run(run_id)
+        _converge_failed_stage(run_id, "freeze", error)
+    except Exception:  # pragma: no cover - the original exception remains primary
+        log.exception("early freeze failure convergence unavailable run=%s", run_id)
+
+
 def _register_completed_stage(run_id: str, stage: str, tree: str | Path, receipt: dict) -> None:
     """The completed-stage registration: platform binding, sealed write, stage confirmation."""
     platform, store_root = _platform_binding()
@@ -1407,8 +1422,15 @@ def solidworks_to_urdf():
         )
     )
     def freeze(**context) -> dict:
-        _conf, _target, _summary, _principal, _config, routing = _submission_basics(context)
-        linked = _linked_conf(context)
+        run_id = _run_uuid(context)
+        try:
+            _conf, _target, _summary, _principal, _config, routing = _submission_basics(context)
+            linked = _linked_conf(context)
+        except Exception as error:
+            # An admitted request must converge even when freeze is refused before its first
+            # driver action; the original exception is carried and re-raised (never masked).
+            _converge_early_freeze_failure(run_id, error)
+            raise
         if linked is not None:
             if linked["from_stage"] in DELIVERY_STAGES:
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
@@ -1494,66 +1516,73 @@ def solidworks_to_urdf():
             identity, routing = _submission_frame(context, purpose=request["purpose"])
             request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
             return request
-        handoff_path = str(context["params"]["handoff_path"]).strip()
-        if not handoff_path:
-            raise AirflowFailException("handoff_path is required")
-        selection = _param_selection(context)
-        intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
-        upload_files = validate_file_index(package_inventory(intake))
-        main = _selection_main(upload_files, selection)
-        run_id = _run_uuid(context)
-        log.info(
-            "selection intake=%s files=%d upload_sha256=%s main_assembly=%s endpoint_conn=%s",
-            intake,
-            len(upload_files),
-            digest(upload_files),
-            main,
-            CONN_ID,
-        )
-        request = {
-            "run_id": run_id,
-            "upload_files": upload_files,
-            "upload_sha256": digest(upload_files),
-            "main_assembly": main,
-            "intake_dir": str(intake),
-            "conn_id": CONN_ID,
-        }
-        conf = getattr(context["dag_run"], "conf", None)
-        conf = conf if isinstance(conf, dict) else {}
-        request_id = str(conf.get("request_id") or context["params"].get("request_id") or "").strip()
-        if not request_id:
-            raise AirflowFailException("request_id is required: the run carries no authenticated request identity")
-        config_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
-        if not config_digest:
-            raise AirflowFailException(
-                "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
+        try:
+            handoff_path = str(context["params"]["handoff_path"]).strip()
+            if not handoff_path:
+                raise AirflowFailException("handoff_path is required")
+            selection = _param_selection(context)
+            intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+            upload_files = validate_file_index(package_inventory(intake))
+            main = _selection_main(upload_files, selection)
+            log.info(
+                "selection intake=%s files=%d upload_sha256=%s main_assembly=%s endpoint_conn=%s",
+                intake,
+                len(upload_files),
+                digest(upload_files),
+                main,
+                CONN_ID,
             )
-        conf_digest = str(conf.get("platform_config_digest") or "").strip()
-        if conf_digest and conf_digest != config_digest:
-            raise AirflowFailException(
-                "conf platform_config_digest does not match the controlled platform configuration identity"
+            request = {
+                "run_id": run_id,
+                "upload_files": upload_files,
+                "upload_sha256": digest(upload_files),
+                "main_assembly": main,
+                "intake_dir": str(intake),
+                "conn_id": CONN_ID,
+            }
+            conf = getattr(context["dag_run"], "conf", None)
+            conf = conf if isinstance(conf, dict) else {}
+            request_id = str(conf.get("request_id") or context["params"].get("request_id") or "").strip()
+            if not request_id:
+                raise AirflowFailException(
+                    "request_id is required: the run carries no authenticated request identity"
+                )
+            config_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
+            if not config_digest:
+                raise AirflowFailException(
+                    "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
+                )
+            conf_digest = str(conf.get("platform_config_digest") or "").strip()
+            if conf_digest and conf_digest != config_digest:
+                raise AirflowFailException(
+                    "conf platform_config_digest does not match the controlled platform configuration identity"
+                )
+            purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
+            if purpose not in REQUEST_PURPOSES:
+                raise AirflowFailException(
+                    "purpose is required: the admitted request must declare engineering or inspection_preview"
+                )
+            identity, routing = _submission_frame(context, purpose=purpose)
+            request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+            paths = _work_paths(CONN_ID, run_id)
+            evidence = freeze_request_evidence(
+                paths.run_dir,
+                purpose=purpose,
+                request_id=request_id,
+                target_hardware=identity["hardware_id"],
+                change_summary=identity.get("change_summary") or "",
+                main_assembly=main,
+                handoff_digest=request["upload_sha256"],
+                platform_config_digest=config_digest,
             )
-        purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
-        if purpose not in REQUEST_PURPOSES:
-            raise AirflowFailException(
-                "purpose is required: the admitted request must declare engineering or inspection_preview"
-            )
-        identity, routing = _submission_frame(context, purpose=purpose)
-        request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
-        paths = _work_paths(CONN_ID, run_id)
-        evidence = freeze_request_evidence(
-            paths.run_dir,
-            purpose=purpose,
-            request_id=request_id,
-            target_hardware=identity["hardware_id"],
-            change_summary=identity.get("change_summary") or "",
-            main_assembly=main,
-            handoff_digest=request["upload_sha256"],
-            platform_config_digest=config_digest,
-        )
-        request["request_evidence"] = str(evidence)
-        request["request_id"] = request_id
-        request["purpose"] = purpose
+            request["request_evidence"] = str(evidence)
+            request["request_id"] = request_id
+            request["purpose"] = purpose
+        except Exception as error:
+            # The admitted request must converge even when freeze fails before its first driver
+            # action; the original exception is carried and re-raised (never masked).
+            _converge_early_freeze_failure(run_id, error)
+            raise
         _register_freeze_stage(paths, run_id, intake=intake, upload_files=upload_files)
         return request
 

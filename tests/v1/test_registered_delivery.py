@@ -20,7 +20,7 @@ from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
 from description_pipeline.platform import flow
-from description_pipeline.stages import require_complete, stage_view
+from description_pipeline.stages import STAGE_IDS, require_complete, stage_view
 
 from .portal_read_support import RegisteredPlatform
 from .protocol_support import protocol_events
@@ -272,6 +272,10 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
                 "detail": {"where": stage},
             },
         )
+        # The convergence registers every later stage blocked after the failure: the trailing
+        # events must never claim the error's stage.
+        for later in STAGE_IDS[STAGE_IDS.index(stage) + 1 :]:
+            platform.store.confirm_stage(run_id=WSGI_RUN, stage=later, state="blocked")
         return platform, original
 
     def _get(self, platform: RegisteredPlatform, endpoint) -> tuple[int, bytes]:
@@ -315,6 +319,14 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
                     self.assertEqual(status, 200)
                     self.assertEqual(payload["job"]["error"], original)
                     self.assertIn(original, body.decode("utf-8"))
+                    finding = next(
+                        row for row in payload["findings"] if original in str(row.get("message", ""))
+                    )
+                    self.assertEqual(
+                        finding["stage"],
+                        stage,
+                        "the registered failed stage owns the error; a later blocked event never does",
+                    )
 
     def test_a_registered_success_keeps_its_closure_and_observes_the_native_error(self) -> None:
         platform = RegisteredPlatform(self.tmp / "success")
