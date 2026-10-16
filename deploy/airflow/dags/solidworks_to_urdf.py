@@ -468,16 +468,16 @@ def _claim_operation_intent(
     dag_run = context.get("dag_run")
     task_instance = context.get("ti") or context.get("task_instance")
     bound_run_id = getattr(dag_run, "run_id", None)
-    task_id = getattr(task_instance, "task_id", None) or stage
+    task_id = getattr(task_instance, "task_id", None)
     map_index = getattr(task_instance, "map_index", None)
     if not isinstance(bound_run_id, str) or not bound_run_id:
         raise AirflowFailException(
             f"the {what} intent requires the triggering DagRun binding; a contextless "
             "execution never registers a new production intent"
         )
-    if not isinstance(task_id, str) or not task_id:
+    if not isinstance(task_id, str) or not task_id.strip():
         raise AirflowFailException(f"the {what} intent requires the executing task identity")
-    if type(map_index) is not int:
+    if type(map_index) is not int or map_index < -1:
         raise AirflowFailException(
             f"the {what} intent requires the real task-instance key of the executing task"
         )

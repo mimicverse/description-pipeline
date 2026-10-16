@@ -457,13 +457,25 @@ class DagTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(AirflowFailException, "DagRun binding"):
                 dag.task_dict["discover"].python_callable(request)
-            with self.assertRaisesRegex(AirflowFailException, "task-instance key"):
+            with self.assertRaisesRegex(AirflowFailException, "task identity"):
                 dag.task_dict["discover"].python_callable(request, dag_run=SimpleNamespace(run_id="portal-binding"))
             with self.assertRaisesRegex(AirflowFailException, "task-instance key"):
                 dag.task_dict["discover"].python_callable(
                     request,
                     dag_run=SimpleNamespace(run_id="portal-binding"),
                     task_instance=SimpleNamespace(task_id="discover"),
+                )
+            with self.assertRaisesRegex(AirflowFailException, "task identity"):
+                dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-binding"),
+                    ti=SimpleNamespace(task_id="  ", map_index=-1),
+                )
+            with self.assertRaisesRegex(AirflowFailException, "task-instance key"):
+                dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-binding"),
+                    ti=SimpleNamespace(task_id="discover", map_index=-2),
                 )
         self.assertEqual(operations.registered, [])
         self.assertEqual(operations.claimed, [])
