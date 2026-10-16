@@ -334,11 +334,14 @@ def validate_source_config(config: object) -> dict[str, Any]:
     #  * 任何声明了质量的组件都必须真的被某个 body 纳入——拼错/改名的键不能静默失效；
     #  * documented_table 模式必须为每个被纳入的组件给出质量，缺一个就直接拒绝，
     #    不允许落回 CAD 的默认密度占位值。
-    # bodies 为空（自动一组件一 link）时纳入集合要到采集后才知道，由 build_scene 用实际读数复核。
+    # groups 为空（自动一组件一 link）时纳入集合要到采集后才知道，由 build_scene 用实际读数复核。
     if documented:
-        declared_bodies = [item for item in (config.get("bodies") or []) if isinstance(item, dict)]
+        declared_groups = [item for item in (config.get("groups") or []) if isinstance(item, dict)]
         included = {
-            str(component) for body in declared_bodies for component in (body.get("components") or []) if component
+            str(component)
+            for group in declared_groups
+            for component in (group.get("components") or [])
+            if component
         }
         if included:
             unknown = sorted(set(documented) - included)
