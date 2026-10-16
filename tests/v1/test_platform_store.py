@@ -530,12 +530,19 @@ class FakeCursor:
                 )
                 rows.append((record[0], record[5], record[6], record[1], dag_id, dag_run_id, task_id, map_index, key))
             self._rows = rows
-        elif normalized.startswith("SELECT 'freeze'::text, ti.task_id, ti.map_index, ti.state FROM task_instance"):
-            dag_id, run_id, successor = params[0], params[1], params[4]
+        elif normalized.startswith("SELECT 'task'::text, ti.task_id, ti.map_index, ti.state FROM task_instance"):
+            dag_id, run_id = params[0], params[1]
             rows = []
             for (task_dag, task_id, task_run, map_index), state in world.task_instances.items():
-                if task_dag == dag_id and task_run == run_id and task_id in {"freeze", successor}:
-                    rows.append(("freeze" if task_id == "freeze" else "successor", task_id, map_index, state))
+                if task_dag == dag_id and task_run == run_id and task_id in {
+                    "freeze",
+                    "discover",
+                    "capture",
+                    "generate",
+                    "verify",
+                    "publish",
+                }:
+                    rows.append(("task", task_id, map_index, state))
             dag_run_state = world.dag_runs.get((dag_id, run_id))
             if dag_run_state is not None:
                 rows.append(("dag_run", None, None, dag_run_state))
@@ -2765,13 +2772,21 @@ class PredispatchClosureTests(unittest.TestCase):
         *,
         dag_run_id: str = DAG_RUN,
         freeze: str = "failed",
-        capture: str = "upstream_failed",
         dag_run: str = "failed",
         freeze_map: int = -1,
-        capture_map: int = -1,
+        successors: dict[str, str] | None = None,
     ) -> None:
+        states = {
+            "discover": "upstream_failed",
+            "capture": "upstream_failed",
+            "generate": "upstream_failed",
+            "verify": "upstream_failed",
+            "publish": "upstream_failed",
+        }
+        states.update(successors or {})
         self.world.task_instances[("solidworks_to_urdf", "freeze", dag_run_id, freeze_map)] = freeze
-        self.world.task_instances[("solidworks_to_urdf", "capture", dag_run_id, capture_map)] = capture
+        for task, state in states.items():
+            self.world.task_instances[("solidworks_to_urdf", task, dag_run_id, -1)] = state
         self.world.dag_runs[("solidworks_to_urdf", dag_run_id)] = dag_run
 
     def _log(
@@ -2866,6 +2881,7 @@ class PredispatchClosureTests(unittest.TestCase):
             "freeze_map_mismatch",
             "capture_failed",
             "capture_running",
+            "generate_executed",
             "dag_run_running",
             "ambiguous_freeze_rows",
             "log_another_dag_run",
@@ -2903,6 +2919,8 @@ class PredispatchClosureTests(unittest.TestCase):
                     self.world.task_instances[("solidworks_to_urdf", "capture", self.DAG_RUN, -1)] = "failed"
                 elif name == "capture_running":
                     self.world.task_instances[("solidworks_to_urdf", "capture", self.DAG_RUN, -1)] = "running"
+                elif name == "generate_executed":
+                    self.world.task_instances[("solidworks_to_urdf", "generate", self.DAG_RUN, -1)] = "success"
                 elif name == "dag_run_running":
                     self.world.dag_runs[("solidworks_to_urdf", self.DAG_RUN)] = "running"
                 elif name == "ambiguous_freeze_rows":
@@ -2915,6 +2933,52 @@ class PredispatchClosureTests(unittest.TestCase):
                 with self.assertRaises(PlatformStoreError):
                     self._close(log)
                 self.assertEqual(self._snapshot(), before, "a refused closure leaves zero change")
+
+    def test_a_caller_supplied_marker_receipt_cannot_open_the_closure(self) -> None:
+        run_id = self._admit()
+        self._airflow_facts()
+        log = self._log()
+        forged = {
+            "schema_version": "solidworks-to-urdf.bundle/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "run_id": run_id,
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "error": "FORGED MESSAGE THAT IS NOT IN THE LOG",
+            "admitted_before_dispatch": True,
+            "airflow_failure": {"path": str(log), "sha256": file_digest(log)},
+        }
+        reconcile = self._reconcile(log)
+        reconcile["evidence"] = [str(log), str(log)]
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self.store.confirm_stage(
+                run_id=run_id, stage="freeze", state="failed", receipt=dict(forged), reconcile=reconcile
+            )
+        self.assertEqual(self._snapshot(), before, "a caller-supplied marker settles nothing")
+
+    def test_a_forged_receipt_never_replaces_the_internally_composed_one(self) -> None:
+        run_id = self._admit()
+        self._airflow_facts()
+        log = self._log()
+        forged = {
+            "schema_version": "solidworks-to-urdf.bundle/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "run_id": run_id,
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "error": "FORGED MESSAGE THAT IS NOT IN THE LOG",
+            "admitted_before_dispatch": True,
+            "airflow_failure": {"path": str(log), "sha256": file_digest(log)},
+        }
+        self.store.confirm_stage(
+            run_id=run_id, stage="freeze", state="failed", receipt=dict(forged), reconcile=self._reconcile(log)
+        )
+        stored = self.world.stages[(run_id, "freeze")][1]
+        self.assertEqual(stored["error"], f"AirflowFailException: {self.EXCEPTION}")
+        self.assertNotIn("FORGED", json.dumps(stored))
 
 
 if __name__ == "__main__":

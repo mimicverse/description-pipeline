@@ -406,16 +406,14 @@ _LOCK_RUN_OPERATIONS = (
     " FROM operation WHERE run_id = %s ORDER BY operation_id FOR UPDATE"
 )
 _COUNT_RUN_STAGES = "SELECT count(*) FROM stage WHERE run_id = %s"
-#: One statement carries the freeze task's, the recorded successor's and the DagRun's real
-#: facts: the UNION ALL evaluates them in a single statement snapshot - the write-side read
-#: of the original Airflow authority stays inside the one reconcile transaction, and a
-#: multi-row (ambiguous) key is never masked by a LIMIT.
+#: One statement carries every six-stage task fact and the DagRun's real state: the UNION ALL
+#: evaluates them in a single statement snapshot - the write-side read of the original
+#: Airflow authority stays inside the one reconcile transaction, and a multi-row (ambiguous)
+#: or missing key is never masked.
 _READ_PREDISPATCH_FACTS = (
-    "SELECT 'freeze'::text, ti.task_id, ti.map_index, ti.state FROM task_instance ti"
-    " WHERE ti.dag_id = %s AND ti.run_id = %s AND ti.task_id = 'freeze'"
-    " UNION ALL"
-    " SELECT 'successor'::text, ti.task_id, ti.map_index, ti.state FROM task_instance ti"
-    " WHERE ti.dag_id = %s AND ti.run_id = %s AND ti.task_id = %s"
+    "SELECT 'task'::text, ti.task_id, ti.map_index, ti.state FROM task_instance ti"
+    " WHERE ti.dag_id = %s AND ti.run_id = %s"
+    " AND ti.task_id IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'publish')"
     " UNION ALL"
     " SELECT 'dag_run'::text, NULL, NULL, dr.state FROM dag_run dr"
     " WHERE dr.dag_id = %s AND dr.run_id = %s"
@@ -1264,13 +1262,18 @@ class PlatformStore:
                         reused_from_run=reused_from_run,
                     )
                     return
-                if isinstance(receipt, dict) and receipt.get("admitted_before_dispatch") is True:
+                # The predispatch closure is entered only through its internally composed,
+                # byte-verified receipt: a caller-supplied marker can never open this path.
+                predispatch = self._predispatch_closure_receipt(
+                    run_id=run_id, stage=stage, state=state, reconcile=reconcile
+                )
+                if predispatch is not None:
                     self._reconcile_admitted_before_dispatch(
                         connection,
                         run_id=run_id,
                         stage=stage,
                         state=state,
-                        receipt=receipt,
+                        receipt=predispatch,
                         reconcile=reconcile,
                         run_state=run_state,
                     )
@@ -1555,22 +1558,30 @@ class PlatformStore:
         if loaded.dag_id != dag_id or loaded.run_id != dag_run_id:
             raise PlatformStoreError("The Airflow failure log names another DagRun than the recorded dispatch")
 
-        cursor.execute(_READ_PREDISPATCH_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id, op_stage, dag_id, dag_run_id))
+        cursor.execute(_READ_PREDISPATCH_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id))
         facts = cursor.fetchall()
-        freeze_rows = [row for row in facts if row[0] == "freeze"]
-        successor_rows = [row for row in facts if row[0] == "successor"]
         dag_run_rows = [row for row in facts if row[0] == "dag_run"]
-        if len(freeze_rows) != 1 or len(successor_rows) != 1 or len(dag_run_rows) != 1:
-            raise PlatformStoreError("The Airflow facts are missing or ambiguous; the predispatch closure refuses")
-        _, freeze_task, freeze_map, freeze_state = freeze_rows[0]
-        _, successor_task, successor_map, successor_state = successor_rows[0]
-        _, _, _, dag_run_state = dag_run_rows[0]
-        if freeze_task != "freeze" or freeze_state != "failed" or freeze_map != loaded.map_index:
-            raise PlatformStoreError("The freeze task does not prove its own failed fact; refused")
-        if successor_task != op_stage or successor_state != "upstream_failed":
-            raise PlatformStoreError("The recorded successor task does not prove its never-executed fact; refused")
-        if dag_run_state != "failed":
+        if len(dag_run_rows) != 1 or dag_run_rows[0][3] != "failed":
             raise PlatformStoreError("The DagRun does not prove its terminal failed fact; refused")
+        by_task: dict[str, list[tuple[int, object]]] = {}
+        for _, task, task_map, task_state in facts:
+            if isinstance(task, str):
+                by_task.setdefault(task, []).append((task_map, task_state))
+        freeze_rows = by_task.get("freeze") or []
+        if len(freeze_rows) != 1 or freeze_rows[0][1] != "failed" or freeze_rows[0][0] != loaded.map_index:
+            raise PlatformStoreError("The freeze task does not prove its own failed fact; refused")
+        successor_task = op_stage
+        successor_map = None
+        for later in STAGE_IDS[STAGE_IDS.index("freeze") + 1 :]:
+            rows = by_task.get(later) or []
+            if len(rows) != 1 or rows[0][1] != "upstream_failed":
+                raise PlatformStoreError(
+                    f"The successor task {later!r} does not prove its never-executed fact; refused"
+                )
+            if later == successor_task:
+                successor_map = rows[0][0]
+        if successor_map is None:
+            raise PlatformStoreError("The recorded dispatch successor is not a canonical downstream task; refused")
 
         cursor.execute(_BIND_ORPHAN_OPERATION, (successor_task, successor_map, operation_id, run_id))
         if cursor.fetchone() is None:
