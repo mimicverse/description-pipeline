@@ -21,6 +21,7 @@ URDF 是拓扑、关节原点/有向轴/范围、质量、COM、完整惯量和�
 | `mjcf.py` | 冻结引用闭包、从 URDF 直接投影 XML、调用完整检查、提交新输出目录 |
 | `verification/mjcf.py` | 独立解析冻结 URDF，重载实际 MJCF，数值、配置、资产及来源检查 |
 | 现有 `cli.py` | `description mjcf build/check` 的参数与结果呈现 |
+| `tests/v1/test_mjcf*.py` | 中性输入、边界反例及不依赖生成算法的数值回归 |
 
 不新增通用机器人类、第二份完整模型、插件注册器、任务数据库、调度器或发布器。URDF 树只在一次调用的内存中解析。共用现有规范数值格式、摘要、路径边界和 `runtime.py` 中的 MuJoCo 版本定义及 `requirements/linux-py312.lock`。
 
@@ -134,4 +135,13 @@ reports/quality.json       # 独立重算的确定性报告
 
 本模块只保留一个生成入口和一个完整只读检查入口。`rg -n 'generate_mjcf|MjModel|MjSpec|fullinertia|diaginertia|robot\.json' src/description_pipeline/mjcf* src/description_pipeline/verification/mjcf.py` 应能证明：无旧脚本复制、无完整第二模型、无原生低精度 XML 导出链。参考脚本属于另一个仓库，不能声称本 PR 已删除它；本仓库不存在旧 MJCF 实现则删除清单明确记为“不适用”，以实测搜索结果作证。
 
-新增复杂度只为四件事服务：无损物理投影、显式场景来源、可携带引用闭包、独立数值验收。任何额外框架或持久状态必须先证明必要性。
+| 清理对象 | 最终状态与检索证据 |
+|---|---|
+| 旧 MJCF 脚本、旧入口与兼容层 | 本仓库基线没有旧 MJCF 实现；未复制参考仓库脚本。模块范围内 `rg 'generate_mjcf'` 无匹配 |
+| 草稿中未使用的格式接口和反向旋转工具 | 已移除 `CONFIG_SCHEMA`、`read_manifest`、`matrix_from_quaternion`；模块范围内同名检索无匹配 |
+| 引擎完整数据的第二份表示与低精度导出链 | 模块范围内 `rg 'base64|pickle|to_xml|saveLastXML|robot\.json'` 无匹配；`MjModel.from_xml_path` 仅在独立验证器装载机器人与场景 |
+| 重复调度、状态和机器人参数配置 | 没有新增；机械事实只读 URDF，原始文件只封存在 `input/`，报告不充当机械或调度状态权威 |
+
+以上模块范围为 `src/description_pipeline/mjcf*.py` 与 `src/description_pipeline/verification/mjcf.py`；检索结果应结合源码职责表检查，不能单凭无匹配证明独立性。
+
+新增复杂度只为无损物理投影、显式场景来源、可携带引用闭包和独立数值验收服务。封闭 XML 预检用于拒绝未授权动力学及包外资源；容差内双向顶点匹配处理 MuJoCo 的顶点焊接与排序变化；Linux `renameat2(RENAME_NOREPLACE)` 防止提交时覆盖并发出现的目标目录。它们均无额外服务或持久状态。任何额外框架必须先证明必要性。
