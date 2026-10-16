@@ -188,7 +188,7 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
                     f"The {stage!r} stage tree carries an unreadable native transfer identity"
                 )
             payload["handoff_sha256"] = transfer_handoff
-    for key in ("error", "tool", "native_tool", "quality", "submission"):
+    for key in ("error", "error_code", "detail", "tool", "native_tool", "quality", "submission"):
         if receipt.get(key) is not None:
             payload[key] = receipt[key]
     return payload
@@ -559,10 +559,32 @@ def _failed_native_stage(job: dict) -> str:
     return "capture"
 
 
+def _boundary_failure(message: str, source: dict) -> AirflowFailException:
+    """A DAG-boundary failure that keeps the source's registered error shape.
+
+    The convergence path reads ``error.code``/``error.detail`` - the same
+    shape ``_register_failed_stage`` records - so a native job or portable
+    receipt that carries the stable code and detail hands them over unchanged;
+    a source without those fields never fabricates them (the attributes stay
+    unset, and the registered receipt remains the readout authority).
+    """
+
+    failure = AirflowFailException(message)
+    code = source.get("error_code")
+    detail = source.get("detail")
+    if code is not None:
+        failure.code = code
+    if detail is not None:
+        failure.detail = detail
+    return failure
+
+
 def _portable_summary(receipt: dict, *, stage: str) -> dict:
     expected = {"generate": {"generated"}, "verify": {"verified"}, "publish": {"published", "updated", "noop"}}
     if receipt.get("state") not in expected[stage] or (stage != "generate" and receipt.get("passed") is not True):
-        raise AirflowFailException(receipt.get("error") or f"{stage} did not complete its required checks")
+        raise _boundary_failure(
+            receipt.get("error") or f"{stage} did not complete its required checks", receipt
+        )
     return {
         "state": receipt.get("state"),
         "passed": receipt.get("passed"),
@@ -1050,7 +1072,9 @@ def _poke(request: dict, **context) -> bool:
         result = job.get("result") or {}
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
         _store_failure_report(endpoint, request, job)
-        failure = AirflowFailException(f"SolidWorks job {request['run_id']} failed: {job.get('error')}")
+        failure = _boundary_failure(
+            f"SolidWorks job {request['run_id']} failed: {job.get('error')}", job
+        )
         _converge_failed_stage(request["run_id"], _failed_native_stage(job), failure, products=True)
         raise failure
     return job["status"] in {"passed", "native_complete"}
