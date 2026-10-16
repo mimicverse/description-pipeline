@@ -84,7 +84,7 @@ description mjcf check /path/to/new-mjcf
 | 单一根、连通、无环 URDF 树 | 保留全部 link 与关节身份；固定 link 不融合 |
 | fixed / revolute / continuous / prismatic | 分别映射固定连接 / 有限 hinge / 无限 hinge / 有限 slide |
 | 非零有向轴、有限且严格递增的有界范围 | 保留轴向、原点、上下限；拒绝零轴、非单位轴和无效范围 |
-| inertial 的任意旋转和非对角惯量 | COM 保留，完整张量旋转到 link 坐标后写入 `fullinertia`；禁止调质量、对角化丢项或自动修复 |
+| inertial 的任意旋转和非对角惯量 | COM 保留，完整张量旋转到 link 坐标后按主轴系写成 `diaginertia`+`quat`；禁止调质量、丢弃非对角项或自动修复 |
 | 正质量与满足物理条件的完整惯量 | 可动刚体必须具备；无惯量的固定坐标 link 保持为无质量 frame，不推定密度 |
 | visual/collision 的 box、sphere、cylinder、二进制 STL | 保留坐标、尺度、颜色；单位为 SI；STL 保留原始字节与引用关系 |
 | URDF damping / friction | 映射关节 damping / frictionloss；不存在时采用 URDF 的零值语义 |
@@ -132,6 +132,8 @@ reports/quality.json       # 独立重算的确定性报告
 
 ## 精简验收
 
-本模块只保留一个生成入口和一个完整只读检查入口。`rg -n 'generate_mjcf|MjModel|MjSpec|fullinertia|robot\.json' src/description_pipeline/mjcf* src/description_pipeline/verification/mjcf.py` 应能证明：无旧脚本复制、无完整第二模型、无原生低精度 XML 导出链。参考脚本属于另一个仓库，不能声称本 PR 已删除它；本仓库不存在旧 MJCF 实现则删除清单明确记为“不适用”，以实测搜索结果作证。
+本模块只保留一个生成入口和一个完整只读检查入口。实测
+`rg -n 'generate_mjcf|MjSpec|to_xml|robot\.json' src/description_pipeline/mjcf.py src/description_pipeline/verification/mjcf.py src/description_pipeline/mjcf_contract.py`
+无任何命中：本仓库没有可被复制的旧 MJCF 实现，也没有第二份完整模型或原生低精度 XML 导出链，因此删除清单记为“不适用”，以该实测搜索为证。参考脚本属于另一个仓库，本 PR 不声称删除它；`fullinertia` 仅作为说明文字出现一次，用于记录为何不采用该编码。
 
 新增复杂度只为四件事服务：无损物理投影、显式场景来源、可携带引用闭包、独立数值验收。任何额外框架或持久状态必须先证明必要性。
