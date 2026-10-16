@@ -86,8 +86,15 @@ ENV_SAFE = re.compile(r"^[A-Za-z0-9._/:=@%+-]*$")
 
 
 def encode_env_value(value: str) -> str:
-    """The canonical on-disk encoding of one env value."""
+    """The canonical on-disk encoding of one env value.
 
+    The format is one line per key=value, so a value carrying a line break cannot be
+    represented: the encoder refuses it (the writer fails closed) instead of emitting a
+    file that every reader would misparse.
+    """
+
+    if "\n" in value or "\r" in value:
+        raise ValueError("an env value cannot carry a line break")
     return value if ENV_SAFE.fullmatch(value) else shlex.quote(value)
 
 

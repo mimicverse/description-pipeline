@@ -1812,6 +1812,42 @@ class InstallOrderingTests(unittest.TestCase):
         health_file.write_text(json.dumps({"passed": True, "verb": "health", "health": health}), encoding="utf-8")
         env["FIXTURE_HEALTH_FILE"] = str(health_file)
 
+    def test_maintenance_reconcile_verifies_the_candidate_before_any_ddl(self) -> None:
+        """A tampered staged snapshot refuses with zero live-DDL calls."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            snapshot = Path(receipt["to"])
+            snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+            refused = run(
+                [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                    "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                    "--evidence", "receipt.json",
+                ],
+                control_env,
+            )
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertIn("snapshot", refused.stderr)
+            self.assertEqual(
+                order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                before,
+                "no live DDL may run before the staged identity verifies",
+            )
+
     def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)

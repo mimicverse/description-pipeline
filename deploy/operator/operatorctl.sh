@@ -537,24 +537,6 @@ GUARD
         -m description_pipeline.orchestration.lifecycle_state report \
         --require-admission-closed >/dev/null \
         || die "the staged-candidate reconcile runs only while the admission is closed"
-      # The staged release's platform objects travel to the live authority only here, behind
-      # the verified closed gate, in the installer's canonical order (airflow-side boundary
-      # grants, then the platform schema/views/roles); they are additive and idempotent and
-      # the staged read model is what the recovery below reads.  The step is recorded on the
-      # receipt; promote re-applies the same migrations as its own verified step.
-      ensure_postgres_ready
-      if ! {
-        PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
-          --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-          --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" \
-        && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
-          --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-          --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}"
-      } > "$RECEIPT_DIR/reconcile-schema-migration.out" 2>&1; then
-        promotion_step "$CANDIDATE_ID" reconcile schema-migration failed "$RECEIPT_DIR/reconcile-schema-migration.out"
-        die "the staged generation's schema objects were not applied (the admission stays closed)"
-      fi
-      promotion_step "$CANDIDATE_ID" reconcile schema-migration completed "$RECEIPT_DIR/reconcile-schema-migration.out"
       python3 - "$HERE/../../release.json" "$RECEIPT_DIR/receipt.json" "$CANDIDATE_DIGEST" \
         "$CANDIDATE_WHEEL_PATH" "$AIRFLOW_VENV" "$HERE" <<'GUARD' || die "the staged generation identity did not verify; re-run stage"
 # staged-generation identity: the recorded snapshot, the wheel binding and the installed package
@@ -609,6 +591,26 @@ if (
     raise SystemExit("the staged runtime's installed package is not the staged release")
 print(f"staged generation verified: {receipt['install_id']}")
 GUARD
+      # The staged release's platform objects travel to the live authority only here: after
+      # the verified closed gate AND after the complete staged-identity verification above
+      # (snapshot digest, wheel binding, installed package), in the installer's canonical
+      # order (airflow-side boundary grants, then the platform schema/views/roles); they are
+      # additive and idempotent and the staged read model is what the recovery below reads.
+      # The step is recorded on the receipt; promote re-applies the same migrations as its
+      # own verified step.
+      ensure_postgres_ready
+      if ! {
+        PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
+          --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+          --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" \
+        && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
+          --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+          --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}"
+      } > "$RECEIPT_DIR/reconcile-schema-migration.out" 2>&1; then
+        promotion_step "$CANDIDATE_ID" reconcile schema-migration failed "$RECEIPT_DIR/reconcile-schema-migration.out"
+        die "the staged generation's schema objects were not applied (the admission stays closed)"
+      fi
+      promotion_step "$CANDIDATE_ID" reconcile schema-migration completed "$RECEIPT_DIR/reconcile-schema-migration.out"
     fi ;;
   stage|promote|rollback)
     load_running_env ;;
