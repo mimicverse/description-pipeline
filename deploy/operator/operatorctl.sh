@@ -268,7 +268,10 @@ ensure_postgres_ready() {
 }
 
 airflow_render() {
-  OPERATOR_DERIVED_ENV="${OPERATOR_DERIVED_ENV:-${ENV_FILE:-}}" \
+  # The runtime units always load the current controlled derived environment: the binding is
+  # this call's ENV_FILE, never an ambient OPERATOR_DERIVED_ENV that could point elsewhere.
+  [ -n "$ENV_FILE" ] || die "ENV_FILE is not set: the runtime units must load the controlled derived environment"
+  OPERATOR_DERIVED_ENV="$ENV_FILE" \
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
   POSTGRES_ROOT="${POSTGRES_ROOT:-}" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
   SOLIDWORKS_SSH_HOST="${SOLIDWORKS_SSH_HOST:-}" \

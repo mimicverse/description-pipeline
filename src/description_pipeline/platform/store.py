@@ -296,6 +296,11 @@ _SETTLE_OPERATIONS = (
     " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
     " AND state IN ('queued', 'running', 'unresolved')"
 )
+_SETTLE_BLOCKED_OPERATIONS = (
+    "UPDATE operation SET state = 'cancelled', updated_at = now()"
+    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
+    " AND state = 'queued'"
+)
 _SETTLE_UNKNOWN = (
     "UPDATE operation SET state = 'unresolved', updated_at = now()"
     " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
@@ -1465,9 +1470,12 @@ class PlatformStore:
         claimed and never-claimed alike - to the mapped terminal state (a
         ``cancel`` command closes as ``succeeded``: whether it actually
         cancelled is the stage record's business), so no queued/running shadow
-        is left for maintenance.  An unresolved outcome freezes only the
-        claimed operation as unknown and leaves the run in place until the
-        evidenced reconciliation, which then settles the rest.
+        is left for maintenance.  A blocked stage never entered execution: it
+        closes only its still-queued (never dispatched) intents as cancelled
+        non-executions and never rewrites a claimed operation.  An unresolved
+        outcome freezes only the claimed operation as unknown and leaves the
+        run in place until the evidenced reconciliation, which then settles
+        the rest.
         """
 
         run_outcome: str | None = None
@@ -1478,6 +1486,12 @@ class PlatformStore:
         elif state in {"failed", "cancelled"}:
             outcome = state
             run_outcome = state
+        elif state == "blocked":
+            # A blocked stage never entered execution: its still-queued intents are the
+            # evidenced non-execution - they close as cancelled, never as failed, and a
+            # claimed (possibly dispatched) operation is never rewritten here.
+            connection.cursor().execute(_SETTLE_BLOCKED_OPERATIONS, (run_id, stage))
+            return
         elif state == "unresolved":
             outcome = "unresolved"
         else:

@@ -1557,6 +1557,60 @@ class LifecycleTests(unittest.TestCase):
             self._render_airflow_units(state, config_home, derived_env=True)
             self.assertEqual(self._digest_reaching_task(unit), controlled)
 
+    def test_airflow_render_binds_this_calls_env_file_not_an_ambient_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, state, _, _ = self._render_units(Path(tmp))
+            derived = state / "derived" / "gen-1" / "operator.env"
+            decoy = Path(tmp) / "ambient-decoy.env"
+            decoy.write_text("OPERATOR_STATE=/ambient\n", encoding="utf-8")
+            airflow_home = Path(tmp) / "airflow-home"
+            stub = airflow_home / "services.sh"
+            stub.parent.mkdir()
+            stub.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$OPERATOR_DERIVED_ENV"\n', encoding="utf-8")
+
+            def call(env_file: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        "set -euo pipefail\n"
+                        'die() { echo "operatorctl: $*" >&2; exit 1; }\n'
+                        "eval \"$(sed -n '/^airflow_render()/,/^}$/p' \"$CONTROL_PATH\")\"\n"
+                        "airflow_render\n",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "PATH": os.environ.get("PATH", ""),
+                        "CONTROL_PATH": str(CONTROL),
+                        "AIRFLOW_HERE": str(airflow_home),
+                        "ENV_FILE": env_file,
+                        "OPERATOR_DERIVED_ENV": str(decoy),
+                        "AIRFLOW_VENV": "/nonexistent/venv",
+                        "AIRFLOW_HOME": "/nonexistent/home",
+                        "POSTGRES_ROOT": "/nonexistent/pg",
+                        "POSTGRES_MAJOR": "14",
+                        "SOLIDWORKS_SSH_HOST": "windows-m3",
+                        "AIRFLOW_API_PORT": "18439",
+                        "POSTGRES_PORT": "5433",
+                        "TUNNEL_LOOPBACK_PORT": "18788",
+                        "SOLIDWORKS_ENDPOINT_PORT": "8743",
+                        "FEISHU_ENV_FILE": "/nonexistent/feishu.env",
+                    },
+                )
+
+            bound = call(str(derived))
+            self.assertEqual(bound.returncode, 0, bound.stderr)
+            self.assertEqual(
+                bound.stdout.strip(),
+                str(derived),
+                "the formal caller binds the current ENV_FILE, never the ambient duplicate",
+            )
+            # An empty ENV_FILE refuses loudly instead of rendering unwired units.
+            refused = call("")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("ENV_FILE is not set", refused.stderr)
+
     @staticmethod
     def _digest_reaching_task(unit: Path) -> str:
         """One fresh task process through the unit's own environment; nothing is exported here.

@@ -585,6 +585,17 @@ class FakeCursor:
                     settled = "succeeded" if record[6] == "cancel" else outcome
                     world.operations[key] = (record[0], settled, *record[2:])
             self._rows = []
+        elif normalized.startswith("UPDATE operation SET state = 'cancelled', updated_at = now()"):
+            run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[4] == run_id
+                    and record[5] == stage
+                    and record[6] not in {"reconcile", "cache_release"}
+                    and record[1] == "queued"
+                ):
+                    world.operations[key] = (record[0], "cancelled", *record[2:])
+            self._rows = []
         elif normalized.startswith("UPDATE operation SET state = 'unresolved'"):
             run_id, stage = params
             for key, record in list(world.operations.items()):
@@ -1871,6 +1882,40 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(self.world.stages[("r-1", "generate")][0], "blocked")
         with self.assertRaisesRegex(PlatformStoreError, "already terminal"):
             self._confirm_generate()
+
+    def test_a_blocked_stage_closes_its_never_dispatched_intent(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="freeze",
+            state="failed",
+            receipt={
+                "schema_version": store_module.BUNDLE_SCHEMA,
+                "run_id": "r-1",
+                "stage": "freeze",
+                "state": "failed",
+                "passed": False,
+            },
+        )
+        self.assertEqual(self.world.operations["r-1/capture:0"][1], "queued")
+        self.store.confirm_stage(run_id="r-1", stage="capture", state="blocked")
+        self.assertEqual(
+            self.world.operations["r-1/capture:0"][1],
+            "cancelled",
+            "a never-dispatched intent closes as a cancelled non-execution, never as failed",
+        )
+
+    def test_a_blocked_stage_never_rewrites_a_claimed_intent(self) -> None:
+        self._running_run()
+        self.assertTrue(
+            self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/capture:0").granted
+        )
+        self.store.confirm_stage(run_id="r-1", stage="capture", state="blocked")
+        self.assertEqual(
+            self.world.operations["r-1/capture:0"][1],
+            "running",
+            "a claimed operation was already dispatched: a blocked record never rewrites it",
+        )
 
     # ------------------------------------------------------- run progression
 
