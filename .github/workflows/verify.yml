@@ -77,6 +77,40 @@ jobs:
       - name: The Windows settle semantics (offline pwsh matrix)
         run: pwsh -NoProfile -File tests/deploy/test_instance_lifecycle.ps1
 
+  windows-ps51:
+    # The Windows lifecycle's required compatibility baseline: Desktop Windows PowerShell 5.1
+    # (powershell.exe) plus the bound CPython 3.12 the stage installs with.  The Linux pwsh
+    # matrix above remains a fast cross-check but is never the 5.1 proof.
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: The baseline is Desktop PowerShell 5.1 with a bound CPython 3.12
+        run: |
+          if ($PSVersionTable.PSEdition -ne 'Desktop') { throw "expected Desktop PowerShell, got $($PSVersionTable.PSEdition)" }
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw "expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)" }
+          Write-Host "powershell: $($PSVersionTable.PSVersion)"
+          $probe = @()
+          try { $probe = @(& py -3.12 --version 2>&1) } catch { $probe = @() }
+          if (-not (($probe -join ' ') -match '3\.12\.')) {
+            choco install python312 --no-progress -y
+          }
+          $version = (& py -3.12 --version 2>&1) -join ' '
+          if ($version -notmatch '3\.12\.') { throw "the bound CPython 3.12 is unavailable: $version" }
+          Write-Host "bound python: $version"
+      - name: The Windows settle/JSON boundary matrix (real Desktop PowerShell 5.1)
+        run: powershell -NoProfile -File tests/deploy/test_instance_lifecycle.ps1
+      - name: The endpoint configuration value boundary (the package reader)
+        run: |
+          & py -3.12 -m pip install --disable-pip-version-check --no-warn-script-location -e .
+          if ($LASTEXITCODE -ne 0) { throw 'the editable install failed' }
+          & py -3.12 -m unittest tests.v1.test_endpoint_config_boundary
+          if ($LASTEXITCODE -ne 0) { throw 'the endpoint configuration boundary suite failed' }
+
   distribution:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
