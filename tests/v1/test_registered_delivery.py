@@ -499,6 +499,28 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
         running.admit(WSGI_RUN)
         advice = get_retry(running)
         self.assertEqual(advice["eligible"], True, advice)
+        unresolved = RegisteredPlatform(self.tmp / "advice-unresolved")
+        unresolved.admit(WSGI_RUN)
+        unresolved.store.confirm_stage(
+            run_id=WSGI_RUN,
+            stage="capture",
+            state="unresolved",
+            receipt={
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": WSGI_RUN,
+                "stage": "capture",
+                "state": "unresolved",
+                "passed": False,
+                "error": "Registered authoritative native outcome",
+            },
+        )
+        advice = get_retry(unresolved)
+        self.assertEqual(advice["eligible"], False, advice)
+        self.assertEqual(advice["reason"], "registered_unresolved")
+        # Stage-neutral: an unresolved outcome requires reconciliation; the
+        # publication-specific classification belongs to publication evidence only.
+        self.assertEqual(advice["classification"], "reconciliation_required")
 
 
 if __name__ == "__main__":

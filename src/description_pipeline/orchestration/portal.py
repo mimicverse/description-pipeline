@@ -866,12 +866,15 @@ _RETRY_REFUSED_MESSAGES = {
 }
 
 
-#: The recovery classification of a registered terminal outcome.
-_REGISTERED_RECOVERY_TERMINAL = {
+#: The recovery classification of a registered outcome that blocks in-place retry.
+#: An unresolved outcome is stage-neutral: it requires reconciliation, and only a
+#: registration whose own evidence names the publication scope may say so.
+RECOVERY_RECONCILIATION_REQUIRED = "reconciliation_required"
+_REGISTERED_RECOVERY_CLASSIFICATION = {
     "failed": RECOVERY_ENGINEERING_TERMINAL,
     "cancelled": RECOVERY_ENGINEERING_TERMINAL,
     "succeeded": "run_succeeded",
-    "unresolved": RECOVERY_UNKNOWN_PUBLICATION,
+    "unresolved": RECOVERY_RECONCILIATION_REQUIRED,
 }
 
 
@@ -879,15 +882,16 @@ def _registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
     """The (reason, classification) blocking in-place recovery, or None while it may proceed.
 
     Only a known live admitted registration (``queued``/``running``) opens the
-    scheduling recovery: terminal outcomes refuse with their recorded reason,
-    and a missing or unproven registration fails closed - Airflow or native
-    facts never substitute for the platform admission.
+    scheduling recovery: decided terminal outcomes refuse with their recorded
+    reason, an unresolved outcome requires reconciliation, and a missing or
+    unproven registration fails closed - Airflow or native facts never
+    substitute for the platform admission.
     """
     state = record.get("state") if isinstance(record, dict) else None
     if state in {"queued", "running"}:
         return None
-    if isinstance(state, str) and state in _REGISTERED_RECOVERY_TERMINAL:
-        return f"registered_{state}", _REGISTERED_RECOVERY_TERMINAL[state]
+    if isinstance(state, str) and state in _REGISTERED_RECOVERY_CLASSIFICATION:
+        return f"registered_{state}", _REGISTERED_RECOVERY_CLASSIFICATION[state]
     return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
 
 
@@ -1792,9 +1796,10 @@ class PortalApp:
                         self.config,
                     )
                 # Only a known live admitted registration opens the scheduling
-                # recovery: terminal outcomes and unproven registrations refuse
-                # BEFORE any Airflow clear (dry-run included) - a stale native
-                # observation never substitutes for the platform admission.
+                # recovery: decided terminal outcomes, unresolved results and
+                # unproven registrations refuse BEFORE any Airflow clear
+                # (dry-run included) - a stale native observation never
+                # substitutes for the platform admission.
                 run_id = native_run_id(dag_run_id)
                 record = self._platform_read(lambda: self._platform().run_record(run_id))
                 block = _registered_recovery_block(record)
@@ -1805,7 +1810,7 @@ class PortalApp:
                         HTTPStatus.CONFLICT,
                         {
                             "error": (
-                                "该运行没有可恢复的平台登记（缺失、未知或已终态）：不可原地清除重试；"
+                                "该运行没有可原地恢复的平台登记（缺失、未知、已终态或结果未决）：不可清除重试；"
                                 "未决结果请先完成对账，其余请按登记结果修复后新建关联运行"
                             ),
                             "reason": reason,
