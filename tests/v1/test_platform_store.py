@@ -2039,13 +2039,17 @@ class OrphanReconcileTests(unittest.TestCase):
         claimed_sha: str | None = None,
         native_run: str | None = None,
         native_document: dict | None = None,
+        native_path: str | None = None,
         with_binding: bool = True,
-    ) -> store_module.NativeReceiptEvidence:
+        with_receipt_inputs: bool = True,
+        formed_receipt: dict | None = None,
+    ) -> str:
         """One whole reconcile action through the one canonical entry.
 
-        The action loads the original native receipt bytes through the canonical
-        loader (never a shaped digest string) and composes the recorded failed
-        fact from the validated result.
+        The action carries only the raw inputs (the original file and the bound
+        endpoint job UUID); the Store action itself loads and validates the
+        bytes - this helper holds no acceptance rules of its own.  It returns
+        the receipt path so callers can compute the expected byte digest.
         Without ``reconcile_operation_id`` the action carries its own
         registration (key plus parameter digest): the maintenance registration,
         the binding and the settlement commit or roll back as one short unit.
@@ -2068,18 +2072,15 @@ class OrphanReconcileTests(unittest.TestCase):
             "error_code": "selection_open_errors",
         }
         receipt_path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+        named_path = Path(native_path) if native_path is not None else receipt_path
+        if evidence is not None:
+            # A raw evidence entry names the original it binds: its path is the raw input.
+            named_path = Path(evidence.split("#", 1)[0])
+        action_evidence = [extra_evidence] if extra_evidence is not None else []
+        if evidence is not None:
+            action_evidence.append(evidence)
         if claimed_sha is not None:
-            entry = f"{receipt_path}#sha256={claimed_sha}"
-        else:
-            entry = evidence if evidence is not None else str(receipt_path)
-        named = entry.split("#", 1)[0]
-        loaded = store_module.load_native_failed_receipt(
-            named, stage="freeze", native_run_id=binding_native
-        )
-        if "#sha256=" in entry and entry.split("#sha256=", 1)[1] != loaded.sha256:
-            raise store_module.PlatformStoreError("The evidence entry contradicts the receipt bytes")
-        digest_entry = f"{loaded.path}#sha256={loaded.sha256}"
-        action_evidence = ([extra_evidence] if extra_evidence is not None else []) + [digest_entry]
+            action_evidence.append(f"{named_path}#sha256={claimed_sha}")
         reconcile: dict = {"evidence": action_evidence}
         if reconcile_operation_id is None:
             reconcile["operation_key"] = f"operatorctl-reconcile:{run_id}:freeze:{state}"
@@ -2096,24 +2097,12 @@ class OrphanReconcileTests(unittest.TestCase):
             reconcile["operation_id"] = reconcile_operation_id
         if with_binding:
             reconcile["binding"] = {"operation_id": dispatch_id, "task_id": task, "map_index": map_index}
-        receipt = {
-            "schema_version": store_module.BUNDLE_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "run_id": run_id,
-            "stage": loaded.stage,
-            "state": loaded.state,
-            "passed": False,
-            "native_run_id": loaded.native_run_id,
-            "native_receipt_sha256": loaded.sha256,
-        }
-        for key in ("error", "error_code", "detail"):
-            value = getattr(loaded, key)
-            if value is not None:
-                receipt[key] = value
+        if with_receipt_inputs:
+            reconcile["native_receipt"] = {"path": str(named_path), "native_run_id": binding_native}
         # The settled-external-failure preflight of the canonical action: the bound
         # operation's own DagRun must be the real terminal failed fact - a live or unknown
         # DagRun refuses (in the operator entry this reads the Airflow runtime metadata).
-        if with_binding:
+        if with_binding and not formed_receipt:
             bound_row = self.world.operation_bindings.get(dispatch_id)
             if bound_row is None or not all(bound_row[:2]):
                 raise store_module.PlatformStoreError(
@@ -2124,9 +2113,9 @@ class OrphanReconcileTests(unittest.TestCase):
                     "The bound DagRun does not prove its terminal failed fact; refused"
                 )
         self.store.confirm_stage(
-            run_id=run_id, stage="freeze", state=state, receipt=receipt, reconcile=reconcile
+            run_id=run_id, stage="freeze", state=state, receipt=formed_receipt, reconcile=reconcile
         )
-        return loaded
+        return str(named_path)
 
     def _snapshot(self):
         """The complete world state (rows, bindings, events) for zero-change proofs."""
@@ -2139,7 +2128,8 @@ class OrphanReconcileTests(unittest.TestCase):
             with self.subTest(run_id=run_id):
                 self.setUp()
                 dispatch_id = self._legacy_orphan(run_id)
-                loaded = self._call(run_id, dispatch_id)
+                receipt_path = self._call(run_id, dispatch_id)
+                loaded_sha = file_digest(Path(receipt_path))
                 self.assertEqual(
                     self.world.operation_bindings[dispatch_id],
                     ("solidworks_to_urdf", run_id, "start_job", -1),
@@ -2150,10 +2140,14 @@ class OrphanReconcileTests(unittest.TestCase):
                 self.assertEqual(stage[1]["error"], "SelectionError: two open errors")
                 self.assertEqual(stage[1]["reconciliation"]["binding"]["task_id"], "start_job")
                 self.assertEqual(stage[1]["native_run_id"], NATIVE_RUNS[run_id])
-                self.assertEqual(stage[1]["native_receipt_sha256"], loaded.sha256)
+                self.assertEqual(stage[1]["native_receipt_sha256"], loaded_sha)
                 self.assertEqual(
                     stage[1]["reconciliation"]["evidence"],
-                    [f"{loaded.path}#sha256={loaded.sha256}"],
+                    [f"{receipt_path}#sha256={loaded_sha}"],
+                )
+                self.assertEqual(
+                    stage[1]["reconciliation"]["native_receipt"],
+                    {"path": receipt_path, "native_run_id": NATIVE_RUNS[run_id]},
                 )
                 self.assertEqual(
                     self.world.operations[f"portal-{run_id}/capture:0"][1], "failed", "the intent settles"
@@ -2172,7 +2166,7 @@ class OrphanReconcileTests(unittest.TestCase):
                 self.assertEqual(binding_payload["dag_id"], "solidworks_to_urdf")
                 self.assertEqual(binding_payload["dag_run_id"], run_id)
                 self.assertEqual(binding_payload["native_run_id"], NATIVE_RUNS[run_id])
-                self.assertEqual(binding_payload["native_receipt_sha256"], loaded.sha256)
+                self.assertEqual(binding_payload["native_receipt_sha256"], loaded_sha)
 
     def test_a_repeat_of_the_same_whole_action_changes_nothing(self) -> None:
         dispatch_id = self._legacy_orphan(RUN_A)
@@ -2246,7 +2240,7 @@ class OrphanReconcileTests(unittest.TestCase):
 
         cases = {
             # A shaped digest string over a file that does not exist proves nothing.
-            "missing_file": dict(evidence="/nonexistent/review/native.json#sha256=" + "f" * 64),
+            "missing_file": dict(native_path="/nonexistent/review/native.json"),
             "empty_document": dict(native_document={}),
             "report_shaped_document": dict(
                 native_document={"schema_version": "solidworks-to-urdf.structural-report/v1", "passed": True}
@@ -2317,12 +2311,101 @@ class OrphanReconcileTests(unittest.TestCase):
     def test_the_failed_receipt_digest_must_be_the_evidence_bound_one(self) -> None:
         dispatch_id = self._legacy_orphan(RUN_A)
         before = self._snapshot()
+        # A caller-supplied digest that contradicts the original bytes is never normalized away.
         with self.assertRaises(PlatformStoreError):
             self._call(RUN_A, dispatch_id, claimed_sha="0" * 64)
-        # an evidence entry that names no receipt digest binds nothing either
+        # A formed receipt with matching digest strings never substitutes for the raw inputs.
         with self.assertRaises(PlatformStoreError):
-            self._call(RUN_A, dispatch_id, evidence="runs/note.json")
+            self._call(
+                RUN_A,
+                dispatch_id,
+                with_receipt_inputs=False,
+                formed_receipt={
+                    "schema_version": store_module.BUNDLE_SCHEMA,
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": RUN_A,
+                    "stage": "freeze",
+                    "state": "failed",
+                    "passed": False,
+                    "native_run_id": NATIVE_RUNS[RUN_A],
+                    "native_receipt_sha256": "f" * 64,
+                },
+            )
         self.assertEqual(self._snapshot(), before)
+
+    def test_a_formed_receipt_at_the_direct_store_boundary_proves_nothing(self) -> None:
+        """The direct Store boundary: a formed receipt plus matching digest strings refuses.
+
+        These four predicates mirror the design side's independent direct-store probe:
+        a missing original, an empty document, a successful ("passed") document and a
+        foreign-run document, each presented as a ready-made platform receipt with a
+        matching ``#sha256=`` evidence entry and no raw inputs.
+        """
+
+        variants = {
+            "missing_original": ("/nonexistent/review/native.json", "f" * 64, None),
+            "empty_original": (None, None, {}),
+            "successful_original": (
+                None,
+                None,
+                {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": NATIVE_RUNS[RUN_A],
+                    "request": {"run_id": NATIVE_RUNS[RUN_A]},
+                    "status": "passed",
+                    "events": [{"stage": "freeze", "state": "passed"}],
+                },
+            ),
+            "foreign_original": (
+                None,
+                None,
+                {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": "deadbeef-0000-4000-8000-000000000000",
+                    "request": {"run_id": "deadbeef-0000-4000-8000-000000000000"},
+                    "status": "failed",
+                    "events": [{"stage": "freeze", "state": "failed"}],
+                },
+            ),
+        }
+        for name, (path_override, sha_override, document) in variants.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="native-bytes-direct-") as directory:
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                if path_override is not None:
+                    path = Path(path_override)
+                    sha = sha_override
+                else:
+                    path = Path(directory) / "original.json"
+                    path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+                    sha = file_digest(path)
+                receipt = {
+                    "schema_version": store_module.BUNDLE_SCHEMA,
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": RUN_A,
+                    "stage": "freeze",
+                    "state": "failed",
+                    "passed": False,
+                    "native_run_id": NATIVE_RUNS[RUN_A],
+                    "native_receipt_sha256": sha,
+                }
+                evidence = [f"{path}#sha256={sha}"]
+                binding = {"operation_id": dispatch_id, "task_id": "start_job", "map_index": -1}
+                reconcile = {
+                    "operation_key": f"operatorctl-reconcile:{RUN_A}:freeze:failed",
+                    "params_digest": digest({"outcome": "failed", "evidence": evidence, "binding": binding}),
+                    "evidence": evidence,
+                    "binding": binding,
+                }
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self.store.confirm_stage(
+                        run_id=RUN_A, stage="freeze", state="failed", receipt=receipt, reconcile=reconcile
+                    )
+                self.assertEqual(self._snapshot(), before, "the refused direct call changed nothing")
+                self.assertEqual(self.world.run_states.get(RUN_A), "queued")
 
     def test_a_live_or_unknown_dag_run_never_authorizes_recovery(self) -> None:
         for name, dag_state in (("live", "running"), ("green", "success")):

@@ -991,6 +991,10 @@ class PlatformStore:
             raise PlatformStoreError("Reconciliation evidence must be a non-empty record")
         if reconcile is not None and state not in {"completed", "failed", "cancelled"}:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
+        if reconcile is not None and isinstance(reconcile.get("binding"), dict):
+            receipt, reconcile = self._byte_bound_orphan_receipt(
+                run_id=run_id, stage=stage, state=state, receipt=receipt, reconcile=reconcile
+            )
         definition = None
         sealed_root = None
         reuse_binding = None
@@ -1165,6 +1169,70 @@ class PlatformStore:
                 payload={"state": state},
             )
             self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+
+    def _byte_bound_orphan_receipt(
+        self, *, run_id: str, stage: str, state: str, receipt: dict | None, reconcile: dict
+    ) -> tuple[dict, dict]:
+        """Compose an orphan's failed receipt from the original native bytes - the one rule.
+
+        An orphan recovery never accepts a formed receipt or a digest string: the
+        reconciliation carries the raw inputs (the original file and the bound
+        endpoint job UUID) and this Store action itself loads the bytes, validates
+        the native job document, binds the outcome and identity, derives the digest
+        from those bytes, and normalizes the recorded evidence to that digest.  The
+        caller's layers hold no acceptance rules and cannot bypass the bytes.
+        """
+
+        if state != "failed":
+            raise PlatformStoreError("An orphan reconciliation records the observed failure")
+        if receipt is not None:
+            raise PlatformStoreError(
+                "An orphan recovery carries its original receipt inputs, never a formed receipt"
+            )
+        inputs = reconcile.get("native_receipt")
+        if not isinstance(inputs, dict):
+            raise PlatformStoreError(
+                "An orphan reconciliation must carry its original native receipt (path and endpoint job UUID)"
+            )
+        path = inputs.get("path")
+        native_run_id = inputs.get("native_run_id")
+        if not isinstance(path, str) or not path or not isinstance(native_run_id, str) or not native_run_id:
+            raise PlatformStoreError("The orphan receipt inputs name their original file and endpoint job UUID")
+        loaded = load_native_failed_receipt(path, stage=stage, native_run_id=native_run_id)
+        digest_entry = f"{loaded.path}#sha256={loaded.sha256}"
+        entries = reconcile.get("evidence")
+        entries = list(entries) if isinstance(entries, list) else []
+        contradicting = [
+            item
+            for item in entries
+            if isinstance(item, str)
+            and item.startswith(f"{loaded.path}#sha256=")
+            and item.split("#sha256=", 1)[1] != loaded.sha256
+        ]
+        if contradicting:
+            raise PlatformStoreError(f"The evidence entry contradicts the original receipt bytes: {contradicting[0]}")
+        normalized_evidence = [
+            item
+            for item in entries
+            if not (isinstance(item, str) and (item == loaded.path or item.startswith(f"{loaded.path}#")))
+        ] + [digest_entry]
+        composed = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "stage": loaded.stage,
+            "state": loaded.state,
+            "passed": False,
+            "native_run_id": loaded.native_run_id,
+            "native_receipt_sha256": loaded.sha256,
+        }
+        for key in ("error", "error_code", "detail"):
+            value = getattr(loaded, key)
+            if value is not None:
+                composed[key] = value
+        resolved = {key: value for key, value in reconcile.items() if key != "evidence"}
+        resolved["evidence"] = normalized_evidence
+        return composed, resolved
 
     def _reconcile_operation(self, connection, *, run_id: str, stage: str, reconcile: dict) -> dict:
         """Resolve the reconciliation's registered operation inside the write transaction.
