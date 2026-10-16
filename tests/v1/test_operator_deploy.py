@@ -2001,6 +2001,10 @@ class InstallOrderingTests(unittest.TestCase):
                     "another database authority",
                     original.replace(dsn_line, f"PLATFORM_SERVICE_DSN={shlex.quote(foreign)}"),
                 ),
+                "duplicate_conflict": (
+                    "conflicting duplicate declaration",
+                    original + "PLATFORM_SERVICE_DSN=" + shlex.quote(foreign) + "\n",
+                ),
             }
             receipt_path = state / "promotions" / "gen-2" / "receipt.json"
             for label, (message, document) in cases.items():
@@ -2032,6 +2036,46 @@ class InstallOrderingTests(unittest.TestCase):
                         f"{label}: the guarded migration never ran",
                     )
             running_env.write_text(original, encoding="utf-8")
+
+    def test_maintenance_reconcile_reads_identical_duplicate_declarations(self) -> None:
+        """Identical duplicates decode to the same bytes the canonical readers see and are
+        accepted; only conflicting duplicates refuse (never first-wins)."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            running_env = state / "derived" / "gen-1" / "operator.env"
+            original = running_env.read_text(encoding="utf-8")
+            dsn_line = next(line for line in original.splitlines() if line.startswith("PLATFORM_SERVICE_DSN="))
+            running_env.write_text(original + dsn_line + "\n", encoding="utf-8")
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            snapshot = Path(receipt["to"])
+            snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+            refused = run(
+                [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                    "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                    "--evidence", "receipt.json",
+                ],
+                control_env,
+            )
+            running_env.write_text(original, encoding="utf-8")
+            # The route passed the environment reads (identical duplicates accepted) and reached
+            # the staged-identity guard, exactly like the canonical single-declaration case.
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertIn("snapshot", refused.stderr)
+            self.assertNotIn("duplicate", refused.stderr)
+            self.assertNotIn("does not declare", refused.stderr)
 
     def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

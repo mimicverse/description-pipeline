@@ -179,7 +179,9 @@ generation_env_value() {
 # the value.  The bootstrap window reads the RUNNING side with this reader: a pre-contract
 # generation holds its values in that writer's own format (bare single words), and the running
 # deployment's declared authority must be read, not rewritten or inherited.  A value that is
-# missing, empty or not exactly one shell word refuses; nothing is ever defaulted.
+# missing, empty or not exactly one shell word refuses; nothing is ever defaulted.  A key
+# declared twice with conflicting values is ambiguous across readers and refuses; identical
+# duplicates decode to the same bytes the canonical readers see and are accepted.
 generation_env_declared_value() {
   local file="$1" key="$2" value
   value="$(python3 - "$HERE/render_operator.py" "$file" "$key" <<'PY'
@@ -201,10 +203,12 @@ for number, line in enumerate(Path(sys.argv[2]).read_text(encoding="utf-8").spli
         continue
     seen = True
     try:
-        value = module.decode_env_value(raw.strip())
+        declared = module.decode_env_value(raw.strip())
     except ValueError as error:
         raise SystemExit(f"{sys.argv[2]}:{number}: {error}")
-    break
+    if value != "" and declared != value:
+        raise SystemExit(f"{sys.argv[2]}:{number}: conflicting duplicate declaration for {sys.argv[3]}")
+    value = declared
 if not seen or value == "":
     raise SystemExit(3)
 sys.stdout.write(value)
