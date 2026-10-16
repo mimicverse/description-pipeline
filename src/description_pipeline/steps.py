@@ -585,12 +585,6 @@ def capture_evidence(
     ``on_activity`` optionally observes best-effort capture progress records for the
     live-activity view; it never changes the snapshot, its checks or a failure path.
     """
-    from .sources.solidworks.discovery import (
-        DISCOVERY_FILE,
-        PLAN_FILE,
-        PLAN_SCHEMA,
-        SOURCE_FILE,
-    )
     from .sources.solidworks.freeze import freeze
     from .sources.solidworks.input import native_source_closure
 

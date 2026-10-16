@@ -585,7 +585,12 @@ class FreezeTests(unittest.TestCase):
         backend.pack_drop_files = {self.parts[1].name}
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "CS_base_link"}},
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            },
             {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
         ]
 
@@ -611,7 +616,12 @@ class FreezeTests(unittest.TestCase):
         backend.resolve_returns_empty = True
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "CS_base_link"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -637,7 +647,12 @@ class FreezeTests(unittest.TestCase):
         backend.copy_extra_components = 1
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "CS_base_link"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -669,7 +684,12 @@ class FreezeTests(unittest.TestCase):
         backend.collect_dependencies = broken_pack  # type: ignore[method-assign]
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "CS_base_link"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -774,7 +794,12 @@ class FreezeTests(unittest.TestCase):
         )
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "CS_base_link"}},
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            },
             {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
         ]
         return backend, config
@@ -1101,7 +1126,12 @@ class FreezeTests(unittest.TestCase):
         # switching the user's document is not this adapter's job
         config["configuration"] = "Other"
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "CS_base_link"}},
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            },
             {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
         ]
 
@@ -1194,7 +1224,12 @@ class FreezeTests(unittest.TestCase):
         )
         config = json.loads(json.dumps(self.config))
         config["bodies"] = [
-            {"id": "base", "name": "base_link", "components": ["base-1"], "frame": {"coordinate_system": "CS_base_link"}}
+            {
+                "id": "base",
+                "name": "base_link",
+                "components": ["base-1"],
+                "frame": {"coordinate_system": "CS_base_link"},
+            }
         ]
         config["joints"] = []
         config.pop("frames", None)
@@ -1531,7 +1566,12 @@ class SharedModelContractTests(unittest.TestCase):
                     "components": ["base-1"],
                     "frame": {"coordinate_system": "CS_base_link"},
                 },
-                {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "CS_arm_link"}},
+                {
+                    "id": "arm",
+                    "name": "arm_link",
+                    "components": ["arm-1"],
+                    "frame": {"coordinate_system": "CS_arm_link"},
+                },
             ],
             "joints": [
                 {

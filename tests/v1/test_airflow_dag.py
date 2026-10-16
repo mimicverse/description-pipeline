@@ -658,7 +658,9 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
         stages = run_dir / "stages"
-        self.module._register_freeze_stage(paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files)
+        self.module._register_freeze_stage(
+            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files
+        )
         call = self.calls[0]
         self.assertEqual(call["stage"], "freeze")
         self.assertEqual(call["state"], "completed")
@@ -946,8 +948,12 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         platform = _RetainingPlatform()
         with patch.object(self.module, "_platform_binding", return_value=(platform, self.root)):
-            self.module._register_freeze_stage(paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files)
-            self.module._register_freeze_stage(paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files)
+            self.module._register_freeze_stage(
+            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files
+        )
+            self.module._register_freeze_stage(
+            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files
+        )
         self.assertEqual(confirmations, ["freeze"])
 
     def test_a_failed_registration_tolerates_a_malformed_handoff(self) -> None:

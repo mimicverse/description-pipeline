@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
-from description_pipeline.io import digest, write_json
+from description_pipeline.io import digest
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory

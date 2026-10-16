@@ -299,6 +299,7 @@ jobs:
           name: real-chain-evidence
           path: |
             ${{ runner.temp }}/real-chain-report.json
+            ${{ runner.temp }}/settlement-fixtures.json
             ${{ runner.temp }}/airflow-home/logs/smoke/*.log
             ${{ runner.temp }}/airflow-home/logs/dag_id=*/*/*/*.log
           if-no-files-found: warn

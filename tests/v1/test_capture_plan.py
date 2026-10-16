@@ -157,9 +157,8 @@ class CapturePlanTests(unittest.TestCase):
         }
         validate_source_config(base)
         for retired in ("bodies", "joints", "frames"):
-            with self.subTest(retired=retired):
-                with self.assertRaisesRegex(ConfigError, "unknown keys"):
-                    validate_source_config({**base, retired: []})
+            with self.subTest(retired=retired), self.assertRaisesRegex(ConfigError, "unknown keys"):
+                validate_source_config({**base, retired: []})
 
 
 if __name__ == "__main__":
