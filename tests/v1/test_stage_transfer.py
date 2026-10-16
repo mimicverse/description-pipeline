@@ -665,7 +665,6 @@ class StageTransferTests(unittest.TestCase):
                         "limits": {"lower": -1.0, "upper": 1.0, "effort": 2.0, "velocity": 3.0},
                     }
                 ],
-                "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "imu_datum"}],
             }
             snapshot = work / "snapshot"
             # Fixtures keep bodies/joints and translate at the call boundary: the product
