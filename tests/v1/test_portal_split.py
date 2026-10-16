@@ -1,4 +1,4 @@
-"""Portal split wiring: Linux-owned attempts stay readable when Windows is down."""
+"""Portal split wiring: registered attempts stay readable when Windows is down."""
 
 from __future__ import annotations
 
@@ -13,13 +13,11 @@ from types import SimpleNamespace
 
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import EndpointError
-from description_pipeline.orchestration.linux_store import LinuxStore
 
-from .portal_read_support import StoreProjection
+from .portal_read_support import RegisteredPlatform
 
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
 CHILD = "3f6a5c2e-6c41-4a1e-9c2a-2a1f7a1d0c33"
-SUBJECT = "a" * 64
 TASK_IDS = (
     "freeze",
     "discover",
@@ -80,57 +78,20 @@ class PortalSplitTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="portal-split-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.store = LinuxStore(self.tmp / "store")
-        self.store.update_meta(
-            RUN,
-            state="published",
-            handoff_sha256="b" * 64,
-            subject_sha256=SUBJECT,
-            repository_slug="owner/repo",
-            repository_base="main",
-        )
-        capture = self.store.capture_dir(RUN)
-        (capture / "input").mkdir(parents=True)
-        (capture / "evidence").mkdir()
-        (capture / "reports").mkdir()
-        generate = self.store.stage_dir(RUN, "generate")
-        (generate / "input").mkdir(parents=True)
-        (generate / "reports").mkdir(parents=True)
-        (generate / "reports/quality.json").write_text(
-            json.dumps({"passed": True, "subject_sha256": SUBJECT}), encoding="utf-8"
-        )
-        (generate / "reports/pr.json").write_text(
-            json.dumps(
-                {
-                    "state": "published",
-                    "passed": True,
-                    "url": "https://github.com/owner/repo/pull/1",
-                    "commit": "c" * 40,
-                    "base": "main",
-                    "subject_sha256": SUBJECT,
-                }
-            ),
-            encoding="utf-8",
-        )
-        self.store.update_meta(
-            CHILD,
-            state="verified",
-            source_run_id=RUN,
-            resume_from="generate",
-            handoff_sha256="b" * 64,
-            subject_sha256=SUBJECT,
-        )
-        verify = self.store.stage_dir(CHILD, "verify")
-        (verify / "input").mkdir(parents=True)
-        (verify / "reports").mkdir(parents=True)
-        (verify / "reports/quality.json").write_text("{}\n", encoding="utf-8")
+        self.platform = RegisteredPlatform(self.tmp / "platform")
+        self.platform.admit(RUN)
+        self.platform.stage(RUN, "capture")
+        self.platform.stage(RUN, "generate")
+        self.platform.conclude(RUN, "succeeded")
+        self.platform.admit(CHILD, from_stage="generate", parent_run_id=RUN)
+        self.platform.stage(CHILD, "verify")
         self.airflow = _ExpiredAirflow()
         self.windows = _EndpointSlot()
         self.app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=self.airflow,
                 endpoint=lambda: self.windows,
-                platform_store=StoreProjection(self.store),
+                platform_store=self.platform.store,
             )
         )
 
@@ -236,7 +197,7 @@ class PortalSplitTests(unittest.TestCase):
             portal_module.PortalConfig(
                 airflow=self.airflow,
                 endpoint=lambda: self.windows,
-                platform_store=StoreProjection(self.store),
+                platform_store=self.platform.store,
                 upload_root=upload_root,
             )
         )

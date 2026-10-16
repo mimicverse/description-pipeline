@@ -1,119 +1,92 @@
-"""Projection adapter: the locked PlatformStore read surface over a real LinuxStore fixture.
+"""The registered platform fixture the portal suites read through.
 
-Tests own real LinuxStore fixtures; the portal reads through the locked platform
-interfaces, so this adapter projects the fixture's bound preview and checkpoints
-into ``run_record``/``stage_records``/``sealed_path`` without touching production.
+The portal suites own real platform stores over the in-memory database double:
+every portal read goes through the locked PlatformStore surface - run records,
+stage records, the sealed resolver and the recorded event stream - exactly as
+production reads it.  Stage rows are seeded as the registered records they
+are; the sealed write path keeps its own canonical coverage.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from types import SimpleNamespace
 
-from description_pipeline.io import PipelineError
-from description_pipeline.orchestration.linux_store import LinuxStore
+from description_pipeline.platform.store import PlatformStore
+
+from .test_platform_store import FakeWorld
 
 
-class StoreProjection:
-    """One LinuxStore fixture served through the registered read projection."""
+class RegisteredPlatform:
+    """One platform fixture: a real store over the in-memory world and sealed root."""
 
-    def __init__(self, store: LinuxStore) -> None:
-        self.store = store
-        self.root = store.root
+    def __init__(self, root: Path | str) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.world = FakeWorld()
+        self.store = PlatformStore(self.world.connect, sealed=self.sealed)
 
-    # ---------------------------------------------------------- admission face
-    def admission(self):
-        return SimpleNamespace(state="open")
+    def sealed(self, uri: str) -> Path:
+        return self.root / "sealed" / uri.removeprefix("store://sealed/")
 
-    def admit_run(self, **kwargs) -> None:
-        return None
-
-    def run_displays(self):
-        return []
-
-    def run_display(self, run_id: str):
-        return None
-
-    def set_run_display(self, run_id: str, title: str | None):
-        return None
-
-    # ---------------------------------------------------- registered read face
-    def run_record(self, run_id: str) -> dict | None:
-        meta = self.store.meta(run_id)
-        if not isinstance(meta, dict):
-            return None
-        state = meta.get("state")
-        projected = {"published": "succeeded"}.get(str(state), state) if isinstance(state, str) else None
-        return {
-            "run_id": run_id,
-            "state": projected,
-            "request_id": None,
-            "parent_run_id": None,
-            "from_stage": None,
-            "tool_identity": None,
-        }
-
-    def _checkpoint_row(self, run_id: str, stage: str) -> dict | None:
-        try:
-            self.store.checkpoint_dir(run_id, stage)
-        except PipelineError:
-            return None
-        return {
-            "stage": stage,
-            "state": "completed",
-            "receipt": {"subject_sha256": None, "artifacts": []},
-            "checkpoint_uri": f"store://sealed/{run_id}/{stage}",
-            "reused_from_run": None,
-            "original_executed_at": None,
-        }
-
-    def stage_records(self, run_id: str) -> dict[str, dict]:
-        rows: dict[str, dict] = {}
-        for stage in ("capture", "generate", "publish", "verify"):
-            row = self._checkpoint_row(run_id, stage)
-            if row is not None:
-                rows[stage] = row
-        try:
-            root, preview = self.store._bound_preview(run_id)
-        except PipelineError:
-            return rows
-        files = {**(preview.get("files") or {}), **(preview.get("report_files") or {})}
-        artifacts = []
-        for path, digest in sorted(files.items()):
-            try:
-                size = (Path(root) / path).stat().st_size
-            except OSError:
-                continue
-            artifacts.append({"path": path, "bytes": size, "sha256": digest})
-        verified = preview.get("verified") is not False
-        rows["verify"] = {
-            "stage": "verify",
-            "state": "completed" if verified else "failed",
-            "receipt": {
-                "subject_sha256": preview.get("subject_sha256"),
-                "artifacts": artifacts,
-                "error": preview.get("error"),
+    def admit(
+        self,
+        run_id: str,
+        *,
+        state: str = "running",
+        from_stage: str | None = None,
+        parent_run_id: str | None = None,
+        target_hardware: str = "nd",
+        main_assembly: str = "cad/robot.SLDASM",
+    ) -> None:
+        self.store.admit_run(
+            request_id=f"q-{run_id}",
+            run_id=run_id,
+            principal="portal",
+            target_hardware=target_hardware,
+            main_assembly=main_assembly,
+            dispatch={
+                "stage": from_stage or "capture",
+                "operation_key": f"{run_id}/dispatch:0",
+                "params_digest": "a" * 64,
             },
-            "checkpoint_uri": f"store://sealed/{run_id}/verify",
-            "reused_from_run": None,
-            "original_executed_at": None,
-        }
-        return rows
+            from_stage=from_stage,
+            parent_run_id=parent_run_id,
+        )
+        self.world.run_states[run_id] = state
 
-    def sealed_path(self, checkpoint_uri: str):
-        prefix = "store://sealed/"
-        if not isinstance(checkpoint_uri, str) or not checkpoint_uri.startswith(prefix):
-            raise PipelineError("invalid sealed reference")
-        parts = checkpoint_uri.removeprefix(prefix).split("/")
-        if len(parts) != 2 or not all(parts):
-            raise PipelineError("invalid sealed reference")
-        run_id, stage = parts
-        if stage == "verify":
-            root, _preview = self.store._bound_preview(run_id)
-            return root
-        return self.store.checkpoint_dir(run_id, stage)
+    def conclude(self, run_id: str, state: str) -> None:
+        """The recorded run outcome; readers consume the registered state only."""
+        self.world.run_states[run_id] = state
 
-    def run_events(self, run_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict]:
-        meta = self.store.meta(run_id) or {}
-        events = meta.get("events")
-        return list(events) if isinstance(events, list) else []
+    def stage(
+        self,
+        run_id: str,
+        stage: str,
+        *,
+        state: str = "completed",
+        receipt: dict | None = None,
+        checkpoint_uri: str | None = None,
+        reused_from_run: str | None = None,
+    ) -> None:
+        """One registered stage row; the default checkpoint keeps the stage readable."""
+        self.world.stages[(run_id, stage)] = (
+            state,
+            dict(receipt or {}),
+            checkpoint_uri if checkpoint_uri is not None else f"store://sealed/{run_id}/{stage}",
+            reused_from_run,
+            None,
+        )
+
+    def tree(self, run_id: str, stage: str) -> Path:
+        """The sealed tree directory of one registered checkpoint, created on demand."""
+        tree = self.sealed(f"store://sealed/{run_id}/{stage}")
+        tree.mkdir(parents=True, exist_ok=True)
+        return tree
+
+    def events(self, run_id: str, events: list[dict]) -> None:
+        """Record one attempt's display events as the platform event rows they become."""
+        for index, event in enumerate(events, start=1):
+            self.world.events.append(
+                (run_id, index, "stage", str(event.get("stage") or ""), None, json.dumps(event))
+            )
