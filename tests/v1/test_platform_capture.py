@@ -14,7 +14,7 @@ from description_pipeline.platform import capture as platform_capture
 from description_pipeline.platform import flow
 from description_pipeline.platform.store import PlatformStore
 
-from .test_linux_split import HANDOFF, SELECTED, UPLOAD, capture_job
+from .linux_split_support import HANDOFF, SELECTED, UPLOAD, capture_job
 from .test_platform_store import FakeWorld
 from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
