@@ -657,6 +657,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         from description_pipeline.platform import flow
 
         paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
+        stages = run_dir / "stages"
         self.module._register_freeze_stage(paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files)
         call = self.calls[0]
         self.assertEqual(call["stage"], "freeze")
