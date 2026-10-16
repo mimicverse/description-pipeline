@@ -483,6 +483,24 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
             evidence_class="cad",
         )
+        # Seal the carrier inputs the closure rebuild consumes: the raw native record, the
+        # full upload index and the CAD bytes (fixture plumbing only - no consumer output).
+        from tests.sources.support import compose_delivery_inputs
+
+        cad_sources: dict[str, Path] = {}
+        for row in self.raw_scene["components"]:
+            relative = str(row["path"]).replace("\\", "/").rsplit("/", 1)[-1]
+            source = self.bundle / "fixture-cad" / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(("control fixture " + str(row["name"])).encode("utf-8"))
+            cad_sources[relative] = source
+        compose_delivery_inputs(
+            self.bundle,
+            main_assembly=str(COLLECTED).replace("\\", "/").rsplit("/", 1)[-1],
+            configuration="Default",
+            record=self.raw_scene,
+            cad_files=cad_sources,
+        )
         report = closure_module.derive_mass_closure(self.evidence)
         _publish(self.bundle, self.evidence)
         self.report = report
