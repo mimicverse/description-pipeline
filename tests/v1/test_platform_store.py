@@ -477,6 +477,10 @@ class PlatformStoreTests(unittest.TestCase):
         self.delivery.mkdir()
         self.subject, self.artifacts, self.handoff_full, self.handoff_native = build_sealed_delivery(self.delivery)
         self.definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+        # The sealed delivery's own report is the qualified payload the receipts
+        # carry inline: the completed agreement gate compares the two, so the
+        # fixture must pair them (reports/ stays outside the manifest subject).
+        write_json(self.delivery / "reports" / "quality.json", self.qualified_quality())
         self.rebuilt = mock.Mock(return_value=self.definition)
         definition_patch = mock.patch.object(solidworks_urdf, "rebuilt_definition", new=self.rebuilt)
         definition_patch.start()

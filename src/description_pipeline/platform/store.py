@@ -1578,6 +1578,25 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
             raise PlatformStoreError(str(error)) from error
         if quality.get("subject_sha256") != subject:
             raise PlatformStoreError("The sealed receipt's quality payload is bound to another subject")
+        if root is not None:
+            # The sealed report bytes are the delivery's own record: the file in
+            # the sealed tree must itself be a qualified report for this subject
+            # and must agree with the inline payload.  Flipping the sealed passed
+            # bit (with its artifact digest synced) refuses instead of
+            # registering a contradictory success; the read-back and reuse paths
+            # run this same check.
+            try:
+                sealed_quality = require_qualified_report(
+                    read_data(confined(root, "reports/quality.json")), definition, root=root
+                )
+            except (PipelineError, OSError) as error:
+                raise PlatformStoreError("The sealed tree carries no qualified reports/quality.json") from error
+            if (
+                sealed_quality.get("passed") != quality.get("passed")
+                or sealed_quality.get("subject_sha256") != quality.get("subject_sha256")
+                or sealed_quality.get("subject_sha256") != subject
+            ):
+                raise PlatformStoreError("The sealed quality report contradicts the receipt's quality payload")
     if stage == "publish":
         submission = receipt.get("submission")
         if (
