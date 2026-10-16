@@ -545,14 +545,15 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[6])
 from install_record import release_identity, wheel_binding  # noqa: E402  (canonical owners)
 
-release_file, receipt_file, config_digest, wheel_path, venv = (Path(value) for value in sys.argv[1:6])
+release_file, receipt_file, wheel_path, venv = (Path(sys.argv[index]) for index in (1, 2, 4, 5))
+config_digest = sys.argv[3]
 release = release_identity(json.loads(release_file.read_text(encoding="utf-8")))
 receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
 snapshot = Path(receipt["to"])
 if not snapshot.is_file() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != receipt["to_sha256"]:
     raise SystemExit("the staged snapshot is missing or no longer matches its recorded digest")
 if config_digest != receipt["to_sha256"]:
-    raise SystemExit("the staged environment binds another snapshot generation")
+    raise SystemExit(f"the staged environment binds another snapshot generation ({config_digest} != {receipt['to_sha256']})")
 steps = {step.get("step"): step.get("status") for step in receipt.get("steps", [])}
 for name in ("linux-generation", "windows-generation"):
     if steps.get(name) != "completed":
