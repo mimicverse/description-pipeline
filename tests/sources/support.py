@@ -1083,13 +1083,15 @@ def source_record_for_robot(record: dict) -> dict:
 def capture_requests(config: dict) -> dict:
     """Translate a fixture config's carriers into the minimal native request sets.
 
-    The product consumes ``groups``/``axis_requests`` only; fixtures keep their
-    bodies/joints data structures and translate at the call boundary.  No
-    product code carries a compatibility fallback.
+    The fixtures keep their bodies/joints authoring structures and gain the
+    derived ``groups``/``axis_requests`` the capture consumes natively; the
+    kept structures stay visible to the authoring-side checks (e.g. the
+    documented-mass coverage precheck runs on ``bodies``).  No product code
+    carries a compatibility fallback.
     """
 
     cfg = dict(config)
-    bodies = cfg.pop("bodies", None)
+    bodies = config.get("bodies")
     if bodies is not None and "groups" not in cfg:
         cfg["groups"] = [
             {
@@ -1098,7 +1100,7 @@ def capture_requests(config: dict) -> dict:
             }
             for body in bodies
         ]
-    joints = cfg.pop("joints", None)
+    joints = config.get("joints")
     if joints is not None and "axis_requests" not in cfg:
         cfg["axis_requests"] = [
             {"name": str(joint.get("name") or joint.get("id") or ""), "axis_reference": joint["axis_reference"]}
