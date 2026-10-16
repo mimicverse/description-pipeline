@@ -527,7 +527,18 @@ class PhysicsTests(unittest.TestCase):
     def test_rebuilt_source_missing_material_source_fails_closed_without_a_default(self):
         self._record_clean_provenance()
         self.write()
-        write_json(self.bundle / "evidence/raw/source_config.json", {})
+        # The negative mutates the actual bound authority the verifier consumes:
+        # the sealed capture provenance block loses its declared material source.
+        self.store_block(
+            "material_provenance",
+            {
+                "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                "assembly": self.captured_identity["assembly"],
+                "configuration": self.source["configuration"],
+                "measured_source": "cad_api",
+                "warnings": [],
+            },
+        )
         with self.assertRaises(PipelineError) as raised:
             self._rebuilt_source()
         self.assertIn("material_source", str(raised.exception))
