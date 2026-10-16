@@ -17,15 +17,27 @@ import numpy as np
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.io import file_digest  # noqa: E402
+from description_pipeline.sources.solidworks.discovery import CONTRACT, DISCOVERY_SCHEMA  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
 from . import support  # noqa: E402
+from .selection_support import sealed_selection  # noqa: E402
 
 
 def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
     return _freeze(support.capture_requests(config), *args, **kwargs)
+
+
+def _Backend(document, components, **kwargs):  # fixture plumbing: supported native datum names
+    """The fixture backend carrying this module's supported native datum names."""
+
+    kwargs.setdefault(
+        "coordinate_systems",
+        {"CS_base_link": support.placement()},
+    )
+    return support.FixtureCadBackend(document, components, **kwargs)
 
 #: 审阅记录里公布的解析张量（零件轴向、质心处，kg·m²）
 BENCHMARK: dict[str, dict[str, Any]] = {
@@ -76,6 +88,107 @@ def _cuboid_tensor(mass: float, dims: tuple[float, float, float], rpy: tuple[flo
     return rotation @ principal @ rotation.T
 
 
+def _native_record(*, files: dict[str, str]) -> dict:
+    """The synthetic discovery record matching this module's freeze fixture.
+
+    The single body owns its ``CS_base_link`` datum; link names come from that
+    datum name alone.
+    """
+
+    translated = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    component = {
+        "name2": "base-1",
+        "lightweight": False,
+        "suppression_state": 2,
+        "instance_id": "base-1",
+        "document": "base.SLDPRT",
+        "configuration": "Default",
+        "fixed": True,
+        "suppressed": False,
+        "transform": translated,
+    }
+    assembly_mass = BENCHMARK["base-1"]["mass"]
+    return {
+        "schema_version": DISCOVERY_SCHEMA,
+        "contract": CONTRACT,
+        "namespace": "dp",
+        "identity": {
+            "hardware_id": "product_convention_fixture",
+            "revision": "r1",
+            "owner": "mechanical-team",
+            "change_summary": "product convention module fixture",
+            "control": {"system": "handoff", "reference": "product-convention-run"},
+            "delivery_configuration": "Default",
+            "main_assembly": "robot.SLDASM",
+            "robot_name": "robot",
+        },
+        "saved_configuration": "Default",
+        "document_state": support.saved_document_state(),
+        "components": [component],
+        "mates": [],
+        "datums": [{"name": "CS_base_link", "owner": "base-1", "array": translated}],
+        "masses": [{"component": "base-1", "mass_kg": float(assembly_mass), "material": "Alloy Steel"}],
+        "assembly_mass_kg": float(assembly_mass),
+        "assembly_extent_m": 0.5,
+        "properties": {
+            "document": {"dp.design_budget_record": "budget.json#robot"},
+            "components": {},
+            "mates": {},
+        },
+        "files": dict(files),
+        "source_selection": sealed_selection(
+            files,
+            "robot.SLDASM",
+            edges={"robot.SLDASM": ["base.SLDPRT"], "base.SLDPRT": []},
+        ),
+    }
+
+
+def _compose_scene_inputs(destination: Path, cad_root: Path) -> None:
+    """Fixture plumbing: seal the consumer inputs the Linux scene rebuild reads.
+
+    Synthetic test-only composition (the canonical/E2E producers build their
+    own evidence and never use this helper): CAD bytes, the discovery payload
+    with its raw native record and controlled records, and a re-sealed
+    snapshot manifest so the added members stay bound by the verified
+    inventory.
+    """
+
+    import hashlib
+
+    names = ["robot.SLDASM", "base.SLDPRT"]
+    cad_files = {name: cad_root / name for name in names}
+    files = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in cad_files.items()}
+    record = _native_record(files=files)
+    controlled = {
+        "budget.json": json.dumps(
+            {
+                "robot": {
+                    "expected_mass_kg": [record["assembly_mass_kg"] - 0.1, record["assembly_mass_kg"] + 0.1],
+                    "expected_extent_m": [0.2, 0.8],
+                }
+            }
+        )
+    }
+    support.compose_delivery_inputs(
+        destination,
+        main_assembly="robot.SLDASM",
+        configuration="Default",
+        record=record,
+        cad_files=cad_files,
+        records=controlled,
+    )
+    from description_pipeline.sources.snapshot import write_manifest
+
+    manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+    write_manifest(
+        destination,
+        kind=manifest["kind"],
+        identity=manifest["identity"],
+        evidence_class=manifest["evidence_class"],
+    )
+
+
 class ProductConventionTests(unittest.TestCase):
     tmp: Path
     backend: support.FixtureCadBackend
@@ -87,7 +200,7 @@ class ProductConventionTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="sw-convention-"))
         self.assembly = support.make_cad_tree(self.tmp / "cad")
         self.payload = self._benchmark_payload("base-1")
-        self.backend = support.FixtureCadBackend(
+        self.backend = _Backend(
             self.assembly,
             [{"name": "base-1", "transform": support.placement(), "mass": self.payload}],
             dependencies=[self.tmp / "cad" / "base.SLDPRT"],
@@ -98,12 +211,13 @@ class ProductConventionTests(unittest.TestCase):
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": False},
+            "coordinate_systems": ["CS_base_link"],
             "bodies": [
                 {
                     "id": "base",
                     "name": "base_link",
                     "components": ["base-1"],
-                    "frame": {"coordinate_system": "base_datum"},
+                    "frame": {"coordinate_system": "CS_base_link"},
                 }
             ],
             "joints": [],
@@ -152,6 +266,7 @@ class ProductConventionTests(unittest.TestCase):
 
     def test_scene_preserves_the_standard_signed_tensor(self) -> None:
         snapshot = self._freeze()
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         scene = load_scene(snapshot)
         link = scene["links"][0]
         inertia = np.array([link["inertial"]["inertia"][index] for index in (0, 1, 2, 3, 4, 5)], dtype=float)
@@ -179,6 +294,7 @@ class ProductConventionTests(unittest.TestCase):
         )
         snapshot = self.tmp / "scaled"
         freeze(config, snapshot, backend=self.backend)
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         scene = load_scene(snapshot)
         inertia = scene["links"][0]["inertial"]["inertia"]
         expected = BENCHMARK["base-1"]["tensor"] * 2.0
@@ -191,6 +307,7 @@ class ProductConventionTests(unittest.TestCase):
     def test_native_reading_without_a_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention=None)
         snapshot = self._freeze("no-convention")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError) as raised:
             load_scene(snapshot)
         self.assertIn("product_convention", str(raised.exception))
@@ -200,12 +317,14 @@ class ProductConventionTests(unittest.TestCase):
         payload["reference"].pop("product_convention")
         self.backend.components[0]["mass"] = payload
         snapshot = self._freeze("no-convention")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError):
             load_scene(snapshot)
 
     def test_positive_product_convention_is_rejected(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="solidworks_positive")
         snapshot = self._freeze("unsupported-convention")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError):
             load_scene(snapshot)
 
@@ -214,6 +333,7 @@ class ProductConventionTests(unittest.TestCase):
     def test_unsupported_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention="ansys_tensor")
         snapshot = self._freeze("unsupported")
+        _compose_scene_inputs(snapshot, self.tmp / "cad")
         with self.assertRaises(ConfigError) as raised:
             load_scene(snapshot)
         self.assertIn("product_convention", str(raised.exception))
