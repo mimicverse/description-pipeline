@@ -80,13 +80,9 @@ def _registered_delivery(
     the recorded check events and the capture tree that binds hardware/revision.
     """
     platform.admit(RUN_ID)
-    capture = platform.tree(RUN_ID, "capture")
-    (capture / "input").mkdir(parents=True, exist_ok=True)
-    write_json(
-        capture / "input/source.json",
-        {"identity": {"hardware_id": "robot"}, "metadata": {"revision": "r1"}},
-    )
-    for stage in ("freeze", "discover", "capture", "generate"):
+    platform.register_capture(RUN_ID)
+    platform.conclude(RUN_ID, "succeeded")
+    for stage in ("freeze", "discover", "generate"):
         platform.stage(RUN_ID, stage)
     platform.stage(
         RUN_ID,
@@ -211,6 +207,13 @@ class SplitWorkflowTests(unittest.TestCase):
                 from description_pipeline.orchestration.airflow_client import ResultNotPublishable
 
                 with self.assertRaises(ResultNotPublishable):
+                    confirm(published)
+                # The registered run outcome is authoritative: a failed run never
+                # confirms, however passing its recorded receipt is.
+                from airflow.sdk.exceptions import AirflowFailException
+
+                platform.conclude(run_id, "failed")
+                with self.assertRaises(AirflowFailException):
                     confirm(published)
 
     def test_engineering_failure_fails_its_airflow_task_even_with_a_retained_subject(self):
