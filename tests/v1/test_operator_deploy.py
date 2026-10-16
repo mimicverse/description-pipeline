@@ -969,6 +969,81 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("description-portal.service", order.read_text())
             self.assertNotIn("description-operator-proxy.service", order.read_text())
 
+    def test_start_keep_admission_closed_starts_the_services_without_opening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            result = run(
+                ["bash", str(CONTROL), "start", "--config", str(config_path), "--keep-admission-closed"], env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("services are running; the platform admission stays closed", result.stdout)
+            self.assertEqual(admission.read_text().strip(), "true")
+            lines = order.read_text().splitlines()
+            self.assertIn("platform close_admission", lines)
+            self.assertNotIn("platform open_admission", lines)
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", lines)
+            self.assertIn("systemctl --user enable --now description-airflow-api-server", lines)
+            self.assertIn(
+                "systemctl --user enable --now description-portal.service description-operator-proxy.service",
+                lines,
+            )
+        # Default behavior is unchanged: without the switch the verified start opens the gate.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            default = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
+            self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+            self.assertEqual(admission.read_text().strip(), "false")
+            default_calls = order.read_text()
+            self.assertIn("platform open_admission", default_calls)
+            self.assertIn("airflow dags unpause solidworks_to_urdf", default_calls)
+
+    def test_start_keep_admission_closed_failure_stays_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            admission.write_text("false")  # a leftover open gate from an interrupted window
+            env["START_INGRESS_RC"] = "7"
+            result = run(
+                ["bash", str(CONTROL), "start", "--config", str(config_path), "--keep-admission-closed"], env
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("platform admission stays closed", result.stderr)
+            self.assertEqual(admission.read_text().strip(), "true")
+            lines = order.read_text().splitlines()
+            self.assertIn("platform close_admission", lines)
+            self.assertNotIn("platform open_admission", lines)
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", lines)
+
+    def test_keep_admission_closed_flag_is_refused_by_other_verbs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            untouched = admission.read_text(encoding="utf-8")
+            before = order.read_text(encoding="utf-8") if order.exists() else None
+            for action in (
+                "validate",
+                "install",
+                "drain",
+                "stop",
+                "status",
+                "health",
+                "reconcile",
+                "stage",
+                "promote",
+                "rollback",
+            ):
+                with self.subTest(action=action):
+                    result = run(
+                        ["bash", str(CONTROL), action, "--config", str(config_path), "--keep-admission-closed"],
+                        env,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--keep-admission-closed is only accepted by start", result.stderr)
+                    self.assertEqual(admission.read_text(encoding="utf-8"), untouched)
+                    after = order.read_text(encoding="utf-8") if order.exists() else None
+                    self.assertEqual(before, after, f"{action} performed a side effect before the refusal")
+        usage = run(["bash", str(CONTROL)], {})
+        self.assertEqual(usage.returncode, 2)
+        self.assertIn("--keep-admission-closed", usage.stderr)
+
     def _project(self, env: dict, data: dict, rc: int) -> None:
         Path(env["PROJECTION_FILE"]).write_text(json.dumps(data), encoding="utf-8")
         env["PROJECTION_RC"] = str(rc)

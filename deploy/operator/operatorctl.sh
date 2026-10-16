@@ -3,6 +3,7 @@
 #   validate  static platform.json checks (schema/paths/targets/ports; no probes)
 #   install   render the immutable config snapshot, then install the pinned runtime
 #   start     enable/start PostgreSQL, Airflow, tunnel, portal and the HTTPS proxy
+#             (start --keep-admission-closed: services up, the platform admission stays closed)
 #   drain     close submissions and DAG admission, keep in-flight, return active/unresolved
 #   stop      disable/stop them in reverse order (only when drained and settled)
 #   status    systemctl --user is-active for every managed unit
@@ -32,6 +33,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
+start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
 orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
@@ -55,6 +57,7 @@ NATIVE_RUN_ID=""
 ORPHAN_OPERATION_ID=""
 ORPHAN_TASK_ID=""
 ORPHAN_MAP_INDEX=""
+KEEP_ADMISSION_CLOSED=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -72,6 +75,7 @@ while [ $# -gt 0 ]; do
     --orphan-task-id) ORPHAN_TASK_ID="${2:-}"; shift 2 ;;
     --orphan-map-index) ORPHAN_MAP_INDEX="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
+    --keep-admission-closed) KEEP_ADMISSION_CLOSED=1; shift ;;
     *) usage ;;
   esac
 done
@@ -80,6 +84,11 @@ case "$ACTION" in
   validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback) ;;
   *) usage ;;
 esac
+# Only start owns this switch; every other verb refuses it here, before any side effect runs.
+if [ -n "$KEEP_ADMISSION_CLOSED" ] && [ "$ACTION" != "start" ]; then
+  echo "operatorctl: --keep-admission-closed is only accepted by start" >&2
+  exit 2
+fi
 
 install_from_config() {
   [ -f "$ENDPOINT_IDENTITY" ] || die "--endpoint-identity FILE is required for install"
@@ -554,7 +563,8 @@ case "$ACTION" in
     # Cold-start order inside the single entry: bring the managed database up and confirm its
     # socket, then actually close the platform admission through the controlled entry (BEFORE
     # any identity/drift verification, so a failed start attempt cannot leave a leftover open
-    # gate), then run the preconditions; the gate reopens only after everything is ready.
+    # gate), then run the preconditions; the gate reopens only after everything is ready (under
+    # --keep-admission-closed it stays closed once everything is ready).
     START_STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
       python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
     [ -f "$START_STATE_ROOT/resolved.env" ] \
@@ -816,15 +826,27 @@ case "$ACTION" in
     load_installed
     drift_check || die "configuration drift detected; run install before start"
     airflow_lifecycle start
-    airflow_unpause_dag
+    # --keep-admission-closed keeps BOTH scheduling and platform admission closed: the DAG
+    # unpause and the platform open are the two state transitions of a plain start, and the
+    # flagged start skips both (services up, admission closed; a later plain start re-verifies
+    # and opens).  A failure above this point never opens anything.
+    if [ -z "$KEEP_ADMISSION_CLOSED" ]; then
+      airflow_unpause_dag
+    fi
     systemctl --user enable --now description-portal.service description-operator-proxy.service \
       || die "ingress services failed to start; the platform admission stays closed"
     systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
       || die "ingress services are not active; the platform admission stays closed"
-    # The gate opens only after every precondition, the identity check, the services and the
-    # ingress readiness confirmation succeeded; any failure above leaves it closed.
-    platform_open_admission
-    echo "start complete: admission open"
+    if [ -n "$KEEP_ADMISSION_CLOSED" ]; then
+      # Identical checks and services, but nothing is opened (never open-then-close): the
+      # start-window close above is the only admission transition that was written.
+      echo "start complete: services are running; the platform admission stays closed (--keep-admission-closed)"
+    else
+      # The gate opens only after every precondition, the identity check, the services and the
+      # ingress readiness confirmation succeeded; any failure above leaves it closed.
+      platform_open_admission
+      echo "start complete: admission open"
+    fi
     ;;
   drain)
     load_installed
