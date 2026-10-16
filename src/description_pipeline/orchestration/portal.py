@@ -831,6 +831,20 @@ def _discovery_evidence(detail: object, digest: str) -> dict:
     return evidence
 
 
+def _registered_error_stage(job: dict) -> str:
+    """The stage a registered error belongs to: the earliest failed stage of the registration.
+
+    The registered failure carries its own stage and is never guessed from event order - the
+    convergence appends later blocked stages whose events must not claim the error.  Only an
+    unregistered native job, which has no registration to attribute from, keeps the native
+    observation's last event stage.
+    """
+    stage = job.get("failed_stage")
+    if isinstance(stage, str) and stage:
+        return stage
+    return str((job.get("events") or [{}])[-1].get("stage", ""))
+
+
 def _findings(job: dict | None) -> list[dict]:
     """Native findings with object/message/evidence, exactly as the endpoint persists them.
 
@@ -862,7 +876,7 @@ def _findings(job: dict | None) -> list[dict]:
             {
                 "id": "",
                 "severity": "error",
-                "stage": (job.get("events") or [{}])[-1].get("stage", ""),
+                "stage": _registered_error_stage(job),
                 "object": "",
                 "message": str(job["error"]),
                 "evidence": job.get("detail") or result.get("detail") or {},
