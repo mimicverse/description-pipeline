@@ -128,6 +128,14 @@ class WorkflowTests(unittest.TestCase):
             "schema_version": "solidworks-to-urdf.native-discovery/v1",
             "contract": "native-discovery/v1", "run_id": "metadata-control",
             "handoff_sha256": digest(files), "native_files": files, "identity": identity,
+            "derivation": {"main_assembly": "assembly.SLDASM"},
+            "raw": {
+                "saved_configuration": "Default",
+                "components": [
+                    {"instance_id": "assembly-1", "document": "assembly.SLDASM"},
+                    {"instance_id": "part-1", "document": "part.SLDPRT"},
+                ],
+            },
         }
         record_path = self.package / "discovery/native-discovery.json"
         write_json(record_path, record)
@@ -137,6 +145,30 @@ class WorkflowTests(unittest.TestCase):
             "native_inventory_sha256": digest(files),
         }
         write_json(self.package / "robot.yaml", author)
+        # The sealed pre-acquisition capture plan: the only plan that travels to
+        # the native side, bound to the sealed discovery bytes and the frozen
+        # inventory (the exact field set the consumer requires).
+        write_json(
+            self.package / "capture-plan.json",
+            {
+                "schema_version": "solidworks-to-urdf.capture-plan/v1",
+                "run_id": record["run_id"],
+                "handoff_sha256": digest(files),
+                "discovery_sha256": file_digest(record_path),
+                "main_assembly": "assembly.SLDASM",
+                "configuration": "Default",
+                "identity": {"hardware_id": None, "revision": None},
+                "selection": {"files": dict(sorted(files.items()))},
+                "objects": [
+                    {"name": "assembly-1", "document": "assembly.SLDASM", "state": 2},
+                    {"name": "part-1", "document": "part.SLDPRT", "state": 2},
+                ],
+                "groups": [{"name": "assembly", "components": ["assembly-1", "part-1"]}],
+                "axis_requests": [],
+                "datums": [],
+                "evidence_requests": list(steps._CAPTURE_EVIDENCE_REQUESTS),
+            },
+        )
         return author, record
 
     def test_bound_missing_admin_allows_inspection_but_not_publication(self):

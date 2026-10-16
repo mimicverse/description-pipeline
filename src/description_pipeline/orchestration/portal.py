@@ -874,7 +874,13 @@ def _retry_assessment(
         if not isinstance(name, str) or not name:
             return RecoveryAssessment(False, "", "unknown_failed_task", ())
         states[name] = AMBIGUOUS_TASK_STATE if name in states or task.get("map_index", -1) != -1 else task.get("state")
-    status = job.get("status") if isinstance(job, dict) and isinstance(job.get("status"), str) else None
+    # The recovery classification consumes the observed native status - the
+    # registered outcome is display authority, never a stand-in for the
+    # endpoint observation the classification and its availability gate need.
+    status = None
+    if isinstance(job, dict):
+        observed = job.get("native_status", job.get("status"))
+        status = observed if isinstance(observed, str) else None
     assessment = classify_recovery(run.get("state"), states, status)
     if not assessment.eligible:
         return assessment
@@ -2538,6 +2544,7 @@ class PortalApp:
             for key in _OBSERVATION_ONLY_JOB_FIELDS
             if isinstance(native, dict) and key in native
         }
+        observation["native_status"] = native.get("status") if isinstance(native, dict) else None
         snapshot = {**observation, **registered}
         if registered.get("error") is None and isinstance(observation.get("error"), str):
             # No registered failure: the native half's error text stays an observation.

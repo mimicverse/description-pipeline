@@ -9,12 +9,15 @@ the six-stage completeness gate it feeds.
 from __future__ import annotations
 
 import json
+import io
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
 from description_pipeline.io import PipelineError
+from description_pipeline.orchestration import portal as portal_module
+from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
 from description_pipeline.platform import flow
 from description_pipeline.stages import require_complete, stage_view
 
@@ -49,15 +52,19 @@ def _publish_receipt(*, submission_state: str = "published", quality_subject: st
 
 
 def _register_delivery(
-    platform: RegisteredPlatform, *, submission_state: str = "published", quality_subject: str = SUBJECT
+    platform: RegisteredPlatform,
+    *,
+    run_id: str = RUN,
+    submission_state: str = "published",
+    quality_subject: str = SUBJECT,
 ) -> None:
     """One registered six-stage delivery: records, sealed capture identity and check events."""
-    platform.admit(RUN)
-    platform.register_capture(RUN)
+    platform.admit(run_id)
+    platform.register_capture(run_id)
     for stage in ("freeze", "discover", "generate"):
-        platform.stage(RUN, stage)
+        platform.stage(run_id, stage)
     platform.stage(
-        RUN,
+        run_id,
         "verify",
         receipt={
             "subject_sha256": SUBJECT,
@@ -66,9 +73,9 @@ def _register_delivery(
         },
     )
     platform.stage(
-        RUN, "publish", receipt=_publish_receipt(submission_state=submission_state, quality_subject=quality_subject)
+        run_id, "publish", receipt=_publish_receipt(submission_state=submission_state, quality_subject=quality_subject)
     )
-    platform.events(RUN, protocol_events(subject=SUBJECT))
+    platform.events(run_id, protocol_events(subject=SUBJECT))
 
 
 class RegisteredDeliveryTests(unittest.TestCase):
@@ -194,6 +201,136 @@ class RegisteredDeliveryTests(unittest.TestCase):
         flow.reuse_events(self.platform.store, child, RUN, "verify")
         copied = [row for row in self.platform.world.events[before:] if row[0] == child]
         self.assertEqual(len(copied), 250)
+
+
+DAG = "portal-20261016T000002-feedcafe"
+WSGI_RUN = native_run_id(DAG)
+
+
+class _PermissiveAirflow:
+    def profile(self, token):
+        return {
+            "principal": "fixture:local:reader",
+            "app_id": "fixture",
+            "tenant_key": "local",
+            "open_id": "reader",
+            "name": "synthetic",
+            "role": "USER",
+        }
+
+    def dag_run(self, token, dag_id, dag_run_id):
+        return {
+            "dag_run_id": dag_run_id,
+            "state": "failed",
+            "conf": {},
+            "triggering_user_name": "synthetic",
+        }
+
+    def task_instances(self, token, dag_id, dag_run_id):
+        return [
+            {"task_id": stage, "state": "failed" if stage in {"freeze", "capture"} else "upstream_failed"}
+            for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")
+        ]
+
+
+class _Endpoint:
+    def __init__(self, error):
+        self.error = error
+
+    def get_job(self, run_id):
+        assert run_id == WSGI_RUN
+        if self.error is None:
+            raise EndpointError("local unavailable Windows observation")
+        return {"run_id": run_id, "status": "failed", "error": self.error}
+
+
+class RegisteredFailureReadoutTests(unittest.TestCase):
+    """The registered failure is the error authority the run page reads."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="registered-failure-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _failed_platform(self, stage: str) -> tuple[RegisteredPlatform, str]:
+        platform = RegisteredPlatform(self.tmp / f"failure-{stage}")
+        platform.admit(WSGI_RUN)
+        original = f"RuntimeError: registered {stage} failure before products"
+        platform.store.confirm_stage(
+            run_id=WSGI_RUN,
+            stage=stage,
+            state="failed",
+            receipt={
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": WSGI_RUN,
+                "stage": stage,
+                "state": "failed",
+                "passed": False,
+                "error": original,
+                "error_code": "fixture",
+                "detail": {"where": stage},
+            },
+        )
+        return platform, original
+
+    def _get(self, platform: RegisteredPlatform, endpoint) -> tuple[int, bytes]:
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(), endpoint=lambda: endpoint, platform_store=platform.store
+            )
+        )
+        session = app.sessions.create("user", "token", principal="fixture:local:reader")
+        response: dict = {}
+
+        def start(status, headers):
+            response["status"] = int(status.split()[0])
+
+        body = b"".join(
+            app(
+                {
+                    "REQUEST_METHOD": "GET",
+                    "PATH_INFO": f"/api/runs/{DAG}",
+                    "HTTP_COOKIE": f"{portal_module.DEFAULT_SESSION_COOKIE}={session.session_id}",
+                    "wsgi.input": io.BytesIO(b""),
+                },
+                start,
+            )
+        )
+        return response["status"], body
+
+    def test_the_registered_failure_is_the_readout_authority(self) -> None:
+        """Windows-down, matching-native and stale-native all read the registration."""
+        for stage in ("freeze", "generate"):
+            for mode in ("down", "matching", "stale"):
+                with self.subTest(stage=stage, mode=mode):
+                    platform, original = self._failed_platform(stage)
+                    native_error = {
+                        "down": None,
+                        "matching": original,
+                        "stale": "RuntimeError: stale native failure",
+                    }[mode]
+                    status, body = self._get(platform, _Endpoint(native_error))
+                    payload = json.loads(body)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(payload["job"]["error"], original)
+                    self.assertIn(original, body.decode("utf-8"))
+
+    def test_a_registered_success_keeps_its_closure_and_observes_the_native_error(self) -> None:
+        platform = RegisteredPlatform(self.tmp / "success")
+        _register_delivery(platform, run_id=WSGI_RUN)
+        platform.conclude(WSGI_RUN, "succeeded")
+        status, body = self._get(platform, _Endpoint(None))
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job"]["status"], "passed")
+        self.assertIsNone(payload["job"]["error"])
+        self.assertEqual(payload["pr"]["url"], "https://github.com/example/robot/pull/1")
+        # A stale native error stays an observation and never flips the outcome.
+        status, body = self._get(platform, _Endpoint("RuntimeError: stale native failure"))
+        payload = json.loads(body)
+        self.assertEqual(payload["job"]["status"], "passed")
+        self.assertEqual(payload["job"]["error"], "RuntimeError: stale native failure")
+        self.assertEqual(payload["pr"]["url"], "https://github.com/example/robot/pull/1")
 
 
 if __name__ == "__main__":

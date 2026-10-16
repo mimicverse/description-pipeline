@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from typing import ClassVar
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookiejar import Cookie, CookieJar
@@ -882,7 +883,7 @@ class PortalTests(unittest.TestCase):
         return dag_run_id
 
     #: The registered run vocabulary beside the native job's status words.
-    _STORE_RUN_STATE = {"passed": "succeeded", "native_complete": "running"}
+    _STORE_RUN_STATE: ClassVar[dict[str, str]] = {"passed": "succeeded", "native_complete": "running"}
 
     def _record_fixture_events(self, run_id: str) -> None:
         """Mirror the seeded job's own facts into the registered side.
