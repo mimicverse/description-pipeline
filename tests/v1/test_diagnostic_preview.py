@@ -99,7 +99,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="diagnostic-preview-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def _registered_failed_verify(self) -> RegisteredPlatform:
+    def _registered_failed_verify(self, *, passed: bool = False) -> RegisteredPlatform:
         """The registered state a failing verify stage leaves: sealed members, failed receipt."""
         platform = RegisteredPlatform(self.tmp / "platform")
         platform.admit(RUN)
@@ -110,7 +110,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         write_json(
             tree / "reports/quality.json",
             {
-                "passed": False,
+                "passed": passed,
                 "subject_sha256": hashlib.sha256(URDF).hexdigest(),
                 "checks": FAILING_CHECKS,
             },
@@ -276,6 +276,37 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "artifacts": artifacts,
             },
             checkpoint_uri=f"store://sealed/{child}/verify",
+        )
+
+    def test_a_success_labelled_failed_report_is_refused(self) -> None:
+        """A failed-verify registration whose report claims success contradicts the
+        registered outcome: the diagnostic is refused while the failed products
+        stay registered and downloadable."""
+        platform = self._registered_failed_verify(passed=True)
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        with self.assertRaises(portal_module.PortalError) as caught:
+            app._preview_payload(session, DAG_RUN_ID)
+        self.assertEqual(caught.exception.status, 502)
+        self.assertIn("不一致", caught.exception.message)
+        # The failed member stays byte-verifiable and downloadable.
+        environ = {"HTTP_COOKIE": f"{portal_module.DEFAULT_SESSION_COOKIE}={session.session_id}"}
+        captured: dict = {}
+
+        def start_response(status, headers):
+            captured["status"] = status
+
+        body = b"".join(app._artifact(environ, start_response, DAG_RUN_ID, "reports/quality.json"))
+        self.assertEqual(captured["status"], "200 OK")
+        self.assertEqual(
+            json.loads(body.decode("utf-8"))["passed"],
+            True,
         )
 
     def test_failing_checks_accept_the_state_failed_convention(self) -> None:
