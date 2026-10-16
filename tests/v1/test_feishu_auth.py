@@ -120,6 +120,9 @@ class FeishuAuthManagerTests(unittest.TestCase):
             engine=cls.engine,
         )
         cls._settings.start()
+        # The migration-window owner creates the sign-in state table; the runtime manager and
+        # every request path below are DDL-free and use this pre-created table.
+        auth.initialize_metadata_state(cls.sessions)
         conf.set("api_auth", "jwt_secret", JWT_SECRET)
         cls._clear_token_caches()
 
@@ -925,6 +928,9 @@ class FeishuAuthManagerTests(unittest.TestCase):
     # -- state store ------------------------------------------------------
 
     def test_metadata_state_is_single_use_expired_and_shared_across_workers(self) -> None:
+        # The table is created only by the migration-window owner; the runtime constructors
+        # below are DDL-free and use the pre-created table (exactly the api-server path).
+        auth.initialize_metadata_state()
         first = auth.MetadataStateStore()
         second = auth.MetadataStateStore()
         state, challenge = first.issue(60.0)
@@ -941,6 +947,57 @@ class FeishuAuthManagerTests(unittest.TestCase):
             stored = [str(row[0]) for row in session.execute(text("SELECT state_hash FROM feishu_auth_state"))]
         self.assertNotIn(state, stored)
         self.assertNotIn(state_digest(state), stored)
+
+    def test_runtime_store_probes_readiness_ddl_free_and_the_initializer_owns_the_create(self) -> None:
+        recorded: list[str] = []
+
+        class _RecordingSession:
+            def execute(self, statement, parameters=None):
+                recorded.append(str(statement))
+                return None
+
+            def commit(self) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                return False
+
+        auth.MetadataStateStore(_RecordingSession)
+        # Exactly one no-DDL readiness probe: the runtime verifies it can read the table and
+        # its required columns instead of assuming the registration worked.
+        self.assertEqual(len(recorded), 1)
+        probe = str(recorded[0]).lstrip().upper()
+        self.assertTrue(probe.startswith("SELECT"))
+        self.assertFalse(probe.startswith(("CREATE", "ALTER", "DROP")))
+        recorded.clear()
+        auth.initialize_metadata_state(_RecordingSession)
+        self.assertEqual(len(recorded), 1)
+        self.assertTrue(
+            str(recorded[0]).lstrip().upper().startswith("CREATE TABLE IF NOT EXISTS FEISHU_AUTH_STATE")
+        )
+
+    def test_runtime_store_fails_closed_on_an_unreadable_probe_without_fallback_ddl(self) -> None:
+        recorded: list[str] = []
+
+        class _DeniedSession:
+            def execute(self, statement, parameters=None):
+                recorded.append(str(statement))
+                raise RuntimeError("permission denied for table feishu_auth_state")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                return False
+
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            auth.MetadataStateStore(_DeniedSession)
+        # The refusal stays DDL-free: no repair or creation is attempted after the failure.
+        self.assertEqual(len(recorded), 1)
+        self.assertFalse(str(recorded[0]).lstrip().upper().startswith(("CREATE", "ALTER", "DROP")))
 
 
 if __name__ == "__main__":

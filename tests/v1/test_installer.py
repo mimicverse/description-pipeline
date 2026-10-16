@@ -238,7 +238,14 @@ class InstallGuardsTest(unittest.TestCase):
             wheel.parent.mkdir()
             wheel.write_bytes(b"fixture")
             python = bindir / "python"
-            python.write_text('#!/bin/bash\n[ "${1:-}" != "-c" ] || echo 3.12\nexit 0\n')
+            python.write_text(
+                '#!/bin/bash\n'
+                '[ "${1:-}" != "-c" ] || echo 3.12\n'
+                'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "description_pipeline.orchestration.feishu_auth" ]; then\n'
+                '  echo "feishu_state_init" >> "$CALLS"\n'
+                'fi\n'
+                'exit 0\n'
+            )
             python.chmod(0o755)
             doctor = bindir / "description"
             doctor.write_text('#!/bin/bash\necho "doctor" >> "$CALLS"\nexit "${DOCTOR_EXIT:-0}"\n')
@@ -267,7 +274,12 @@ class InstallGuardsTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(admission.read_text(), initial)
-            self.assertEqual(calls.read_text().splitlines(), ["doctor", "db migrate", "version"] * 2)
+            # The sign-in state is initialized inside the migration window, after `db migrate`
+            # and before the runtime identity takes over (the same entry the CI step runs).
+            self.assertEqual(
+                calls.read_text().splitlines(),
+                ["doctor", "db migrate", "feishu_state_init", "version"] * 2,
+            )
             calls.write_text("")
             rejected = self._install(
                 tmp, AIRFLOW_PYTHON=str(python), PIPELINE_WHEEL=str(wheel),
