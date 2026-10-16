@@ -41,6 +41,7 @@ from description_pipeline.orchestration.airflow_client import (
     submission_identity,
     validate_main_assembly,
 )
+from description_pipeline.orchestration.run_ownership import recorded_actor_principal
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST
 from description_pipeline.platform import capture as native_capture
 from description_pipeline.platform import flow
@@ -702,11 +703,13 @@ def _submission_frame(context) -> tuple[dict, dict]:
         )
     if not summary:
         raise AirflowFailException("change_summary is required: the run carries no nonempty change summary")
-    # The submitter identity is never read from conf: it is the Airflow-authenticated actor
-    # of this run, stamped by the auth manager from the signed session.  A missing actor
-    # refuses - there is no fallback to a username, client text or a parent run's owner.
-    principal = str(getattr(context["dag_run"], "triggering_user_name", "") or "").strip()
-    if not principal:
+    # The submitter identity is never read from conf: it is the auth-owned
+    # ``triggering_user_name`` envelope of this run, and only the one canonical ownership
+    # parser may turn it into a principal.  A missing, damaged or non-canonical actor
+    # refuses - there is no fallback to a username, client text or a parent run's owner,
+    # and the raw envelope (name suffix included) never becomes the owner.
+    principal = recorded_actor_principal(getattr(context["dag_run"], "triggering_user_name", None))
+    if principal is None:
         raise AirflowFailException("the run carries no authenticated submitter identity")
     config = config_from_airflow_connection(CONN_ID)
     routing = config.targets.get(target)

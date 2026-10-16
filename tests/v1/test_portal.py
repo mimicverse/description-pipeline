@@ -1321,7 +1321,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(len(self.platform.admits), 1)
         admit = self.platform.admits[0]
         self.assertEqual(admit["request_id"], f"portal-{dag_run_id}")
-        self.assertEqual(admit["run_id"], dag_run_id)
+        self.assertEqual(admit["run_id"], native_run_id(dag_run_id))
         self.assertEqual(admit["principal"], FEISHU_PRINCIPAL)
         self.assertEqual(admit["main_assembly"], "model.SLDASM")
         dispatch = admit["dispatch"]

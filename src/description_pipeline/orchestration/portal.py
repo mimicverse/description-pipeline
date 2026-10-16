@@ -1232,7 +1232,7 @@ class PortalApp:
                 record = local.get(dag_run_id)
                 conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
                 owner, name = _run_identity(item.get("triggering_user_name"), record)
-                overlay = metadata.get(dag_run_id) or _EMPTY_OVERLAY
+                overlay = metadata.get(native_run_id(dag_run_id)) or _EMPTY_OVERLAY
                 if overlay["deleted"] and not include_deleted:
                     continue
                 runs.append(
@@ -1258,7 +1258,7 @@ class PortalApp:
                 break
         for record in sorted(local.values(), key=lambda item: item.started_at, reverse=True):
             if record.dag_run_id not in seen:
-                overlay = metadata.get(record.dag_run_id) or _EMPTY_OVERLAY
+                overlay = metadata.get(native_run_id(record.dag_run_id)) or _EMPTY_OVERLAY
                 if overlay["deleted"] and not include_deleted:
                     continue
                 runs.append(
@@ -1292,6 +1292,11 @@ class PortalApp:
     def _start_run(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         """One uploaded SolidWorks folder starts one run; manual platform paths are gone."""
         session = self._session(environ, csrf=True)
+        principal = session.principal or ""
+        if not principal:
+            # The submitter identity is the strict profile principal only - never a
+            # username fallback and never client text.
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
         content_type = str(environ.get("CONTENT_TYPE") or "")
         if not content_type.lower().startswith("multipart/form-data"):
             raise PortalError(HTTPStatus.BAD_REQUEST, "请通过页面上的文件夹按钮上传工程文件夹后启动运行")
@@ -1337,7 +1342,7 @@ class PortalApp:
                 environ,
                 intake_root=self.config.upload_root,
                 run_id=dag_run_id,
-                principal=session.principal,
+                principal=principal,
                 gate=self._upload_gate,
             )
         except UploadRejected as error:
@@ -1366,8 +1371,10 @@ class PortalApp:
         try:
             self._platform().admit_run(
                 request_id=f"portal-{dag_run_id}",
-                run_id=dag_run_id,
-                principal=session.principal or session.user or "",
+                # The store's run identity is the same canonical native UUID the DAG
+                # derives; the raw dag_run_id stays only as the Airflow binding.
+                run_id=native_run_id(dag_run_id),
+                principal=principal,
                 target_hardware=receipt.target_hardware or "",
                 main_assembly=receipt.main_assembly or "",
                 dispatch={
@@ -1525,7 +1532,7 @@ class PortalApp:
 
     def _metadata_overlay(self, dag_run_id: str) -> dict:
         try:
-            display = self._platform().run_display(dag_run_id)
+            display = self._platform().run_display(native_run_id(dag_run_id))
         except PlatformStoreError as error:
             log.error("run display state unavailable: %s", error)
             raise PortalError(
@@ -1565,7 +1572,7 @@ class PortalApp:
         except TitleError as error:
             raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
         try:
-            display = self._platform().set_run_display(dag_run_id, title)
+            display = self._platform().set_run_display(native_run_id(dag_run_id), title)
         except RunNotAdmittedError as error:
             raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法重命名") from error
         except PlatformStoreError as error:
@@ -1599,7 +1606,9 @@ class PortalApp:
                     start_response, HTTPStatus.CONFLICT, {"error": message, "reason": reason}, self.config
                 )
             try:
-                display = self._platform().hide_run(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
+                display = self._platform().hide_run(
+                    native_run_id(dag_run_id), actor=self._actor_label(session, dag_run_id, run)
+                )
             except RunNotAdmittedError as error:
                 raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法删除") from error
             except PlatformStoreError as error:
@@ -1652,7 +1661,7 @@ class PortalApp:
         if not self._can_manage(session, run):
             raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可恢复此运行")
         try:
-            overlay = _display_overlay(self._platform().restore_run(dag_run_id))
+            overlay = _display_overlay(self._platform().restore_run(native_run_id(dag_run_id)))
         except RunNotAdmittedError as error:
             raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法恢复") from error
         except PlatformStoreError as error:

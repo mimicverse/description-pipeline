@@ -16,6 +16,7 @@ from tests.v1._airflow_env import pinned_airflow_home
 
 from description_pipeline.io import digest
 from description_pipeline.orchestration.airflow_client import EndpointConfig
+from description_pipeline.orchestration.feishu_oauth import build_actor_name
 
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
@@ -70,7 +71,12 @@ class DagTests(unittest.TestCase):
         )
 
         def context(conf):
-            return {"dag_run": SimpleNamespace(conf=conf, triggering_user_name="ops"), "params": {}}
+            return {
+                "dag_run": SimpleNamespace(
+                    conf=conf, triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke")
+                ),
+                "params": {},
+            }
 
         with patch.object(module, "config_from_airflow_connection", return_value=config):
             for conf in (
@@ -116,9 +122,20 @@ class DagTests(unittest.TestCase):
             return {"dag_run": SimpleNamespace(conf=forged, triggering_user_name=actor), "params": {}}
 
         with patch.object(module, "config_from_airflow_connection", return_value=config):
-            identity, _routing = module._submission_frame(context("cli_smoke:smoke-tenant:ou_smoke"))
+            identity, _routing = module._submission_frame(
+                context(build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"))
+            )
             self.assertEqual(identity["owner"], "cli_smoke:smoke-tenant:ou_smoke")
-            for actor in ("", "   ", None):
+            for actor in (
+                "",
+                "   ",
+                None,
+                "ops",
+                42,
+                "cli_smoke:smoke-tenant:ou_smoke",
+                "cli_smoke:smoke-tenant:ou_smoke|not-json",
+                'cli_smoke:smoke-tenant:ou_smoke|" smoke"',
+            ):
                 with self.subTest(actor=actor), self.assertRaisesRegex(
                     AirflowFailException, "authenticated submitter identity"
                 ):
@@ -434,7 +451,7 @@ class DagTests(unittest.TestCase):
                     "change_summary": "linked capture rerun",
                 },
                 run_id="portal-child-1",
-                triggering_user_name="ops",
+                triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
@@ -569,7 +586,7 @@ class DagTests(unittest.TestCase):
                     "change_summary": "rebound publish",
                 },
                 run_id="portal-child-2",
-                triggering_user_name="ops",
+                triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
             "params": {},
         }
