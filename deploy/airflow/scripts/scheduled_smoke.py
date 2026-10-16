@@ -860,8 +860,13 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
     return comparisons
 
 
-def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict) -> dict:
-    """The platform rows of this run plus the strict settlement comparisons."""
+def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict, *, request_id: str) -> dict:
+    """The platform rows of this run plus the strict settlement comparisons.
+
+    ``run_id`` is the store's canonical native UUID (the DAG and the admission both
+    write that identity); ``request_id`` is the portal-issued request identity of the
+    same submission (``portal-<dag_run_id>``).
+    """
 
     import psycopg2  # noqa: PLC0415
 
@@ -876,7 +881,7 @@ def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict) 
         rows["run_state"] = [row[0] for row in cursor.fetchall()]
         cursor.execute(
             f"SELECT request_id, target_hardware, principal FROM {platform_schema}.request WHERE request_id=%s",
-            (f"portal-{run_id}",),
+            (request_id,),
         )
         rows["request"] = cursor.fetchall()
         cursor.execute(
@@ -1452,8 +1457,9 @@ def main() -> int:
                     )
             sql_evidence = _platform_sql_evidence(
                 args.platform_schema,
-                run_id,
+                native_id,
                 projection,
+                request_id=f"portal-{run_id}",
             )
             problems.extend(sql_evidence.get("problems", []))
             if identity_stable is False:

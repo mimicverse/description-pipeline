@@ -294,6 +294,22 @@ def _failure_tree(run_dir: Path, stage: str) -> Path:
     return tree
 
 
+def _register_blocked_downstream(platform: PlatformStore, run_id: str, failed_stage: str) -> None:
+    """Every unexecuted downstream stage records ``blocked`` once a stage fails.
+
+    ``blocked`` is the frozen vocabulary for a precondition failure: the stage
+    never entered execution, carries no receipt and no checkpoint, and the row
+    keeps the platform records in exact agreement with the lifecycle projection.
+    """
+    if failed_stage not in STAGE_IDS:
+        return
+    records = platform.stage_records(run_id)
+    for stage in STAGE_IDS[STAGE_IDS.index(failed_stage) + 1 :]:
+        if (records.get(stage) or {}).get("state"):
+            continue
+        platform.confirm_stage(run_id=run_id, stage=stage, state="blocked", receipt={})
+
+
 def _converge_failed_stage(
     run_id: str, stage: str, error: Exception, tree: Path | None = None, *, products: bool = False
 ) -> None:
@@ -311,6 +327,7 @@ def _converge_failed_stage(
                 log.exception("failure-product snapshot unavailable run=%s stage=%s", run_id, stage)
                 tree = None
         _register_failed_stage(platform, store_root, run_id, stage, error, tree=tree)
+        _register_blocked_downstream(platform, run_id, stage)
     except Exception:  # pragma: no cover - the stage failure stays the primary signal
         log.exception("failed-stage registration unavailable run=%s stage=%s", run_id, stage)
 
