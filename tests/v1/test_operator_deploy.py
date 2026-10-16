@@ -240,6 +240,25 @@ def platform_fixture(
         key, _, value = line.partition("=")
         if key:
             env[key] = value
+    # One managed proxy binary for the whole fixture: the lifecycle resolves NGINX_BIN from
+    # resolved.env, so the render pins the same stubbed executable the control verbs see.
+    (tmp / "bin").mkdir(exist_ok=True)
+    fixture_nginx = tmp / "bin" / "nginx"
+    write_stub(fixture_nginx, "#!/bin/bash\nexit 0\n")
+    env["NGINX_BIN"] = str(fixture_nginx)
+    repinned = run(
+        [
+            sys.executable,
+            str(OPERATOR / "render_operator.py"),
+            "--env-file",
+            env_path,
+            "--nginx-bin",
+            str(fixture_nginx),
+        ],
+        {},
+    )
+    if repinned.returncode != 0:
+        raise AssertionError(repinned.stderr)
     venv_bin = Path(env["AIRFLOW_VENV"]) / "bin"
     venv_bin.mkdir(parents=True, exist_ok=True)
     write_stub(venv_bin / "python", '#!/bin/bash\nexec python3 "$@"\n')
@@ -636,7 +655,16 @@ class LifecycleTests(unittest.TestCase):
         target = config_home / "systemd" / "user"
         target.mkdir(parents=True)
         rendered = run(
-            [sys.executable, str(RENDER), "--env-file", str(env_path), "--units-dir", str(target)],
+            [
+                sys.executable,
+                str(RENDER),
+                "--env-file",
+                str(env_path),
+                "--nginx-bin",
+                env["NGINX_BIN"],
+                "--units-dir",
+                str(target),
+            ],
             {"XDG_CONFIG_HOME": str(config_home)},
         )
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
@@ -657,7 +685,7 @@ class LifecycleTests(unittest.TestCase):
             if key:
                 derived_env[key] = decode_env_value(value.strip())
         bindir = tmp / "bin"
-        bindir.mkdir()
+        bindir.mkdir(exist_ok=True)
         pgbin = state / "airflow-pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
         pgbin.mkdir(parents=True, exist_ok=True)
         write_stub(pgbin / "pg_isready", '#!/bin/bash\necho "pg_isready" >> "$ORDER_LOG"\nexit 0\n')
@@ -1309,6 +1337,7 @@ class LifecycleTests(unittest.TestCase):
             HEALTH,
             OPERATOR / "scripts" / "install_toolchain.sh",
             OPERATOR / "scripts" / "install_proxy.sh",
+            OPERATOR / "scripts" / "ensure_proxy_binary.sh",
         ):
             result = run(["bash", "-n", str(script)], {})
             self.assertEqual(result.returncode, 0, f"{script}: {result.stderr}")
@@ -1350,7 +1379,18 @@ class InstallOrderingTests(unittest.TestCase):
             release / "operator" / "scripts" / "install_toolchain.sh",
             '#!/usr/bin/env bash\necho "AIRFLOW_PYTHON=/usr/bin/python3"\n',
         )
-        write_stub(release / "operator" / "scripts" / "install_proxy.sh", "#!/usr/bin/env bash\nexit 0\n")
+        write_stub(
+            release / "operator" / "scripts" / "install_proxy.sh",
+            "#!/usr/bin/env bash\n"
+            'BIN="$OPERATOR_STATE/toolchain/nginx/root/usr/sbin/nginx"\n'
+            'mkdir -p "$(dirname "$BIN")"\n'
+            'printf "#!/usr/bin/env bash\\nexit 0\\n" > "$BIN"\n'
+            'chmod +x "$BIN"\n'
+            'echo "$BIN"\n',
+        )
+        (release / "operator" / "scripts" / "ensure_proxy_binary.sh").write_bytes(
+            (OPERATOR / "scripts" / "ensure_proxy_binary.sh").read_bytes()
+        )
         write_stub(
             release / "airflow" / "services.sh",
             '#!/usr/bin/env bash\necho "services_$1" >> "$ORDER_LOG"\n'

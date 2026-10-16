@@ -56,12 +56,12 @@ fi
 [ -f "$PORTAL_CONFIG" ] && report PASS "portal config: $PORTAL_CONFIG" \
   || report FAIL "portal config missing: $PORTAL_CONFIG"
 
-if [ -x "${NGINX_BIN:-/usr/sbin/nginx}" ]; then
-  if "$NGINX_BIN" -t -c "$OPERATOR_NGINX_CONF" -p "$OPERATOR_STATE/nginx" >/dev/null 2>&1; then
-    report PASS "nginx -t"
-  else
-    report FAIL "nginx -t rejected $OPERATOR_NGINX_CONF"
-  fi
+if [ ! -x "${NGINX_BIN:-/usr/sbin/nginx}" ]; then
+  report FAIL "managed nginx binary missing or not executable: ${NGINX_BIN:-/usr/sbin/nginx}"
+elif "$NGINX_BIN" -t -c "$OPERATOR_NGINX_CONF" -p "$OPERATOR_STATE/nginx" >/dev/null 2>&1; then
+  report PASS "nginx -t"
+else
+  report FAIL "nginx -t rejected $OPERATOR_NGINX_CONF"
 fi
 
 TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"

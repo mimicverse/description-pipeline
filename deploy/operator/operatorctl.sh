@@ -223,6 +223,15 @@ PY
   printf '%s' "$value"
 }
 
+# The ONE managed proxy binary: the installer's actual result (a system binary or the
+# toolchain nginx ``install_proxy.sh`` lands) is decided in scripts/ensure_proxy_binary.sh
+# and feeds every render (resolved.env, the units) and therefore health; a missing or
+# non-executable result refuses instead of rendering a path that was never installed.
+ensure_proxy_binary() {
+  NGINX_BIN="${NGINX_BIN:-}" OPERATOR_STATE="${OPERATOR_STATE:-}" \
+    bash "$HERE/scripts/ensure_proxy_binary.sh"
+}
+
 # The gates read the platform authority from the managed database, so the start window must
 # begin by bringing that database up and confirming its socket.  The cluster identity never
 # runs here; this is the same managed unit the installation created.
@@ -471,11 +480,13 @@ load_installed() {
 # compare with the installed deployment. Missing installed files, missing renders and render
 # failures count as drift, not as silent passes.
 drift_check() {
-  local rc=0 tmp_xdg drift_log tmp_state
+  local rc=0 tmp_xdg drift_log tmp_state proxy_bin extra=()
+  proxy_bin="$(ensure_proxy_binary)" || { echo "DRIFT managed proxy binary unavailable"; rc=1; proxy_bin=""; }
+  [ -n "$proxy_bin" ] && extra=(--nginx-bin "$proxy_bin")
   drift_log="$(mktemp)"
   tmp_xdg="$(mktemp -d)"
   if ! python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --dry-run \
-        --units-dir "$tmp_xdg/systemd/user" > "$drift_log"; then rc=1; fi
+        "${extra[@]}" --units-dir "$tmp_xdg/systemd/user" > "$drift_log"; then rc=1; fi
   grep -v -e '^DRIFT none$' -e '^OPERATOR_UNITS=' "$drift_log" || true
   # The operator units carry the temporary render state; normalize it before comparing.
   tmp_state="$(sed -n 's/^Environment=OPERATOR_STATE=//p' \
@@ -687,7 +698,12 @@ case "$ACTION" in
     RENDER_LOG="$(mktemp)"
     TOOLCHAIN_LOG="$(mktemp)"
     trap 'rm -f "$RENDER_LOG" "$TOOLCHAIN_LOG"' EXIT
-    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" > "$RENDER_LOG"
+    # The managed proxy binary is decided before any render: whichever binary this
+    # installation actually lands (or an already-executable system one) becomes the NGINX_BIN
+    # written into resolved.env, the units and health - one path, one source.
+    OPERATOR_STATE="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
+    PROXY_BIN="$(ensure_proxy_binary)" || die "the managed proxy binary is unavailable; nothing was installed"
+    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" > "$RENDER_LOG"
     cat "$RENDER_LOG"
     # shellcheck disable=SC1090
     source "$(sed -n 's/^OPERATOR_STATE=//p' "$RENDER_LOG" | head -1)/resolved.env"
@@ -696,7 +712,8 @@ case "$ACTION" in
     cat "$TOOLCHAIN_LOG"
     # shellcheck disable=SC1090
     source "$TOOLCHAIN_LOG"
-    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" >/dev/null
+    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+      --units-dir "$TARGET" >/dev/null
     airflow_render
     if [ -n "${POSTGRES_ROOT:-}" ]; then
       if [ ! -f "$POSTGRES_ROOT/data/PG_VERSION" ]; then
@@ -758,9 +775,8 @@ case "$ACTION" in
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
       --token-file "$ENDPOINT_TOKEN_FILE" --host 127.0.0.1 --port "$TUNNEL_LOOPBACK_PORT" \
       --handoff-root "$SOLIDWORKS_HANDOFF_ROOT" --pipeline-config "$PORTAL_CONFIG"
-    if [ ! -x "${NGINX_BIN:-/usr/sbin/nginx}" ]; then
-      OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/scripts/install_proxy.sh" >/dev/null
-    fi
+    # The binary decided above is the one everything rendered; it may not vanish mid-install.
+    [ -x "$PROXY_BIN" ] || die "the managed proxy binary is missing: $PROXY_BIN"
     systemctl --user daemon-reload
     # The install record binds this generation to its snapshot, release identity and both ends;
     # it is written only after the installation legs are ready.
@@ -1146,8 +1162,11 @@ PY
     # 8. the switched generation starts through its own derived environment
     load_active_env
     load_installed
+    PROXY_BIN="$(ensure_proxy_binary)" \
+      || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
+      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+        --units-dir "$TARGET" \
       && source "$STATE_ROOT/resolved.env" \
       && airflow_render \
       && systemctl --user daemon-reload \
@@ -1353,8 +1372,11 @@ PY
     # platform.json may already describe a candidate).
     load_running_env
     load_installed
+    PROXY_BIN="$(ensure_proxy_binary)" \
+      || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
+      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+        --units-dir "$TARGET" \
       && airflow_render \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
