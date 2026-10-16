@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -58,7 +59,9 @@ class HealthGateTests(unittest.TestCase):
             result = invoke(gate, evidence, ["0.15", "1", "0.05"])
             took = time.monotonic() - begun
             self.assertNotEqual(result.returncode, 0)
-            self.assertLess(took, 0.5, f"the gate must fail within the budget, took {took:.3f}s")
+            elapsed = int(re.search(r"elapsed_ms=(\d+)", result.stderr).group(1))
+            self.assertLess(elapsed, 300, f"strong finish must stay in the 0.15s budget, gate said {elapsed}ms")
+            self.assertLess(took, 0.6, f"the gate must fail at budget scale, took {took:.3f}s")
             summary = (self._runs(evidence)[0] / "summary.txt").read_text(encoding="utf-8")
             self.assertIn("rc=124", summary)
 
@@ -71,7 +74,9 @@ class HealthGateTests(unittest.TestCase):
             result = invoke(gate, evidence, ["0.5", "0.05", "0.05"])
             took = time.monotonic() - begun
             self.assertNotEqual(result.returncode, 0)
-            self.assertLess(took, 2.0, f"a TERM-ignoring probe must be bounded, took {took:.3f}s")
+            elapsed = int(re.search(r"elapsed_ms=(\d+)", result.stderr).group(1))
+            self.assertLess(elapsed, 800, f"a TERM-ignoring probe must finish near the budget, gate said {elapsed}ms")
+            self.assertLess(took, 1.2, f"a TERM-ignoring probe must be bounded, took {took:.3f}s")
 
     def test_a_late_success_never_opens(self) -> None:
         # The probe ignores TERM and would exit 0 after the budget: the forced finish wins and

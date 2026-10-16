@@ -36,12 +36,13 @@ while :; do
       | tee -a "$SUMMARY" >&2
     exit 1
   fi
+  now="$(now_ms)"  # fresh: the start overhead is already spent from the same budget
   remaining_ms=$((deadline_ms - now))
   remaining_s="$(awk -v ms="$remaining_ms" 'BEGIN{printf "%.3f", ms / 1000}')"
-  # The single probe may never outrun the remaining total budget, and a probe that ignores the
-  # polite stop signal is force-finished within the same budget (kill-after below).
-  probe_s="$(min_s "$PER_PROBE_S" "$remaining_s")"
-  kill_after_s="$(awk -v r="$remaining_s" 'BEGIN{ x = r < 5 ? r : 5; if (x < 0.05) x = 0.05; printf "%.3f", x }')"
+  # The polite stop and the forced finish share the one remaining budget: kill_after is small
+  # and bounded, and the probe timeout is what remains after reserving it (probe + kill <= rem).
+  kill_after_s="$(awk -v r="$remaining_s" 'BEGIN{ x = r / 4; if (x > 1) x = 1; if (x < 0.05) x = 0.05; printf "%.3f", x }')"
+  probe_s="$(awk -v per="$PER_PROBE_S" -v rem="$remaining_s" -v k="$kill_after_s" 'BEGIN{ t = rem - k; if (t > per) t = per; if (t < 0.001) t = 0.001; printf "%.3f", t }')"
   out="$RUN_DIR/attempts/attempt-$attempt.out"
   rc=0
   OPERATOR_STATE="${OPERATOR_STATE:-}" timeout -k "$kill_after_s" "$probe_s" bash "$PROBE" >"$out" 2>&1 || rc=$?
