@@ -15,7 +15,7 @@ from description_pipeline.stages import CONTRACT, STAGE_IDS
 from tests.v1.protocol_support import protocol_events
 from description_pipeline.delivery import PIPELINE_ID
 
-from .portal_read_support import RegisteredPlatform
+from .portal_read_support import RegisteredPlatform, stub_definition_rebuild
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_ID = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
@@ -25,8 +25,10 @@ SUBJECT = "a" * 64
 class _RecordingTaskInstance:
     """Minimal task instance that captures the engineering_stages push in direct unit tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, task_id: str = "publish", map_index: int = -1) -> None:
         self.values: dict[str, dict] = {}
+        self.task_id = task_id
+        self.map_index = map_index
 
     def xcom_pull(self, *, task_ids, key):
         return self.values.get(key)
@@ -70,34 +72,36 @@ def _passing_publish_receipt() -> dict:
 
 
 def _registered_delivery(
-    platform: RegisteredPlatform, *, quality_subject: str = SUBJECT, submission_state: str = "published"
-) -> None:
+    platform: RegisteredPlatform, *, submission_state: str = "published", confirm_publish: bool = True
+) -> str:
     """Register the six-stage records of one passing delivery over the platform store.
 
     The confirmation consumes exactly these records: the run row, the six stage
-    receipts (the publish receipt carries the delivered quality and submission),
-    the recorded check events and the capture tree that binds hardware/revision.
+    receipts, the recorded check events and the sealed capture tree that binds
+    hardware/revision.  The capture and publication trees are genuinely sealed
+    through the production writer and confirmed through the store, so a
+    confirmed-stage read-back re-verifies the same bytes production would.  The
+    returned subject is the sealed delivery's own digest the events bind.
     """
     platform.admit(RUN_ID)
     platform.register_capture(RUN_ID)
     platform.conclude(RUN_ID, "succeeded")
     for stage in ("freeze", "discover", "generate"):
         platform.stage(RUN_ID, stage)
+    subject = SUBJECT
+    if confirm_publish:
+        subject = platform.register_publish(RUN_ID, submission_state=submission_state)
     platform.stage(
         RUN_ID,
         "verify",
         receipt={
-            "subject_sha256": SUBJECT,
+            "subject_sha256": subject,
             "handoff_sha256": "b" * 64,
-            "quality": {"passed": True, "subject_sha256": SUBJECT},
+            "quality": {"passed": True, "subject_sha256": subject},
         },
     )
-    receipt = _passing_publish_receipt()
-    receipt["handoff_sha256"] = "b" * 64
-    receipt["quality"] = {"passed": True, "subject_sha256": quality_subject}
-    receipt["submission"] = {**receipt["submission"], "state": submission_state}
-    platform.stage(RUN_ID, "publish", receipt=receipt)
-    platform.events(RUN_ID, protocol_events(subject=SUBJECT))
+    platform.events(RUN_ID, protocol_events(subject=subject))
+    return subject
 
 
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
@@ -168,7 +172,7 @@ class SplitWorkflowTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             platform = RegisteredPlatform(Path(tmp) / "platform")
-            _registered_delivery(platform)
+            subject = _registered_delivery(platform)
             # The run's bound routing rides the chain; hardware/revision keep the
             # registered capture identity as their authority.
             published = {
@@ -187,8 +191,13 @@ class SplitWorkflowTests(unittest.TestCase):
                     with self.subTest(state=state):
                         receipt = _passing_publish_receipt()
                         receipt["handoff_sha256"] = "b" * 64
-                        receipt["quality"] = {"passed": True, "subject_sha256": SUBJECT}
-                        receipt["submission"] = {**receipt["submission"], "state": state}
+                        receipt["subject_sha256"] = subject
+                        receipt["quality"] = {"passed": True, "subject_sha256": subject}
+                        receipt["submission"] = {
+                            **receipt["submission"],
+                            "state": state,
+                            "subject_sha256": subject,
+                        }
                         platform.stage(run_id, "publish", receipt=receipt)
                         result = confirm(published)
                         self.assertEqual(result["pipeline_id"], PIPELINE_ID)
@@ -198,7 +207,9 @@ class SplitWorkflowTests(unittest.TestCase):
                         self.assertEqual(result["handoff"]["revision"], "r1")
                 receipt = _passing_publish_receipt()
                 receipt["handoff_sha256"] = "b" * 64
+                receipt["subject_sha256"] = subject
                 receipt["quality"] = {"passed": True, "subject_sha256": "d" * 64}
+                receipt["submission"] = {**receipt["submission"], "subject_sha256": subject}
                 platform.stage(run_id, "publish", receipt=receipt)
                 from description_pipeline.platform import flow as flow_module
 
@@ -334,17 +345,63 @@ class SplitWorkflowTests(unittest.TestCase):
             platform = RegisteredPlatform(Path(tmp) / "platform")
             _registered_delivery(platform)
             with (
-                patch.object(module.flow, "run_stage", return_value=_passing_publish_receipt()),
+                stub_definition_rebuild(),
+                patch.object(module.flow, "run_stage", side_effect=AssertionError("publication re-sent")),
                 patch.object(module, "_platform_binding", return_value=(platform.store, platform.root)),
-                patch.object(module, "_register_completed_stage", side_effect=lambda *args, **kwargs: None),
                 patch.object(module, "config_from_airflow_connection", return_value=config),
             ):
+                registered = platform.store.confirmed_stage(RUN_ID, "publish")
+                before = dict(platform.world.operations)
                 publish = module.dag.get_task("publish").python_callable
                 result = publish(verified, ti=ti)
-        self.assertEqual(result["submission"]["state"], "published")
+        self.assertIsNotNone(registered)
+        # The confirmed publication is replayed: the registered sealed receipt is the
+        # result, the stage never re-runs and nothing new is written.  The task's
+        # stage report belongs to the original attempt; the replay returns the
+        # delivery summary from the registered receipt alone.
+        self.assertEqual(result["pipeline_id"], PIPELINE_ID)
+        self.assertEqual(result["submission"]["state"], registered["submission"]["state"])
         self.assertEqual(result["submission"]["url"], "https://github.com/example/robot/pull/1")
-        pushed = ti.values["engineering_stages"]
-        self.assertEqual(next(item for item in pushed["stages"] if item["id"] == "publish")["state"], "completed")
+        self.assertEqual(platform.world.operations, before, "the replay writes no new operation")
+
+    def test_publish_on_a_terminal_run_without_a_registration_is_refused(self):
+        from description_pipeline.platform.store import PlatformStoreError
+
+        module = self.module()
+        ti = _RecordingTaskInstance()
+        verified = {
+            "run_id": RUN_ID,
+            "request": {
+                "run_id": RUN_ID,
+                "package": "control",
+                "handoff_sha256": "b" * 64,
+                "conn_id": "test",
+                "linux_owned": True,
+            },
+            "verify": {"state": "verified", "passed": True, "subject_sha256": SUBJECT},
+            "repository_slug": "example/robot",
+            "repository_base": "feature/robot",
+            "from_stage": None,
+        }
+        config = SimpleNamespace(
+            repositories={"example/robot": Path("/tmp/model-repository")},
+            store_root=Path("/nonexistent-work"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            platform = RegisteredPlatform(Path(tmp) / "platform")
+            _registered_delivery(platform, confirm_publish=False)
+            before = dict(platform.world.operations)
+            with (
+                patch.object(module.flow, "run_stage", side_effect=AssertionError("publication re-sent")),
+                patch.object(module, "_platform_binding", return_value=(platform.store, platform.root)),
+                patch.object(module, "config_from_airflow_connection", return_value=config),
+                self.assertRaisesRegex(PlatformStoreError, "terminal"),
+            ):
+                module.dag.get_task("publish").python_callable(
+                    verified, ti=ti, dag_run=SimpleNamespace(run_id=RUN_ID)
+                )
+            # Nothing was written: the terminal run refuses even the new intent.
+            self.assertEqual(platform.world.operations, before)
 
 
 if __name__ == "__main__":

@@ -9,15 +9,31 @@ are; the sealed write path keeps its own canonical coverage.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
 from description_pipeline.io import file_digest, read_data, write_json
+from description_pipeline.platform.storage import seal_stage_confirmation
 from description_pipeline.platform.store import PlatformStore
+from description_pipeline.verification import solidworks_urdf
+from description_pipeline.verification.solidworks_urdf import required_checks
 
 from .test_platform_store import FakeWorld, build_sealed_delivery
+
+#: The definition the synthetic sealed publication fixture binds its quality to.
+DEFINITION = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+
+
+@contextlib.contextmanager
+def stub_definition_rebuild():
+    """The rebuilt definition of the synthetic sealed fixture's tree."""
+    with mock.patch.object(solidworks_urdf, "rebuilt_definition", return_value=DEFINITION):
+        yield
 
 
 class RegisteredPlatform:
@@ -133,6 +149,67 @@ class RegisteredPlatform:
             receipt=receipt,
         )
         return capture
+
+    def register_publish(self, run_id: str, *, submission_state: str = "published") -> str:
+        """One genuinely sealed publication, registered through the production writer.
+
+        The tree is the same real sealed delivery the capture fixture uses; the writer
+        seals it and completes the receipt with the report members bound to the sealed
+        bytes, and ``confirm_stage`` re-verifies everything exactly as production does.
+        Returns the sealed subject digest every read-back binds.
+        """
+        registered = self.store.stage_records(run_id).get("publish") or {}
+        if registered.get("state") == "completed":
+            return str((registered.get("receipt") or {}).get("subject_sha256") or "")
+        source = Path(tempfile.mkdtemp(prefix="publish-seal-", dir=self.root))
+        try:
+            subject, artifacts, _handoff_full, handoff_native = build_sealed_delivery(source)
+            checks = [
+                {"id": name, "state": "passed", "passed": True, "details": {}} for name in required_checks(DEFINITION)
+            ]
+            quality = {
+                "passed": True,
+                "subject_sha256": subject,
+                "checks": checks,
+                "required_checks": required_checks(DEFINITION),
+                "qualifications": solidworks_urdf.qualifications(source, DEFINITION, checks),
+            }
+            write_json(source / "reports/quality.json", quality)
+            receipt = {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": run_id,
+                "stage": "publish",
+                "state": submission_state,
+                "passed": True,
+                "handoff_sha256": handoff_native,
+                "subject_sha256": subject,
+                "artifacts": [dict(record) for record in artifacts],
+                "quality": quality,
+                "submission": {
+                    "passed": True,
+                    "state": submission_state,
+                    "subject_sha256": subject,
+                    "commit": "c" * 40,
+                    "base": "feature/robot",
+                    "repository_slug": "example/robot",
+                    "branch": "work/solidworks/robot",
+                    "url": "https://github.com/example/robot/pull/1",
+                },
+            }
+            with stub_definition_rebuild():
+                uri, sealed_receipt = seal_stage_confirmation(self.root, run_id, "publish", source, receipt)
+                self.world.stages.pop((run_id, "publish"), None)
+                self.store.confirm_stage(
+                    run_id=run_id,
+                    stage="publish",
+                    state="completed",
+                    checkpoint_uri=uri,
+                    receipt=sealed_receipt,
+                )
+            return subject
+        finally:
+            shutil.rmtree(source, ignore_errors=True)
 
     def events(self, run_id: str, events: list[dict]) -> None:
         """Record one attempt's display events as the platform event rows they become.
