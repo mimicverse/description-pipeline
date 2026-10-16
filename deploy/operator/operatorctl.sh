@@ -157,11 +157,20 @@ load_running_env() {
 # One env contract: platform_env and render_operator write every derived value through the
 # canonical encoding (bare when shell-safe, single-quoted otherwise - the libpq DSNs' "&"
 # above all), so any consumer can simply `source` the file.  This helper reads one generation
-# value back by sourcing it in a subshell and never parses quoting itself.
+# value back by sourcing it in a subshell and never parses quoting itself - and it clears the
+# key first, so a candidate file that does not define it (missing line, a defeated assignment
+# such as an unquoted "&", a syntax error, an empty file) can never fall back to a value the
+# route shell inherited from another generation.  A missing or empty value is an explicit,
+# human-readable refusal at the read, before any DDL or recovery step.
 generation_env_value() {
   local file="$1" key="$2" value
-  value="$( set -a; source "$file"; printf '%s' "${!key}" )" \
-    || die "the derived environment $file does not define $key"
+  value="$(
+    set -a
+    unset "$key"
+    source "$file" >/dev/null 2>&1 || exit 3
+    printf '%s' "${!key-}"
+  )" || die "the derived environment $file could not be read for $key"
+  [ -n "$value" ] || die "the derived environment $file does not define $key"
   printf '%s' "$value"
 }
 

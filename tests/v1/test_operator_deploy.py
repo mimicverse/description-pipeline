@@ -1848,6 +1848,74 @@ class InstallOrderingTests(unittest.TestCase):
                 "no live DDL may run before the staged identity verifies",
             )
 
+    def test_maintenance_reconcile_refuses_an_undefined_candidate_value(self) -> None:
+        """A candidate env that cannot define a value never falls back to the running generation."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            candidate_env = state / "derived" / "gen-2" / "operator.env"
+            original = candidate_env.read_text(encoding="utf-8")
+            dsn_line = next(line for line in original.splitlines() if line.startswith("PLATFORM_SERVICE_DSN="))
+            foreign = "postgresql://platform_service@/airflow_meta?host=/elsewhere&port=1"
+            cases = {
+                # A missing key, an empty candidate and a defeated (unquoted "&") assignment are
+                # all three "the file does not define it": never the inherited running value,
+                # always a fail-closed refusal at the read, before any DDL or recovery step.
+                "missing_key": (
+                    "PLATFORM_SERVICE_DSN",
+                    "\n".join(
+                        line for line in original.splitlines() if not line.startswith("PLATFORM_SERVICE_DSN=")
+                    )
+                    + "\n",
+                ),
+                "empty_file": ("AIRFLOW_VENV", ""),
+                "defeated_unquoted_assignment": (
+                    "PLATFORM_SERVICE_DSN",
+                    original.replace(dsn_line, f"PLATFORM_SERVICE_DSN={foreign}"),
+                ),
+            }
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            for label, (key, document) in cases.items():
+                with self.subTest(label):
+                    candidate_env.write_text(document, encoding="utf-8")
+                    receipt_before = receipt_path.read_bytes()
+                    before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+                    refused = run(
+                        [
+                            "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                            "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                            "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                            "--evidence", "receipt.json",
+                        ],
+                        control_env,
+                    )
+                    self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                    self.assertIn("derived environment", refused.stderr)
+                    self.assertIn(key, refused.stderr)
+                    self.assertEqual(
+                        order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                        before,
+                        f"{label}: no live DDL may run for an undefined candidate value",
+                    )
+                    self.assertEqual(
+                        receipt_path.read_bytes(), receipt_before, f"{label}: the receipt is untouched"
+                    )
+                    self.assertFalse(
+                        (state / "promotions" / "gen-2" / "reconcile-schema-migration.out").exists(),
+                        f"{label}: the guarded migration never ran",
+                    )
+            candidate_env.write_text(original, encoding="utf-8")
+
     def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
