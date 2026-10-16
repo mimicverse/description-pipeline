@@ -24,6 +24,7 @@ from description_pipeline.sources.solidworks.scene import (  # noqa: E402
     build_scene,
     identity_matrix,
 )
+from . import support  # noqa: E402
 from .support import compose_fixture_link_reads  # noqa: E402
 
 IDENTITY = identity_matrix()
@@ -97,7 +98,9 @@ class EffectiveInstanceSceneTests(unittest.TestCase):
         """Attach a valid direct link group record whose read 1 is the recombination."""
 
         effective = (scene.notes or {}).get("effective_instances") or {}
-        selections = _link_group_selections(cfg, scene, effective)
+        # The capture-side selection helper consumes the native request sets;
+        # the derivation-side build_scene keeps the rebuilt bodies vocabulary.
+        selections = _link_group_selections(support.capture_requests(cfg), scene, effective)
         scene.link_group_mass_properties = {
             "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
             "assembly": "fixture.SLDASM",

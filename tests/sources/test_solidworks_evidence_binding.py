@@ -17,9 +17,13 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.io import file_digest  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import validate_source_config  # noqa: E402
+from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config  # noqa: E402
 
 from . import support  # noqa: E402
+
+
+def validate_source_config(config):  # noqa: F811 - fixture adapter for the request sets
+    return _validate_source_config(support.capture_requests(config))
 
 
 def _detail(error: Exception) -> dict:
@@ -47,6 +51,7 @@ class EvidenceBindingTests(unittest.TestCase):
             "configuration": "Default",
             "allowed_roots": [str(self.tmp / "cad")],
             "geometry": {"enabled": False},
+            "coordinate_systems": ["CS_base_link", "CS_arm_link"],
             "material_source": "documented_table",
             "mass_evidence": self._binding(),
             "documented_masses": {
@@ -58,9 +63,14 @@ class EvidenceBindingTests(unittest.TestCase):
                     "id": "base",
                     "name": "base_link",
                     "components": ["base-1"],
-                    "frame": {"coordinate_system": "base_datum"},
+                    "frame": {"coordinate_system": "CS_base_link"},
                 },
-                {"id": "arm", "name": "arm_link", "components": ["arm-1"], "frame": {"coordinate_system": "arm_datum"}},
+                {
+                    "id": "arm",
+                    "name": "arm_link",
+                    "components": ["arm-1"],
+                    "frame": {"coordinate_system": "CS_arm_link"},
+                },
             ],
             "joints": [],
         }
