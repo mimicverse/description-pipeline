@@ -1115,13 +1115,17 @@ def compose_delivery_inputs(
     configuration: str,
     record: dict,
     cad_files: dict[str, Path],
+    records: dict[str, str] | None = None,
+    record_keys: dict[str, str] | None = None,
     material_source: str | None = None,
 ) -> None:
     """Compose the sealed inputs Linux consumers rebuild from (fixture plumbing).
 
     Copies the genuine CAD bytes into ``input/cad/<relative>``, writes the
     sealed discovery payload (with its raw native record) at
-    ``evidence/discovery.json`` and, when a material authority is given,
+    ``evidence/discovery.json`` (including optional controlled-record files at
+    ``input/records/<name>`` carrying their payload entries), and, when a
+    material authority is given,
     ensures the canonical provenance block exists in ``evidence/capture.json``.
     Synthetic consumer-fixture inputs only: it must never feed the unchanged
     canonical/E2E producers, which produce their own evidence.  Existing
@@ -1145,6 +1149,22 @@ def compose_delivery_inputs(
         shutil.copyfile(source, target)
         native_files[str(relative)] = file_digest(target)
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    import hashlib as _hashlib
+
+    payload_records: list[dict] = []
+    for name, text in (records or {}).items():
+        target = delivery / "input" / "records" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        entry = {
+            "file": str(name),
+            "package_file": str(name),
+            "sha256": _hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+        key = (record_keys or {}).get(name)
+        if key is not None:
+            entry["key"] = str(key)
+        payload_records.append(entry)
     write_json(
         evidence / "discovery.json",
         {
@@ -1161,7 +1181,7 @@ def compose_delivery_inputs(
                 "delivery_configuration": configuration,
                 "robot_name": str(identity.get("robot_name") or "robot"),
             },
-            "records": [],
+            "records": payload_records,
             "raw": record,
             "native_files": dict(sorted(native_files.items())),
         },
