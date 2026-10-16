@@ -379,6 +379,34 @@ _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
 #: The bound on the registered reuse lineage of one attempt; a longer chain is malformed.
 REUSE_LINEAGE_DEPTH = 256
 
+#: The constructor sentinel of the default Airflow-runtime DagRun reader.
+_RUNTIME_DAG_RUN_READER = object()
+
+
+def _runtime_dag_run_reader() -> Callable[[str, str], str | None] | None:
+    """The Airflow runtime identity's own DagRun state reader, or None without its DSN.
+
+    The runtime metadata is read under the runtime role's own canonical schema
+    (its role search_path resolves the table; no schema setting is copied), and
+    a missing authority returns ``None`` so the acceptance refuses instead of
+    trusting an unverified DagRun fact.
+    """
+
+    dsn = os.environ.get("AIRFLOW_RUNTIME_DB_URL", "")
+    if not dsn:
+        return None
+
+    def read(dag_id: str, dag_run_id: str) -> str | None:
+        import psycopg2  # noqa: PLC0415  (provided by the deployment interpreter)
+
+        with psycopg2.connect(dsn.replace("postgresql+psycopg2://", "postgresql://", 1)) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT state FROM dag_run WHERE dag_id = %s AND run_id = %s", (dag_id, dag_run_id))
+                row = cursor.fetchone()
+        return row[0] if row is not None else None
+
+    return read
+
 
 def _stored_receipt(row) -> dict | None:
     """The parsed receipt of one locked stage row (jsonb arrives as text or a mapping)."""
@@ -454,9 +482,26 @@ def _json(value: Any) -> str | None:
 class PlatformStore:
     """The application-side store API: the single transaction entry for platform state."""
 
-    def __init__(self, connect: Callable[[], Any], *, sealed: Callable[[str], Any] | None = None):
+    def __init__(
+        self,
+        connect: Callable[[], Any],
+        *,
+        sealed: Callable[[str], Any] | None = None,
+        dag_run_states: Callable[[str, str], str | None] | None = _RUNTIME_DAG_RUN_READER,
+    ):
+        """``dag_run_states`` is the Airflow-runtime DagRun reader of this instance.
+
+        The default builds it from ``AIRFLOW_RUNTIME_DB_URL`` (the deploy-side
+        runtime identity); a caller with its own authority injects its reader, and
+        ``None`` means no runtime authority exists - the orphan acceptance then
+        refuses rather than accepting an unverified DagRun fact.  The Store's
+        acceptance snapshot always co-verifies the bound DagRun through this one
+        reader; no CLI-only variant of the predicate exists.
+        """
+
         self._connect = connect
         self._sealed = sealed
+        self._dag_run_states = _runtime_dag_run_reader() if dag_run_states is _RUNTIME_DAG_RUN_READER else dag_run_states
 
     @classmethod
     def from_environment(
@@ -1170,6 +1215,30 @@ class PlatformStore:
             )
             self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
 
+    def _bound_dag_run(self, *, run_id: str, operation_id: object) -> tuple:
+        """The bound intent's own recorded DagRun identity, from the platform authority."""
+
+        if not isinstance(operation_id, str) or not operation_id:
+            raise PlatformStoreError("The orphan binding names its registered operation")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT dag_id, dag_run_id FROM operation WHERE operation_id = %s AND run_id = %s",
+                (operation_id, run_id),
+            )
+            row = cursor.fetchone()
+        if row is None or not all(row):
+            raise PlatformStoreError("The orphan binding names no registered operation with a DagRun identity")
+        return row
+
+    def _require_settled_dag_run(self, *, dag_id: str, dag_run_id: str) -> None:
+        """The bound DagRun must be the runtime authority's terminal failed fact."""
+
+        if self._dag_run_states is None:
+            raise PlatformStoreError("The Airflow runtime authority is unavailable; the orphan recovery refuses")
+        if self._dag_run_states(dag_id, dag_run_id) != "failed":
+            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact; refused")
+
     def _byte_bound_orphan_receipt(
         self, *, run_id: str, stage: str, state: str, receipt: dict | None, reconcile: dict
     ) -> tuple[dict, dict]:
@@ -1211,6 +1280,11 @@ class PlatformStore:
         ]
         if contradicting:
             raise PlatformStoreError(f"The evidence entry contradicts the original receipt bytes: {contradicting[0]}")
+        binding = reconcile.get("binding")
+        bound = self._bound_dag_run(
+            run_id=run_id, operation_id=binding.get("operation_id") if isinstance(binding, dict) else None
+        )
+        self._require_settled_dag_run(dag_id=bound[0], dag_run_id=bound[1])
         normalized_evidence = [
             item
             for item in entries
@@ -1367,6 +1441,10 @@ class PlatformStore:
             # flight and a green task contradicts the failure: all refuse, and the
             # tentative binding rolls back with this transaction.
             raise PlatformStoreError("The bound Airflow task does not prove its own failed fact; refused")
+        # The bound DagRun's terminal fact is re-verified on the same acceptance
+        # boundary as the locked binding and the task key: a DagRun that went live
+        # again (clear/retry) refuses here, with the tentative binding rolled back.
+        self._require_settled_dag_run(dag_id=dag_id, dag_run_id=dag_run_id)
         payload_receipt = {**receipt, "reconciliation": reconcile}
         cursor.execute(_INSERT_STAGE, (run_id, stage, state, _json(payload_receipt), None, None, None))
         if cursor.fetchone() is None:

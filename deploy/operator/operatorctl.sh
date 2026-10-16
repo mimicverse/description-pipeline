@@ -562,8 +562,11 @@ wheel_binding(release, wheel=wheel_path)
 runtime = subprocess.run(
     [str(venv / "bin" / "python"), "-c",
      "import json, pathlib, description_pipeline as p;"
+     "from description_pipeline import interface_records;"
+     "from description_pipeline.delivery import PIPELINE_ID;"
      "root = pathlib.Path(p.__file__).resolve().parent;"
-     "print(json.dumps({'root': str(root),"
+     "print(json.dumps({'root': str(root), 'pipeline_id': PIPELINE_ID,"
+     " 'domain': interface_records.release_domain_identity(),"
      " 'identity': json.loads((root / 'tool-release.json').read_text(encoding='utf-8'))}))"],
     capture_output=True, text=True,
 )
@@ -573,11 +576,14 @@ reported = json.loads(runtime.stdout)
 if not Path(reported["root"]).is_relative_to(venv):
     raise SystemExit("the staged runtime imports the package from outside its own venv")
 identity = reported["identity"]
-installed = (
-    identity.get("pipeline_id"), identity.get("version"), identity.get("source_sha256"),
-    identity.get("contract"),
-)
-if installed != (release["pipeline_id"], release["version"], release["source_sha256"], release.get("contract")):
+domain = reported["domain"]
+if (
+    identity.get("pipeline_id") != reported["pipeline_id"]
+    or identity.get("version") != release["version"]
+    or identity.get("source_sha256") != release["source_sha256"]
+    or identity.get("contract") != domain["contract"]
+    or identity.get("support") != domain["support"]
+):
     raise SystemExit("the staged runtime's installed package is not the staged release")
 print(f"staged generation verified: {receipt['install_id']}")
 GUARD
@@ -1290,7 +1296,7 @@ import json
 import os
 
 from description_pipeline import io
-from description_pipeline.platform.store import PlatformStore, load_native_failed_receipt
+from description_pipeline.platform.store import PlatformStore
 
 run_id = os.environ["RECONCILE_RUN_ID"]
 stage = os.environ["RECONCILE_STAGE"]
@@ -1306,41 +1312,16 @@ evidence = json.loads(os.environ["RECONCILE_EVIDENCE"])
 binding = None
 native_receipt = os.environ.get("RECONCILE_NATIVE_RECEIPT") or ""
 if native_receipt:
-    # Fail fast on the original bytes through the same canonical loader the Store action
-    # re-runs authoritatively; this entry holds no acceptance rules of its own.
-    load_native_failed_receipt(
-        native_receipt,
-        stage=stage,
-        native_run_id=os.environ["RECONCILE_NATIVE_RUN_ID"],
-    )
+    # The Store action owns every acceptance rule for the original bytes and the bound DagRun;
+    # this entry only names the raw inputs.
     binding = {
         "operation_id": os.environ["RECONCILE_ORPHAN_OPERATION_ID"],
         "task_id": os.environ["RECONCILE_ORPHAN_TASK_ID"],
         "map_index": int(os.environ["RECONCILE_ORPHAN_MAP_INDEX"]),
     }
-    # The settled-external-failure check: the bound operation's own DagRun must be the real
-    # terminal failed fact in the Airflow metadata - a live or unknown DagRun refuses before
-    # the store action is entered.  The operation's DagRun key comes from the platform
-    # authority itself; the DagRun row is resolved through the runtime identity's own
-    # canonical schema (its role search_path), never a copied schema setting.
-    import psycopg2
-
-    with psycopg2.connect(os.environ["PLATFORM_SERVICE_DSN"]) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT dag_id, dag_run_id FROM operation WHERE operation_id = %s AND run_id = %s",
-                (binding["operation_id"], run_id),
-            )
-            bound = cursor.fetchone()
-    if bound is None or not all(bound):
-        raise SystemExit("The orphan binding names no registered operation with a DagRun identity")
-    runtime_dsn = os.environ["AIRFLOW_RUNTIME_DB_URL"].replace("postgresql+psycopg2://", "postgresql://", 1)
-    with psycopg2.connect(runtime_dsn) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT state FROM dag_run WHERE dag_id = %s AND run_id = %s", (bound[0], bound[1]))
-            settled = cursor.fetchone()
-    if settled is None or settled[0] != "failed":
-        raise SystemExit("The bound DagRun does not prove its terminal failed fact; refused")
+    # The bound DagRun's terminal fact is verified by the Store action itself on its own
+    # acceptance boundary (the runtime identity's reader); this entry holds no copy of the
+    # predicate and passes only the raw inputs.
 
 reconcile = {
     "operation_key": f"operatorctl-reconcile:{run_id}:{stage}:{outcome}",

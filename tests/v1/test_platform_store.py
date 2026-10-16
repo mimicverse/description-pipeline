@@ -286,6 +286,16 @@ class FakeCursor:
                 world.operations[key] = record
                 world.operation_bindings[params[0]] = (params[6], params[7], params[8], params[9])
                 self._rows = [record]
+        elif normalized.startswith("SELECT dag_id, dag_run_id FROM operation WHERE operation_id"):
+            operation_id, run_id = params
+            bound = None
+            for record in world.operations.values():
+                if record[0] != operation_id or record[4] != run_id:
+                    continue
+                dag_id, dag_run_id = world.operation_bindings.get(operation_id, (None, None))[:2]
+                bound = (dag_id, dag_run_id)
+                break
+            self._rows = [bound] if bound is not None else []
         elif normalized.startswith(
             "SELECT stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
             " FROM operation WHERE operation_id"
@@ -1988,7 +1998,10 @@ class OrphanReconcileTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.world = FakeWorld()
-        self.store = PlatformStore(self.world.connect)
+        self.store = PlatformStore(
+            self.world.connect,
+            dag_run_states=lambda dag_id, dag_run_id: self.world.dag_runs.get((dag_id, dag_run_id)),
+        )
 
     # ------------------------------------------------------------------ fixtures
     def _legacy_orphan(self, run_id: str, *, dag_run_id: str | None = None) -> str:
@@ -2099,19 +2112,6 @@ class OrphanReconcileTests(unittest.TestCase):
             reconcile["binding"] = {"operation_id": dispatch_id, "task_id": task, "map_index": map_index}
         if with_receipt_inputs:
             reconcile["native_receipt"] = {"path": str(named_path), "native_run_id": binding_native}
-        # The settled-external-failure preflight of the canonical action: the bound
-        # operation's own DagRun must be the real terminal failed fact - a live or unknown
-        # DagRun refuses (in the operator entry this reads the Airflow runtime metadata).
-        if with_binding and not formed_receipt:
-            bound_row = self.world.operation_bindings.get(dispatch_id)
-            if bound_row is None or not all(bound_row[:2]):
-                raise store_module.PlatformStoreError(
-                    "The orphan binding names no registered operation with a DagRun identity"
-                )
-            if self.world.dag_runs.get((bound_row[0], bound_row[1])) != "failed":
-                raise store_module.PlatformStoreError(
-                    "The bound DagRun does not prove its terminal failed fact; refused"
-                )
         self.store.confirm_stage(
             run_id=run_id, stage="freeze", state=state, receipt=formed_receipt, reconcile=reconcile
         )
@@ -2406,6 +2406,43 @@ class OrphanReconcileTests(unittest.TestCase):
                     )
                 self.assertEqual(self._snapshot(), before, "the refused direct call changed nothing")
                 self.assertEqual(self.world.run_states.get(RUN_A), "queued")
+
+    def test_a_missing_runtime_authority_refuses_recovery(self) -> None:
+        """Without the Airflow runtime authority, the Store acceptance refuses - fail closed."""
+
+        dispatch_id = self._legacy_orphan(RUN_A)
+        directory = Path(tempfile.mkdtemp(prefix="orphan-authority-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        original = directory / "original.json"
+        original.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": NATIVE_RUNS[RUN_A],
+                    "request": {"run_id": NATIVE_RUNS[RUN_A]},
+                    "status": "failed",
+                    "events": [{"stage": "freeze", "state": "failed"}],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        store = PlatformStore(
+            self.world.connect,
+            dag_run_states=None,
+        )
+        reconcile = {
+            "operation_key": f"operatorctl-reconcile:{RUN_A}:freeze:failed",
+            "params_digest": digest({"outcome": "failed", "evidence": [], "binding": dispatch_id}),
+            "evidence": [],
+            "binding": {"operation_id": dispatch_id, "task_id": "start_job", "map_index": -1},
+            "native_receipt": {"path": str(original), "native_run_id": NATIVE_RUNS[RUN_A]},
+        }
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            store.confirm_stage(run_id=RUN_A, stage="freeze", state="failed", reconcile=reconcile)
+        self.assertEqual(self._snapshot(), before)
 
     def test_a_live_or_unknown_dag_run_never_authorizes_recovery(self) -> None:
         for name, dag_state in (("live", "running"), ("green", "success")):
