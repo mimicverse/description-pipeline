@@ -776,7 +776,12 @@ class DagTests(unittest.TestCase):
         (intake / "parts" / "bracket.SLDPRT").write_bytes(b"part-bytes")
         upload_files = validate_file_index(package_inventory(intake))
         upload_sha = digest(upload_files)
-        baseline = {"handoff_sha256": upload_sha, "files": len(upload_files), "folder": "M3.0.3"}
+        baseline = {
+            "handoff_sha256": upload_sha,
+            "files": len(upload_files),
+            "bytes": sum(entry.stat().st_size for entry in intake.rglob("*") if entry.is_file()),
+            "folder": "M3.0.3",
+        }
         confirmed: list[dict] = []
         config = EndpointConfig(
             "http://127.0.0.1:1",

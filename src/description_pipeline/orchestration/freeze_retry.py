@@ -13,13 +13,14 @@ byte-for-byte; there is deliberately no permissive fallback.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..io import PipelineError, digest, file_digest
+from ..io import PipelineError, digest
 from ..platform.store import PlatformStore
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import validate_file_index
@@ -91,12 +92,16 @@ def _read_bound_selection(
     path = Path(log_path)
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise _identity_refusal("冻结失败证据文件不可用（缺失、符号链接或非普通文件），拒绝重跑")
-    if file_digest(path) != bound_sha256:
+    try:
+        evidence_bytes = path.read_bytes()
+    except OSError as error:
+        raise _identity_refusal("冻结失败证据无法读取，拒绝重跑") from error
+    if hashlib.sha256(evidence_bytes).hexdigest() != bound_sha256:
         raise _identity_refusal("冻结失败证据与登记摘要不符，拒绝重跑")
     try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise _identity_refusal("冻结失败证据无法读取，拒绝重跑") from error
+        raw = evidence_bytes.decode("utf-8")
+    except UnicodeError as error:
+        raise _identity_refusal("冻结失败证据无法解码，拒绝重跑") from error
     selections: list[dict] = []
     for line in raw.splitlines():
         line = line.strip()
@@ -171,21 +176,9 @@ def resolve_freeze_retry_identity(
         raise _identity_refusal("原运行未登记主装配，拒绝从“冻结输入”重跑")
     purpose = request.get("purpose") if isinstance(request.get("purpose"), str) else None
     baseline = request.get("baseline")
-    baseline_handoff = baseline.get("handoff_sha256") if isinstance(baseline, dict) else None
     given = _safe_intake(str(intake_path), intake_root, context_text="本次触发提供的原件目录")
     stated_bytes: int | None = None
-    if isinstance(baseline_handoff, str) and _SHA256.fullmatch(baseline_handoff) is not None:
-        source = "baseline"
-        bound_handoff = baseline_handoff
-        expected_files: int | None = baseline.get("files") if isinstance(baseline.get("files"), int) else None
-        stated_bytes = baseline.get("bytes") if isinstance(baseline.get("bytes"), int) else None
-        folder = (
-            baseline.get("folder")
-            if isinstance(baseline.get("folder"), str) and baseline.get("folder")
-            else given.name
-        )
-        provenance = None
-    else:
+    if baseline is None:
         receipt = freeze_row.get("receipt")
         failure = receipt.get("airflow_failure") if isinstance(receipt, dict) else None
         evidence_path = failure.get("path") if isinstance(failure, dict) else None
@@ -220,6 +213,33 @@ def resolve_freeze_retry_identity(
             "sha256": selection["sha256"],
             "parent_run_id": parent_run_id,
         }
+    else:
+        if not isinstance(baseline, dict):
+            raise _identity_refusal("运行登记的上传身份已损坏（baseline 非对象），拒绝从“冻结输入”重跑")
+        handoff_value = baseline.get("handoff_sha256")
+        files_value = baseline.get("files")
+        bytes_value = baseline.get("bytes")
+        folder_value = baseline.get("folder")
+        if not (
+            isinstance(handoff_value, str)
+            and _SHA256.fullmatch(handoff_value) is not None
+            and isinstance(files_value, int)
+            and not isinstance(files_value, bool)
+            and files_value > 0
+            and isinstance(bytes_value, int)
+            and not isinstance(bytes_value, bool)
+            and bytes_value >= 0
+            and isinstance(folder_value, str)
+            and folder_value
+            and "provenance" not in baseline
+        ):
+            raise _identity_refusal("运行登记的上传身份已损坏（字段缺失或非法），拒绝从“冻结输入”重跑")
+        source = "baseline"
+        bound_handoff = handoff_value
+        expected_files = files_value
+        stated_bytes = bytes_value
+        folder = folder_value
+        provenance = None
     try:
         upload_files = validate_file_index(package_inventory(given))
     except (PipelineError, OSError, ValueError) as error:

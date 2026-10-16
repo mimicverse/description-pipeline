@@ -3374,6 +3374,7 @@ class PortalTests(unittest.TestCase):
         receipt: bool = True,
         bind_main: bool = True,
         intake_override: str | None = None,
+        baseline: dict | None = None,
     ) -> Path:
         """The real pre-baseline shape: admitted request WITHOUT baseline + a bound freeze failure log."""
         from description_pipeline.io import digest as pipeline_digest
@@ -3429,7 +3430,7 @@ class PortalTests(unittest.TestCase):
             "target_hardware": TEST_TARGET,
             "main_assembly": "3.0 总装.SLDASM",
             "configuration": {"purpose": "engineering"},
-            "baseline": None,
+            "baseline": baseline,
             "sealed_at": "2026-10-16 21:51:07.308311+08",
         }
         stage_receipt = (
@@ -3449,6 +3450,8 @@ class PortalTests(unittest.TestCase):
     def test_freeze_retry_old_shape_resolves_the_bound_failure_evidence(self) -> None:
         intake = self._seed_old_shape_parent()
         self.client.login()
+        jobs_before = set(self.endpoint_server.jobs)
+        parent_conf = dict(self.airflow.dag_runs[DAG_RUN_ID]["conf"])
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         rows = {row["stage"]: row for row in json.loads(body)["stage_reruns"]}
@@ -3491,6 +3494,8 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 202, again)
         self.assertEqual(json.loads(again)["dag_run_id"], child)
         self.assertEqual(len(self.platform.admits), 1)
+        self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
+        self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], parent_conf)
 
     def test_freeze_retry_old_shape_refuses_unprovable_or_changed_evidence(self) -> None:
         outside = Path(tempfile.mkdtemp(prefix="outside-intake-"))
@@ -3521,6 +3526,36 @@ class PortalTests(unittest.TestCase):
                 status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
                 self.assertEqual(status, 409, body)
                 self.assertEqual(json.loads(body)["reason"], reason)
+                self.assertEqual(self.platform.admits, [])
+                self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_freeze_retry_malformed_baseline_never_falls_back_to_evidence(self) -> None:
+        self.client.login()
+        valid = {
+            "handoff_sha256": None,
+            "files": None,
+            "bytes": 64,
+            "folder": "M3.0.3_20261016",
+        }
+        probe = self._seed_old_shape_parent()
+        valid["handoff_sha256"] = self.upload_digest
+        valid["files"] = len(self.upload_files)
+        cases = (
+            ("corrupt_handoff", {**valid, "handoff_sha256": "f" * 63}),
+            ("wrong_typed_files", {**valid, "files": "71"}),
+            ("empty_folder", {**valid, "folder": ""}),
+            ("provenance_present", {**valid, "provenance": {"source": "anything"}}),
+            ("empty", {}),
+        )
+        self.assertIsNotNone(probe)
+        for label, malformed in cases:
+            with self.subTest(case=label):
+                self._seed_old_shape_parent(baseline=malformed)
+                self.platform.admits.clear()
+                self.airflow.trigger_payloads.clear()
+                status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+                self.assertEqual(status, 409, body)
+                self.assertEqual(json.loads(body)["reason"], "originals_identity_missing")
                 self.assertEqual(self.platform.admits, [])
                 self.assertEqual(self.airflow.trigger_payloads, [])
 
