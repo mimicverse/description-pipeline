@@ -662,6 +662,10 @@ def _quality_rejection_comparisons(checks: list[dict], preview_failing: set[str]
         "unexpected_gates": sorted(failing - set(CONTROL_LIMITS)),
         "missing_required_gates": [] if required_ok else sorted(REQUIRED_CONTROL_GATES),
         "views_agree": failing == preview_failing,
+        # The controlled rejection is the documented failure set: required gates pass and
+        # at least one allowed control-limit gate fails.  An all-passing document can never
+        # substantiate a rejection claim.
+        "allowed_failure": bool(failing) and failing <= set(CONTROL_LIMITS),
     }
 
 
@@ -743,14 +747,22 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
         seq = event.get("seq") if isinstance(event.get("seq"), int) else 0
         if stage not in latest_by_stage or seq >= latest_by_stage[stage][0]:
             latest_by_stage[stage] = (seq, str(state))
-    for stage, (_seq, state) in latest_by_stage.items():
-        if stages.get(stage) != state:
-            identity_ok = False
+    missing_transitions = sorted(set(stages) - set(latest_by_stage))
+    mismatched = sorted(stage for stage, (_seq, state) in latest_by_stage.items() if stages.get(stage) != state)
     comparisons.append(
         {
             "name": "run_event_identity",
-            "passed": bool(events) and identity_ok,
-            "observed": {"events": events, "stages": stages},
+            # Every registered stage must carry its own transition event bound to the row it
+            # produced (the latest event wins, so a recorded running->failed history stays
+            # valid); an unrelated event can never stand in for a stage transition, and no
+            # fixed event count is assumed.
+            "passed": bool(stages) and identity_ok and not missing_transitions and not mismatched,
+            "observed": {
+                "events": events,
+                "stages": stages,
+                "missing_transitions": missing_transitions,
+                "mismatched": mismatched,
+            },
         }
     )
     return comparisons
@@ -1218,6 +1230,7 @@ def main() -> int:
                     "execution_evidence": quality["executed"],
                     "consistent": quality["consistent"],
                     "views_agree": quality["views_agree"],
+                    "allowed_failure": quality["allowed_failure"],
                     "document_subject_sha256": quality_doc.get("subject_sha256")
                     if isinstance(quality_doc, dict)
                     else None,
@@ -1241,6 +1254,11 @@ def main() -> int:
                 elif not quality["views_agree"]:
                     problems.append(
                         f"the quality document and the diagnostic summary disagree on failures: {rejection}"
+                    )
+                if not quality["allowed_failure"]:
+                    problems.append(
+                        "the expected rejection requires a non-empty allowed failure set: "
+                        + str(rejection["quality"])
                     )
                 if quality["unexpected_gates"]:
                     problems.append(

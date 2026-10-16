@@ -49,6 +49,11 @@ class SettlementCheckerTests(unittest.TestCase):
         }
 
     def rows(self) -> dict:
+        events = [
+            {"seq": index + 1, "kind": "stage", "stage": stage, "payload": {"state": state}}
+            for index, (stage, state) in enumerate(STAGES.items())
+        ]
+        events.append({"seq": len(events) + 1, "kind": "checker_baseline", "stage": None, "payload": None})
         return {
             "run_state": ["failed"],
             "request": [[f"portal-{RUN_ID}", "fixture", "app:tenant:ordinary-operator"]],
@@ -57,7 +62,7 @@ class SettlementCheckerTests(unittest.TestCase):
                 ["native-key", "capture", "native", "succeeded"],
             ],
             "stages": [[stage, state] for stage, state in STAGES.items()],
-            "events": [{"seq": 1, "kind": "checker_baseline", "stage": None, "payload": None}],
+            "events": events,
         }
 
     def compare(self, rows: dict) -> dict:
@@ -72,9 +77,27 @@ class SettlementCheckerTests(unittest.TestCase):
         rows["events"] = []
         self.assertFalse(self.compare(rows)["run_event_identity"]["passed"])
 
+    def test_events_without_stage_transitions_are_rejected(self) -> None:
+        """An unrelated event can never stand in for the registered stage transitions."""
+
+        rows = self.rows()
+        rows["events"] = [{"seq": 1, "kind": "checker_baseline", "stage": None, "payload": None}]
+        comparison = self.compare(rows)["run_event_identity"]
+        self.assertFalse(comparison["passed"])
+        self.assertEqual(comparison["observed"]["missing_transitions"], sorted(STAGES))
+
+    def test_a_missing_failed_stage_transition_is_rejected(self) -> None:
+        rows = self.rows()
+        rows["events"] = [
+            event for event in rows["events"] if not (event["kind"] == "stage" and event["stage"] == "verify")
+        ]
+        comparison = self.compare(rows)["run_event_identity"]
+        self.assertFalse(comparison["passed"])
+        self.assertEqual(comparison["observed"]["missing_transitions"], ["verify"])
+
     def test_a_fabricated_stage_event_is_rejected(self) -> None:
         rows = self.rows()
-        rows["events"].append({"seq": 2, "kind": "stage", "stage": "verify", "payload": {"state": "completed"}})
+        rows["events"].append({"seq": 99, "kind": "stage", "stage": "verify", "payload": {"state": "completed"}})
         self.assertFalse(self.compare(rows)["run_event_identity"]["passed"])
 
     def test_legitimate_stage_history_is_accepted(self) -> None:
@@ -82,9 +105,14 @@ class SettlementCheckerTests(unittest.TestCase):
 
         rows = self.rows()
         rows["events"] = [
-            {"seq": 1, "kind": "stage", "stage": "verify", "payload": {"state": "running"}},
-            {"seq": 2, "kind": "stage", "stage": "verify", "payload": {"state": "failed"}},
+            event for event in rows["events"] if not (event["kind"] == "stage" and event["stage"] == "verify")
         ]
+        rows["events"].extend(
+            [
+                {"seq": 90, "kind": "stage", "stage": "verify", "payload": {"state": "running"}},
+                {"seq": 91, "kind": "stage", "stage": "verify", "payload": {"state": "failed"}},
+            ]
+        )
         self.assertTrue(self.compare(rows)["run_event_identity"]["passed"])
 
     def test_a_stage_event_for_a_nonexistent_stage_is_rejected(self) -> None:
@@ -145,8 +173,17 @@ class QualityRejectionTests(unittest.TestCase):
         self.assertTrue(quality["executed"], quality)
         self.assertTrue(quality["consistent"], quality)
         self.assertTrue(quality["views_agree"], quality)
+        self.assertTrue(quality["allowed_failure"], quality)
         self.assertEqual(quality["unexpected_gates"], [])
         self.assertEqual(quality["missing_required_gates"], [])
+
+    def test_required_pass_without_any_failure_is_rejected(self) -> None:
+        """An all-passing document can never substantiate the controlled rejection."""
+
+        checks = [{"id": gate, "state": "passed", "passed": True} for gate in [*self.required, *self.limits]]
+        quality = self.module._quality_rejection_comparisons(checks, set())
+        self.assertTrue(quality["executed"])
+        self.assertFalse(quality["allowed_failure"])
 
     def test_a_missing_required_gate_is_rejected(self) -> None:
         checks = [item for item in self.control_checks() if item["id"] != self.required[0]]
