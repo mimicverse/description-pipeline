@@ -856,7 +856,6 @@ def write_target_delivery(
     tool: dict | None = None,
     originals: dict[str, str] | None = None,
     records: dict[str, str] | None = None,
-    raw_source_config: dict | None = None,
     request: dict | None = None,
 ) -> Path:
     """Create a minimal target-tree delivery holding the given capture blocks."""
@@ -909,14 +908,20 @@ def write_target_delivery(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
     write_json(root / "evidence/discovery.json", discovery or {})
+    capture = dict(capture)
+    if "material_provenance" not in capture:
+        # The sealed capture block is the material authority the verifier reads
+        # (the retired evidence/raw/source_config.json is no longer a carrier).
+        capture["material_provenance"] = {
+            "schema_version": "solidworks-to-urdf.material-provenance/v1",
+            "assembly": str((root / "input/cad" / str(selection["main_assembly"])).resolve()),
+            "configuration": str(selection["configuration"]),
+            "material_source": "cad",
+            "measured_source": "cad_api",
+            "warnings": [],
+        }
     write_json(root / "evidence/capture.json", capture)
     write_json(root / "evidence/native-runtime.json", runtime or {})
-    # The native capture seals its own config as raw evidence; the delivery
-    # fixture mirrors that shape (the verifier reads material_source verbatim).
-    write_json(
-        root / "evidence/raw/source_config.json",
-        {"material_source": "cad"} if raw_source_config is None else raw_source_config,
-    )
     write_json(root / "model/robot.json", {})
     (root / "urdf/robot.urdf").write_text("<robot name='m3.0'/>\n", encoding="utf-8")
     (root / "meshes/part.stl").write_text("solid\n", encoding="utf-8")

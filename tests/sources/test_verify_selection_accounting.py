@@ -1,6 +1,7 @@
 """The verifier recomputes the producer's selection accounting from the sealed facts."""
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 from .test_solidworks_closure import (  # noqa: E402
     DEV,
     EASYEDA,
+    _carrier_record,
     _effective_payload,
     _flags,
     _instance,
@@ -136,9 +138,49 @@ def _write_evidence(root: Path, bodies, *, top_mass, clear_parent):
     }
     (root / "raw/mass_closure.json").write_text(json.dumps(native), encoding="utf-8")
     (root / "raw/scene_raw.json").write_text(json.dumps(scene), encoding="utf-8")
-    (root / "raw/source_config.json").write_text(
-        json.dumps({"assembly": "C:/source/robot.SLDASM", "bodies": bodies}), encoding="utf-8"
+    record, controlled = _carrier_record(bodies)
+    payload_records = []
+    for relative, text in controlled.items():
+        path = root / "input" / "records" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        payload_records.append(
+            {
+                "file": relative,
+                "package_file": relative,
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "key": "limits",
+            }
+        )
+    (root / "evidence").mkdir(parents=True, exist_ok=True)
+    (root / "evidence/discovery.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                "run_id": "fixture-run",
+                "derivation": {
+                    "main_assembly": "robot.SLDASM",
+                    "configuration": "Default",
+                    "frozen_names": {},
+                    "record_roots": [],
+                },
+                "identity": {
+                    "main_assembly": "robot.SLDASM",
+                    "delivery_configuration": "Default",
+                    "robot_name": "robot",
+                },
+                "records": payload_records,
+                "raw": record,
+                "native_files": {},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
     )
+    assembly = root / "input" / "cad" / "robot.SLDASM"
+    assembly.parent.mkdir(parents=True, exist_ok=True)
+    assembly.write_bytes(b"fixture assembly")
     delivery = root / "delivery"
     return support.write_target_delivery(delivery, capture={"scene": scene, "mass_closure": native})
 
@@ -152,7 +194,16 @@ class ProducerVerifierSelectionTests(unittest.TestCase):
     def _payloads(self):
         native = json.loads((self.root / "raw/mass_closure.json").read_text(encoding="utf-8"))
         scene = json.loads((self.root / "raw/scene_raw.json").read_text(encoding="utf-8"))
-        config = json.loads((self.root / "raw/source_config.json").read_text(encoding="utf-8"))
+        # The oracle consumes the same rebuilt definition the producer derives
+        # from the sealed discovery payload (the frozen carrier input).
+        from description_pipeline.sources.solidworks.discovery import source_definition  # noqa: PLC0415
+
+        config = source_definition(
+            self.root,
+            discovery_name="evidence/discovery.json",
+            cad_prefix="input/cad/",
+            records_prefix="input/records/",
+        )
         return native, scene, config
 
     def test_unassigned_gap_is_recomputed_exactly_and_bound_to_the_producer(self):
