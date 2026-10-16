@@ -260,6 +260,15 @@ def rebuilt_definition(root) -> dict:
     return _input(root)
 
 
+def _request_purpose(root) -> str:
+    """The frozen request's declared purpose: the single purpose authority."""
+
+    from ..request_evidence import read_request_evidence
+
+    record, _digest = read_request_evidence(Path(root) / "input" / "request.json")
+    return str(record["purpose"])
+
+
 def _input(root, diagnostics=None):
     """Bind the frozen input and the author definition carried by the discovery record.
 
@@ -295,7 +304,7 @@ def _input(root, diagnostics=None):
         frames = rebuild_interface_frames(raw, bodies=bodies, base=base, expansion=carrier.get("expansion"))
     else:
         bodies = rebuild_rigid_bodies(discovery_record)
-        joints = rebuild_joint_facts(discovery_record, root)
+        joints = rebuild_joint_facts(discovery_record, root, purpose=_request_purpose(root))
         frames = rebuild_interface_frames(discovery_record)
     source = read_source_record(root)
     handoff = evidence.handoff(root)

@@ -141,13 +141,16 @@ class DagTests(unittest.TestCase):
         self.assertEqual(edges["verify"], {"generate"})
         self.assertEqual(edges["publish"], {"verify"})
         self.assertEqual(
-            set(dag.params), {"handoff_path", "main_assembly", "target_hardware", "change_summary"}
+            set(dag.params), {"handoff_path", "main_assembly", "target_hardware", "change_summary", "purpose"}
         )
         handoff_param = dict(dag.params.items())["handoff_path"]
         self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
         self.assertEqual(handoff_param.schema["type"], "string")
         assembly_param = dict(dag.params.items())["main_assembly"]
         self.assertEqual(assembly_param.schema["title"], "Delivered main assembly")
+        purpose_param = dict(dag.params.items())["purpose"]
+        self.assertEqual(purpose_param.schema["title"], "Purpose")
+        self.assertEqual(purpose_param.schema["type"], "string")
         self.assertEqual(assembly_param.schema["type"], "string")
         from description_pipeline.stages import contract_markdown
 

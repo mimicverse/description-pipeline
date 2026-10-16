@@ -445,7 +445,7 @@ class DiscoveryTests(unittest.TestCase):
             {body["name"]: body["frame"]["coordinate_system"] for body in bodies},
             {"arm_link": "CS_arm_link", "base_link": "CS_base_link"},
         )
-        joint = rebuild_joint_facts(payload, output)[0]
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
         self.assertEqual(joint["name"], "shoulder_pitch_joint")
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual((joint["parent"], joint["child"]), ("base_link", "arm_link"))
@@ -644,7 +644,7 @@ class DiscoveryTests(unittest.TestCase):
         payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
         base = next(body for body in rebuild_rigid_bodies(payload) if body["name"] == "base_link")
         self.assertEqual(base["components"], ["a_mount-1", "base-1"])
-        self.assertEqual(rebuild_joint_facts(payload, output)[0]["parent"], "base_link")
+        self.assertEqual(rebuild_joint_facts(payload, output, purpose="engineering")[0]["parent"], "base_link")
         report = self._verify(output)
         self.assertTrue(report["passed"], report["errors"])
 
@@ -781,7 +781,7 @@ class DiscoveryTests(unittest.TestCase):
                 "coordinate_system": "SCS_tool_flange",
             },
         )
-        joints = rebuild_joint_facts(payload, output)
+        joints = rebuild_joint_facts(payload, output, purpose="engineering")
         self.assertEqual(len(joints), 1)
         self.assertEqual((joints[0]["parent"], joints[0]["child"]), ("base_link", "arm_link"))
         # The grounding mates add no joint and never rewrite the raw evidence.
@@ -1335,7 +1335,7 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
         payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
-        joint = rebuild_joint_facts(payload, output)[0]
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 1.0, 0.0])
         self.assertEqual(self._verify(output)["passed"], True)
@@ -1661,7 +1661,7 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
         payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
-        joint = rebuild_joint_facts(payload, output)[0]
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
         self.assertTrue(self._verify(output)["passed"])
@@ -1896,7 +1896,7 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
         payload = json.loads((output / "discovery" / "native-discovery.json").read_text(encoding="utf-8"))
-        joint = rebuild_joint_facts(payload, output)[0]
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
         self.assertEqual(joint["type"], "revolute")
         self.assertEqual(joint["axis"], [0.0, 0.0, 1.0])
         self.assertEqual((joint["parent"], joint["child"]), ("base_link", "arm_link"))

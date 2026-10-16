@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import __version__
 from .delivery import PIPELINE_ID, read_source_record, subject_digest, subject_inventory
+from .interface_records import PURPOSE_ENGINEERING, REQUEST_PURPOSES
 from .io import PipelineError, confined, digest, file_digest, inventory, read_data, write_json
 from .runtime import tool_record
 from .sources.snapshot import verify_snapshot
@@ -122,10 +123,21 @@ def discover_structure(
             and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
             "Frozen-name registry must map native identities to interface names",
         )
+        purpose = configuration.get("purpose") if isinstance(configuration, dict) else None
+        if prepared is None:
+            _require(
+                isinstance(purpose, str) and purpose in REQUEST_PURPOSES,
+                "The derivation purpose must come from the frozen request",
+            )
+        else:
+            # The prepared package was already derived under the request-bound
+            # purpose; this echo is inert for the validation-only path.
+            purpose = purpose if isinstance(purpose, str) and purpose in REQUEST_PURPOSES else PURPOSE_ENGINEERING
         return DiscoverySettings(
             record_roots=tuple(record_roots),
             frozen_names=names,
             main_assembly=main_assembly,
+            purpose=str(purpose),
         )
 
     def describe_settings(value):

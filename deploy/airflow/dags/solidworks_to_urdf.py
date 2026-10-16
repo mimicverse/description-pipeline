@@ -863,7 +863,7 @@ def _materialize_selection(intake: Path, files: dict[str, str], target: Path) ->
     return target
 
 
-def _definition_settings(config: EndpointConfig, main_assembly: str):
+def _definition_settings(config: EndpointConfig, main_assembly: str, *, purpose: str):
     """The pinned Linux derivation settings of one definition hand-off."""
 
     from description_pipeline.sources.solidworks.discovery import DiscoverySettings
@@ -887,6 +887,7 @@ def _definition_settings(config: EndpointConfig, main_assembly: str):
         record_roots=tuple(Path(value) for value in roots),
         frozen_names=names,
         main_assembly=main_assembly,
+        purpose=str(purpose),
     )
 
 
@@ -926,7 +927,7 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
         selected = manifest.get("files")
         if not isinstance(selected, dict) or not selected:
             raise AirflowFailException("The sealed selection lists no files to derive")
-        settings = _definition_settings(endpoint.config, main_assembly)
+        settings = _definition_settings(endpoint.config, main_assembly, purpose=str(request["purpose"]))
         frozen = _materialize_selection(Path(intake), selected, work / "selected")
         identity_block = request.get("identity") if isinstance(request.get("identity"), dict) else None
         submission = None
@@ -1234,6 +1235,15 @@ def _confirm_delivery(published: dict) -> dict:
             type="string",
             title="Change summary",
             description="Required nonempty one-line change summary carried into the release submission",
+        ),
+        "purpose": Param(
+            "",
+            type="string",
+            title="Purpose",
+            description=(
+                "Required declared purpose carried into the frozen request: "
+                "'engineering' or 'inspection_preview' (never defaulted)"
+            ),
         ),
     },
 )

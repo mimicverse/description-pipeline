@@ -1147,6 +1147,7 @@ def compose_delivery_inputs(
     from description_pipeline.io import file_digest, read_data, write_json
     from description_pipeline.sources.solidworks.discovery import DISCOVERY_SCHEMA
 
+    write_fixture_request(Path(delivery), main_assembly=main_assembly)
     delivery = Path(delivery)
     evidence = delivery / "evidence"
     evidence.mkdir(parents=True, exist_ok=True)
@@ -1534,6 +1535,36 @@ def stage_discovery_inputs(
             "native_files": {},
         },
     )
+    write_fixture_request(root, main_assembly="robot.SLDASM")
     assembly = root / "input" / "cad" / "robot.SLDASM"
     assembly.parent.mkdir(parents=True, exist_ok=True)
     assembly.write_bytes(b"fixture assembly")
+
+
+def write_fixture_request(delivery: Path, *, main_assembly: str) -> None:
+    """Fixture plumbing: the frozen v2 request record every fixture delivery carries.
+
+    Synthetic fixture data only (``purpose=engineering``); the persisted request
+    remains the single purpose authority every consumer reads.  An existing
+    record is left untouched so fixtures may author their own.
+    """
+
+    from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
+
+    target = Path(delivery) / "input" / "request.json"
+    if target.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(
+        request_evidence_bytes(
+            build_request_evidence(
+                purpose="engineering",
+                request_id="fixture-run",
+                target_hardware="fixture",
+                change_summary="fixture frozen request",
+                main_assembly=main_assembly,
+                handoff_digest="0" * 64,
+                platform_config_digest="0" * 64,
+            )
+        )
+    )

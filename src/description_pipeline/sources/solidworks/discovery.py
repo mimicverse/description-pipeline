@@ -68,6 +68,8 @@ from typing import Any
 from collections.abc import Mapping, Sequence
 
 from ...io import PipelineError, confined, digest, inventory, parse_data, read_data
+from ...interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
+from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
@@ -141,11 +143,19 @@ def _finding(code: str, obj: str, message: str, detail: Any = None, *, blocking:
 
 @dataclass(frozen=True)
 class DiscoverySettings:
-    """The platform-controlled inputs: records, published names and the explicit entry."""
+    """The platform-controlled inputs: records, published names, the entry and the purpose.
+
+    ``purpose`` mirrors the frozen request solely as in-flight derivation input
+    (the persisted ``input/request.json`` remains the single purpose authority):
+    it selects which joint parameters may be proven missing and whether the
+    policy preview window or a bound preview declaration supplies them.  No
+    consumer may persist it as a second authority.
+    """
 
     record_roots: tuple[Path, ...] = ()
     frozen_names: Mapping[str, str] = field(default_factory=dict)
     main_assembly: str | None = None
+    purpose: str = PURPOSE_ENGINEERING
 
 
 @dataclass(frozen=True)
@@ -1604,6 +1614,98 @@ def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[
     }
 
 
+PREVIEW_RANGE_SCHEMA = "solidworks-to-urdf.preview-range/v1"
+_PREVIEW_RANGE_KEYS = {
+    "schema_version",
+    "joint",
+    "instance",
+    "configuration",
+    "unit",
+    "zero",
+    "direction",
+    "purpose",
+    "lower",
+    "upper",
+    "source_sha256",
+}
+
+
+def _declared_preview_range(
+    record: dict,
+    settings: DiscoverySettings,
+    findings: list[dict],
+    obj: str,
+    *,
+    joint: str,
+    instances: Sequence[str],
+) -> tuple[dict | None, dict | None]:
+    """Resolve one prismatic joint's bound finite preview declaration.
+
+    The declaration reuses the controlled-record reference: the resolved file's
+    digest and the parsed exact semantics (joint, instance, configuration, unit,
+    zero, direction, purpose, finite ordered range and the source digest) are
+    all required - a file that merely exists, or an anchor substring that merely
+    matches, never passes.
+    """
+
+    reference = (record.get("properties") or {}).get(f"{NAMESPACE}.joint.preview_range_record")
+    if not _text(reference):
+        findings.append(
+            _finding(
+                "discovery.joint_preview_range_missing",
+                obj,
+                "a prismatic joint with a proven-missing engineering range requires a bound finite "
+                "preview declaration",
+            )
+        )
+        return None, None
+    resolved = _resolve_record(settings, str(reference), findings, obj)
+    if resolved is None:
+        return None, None
+    value = resolved["value"]
+    if not isinstance(value, dict) or set(value) != _PREVIEW_RANGE_KEYS:
+        findings.append(
+            _finding(
+                "discovery.joint_preview_range_invalid",
+                obj,
+                "preview declaration must carry exactly the bound finite semantics",
+                {"file": resolved["file"]},
+            )
+        )
+        return None, None
+    try:
+        lower = float(value["lower"])
+        upper = float(value["upper"])
+        zero = float(value["zero"])
+    except (KeyError, TypeError, ValueError):
+        lower = upper = zero = math.nan
+    source = str(value["source_sha256"])
+    configuration = str(record.get("saved_configuration") or "")
+    if (
+        value["schema_version"] != PREVIEW_RANGE_SCHEMA
+        or str(value["joint"]) != joint
+        or str(value["instance"]) not in {str(member) for member in instances}
+        or str(value["configuration"]) != configuration
+        or value["unit"] != "m"
+        or str(value["direction"]) not in {"+1", "-1"}
+        or value["purpose"] != PURPOSE_INSPECTION_PREVIEW
+        or not (math.isfinite(lower) and math.isfinite(upper) and math.isfinite(zero))
+        or not lower < upper
+        or re.fullmatch(r"[0-9a-f]{64}", source) is None
+    ):
+        findings.append(
+            _finding(
+                "discovery.joint_preview_range_invalid",
+                obj,
+                "preview declaration does not bind this joint, instance, configuration, unit, zero, "
+                "direction, purpose and a finite ordered range",
+                {"file": resolved["file"]},
+            )
+        )
+        return None, None
+    return {"lower": lower, "upper": upper}, resolved
+
+
 def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None:
     """The single datum of that name owned by one of ``owners``.
 
@@ -1837,6 +1939,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             axis_reference["face_index"] = int(cylinder_entity["face_index"])
         limits = None
         limit_evidence = None
+        limit_source = None
         native = group["limits"]
         if joint_type == "continuous":
             if isinstance(native, dict):
@@ -1866,6 +1969,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     _finding("discovery.joint_limits_invalid", obj, "native mate limits are not finite numbers")
                 )
                 continue
+            limit_source = "native"
             native_record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
             if _text(native_record_ref):
                 declared = _resolve_record(settings, str(native_record_ref), findings, obj)
@@ -1903,61 +2007,95 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
             if _text(record_ref):
                 resolved = _resolve_record(settings, str(record_ref), findings, obj)
-                if resolved is not None:
-                    try:
-                        limits = {
-                            "lower": float(resolved["value"]["lower"]),
-                            "upper": float(resolved["value"]["upper"]),
-                        }
-                    except (KeyError, TypeError, ValueError):
-                        findings.append(
-                            _finding(
-                                "discovery.joint_limits_invalid",
-                                obj,
-                                "controlled record lacks finite lower/upper limits",
-                                {"file": resolved["file"]},
-                            )
+                if resolved is None:
+                    continue
+                try:
+                    lower = float(resolved["value"]["lower"])
+                    upper = float(resolved["value"]["upper"])
+                except (KeyError, TypeError, ValueError):
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_invalid",
+                            obj,
+                            "controlled record lacks finite lower/upper limits",
+                            {"file": resolved["file"]},
                         )
-                        continue
-                    limit_evidence = resolved
+                    )
+                    continue
+                if not (math.isfinite(lower) and math.isfinite(upper)):
+                    findings.append(
+                        _finding("discovery.joint_limits_invalid", obj, "controlled position limits must be finite")
+                    )
+                    continue
+                limits = {"lower": lower, "upper": upper}
+                limit_evidence = resolved
+                limit_source = "controlled"
+            elif settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "revolute":
+                radius = preview_revolute_window_rad()
+                limits = {"lower": -radius, "upper": radius}
+                limit_source = "policy_preview_window"
+            elif settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
+                limits, limit_evidence = _declared_preview_range(
+                    record, settings, findings, obj, joint=name, instances=(str(left), str(right))
+                )
+                if limits is None:
+                    continue
+                limit_source = "declared_preview_window"
         if joint_type != "continuous" and limits is None:
-            findings.append(
-                _finding("discovery.joint_limits_missing", obj, "no native or controlled position range for this joint")
-            )
+            if settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
+                findings.append(
+                    _finding(
+                        "discovery.joint_preview_range_missing",
+                        obj,
+                        "a prismatic joint with a proven-missing engineering range requires a bound finite "
+                        "preview declaration",
+                    )
+                )
+            else:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_missing", obj, "no native or controlled position range for this joint"
+                    )
+                )
             continue
         drive = None
+        drive_source = "absent"
         drive_ref = properties.get(f"{NAMESPACE}.joint.drive_record")
         if _text(drive_ref):
             drive = _resolve_record(settings, str(drive_ref), findings, obj)
-        if drive is None:
+            if drive is None:
+                continue
+            drive_source = "controlled"
+        elif settings.purpose != PURPOSE_INSPECTION_PREVIEW:
             findings.append(
                 _finding("discovery.joint_drive_missing", obj, "no controlled drive specification for this joint")
             )
             continue
-        spec = drive["value"]
-        try:
-            effort = float(spec["effort"])
-            velocity_value = float(spec["velocity"])
-        except (KeyError, TypeError, ValueError):
-            findings.append(
-                _finding(
-                    "discovery.joint_drive_invalid",
-                    obj,
-                    "drive record lacks finite effort/velocity",
-                    {"file": drive["file"]},
+        if drive is not None:
+            spec = drive["value"]
+            try:
+                effort = float(spec["effort"])
+                velocity_value = float(spec["velocity"])
+            except (KeyError, TypeError, ValueError):
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_invalid",
+                        obj,
+                        "drive record lacks finite effort/velocity",
+                        {"file": drive["file"]},
+                    )
                 )
-            )
-            continue
-        if not (math.isfinite(effort) and math.isfinite(velocity_value)) or effort <= 0.0 or velocity_value <= 0.0:
-            findings.append(
-                _finding(
-                    "discovery.joint_drive_invalid",
-                    obj,
-                    "drive record effort/velocity must be finite and positive",
-                    {"file": drive["file"]},
+                continue
+            if not (math.isfinite(effort) and math.isfinite(velocity_value)) or effort <= 0.0 or velocity_value <= 0.0:
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_invalid",
+                        obj,
+                        "drive record effort/velocity must be finite and positive",
+                        {"file": drive["file"]},
+                    )
                 )
-            )
-            continue
+                continue
         joints.append(
             {
                 "mate": name,
@@ -1973,7 +2111,9 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "axis_reference": axis_reference,
                 "limits": limits,
                 "limit_evidence": limit_evidence,
+                "limit_source": limit_source,
                 "drive": drive,
+                "drive_source": drive_source,
                 "properties": dict(properties),
             }
         )
@@ -4407,10 +4547,12 @@ def source_definition(
             target = confined(root, relative, exists=False)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(confined(package, records_prefix + str(entry.get("package_file") or "")), target)
+        request_record, _request_digest = read_request_evidence(package / "input" / "request.json")
         settings = DiscoverySettings(
             record_roots=(root,),
             frozen_names=dict(derivation.get("frozen_names") or {}),
             main_assembly=derivation.get("main_assembly") or None,
+            purpose=str(request_record["purpose"]),
         )
         findings: list[dict] = []
         view = {
@@ -4482,17 +4624,19 @@ def source_definition(
                 "anchor": raw["exporter"]["raw_xml_sha256"],
             }
         elif joint["type"] == "continuous":
-            entry["limits"] = {
-                "effort": float(joint["drive"]["value"]["effort"]),
-                "velocity": float(joint["drive"]["value"]["velocity"]),
-            }
+            if joint.get("drive") is not None:
+                entry["limits"] = {
+                    "effort": float(joint["drive"]["value"]["effort"]),
+                    "velocity": float(joint["drive"]["value"]["velocity"]),
+                }
         else:
             entry["limits"] = {
                 "lower": float(joint["limits"]["lower"]),
                 "upper": float(joint["limits"]["upper"]),
-                "effort": float(joint["drive"]["value"]["effort"]),
-                "velocity": float(joint["drive"]["value"]["velocity"]),
             }
+            if joint.get("drive") is not None:
+                entry["limits"]["effort"] = float(joint["drive"]["value"]["effort"])
+                entry["limits"]["velocity"] = float(joint["drive"]["value"]["velocity"])
         if joint.get("limit_evidence") is not None:
             embedded = next(
                 (
@@ -4509,6 +4653,8 @@ def source_definition(
                     "sha256": embedded["sha256"],
                     "anchor": embedded["anchor"],
                 }
+        if joint.get("limit_source") is not None:
+            entry["limit_source"] = str(joint["limit_source"])
         joints_out.append(entry)
     coordinate_systems = sorted(
         {str(body["datum"]) for body in bodies if body.get("datum")}

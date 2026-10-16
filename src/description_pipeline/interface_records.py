@@ -1414,7 +1414,9 @@ REQUEST_RECORD_SCHEMA = "solidworks-to-urdf.request/v2"
 #: The only two purposes an admitted request may declare.  The frozen request
 #: record is the single purpose authority; the freeze writer and every reader
 #: carry the value explicitly and never default it.
-REQUEST_PURPOSES = ("engineering", "inspection_preview")
+PURPOSE_ENGINEERING = "engineering"
+PURPOSE_INSPECTION_PREVIEW = "inspection_preview"
+REQUEST_PURPOSES = (PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW)
 
 _REQUEST_RECORD_KEYS = {
     "schema_version",

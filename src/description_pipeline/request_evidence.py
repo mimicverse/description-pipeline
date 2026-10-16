@@ -90,7 +90,7 @@ def read_request_evidence(path: str | Path) -> tuple[dict, str]:
 
     A missing file is an explicit refusal, and the shared ``io`` entry refuses
     duplicate keys, non-finite numbers and malformed JSON before this module's
-    own seven-field validation runs - there is no lenient reading path.
+    own eight-field validation runs - there is no lenient reading path.
     """
 
     source = Path(path)

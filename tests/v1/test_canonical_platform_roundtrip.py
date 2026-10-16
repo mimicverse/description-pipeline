@@ -92,7 +92,7 @@ def _run_scenario(root: Path) -> dict:
             report["calls"].append("DAG._register_freeze_stage")
             phase = "producer"
             with patch.object(producer, "capture_record", return_value=raw):
-                native = producer.build_fixture_capture(root / "producer", run_id=RUN)
+                native = producer.build_fixture_capture(root / "producer", run_id=RUN, purpose="engineering")
             assert inventory(native_root) == upload
             report["calls"].append("shared.build_fixture_capture: real freeze/discover/capture")
             phase = "import"
