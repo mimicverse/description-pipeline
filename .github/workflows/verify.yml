@@ -72,7 +72,8 @@ jobs:
             -r deploy/airflow/requirements.lock
           "$AIRFLOW_VENV/bin/python" -m pip install --no-deps -e .
       - name: Regression suite
-        run: "$AIRFLOW_VENV/bin/python" -B -m unittest discover -s tests -t .
+        run: |
+          "$AIRFLOW_VENV/bin/python" -B -m unittest discover -s tests -t .
       - name: The Windows settle semantics (offline pwsh matrix)
         run: pwsh -NoProfile -File tests/deploy/test_instance_lifecycle.ps1
 
