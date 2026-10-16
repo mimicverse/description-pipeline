@@ -964,6 +964,114 @@ def _linked_source(retained: object, supplied) -> tuple[dict[str, str], str, str
     return validated, upload_sha256, main
 
 
+def _linked_freeze_request(context, linked: dict) -> dict:
+    """The freeze-stage request of a Linux-managed linked retry.
+
+    The admitted child and the parent's registered facts are the only authority:
+    the child's own admission must bind this parent and the freeze boundary, the
+    parent request must carry a sealed upload identity, and the sealed intake
+    must still recompute to exactly that identity.  No Windows job is contacted
+    and no upload is repeated; the freeze stage then seals these same originals
+    as the new run's own frozen request.
+    """
+
+    run_id = _run_uuid(context)
+    platform, _store_root = _platform_binding()
+    platform.start_run(run_id)  # the first driver action claims the admitted child
+    child = platform.run_record(run_id)
+    if not (
+        isinstance(child, dict)
+        and child.get("from_stage") == "freeze"
+        and child.get("parent_run_id") == linked["parent_run"]
+        and isinstance(child.get("request_id"), str)
+    ):
+        raise AirflowFailException("The admitted child does not bind this parent and the freeze boundary")
+    parent = platform.run_record(linked["parent_run"])
+    if not (isinstance(parent, dict) and parent.get("state") == "failed"):
+        raise AirflowFailException("The linked parent is not a terminal failed run")
+    parent_request = (
+        platform.request_record(parent.get("request_id")) if isinstance(parent.get("request_id"), str) else None
+    )
+    if not isinstance(parent_request, dict):
+        raise AirflowFailException("The linked parent has no admitted request to reuse")
+    baseline = parent_request.get("baseline")
+    handoff_sha256 = baseline.get("handoff_sha256") if isinstance(baseline, dict) else None
+    parent_main = parent_request.get("main_assembly")
+    parent_purpose = parent_request.get("purpose")
+    if not (
+        isinstance(handoff_sha256, str)
+        and len(handoff_sha256) == 64
+        and all(character in "0123456789abcdef" for character in handoff_sha256)
+        and isinstance(parent_main, str)
+        and parent_main
+        and isinstance(parent_purpose, str)
+        and parent_purpose in REQUEST_PURPOSES
+    ):
+        raise AirflowFailException("The linked parent carries no sealed upload identity to reuse")
+    child_request = platform.request_record(child["request_id"])
+    if not isinstance(child_request, dict):
+        raise AirflowFailException("The admitted child carries no request row")
+    child_baseline = child_request.get("baseline")
+    child_digest = child_baseline.get("handoff_sha256") if isinstance(child_baseline, dict) else None
+    if child_digest not in (None, handoff_sha256):
+        raise AirflowFailException("The admitted child binds a different upload identity")
+    if child_request.get("main_assembly") not in (None, "", parent_main):
+        raise AirflowFailException("The admitted child binds a different main assembly")
+    if child_request.get("purpose") not in (None, parent_purpose):
+        raise AirflowFailException("The admitted child binds a different purpose")
+    conf = getattr(context["dag_run"], "conf", None)
+    conf = conf if isinstance(conf, dict) else {}
+    handoff_path = str(conf.get("handoff_path") or context["params"].get("handoff_path") or "").strip()
+    if not handoff_path:
+        raise AirflowFailException("A linked freeze retry needs handoff_path with the original sealed intake")
+    purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
+    if purpose != parent_purpose:
+        raise AirflowFailException("A linked freeze retry must keep the parent's purpose")
+    supplied = conf.get("main_assembly") or context["params"].get("main_assembly") or None
+    if supplied and validate_main_assembly(supplied) != parent_main:
+        raise AirflowFailException("A linked freeze retry must keep the parent's main assembly")
+    intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+    upload_files = validate_file_index(package_inventory(intake))
+    if parent_main not in upload_files:
+        raise AirflowFailException("The sealed intake no longer carries the parent's main assembly")
+    if digest(upload_files) != handoff_sha256:
+        raise AirflowFailException("The sealed intake no longer matches the parent's admitted upload identity")
+    config_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
+    if not config_digest:
+        raise AirflowFailException(
+            "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
+        )
+    conf_digest = str(conf.get("platform_config_digest") or "").strip()
+    if conf_digest and conf_digest != config_digest:
+        raise AirflowFailException(
+            "conf platform_config_digest does not match the controlled platform configuration identity"
+        )
+    identity = _submission_frame(context, purpose=purpose)[0]
+    paths = _work_paths(CONN_ID, run_id)
+    evidence = freeze_request_evidence(
+        paths.run_dir,
+        purpose=purpose,
+        request_id=child["request_id"],
+        target_hardware=identity["hardware_id"],
+        change_summary=identity.get("change_summary") or "",
+        main_assembly=parent_main,
+        handoff_digest=handoff_sha256,
+        platform_config_digest=config_digest,
+    )
+    return {
+        "run_id": run_id,
+        "upload_files": upload_files,
+        "upload_sha256": digest(upload_files),
+        "main_assembly": parent_main,
+        "intake_dir": str(intake),
+        "conn_id": CONN_ID,
+        "purpose": purpose,
+        "request_id": child["request_id"],
+        "request_evidence": str(evidence),
+        "identity": {**identity, "control_reference": digest(upload_files)},
+    }
+
+
 def _store_failure_report(endpoint: WindowsEndpoint, request: dict, job: dict) -> None:
     """Best-effort Linux-rendered structural-team report of one failed native job.
 
@@ -1432,6 +1540,22 @@ def solidworks_to_urdf():
             _converge_early_freeze_failure(run_id, error)
             raise
         if linked is not None:
+            if linked["from_stage"] == "freeze":
+                # The Linux-managed freeze retry re-seals the parent's admitted originals
+                # from the sealed intake as this attempt's own freeze; no Windows job and
+                # no second upload.  Failures converge like every early freeze refusal.
+                try:
+                    request = _linked_freeze_request(context, linked)
+                except Exception as error:
+                    _converge_early_freeze_failure(run_id, error)
+                    raise
+                _register_freeze_stage(
+                    _work_paths(request["conn_id"], run_id),
+                    run_id,
+                    intake=Path(request["intake_dir"]),
+                    upload_files=request["upload_files"],
+                )
+                return request
             if linked["from_stage"] in DELIVERY_STAGES:
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
                 # contacts Windows: the parent's registered capture is the authority.

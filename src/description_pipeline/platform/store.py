@@ -439,7 +439,8 @@ _READ_REQUEST_RECORD = (
     "  JOIN run u ON u.run_id = o.run_id"
     "  WHERE u.request_id = request.request_id AND o.kind = 'dispatch'"
     "  ORDER BY o.updated_at, o.operation_id LIMIT 1),"
-    " configuration"
+    " configuration,"
+    " baseline"
     " FROM request WHERE request_id = %s"
 )
 _READ_STAGE_RECORDS = (
@@ -2244,6 +2245,7 @@ class PlatformStore:
             "sealed_at": row[3],
             "dispatch_digest": row[4],
             "purpose": row[5].get("purpose") if isinstance(row[5], dict) else None,
+            "baseline": row[6],
         }
 
     def stage_records(self, run_id: str) -> dict[str, dict]:

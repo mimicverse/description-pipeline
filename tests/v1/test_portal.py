@@ -653,6 +653,8 @@ class FakePlatformStore:
         self.runs: dict[str, dict] = {}
         #: Admitted request rows as the read side sees them (the immutable frame).
         self.requests: dict[str, dict] = {}
+        #: Explicit stage-row overrides (terminal freeze failures) keyed by run id.
+        self.stages: dict[str, dict] = {}
         self.displays: dict[str, object] = {}
         #: The one preview fixture this double projects registered reads from.
         self.fixtures: PreviewStore | None = None
@@ -708,6 +710,9 @@ class FakePlatformStore:
         return rows
 
     def stage_records(self, run_id: str) -> dict[str, dict]:
+        override = self.stages.get(run_id)
+        if override is not None:
+            return {stage: dict(row) for stage, row in override.items()}
         entry = self._entry(run_id)
         if entry is None:
             return {}
@@ -3127,7 +3132,7 @@ class PortalTests(unittest.TestCase):
         self.airflow.trigger_fail_after_create = True
         self.airflow.trigger_fail_times = 1
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
-            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "capture"})
         self.assertEqual(status, 202, body)
         self.assertIn(json.loads(body)["dag_run_id"], self.airflow.dag_runs)
 
@@ -3142,6 +3147,180 @@ class PortalTests(unittest.TestCase):
         self.assertTrue(json.loads(body)["dag_run_id"])
         self.assertEqual(len(self.platform.admits), 1)
         self.assertEqual(list(self.airflow.dag_runs), [DAG_RUN_ID])
+
+    # ------------------------------------------------- Linux freeze retry
+    def _seed_freeze_failed_parent(self) -> Path:
+        """A terminal freeze-failed parent with a sealed intake and its recorded identity."""
+        from description_pipeline.io import digest as pipeline_digest
+        from description_pipeline.sources.solidworks.revision import package_inventory
+        from description_pipeline.sources.solidworks.selection import validate_file_index
+
+        self._seed_retryable_run()
+        self.endpoint_server.jobs.pop(native_run_id(DAG_RUN_ID), None)
+        intake = self.upload_root / DAG_RUN_ID / "M3.0.3_20261016"
+        (intake / "parts").mkdir(parents=True)
+        (intake / "3.0 总装.SLDASM").write_bytes(b"assembly-bytes")
+        (intake / "parts" / "bracket.SLDPRT").write_bytes(b"part-bytes")
+        upload_files = validate_file_index(package_inventory(intake))
+        self.upload_files = upload_files
+        self.upload_digest = pipeline_digest(upload_files)
+        native = native_run_id(DAG_RUN_ID)
+        request_id = f"portal-{DAG_RUN_ID}"
+        conf = self.airflow.dag_runs[DAG_RUN_ID]["conf"]
+        conf["handoff_path"] = str(intake)
+        conf["main_assembly"] = "3.0 总装.SLDASM"
+        self.platform.runs[native] = {
+            "run_id": native,
+            "state": "failed",
+            "request_id": request_id,
+            "parent_run_id": None,
+            "from_stage": None,
+            "tool_identity": None,
+        }
+        self.platform.requests[request_id] = {
+            "request_id": request_id,
+            "principal": FEISHU_PRINCIPAL,
+            "target_hardware": TEST_TARGET,
+            "main_assembly": "3.0 总装.SLDASM",
+            "configuration": {"purpose": "engineering"},
+            "baseline": {
+                "handoff_sha256": self.upload_digest,
+                "files": len(upload_files),
+                "bytes": sum(path.stat().st_size for path in intake.rglob("*") if path.is_file()),
+                "folder": "M3.0.3_20261016",
+            },
+            "sealed_at": "2026-10-16 21:51:07.308311+08",
+        }
+        self.platform.stages[native] = {
+            "freeze": {"stage": "freeze", "state": "failed", "receipt": {"error": "freeze prelude refused"}}
+        }
+        return intake
+
+    def test_freeze_retry_creates_a_linked_child_without_a_native_job(self) -> None:
+        intake = self._seed_freeze_failed_parent()
+        self.client.login()
+        jobs_before = set(self.endpoint_server.jobs)
+        parent_conf = dict(self.airflow.dag_runs[DAG_RUN_ID]["conf"])
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        rows = {row["stage"]: row for row in json.loads(body)["stage_reruns"]}
+        self.assertIs(rows["freeze"]["eligible"], True)
+        self.assertEqual(rows["freeze"]["reason"], "linux_ready")
+        self.assertTrue(rows["freeze"]["reason_zh"])
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 202, body)
+        payload = json.loads(body)
+        child = payload["dag_run_id"]
+        self.assertEqual(payload["resume_from"], "freeze")
+        self.assertEqual(payload["resume_from_name_zh"], "冻结输入")
+        self.assertEqual(len(self.platform.admits), 1)
+        admit = self.platform.admits[0]
+        self.assertEqual(admit["request_id"], f"portal-{child}")
+        self.assertEqual(admit["run_id"], native_run_id(child))
+        self.assertEqual(admit["parent_run_id"], native_run_id(DAG_RUN_ID))
+        self.assertEqual(admit["from_stage"], "freeze")
+        self.assertEqual(admit["dispatch"]["stage"], "freeze")
+        self.assertEqual(admit["dispatch"]["operation_key"], f"portal-{child}/freeze:0")
+        self.assertEqual(admit["baseline"]["handoff_sha256"], self.upload_digest)
+        self.assertEqual(
+            self.airflow.trigger_payloads[-1]["conf"],
+            {
+                "handoff_path": str(intake),
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "freeze",
+                "purpose": "engineering",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+                "main_assembly": "3.0 总装.SLDASM",
+            },
+        )
+        self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
+        self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["conf"], parent_conf)
+
+    def test_freeze_retry_refuses_missing_or_tampered_originals(self) -> None:
+        intake = self._seed_freeze_failed_parent()
+        self.client.login()
+        target = intake / "parts" / "bracket.SLDPRT"
+        content = target.read_bytes()
+        target.unlink()
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "originals_missing")
+        target.write_bytes(b"tampered-part")
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "originals_mismatch")
+        self.assertEqual(self.platform.admits, [])
+        self.assertEqual(self.airflow.trigger_payloads, [])
+        target.write_bytes(content)
+
+    def test_freeze_retry_requires_a_registered_identity_and_terminal_failure(self) -> None:
+        self._seed_freeze_failed_parent()
+        self.client.login()
+        request_id = f"portal-{DAG_RUN_ID}"
+        baseline = self.platform.requests[request_id].pop("baseline")
+        with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("no native job")):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "originals_identity_missing")
+        self.platform.requests[request_id]["baseline"] = baseline
+        self.platform.runs[native_run_id(DAG_RUN_ID)]["state"] = "running"
+        with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("no native job")):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "linux_owned")
+        self.platform.runs[native_run_id(DAG_RUN_ID)]["state"] = "failed"
+        self.platform.stages[native_run_id(DAG_RUN_ID)] = {
+            "freeze": {"stage": "freeze", "state": "completed", "receipt": {}}
+        }
+        with patch.object(self.endpoint, "rerun_plan", create=True, side_effect=EndpointError("no native job")):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "linux_owned")
+        self.assertEqual(self.platform.admits, [])
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
+    def test_freeze_retry_reuses_the_open_attempt_and_refuses_a_conflict(self) -> None:
+        from description_pipeline.platform.store import OpenAttemptConflictError
+
+        intake = self._seed_freeze_failed_parent()
+        child = "portal-20261009T000000-feedface"
+        self.platform.seed_open_child(native_run_id(DAG_RUN_ID), child, from_stage="freeze")
+        self._seed_airflow_run(
+            child,
+            state="queued",
+            conf={
+                "handoff_path": str(intake),
+                "parent_dag_run_id": DAG_RUN_ID,
+                "resume_from": "freeze",
+                "target_hardware": TEST_TARGET,
+                "change_summary": TEST_SUMMARY,
+                "purpose": "engineering",
+                "main_assembly": "3.0 总装.SLDASM",
+            },
+        )
+        self.client.login()
+        before = len(self.airflow.trigger_payloads)
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(json.loads(body)["dag_run_id"], child)
+        self.assertEqual(len(self.airflow.trigger_payloads), before)
+        self.assertEqual(self.platform.admits, [])
+        status, _, body = self.client.request(
+            "POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze", "target_hardware": "m3.1"}
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "attempt_mismatch")
+        self.platform.runs.pop(native_run_id(child), None)
+        other = "20261009T000001-aaaaaaaa"
+        self.platform.admit_error = OpenAttemptConflictError(
+            native_run_id(DAG_RUN_ID), native_run_id(child), f"portal-{other}"
+        )
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
+        self.assertEqual(status, 409, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["reason"], "already_active")
+        self.assertEqual(payload["active_dag_run_id"], other)
 
     def test_list_runs_exposes_linked_attempt_lineage(self) -> None:
         self._seed_retryable_run()
