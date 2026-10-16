@@ -221,8 +221,6 @@ jobs:
       PLATFORM_SERVICE_DSN: postgresql://platform_service@127.0.0.1:5432/postgres
       AIRFLOW_MIGRATE_DSN: postgresql+psycopg2://airflow_migrate@127.0.0.1:5432/postgres
       AIRFLOW_RUNTIME_DSN: postgresql+psycopg2://airflow_runtime@127.0.0.1:5432/postgres
-      AIRFLOW_HOME: ${{ runner.temp }}/airflow-home
-      AIRFLOW_VENV: ${{ runner.temp }}/airflow-venv
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
@@ -233,8 +231,13 @@ jobs:
           cache: pip
           cache-dependency-path: deploy/airflow/requirements.lock
       - name: Install the hash-locked Airflow runtime
+        env:
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow-home
+          AIRFLOW_VENV: ${{ runner.temp }}/airflow-venv
         run: |
           set -eu
+          echo "AIRFLOW_HOME=$AIRFLOW_HOME" >> "$GITHUB_ENV"
+          echo "AIRFLOW_VENV=$AIRFLOW_VENV" >> "$GITHUB_ENV"
           python -m venv "$AIRFLOW_VENV"
           "$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
             -r deploy/airflow/requirements.lock
