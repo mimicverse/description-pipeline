@@ -1333,6 +1333,8 @@ class InstallOrderingTests(unittest.TestCase):
             '#!/usr/bin/env bash\necho "airflow_install" >> "$ORDER_LOG"\n'
             'if [ "${1:-}" = "--stage" ]; then\n'
             '  mkdir -p "$AIRFLOW_VENV/bin"\n'
+            '  cp "$FIXTURE_STUB_PYTHON" "$AIRFLOW_VENV/bin/python"\n'
+            '  chmod +x "$AIRFLOW_VENV/bin/python"\n'
             "  printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$AIRFLOW_VENV/bin/airflow\"\n"
             '  chmod +x "$AIRFLOW_VENV/bin/airflow"\n'
             "fi\nexit 0\n",
@@ -1599,6 +1601,7 @@ class InstallOrderingTests(unittest.TestCase):
             "REGISTER_AFTER": "0",
             "UNPAUSE_RC": "0",
             "PAUSE_RC": "0",
+            "FIXTURE_STUB_PYTHON": str(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python"),
             "PROJECTION_FILE": str(tmp / "projection.json"),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
         }

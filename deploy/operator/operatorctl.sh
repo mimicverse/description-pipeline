@@ -1075,6 +1075,7 @@ PY
     load_installed
     if ! {
       python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
+      && source "$STATE_ROOT/resolved.env" \
       && airflow_render \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
