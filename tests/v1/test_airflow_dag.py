@@ -378,7 +378,11 @@ class DagTests(unittest.TestCase):
                 patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
                 patch.object(module, "_platform_binding", return_value=(operations, None)),
             ):
-                started = dag.task_dict["discover"].python_callable(request)
+                started = dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-native-half"),
+                    ti=SimpleNamespace(task_id="discover", map_index=-1),
+                )
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
                 polled = False
                 for _ in range(8):
@@ -419,6 +423,50 @@ class DagTests(unittest.TestCase):
                     }
                 ],
             )
+            self.assertEqual(
+                operations.registered[0]["dispatch"],
+                {
+                    "dag_id": "solidworks_to_urdf",
+                    "dag_run_id": "portal-native-half",
+                    "task_id": "discover",
+                    "map_index": -1,
+                },
+            )
+
+    def test_a_contextless_native_intent_is_refused_before_any_operation(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+        dag = module.dag
+        request = {
+            "run_id": module.native_run_id("dag-run-binding"),
+            "upload_files": {"assembly.SLDASM": "a" * 64},
+            "upload_sha256": "a" * 64,
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "solidworks_windows",
+        }
+
+        class UnknownEndpoint:
+            def get_job(self, run_id):
+                raise module.EndpointNotFound(run_id)
+
+        operations = _OperationRecorder()
+        with (
+            patch.object(module, "_endpoint", return_value=UnknownEndpoint()),
+            patch.object(module, "_platform_binding", return_value=(operations, None)),
+        ):
+            with self.assertRaisesRegex(AirflowFailException, "DagRun binding"):
+                dag.task_dict["discover"].python_callable(request)
+            with self.assertRaisesRegex(AirflowFailException, "task-instance key"):
+                dag.task_dict["discover"].python_callable(request, dag_run=SimpleNamespace(run_id="portal-binding"))
+            with self.assertRaisesRegex(AirflowFailException, "task-instance key"):
+                dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-binding"),
+                    task_instance=SimpleNamespace(task_id="discover"),
+                )
+        self.assertEqual(operations.registered, [])
+        self.assertEqual(operations.claimed, [])
 
     def test_linked_conf_binding_is_validated(self) -> None:
         from types import SimpleNamespace
@@ -485,7 +533,11 @@ class DagTests(unittest.TestCase):
                 patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
                 patch.object(module, "_platform_binding", return_value=(operations, None)),
             ):
-                started = dag.task_dict["discover"].python_callable(request)
+                started = dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-selection"),
+                    task_instance=SimpleNamespace(task_id="discover", map_index=-1),
+                )
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
@@ -571,6 +623,9 @@ class DagTests(unittest.TestCase):
             handoff_digest=digest(upload),
             platform_config_digest="c" * 64,
         )
+
+        started_child_runs: list[str] = []
+
         class _Platform:
             def confirmed_stage(self, run_id, stage):
                 return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
@@ -586,6 +641,9 @@ class DagTests(unittest.TestCase):
 
             def claim_operation(self, **kwargs):
                 return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
+            def start_run(self, run_id):
+                started_child_runs.append(run_id)
 
         config = EndpointConfig(
             "http://127.0.0.1:1",
@@ -603,7 +661,10 @@ class DagTests(unittest.TestCase):
             self.assertEqual(request["upload_sha256"], digest(upload))
             self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
-            started = dag.task_dict["discover"].python_callable(request)
+            self.assertEqual(started_child_runs, [request["run_id"]])
+            started = dag.task_dict["discover"].python_callable(
+                request, dag_run=context["dag_run"], ti=SimpleNamespace(task_id="discover", map_index=-1)
+            )
         self.assertEqual(
             (store_root / request["run_id"] / "input" / "request.json").read_bytes(),
             (store_root / "sealed" / parent_run_id / "freeze" / "input" / "request.json").read_bytes(),
@@ -673,6 +734,8 @@ class DagTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        started_child_runs: list[str] = []
+
         class _Platform:
             def confirmed_stage(self, run_id, stage):
                 return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
@@ -685,6 +748,9 @@ class DagTests(unittest.TestCase):
 
             def sealed_path(self, uri):
                 return store_root / "sealed" / uri.removeprefix("store://sealed/")
+
+            def start_run(self, run_id):
+                started_child_runs.append(run_id)
 
         context = {
             "dag_run": SimpleNamespace(
@@ -707,6 +773,7 @@ class DagTests(unittest.TestCase):
             self.assertTrue(request["linux_owned"])
             self.assertEqual(request["repository_slug"], "mimicverse/description")
             self.assertEqual(request["repository_base"], "main")
+            self.assertEqual(started_child_runs, [request["run_id"]])
             binding = dag.task_dict["capture"].python_callable(request)
         self.assertEqual(binding["repository_slug"], "mimicverse/description")
         self.assertEqual(binding["repository_base"], "main")
@@ -805,7 +872,15 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         with patch.object(self.module.flow, "run_stage", side_effect=run_stage):
             result = self.module._portable_registered(
-                "run-1", "publish", tree=tree, expected_subject="a" * 64, base="main"
+                "run-1",
+                "publish",
+                tree=tree,
+                expected_subject="a" * 64,
+                base="main",
+                context={
+                    "dag_run": SimpleNamespace(run_id="portal-publish-1"),
+                    "ti": SimpleNamespace(task_id="publish", map_index=-1, xcom_push=lambda **kwargs: None),
+                },
             )
         self.assertEqual(result, receipt)
         # The registered and claimed intent precedes the one external write.
@@ -815,6 +890,15 @@ class PlatformRegistrationTests(unittest.TestCase):
             [("publish", "publish", "run-1/publish:0")],
         )
         self.assertRegex(self.registered[0]["params_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            self.registered[0]["dispatch"],
+            {
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": "portal-publish-1",
+                "task_id": "publish",
+                "map_index": -1,
+            },
+        )
         self.assertEqual(
             self.claimed,
             [{"run_id": "run-1", "stage": "publish", "operation_key": "run-1/publish:0"}],
@@ -1374,6 +1458,10 @@ class LinkedMaterializationTests(unittest.TestCase):
                 expected_subject=subject,
                 repository=repository,
                 base="main",
+                context={
+                    "dag_run": SimpleNamespace(run_id=f"portal-{run_id}"),
+                    "ti": SimpleNamespace(task_id=stage, map_index=-1, xcom_push=lambda **kwargs: None),
+                },
             )
 
     def _registered_parent(self) -> None:
@@ -1447,6 +1535,42 @@ class LinkedMaterializationTests(unittest.TestCase):
         self.assertEqual(seeds, [("publish", self.root / "sealed" / self.GRANDCHILD / "verify")])
         self.assertEqual({owner for _, owner in gates}, {self.CHILD})
         self.assertEqual(self.store.stage_records(self.GRANDCHILD)["publish"]["state"], "completed")
+
+    def test_a_confirmed_publication_replays_its_registered_receipt(self) -> None:
+        self._registered_parent()
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        self._linked_stage(self.CHILD, "verify", source=self.PARENT, seeds=[], gates=[], subject="b" * 64)
+        receipt = self._linked_stage(
+            self.CHILD,
+            "publish",
+            source=self.PARENT,
+            seeds=[],
+            gates=[],
+            subject="c" * 64,
+            repository=self.root / "model-repository",
+        )
+        self.assertEqual(receipt["state"], "published")
+        sealed = self.store.confirmed_stage(self.CHILD, "publish")
+        self.assertIsNotNone(sealed)
+        # A retry of the exact confirmed publication replays the registered receipt and
+        # never re-sends the side effect.
+        tree = self.module.flow.RunPaths(self.root, self.CHILD).stage_output("publish")
+        with (
+            patch.object(self.module, "_platform_binding", return_value=(self.store, self.root)),
+            patch.object(self.module.flow, "run_stage", side_effect=AssertionError("publication re-sent")),
+        ):
+            replayed = self.module._portable_registered(
+                self.CHILD,
+                "publish",
+                tree=tree,
+                expected_subject="c" * 64,
+                repository=self.root / "model-repository",
+                base="main",
+                source_run_id=self.PARENT,
+            )
+        self.assertEqual(replayed, sealed, "the replay returns the registered sealed receipt")
+        self.assertEqual(replayed["submission"]["state"], sealed["submission"]["state"])
+        self.assertEqual(self.store.confirmed_stage(self.CHILD, "publish"), sealed)
 
     def test_a_removed_parent_work_tree_leaves_the_linked_attempt_intact(self):
         import shutil as _shutil

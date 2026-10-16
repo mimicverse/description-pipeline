@@ -386,6 +386,13 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
     """
     platform, store_root = _platform_binding()
     source_run_id = kwargs.get("source_run_id")
+    if stage == "publish":
+        confirmed = platform.confirmed_stage(run_id, "publish")
+        if confirmed is not None:
+            # A confirmed publication is never re-sent: the registered sealed receipt
+            # IS the replay's result (terminal replay is idempotent by construction).
+            log.info("publication already confirmed run_id=%s; returning the registered receipt", run_id)
+            return confirmed
     if source_run_id:
         _materialize_linked_attempt(platform, store_root, run_id, source_run_id)
     if stage == "publish":
@@ -448,13 +455,32 @@ def _claim_operation_intent(
 ) -> None:
     """Register one side-effect intent with its real Airflow binding, then claim it.
 
-    The registration is idempotent on the same key and parameter digest; only the
-    claiming call may perform the side effect, and a repeat claim of a still-running
-    operation is the controlled reconciliation replay.  A settled state refuses
-    here - repeating an uncontrolled write is never a fallback.
+    A new production intent requires the real, complete Airflow key (dag_id,
+    task_id, run_id, map_index) BEFORE anything is persisted: a missing or
+    malformed binding refuses here, and nothing is written with unknown binding
+    fields - legacy unbound rows continue only through the controlled reconcile
+    path.  The registration is idempotent on the same key and parameter digest;
+    only the claiming call may perform the side effect, and a repeat claim of a
+    still-running operation is the controlled reconciliation replay.  A settled
+    state refuses here - repeating an uncontrolled write is never a fallback.
     """
     context = context if isinstance(context, dict) else {}
+    dag_run = context.get("dag_run")
     task_instance = context.get("ti") or context.get("task_instance")
+    bound_run_id = getattr(dag_run, "run_id", None)
+    task_id = getattr(task_instance, "task_id", None) or stage
+    map_index = getattr(task_instance, "map_index", None)
+    if not isinstance(bound_run_id, str) or not bound_run_id:
+        raise AirflowFailException(
+            f"the {what} intent requires the triggering DagRun binding; a contextless "
+            "execution never registers a new production intent"
+        )
+    if not isinstance(task_id, str) or not task_id:
+        raise AirflowFailException(f"the {what} intent requires the executing task identity")
+    if type(map_index) is not int:
+        raise AirflowFailException(
+            f"the {what} intent requires the real task-instance key of the executing task"
+        )
     platform.register_operation(
         run_id=run_id,
         stage=stage,
@@ -463,9 +489,9 @@ def _claim_operation_intent(
         params_digest=params_digest,
         dispatch={
             "dag_id": DAG_ID,
-            "dag_run_id": getattr(context.get("dag_run"), "run_id", None),
-            "task_id": stage,
-            "map_index": getattr(task_instance, "map_index", None),
+            "dag_run_id": bound_run_id,
+            "task_id": task_id,
+            "map_index": map_index,
         },
     )
     try:
@@ -1317,13 +1343,15 @@ def solidworks_to_urdf():
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
                 # contacts Windows: the parent's registered capture is the authority.
                 platform, store_root = _platform_binding()
+                run_id = _run_uuid(context)
+                platform.start_run(run_id)  # the first driver action claims the admitted child
                 receipt = platform.confirmed_stage(linked["parent_run"], "capture")
                 if receipt is None or not receipt.get("handoff_sha256"):
                     raise AirflowFailException(
                         f"Linked parent {linked['parent_run']} has no admitted Linux capture to resume"
                     )
                 request = {
-                    "run_id": _run_uuid(context),
+                    "run_id": run_id,
                     "package": str(_sealed_stage_tree(platform, linked["parent_run"], "capture")),
                     "handoff_sha256": str(receipt["handoff_sha256"]),
                     "conn_id": CONN_ID,
@@ -1369,6 +1397,7 @@ def solidworks_to_urdf():
                 "conn_id": CONN_ID,
             }
             platform, store_root = _platform_binding()
+            platform.start_run(request["run_id"])  # the first driver action claims the admitted child
             carried = carry_request_evidence(
                 _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
                 flow.RunPaths(store_root, request["run_id"]).run_dir,
