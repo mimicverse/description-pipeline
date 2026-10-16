@@ -12,10 +12,17 @@
 # observer/ownership gates must make that run fail.
 [CmdletBinding()]
 param(
-  [string]$ScriptPath = (Join-Path $PSScriptRoot '..' '..' 'deploy' 'windows' 'instance-lifecycle.ps1'),
+  [string]$ScriptPath = '',
   [switch]$StaticOnly
 )
 $ErrorActionPreference = 'Stop'
+if (-not $ScriptPath) {
+  # Windows PowerShell 5.1 does not populate $PSScriptRoot while parameter defaults evaluate and
+  # has no multi-child Join-Path (PowerShell 6+ -AdditionalChildPath): the repository-relative
+  # default resolves here, after the parameter block.
+  $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+  $ScriptPath = Join-Path (Join-Path (Join-Path $repositoryRoot 'deploy') 'windows') 'instance-lifecycle.ps1'
+}
 $script:checks = 0
 $script:failures = [System.Collections.Generic.List[string]]::new()
 function Check([string]$name, [bool]$condition, [string]$detail = '') {
