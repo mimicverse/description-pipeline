@@ -2023,7 +2023,7 @@ def _gate_scene(state: dict) -> dict:
     }
 
 
-def _runtime_of(model, steps: int) -> dict:
+def _runtime_of(model, steps: int, time_tolerance: float) -> dict:
     import mujoco
 
     warnings: list[str] = []
@@ -2051,7 +2051,7 @@ def _runtime_of(model, steps: int) -> dict:
                 break
         counters = [int(entry.number) for entry in data.warning]
         expected = steps * float(model.opt.timestep)
-        advanced = abs(float(data.time) - expected) <= 1e-6 * max(1.0, expected)
+        advanced = abs(float(data.time) - expected) <= time_tolerance * max(1.0, abs(expected))
         return {
             "steps": steps,
             "finite": finite,
@@ -2067,7 +2067,7 @@ def _runtime_of(model, steps: int) -> dict:
 def _gate_runtime(state: dict) -> dict:
     policy = state["policy"]
     model = _need(state, "robot_model")
-    runtime = _runtime_of(model, policy["runtime_steps"])
+    runtime = _runtime_of(model, policy["runtime_steps"], policy["tolerances"]["option_atol"])
     if runtime["warnings"]:
         raise CheckError(f"the engine reported an unstable runtime: {runtime['warnings'][0]}")
     if any(runtime["warning_counts"]):
@@ -2078,7 +2078,7 @@ def _gate_runtime(state: dict) -> dict:
         raise CheckError("the simulation time did not advance as expected; the state was implicitly reset")
     details = {"steps": runtime["steps"], "time": runtime["time"], "robot_finite": True}
     if "scene_model" in state:
-        scene_runtime = _runtime_of(state["scene_model"], policy["runtime_steps"])
+        scene_runtime = _runtime_of(state["scene_model"], policy["runtime_steps"], policy["tolerances"]["option_atol"])
         if scene_runtime["warnings"]:
             raise CheckError(f"the scene reported an unstable runtime: {scene_runtime['warnings'][0]}")
         if any(scene_runtime["warning_counts"]):
