@@ -676,7 +676,10 @@ class StageTransferTests(unittest.TestCase):
                 "frames": [{"id": "imu", "parent": "base_link", "coordinate_system": "imu_datum"}],
             }
             snapshot = work / "snapshot"
-            freeze(config, snapshot, backend=backend, worker_version="test-worker")
+            # The fixture keeps its authoring carriers; the retired keys are
+            # dropped at the call boundary and only groups/axis_requests reach
+            # the product.
+            freeze(support.capture_requests(config), snapshot, backend=backend, worker_version="test-worker")
 
             capture = self.base / "real-capture"
             (capture / "input" / "cad").mkdir(parents=True)

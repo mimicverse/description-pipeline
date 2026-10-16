@@ -6,6 +6,11 @@ case names and assertion intents are preserved; only the call surface moved.
 The artifact-read case (preview/open_artifact byte streaming) has no subject
 on the platform read face yet and is tracked as a reported gap, not silently
 dropped.
+
+The quality-binding reuse case is retired to its owned successor,
+``tests.v1.test_platform_store.test_the_quality_inventory_binds_the_rebuilt_definition``,
+which drives an otherwise-valid sealed checkpoint with only the quality
+attribute changed (and a valid receipt as the positive control).
 """
 
 from __future__ import annotations
@@ -191,38 +196,33 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
 
     def test_a_forged_receipt_claiming_confirmation_is_refused(self) -> None:
         self.admit(RUN)
-        with self.assertRaises(PipelineError):
+        # Positive control: the otherwise-valid sealed receipt registers and reads back.
+        self._record_generate()
+        uri = self.store.stage_records(RUN)["generate"]["checkpoint_uri"]
+        valid = self.world.stages[(RUN, "generate")][1]
+        self.assertEqual(self.store.confirmed_stage(RUN, "generate"), valid)
+        # Only the claimed identity changes; the sealed checkpoint stays byte-valid.
+        forged = {**valid, "run_id": "9b2f4c55-0c3a-4f2b-9d1e-7a6b5c4d3e2f"}
+        with self.assertRaisesRegex(PipelineError, "another run or stage"):
             self.store.confirm_stage(
-                run_id=RUN,
-                stage="verify",
-                state="completed",
-                receipt={
-                    "schema_version": "solidworks-to-urdf.bundle/v1",
-                    "run_id": "9b2f4c55-0c3a-4f2b-9d1e-7a6b5c4d3e2f",
-                    "stage": "publish",
-                    "state": "verified",
-                    "passed": True,
-                    "subject_sha256": "bad",
-                },
+                run_id=RUN, stage="generate", state="completed", receipt=forged, checkpoint_uri=uri
             )
+        self.assertEqual(self.world.stages[(RUN, "generate")][1], valid)
 
     def test_a_confirmed_receipt_without_sealed_artifacts_is_refused(self) -> None:
         self.admit(RUN)
-        with self.assertRaises(PipelineError):
+        # Positive control: the otherwise-valid sealed receipt registers and reads back.
+        self._record_generate()
+        uri = self.store.stage_records(RUN)["generate"]["checkpoint_uri"]
+        valid = self.world.stages[(RUN, "generate")][1]
+        self.assertEqual(self.store.confirmed_stage(RUN, "generate"), valid)
+        # Only the artifact inventory is dropped; the sealed checkpoint stays byte-valid.
+        without = {key: value for key, value in valid.items() if key != "artifacts"}
+        with self.assertRaisesRegex(PipelineError, "artifact inventory"):
             self.store.confirm_stage(
-                run_id=RUN,
-                stage="generate",
-                state="completed",
-                receipt={
-                    "schema_version": "solidworks-to-urdf.bundle/v1",
-                    "run_id": RUN,
-                    "stage": "generate",
-                    "state": "generated",
-                    "passed": False,
-                    "subject_sha256": "a" * 64,
-                    "handoff_sha256": HANDOFF,
-                },
+                run_id=RUN, stage="generate", state="completed", receipt=without, checkpoint_uri=uri
             )
+        self.assertEqual(self.world.stages[(RUN, "generate")][1], valid)
 
     def test_a_tampered_checkpoint_is_refused_instead_of_replayed(self) -> None:
         self.admit(RUN)
@@ -250,26 +250,6 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
             self.assertRaisesRegex(PipelineError, "differs from the native capture"),
         ):
             flow.run_stage(self.store, self.store_root, RUN, "generate")
-
-    def test_verify_reuse_requires_the_bound_quality_report(self) -> None:
-        self.admit(RUN)
-        self._record_generate()
-        with self.assertRaises(PipelineError):
-            self.store.confirm_stage(
-                run_id=RUN,
-                stage="verify",
-                state="completed",
-                receipt={
-                    "schema_version": "solidworks-to-urdf.bundle/v1",
-                    "run_id": RUN,
-                    "stage": "verify",
-                    "state": "verified",
-                    "passed": True,
-                    "subject_sha256": "a" * 64,
-                    "handoff_sha256": HANDOFF,
-                    "events": [],
-                },
-            )
 
     def test_stage_guards_and_identity_gate_fail_closed(self) -> None:
         self.admit(RUN)
@@ -369,6 +349,57 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
         self.assertEqual(stages[0][1], self.store.sealed_path(generate_uri))
         self.assertEqual(stages[0][2], self._paths(RUN).stage_dir("verify"))
         self.assertEqual(receipt["state"], "verified")
+
+        # The registered verify checkpoint this case seeds from is fixture-provided:
+        # the case owns the flow's seeding and caller forwarding, while the
+        # confirmation grammar lives in the store suite (tests.v1.test_platform_store)
+        # and the caller-side sealing/registration in the DAG suite
+        # (tests.v1.test_airflow_dag).
+        verify_uri = f"store://sealed/{RUN}/verify"
+        self.store.sealed_path(verify_uri).mkdir(parents=True, exist_ok=True)
+        self.world.stages[(RUN, "verify")] = ("completed", {"state": "verified"}, verify_uri)
+        published = {
+            "state": "published",
+            "passed": True,
+            "subject_sha256": subject,
+            "submission": {"passed": True, "state": "published", "url": "https://example.invalid/pr/1"},
+            "events": [{"stage": "publish", "state": "completed", "at": "2026-10-10T03:00:00+00:00"}],
+        }
+        events: list[dict] = []
+        repository = self.tmp / "repo"
+
+        def fake_publish(seed_dir, output, **kwargs):
+            stages.append(("publish", Path(seed_dir), Path(output), kwargs.get("repository"), kwargs))
+            Path(output).mkdir(parents=True, exist_ok=True)
+            kwargs["on_event"]({"stage": "publish", "state": "running", "at": "2026-10-10T03:00:00+00:00"})
+            return published
+
+        with (
+            mock.patch.object(flow, "tool_record", return_value=self._portable()),
+            mock.patch.object(flow.solidworks, "publish", side_effect=fake_publish),
+        ):
+            publish_receipt = flow.run_stage(
+                self.store,
+                self.store_root,
+                RUN,
+                "publish",
+                expected_subject=subject,
+                repository=repository,
+                base="main",
+                on_event=events.append,
+            )
+        publish_call = stages[1][4]
+        self.assertEqual(stages[1][1], self.store.sealed_path(verify_uri))
+        self.assertEqual(stages[1][2], self._paths(RUN).output_dir)
+        self.assertEqual(stages[1][3], repository)
+        self.assertEqual(publish_call["expected_subject"], subject)
+        self.assertEqual(publish_call["base"], "main")
+        self.assertEqual(publish_call["run_id"], RUN)
+        self.assertEqual(publish_call["handoff_sha256"], HANDOFF)
+        self.assertEqual(publish_receipt["state"], "published")
+        self.assertTrue(any(event.get("state") == "running" for event in events))
+        # The flow never registers; the caller seals and confirms the receipt.
+        self.assertNotIn((RUN, "publish"), self.world.stages)
 
 
 if __name__ == "__main__":
