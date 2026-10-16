@@ -25,7 +25,7 @@ from ..orchestration.stage_transfer import (
     admit_capture,
     verify_transfer,
 )
-from .flow import RunPaths, _registered_request_sha256
+from .flow import RunPaths, _registered_request_sha256, recorded_events
 from .store import PlatformStore
 
 
@@ -96,15 +96,8 @@ def _append_native_events(platform: PlatformStore, run_id: str, capture: Path) -
 
 
 def _recorded_payloads(platform: PlatformStore, run_id: str) -> list:
-    """Every recorded payload of one run, paged forward with the store's own cursor."""
-    payloads: list = []
-    after_seq = 0
-    while True:
-        page = platform.run_events(run_id, after_seq=after_seq)
-        payloads.extend(row.get("payload") if isinstance(row, dict) else None for row in page)
-        if len(page) < 200:
-            return payloads
-        after_seq = page[-1].get("seq", after_seq + len(page))
+    """Every recorded payload of one run, over the shared paging read facility."""
+    return [row.get("payload") if isinstance(row, dict) else None for row in recorded_events(platform, run_id)]
 
 
 def source_identity(capture: Path) -> tuple[str | None, str | None]:

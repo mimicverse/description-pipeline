@@ -10,11 +10,14 @@ are; the sealed write path keeps its own canonical coverage.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
+from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
+from description_pipeline.io import file_digest, read_data, write_json
 from description_pipeline.platform.store import PlatformStore
 
-from .test_platform_store import FakeWorld
+from .test_platform_store import FakeWorld, build_sealed_delivery
 
 
 class RegisteredPlatform:
@@ -83,6 +86,53 @@ class RegisteredPlatform:
         tree = self.sealed(f"store://sealed/{run_id}/{stage}")
         tree.mkdir(parents=True, exist_ok=True)
         return tree
+
+    def register_capture(self, run_id: str, *, hardware_id: str = "robot", revision: str = "r1") -> Path:
+        """One genuinely registered capture: a real sealed tree through the real writer.
+
+        The tree carries the frozen source identity the capture stage binds; the
+        row is written through ``confirm_stage``, so the sealed rebinding and
+        its refusals behave exactly as production's do.
+        """
+        capture = self.sealed(f"store://sealed/{run_id}/capture")
+        registered = self.store.stage_records(run_id).get("capture") or {}
+        if registered.get("state") == "completed":
+            # One registration per stage: a redo is a linked attempt, not a rewrite.
+            return capture
+        if capture.exists():
+            shutil.rmtree(capture)
+        capture.mkdir(parents=True)
+        _subject, _artifacts, _handoff_full, handoff_native = build_sealed_delivery(capture)
+        manifest = read_delivery_manifest(capture)
+        write_json(
+            capture / "input/source.json",
+            {"identity": {"hardware_id": hardware_id}, "metadata": {"revision": revision}},
+        )
+        handoff = read_data(capture / "input/handoff.json")
+        handoff["package_files"]["source.json"] = file_digest(capture / "input/source.json")
+        write_json(capture / "input/handoff.json", handoff)
+        write_delivery_manifest(capture, contract=manifest["contract"], policy=manifest["policy"])
+        manifest = read_delivery_manifest(capture)
+        receipt = {
+            "schema_version": "solidworks-to-urdf.bundle/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "run_id": run_id,
+            "stage": "capture",
+            "state": "native_complete",
+            "passed": False,
+            "handoff_sha256": handoff_native,
+            "artifacts": [dict(record) for record in manifest["subject"]["files"]],
+            "native_tool": read_data(capture / "reports/native-tool.json"),
+        }
+        self.world.stages.pop((run_id, "capture"), None)
+        self.store.confirm_stage(
+            run_id=run_id,
+            stage="capture",
+            state="completed",
+            checkpoint_uri=f"store://sealed/{run_id}/capture",
+            receipt=receipt,
+        )
+        return capture
 
     def events(self, run_id: str, events: list[dict]) -> None:
         """Record one attempt's display events as the platform event rows they become."""
