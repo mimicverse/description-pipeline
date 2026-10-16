@@ -1,4 +1,4 @@
-"""SolidWorks-to-URDF command-line entry point."""
+"""Description delivery and downstream model commands."""
 
 from __future__ import annotations
 
@@ -35,6 +35,15 @@ def parser() -> argparse.ArgumentParser:
     serve = operations.add_parser("serve", help="run the authenticated Windows endpoint used by Apache Airflow")
     serve.add_argument("--config", type=Path, required=True)
     operations.add_parser("doctor", help="check this host's native or portable runtime")
+    mjcf = operations.add_parser("mjcf", help="build or independently check a downstream MuJoCo delivery")
+    mjcf_operations = mjcf.add_subparsers(dest="mjcf_operation", required=True)
+    mjcf_build = mjcf_operations.add_parser("build", help="convert an immutable URDF and explicit simulation config")
+    mjcf_build.add_argument("source", type=Path, help="root containing the URDF and all referenced meshes")
+    mjcf_build.add_argument("--urdf", type=Path, required=True, help="URDF path relative to the source root")
+    mjcf_build.add_argument("--config", type=Path, required=True, help="simulation JSON configuration")
+    mjcf_build.add_argument("--output", type=Path, required=True, help="new delivery directory")
+    mjcf_check = mjcf_operations.add_parser("check", help="recompute all checks against the delivered MJCF bytes")
+    mjcf_check.add_argument("bundle", type=Path)
     return commands
 
 
@@ -47,7 +56,16 @@ def main(argv: list[str] | None = None) -> int:
 
             serve(arguments.config)
             return 0
-        if arguments.operation == "check":
+        if arguments.operation == "mjcf":
+            if arguments.mjcf_operation == "build":
+                from .mjcf import build
+
+                result = build(arguments.source, arguments.urdf, arguments.config, arguments.output)
+            else:
+                from .verification.mjcf import check_bundle
+
+                result = check_bundle(arguments.bundle)
+        elif arguments.operation == "check":
             from .verification.solidworks_urdf import check_bundle
 
             result = check_bundle(arguments.bundle)
