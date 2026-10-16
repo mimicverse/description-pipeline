@@ -50,7 +50,7 @@ def _native_record(*, with_arm: bool, with_joint: bool, files: dict[str, str]) -
     limits travel through ``dp.joint.*`` claims and controlled records.
     """
 
-    components = [support.native_component("base-1")]
+    components = [support.native_component("base-1", document="base.SLDPRT")]
     datums = [
         support.native_datum("CS_base_link", "base-1", support.placement()),
         support.native_datum("TCP_imu", "base-1", support.placement((0.01, 0.0, 0.03))),
@@ -59,7 +59,11 @@ def _native_record(*, with_arm: bool, with_joint: bool, files: dict[str, str]) -
     mates: list[dict] = []
     joint_claims = None
     if with_arm:
-        components.append(support.native_component("arm-1", transform=support.placement((0.0, 0.0, 0.2)), fixed=False))
+        components.append(
+            support.native_component(
+                "arm-1", document="arm.SLDPRT", transform=support.placement((0.0, 0.0, 0.2)), fixed=False
+            )
+        )
         datums.append(support.native_datum("CS_arm_link", "arm-1", support.placement((0.0, 0.0, 0.2))))
         masses.append({"component": "arm-1", "mass_kg": 0.5, "material": "Alloy Steel"})
     if with_joint:

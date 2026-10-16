@@ -97,7 +97,7 @@ def _native_record(*, files: dict[str, str]) -> dict:
         hardware_id="product_convention_fixture",
         change_summary="product convention module fixture",
         control_reference="product-convention-run",
-        components=[support.native_component("base-1")],
+        components=[support.native_component("base-1", document="base.SLDPRT")],
         datums=[support.native_datum("CS_base_link", "base-1", support.placement())],
         masses=[{"component": "base-1", "mass_kg": float(BENCHMARK["base-1"]["mass"]), "material": "Alloy Steel"}],
         files=files,

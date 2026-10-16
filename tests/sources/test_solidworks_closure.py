@@ -118,7 +118,12 @@ def _carrier_record(bodies: list[dict]) -> tuple[dict, dict[str, str]]:
     names = [str(member) for body in bodies for member in (body.get("components") or [])]
     if not names:
         names = [DEV]
-    components = [support.native_component(name, transform=_carrier_transform(name)) for name in dict.fromkeys(names)]
+    components = [
+        support.native_component(
+            name, document=name.split("/")[-1].split("~")[0] + ".SLDPRT", transform=_carrier_transform(name)
+        )
+        for name in dict.fromkeys(names)
+    ]
     datums = [
         support.native_datum("CS_" + str(body["name"]), str(members[0]), _carrier_transform(str(members[0])))
         for body in bodies

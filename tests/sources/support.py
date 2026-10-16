@@ -1224,28 +1224,38 @@ def compose_delivery_inputs(
 # ---------------------------------------------------------------------------
 
 
+def _native_float(value: float | int) -> float:
+    """Canonical record float: +0.0 zeros, all other values unchanged (fixture plumbing)."""
+
+    return float(value) + 0.0
+
+
 def native_component(
-    name: str, *, transform: Sequence[float] | None = None, fixed: bool = True, document: str | None = None
+    name: str, *, document: str, transform: Sequence[float] | None = None, fixed: bool = True
 ) -> dict:
-    """One recorded native occurrence entry (fixture plumbing)."""
+    """One recorded native occurrence entry (fixture plumbing).
+
+    ``document`` is the scenario's own binding of the occurrence to its
+    original part document; it is never derived from the occurrence name.
+    """
 
     return {
         "name2": name,
         "lightweight": False,
         "suppression_state": 2,
         "instance_id": name,
-        "document": document or name.split("/")[-1].split("~")[0] + ".SLDPRT",
+        "document": str(document),
         "configuration": "Default",
         "fixed": fixed,
         "suppressed": False,
-        "transform": [float(value) for value in (placement() if transform is None else transform)],
+        "transform": [_native_float(value) for value in (placement() if transform is None else transform)],
     }
 
 
 def native_datum(name: str, owner: str, transform: Sequence[float]) -> dict:
     """One recorded native coordinate system (fixture plumbing)."""
 
-    return {"name": name, "owner": owner, "array": [float(value) for value in transform]}
+    return {"name": name, "owner": owner, "array": [_native_float(value) for value in transform]}
 
 
 def native_hinge_mates(
