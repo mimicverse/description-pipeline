@@ -325,52 +325,79 @@ class FakeCursor:
                     updated = (operation_id,)
                 break
             self._rows = [updated] if updated is not None else []
+        elif normalized.startswith(
+            "SELECT object_kind, state, bucket FROM lifecycle_projection"
+            " WHERE (object_kind = 'scheduling'"
+        ):
+            # The one statement that carries every lifecycle fact of an orphan acceptance.
+            operation_id, dag_run_object = params
+            rows = []
+            state = None
+            for record in world.operations.values():
+                if record[0] != operation_id:
+                    continue
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    operation_id, (None, None, None, None)
+                )
+                if None not in (dag_id, dag_run_id, task_id, map_index):
+                    state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
+                break
+            if state in {
+                "queued",
+                "running",
+                "scheduled",
+                "deferred",
+                "up_for_retry",
+                "up_for_reschedule",
+                "restarting",
+            }:
+                bucket = "in_flight"
+            elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
+                bucket = "terminal"
+            else:
+                bucket = "unknown"
+            rows.append(("scheduling", state, bucket))
+            for (dag_id, dag_run_id), dag_state in world.dag_runs.items():
+                if f"{dag_id}/{dag_run_id}" != dag_run_object:
+                    continue
+                if dag_state in {"success", "failed"}:
+                    dag_bucket = "terminal"
+                elif dag_state in {"queued", "running"}:
+                    dag_bucket = "in_flight"
+                else:
+                    dag_bucket = "unknown"
+                rows.append(("dag_run", dag_state, dag_bucket))
+                break
+            self._rows = rows
         elif normalized.startswith("SELECT state, bucket FROM lifecycle_projection"):
             (object_id,) = params
-            if "object_kind = 'dag_run'" in normalized:
-                state = None
-                found = False
-                for (dag_id, dag_run_id), dag_state in world.dag_runs.items():
-                    if f"{dag_id}/{dag_run_id}" != object_id:
-                        continue
-                    found = True
-                    state = dag_state
-                    break
-                if state in {"success", "failed"}:
-                    bucket = "terminal"
-                elif state in {"queued", "running"}:
-                    bucket = "in_flight"
-                else:
-                    bucket = "unknown"
-                self._rows = [(state, bucket)] if found else []
+            state = None
+            found = False
+            for record in world.operations.values():
+                if record[0] != object_id:
+                    continue
+                found = True
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    object_id, (None, None, None, None)
+                )
+                if None not in (dag_id, dag_run_id, task_id, map_index):
+                    state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
+                break
+            if state in {
+                "queued",
+                "running",
+                "scheduled",
+                "deferred",
+                "up_for_retry",
+                "up_for_reschedule",
+                "restarting",
+            }:
+                bucket = "in_flight"
+            elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
+                bucket = "terminal"
             else:
-                state = None
-                found = False
-                for record in world.operations.values():
-                    if record[0] != object_id:
-                        continue
-                    found = True
-                    dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
-                        object_id, (None, None, None, None)
-                    )
-                    if None not in (dag_id, dag_run_id, task_id, map_index):
-                        state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
-                    break
-                if state in {
-                    "queued",
-                    "running",
-                    "scheduled",
-                    "deferred",
-                    "up_for_retry",
-                    "up_for_reschedule",
-                    "restarting",
-                }:
-                    bucket = "in_flight"
-                elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
-                    bucket = "terminal"
-                else:
-                    bucket = "unknown"
-                self._rows = [(state, bucket)] if found else []
+                bucket = "unknown"
+            self._rows = [(state, bucket)] if found else []
         elif normalized.startswith(
             "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
             " FROM operation WHERE operation_key"
@@ -2406,6 +2433,21 @@ class OrphanReconcileTests(unittest.TestCase):
                     )
                 self.assertEqual(self._snapshot(), before, "the refused direct call changed nothing")
                 self.assertEqual(self.world.run_states.get(RUN_A), "queued")
+
+    def test_the_lifecycle_facts_travel_in_one_statement(self) -> None:
+        """One query carries the task and the DagRun: two separate reads are never a snapshot."""
+
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self.world.dag_runs[("solidworks_to_urdf", RUN_A)] = "running"
+        self.world.statements.clear()
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id)
+        self.assertEqual(self._snapshot(), before)
+        reads = [row for row in self.world.statements if "FROM lifecycle_projection" in row]
+        self.assertEqual(len(reads), 1, f"the acceptance read the lifecycle association {len(reads)} times")
+        self.assertIn("object_kind = 'scheduling'", reads[0])
+        self.assertIn("object_kind = 'dag_run'", reads[0])
 
     def test_a_live_or_unknown_dag_run_never_authorizes_recovery(self) -> None:
         for name, dag_state in (("live", "running"), ("green", "success")):

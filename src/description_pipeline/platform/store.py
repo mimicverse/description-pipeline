@@ -327,13 +327,13 @@ _BIND_ORPHAN_OPERATION = (
     " WHERE operation_id = %s AND run_id = %s AND task_id IS NULL AND map_index IS NULL"
     " RETURNING operation_id"
 )
-_READ_ORPHAN_SCHEDULING = (
-    "SELECT state, bucket FROM lifecycle_projection"
-    " WHERE object_kind = 'scheduling' AND object_id = %s"
-)
-_READ_ORPHAN_DAGRUN = (
-    "SELECT state, bucket FROM lifecycle_projection"
-    " WHERE object_kind = 'dag_run' AND object_id = %s"
+#: One statement carries every lifecycle fact of the orphan acceptance: a single
+#: query evaluates the view once, so the task's and the DagRun's states are always
+#: the same database snapshot - two separate reads are never a snapshot.
+_READ_ORPHAN_LIFECYCLE = (
+    "SELECT object_kind, state, bucket FROM lifecycle_projection"
+    " WHERE (object_kind = 'scheduling' AND object_id = %s)"
+    "    OR (object_kind = 'dag_run' AND object_id = %s)"
 )
 _SETTLE_ORPHAN_INTENT = (
     "UPDATE operation SET state = %s, updated_at = now()"
@@ -1362,21 +1362,21 @@ class PlatformStore:
         cursor.execute(_BIND_ORPHAN_OPERATION, (task_id, map_index, operation_id, run_id))
         if cursor.fetchone() is None:
             raise PlatformStoreError("The orphan binding lost its operation to another writer")
-        cursor.execute(_READ_ORPHAN_SCHEDULING, (operation_id,))
-        scheduling = cursor.fetchone()
-        if scheduling is None or scheduling[1] != "terminal" or scheduling[0] != "failed":
+        # One statement carries every lifecycle fact of this acceptance: a single query
+        # evaluates the view once, so the task's and the DagRun's states are the same
+        # database snapshot - a schedule that flips between two reads is never two
+        # separately-read terminal facts.
+        cursor.execute(_READ_ORPHAN_LIFECYCLE, (operation_id, f"{dag_id}/{dag_run_id}"))
+        lifecycle = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        scheduling = lifecycle.get("scheduling")
+        if scheduling != ("failed", "terminal"):
             # A fabricated or ambiguous key joins nothing (unknown), an unexecuted
             # upstream_failed sibling never sent the native request, a live task is in
             # flight and a green task contradicts the failure: all refuse, and the
             # tentative binding rolls back with this transaction.
             raise PlatformStoreError("The bound Airflow task does not prove its own failed fact; refused")
-        cursor.execute(_READ_ORPHAN_DAGRUN, (f"{dag_id}/{dag_run_id}",))
-        dag_run = cursor.fetchone()
-        if dag_run is None or dag_run[1] != "terminal" or dag_run[0] != "failed":
-            # The bound DagRun's terminal fact comes through the same lifecycle
-            # association - the same connection, the same acceptance snapshot as the
-            # locked binding and the task key; a live or unknown DagRun refuses here,
-            # with the tentative binding rolled back.
+        dag_run = lifecycle.get("dag_run")
+        if dag_run != ("failed", "terminal"):
             raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact; refused")
         payload_receipt = {**receipt, "reconciliation": reconcile}
         cursor.execute(_INSERT_STAGE, (run_id, stage, state, _json(payload_receipt), None, None, None))
