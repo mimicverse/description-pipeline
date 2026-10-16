@@ -56,6 +56,8 @@ Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath
 Check 'wording.no_system_text_json' (-not $source.Contains('System.Text.Json')) 'a Core-only JSON type the Desktop PowerShell 5.1 lifecycle cannot load is still present'
 Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfigScanPython') -and
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
+Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
+  $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
 if ($StaticOnly) {
   Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
   exit ([int]($script:failures.Count -gt 0))
@@ -67,7 +69,7 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
-  'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram'
+  'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
 # ---- strict JSON boundary on the bound CPython 3.12 (PowerShell 5.1-compatible path) --------
@@ -276,6 +278,73 @@ $message = ''
 try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
 Check 'pins.served_state_root_mismatch_refused' ($message -match 'state_root_mismatch')
 $script:ServedStateRoot = $root
+# Representation-insensitive: the official reader reports backslashes on Windows while the
+# binding and platform.json declare forward slashes; the same root in either spelling passes.
+$script:ServedStateRoot = $root.Replace('/', '\')
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_insensitive_pass' (($null -ne $pins) -and ($message -eq ''))
+$script:ServedStateRoot = $root
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins ($root.Replace('/', '\')) $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_variant_state_root_pass' (($null -ne $pins) -and ($message -eq ''))
+# A genuinely different path still refuses after normalization (a near miss, not a separator).
+$script:ServedStateRoot = ($root + '-other')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.true_mismatch_after_normalization_refused' ($message -match 'state_root_mismatch')
+$script:ServedStateRoot = $root
+# The account pins may carry either spelling too: the same generation restated with backslashes
+# passes; a different generation still refuses.
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation.Replace('/', '\')
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical.Replace('/', '\')
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.pin_representation_restates_pass' (($null -ne $pins) -and ($message -eq ''))
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = ($generation + '-other')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_true_root_change_refused' ($message -match 'cad_domain_override_refused')
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical
+
+# ---- writer residue: the stop gate scans path identity, not path spelling ----
+# Win32_Process reports backslash images while the binding's roots travel slash-normalized; a
+# writer that keeps its image under the root in either spelling must count as residue, while a
+# neighbouring directory never may (the separator stays a boundary).
+$script:WriterImages = @()
+function Get-CimInstance {
+  param($ClassName, $ErrorAction)
+  foreach ($image in $script:WriterImages) { [pscustomobject]@{ ExecutablePath = $image } }
+}
+$residueRoot = 'C:\description-v1-review\endpoint-state'
+$residueGeneration = $residueRoot + '\lifecycle\gen140\generation'
+$residueBinding = @{ state_root = $residueRoot; generation = $residueGeneration }
+$residueImage = $residueGeneration + '\runtime\Scripts\python.exe'
+$script:WriterImages = @($residueImage)
+Check 'writer_residue.same_spelling_counts' ((@(Get-WriterResidue $residueBinding)).Count -eq 1)
+# The regression counterexample: a slash-normalized binding must count the backslash image too.
+$residueForward = @{ state_root = $residueRoot.Replace('\', '/'); generation = $residueGeneration.Replace('\', '/') }
+Check 'writer_residue.forward_binding_backslash_process_counts' ((@(Get-WriterResidue $residueForward)).Count -eq 1)
+# And the reverse spelling agrees.
+$script:WriterImages = @($residueImage.Replace('\', '/'))
+Check 'writer_residue.backslash_binding_forward_process_counts' ((@(Get-WriterResidue $residueBinding)).Count -eq 1)
+# A process under a different root is somebody else's writer.
+$script:WriterImages = @('C:\another-root\runtime\Scripts\python.exe')
+Check 'writer_residue.different_root_ignored' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
+# A near-neighbour prefix is not inside the root: the separator stays the boundary.
+$script:WriterImages = @('C:\description-v1-review\endpoint-state-other\python.exe')
+Check 'writer_residue.near_neighbour_ignored' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
+# The generation prefix counts its writers even outside the state root.
+$script:WriterImages = @($residueImage)
+$residueGenerationOnly = @{ state_root = 'C:\description-v1-review\other-state'; generation = $residueGeneration }
+Check 'writer_residue.generation_prefix_counts' ((@(Get-WriterResidue $residueGenerationOnly)).Count -eq 1)
+# An empty sweep is clean.
+$script:WriterImages = @()
+Check 'writer_residue.empty_sweep_clean' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
 
 Reset-State
 $facts = Get-OwnershipRefusalFacts $generation $binding
