@@ -370,6 +370,57 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
         self.assertEqual(stages[0][2], self._paths(RUN).stage_dir("verify"))
         self.assertEqual(receipt["state"], "verified")
 
+        # The registered verify checkpoint this case seeds from is fixture-provided:
+        # the case owns the flow's seeding and caller forwarding, while the
+        # confirmation grammar lives in the store suite (tests.v1.test_platform_store)
+        # and the caller-side sealing/registration in the DAG suite
+        # (tests.v1.test_airflow_dag).
+        verify_uri = f"store://sealed/{RUN}/verify"
+        self.store.sealed_path(verify_uri).mkdir(parents=True, exist_ok=True)
+        self.world.stages[(RUN, "verify")] = ("completed", {"state": "verified"}, verify_uri)
+        published = {
+            "state": "published",
+            "passed": True,
+            "subject_sha256": subject,
+            "submission": {"passed": True, "state": "published", "url": "https://example.invalid/pr/1"},
+            "events": [{"stage": "publish", "state": "completed", "at": "2026-10-10T03:00:00+00:00"}],
+        }
+        events: list[dict] = []
+        repository = self.tmp / "repo"
+
+        def fake_publish(seed_dir, output, **kwargs):
+            stages.append(("publish", Path(seed_dir), Path(output), kwargs.get("repository"), kwargs))
+            Path(output).mkdir(parents=True, exist_ok=True)
+            kwargs["on_event"]({"stage": "publish", "state": "running", "at": "2026-10-10T03:00:00+00:00"})
+            return published
+
+        with (
+            mock.patch.object(flow, "tool_record", return_value=self._portable()),
+            mock.patch.object(flow.solidworks, "publish", side_effect=fake_publish),
+        ):
+            publish_receipt = flow.run_stage(
+                self.store,
+                self.store_root,
+                RUN,
+                "publish",
+                expected_subject=subject,
+                repository=repository,
+                base="main",
+                on_event=events.append,
+            )
+        publish_call = stages[1][4]
+        self.assertEqual(stages[1][1], self.store.sealed_path(verify_uri))
+        self.assertEqual(stages[1][2], self._paths(RUN).output_dir)
+        self.assertEqual(stages[1][3], repository)
+        self.assertEqual(publish_call["expected_subject"], subject)
+        self.assertEqual(publish_call["base"], "main")
+        self.assertEqual(publish_call["run_id"], RUN)
+        self.assertEqual(publish_call["handoff_sha256"], HANDOFF)
+        self.assertEqual(publish_receipt["state"], "published")
+        self.assertTrue(any(event.get("state") == "running" for event in events))
+        # The flow never registers; the caller seals and confirms the receipt.
+        self.assertNotIn((RUN, "publish"), self.world.stages)
+
 
 if __name__ == "__main__":
     unittest.main()
