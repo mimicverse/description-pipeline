@@ -515,6 +515,31 @@ class FakeCursor:
                 for item in world.operations.values()
             )
             self._rows = [(1,)] if found else []
+        elif normalized.startswith("SELECT count(*) FROM stage WHERE run_id = %s"):
+            self._rows = [(sum(1 for (run_id, _stage) in world.stages if run_id == params[0]),)]
+        elif normalized.startswith(
+            "SELECT operation_id, stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+            " FROM operation WHERE run_id = %s ORDER BY operation_id FOR UPDATE"
+        ):
+            rows = []
+            for key, record in sorted(world.operations.items()):
+                if record[4] != params[0]:
+                    continue
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    record[0], (None, None, None, None)
+                )
+                rows.append((record[0], record[5], record[6], record[1], dag_id, dag_run_id, task_id, map_index, key))
+            self._rows = rows
+        elif normalized.startswith("SELECT 'freeze'::text, ti.task_id, ti.map_index, ti.state FROM task_instance"):
+            dag_id, run_id, successor = params[0], params[1], params[4]
+            rows = []
+            for (task_dag, task_id, task_run, map_index), state in world.task_instances.items():
+                if task_dag == dag_id and task_run == run_id and task_id in {"freeze", successor}:
+                    rows.append(("freeze" if task_id == "freeze" else "successor", task_id, map_index, state))
+            dag_run_state = world.dag_runs.get((dag_id, run_id))
+            if dag_run_state is not None:
+                rows.append(("dag_run", None, None, dag_run_state))
+            self._rows = rows
         elif normalized.startswith("SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
             record = world.stages.get((params[0], params[1]))
             self._rows = [(record[0],)] if record else []
@@ -2695,6 +2720,201 @@ class OrphanReconcileTests(unittest.TestCase):
         with self.assertRaises(PlatformStoreError):
             self._call(RUN_A, dispatch_id, task="ghost_task")
         self.assertEqual(self._snapshot(), before)
+
+
+PREDISPATCH_RUN = "9c1f5e42-3b7d-4a8e-b0c2-5d6f7a8b9c0d"
+
+
+class PredispatchClosureTests(unittest.TestCase):
+    """The admitted-before-dispatch closure through the one canonical reconcile entry."""
+
+    DAG_RUN = "portal-predispatch-1"
+    EXCEPTION = (
+        "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
+    )
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="predispatch-closure-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.world = FakeWorld()
+        self.store = PlatformStore(self.world.connect)
+
+    # ------------------------------------------------------------------ fixtures
+    def _snapshot(self) -> dict:
+        return self.world.snapshot_state()
+
+    def _admit(self, *, dag_run_id: str = DAG_RUN) -> str:
+        self.store.admit_run(
+            request_id=f"portal-{dag_run_id}",
+            run_id=PREDISPATCH_RUN,
+            principal="portal",
+            target_hardware="m3.0",
+            main_assembly="3.0 总装.SLDASM",
+            dispatch={
+                "stage": "capture",
+                "operation_key": f"portal-{dag_run_id}/capture:0",
+                "params_digest": "a" * 64,
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": dag_run_id,
+            },
+        )
+        return PREDISPATCH_RUN
+
+    def _airflow_facts(
+        self,
+        *,
+        dag_run_id: str = DAG_RUN,
+        freeze: str = "failed",
+        capture: str = "upstream_failed",
+        dag_run: str = "failed",
+        freeze_map: int = -1,
+        capture_map: int = -1,
+    ) -> None:
+        self.world.task_instances[("solidworks_to_urdf", "freeze", dag_run_id, freeze_map)] = freeze
+        self.world.task_instances[("solidworks_to_urdf", "capture", dag_run_id, capture_map)] = capture
+        self.world.dag_runs[("solidworks_to_urdf", dag_run_id)] = dag_run
+
+    def _log(
+        self,
+        *,
+        dag_run_id: str = DAG_RUN,
+        task_id: str = "freeze",
+        map_index: int = -1,
+        exc_value: str = EXCEPTION,
+    ) -> Path:
+        record = {
+            "timestamp": "2026-10-16T13:51:10.237927Z",
+            "level": "error",
+            "event": "Task failed with exception",
+            "try_number": 1,
+            "run_id": dag_run_id,
+            "task_id": task_id,
+            "dag_id": "solidworks_to_urdf",
+            "map_index": map_index,
+            "error_detail": [{"exc_type": "AirflowFailException", "exc_value": exc_value, "exc_notes": []}],
+        }
+        path = self.tmp / f"failure-{task_id}-{map_index}-{len(list(self.tmp.iterdir()))}.log"
+        path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return path
+
+    def _reconcile(self, log: Path) -> dict:
+        evidence = [str(log)]
+        return {
+            "operation_key": f"operatorctl-reconcile:{PREDISPATCH_RUN}:freeze:failed",
+            "evidence": evidence,
+            "params_digest": digest({"outcome": "failed", "evidence": evidence, "binding": None}),
+        }
+
+    def _close(self, log: Path) -> None:
+        self.store.confirm_stage(run_id=PREDISPATCH_RUN, stage="freeze", state="failed", reconcile=self._reconcile(log))
+
+    # ------------------------------------------------------------------ positive
+    def test_the_closure_records_the_real_failure_and_cancels_the_never_issued_intent(self) -> None:
+        run_id = self._admit()
+        self._airflow_facts()
+        log = self._log()
+        self._close(log)
+        freeze = self.world.stages[(run_id, "freeze")]
+        self.assertEqual(freeze[0], "failed")
+        receipt = freeze[1]
+        self.assertEqual(receipt["error"], f"AirflowFailException: {self.EXCEPTION}")
+        self.assertTrue(receipt["admitted_before_dispatch"])
+        self.assertEqual(receipt["airflow_failure"], {"path": str(log), "sha256": file_digest(log)})
+        for later in ("discover", "capture", "generate", "verify", "publish"):
+            self.assertEqual(self.world.stages[(run_id, later)][0], "blocked")
+        self.assertEqual(self.world.run_states[run_id], "failed")
+        intent = self.world.operations["portal-portal-predispatch-1/capture:0"]
+        self.assertEqual(intent[1], "cancelled", "the never-issued intent closes as cancelled")
+        self.assertEqual(
+            self.world.operation_bindings[intent[0]],
+            ("solidworks_to_urdf", "portal-predispatch-1", "capture", -1),
+            "the recorded successor key is completed from its real unique row",
+        )
+        self.assertEqual(self.world.operations[f"operatorctl-reconcile:{run_id}:freeze:failed"][1], "succeeded")
+        kinds = [row[2] for row in self.world.events if row[0] == run_id]
+        self.assertEqual(kinds, ["stage", "stage", "stage", "stage", "stage", "binding", "stage"])
+
+    def test_the_same_evidence_replays_as_a_no_op(self) -> None:
+        self._admit()
+        self._airflow_facts()
+        log = self._log()
+        self._close(log)
+        before = self._snapshot()
+        self._close(log)
+        self.assertEqual(self._snapshot(), before, "the identical whole action repeats as a no-op")
+
+    def test_a_replay_with_changed_evidence_bytes_is_refused(self) -> None:
+        self._admit()
+        self._airflow_facts()
+        log = self._log()
+        self._close(log)
+        before = self._snapshot()
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("\n")
+        with self.assertRaisesRegex(PlatformStoreError, "does not match the recorded evidence"):
+            self._close(log)
+        self.assertEqual(self._snapshot(), before)
+
+    # ------------------------------------------------------------------ refusals
+    def test_every_executed_unresolved_or_ambiguous_shape_refuses_with_zero_change(self) -> None:
+        cases = (
+            "run_running",
+            "stage_rows",
+            "intent_claimed",
+            "intent_bound",
+            "freeze_upstream_failed",
+            "freeze_map_mismatch",
+            "capture_failed",
+            "capture_running",
+            "dag_run_running",
+            "ambiguous_freeze_rows",
+            "log_another_dag_run",
+            "log_not_freeze",
+        )
+        for name in cases:
+            with self.subTest(name=name):
+                self.setUp()
+                run_id = self._admit()
+                self._airflow_facts()
+                log = self._log()
+                if name == "run_running":
+                    self.world.run_states[run_id] = "running"
+                elif name == "stage_rows":
+                    self.store.confirm_stage(run_id=run_id, stage="discover", state="blocked")
+                elif name == "intent_claimed":
+                    self.store.start_run(run_id)
+                    self.store.claim_operation(
+                        run_id=run_id, stage="capture", operation_key="portal-portal-predispatch-1/capture:0"
+                    )
+                elif name == "intent_bound":
+                    intent_id = self.world.operations["portal-portal-predispatch-1/capture:0"][0]
+                    self.world.operation_bindings[intent_id] = (
+                        "solidworks_to_urdf",
+                        self.DAG_RUN,
+                        "capture",
+                        -1,
+                    )
+                elif name == "freeze_upstream_failed":
+                    self.world.task_instances[("solidworks_to_urdf", "freeze", self.DAG_RUN, -1)] = "upstream_failed"
+                elif name == "freeze_map_mismatch":
+                    self.world.task_instances.pop(("solidworks_to_urdf", "freeze", self.DAG_RUN, -1))
+                    self.world.task_instances[("solidworks_to_urdf", "freeze", self.DAG_RUN, 0)] = "failed"
+                elif name == "capture_failed":
+                    self.world.task_instances[("solidworks_to_urdf", "capture", self.DAG_RUN, -1)] = "failed"
+                elif name == "capture_running":
+                    self.world.task_instances[("solidworks_to_urdf", "capture", self.DAG_RUN, -1)] = "running"
+                elif name == "dag_run_running":
+                    self.world.dag_runs[("solidworks_to_urdf", self.DAG_RUN)] = "running"
+                elif name == "ambiguous_freeze_rows":
+                    self.world.task_instances[("solidworks_to_urdf", "freeze", self.DAG_RUN, 0)] = "failed"
+                elif name == "log_another_dag_run":
+                    log = self._log(dag_run_id="portal-predispatch-2")
+                elif name == "log_not_freeze":
+                    log = self._log(task_id="discover")
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._close(log)
+                self.assertEqual(self._snapshot(), before, "a refused closure leaves zero change")
 
 
 if __name__ == "__main__":

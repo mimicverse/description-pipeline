@@ -1457,14 +1457,14 @@ PY
       [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
       [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
       [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
-      # The derived environment writes the libpq DSNs unquoted: read them back from the
-      # file so the canonical action consumes the exact generation values.
-      [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
-      PLATFORM_SERVICE_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_SERVICE_DSN)"
-      PLATFORM_OPERATOR_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_OPERATOR_DSN)"
-      PIPELINE_STORE_ROOT="$(generation_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
-      export PLATFORM_SERVICE_DSN PLATFORM_OPERATOR_DSN PIPELINE_STORE_ROOT
     fi
+    # Every reconcile shape consumes the generation DSNs: read them back from the derived
+    # environment file so the canonical action always runs against the controlled values.
+    [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
+    PLATFORM_SERVICE_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_SERVICE_DSN)"
+    PLATFORM_OPERATOR_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_OPERATOR_DSN)"
+    PIPELINE_STORE_ROOT="$(generation_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
+    export PLATFORM_SERVICE_DSN PLATFORM_OPERATOR_DSN PIPELINE_STORE_ROOT
     RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \
     RECONCILE_EVIDENCE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
     RECONCILE_NATIVE_RECEIPT="$NATIVE_RECEIPT" RECONCILE_NATIVE_RUN_ID="$NATIVE_RUN_ID" \

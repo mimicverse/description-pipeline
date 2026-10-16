@@ -205,6 +205,96 @@ def load_native_failed_receipt(
     )
 
 
+@dataclass(frozen=True)
+class AirflowTaskFailureEvidence:
+    """The immutable, byte-bound Airflow task-failure fact a maintenance action carries.
+
+    Produced only by :func:`load_airflow_task_failure`: the original log bytes are read
+    once, their SHA-256 is computed from those bytes, and the record's own scheduling
+    identity plus the verbatim exception pair are validated before this value exists.
+    The predispatch closure consumes exactly this fact; nothing downstream re-derives,
+    fills in or rewrites it, and no native receipt is ever composed from it.
+    """
+
+    path: str
+    sha256: str
+    dag_id: str
+    run_id: str
+    task_id: str
+    map_index: int
+    try_number: int
+    exc_type: str
+    exc_value: str
+
+
+def load_airflow_task_failure(path: object) -> AirflowTaskFailureEvidence:
+    """Load one original Airflow task-failure log - the single acceptance source.
+
+    The bytes on disk are the authority: the Airflow task's own structured log carries one
+    JSON record per line, exactly one of which is the task's own failure (``Task failed
+    with exception``) with its complete scheduling identity (dag_id, run_id, task_id,
+    map_index, try_number) and its verbatim exception pair.  Nothing is defaulted or
+    guessed: a missing file, unreadable or non-JSON bytes, zero or several failure
+    records, or an incomplete identity/text refuses here.
+    """
+
+    log_path = Path(str(path))
+    try:
+        raw = log_path.read_bytes()
+    except OSError as error:
+        raise PlatformStoreError(f"The Airflow failure log is unreadable: {error}") from error
+    sha256 = hashlib.sha256(raw).hexdigest()
+    records: list[dict] = []
+    for number, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError as error:
+            raise PlatformStoreError(f"The Airflow failure log line {number} is not a JSON record") from error
+        if not isinstance(record, dict):
+            raise PlatformStoreError(f"The Airflow failure log line {number} is not a JSON object")
+        records.append(record)
+    failures = [record for record in records if record.get("event") == "Task failed with exception"]
+    if len(failures) != 1:
+        raise PlatformStoreError("The Airflow failure log must carry exactly one task-failure record")
+    record = failures[0]
+    dag_id = record.get("dag_id")
+    run_id = record.get("run_id")
+    task_id = record.get("task_id")
+    map_index = record.get("map_index")
+    try_number = record.get("try_number")
+    if not (
+        isinstance(dag_id, str)
+        and dag_id
+        and isinstance(run_id, str)
+        and run_id
+        and isinstance(task_id, str)
+        and task_id
+        and type(map_index) is int
+        and type(try_number) is int
+    ):
+        raise PlatformStoreError("The Airflow failure record lacks its scheduling identity fields")
+    details = record.get("error_detail")
+    if not isinstance(details, list) or len(details) != 1 or not isinstance(details[0], dict):
+        raise PlatformStoreError("The Airflow failure record must carry exactly one exception detail")
+    exc_type = details[0].get("exc_type")
+    exc_value = details[0].get("exc_value")
+    if not (isinstance(exc_type, str) and exc_type and isinstance(exc_value, str) and exc_value):
+        raise PlatformStoreError("The Airflow failure record lacks its verbatim exception text")
+    return AirflowTaskFailureEvidence(
+        path=str(log_path),
+        sha256=sha256,
+        dag_id=dag_id,
+        run_id=run_id,
+        task_id=task_id,
+        map_index=map_index,
+        try_number=try_number,
+        exc_type=exc_type,
+        exc_value=exc_value,
+    )
+
+
 def _report_member(path: object) -> bool:
     """The one class projection: ``reports/**`` members are report-class."""
 
@@ -310,6 +400,25 @@ _SETTLE_RECONCILE = (
     "UPDATE operation SET state = 'succeeded', updated_at = now()"
     " WHERE operation_id = %s AND run_id = %s AND stage = %s AND kind = 'reconcile'"
     " AND state <> 'succeeded'"
+)
+_LOCK_RUN_OPERATIONS = (
+    "SELECT operation_id, stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+    " FROM operation WHERE run_id = %s ORDER BY operation_id FOR UPDATE"
+)
+_COUNT_RUN_STAGES = "SELECT count(*) FROM stage WHERE run_id = %s"
+#: One statement carries the freeze task's, the recorded successor's and the DagRun's real
+#: facts: the UNION ALL evaluates them in a single statement snapshot - the write-side read
+#: of the original Airflow authority stays inside the one reconcile transaction, and a
+#: multi-row (ambiguous) key is never masked by a LIMIT.
+_READ_PREDISPATCH_FACTS = (
+    "SELECT 'freeze'::text, ti.task_id, ti.map_index, ti.state FROM task_instance ti"
+    " WHERE ti.dag_id = %s AND ti.run_id = %s AND ti.task_id = 'freeze'"
+    " UNION ALL"
+    " SELECT 'successor'::text, ti.task_id, ti.map_index, ti.state FROM task_instance ti"
+    " WHERE ti.dag_id = %s AND ti.run_id = %s AND ti.task_id = %s"
+    " UNION ALL"
+    " SELECT 'dag_run'::text, NULL, NULL, dr.state FROM dag_run dr"
+    " WHERE dr.dag_id = %s AND dr.run_id = %s"
 )
 _SETTLE_CACHE_RELEASE = (
     "UPDATE operation SET state = %s, updated_at = now()"
@@ -1044,6 +1153,15 @@ class PlatformStore:
             receipt, reconcile = self._byte_bound_orphan_receipt(
                 run_id=run_id, stage=stage, state=state, receipt=receipt, reconcile=reconcile
             )
+        elif reconcile is not None:
+            # The admitted-before-dispatch closure composes its own receipt from the
+            # byte-bound original Airflow failure log; every other reconcile shape stays
+            # untouched and falls through to the existing paths.
+            predispatch = self._predispatch_closure_receipt(
+                run_id=run_id, stage=stage, state=state, reconcile=reconcile
+            )
+            if predispatch is not None:
+                receipt = predispatch
         definition = None
         sealed_root = None
         reuse_binding = None
@@ -1097,6 +1215,23 @@ class PlatformStore:
                         cursor.execute(_READ_STAGE_ROW, (run_id, stage))
                         stored = cursor.fetchone()
                         stored_receipt = _stored_receipt(stored)
+                        if isinstance(stored_receipt, dict) and stored_receipt.get("admitted_before_dispatch") is True:
+                            # The predispatch closure replays only with the identical original
+                            # bytes: the recorded digest must equal the freshly composed one.
+                            recorded = stored_receipt.get("airflow_failure")
+                            incoming = (receipt or {}).get("airflow_failure")
+                            if (
+                                current == state
+                                and _stored_reconciliation(stored) == reconcile
+                                and isinstance(recorded, dict)
+                                and isinstance(incoming, dict)
+                                and recorded.get("path") == incoming.get("path")
+                                and recorded.get("sha256") == incoming.get("sha256")
+                            ):
+                                return
+                            raise PlatformStoreError(
+                                "The repeated predispatch closure does not match the recorded evidence; refused"
+                            )
                         if (
                             current == state
                             and _stored_reconciliation(stored) == reconcile
@@ -1127,6 +1262,17 @@ class PlatformStore:
                         run_state=run_state,
                         checkpoint_uri=checkpoint_uri,
                         reused_from_run=reused_from_run,
+                    )
+                    return
+                if isinstance(receipt, dict) and receipt.get("admitted_before_dispatch") is True:
+                    self._reconcile_admitted_before_dispatch(
+                        connection,
+                        run_id=run_id,
+                        stage=stage,
+                        state=state,
+                        receipt=receipt,
+                        reconcile=reconcile,
+                        run_state=run_state,
                     )
                     return
                 raise PlatformStoreError("Reconciliation requires the unresolved stage record of this run")
@@ -1321,6 +1467,155 @@ class PlatformStore:
         resolved = {key: value for key, value in reconcile.items() if key not in {"operation_key", "params_digest"}}
         resolved["operation_id"] = record.operation_id
         return resolved
+
+    def _predispatch_closure_receipt(self, *, run_id: str, stage: str, state: str, reconcile: dict) -> dict | None:
+        """The admitted-before-dispatch closure's composed receipt, or None for other shapes.
+
+        The flavor is recognized by the recorded reconcile shape alone: freeze failed with
+        exactly one evidence file that parses as the freeze task's own Airflow failure log.
+        The composed receipt binds the original bytes by digest and preserves the exception
+        verbatim; every later guard (queued run, no stage rows, the one unclaimed unbound
+        dispatch intent, the real Airflow facts read in one snapshot) runs inside the one
+        write transaction.
+        """
+        if stage != "freeze" or state != "failed":
+            return None
+        evidence = reconcile.get("evidence")
+        if not (isinstance(evidence, list) and len(evidence) == 1 and isinstance(evidence[0], str)):
+            return None
+        try:
+            loaded = load_airflow_task_failure(evidence[0])
+        except PipelineError:
+            # Not an Airflow failure log: every other reconcile keeps its existing paths.
+            return None
+        if loaded.task_id != "freeze":
+            return None
+        return {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "stage": "freeze",
+            "state": "failed",
+            "passed": False,
+            "error": f"{loaded.exc_type}: {loaded.exc_value}",
+            "admitted_before_dispatch": True,
+            "airflow_failure": {"path": loaded.path, "sha256": loaded.sha256},
+        }
+
+    def _reconcile_admitted_before_dispatch(
+        self, connection, *, run_id: str, stage: str, state: str, receipt: dict, reconcile: dict, run_state: object
+    ) -> None:
+        """Close one admitted, never-dispatched run from its original records, atomically.
+
+        Boundary (the frozen recovery contract): only a run still ``queued`` with zero stage
+        records and exactly the one unclaimed, unbound dispatch intent may close here.  One
+        statement reads the original Airflow authority (the freeze task, the recorded
+        successor task, the DagRun) inside this transaction; the freeze failure text is the
+        verbatim exception from the byte-bound original log, whose embedded identity must
+        equal the recorded DagRun identity and the real freeze row.  The recorded successor
+        key is completed from its real unique row - never defaulted, never borrowed from the
+        freeze task - the never-issued intent closes as cancelled, freeze records failed
+        with its downstream stages blocked, and the run settles failed; any executed,
+        unresolved, active, ambiguous, missing or mismatched fact refuses with zero writes.
+        """
+        if state != "failed" or stage != "freeze":
+            raise PlatformStoreError("The predispatch closure records the freeze failure only")
+        if run_state != "queued":
+            raise PlatformStoreError("The predispatch closure requires the never-started queued run")
+        loaded = load_airflow_task_failure((reconcile.get("evidence") or [""])[0])
+        recorded = receipt.get("airflow_failure")
+        if not (
+            isinstance(recorded, dict)
+            and recorded.get("path") == loaded.path
+            and recorded.get("sha256") == loaded.sha256
+        ):
+            raise PlatformStoreError("The predispatch evidence changed between composition and commit; refused")
+
+        cursor = connection.cursor()
+        cursor.execute(_COUNT_RUN_STAGES, (run_id,))
+        if cursor.fetchone()[0] != 0:
+            raise PlatformStoreError("The run carries stage results; the predispatch closure refuses")
+        cursor.execute(_LOCK_RUN_OPERATIONS, (run_id,))
+        operations = [row for row in cursor.fetchall() if row[2] not in {"reconcile", "cache_release"}]
+        if len(operations) != 1:
+            raise PlatformStoreError("The predispatch closure requires exactly the one recorded dispatch intent")
+        operation_id, op_stage, kind, op_state, dag_id, dag_run_id, task_id, map_index, operation_key = operations[0]
+        if (
+            kind != "dispatch"
+            or op_state != "queued"
+            or task_id is not None
+            or map_index is not None
+            or not (isinstance(dag_id, str) and dag_id and isinstance(dag_run_id, str) and dag_run_id)
+        ):
+            raise PlatformStoreError("The recorded dispatch intent is not an unclaimed, unbound queued intent")
+        if not (isinstance(op_stage, str) and op_stage in STAGE_IDS):
+            raise PlatformStoreError("The dispatch intent records no canonical successor stage")
+        if STAGE_IDS.index(op_stage) <= STAGE_IDS.index("freeze"):
+            raise PlatformStoreError("The dispatch intent names no successor after freeze; refused")
+        if loaded.dag_id != dag_id or loaded.run_id != dag_run_id:
+            raise PlatformStoreError("The Airflow failure log names another DagRun than the recorded dispatch")
+
+        cursor.execute(_READ_PREDISPATCH_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id, op_stage, dag_id, dag_run_id))
+        facts = cursor.fetchall()
+        freeze_rows = [row for row in facts if row[0] == "freeze"]
+        successor_rows = [row for row in facts if row[0] == "successor"]
+        dag_run_rows = [row for row in facts if row[0] == "dag_run"]
+        if len(freeze_rows) != 1 or len(successor_rows) != 1 or len(dag_run_rows) != 1:
+            raise PlatformStoreError("The Airflow facts are missing or ambiguous; the predispatch closure refuses")
+        _, freeze_task, freeze_map, freeze_state = freeze_rows[0]
+        _, successor_task, successor_map, successor_state = successor_rows[0]
+        _, _, _, dag_run_state = dag_run_rows[0]
+        if freeze_task != "freeze" or freeze_state != "failed" or freeze_map != loaded.map_index:
+            raise PlatformStoreError("The freeze task does not prove its own failed fact; refused")
+        if successor_task != op_stage or successor_state != "upstream_failed":
+            raise PlatformStoreError("The recorded successor task does not prove its never-executed fact; refused")
+        if dag_run_state != "failed":
+            raise PlatformStoreError("The DagRun does not prove its terminal failed fact; refused")
+
+        cursor.execute(_BIND_ORPHAN_OPERATION, (successor_task, successor_map, operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The dispatch intent lost its unbound queued row to another writer; refused")
+        payload_receipt = {**receipt, "reconciliation": reconcile}
+        cursor.execute(_INSERT_STAGE, (run_id, "freeze", "failed", _json(payload_receipt), None, None, None))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The predispatch freeze record lost its run to another writer")
+        for later in STAGE_IDS[STAGE_IDS.index("freeze") + 1 :]:
+            cursor.execute(_INSERT_STAGE, (run_id, later, "blocked", _json({}), None, None, None))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError("The predispatch blocked record lost its run to another writer")
+            self._insert_event(
+                connection, run_id=run_id, stage=later, kind="stage", operation_id=None, payload={"state": "blocked"}
+            )
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage="freeze",
+            kind="binding",
+            operation_id=operation_id,
+            payload={
+                "operation_key": operation_key,
+                "intent_stage": op_stage,
+                "reconciled_stage": "freeze",
+                "reconciled_state": "failed",
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": successor_task,
+                "map_index": successor_map,
+                "airflow_failure_sha256": loaded.sha256,
+            },
+        )
+        reconcile_operation = reconcile.get("operation_id")
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage="freeze",
+            kind="stage",
+            operation_id=reconcile_operation,
+            payload={"state": "failed"},
+        )
+        self._stage_outcome(connection, run_id=run_id, stage="freeze", state="failed")
+        cursor.execute(_SETTLE_ORPHAN_INTENT, ("cancelled", operation_id, run_id))
+        cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "freeze"))
 
     def _reconcile_orphan_binding(
         self,
