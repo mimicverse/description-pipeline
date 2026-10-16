@@ -1998,10 +1998,7 @@ class OrphanReconcileTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.world = FakeWorld()
-        self.store = PlatformStore(
-            self.world.connect,
-            dag_run_states=lambda dag_id, dag_run_id: self.world.dag_runs.get((dag_id, dag_run_id)),
-        )
+        self.store = PlatformStore(self.world.connect)
 
     # ------------------------------------------------------------------ fixtures
     def _legacy_orphan(self, run_id: str, *, dag_run_id: str | None = None) -> str:
@@ -2178,14 +2175,14 @@ class OrphanReconcileTests(unittest.TestCase):
     # ------------------------------------------------------------------ refusals
     def test_unprovable_or_conflicting_bindings_change_nothing(self) -> None:
         cases = {
-            "ghost_task": dict(task="ghost_task"),
+            "ghost_task": {"task": "ghost_task"},
             # upstream_failed never executed: the sibling's existence is not intent binding.
-            "unexecuted_sibling": dict(task="run_publish"),
-            "live_task": dict(task="fetch_capture"),
-            "green_task": dict(task="resolve_handoff"),
-            "wrong_map_index": dict(map_index=0),
-            "foreign_native_uuid": dict(native_run="deadbeef-0000-4000-8000-000000000000"),
-            "foreign_receipt_digest": dict(claimed_sha="0" * 64),
+            "unexecuted_sibling": {"task": "run_publish"},
+            "live_task": {"task": "fetch_capture"},
+            "green_task": {"task": "resolve_handoff"},
+            "wrong_map_index": {"map_index": 0},
+            "foreign_native_uuid": {"native_run": "deadbeef-0000-4000-8000-000000000000"},
+            "foreign_receipt_digest": {"claimed_sha": "0" * 64},
         }
         for name, overrides in cases.items():
             with self.subTest(name=name):
@@ -2240,42 +2237,45 @@ class OrphanReconcileTests(unittest.TestCase):
 
         cases = {
             # A shaped digest string over a file that does not exist proves nothing.
-            "missing_file": dict(native_path="/nonexistent/review/native.json"),
-            "empty_document": dict(native_document={}),
-            "report_shaped_document": dict(
-                native_document={"schema_version": "solidworks-to-urdf.structural-report/v1", "passed": True}
-            ),
-            "completed_receipt": dict(
-                native_document=job_document(status="passed", events=[{"stage": "freeze", "state": "passed"}])
-            ),
-            "passed_terminal_event": dict(
-                native_document=job_document(
-                    events=[{"stage": "freeze", "state": "passed", "error": None}, {"stage": "capture", "state": "failed"}]
+            "missing_file": {"native_path": "/nonexistent/review/native.json"},
+            "empty_document": {"native_document": {}},
+            "report_shaped_document": {
+                "native_document": {"schema_version": "solidworks-to-urdf.structural-report/v1", "passed": True}
+            },
+            "completed_receipt": {
+                "native_document": job_document(status="passed", events=[{"stage": "freeze", "state": "passed"}])
+            },
+            "passed_terminal_event": {
+                "native_document": job_document(
+                    events=[
+                        {"stage": "freeze", "state": "passed", "error": None},
+                        {"stage": "capture", "state": "failed"},
+                    ]
                 )
-            ),
-            "no_terminal_event": dict(native_document=job_document(events=[])),
-            "ambiguous_terminal_events": dict(
-                native_document=job_document(
+            },
+            "no_terminal_event": {"native_document": job_document(events=[])},
+            "ambiguous_terminal_events": {
+                "native_document": job_document(
                     events=[
                         {"stage": "freeze", "state": "failed"},
                         {"stage": "capture", "state": "failed"},
                     ]
                 )
-            ),
-            "foreign_receipt_run": dict(
-                native_document=job_document(
+            },
+            "foreign_receipt_run": {
+                "native_document": job_document(
                     run_id="deadbeef-0000-4000-8000-000000000000",
                     request={"run_id": "deadbeef-0000-4000-8000-000000000000"},
                 )
-            ),
-            "foreign_receipt_stage": dict(
-                native_document=job_document(events=[{"stage": "capture", "state": "failed"}])
-            ),
-            "foreign_receipt_job": dict(
-                native_document=job_document(
+            },
+            "foreign_receipt_stage": {
+                "native_document": job_document(events=[{"stage": "capture", "state": "failed"}])
+            },
+            "foreign_receipt_job": {
+                "native_document": job_document(
                     run_id=NATIVE_RUNS[RUN_B], request={"run_id": NATIVE_RUNS[RUN_B]}
                 )
-            ),
+            },
         }
         for name, overrides in cases.items():
             with self.subTest(name=name):
@@ -2289,9 +2289,9 @@ class OrphanReconcileTests(unittest.TestCase):
 
     def test_the_native_identity_must_derive_from_the_runs_own_dag_run(self) -> None:
         for name, overrides in {
-            "empty": dict(native_run=""),
-            "not_a_uuid": dict(native_run="not-a-uuid"),
-            "another_runs_job": dict(native_run=NATIVE_RUNS[RUN_B]),
+            "empty": {"native_run": ""},
+            "not_a_uuid": {"native_run": "not-a-uuid"},
+            "another_runs_job": {"native_run": NATIVE_RUNS[RUN_B]},
         }.items():
             with self.subTest(name=name):
                 self.setUp()
@@ -2407,43 +2407,6 @@ class OrphanReconcileTests(unittest.TestCase):
                 self.assertEqual(self._snapshot(), before, "the refused direct call changed nothing")
                 self.assertEqual(self.world.run_states.get(RUN_A), "queued")
 
-    def test_a_missing_runtime_authority_refuses_recovery(self) -> None:
-        """Without the Airflow runtime authority, the Store acceptance refuses - fail closed."""
-
-        dispatch_id = self._legacy_orphan(RUN_A)
-        directory = Path(tempfile.mkdtemp(prefix="orphan-authority-"))
-        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-        original = directory / "original.json"
-        original.write_text(
-            json.dumps(
-                {
-                    "schema_version": "solidworks-to-urdf.job/v1",
-                    "pipeline_id": PIPELINE_ID,
-                    "run_id": NATIVE_RUNS[RUN_A],
-                    "request": {"run_id": NATIVE_RUNS[RUN_A]},
-                    "status": "failed",
-                    "events": [{"stage": "freeze", "state": "failed"}],
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        store = PlatformStore(
-            self.world.connect,
-            dag_run_states=None,
-        )
-        reconcile = {
-            "operation_key": f"operatorctl-reconcile:{RUN_A}:freeze:failed",
-            "params_digest": digest({"outcome": "failed", "evidence": [], "binding": dispatch_id}),
-            "evidence": [],
-            "binding": {"operation_id": dispatch_id, "task_id": "start_job", "map_index": -1},
-            "native_receipt": {"path": str(original), "native_run_id": NATIVE_RUNS[RUN_A]},
-        }
-        before = self._snapshot()
-        with self.assertRaises(PlatformStoreError):
-            store.confirm_stage(run_id=RUN_A, stage="freeze", state="failed", reconcile=reconcile)
-        self.assertEqual(self._snapshot(), before)
-
     def test_a_live_or_unknown_dag_run_never_authorizes_recovery(self) -> None:
         for name, dag_state in (("live", "running"), ("green", "success")):
             with self.subTest(name=name):
@@ -2494,8 +2457,8 @@ class OrphanReconcileTests(unittest.TestCase):
         registered = self._registered_reconcile(RUN_A)
         before = self._snapshot()
         for overrides in (
-            dict(native_run="deadbeef-0000-4000-8000-000000000000"),
-            dict(task="run_publish"),
+            {"native_run": "deadbeef-0000-4000-8000-000000000000"},
+            {"task": "run_publish"},
         ):
             with self.assertRaises(PlatformStoreError):
                 self._call(RUN_A, dispatch_id, reconcile_operation_id=registered, **overrides)

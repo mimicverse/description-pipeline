@@ -1281,9 +1281,9 @@ PY
       # file so the canonical action consumes the exact generation values.
       [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
       PLATFORM_SERVICE_DSN="$(derived_env_value "$ENV_FILE" PLATFORM_SERVICE_DSN)"
-      AIRFLOW_RUNTIME_DB_URL="$(derived_env_value "$ENV_FILE" AIRFLOW_RUNTIME_DB_URL)"
       PLATFORM_OPERATOR_DSN="$(derived_env_value "$ENV_FILE" PLATFORM_OPERATOR_DSN)"
-      export PLATFORM_SERVICE_DSN AIRFLOW_RUNTIME_DB_URL PLATFORM_OPERATOR_DSN
+      PIPELINE_STORE_ROOT="$(derived_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
+      export PLATFORM_SERVICE_DSN PLATFORM_OPERATOR_DSN PIPELINE_STORE_ROOT
     fi
     RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \
     RECONCILE_EVIDENCE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
