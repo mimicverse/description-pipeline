@@ -2,7 +2,7 @@
 -- Run through apply.sh, which supplies :airflow_schema (default: airflow).
 --
 -- lifecycle_projection:
---   object_kind in (request, run, stage, operation, scheduling).  state is the raw source
+--   object_kind in (request, run, stage, operation, scheduling, dag_run).  state is the raw source
 --   value - NULL included, never pre-filtered.  bucket is computed here (the single owner of
 --   the interpretation) from the per-object vocabulary; NULL or an unrecognized value always
 --   becomes unknown.
@@ -14,6 +14,11 @@
 --   unknown (no INNER JOIN, no silent loss).  Only an explicit map_index = -1 (the real
 --   unmapped-task value) can bind.  For a present source row updated_at freezes to
 --   end_date, falling back to start_date.
+--   dag_run rows: one per DagRun referenced by a platform operation (the same binding the
+--   scheduling rows use), carrying the real dag_run.state raw - the settledness evidence of
+--   the actual Airflow schedule on the same association.  A live DagRun is activity for the
+--   gates, so an orphan binding can never claim a settled failure while its own DagRun is
+--   still in flight.
 --   request rows are accepted facts for reports only; the stop/drain gates ignore the kind.
 
 CREATE OR REPLACE VIEW :"platform_schema".lifecycle_projection AS
@@ -84,6 +89,23 @@ FROM (
           AND ti.run_id = o.dag_run_id
           AND ti.map_index = o.map_index
     WHERE o.kind IN ('dispatch', 'native', 'publish', 'cancel')
+    UNION ALL
+    SELECT 'dag_run'::text,
+           dr.dag_id || '/' || dr.run_id,
+           dr.run_id,
+           dr.state,
+           CASE
+               WHEN dr.state IN ('success', 'failed') THEN 'terminal'
+               WHEN dr.state IN ('queued', 'running') THEN 'in_flight'
+               ELSE 'unknown'
+           END,
+           COALESCE(dr.end_date, dr.start_date)
+    FROM :"airflow_schema".dag_run dr
+    WHERE EXISTS (
+        SELECT 1
+        FROM :"platform_schema".operation o
+        WHERE o.dag_id = dr.dag_id AND o.dag_run_id = dr.run_id
+    )
 ) AS rows;
 
 CREATE OR REPLACE VIEW :"platform_schema".admission_projection AS

@@ -16,6 +16,8 @@ closes the connection again; no transaction ever spans an external call.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import uuid
 from collections.abc import Callable, Mapping
@@ -27,6 +29,7 @@ from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
+from ..orchestration.airflow_client import JOB_SCHEMA, native_run_id
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -87,6 +90,100 @@ class OperationClaim:
 
     record: OperationRecord
     granted: bool
+
+
+@dataclass(frozen=True)
+class NativeReceiptEvidence:
+    """The immutable, byte-bound native failed-receipt fact a maintenance action carries.
+
+    Produced only by :func:`load_native_failed_receipt`: the original receipt bytes are
+    read once, their SHA-256 is computed from those bytes, and the native identity fields
+    are validated against the bound endpoint-job UUID and stage before this value
+    exists.  The reconcile action consumes exactly this fact; nothing downstream
+    re-derives, fills in or rewrites its terminal state.
+    """
+
+    path: str
+    sha256: str
+    native_run_id: str
+    stage: str
+    state: str
+    error: str | None
+    error_code: str | None
+    detail: object
+
+
+#: The job contract's final states: a terminal event row is one of these, and only a
+#: ``failed`` terminal row authorizes the failure reconciliation.
+NATIVE_TERMINAL_STATES = frozenset({"passed", "failed"})
+
+
+def load_native_failed_receipt(
+    path: object, *, stage: str, native_run_id: str
+) -> NativeReceiptEvidence:
+    """Load and validate one original native failed receipt - the single acceptance source.
+
+    The bytes on disk are the authority: they are read once, the receipt digest is
+    computed from them, and the parsed document must be the bound endpoint job's own
+    terminal failure under the real native job contract (``JOB_SCHEMA``): its identity
+    fields name exactly the bound UUID, its request carries the same UUID, its status is
+    ``failed``, and its events carry exactly one terminal row - ``failed`` at the bound
+    stage.  A missing file, malformed bytes, a report-shaped document or any other
+    identity/state refuses here, before the store transaction is ever entered; every
+    caller (the operator entry and the maintenance route alike) shares this one
+    implementation.
+    """
+
+    receipt_path = Path(str(path))
+    try:
+        raw = receipt_path.read_bytes()
+    except OSError as error:
+        raise PlatformStoreError(f"The native failed receipt is unreadable: {error}") from error
+    sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        document = json.loads(raw)
+    except ValueError as error:
+        raise PlatformStoreError("The native failed receipt is not a JSON document") from error
+    if not isinstance(document, dict):
+        raise PlatformStoreError("The native failed receipt must be a JSON object")
+    if document.get("schema_version") != JOB_SCHEMA:
+        raise PlatformStoreError("The native receipt is not a native job document under the job contract")
+    if document.get("pipeline_id") != PIPELINE_ID:
+        raise PlatformStoreError("The native failed receipt names another pipeline")
+    if not _is_canonical_uuid(native_run_id):
+        raise PlatformStoreError("The bound endpoint job UUID is not canonical")
+    if document.get("run_id") != native_run_id:
+        raise PlatformStoreError("The native failed receipt names another endpoint job")
+    request = document.get("request")
+    if not isinstance(request, dict) or request.get("run_id") != native_run_id:
+        raise PlatformStoreError("The native receipt's request does not carry the bound endpoint job")
+    if document.get("status") != "failed":
+        raise PlatformStoreError("The native receipt is not the bound job's failed terminal fact")
+    events = [event for event in document.get("events") or [] if isinstance(event, dict)]
+    terminal = [event for event in events if event.get("state") in NATIVE_TERMINAL_STATES]
+    if len(terminal) != 1:
+        raise PlatformStoreError("The native receipt must carry exactly one terminal event row")
+    if terminal[0].get("state") != "failed":
+        raise PlatformStoreError("The native receipt's terminal event is not a failure")
+    if terminal[0].get("stage") != stage:
+        raise PlatformStoreError("The native receipt's terminal event names another stage")
+
+    detail = document.get("detail")
+    error = terminal[0].get("error")
+    if not isinstance(error, str) or not error:
+        error = document.get("error")
+    error_code = document.get("error_code")
+
+    return NativeReceiptEvidence(
+        path=str(receipt_path),
+        sha256=sha256,
+        native_run_id=native_run_id,
+        stage=stage,
+        state="failed",
+        error=error if isinstance(error, str) and error else None,
+        error_code=error_code if isinstance(error_code, str) and error_code else None,
+        detail=detail,
+    )
 
 
 def _report_member(path: object) -> bool:
@@ -221,6 +318,28 @@ _FIND_UNKNOWN_ORIGIN = (
     "SELECT 1 FROM operation"
     " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'unresolved' LIMIT 1"
 )
+_READ_ORPHAN_OPERATION = (
+    "SELECT stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+    " FROM operation WHERE operation_id = %s AND run_id = %s FOR UPDATE"
+)
+_BIND_ORPHAN_OPERATION = (
+    "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND task_id IS NULL AND map_index IS NULL"
+    " RETURNING operation_id"
+)
+#: One statement carries every lifecycle fact of the orphan acceptance: a single
+#: query evaluates the view once, so the task's and the DagRun's states are always
+#: the same database snapshot - two separate reads are never a snapshot.
+_READ_ORPHAN_LIFECYCLE = (
+    "SELECT object_kind, state, bucket FROM lifecycle_projection"
+    " WHERE (object_kind = 'scheduling' AND object_id = %s)"
+    "    OR (object_kind = 'dag_run' AND object_id = %s)"
+)
+_SETTLE_ORPHAN_INTENT = (
+    "UPDATE operation SET state = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND state = 'queued'"
+    " AND kind NOT IN ('reconcile', 'cache_release')"
+)
 _INSERT_STAGE = (
     "INSERT INTO stage (run_id, stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at)"
     " VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)"
@@ -263,6 +382,61 @@ _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
 
 #: The bound on the registered reuse lineage of one attempt; a longer chain is malformed.
 REUSE_LINEAGE_DEPTH = 256
+
+def _stored_receipt(row) -> dict | None:
+    """The parsed receipt of one locked stage row (jsonb arrives as text or a mapping)."""
+
+    receipt = row[1] if row and len(row) > 1 else None
+    if isinstance(receipt, str):
+        try:
+            receipt = json.loads(receipt)
+        except ValueError:
+            return None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _stored_reconciliation(row) -> object:
+    """The recorded reconciliation of one locked stage row, for idempotent repeats."""
+
+    receipt = _stored_receipt(row)
+    return receipt.get("reconciliation") if receipt is not None else None
+
+
+def _native_receipt_identity(receipt: object) -> tuple:
+    """The bound native identity of one receipt: endpoint job UUID plus failed receipt digest.
+
+    A repeat is only the same recorded fact when this identity is unchanged;
+    a receipt that renames the native job or its digest is a conflicting
+    submission, never an idempotent one.
+    """
+
+    if not isinstance(receipt, dict):
+        return (None, None)
+    return (receipt.get("native_run_id"), receipt.get("native_receipt_sha256"))
+
+
+def _evidence_digests(entries: object) -> set:
+    """The ``path#sha256=...`` digest fragments a reconciliation's evidence entries bind."""
+
+    digests = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, str) and "#sha256=" in entry:
+            fragment = entry.split("#sha256=", 1)[1]
+            if _is_sha256(fragment):
+                digests.add(fragment)
+    return digests
+
+
+def _is_canonical_uuid(value: object) -> bool:
+    """One canonical lowercase UUID string, the endpoint job identity shape."""
+
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return value == parsed
 
 
 def _json(value: Any) -> str | None:
@@ -463,16 +637,7 @@ class PlatformStore:
             return existing
         binding = self._rebind_predecessor(run_id=run_id, stage=stage, kind=kind)
         with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute(_FIND_OPERATION, (operation_key,))
-            row = cursor.fetchone()
-            if row is not None:
-                return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
-            if stage not in STAGE_IDS:
-                raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
-            self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind, claiming=False)
-            _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
-            return self._insert_operation(
+            return self._register_operation_locked(
                 connection,
                 run_id=run_id,
                 stage=stage,
@@ -480,7 +645,48 @@ class PlatformStore:
                 operation_key=operation_key,
                 params_digest=params_digest,
                 dispatch=dispatch or {},
+                binding=binding,
             )
+
+    def _register_operation_locked(
+        self,
+        connection,
+        *,
+        run_id: str,
+        stage: str,
+        kind: str,
+        operation_key: str,
+        params_digest: str,
+        dispatch: dict,
+        binding: dict | None = None,
+    ) -> OperationRecord:
+        """The in-transaction core of ``register_operation``.
+
+        The same key with the same scope and parameters returns the recorded
+        operation; a conflict refuses without touching anything else.  The
+        reconcile confirmation calls this core inside its own write
+        transaction, so the maintenance registration, the binding backfill and
+        the settlement commit or roll back as one short unit.
+        """
+
+        cursor = connection.cursor()
+        cursor.execute(_FIND_OPERATION, (operation_key,))
+        row = cursor.fetchone()
+        if row is not None:
+            return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
+        if stage not in STAGE_IDS:
+            raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+        self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind, claiming=False)
+        _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
+        return self._insert_operation(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind=kind,
+            operation_key=operation_key,
+            params_digest=params_digest,
+            dispatch=dispatch,
+        )
 
     def claim_operation(self, *, run_id: str, stage: str, operation_key: str) -> OperationClaim:
         """Claim a registered operation as ``running`` (queued -> running; idempotent).
@@ -788,6 +994,10 @@ class PlatformStore:
             raise PlatformStoreError("Reconciliation evidence must be a non-empty record")
         if reconcile is not None and state not in {"completed", "failed", "cancelled"}:
             raise PlatformStoreError("A reconciliation confirms a definite outcome; unresolved is not an outcome")
+        if reconcile is not None and isinstance(reconcile.get("binding"), dict):
+            receipt, reconcile = self._byte_bound_orphan_receipt(
+                run_id=run_id, stage=stage, state=state, receipt=receipt, reconcile=reconcile
+            )
         definition = None
         sealed_root = None
         reuse_binding = None
@@ -824,13 +1034,31 @@ class PlatformStore:
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
-            if cursor.fetchone() is None:
+            run_row = cursor.fetchone()
+            if run_row is None:
                 raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            run_state = run_row[0]
+            if reconcile is not None:
+                reconcile = self._reconcile_operation(
+                    connection, run_id=run_id, stage=stage, reconcile=reconcile
+                )
             cursor.execute(_LOCK_STAGE, (run_id, stage))
             row = cursor.fetchone()
             current = row[0] if row else None
             if current is not None:
                 if current in TERMINAL_STAGE_STATES:
+                    if reconcile is not None:
+                        cursor.execute(_READ_STAGE_ROW, (run_id, stage))
+                        stored = cursor.fetchone()
+                        stored_receipt = _stored_receipt(stored)
+                        if (
+                            current == state
+                            and _stored_reconciliation(stored) == reconcile
+                            and _native_receipt_identity(stored_receipt) == _native_receipt_identity(receipt)
+                        ):
+                            # The same operation, evidence, binding, native identity and outcome
+                            # repeated: return the recorded result and change nothing.
+                            return
                     raise PlatformStoreError(
                         f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
                     )
@@ -841,6 +1069,20 @@ class PlatformStore:
                 if current != "unresolved" and reconcile is not None:
                     raise PlatformStoreError("Reconciliation only confirms an unresolved stage")
             elif reconcile is not None:
+                if isinstance(reconcile.get("binding"), dict):
+                    self._reconcile_orphan_binding(
+                        connection,
+                        cursor,
+                        run_id=run_id,
+                        stage=stage,
+                        state=state,
+                        receipt=receipt,
+                        reconcile=reconcile,
+                        run_state=run_state,
+                        checkpoint_uri=checkpoint_uri,
+                        reused_from_run=reused_from_run,
+                    )
+                    return
                 raise PlatformStoreError("Reconciliation requires the unresolved stage record of this run")
             if reused_from_run is not None:
                 cursor.execute(_READ_RUN_PARENT, (run_id,))
@@ -930,6 +1172,246 @@ class PlatformStore:
                 payload={"state": state},
             )
             self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+
+    def _byte_bound_orphan_receipt(
+        self, *, run_id: str, stage: str, state: str, receipt: dict | None, reconcile: dict
+    ) -> tuple[dict, dict]:
+        """Compose an orphan's failed receipt from the original native bytes - the one rule.
+
+        An orphan recovery never accepts a formed receipt or a digest string: the
+        reconciliation carries the raw inputs (the original file and the bound
+        endpoint job UUID) and this Store action itself loads the bytes, validates
+        the native job document, binds the outcome and identity, derives the digest
+        from those bytes, and normalizes the recorded evidence to that digest.  The
+        caller's layers hold no acceptance rules and cannot bypass the bytes.
+        """
+
+        if state != "failed":
+            raise PlatformStoreError("An orphan reconciliation records the observed failure")
+        if receipt is not None:
+            raise PlatformStoreError(
+                "An orphan recovery carries its original receipt inputs, never a formed receipt"
+            )
+        inputs = reconcile.get("native_receipt")
+        if not isinstance(inputs, dict):
+            raise PlatformStoreError(
+                "An orphan reconciliation must carry its original native receipt (path and endpoint job UUID)"
+            )
+        path = inputs.get("path")
+        native_run_id = inputs.get("native_run_id")
+        if not isinstance(path, str) or not path or not isinstance(native_run_id, str) or not native_run_id:
+            raise PlatformStoreError("The orphan receipt inputs name their original file and endpoint job UUID")
+        loaded = load_native_failed_receipt(path, stage=stage, native_run_id=native_run_id)
+        digest_entry = f"{loaded.path}#sha256={loaded.sha256}"
+        entries = reconcile.get("evidence")
+        entries = list(entries) if isinstance(entries, list) else []
+        contradicting = [
+            item
+            for item in entries
+            if isinstance(item, str)
+            and item.startswith(f"{loaded.path}#sha256=")
+            and item.split("#sha256=", 1)[1] != loaded.sha256
+        ]
+        if contradicting:
+            raise PlatformStoreError(f"The evidence entry contradicts the original receipt bytes: {contradicting[0]}")
+        normalized_evidence = [
+            item
+            for item in entries
+            if not (isinstance(item, str) and (item == loaded.path or item.startswith(f"{loaded.path}#")))
+        ] + [digest_entry]
+        composed = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": run_id,
+            "stage": loaded.stage,
+            "state": loaded.state,
+            "passed": False,
+            "native_run_id": loaded.native_run_id,
+            "native_receipt_sha256": loaded.sha256,
+        }
+        for key in ("error", "error_code", "detail"):
+            value = getattr(loaded, key)
+            if value is not None:
+                composed[key] = value
+        resolved = {key: value for key, value in reconcile.items() if key != "evidence"}
+        resolved["evidence"] = normalized_evidence
+        return composed, resolved
+
+    def _reconcile_operation(self, connection, *, run_id: str, stage: str, reconcile: dict) -> dict:
+        """Resolve the reconciliation's registered operation inside the write transaction.
+
+        The caller either names an already-registered reconcile operation, or
+        carries the registration itself (its key plus parameter digest); the
+        registration then travels in the same short locked transaction as the
+        binding and the settlement, so a refused reconciliation leaves no
+        maintenance row behind and a retry reuses the same operation identity.
+        """
+
+        operation_id = reconcile.get("operation_id")
+        operation_key = reconcile.get("operation_key")
+        params_digest = reconcile.get("params_digest")
+        if operation_id is not None and (operation_key is not None or params_digest is not None):
+            raise PlatformStoreError("A reconciliation names its operation or its registration, not both")
+        if operation_id is not None:
+            return reconcile
+        if not (
+            isinstance(operation_key, str)
+            and operation_key
+            and isinstance(params_digest, str)
+            and params_digest
+        ):
+            raise PlatformStoreError(
+                "A reconciliation must name its registered reconcile operation or carry its registration key"
+            )
+        record = self._register_operation_locked(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="reconcile",
+            operation_key=operation_key,
+            params_digest=params_digest,
+            dispatch={},
+        )
+        resolved = {key: value for key, value in reconcile.items() if key not in {"operation_key", "params_digest"}}
+        resolved["operation_id"] = record.operation_id
+        return resolved
+
+    def _reconcile_orphan_binding(
+        self,
+        connection,
+        cursor,
+        *,
+        run_id: str,
+        stage: str,
+        state: str,
+        receipt: dict | None,
+        reconcile: dict,
+        run_state: object,
+        checkpoint_uri,
+        reused_from_run,
+    ) -> None:
+        """Controlled orphan recovery: bind a queued intent's missing Airflow key, then confirm.
+
+        The one reconcile entry may fill only the missing binding columns of a
+        never-started queued intent (the 1.4.3 pre-candidate shape) from the
+        real Airflow full key the caller evidences.  The receipt must name this
+        run's own endpoint job - checked against the one canonical
+        ``native_run_id`` derivation from the operation's recorded DagRun -
+        and its failed-receipt digest must be the digest the reconciliation's
+        evidence entries bind.  The binding is accepted only after the lifecycle
+        view itself shows the bound task actually failed (never an unexecuted
+        ``upstream_failed`` sibling); the action's own pre-transaction check
+        refuses a DagRun that is not the settled failed fact before this
+        transaction opens.  Conflict, foreign, missing, ambiguous, live or
+        success facts refuse with zero change (the tentative binding rolls back
+        with the transaction), and no unresolved intermediate state is ever
+        fabricated.
+        """
+
+        if state != "failed":
+            raise PlatformStoreError("An orphan reconciliation records the observed failure")
+        if run_state != "queued":
+            raise PlatformStoreError("Orphan recovery requires the never-started queued run")
+        if checkpoint_uri is not None or reused_from_run is not None:
+            raise PlatformStoreError("An orphan reconciliation carries no checkpoint or reuse binding")
+        if not isinstance(receipt, dict):
+            raise PlatformStoreError("An orphan reconciliation carries its failed receipt")
+        binding = reconcile.get("binding")
+        operation_id = binding.get("operation_id") if isinstance(binding, dict) else None
+        task_id = binding.get("task_id") if isinstance(binding, dict) else None
+        map_index = binding.get("map_index") if isinstance(binding, dict) else None
+        if (
+            not isinstance(operation_id, str)
+            or not operation_id
+            or not isinstance(task_id, str)
+            or not task_id
+            or type(map_index) is not int
+            or map_index < -1
+        ):
+            raise PlatformStoreError("An orphan binding names its operation, task id and integer map index")
+        native_run = receipt.get("native_run_id")
+        native_sha = receipt.get("native_receipt_sha256")
+        if not _is_canonical_uuid(native_run) or not _is_sha256(native_sha):
+            raise PlatformStoreError("An orphan reconciliation binds its native run UUID and failed receipt digest")
+        if native_sha not in _evidence_digests(reconcile.get("evidence")):
+            raise PlatformStoreError(
+                "The failed receipt digest must be the one the reconciliation evidence entries bind"
+            )
+        reconcile_operation = reconcile.get("operation_id")
+        cursor.execute(_FIND_RECONCILE, (reconcile_operation, run_id, stage))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError(
+                "The reconciliation names no registered reconcile operation of this run and stage"
+            )
+        cursor.execute(_READ_ORPHAN_OPERATION, (operation_id, run_id))
+        row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError("The orphan binding names no operation of this run")
+        op_stage, kind, op_state, dag_id, dag_run_id, bound_task, bound_map, operation_key = row
+        if kind not in {"dispatch", "native"}:
+            raise PlatformStoreError("Only a queued dispatch intent may be recovered as an orphan")
+        if op_state != "queued" or bound_task is not None or bound_map is not None:
+            raise PlatformStoreError("The named operation is not an unstarted unbound orphan; refused")
+        if not (isinstance(dag_id, str) and dag_id and isinstance(dag_run_id, str) and dag_run_id):
+            raise PlatformStoreError("The operation lacks its recorded Airflow DagRun identity evidence")
+        if native_run != native_run_id(dag_run_id):
+            # The endpoint job identity is fixed by the run's own recorded DagRun id
+            # through the one canonical derivation: a foreign, copied or merely
+            # UUID-shaped value never authorizes recovery.
+            raise PlatformStoreError("The native receipt names another run's endpoint job; refused")
+        cursor.execute(_BIND_ORPHAN_OPERATION, (task_id, map_index, operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The orphan binding lost its operation to another writer")
+        # One statement carries every lifecycle fact of this acceptance: a single query
+        # evaluates the view once, so the task's and the DagRun's states are the same
+        # database snapshot - a schedule that flips between two reads is never two
+        # separately-read terminal facts.
+        cursor.execute(_READ_ORPHAN_LIFECYCLE, (operation_id, f"{dag_id}/{dag_run_id}"))
+        lifecycle = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        scheduling = lifecycle.get("scheduling")
+        if scheduling != ("failed", "terminal"):
+            # A fabricated or ambiguous key joins nothing (unknown), an unexecuted
+            # upstream_failed sibling never sent the native request, a live task is in
+            # flight and a green task contradicts the failure: all refuse, and the
+            # tentative binding rolls back with this transaction.
+            raise PlatformStoreError("The bound Airflow task does not prove its own failed fact; refused")
+        dag_run = lifecycle.get("dag_run")
+        if dag_run != ("failed", "terminal"):
+            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact; refused")
+        payload_receipt = {**receipt, "reconciliation": reconcile}
+        cursor.execute(_INSERT_STAGE, (run_id, stage, state, _json(payload_receipt), None, None, None))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The orphan stage record lost its run to another writer")
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="binding",
+            operation_id=operation_id,
+            payload={
+                "operation_key": operation_key,
+                "intent_stage": op_stage,
+                "reconciled_stage": stage,
+                "reconciled_state": state,
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": task_id,
+                "map_index": map_index,
+                "native_run_id": native_run,
+                "native_receipt_sha256": native_sha,
+            },
+        )
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="stage",
+            operation_id=reconcile_operation,
+            payload={"state": state},
+        )
+        self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+        cursor.execute(_SETTLE_ORPHAN_INTENT, (state, operation_id, run_id))
+        cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, stage))
 
     def _stage_outcome(self, connection, *, run_id: str, stage: str, state: str) -> None:
         """The run-terminal transition a stage record concludes, in the same transaction.

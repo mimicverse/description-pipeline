@@ -8,11 +8,15 @@
 #   status    systemctl --user is-active for every managed unit
 #   health    deploy/operator/health.sh (static checks plus live service/HTTP checks)
 #   reconcile confirm and register external outcomes; never repeats unknown side effects
+#             (--install-id runs it from a staged candidate in a closed admission window)
 #   stage     build the two-end candidate installation (isolated targets)
 #   promote   switch both ends to the staged candidate (admission closed until verified)
 #   rollback  restore both ends from the recorded previous installation
 #
 #   operatorctl.sh <verb> --config FILE
+#   orphan recovery: reconcile --run-id R --stage S --outcome failed --evidence FILE... \
+#     --native-receipt FILE --native-run-id UUID --orphan-operation-id OP \
+#     --orphan-task-id TASK --orphan-map-index N
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
@@ -28,6 +32,8 @@ usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
+reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
+orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2
@@ -44,6 +50,11 @@ RELEASE_FILE=""
 RUN_ID=""
 STAGE=""
 OUTCOME=""
+NATIVE_RECEIPT=""
+NATIVE_RUN_ID=""
+ORPHAN_OPERATION_ID=""
+ORPHAN_TASK_ID=""
+ORPHAN_MAP_INDEX=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,6 +66,11 @@ while [ $# -gt 0 ]; do
     --run-id) RUN_ID="${2:-}"; shift 2 ;;
     --stage) STAGE="${2:-}"; shift 2 ;;
     --outcome) OUTCOME="${2:-}"; shift 2 ;;
+    --native-receipt) NATIVE_RECEIPT="${2:-}"; shift 2 ;;
+    --native-run-id) NATIVE_RUN_ID="${2:-}"; shift 2 ;;
+    --orphan-operation-id) ORPHAN_OPERATION_ID="${2:-}"; shift 2 ;;
+    --orphan-task-id) ORPHAN_TASK_ID="${2:-}"; shift 2 ;;
+    --orphan-map-index) ORPHAN_MAP_INDEX="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
     *) usage ;;
   esac
@@ -136,6 +152,13 @@ load_running_env() {
   [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
   ENV_FILE="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
+}
+
+# The derived environments write their values raw; the libpq DSNs carry "&", which no `source`
+# assignment survives.  This one reader is how an entry reads a generation value back from its
+# file - never a per-verb parsing copy.
+derived_env_value() {
+  sed -n "s/^$2=//p" "$1" | head -1
 }
 
 # The gates read the platform authority from the managed database, so the start window must
@@ -419,10 +442,16 @@ drift_check() {
 }
 
 [ -n "$CONFIG_FILE" ] || usage
-if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ] \
+if [ "$ACTION" = "reconcile" ]; then
+  # The maintenance reconcile may name a staged generation (--install-id); the install asset
+  # inputs belong to the install/stage family alone.
+  [ -z "$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] || usage
+elif [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ] \
    && [ "$ACTION" != "stage" ] && [ "$ACTION" != "promote" ] && [ "$ACTION" != "rollback" ]; then
   usage
 fi
+[ -z "$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX" ] \
+  || [ "$ACTION" = "reconcile" ] || usage
 [ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
 # Every verb passes the same static config gate first; the install record and its derived
 # per-generation environment stay the single authority for the operational verbs.
@@ -448,7 +477,117 @@ case "$ACTION" in
     platform_close_admission "start-window" "operatorctl start"
     load_active_env ;;
   drain|stop|status|health|reconcile)
-    load_active_env ;;
+    if [ "$ACTION" != "reconcile" ] || [ -z "$INSTALL_ID" ]; then
+      load_active_env
+    else
+      # The bootstrap maintenance window: the staged candidate generation runs the canonical
+      # recovery against the same real database.  The running record stays the reference, the
+      # staged generation itself is re-verified below (recorded snapshot, wheel binding to the
+      # release manifest, the runtime the reconcile executes), and the active pointer, units
+      # and admission stay untouched.  The channel is closed-window only: it refuses while
+      # the admission is open.
+      load_running_env
+      CANDIDATE_ID="$INSTALL_ID"
+      RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
+      [ -f "$RECEIPT_DIR/receipt.json" ] \
+        || die "no stage receipt for $CANDIDATE_ID; run stage first"
+      CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
+      [ -f "$CANDIDATE_ENV" ] || die "the staged generation $CANDIDATE_ID is incomplete; re-run stage"
+      # The generated environment of the generation this action runs now is the candidate's.
+      ENV_FILE="$CANDIDATE_ENV"
+      AIRFLOW_VENV="$(derived_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
+      CANDIDATE_WHEEL_PATH="$(derived_env_value "$CANDIDATE_ENV" PIPELINE_WHEEL)"
+      CANDIDATE_DIGEST="$(derived_env_value "$CANDIDATE_ENV" PLATFORM_CONFIG_DIGEST)"
+      RUNNING_ENV="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
+      [ -f "$RUNNING_ENV" ] || die "the running generation environment is missing: $RUNNING_ENV"
+      CAND_SERVICE_DSN="$(derived_env_value "$CANDIDATE_ENV" PLATFORM_SERVICE_DSN)"
+      CAND_OPERATOR_DSN="$(derived_env_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN)"
+      CAND_RUNTIME_DSN="$(derived_env_value "$CANDIDATE_ENV" AIRFLOW_RUNTIME_DB_URL)"
+      RUN_SERVICE_DSN="$(derived_env_value "$RUNNING_ENV" PLATFORM_SERVICE_DSN)"
+      RUN_OPERATOR_DSN="$(derived_env_value "$RUNNING_ENV" PLATFORM_OPERATOR_DSN)"
+      RUN_RUNTIME_DSN="$(derived_env_value "$RUNNING_ENV" AIRFLOW_RUNTIME_DB_URL)"
+      [ -n "$CAND_SERVICE_DSN" ] && [ "$CAND_SERVICE_DSN" = "$RUN_SERVICE_DSN" ] \
+        && [ "$CAND_OPERATOR_DSN" = "$RUN_OPERATOR_DSN" ] && [ "$CAND_RUNTIME_DSN" = "$RUN_RUNTIME_DSN" ] \
+        || die "the staged generation names another database authority than the running generation; refused"
+      [ -x "$AIRFLOW_VENV/bin/python" ] || die "the staged generation runtime is missing; re-run stage"
+      # The one live authority check: both generations must reach the same real cluster and
+      # database (a copied or foreign database never satisfies the recovery).
+      PLATFORM_SERVICE_DSN="$CAND_SERVICE_DSN" RUNNING_SERVICE_DSN="$RUN_SERVICE_DSN" \
+        "$AIRFLOW_VENV/bin/python" - <<'GUARD' || die "the staged generation does not reach the running database authority; refused"
+import os
+
+import psycopg2
+
+
+def probe(dsn):
+    with psycopg2.connect(dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_database(), pg_postmaster_start_time()::text")
+            return cursor.fetchone()
+
+
+if probe(os.environ["PLATFORM_SERVICE_DSN"]) != probe(os.environ["RUNNING_SERVICE_DSN"]):
+    raise SystemExit("the staged generation reaches another database authority")
+GUARD
+      PLATFORM_OPERATOR_DSN="$CAND_OPERATOR_DSN" "$AIRFLOW_VENV/bin/python" \
+        -m description_pipeline.orchestration.lifecycle_state report \
+        --require-admission-closed >/dev/null \
+        || die "the staged-candidate reconcile runs only while the admission is closed"
+      python3 - "$HERE/../../release.json" "$RECEIPT_DIR/receipt.json" "$CANDIDATE_DIGEST" \
+        "$CANDIDATE_WHEEL_PATH" "$AIRFLOW_VENV" "$HERE" <<'GUARD' || die "the staged generation identity did not verify; re-run stage"
+# staged-generation identity: the recorded snapshot, the wheel binding and the installed package
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[6])
+from install_record import release_identity, wheel_binding  # noqa: E402  (canonical owners)
+
+release_file, receipt_file, wheel_path, venv = (Path(sys.argv[index]) for index in (1, 2, 4, 5))
+config_digest = sys.argv[3]
+release = release_identity(json.loads(release_file.read_text(encoding="utf-8")))
+receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
+snapshot = Path(receipt["to"])
+if not snapshot.is_file() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != receipt["to_sha256"]:
+    raise SystemExit("the staged snapshot is missing or no longer matches its recorded digest")
+if config_digest != receipt["to_sha256"]:
+    raise SystemExit(f"the staged environment binds another snapshot generation ({config_digest} != {receipt['to_sha256']})")
+steps = {step.get("step"): step.get("status") for step in receipt.get("steps", [])}
+for name in ("linux-generation", "windows-generation"):
+    if steps.get(name) != "completed":
+        raise SystemExit(f"the staged generation has no completed {name} step")
+wheel_binding(release, wheel=wheel_path)
+runtime = subprocess.run(
+    [str(venv / "bin" / "python"), "-c",
+     "import json, pathlib, description_pipeline as p;"
+     "from description_pipeline import interface_records;"
+     "from description_pipeline.delivery import PIPELINE_ID;"
+     "root = pathlib.Path(p.__file__).resolve().parent;"
+     "print(json.dumps({'root': str(root), 'pipeline_id': PIPELINE_ID,"
+     " 'domain': interface_records.release_domain_identity(),"
+     " 'identity': json.loads((root / 'tool-release.json').read_text(encoding='utf-8'))}))"],
+    capture_output=True, text=True,
+)
+if runtime.returncode != 0:
+    raise SystemExit(f"the staged runtime cannot report its identity: {runtime.stderr.strip()}")
+reported = json.loads(runtime.stdout)
+if not Path(reported["root"]).is_relative_to(venv):
+    raise SystemExit("the staged runtime imports the package from outside its own venv")
+identity = reported["identity"]
+domain = reported["domain"]
+if (
+    identity.get("pipeline_id") != reported["pipeline_id"]
+    or identity.get("version") != release["version"]
+    or identity.get("source_sha256") != release["source_sha256"]
+    or identity.get("contract") != domain["contract"]
+    or identity.get("support") != domain["support"]
+):
+    raise SystemExit("the staged runtime's installed package is not the staged release")
+print(f"staged generation verified: {receipt['install_id']}")
+GUARD
+    fi ;;
   stage|promote|rollback)
     load_running_env ;;
   *)
@@ -1130,8 +1269,27 @@ PY
       completed|failed|cancelled) ;;
       *) die "unresolved is not a result; --outcome must be completed, failed or cancelled" ;;
     esac
+    ORPHAN_INPUTS="$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX"
+    if [ -n "$ORPHAN_INPUTS" ]; then
+      [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] && [ -n "$ORPHAN_OPERATION_ID" ] \
+        && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
+        || die "orphan recovery requires --native-receipt, --native-run-id, --orphan-operation-id --orphan-task-id and --orphan-map-index together"
+      [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
+      [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
+      [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
+      # The derived environment writes the libpq DSNs unquoted: read them back from the
+      # file so the canonical action consumes the exact generation values.
+      [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
+      PLATFORM_SERVICE_DSN="$(derived_env_value "$ENV_FILE" PLATFORM_SERVICE_DSN)"
+      PLATFORM_OPERATOR_DSN="$(derived_env_value "$ENV_FILE" PLATFORM_OPERATOR_DSN)"
+      PIPELINE_STORE_ROOT="$(derived_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
+      export PLATFORM_SERVICE_DSN PLATFORM_OPERATOR_DSN PIPELINE_STORE_ROOT
+    fi
     RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \
     RECONCILE_EVIDENCE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
+    RECONCILE_NATIVE_RECEIPT="$NATIVE_RECEIPT" RECONCILE_NATIVE_RUN_ID="$NATIVE_RUN_ID" \
+    RECONCILE_ORPHAN_OPERATION_ID="$ORPHAN_OPERATION_ID" RECONCILE_ORPHAN_TASK_ID="$ORPHAN_TASK_ID" \
+    RECONCILE_ORPHAN_MAP_INDEX="$ORPHAN_MAP_INDEX" \
       "$AIRFLOW_VENV/bin/python" - <<'PY' || die "reconcile refused"
 # platform-reconcile
 import json
@@ -1145,22 +1303,43 @@ stage = os.environ["RECONCILE_STAGE"]
 outcome = os.environ["RECONCILE_OUTCOME"]
 evidence = json.loads(os.environ["RECONCILE_EVIDENCE"])
 
-# The confirmation binds the same registered reconcile operation it carries as evidence: the
-# store refuses an unbound dict, a foreign run/stage, or a stage without an unresolved original
-# operation.  A retry with the same outcome reuses the same operation key - none is re-sent.
+# One canonical action: the maintenance intent registers, the orphan binding backfills and the
+# settlement commits - or the whole action rolls back - inside one short store transaction.  A
+# retry with the same operation key, evidence, binding and outcome reuses the recorded result;
+# any conflict refuses with zero change and no maintenance row left behind.  The Store action
+# owns every acceptance rule for the original native bytes; this entry only names the raw
+# inputs and never validates, rewrites or manufactures a receipt.
+binding = None
+native_receipt = os.environ.get("RECONCILE_NATIVE_RECEIPT") or ""
+if native_receipt:
+    # The Store action owns every acceptance rule for the original bytes and the bound DagRun;
+    # this entry only names the raw inputs.
+    binding = {
+        "operation_id": os.environ["RECONCILE_ORPHAN_OPERATION_ID"],
+        "task_id": os.environ["RECONCILE_ORPHAN_TASK_ID"],
+        "map_index": int(os.environ["RECONCILE_ORPHAN_MAP_INDEX"]),
+    }
+    # The bound DagRun's terminal fact is verified by the Store action itself on its own
+    # acceptance boundary (the runtime identity's reader); this entry holds no copy of the
+    # predicate and passes only the raw inputs.
+
+reconcile = {
+    "operation_key": f"operatorctl-reconcile:{run_id}:{stage}:{outcome}",
+    "evidence": evidence,
+    "params_digest": io.digest({"outcome": outcome, "evidence": evidence, "binding": binding}),
+}
+if binding is not None:
+    reconcile["binding"] = binding
+    reconcile["native_receipt"] = {
+        "path": native_receipt,
+        "native_run_id": os.environ["RECONCILE_NATIVE_RUN_ID"],
+    }
 store = PlatformStore.from_environment()
-operation = store.register_operation(
-    run_id=run_id,
-    stage=stage,
-    kind="reconcile",
-    operation_key=f"operatorctl-reconcile:{run_id}:{stage}:{outcome}",
-    params_digest=io.digest({"outcome": outcome, "evidence": evidence}),
-)
 store.confirm_stage(
     run_id=run_id,
     stage=stage,
     state=outcome,
-    reconcile={"operation_id": operation.operation_id, "evidence": evidence},
+    reconcile=reconcile,
 )
 print(f"reconciled={run_id}:{stage} outcome={outcome}")
 PY
