@@ -490,8 +490,14 @@ case "$ACTION" in
       # shellcheck disable=SC1090
       source "$CANDIDATE_ENV"
       set +a
+      # The generated environment of the generation this action runs now is the candidate's.
+      ENV_FILE="$CANDIDATE_ENV"
       [ -x "$AIRFLOW_VENV/bin/python" ] || die "the staged generation runtime is missing; re-run stage"
-      "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.lifecycle_state report \
+      # The derived operator env writes the libpq DSNs unquoted (their "&" never survives a
+      # shell source), so the preflight reads the read role's DSN back from the file itself.
+      PLATFORM_OPERATOR_DSN="$(sed -n 's/^PLATFORM_OPERATOR_DSN=//p' "$CANDIDATE_ENV" | head -1)" \
+        "$AIRFLOW_VENV/bin/python" \
+        -m description_pipeline.orchestration.lifecycle_state report \
         --require-admission-closed >/dev/null \
         || die "the staged-candidate reconcile runs only while the admission is closed"
       python3 - "$HERE/../../release.json" "$OPERATOR_STATE" "$CANDIDATE_ID" "$CANDIDATE_ENV" "$AIRFLOW_VENV" \
@@ -1230,6 +1236,13 @@ PY
       [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
       [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
       [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
+      # The derived environment writes the libpq DSNs unquoted: read them back from the
+      # file so the canonical action consumes the exact generation values.
+      [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
+      PLATFORM_SERVICE_DSN="$(sed -n 's/^PLATFORM_SERVICE_DSN=//p' "$ENV_FILE" | head -1)"
+      AIRFLOW_RUNTIME_DB_URL="$(sed -n 's/^AIRFLOW_RUNTIME_DB_URL=//p' "$ENV_FILE" | head -1)"
+      PLATFORM_OPERATOR_DSN="$(sed -n 's/^PLATFORM_OPERATOR_DSN=//p' "$ENV_FILE" | head -1)"
+      export PLATFORM_SERVICE_DSN AIRFLOW_RUNTIME_DB_URL PLATFORM_OPERATOR_DSN
     fi
     RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \
     RECONCILE_EVIDENCE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
