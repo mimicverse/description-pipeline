@@ -480,17 +480,37 @@ def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> t
     return commit, False
 
 
-def _body(subject: str, commit: str, report: dict) -> str:
+def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
     checks = report.get("checks") or []
+    facts = {
+        item.get("fact_id"): item.get("status")
+        for item in (report.get("qualifications") or [])
+        if isinstance(item, dict)
+    }
+    qualifications = "".join(
+        f"- {fact_id}: {facts.get(fact_id) or 'unqualified'}"
+        f"{'（未建立）' if facts.get(fact_id) in (None, 'unqualified') else ''}\n"
+        for fact_id in ("engineering_position_range", "drive_sizing", "machine_qualification")
+    )
     return (
         f"Automatic SolidWorks-to-URDF publication.\n\n"
         f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
+        f"- purpose: `{purpose}`\n"
         f"- verifier: recomputed, passed ({len(checks)} checks)\n"
+        f"{qualifications}"
     )
 
 
 def _pr(
-    repository: Path, slug: str, base: str, branch: str, subject: str, commit: str, report: dict, message: str | None
+    repository: Path,
+    slug: str,
+    base: str,
+    branch: str,
+    subject: str,
+    commit: str,
+    report: dict,
+    purpose: str,
+    message: str | None,
 ) -> tuple[str, str]:
     listing = json.loads(
         _gh(
@@ -514,7 +534,7 @@ def _pr(
     if len(matches) > 1:
         raise PrError("pr_ambiguous", [item["url"] for item in matches])
     title = message.splitlines()[0] if message else f"SolidWorks-to-URDF bundle ({commit[:12]})"
-    body = _body(subject, commit, report)
+    body = _body(subject, commit, report, purpose)
     with tempfile.NamedTemporaryFile(
         "w", suffix=".json" if matches else ".md", delete=False, encoding="utf-8"
     ) as handle:
@@ -769,7 +789,7 @@ def submit_bundle(
             shutil.rmtree(staging, ignore_errors=True)
         if _remote_ref(repository, f"refs/heads/{branch}") != pushed:
             raise PrError("remote_head_mismatch", {"expected": pushed})
-        state, url = _pr(repository, slug, base, branch, subject, pushed, report, message)
+        state, url = _pr(repository, slug, base, branch, subject, pushed, report, purpose, message)
         # Final confirmation: the baseline must still be the one this candidate
         # was planned and merged against.  When it moved after the candidate
         # write, the write is retained and the receipt stays unresolved for
@@ -799,6 +819,7 @@ def submit_bundle(
             "commit": pushed,
             "url": url,
             "repository_slug": slug,
+            "purpose": purpose,
         }
         observed("publication.receipt", "passed", {**result, "subject_sha256": subject})
         return result

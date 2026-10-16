@@ -205,10 +205,31 @@ class PublishTests(unittest.TestCase):
             raise AssertionError(args)
 
         def verifier(bundle: Path) -> dict:
+            from description_pipeline.io import read_data
+            from description_pipeline.verification import solidworks_urdf as _verification
+
+            checks = [{"id": "x", "status": "passed"}]
+            definition = {
+                "checks": {},
+                "source": {
+                    "bodies": [],
+                    "joints": [
+                        {
+                            "name": "slide",
+                            "type": "revolute",
+                            "limit_source": "native",
+                            "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+                        }
+                    ],
+                    "frames": [],
+                },
+            }
+            read_data(bundle / "input/request.json")
             report = {
                 "passed": True,
                 "subject_sha256": subject_digest(bundle),
-                "checks": [{"id": "x", "status": "passed"}],
+                "checks": checks,
+                "qualifications": _verification.qualifications(bundle, definition, checks),
             }
             (bundle / "reports/quality.json").write_text(urdf_pr._serialize(report), encoding="utf-8")
             return report
@@ -541,6 +562,12 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.rest_payloads[-1]["title"], message.splitlines()[0])
         self.assertIn(f"verified commit: `{result['commit']}`", self.rest_payloads[-1]["body"])
         self.assertIn(f"subject: `{result['subject']}`", self.rest_payloads[-1]["body"])
+        body = self.rest_payloads[-1]["body"]
+        self.assertIn("- purpose: `engineering`", body)
+        self.assertIn("- engineering_position_range: established", body)
+        self.assertIn("- drive_sizing: established", body)
+        self.assertIn("- machine_qualification: unqualified（未建立）", body)
+        self.assertEqual(result["purpose"], "engineering")
         self.assertFalse(any(call[:2] == ("pr", "edit") for call in self.gh_calls))
 
     def test_failed_existing_pr_update_preserves_url_and_pushed_commit(self):
@@ -839,6 +866,7 @@ class PublishTests(unittest.TestCase):
         self.branch = INSPECTION_BRANCH
         second = self.submit()
         self.assertIn(second["state"], {"published", "updated"})
+        self.assertEqual(second["purpose"], "inspection_preview")
         self.assertEqual(self.fx.remote_head(BRANCH), engineering_head)
         inspection_head = self.fx.remote_head(INSPECTION_BRANCH)
         self.assertTrue(inspection_head and inspection_head != engineering_head)
@@ -847,6 +875,10 @@ class PublishTests(unittest.TestCase):
         self.assertIn(third["state"], {"updated", "noop"})
         self.assertEqual(self.fx.remote_head(BRANCH), engineering_head)
         self.assertEqual(self.fx.remote_head(INSPECTION_BRANCH), third["commit"])
+        body = self.rest_payloads[-1]["body"]
+        self.assertIn("- purpose: `inspection_preview`", body)
+        for fact_id in ("engineering_position_range", "drive_sizing", "machine_qualification"):
+            self.assertIn(f"- {fact_id}: unqualified（未建立）", body)
 
 
 if __name__ == "__main__":

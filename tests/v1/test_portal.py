@@ -1142,6 +1142,45 @@ class PortalTests(unittest.TestCase):
         )
         self._record_fixture_events(run_id)
 
+    def test_run_detail_carries_the_declared_purpose_and_unknown_is_not_recorded(self) -> None:
+        self._seed_airflow_run(DAG_RUN_ID, state="success")
+        self.client.login()
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["purpose"], "engineering")
+        self._seed_airflow_run(DAG_RUN_ID, state="success", conf={})
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200)
+        self.assertIsNone(json.loads(body)["purpose"])
+
+    def test_registered_purpose_reads_the_freeze_request_and_never_guesses(self) -> None:
+        from description_pipeline import request_evidence
+
+        app = PortalApp.__new__(PortalApp)
+        payload = request_evidence.request_evidence_bytes(
+            request_evidence.build_request_evidence(
+                purpose="inspection_preview",
+                request_id="fixture",
+                target_hardware="m3.0",
+                change_summary="fixture",
+                main_assembly="assembly.SLDASM",
+                handoff_digest="a" * 64,
+                platform_config_digest="c" * 64,
+            )
+        )
+        app._registered_member_bytes = lambda path, member: payload
+        projection = {"by_stage": {"freeze": {"input/request.json": {"sha256": "b" * 64}}}}
+        self.assertEqual(PortalApp._registered_purpose(app, projection), "inspection_preview")
+        self.assertIsNone(PortalApp._registered_purpose(app, {"by_stage": {}}))
+
+        def boom(path, member):
+            raise PipelineError("broken member")
+
+        app._registered_member_bytes = boom
+        self.assertIsNone(PortalApp._registered_purpose(app, projection))
+        app._registered_member_bytes = lambda path, member: b'{"purpose": "unknown"}'
+        self.assertIsNone(PortalApp._registered_purpose(app, projection))
+
     def _seed_airflow_run(
         self,
         dag_run_id: str = DAG_RUN_ID,

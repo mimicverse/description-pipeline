@@ -1816,11 +1816,15 @@ class PortalApp:
                 pr = None
         stage_view_payload = stage_view(job)
         report = build_report(job, view=stage_view_payload)
+        purpose = _optional_str(conf.get("purpose"))
+        if purpose not in REQUEST_PURPOSES:
+            purpose = None
         payload = {
             "dag_run_id": dag_run_id,
             "state": airflow_run.get("state"),
             "handoff_path": conf.get("handoff_path"),
             "main_assembly": _optional_str(conf.get("main_assembly")),
+            "purpose": purpose,
             "operator": operator,
             "principal": principal,
             "can_manage": can_manage,
@@ -2599,6 +2603,7 @@ class PortalApp:
             "schema_version": "solidworks-to-urdf.preview/v1",
             "pipeline_id": PIPELINE_ID,
             "run_id": run_id,
+            "purpose": self._registered_purpose(projection),
             "subject_sha256": receipt.get("subject_sha256"),
             "urdf": "urdf/robot.urdf",
             "files": files,
@@ -2637,6 +2642,26 @@ class PortalApp:
                 }
             )
         return payload
+
+    def _registered_purpose(self, projection: dict) -> str | None:
+        """The declared purpose of the registered freeze request, for display only.
+
+        The value is read from the registered ``input/request.json`` member (the
+        same store-side request record the freeze stage sealed); a missing,
+        unreadable or undeclared purpose yields ``None`` so the display layer
+        states "未记录" instead of guessing.  D's sourcing and validation stay
+        untouched - this is a read for the run/preview payloads.
+        """
+
+        member = (projection.get("by_stage", {}).get("freeze") or {}).get("input/request.json")
+        if not isinstance(member, dict):
+            return None
+        try:
+            record = _parse_registered_json(self._registered_member_bytes("input/request.json", member))
+        except Exception:  # noqa: BLE001 - display read; served members keep their own validation
+            return None
+        purpose = record.get("purpose") if isinstance(record, dict) else None
+        return purpose if purpose in REQUEST_PURPOSES else None
 
     def _preview_payload(self, session: PortalSession, dag_run_id: str, *, missing_ok: bool = False) -> dict | None:
         run_id = self._authorize_run(session, dag_run_id)

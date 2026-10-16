@@ -11,6 +11,7 @@ import {
   jointRows,
   linkRows,
   previewExpansion,
+  purposeLabel,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
@@ -1521,7 +1522,7 @@ function fillPanelTable(host, headers, rows) {
 async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   const data = {
     robot: await loadPreviewArtifactJson(artifactUrl, preview.files, "model/robot.json", signal),
-    tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/tool.json", signal),
+    tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal),
     quality: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/quality.json", signal),
   };
   state.previewData = data;
@@ -1531,6 +1532,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   for (const row of infoPanelRows({
     runId: identity.run_id,
     subjectSha256: identity.subject_sha256,
+    purpose: preview.purpose,
     tool: data.tool,
     qualitySchema: data.quality ? data.quality.schema_version : null,
     qualificationStates: data.quality ? data.quality.qualifications : null,
@@ -1542,18 +1544,30 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     info.append(key, value);
   }
   const limits = jointRows(records ? records.joints : []);
+  const fmt = (value, digits) => (Number.isFinite(value) ? value.toFixed(digits) : "未提供");
+  const modelJoints = new Map(((data.robot && data.robot.joints) || []).map((joint) => [joint.name, joint]));
+  const windowLabel = "检查/预览分析窗口，非机械限位";
+  const absentDrive = "未提供（未建立驱动能力）";
+  const sourceLabel = (source) =>
+    source === "policy_preview_window" || source === "declared_preview_window"
+      ? `${source}（${windowLabel}）`
+      : source || "未记录";
   fillPanelTable(
     $("panel-limits"),
-    ["关节", "类型", "下限", "上限", "力矩", "速度", "轴 (xyz)"],
-    limits.map((row) => [
-      row.name,
-      row.type,
-      row.lower === null ? null : row.lower.toFixed(4),
-      row.upper === null ? null : row.upper.toFixed(4),
-      row.effort,
-      row.velocity,
-      row.axis ? row.axis.map((value) => value.toFixed(3)).join(", ") : null,
-    ]),
+    ["关节", "类型", "下限", "上限", "力矩", "速度", "轴 (xyz)", "限位来源"],
+    limits.map((row) => {
+      const source = modelJoints.get(row.name) && modelJoints.get(row.name).limit_source;
+      return [
+        row.name,
+        row.type,
+        row.lower === null ? null : row.lower.toFixed(4),
+        row.upper === null ? null : row.upper.toFixed(4),
+        row.effort === null || row.effort === undefined ? absentDrive : row.effort,
+        row.velocity === null || row.velocity === undefined ? absentDrive : row.velocity,
+        row.axis ? row.axis.map((value) => fmt(value, 3)).join(", ") : null,
+        sourceLabel(source),
+      ];
+    }),
   );
   $("limits-title").textContent = `限位 / 轴读数（${limits.length}）`;
   const links = linkRows(records ? records.links : []);
@@ -1562,10 +1576,10 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     ["链接", "质量 kg", "质心 m", "惯量 (kg·m²)"],
     links.map((row) => [
       row.name,
-      row.mass_kg === null ? null : row.mass_kg.toFixed(6),
-      row.com_m ? row.com_m.map((value) => value.toFixed(4)).join(", ") : null,
+      row.mass_kg === null ? "未提供" : row.mass_kg.toFixed(6),
+      row.com_m ? row.com_m.map((value) => fmt(value, 4)).join(", ") : null,
       row.inertia_kg_m2
-        ? `ixx ${row.inertia_kg_m2.ixx.toFixed(6)} · iyy ${row.inertia_kg_m2.iyy.toFixed(6)} · izz ${row.inertia_kg_m2.izz.toFixed(6)}`
+        ? `ixx ${fmt(row.inertia_kg_m2.ixx, 6)} · iyy ${fmt(row.inertia_kg_m2.iyy, 6)} · izz ${fmt(row.inertia_kg_m2.izz, 6)}`
         : null,
     ]),
   );
@@ -1578,8 +1592,8 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     frames.map((row) => [
       row.name,
       row.parent,
-      row.xyz ? row.xyz.map((value) => value.toFixed(4)).join(", ") : null,
-      row.rpy ? row.rpy.map((value) => value.toFixed(4)).join(", ") : null,
+      row.xyz ? row.xyz.map((value) => fmt(value, 4)).join(", ") : null,
+      row.rpy ? row.rpy.map((value) => fmt(value, 4)).join(", ") : null,
     ]),
   );
   fillPanelTable(
@@ -1983,6 +1997,7 @@ function renderRun(run) {
   if (typeof run.main_assembly === "string" && run.main_assembly) {
     rows.splice(1, 0, ["主装配", run.main_assembly]);
   }
+  rows.splice(1, 0, ["用途", purposeLabel(run.purpose)]);
   const measured = report && report.measured ? report.measured : null;
   if (measured) {
     if (measured.subject_sha256) rows.push(["交付摘要", `${String(measured.subject_sha256).slice(0, 12)}…`]);
