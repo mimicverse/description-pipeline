@@ -13,7 +13,6 @@ from unittest.mock import patch
 from tests.v1.test_airflow_dag import AIRFLOW_AVAILABLE
 from description_pipeline.stages import CONTRACT, STAGE_IDS
 from tests.v1.protocol_support import protocol_events
-from description_pipeline.io import write_json
 from description_pipeline.delivery import PIPELINE_ID
 
 from .portal_read_support import RegisteredPlatform

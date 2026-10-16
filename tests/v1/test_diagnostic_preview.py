@@ -178,6 +178,48 @@ class DiagnosticPreviewTests(unittest.TestCase):
         with self.assertRaises(portal_module.PortalError):
             app._artifact(environ, start_response, DAG_RUN_ID, "reports/stages.json")
 
+    def test_a_linked_child_serves_its_diagnostic_with_the_parent_transfer(self) -> None:
+        """The child's reused verify registration serves the parent's sealed
+        transfer: the diagnostic comes from the registered source tree, never a
+        re-materialized copy or a second store."""
+        platform = self._registered_failed_verify()
+        child_dag = "portal-20261010T000001-abcdef02"
+        child = native_run_id(child_dag)
+        platform.admit(child, from_stage="publish", parent_run_id=RUN)
+        parent_row = platform.store.stage_records(RUN)["verify"]
+        platform.stage(
+            child,
+            "verify",
+            state="failed",
+            receipt=parent_row["receipt"],
+            checkpoint_uri=parent_row["checkpoint_uri"],
+            reused_from_run=RUN,
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, child_dag)
+        self.assertIs(preview["verified"], False)
+        self.assertEqual(preview["run_id"], child)
+        self.assertEqual(
+            [row["id"] for row in preview["failing_checks"]],
+            ["joints.shoulder_pitch_joint", "physics.mass_closure_equality"],
+        )
+        environ = {"HTTP_COOKIE": f"{portal_module.DEFAULT_SESSION_COOKIE}={session.session_id}"}
+        captured: dict = {}
+
+        def start_response(status, headers):
+            captured["status"] = status
+
+        body = b"".join(app._artifact(environ, start_response, child_dag, "urdf/robot.urdf"))
+        self.assertEqual(captured["status"], "200 OK")
+        self.assertEqual(body, URDF)
+
     def test_failing_checks_accept_the_state_failed_convention(self) -> None:
         from description_pipeline.orchestration.portal import _failing_checks
 

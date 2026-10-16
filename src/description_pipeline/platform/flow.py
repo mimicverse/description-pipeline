@@ -31,6 +31,26 @@ _SEED_STAGE = {"generate": "capture", "verify": "generate", "publish": "verify"}
 _JOB_STATUS_BY_RUN_STATE = {"succeeded": "passed", "cancelled": "failed", "unresolved": "failed"}
 
 
+def _registered_failure(rows: dict[str, dict]) -> dict:
+    """The registered failure authority of one attempt: the failed stage's own receipt facts.
+
+    The earliest failed engineering stage carries the original error (and its
+    diagnostic identity when recorded); a stale native observation can never
+    replace it because it lives in the registration, not in the endpoint.
+    """
+    for stage in STAGE_IDS:
+        row = rows.get(stage) or {}
+        if row.get("state") != "failed":
+            continue
+        receipt = row.get("receipt") if isinstance(row.get("receipt"), dict) else {}
+        return {
+            "error": receipt.get("error"),
+            "error_code": receipt.get("error_code"),
+            "detail": receipt.get("detail"),
+        }
+    return {"error": None, "error_code": None, "detail": None}
+
+
 class RunPaths:
     """The in-flight working layout of one run; nothing here is authority."""
 
@@ -418,6 +438,7 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
     if submission:
         result["submission"] = submission
     hardware, revision = _registered_capture_identity(platform, run_id, rows)
+    failure = _registered_failure(rows)
     return {
         "schema_version": JOB_SCHEMA,
         "pipeline_id": PIPELINE_ID,
@@ -427,7 +448,9 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
         "request": {"handoff_sha256": receipt.get("handoff_sha256")},
         "events": registered_delivery_events(platform, run_id),
         "result": result,
-        "error": None,
+        "error": failure["error"],
+        "error_code": failure["error_code"],
+        "detail": failure["detail"],
         "hardware_id": hardware,
         "revision": revision,
     }

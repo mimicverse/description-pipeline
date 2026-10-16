@@ -53,8 +53,13 @@ class _RegisteredRows:
     def sealed_path(self, uri):
         return self.root / "sealed" / uri.removeprefix("store://sealed/")
 
-    def run_events(self, run_id):
-        return list(self.events.get(run_id, []))
+    def run_events(self, run_id, *, after_seq=0, limit=200):
+        """The store contract's bounded page: everything after ``after_seq``, capped."""
+        rows = list(self.events.get(run_id, []))
+        for index, row in enumerate(rows, start=1):
+            if isinstance(row, dict):
+                row.setdefault("seq", index)
+        return [row for row in rows if isinstance(row, dict) and row.get("seq", 0) > after_seq][:limit]
 
     def append_event(self, run_id, *, stage, kind, payload):
         self.appended.append({"run_id": run_id, "stage": stage, "kind": kind, "payload": payload})

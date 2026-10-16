@@ -135,8 +135,14 @@ class RegisteredPlatform:
         return capture
 
     def events(self, run_id: str, events: list[dict]) -> None:
-        """Record one attempt's display events as the platform event rows they become."""
-        for index, event in enumerate(events, start=1):
+        """Record one attempt's display events as the platform event rows they become.
+
+        Sequence numbers continue past anything the registration already wrote
+        (``register_capture`` appends its own confirmation event), so the world
+        keeps the database's per-run uniqueness the paging cursor relies on.
+        """
+        start = max((row[1] for row in self.world.events if row[0] == run_id), default=0)
+        for offset, event in enumerate(events, start=1):
             self.world.events.append(
-                (run_id, index, "stage", str(event.get("stage") or ""), None, json.dumps(event))
+                (run_id, start + offset, "stage", str(event.get("stage") or ""), None, json.dumps(event))
             )

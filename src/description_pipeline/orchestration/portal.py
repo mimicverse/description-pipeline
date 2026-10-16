@@ -2529,6 +2529,9 @@ class PortalApp:
             if isinstance(native, dict) and key in native
         }
         snapshot = {**observation, **registered}
+        if registered.get("error") is None and isinstance(observation.get("error"), str):
+            # No registered failure: the native half's error text stays an observation.
+            snapshot["error"] = observation["error"]
         # The registered publication carries its own repository identity; the
         # displayed PR is validated against exactly that, never the native claim.
         submission = registered.get("result", {}).get("submission") or {}

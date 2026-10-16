@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError
 from description_pipeline.platform import flow
 from description_pipeline.stages import require_complete, stage_view
 

@@ -663,6 +663,13 @@ class FakePlatformStore:
             "tool_identity": None,
         }
 
+    def confirmed_stage(self, run_id: str, stage: str):
+        """The validated reuse read the flow consumes: the completed row's receipt."""
+        row = self.stage_records(run_id).get(stage)
+        if not isinstance(row, dict) or row.get("state") != "completed":
+            return None
+        return row.get("receipt")
+
     def _stage_members(self, run_id: str) -> list[dict]:
         entry = self._entry(run_id) or {}
         preview = entry.get("preview")
@@ -712,10 +719,29 @@ class FakePlatformStore:
                 "reused_from_run": None,
                 "original_executed_at": None,
             }
+        merged = entry.get("merged") or {}
+        result = merged.get("result") if isinstance(merged.get("result"), dict) else None
+        if result:
+            # The publish registration carries what the publish stage produced:
+            # the delivered quality and submission, exactly as _platform_receipt
+            # copies them from the stage receipt.
+            stages["publish"] = {
+                "stage": "publish",
+                "state": "completed",
+                "receipt": {
+                    "subject_sha256": result.get("subject_sha256"),
+                    "handoff_sha256": (entry.get("meta") or {}).get("handoff_sha256"),
+                    "quality": result.get("quality"),
+                    "submission": result.get("submission"),
+                },
+                "checkpoint_uri": f"store://sealed/{run_id}/publish",
+                "reused_from_run": None,
+                "original_executed_at": None,
+            }
         return stages
 
     def run_events(self, run_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict]:
-        """The recorded events in their database row shape (stage plus payload)."""
+        """One bounded page of recorded events in their database row shape."""
         entry = self._entry(run_id) or {}
         events = (entry.get("merged") or {}).get("events")
         rows = []
@@ -731,7 +757,7 @@ class FakePlatformStore:
                     "payload": event,
                 }
             )
-        return rows
+        return [row for row in rows if row["seq"] > after_seq][:limit]
 
     def sealed_path(self, checkpoint_uri: str):
         """Materialize the registered checkpoint members and return their root."""
@@ -855,17 +881,38 @@ class PortalTests(unittest.TestCase):
         self._record_fixture_events(run_id)
         return dag_run_id
 
-    def _record_fixture_events(self, run_id: str) -> None:
-        """Mirror the seeded protocol events into the registered side.
+    #: The registered run vocabulary beside the native job's status words.
+    _STORE_RUN_STATE = {"passed": "succeeded", "native_complete": "running"}
 
-        The runner records the observed stage/check events in the platform store,
-        which is the read authority for the run page; the fixture models that by
-        copying the seeded job's events into the registered row.
+    def _record_fixture_events(self, run_id: str) -> None:
+        """Mirror the seeded job's own facts into the registered side.
+
+        The runner records the observed stage/check events and the run outcome
+        in the platform store, and the publish stage's receipt carries the
+        delivered quality and submission - the read authority for the run
+        page. The fixture models that by copying the seeded job's facts in.
         """
 
         job = self.endpoint_server.jobs.get(run_id) or {}
         entry = self.store.runs[run_id]
-        entry["merged"] = {**(entry.get("merged") or {}), "events": job.get("events") or []}
+        merged = {**(entry.get("merged") or {}), "events": job.get("events") or []}
+        status = job.get("status")
+        state = self._STORE_RUN_STATE.get(str(status), status)
+        if isinstance(state, str) and state:
+            merged["status"] = state
+        if isinstance(job.get("result"), dict):
+            merged["result"] = job["result"]
+        entry["merged"] = merged
+        hardware = job.get("hardware_id")
+        if isinstance(hardware, str) and hardware:
+            # The registered capture tree carries the frozen source identity the
+            # run page reads its hardware/revision from.
+            capture = self.store.root / "sealed" / run_id / "capture" / "input"
+            capture.mkdir(parents=True, exist_ok=True)
+            (capture / "source.json").write_text(
+                json.dumps({"identity": {"hardware_id": hardware}, "metadata": {"revision": job.get("revision")}}),
+                encoding="utf-8",
+            )
 
     def _rebind_attempt_member(self, run_id: str, path: str, payload: bytes) -> None:
         """Re-register one member with new bytes: the fixture keeps the registration
@@ -953,6 +1000,9 @@ class PortalTests(unittest.TestCase):
             },
             events=protocol_events(failed_stage="discover"),
         )
+        run_id = native_run_id(dag_run_id)
+        if run_id in self.store.runs:
+            self._record_fixture_events(run_id)
 
     def _register_attempt(self, run_id: str, members: dict[str, bytes], *, verified: bool) -> None:
         """One registered attempt: the fixture members are the only servable bytes."""
@@ -2290,6 +2340,7 @@ class PortalTests(unittest.TestCase):
             preview=_preview_payload(),
             artifacts=_endpoint_artifacts(),
         )
+        self._record_fixture_events(native_run_id(DAG_RUN_ID))
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         payload = json.loads(body)
@@ -2339,6 +2390,7 @@ class PortalTests(unittest.TestCase):
             preview=_preview_payload(),
             artifacts=_endpoint_artifacts(),
         )
+        self._record_fixture_events(native_run_id(DAG_RUN_ID))
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         payload = json.loads(body)
