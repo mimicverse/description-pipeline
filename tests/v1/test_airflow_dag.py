@@ -1097,6 +1097,7 @@ class LinkedMaterializationTests(unittest.TestCase):
 
     def _producer(self, run_id: str, stage: str, seeds: list):
         from description_pipeline.delivery import read_delivery_manifest
+        from description_pipeline.io import write_json
         from description_pipeline.verification import solidworks_urdf
         from description_pipeline.verification.solidworks_urdf import required_checks
         from tests.v1.test_platform_store import build_sealed_delivery
@@ -1123,6 +1124,11 @@ class LinkedMaterializationTests(unittest.TestCase):
                 "required_checks": expected,
                 "qualifications": solidworks_urdf.qualifications(output, self.definition, checks),
             }
+            # The sealed tree must carry the same qualified report the receipt
+            # binds inline: the completed gate compares the two deterministically
+            # (the manifest subject excludes reports/, so overwriting the
+            # placeholder is safe and member registration picks it up).
+            write_json(output / "reports" / "quality.json", receipt["quality"])
             if stage == "publish":
                 receipt["submission"] = {
                     "passed": True,
