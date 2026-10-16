@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 RECEIPT_SCHEMA = "solidworks-to-urdf.promotion/v1"
-VERBS = ("stage", "promote", "rollback")
+VERBS = ("stage", "reconcile", "promote", "rollback")
 STATUSES = ("completed", "failed", "unknown")
 
 

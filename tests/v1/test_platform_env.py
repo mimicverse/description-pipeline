@@ -30,6 +30,7 @@ def _load_from_path(name: str, path: Path):
 
 
 platform_config = _load_from_path("deploy_platform_config_env", OPERATOR / "platform_config.py")
+render_operator = _load_from_path("deploy_render_operator_env", OPERATOR / "render_operator.py")
 platform_env = _load_from_path("deploy_platform_env", OPERATOR / "platform_env.py")
 install_record = _load_from_path("deploy_install_record_env", OPERATOR / "install_record.py")
 
@@ -181,7 +182,14 @@ class PlatformEnvTests(unittest.TestCase):
         env_file = Path(result["env_path"])
         self.assertEqual(stat.S_IMODE(env_file.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(env_file.parent.stat().st_mode), 0o700)
-        parsed = dict(line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if line)
+        # The file carries the one canonical encoding; reading it back with the canonical
+        # decoder must reproduce every value byte-for-byte (shell-safety quoting included).
+        parsed = {
+            key: render_operator.decode_env_value(raw.strip())
+            for key, raw in (
+                line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if line
+            )
+        }
         self.assertEqual(parsed, env)
 
     def test_wheel_selection_is_bound_to_the_release(self):

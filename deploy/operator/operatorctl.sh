@@ -154,11 +154,15 @@ load_running_env() {
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
 }
 
-# The derived environments write their values raw; the libpq DSNs carry "&", which no `source`
-# assignment survives.  This one reader is how an entry reads a generation value back from its
-# file - never a per-verb parsing copy.
-derived_env_value() {
-  sed -n "s/^$2=//p" "$1" | head -1
+# One env contract: platform_env and render_operator write every derived value through the
+# canonical encoding (bare when shell-safe, single-quoted otherwise - the libpq DSNs' "&"
+# above all), so any consumer can simply `source` the file.  This helper reads one generation
+# value back by sourcing it in a subshell and never parses quoting itself.
+generation_env_value() {
+  local file="$1" key="$2" value
+  value="$( set -a; source "$file"; printf '%s' "${!key}" )" \
+    || die "the derived environment $file does not define $key"
+  printf '%s' "$value"
 }
 
 # The gates read the platform authority from the managed database, so the start window must
@@ -392,7 +396,7 @@ PY
 }
 
 load_installed() {
-  OPERATOR_STATE_DIR="$(sed -n 's/^OPERATOR_STATE=//p' "$ENV_FILE" | head -1)"
+  OPERATOR_STATE_DIR="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
   [ -f "$OPERATOR_STATE_DIR/resolved.env" ] \
     || die "not installed: $OPERATOR_STATE_DIR/resolved.env is missing (run install first)"
@@ -495,17 +499,17 @@ case "$ACTION" in
       [ -f "$CANDIDATE_ENV" ] || die "the staged generation $CANDIDATE_ID is incomplete; re-run stage"
       # The generated environment of the generation this action runs now is the candidate's.
       ENV_FILE="$CANDIDATE_ENV"
-      AIRFLOW_VENV="$(derived_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
-      CANDIDATE_WHEEL_PATH="$(derived_env_value "$CANDIDATE_ENV" PIPELINE_WHEEL)"
-      CANDIDATE_DIGEST="$(derived_env_value "$CANDIDATE_ENV" PLATFORM_CONFIG_DIGEST)"
+      AIRFLOW_VENV="$(generation_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
+      CANDIDATE_WHEEL_PATH="$(generation_env_value "$CANDIDATE_ENV" PIPELINE_WHEEL)"
+      CANDIDATE_DIGEST="$(generation_env_value "$CANDIDATE_ENV" PLATFORM_CONFIG_DIGEST)"
       RUNNING_ENV="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
       [ -f "$RUNNING_ENV" ] || die "the running generation environment is missing: $RUNNING_ENV"
-      CAND_SERVICE_DSN="$(derived_env_value "$CANDIDATE_ENV" PLATFORM_SERVICE_DSN)"
-      CAND_OPERATOR_DSN="$(derived_env_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN)"
-      CAND_RUNTIME_DSN="$(derived_env_value "$CANDIDATE_ENV" AIRFLOW_RUNTIME_DB_URL)"
-      RUN_SERVICE_DSN="$(derived_env_value "$RUNNING_ENV" PLATFORM_SERVICE_DSN)"
-      RUN_OPERATOR_DSN="$(derived_env_value "$RUNNING_ENV" PLATFORM_OPERATOR_DSN)"
-      RUN_RUNTIME_DSN="$(derived_env_value "$RUNNING_ENV" AIRFLOW_RUNTIME_DB_URL)"
+      CAND_SERVICE_DSN="$(generation_env_value "$CANDIDATE_ENV" PLATFORM_SERVICE_DSN)"
+      CAND_OPERATOR_DSN="$(generation_env_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN)"
+      CAND_RUNTIME_DSN="$(generation_env_value "$CANDIDATE_ENV" AIRFLOW_RUNTIME_DB_URL)"
+      RUN_SERVICE_DSN="$(generation_env_value "$RUNNING_ENV" PLATFORM_SERVICE_DSN)"
+      RUN_OPERATOR_DSN="$(generation_env_value "$RUNNING_ENV" PLATFORM_OPERATOR_DSN)"
+      RUN_RUNTIME_DSN="$(generation_env_value "$RUNNING_ENV" AIRFLOW_RUNTIME_DB_URL)"
       [ -n "$CAND_SERVICE_DSN" ] && [ "$CAND_SERVICE_DSN" = "$RUN_SERVICE_DSN" ] \
         && [ "$CAND_OPERATOR_DSN" = "$RUN_OPERATOR_DSN" ] && [ "$CAND_RUNTIME_DSN" = "$RUN_RUNTIME_DSN" ] \
         || die "the staged generation names another database authority than the running generation; refused"
@@ -533,6 +537,24 @@ GUARD
         -m description_pipeline.orchestration.lifecycle_state report \
         --require-admission-closed >/dev/null \
         || die "the staged-candidate reconcile runs only while the admission is closed"
+      # The staged release's platform objects travel to the live authority only here, behind
+      # the verified closed gate, in the installer's canonical order (airflow-side boundary
+      # grants, then the platform schema/views/roles); they are additive and idempotent and
+      # the staged read model is what the recovery below reads.  The step is recorded on the
+      # receipt; promote re-applies the same migrations as its own verified step.
+      ensure_postgres_ready
+      if ! {
+        PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
+          --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+          --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" \
+        && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
+          --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+          --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}"
+      } > "$RECEIPT_DIR/reconcile-schema-migration.out" 2>&1; then
+        promotion_step "$CANDIDATE_ID" reconcile schema-migration failed "$RECEIPT_DIR/reconcile-schema-migration.out"
+        die "the staged generation's schema objects were not applied (the admission stays closed)"
+      fi
+      promotion_step "$CANDIDATE_ID" reconcile schema-migration completed "$RECEIPT_DIR/reconcile-schema-migration.out"
       python3 - "$HERE/../../release.json" "$RECEIPT_DIR/receipt.json" "$CANDIDATE_DIGEST" \
         "$CANDIDATE_WHEEL_PATH" "$AIRFLOW_VENV" "$HERE" <<'GUARD' || die "the staged generation identity did not verify; re-run stage"
 # staged-generation identity: the recorded snapshot, the wheel binding and the installed package
@@ -823,25 +845,10 @@ PY
     fi
     python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --verb promote --step windows-generation --status completed --evidence "$WINDOWS_STAGE" >/dev/null
-    # The staged release's platform objects travel to the live authority now, inside the
-    # maintenance window and in the installer's canonical order (airflow-side boundary
-    # grants, then the platform schema/views/roles): they are additive and idempotent, no
-    # pointer, unit or admission changes, and the staged read model is exactly what the
-    # window's recovery reads before any switch.  promote records the same migrations
-    # again as its own verified step.
-    ensure_postgres_ready
-    if ! {
-      PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
-        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-        --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" \
-      && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
-        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-        --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}"
-    } > "$RECEIPT_DIR/stage-schema-migration.out" 2>&1; then
-      promotion_step "$CANDIDATE_ID" stage schema-migration failed "$RECEIPT_DIR/stage-schema-migration.out"
-      die "the staged generation's schema objects were not applied (the active generation is unchanged)"
-    fi
-    promotion_step "$CANDIDATE_ID" stage schema-migration completed "$RECEIPT_DIR/stage-schema-migration.out"
+    # stage performs no schema DDL: the live database is only written by guarded windows -
+    # the closed-admission reconcile route (which applies the staged objects before it
+    # recovers through them) and promote's own schema-migration step - so a stage while the
+    # system serves never touches the live objects.
     echo "stage complete: $CANDIDATE_ID (active pointer and admission unchanged)"
     ;;
   promote)
@@ -985,7 +992,7 @@ PY
     #    canonical order the installer uses: the Airflow metadata migration (the candidate
     #    runtime's own `airflow db migrate`), then the airflow-side boundary grants, then the
     #    platform objects and consumer grants - all idempotent and re-verified per release.
-    CANDIDATE_RUNTIME_VENV="$(derived_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
+    CANDIDATE_RUNTIME_VENV="$(generation_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
     [ -x "$CANDIDATE_RUNTIME_VENV/bin/airflow" ] \
       || die "the staged runtime provides no Airflow entry; re-run stage"
     if ! {
@@ -1320,9 +1327,9 @@ PY
       # The derived environment writes the libpq DSNs unquoted: read them back from the
       # file so the canonical action consumes the exact generation values.
       [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
-      PLATFORM_SERVICE_DSN="$(derived_env_value "$ENV_FILE" PLATFORM_SERVICE_DSN)"
-      PLATFORM_OPERATOR_DSN="$(derived_env_value "$ENV_FILE" PLATFORM_OPERATOR_DSN)"
-      PIPELINE_STORE_ROOT="$(derived_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
+      PLATFORM_SERVICE_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_SERVICE_DSN)"
+      PLATFORM_OPERATOR_DSN="$(generation_env_value "$ENV_FILE" PLATFORM_OPERATOR_DSN)"
+      PIPELINE_STORE_ROOT="$(generation_env_value "$ENV_FILE" PIPELINE_STORE_ROOT)"
       export PLATFORM_SERVICE_DSN PLATFORM_OPERATOR_DSN PIPELINE_STORE_ROOT
     fi
     RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \

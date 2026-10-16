@@ -22,6 +22,31 @@ from .contract_wheel import write_contract_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
+
+
+_RENDER_MODULE: object | None = None
+
+
+def _render_module():
+    global _RENDER_MODULE
+    if _RENDER_MODULE is None:
+        spec = importlib.util.spec_from_file_location("render_operator_under_test", OPERATOR / "render_operator.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RENDER_MODULE = module
+    return _RENDER_MODULE
+
+
+def decode_env_value(raw: str) -> str:
+    """The canonical env decode (render_operator.encode_env_value's exact inverse)."""
+
+    return _render_module().decode_env_value(raw)
+
+
+def encode_env_value(value: str) -> str:
+    """The canonical env encoding, so fixtures write exactly what the writers would."""
+
+    return _render_module().encode_env_value(value)
 RENDER = OPERATOR / "render_operator.py"
 CONTROL = OPERATOR / "operatorctl.sh"
 HEALTH = OPERATOR / "health.sh"
@@ -59,7 +84,9 @@ def render(state: Path, **overrides: str) -> subprocess.CompletedProcess:
     env = base_env(state, **overrides)
     env_file = state.parent / "operator.env"
     env_file.parent.mkdir(parents=True, exist_ok=True)
-    env_file.write_text("".join(f"{key}={value}\n" for key, value in env.items()), encoding="utf-8")
+    env_file.write_text(
+        "".join(f"{key}={encode_env_value(value)}\n" for key, value in env.items()), encoding="utf-8"
+    )
     return run([sys.executable, str(RENDER), "--env-file", str(env_file)], env)
 
 
@@ -627,7 +654,7 @@ class LifecycleTests(unittest.TestCase):
         for line in (state / "derived" / "gen-1" / "operator.env").read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition("=")
             if key:
-                derived_env[key] = value
+                derived_env[key] = decode_env_value(value.strip())
         bindir = tmp / "bin"
         bindir.mkdir()
         pgbin = state / "airflow-pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
@@ -1256,9 +1283,11 @@ class LifecycleTests(unittest.TestCase):
             env_path = state / "derived" / "gen-1" / "operator.env"
             unit = (target / "description-portal.service").read_text(encoding="utf-8")
             self.assertIn(f"EnvironmentFile={env_path}", unit)
-            # The portal consumes the platform store through the derived DSN (A's U1 slice).
+            # The portal consumes the platform store through the derived DSN (A's U1 slice);
+            # the canonical env encoding single-quotes the value (its "&"/"?" are not
+            # shell-safe), which a `source` and systemd's EnvironmentFile both decode.
             self.assertIn(
-                "PLATFORM_SERVICE_DSN=postgresql://platform_service@/airflow_meta",
+                "PLATFORM_SERVICE_DSN='postgresql://platform_service@/airflow_meta",
                 env_path.read_text(encoding="utf-8"),
             )
 
@@ -1713,7 +1742,8 @@ class InstallOrderingTests(unittest.TestCase):
             receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
             self.assertEqual(
                 [row["step"] for row in receipt["steps"]],
-                ["linux-generation", "windows-generation", "schema-migration"],
+                ["linux-generation", "windows-generation"],
+                "stage performs no schema DDL; the guarded windows own it",
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
             # The bound source is the immutable generation file with its real digest.
@@ -1744,7 +1774,7 @@ class InstallOrderingTests(unittest.TestCase):
     def _derived_value(state: Path, generation: str, key: str) -> str:
         for line in (state / "derived" / generation / "operator.env").read_text(encoding="utf-8").splitlines():
             if line.startswith(key + "="):
-                return line.split("=", 1)[1]
+                return decode_env_value(line.split("=", 1)[1].strip())
         raise AssertionError(f"the derived environment carries no {key}")
 
     def _clone_generation_stubs(self, state: Path) -> None:
@@ -1809,7 +1839,7 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(
                 [row["step"] for row in receipt["steps"]],
                 [
-                    "linux-generation", "windows-generation", "schema-migration",
+                    "linux-generation", "windows-generation",
                     "close-admission", "drain", "backup",
                     "stop-services", "schema-migration", "windows-switch", "endpoint-identity",
                     "switch-pointer", "start-services", "verify", "open-admission",
