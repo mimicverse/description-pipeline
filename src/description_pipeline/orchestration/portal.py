@@ -60,7 +60,13 @@ from .airflow_client import (
 from ..io import PipelineError, digest
 from ..delivery import PIPELINE_ID
 from ..platform import flow
-from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError, RunNotAdmittedError
+from ..platform.store import (
+    AdmissionClosedError,
+    OpenAttemptConflictError,
+    PlatformStore,
+    PlatformStoreError,
+    RunNotAdmittedError,
+)
 from ..ports import PORTAL_HTTP_PORT
 from .stage_transfer import TEAM_REPORTS
 from .feishu_oauth import (
@@ -730,6 +736,51 @@ def _attempt_conf_matches(
         and _optional_str(conf.get("target_hardware")) == target_hardware
         and recorded_summary == change_summary
         and _optional_str(conf.get("main_assembly")) == parent_assembly
+    )
+
+
+def _attempt_frame_digest(
+    *,
+    handoff_path: str,
+    stage: str,
+    target_hardware: str,
+    change_summary: str,
+    parent_assembly: str | None,
+) -> str:
+    """The sealed frame digest of one linked attempt: the admission's own identity."""
+    return digest(
+        {
+            "handoff_path": handoff_path,
+            "main_assembly": parent_assembly,
+            "target_hardware": target_hardware,
+            "resume_from": stage,
+            "change_summary": change_summary,
+        }
+    )
+
+
+def _admission_matches(
+    admission: object,
+    *,
+    principal: str,
+    target_hardware: str,
+    parent_assembly: str | None,
+    frame_digest: str,
+) -> bool:
+    """Whether an uncertain retry equals the immutable admitted request exactly.
+
+    The retry may only ride the reservation when its authenticated principal,
+    target, selection and sealed frame digest all equal the admission; a changed
+    actor, target or summary names a different request and must never be
+    answered by the other attempt's run.
+    """
+    if not isinstance(admission, dict):
+        return False
+    return (
+        admission.get("principal") == principal
+        and admission.get("target_hardware") == target_hardware
+        and admission.get("main_assembly") == (parent_assembly or "")
+        and admission.get("dispatch_digest") == frame_digest
     )
 
 
@@ -2210,7 +2261,37 @@ class PortalApp:
                             active_dag_run_id=child_id,
                         )
                     # Same stage and the trigger outcome is still unknown: reuse the exact
-                    # admitted id, never a second admission.
+                    # admitted id only when this retry equals the immutable admission.
+                    try:
+                        native_child = native_run_id(child_id)
+                        child_record = self._platform().run_record(native_child)
+                        admission = (
+                            self._platform().request_record(child_record.get("request_id"))
+                            if isinstance(child_record, dict)
+                            else None
+                        )
+                    except PlatformStoreError as error:
+                        raise RerunUncertainty("the admitted frame cannot be read") from error
+                    if not _admission_matches(
+                        admission,
+                        principal=principal,
+                        target_hardware=target_hardware,
+                        parent_assembly=parent_assembly,
+                        frame_digest=_attempt_frame_digest(
+                            handoff_path=handoff_path,
+                            stage=stage,
+                            target_hardware=target_hardware,
+                            change_summary=change_summary,
+                            parent_assembly=parent_assembly,
+                        ),
+                    ):
+                        return self._rerun_refusal(
+                            start_response,
+                            "attempt_mismatch",
+                            "已存在的关联尝试与本次准入请求不一致，请等待其结束或恢复原请求",
+                            None,
+                            active_dag_run_id=child_id,
+                        )
                     reserved_id = child_id
                 rows = self._rerun_rows(native_run_id(dag_run_id))
                 if rows is None:
@@ -2262,19 +2343,27 @@ class PortalApp:
                             dispatch={
                                 "stage": stage,
                                 "operation_key": f"portal-{new_run_id}/{stage}:0",
-                                "params_digest": digest(
-                                    {
-                                        "handoff_path": handoff_path,
-                                        "main_assembly": parent_assembly,
-                                        "target_hardware": target_hardware,
-                                        "resume_from": stage,
-                                    }
+                                "params_digest": _attempt_frame_digest(
+                                    handoff_path=handoff_path,
+                                    stage=stage,
+                                    target_hardware=target_hardware,
+                                    change_summary=change_summary,
+                                    parent_assembly=parent_assembly,
                                 ),
                                 "dag_id": self.config.dag_id,
                                 "dag_run_id": new_run_id,
                             },
                             from_stage=stage,
                             parent_run_id=native_run_id(dag_run_id),
+                        )
+                    except OpenAttemptConflictError as error:
+                        # A concurrent submission won the reservation; answer with its attempt.
+                        return self._rerun_refusal(
+                            start_response,
+                            "already_active",
+                            "已有并发开始的关联尝试，请刷新后重试",
+                            None,
+                            active_dag_run_id=self._admitted_dag_run_id(error.request_id),
                         )
                     except AdmissionClosedError:
                         return _json_response(
