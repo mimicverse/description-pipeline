@@ -1009,6 +1009,39 @@ def main() -> int:
             server.close()
         return 1
     os.environ.update(snapshot_env)
+    # The snapshot's secret references must be the real ones this run uses: the endpoint
+    # token file is materialized (0600) and read back for the connection, and the platform
+    # database reference is the actual PLATFORM_SERVICE_DSN this smoke was given -
+    # materialized as the referenced file and re-published from it.  Nothing secret is
+    # printed or copied into evidence.
+    secrets_dir = args.airflow_home / "smoke-config" / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(secrets_dir, 0o700)
+    token_file = Path(resolved["windows"]["token_file"])
+    token_file.write_text(TOKEN, encoding="utf-8")
+    os.chmod(token_file, 0o600)
+    endpoint_token = token_file.read_text(encoding="utf-8")
+    supplied_dsn = os.environ.get("PLATFORM_SERVICE_DSN", "")
+    if not supplied_dsn:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "stage": "platform_dsn",
+                    "error": (
+                        "PLATFORM_SERVICE_DSN is required: the platform database reference "
+                        "must be the real connection this run uses"
+                    ),
+                }
+            )
+        )
+        if server is not None:
+            server.close()
+        return 1
+    dsn_file = Path(resolved["database"]["dsn_file"])
+    dsn_file.write_text(supplied_dsn, encoding="utf-8")
+    os.chmod(dsn_file, 0o600)
+    os.environ["PLATFORM_SERVICE_DSN"] = dsn_file.read_text(encoding="utf-8")
     # The one canonical smoke store root: the snapshot's derived store root, created once
     # here (the operator convention: a dedicated directory under the isolated home, mode
     # 0700) and published to every consumer of this smoke: the in-process admission and
@@ -1031,7 +1064,7 @@ def main() -> int:
             "conn_type": "http",
             "host": "127.0.0.1",
             "port": port,
-            "password": TOKEN,
+            "password": endpoint_token,
             "extra": {
                 "store_root": str(store_root),
                 "repositories": {REPOSITORY_SLUG: str(repository_path)},
