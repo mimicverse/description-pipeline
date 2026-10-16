@@ -1697,7 +1697,17 @@ class PortalApp:
                 }
                 for task in tasks
             ],
-            "job": None if job is None else {"status": job.get("status"), "error": job.get("error")},
+            "job": None
+            if job is None
+            else {
+                "status": job.get("status"),
+                "error": job.get("error"),
+                # The registered failure is the readout authority: its stable code
+                # and detail travel with the same projection; a shape-only legacy
+                # failure stays null instead of fabricating fields.
+                "error_code": job.get("error_code"),
+                "detail": job.get("detail"),
+            },
             "discovery": None
             if not isinstance(job, dict) or not isinstance(job.get("discovery"), dict)
             else {

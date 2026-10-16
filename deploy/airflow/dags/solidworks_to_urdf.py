@@ -246,6 +246,8 @@ def _register_failed_stage(
         "state": "failed",
         "passed": False,
         "error": f"{type(error).__name__}: {error}",
+        "error_code": getattr(error, "code", None),
+        "detail": getattr(error, "detail", None) or getattr(error, "details", None),
     }
     if tree is not None and (Path(tree) / "manifest.json").is_file():
         try:
