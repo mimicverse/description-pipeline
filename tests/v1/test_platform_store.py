@@ -130,6 +130,7 @@ class FakeWorld:
         "operations",
         "operation_bindings",
         "task_instances",
+        "dag_runs",
         "stages",
         "events",
         "confirmed_publishes",
@@ -157,6 +158,8 @@ class FakeWorld:
         self.operation_bindings: dict[str, tuple] = {}
         #: (dag_id, task_id, dag_run_id, map_index) -> task_instance state.
         self.task_instances: dict[tuple[str, str, str, int], str] = {}
+        #: (dag_id, dag_run_id) -> dag_run state; the view's DagRun-settled source.
+        self.dag_runs: dict[tuple[str, str], str] = {}
         self.stages: dict[tuple[str, str], tuple] = {}
         self.events: list[tuple] = []
         self.confirmed_publishes: set[tuple[str, str]] = set()
@@ -312,34 +315,51 @@ class FakeCursor:
                 break
             self._rows = [updated] if updated is not None else []
         elif normalized.startswith("SELECT state, bucket FROM lifecycle_projection"):
-            (operation_id,) = params
-            state = None
-            found = False
-            for record in world.operations.values():
-                if record[0] != operation_id:
-                    continue
-                found = True
-                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
-                    operation_id, (None, None, None, None)
-                )
-                if None not in (dag_id, dag_run_id, task_id, map_index):
-                    state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
-                break
-            if state in {
-                "queued",
-                "running",
-                "scheduled",
-                "deferred",
-                "up_for_retry",
-                "up_for_reschedule",
-                "restarting",
-            }:
-                bucket = "in_flight"
-            elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
-                bucket = "terminal"
+            (object_id,) = params
+            if "object_kind = 'dag_run'" in normalized:
+                state = None
+                found = False
+                for (dag_id, dag_run_id), dag_state in world.dag_runs.items():
+                    if f"{dag_id}/{dag_run_id}" != object_id:
+                        continue
+                    found = True
+                    state = dag_state
+                    break
+                if state in {"success", "failed"}:
+                    bucket = "terminal"
+                elif state in {"queued", "running"}:
+                    bucket = "in_flight"
+                else:
+                    bucket = "unknown"
+                self._rows = [(state, bucket)] if found else []
             else:
-                bucket = "unknown"
-            self._rows = [(state, bucket)] if found else []
+                state = None
+                found = False
+                for record in world.operations.values():
+                    if record[0] != object_id:
+                        continue
+                    found = True
+                    dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                        object_id, (None, None, None, None)
+                    )
+                    if None not in (dag_id, dag_run_id, task_id, map_index):
+                        state = world.task_instances.get((dag_id, task_id, dag_run_id, map_index))
+                    break
+                if state in {
+                    "queued",
+                    "running",
+                    "scheduled",
+                    "deferred",
+                    "up_for_retry",
+                    "up_for_reschedule",
+                    "restarting",
+                }:
+                    bucket = "in_flight"
+                elif state in {"success", "failed", "skipped", "upstream_failed", "removed"}:
+                    bucket = "terminal"
+                else:
+                    bucket = "unknown"
+                self._rows = [(state, bucket)] if found else []
         elif normalized.startswith(
             "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind"
             " FROM operation WHERE operation_key"
@@ -1989,9 +2009,12 @@ class OrphanReconcileTests(unittest.TestCase):
         )
         for task, state in REAL_TIS.items():
             self.world.task_instances[("solidworks_to_urdf", task, run_id, -1)] = state
+        self.world.dag_runs[("solidworks_to_urdf", run_id)] = "failed"
         return self.world.operations[f"portal-{run_id}/capture:0"][0]
 
     def _registered_reconcile(self, run_id: str, state: str = "failed") -> str:
+        """A pre-registered maintenance intent, as the schema shows it before the action."""
+
         operation = self.store.register_operation(
             run_id=run_id,
             stage="freeze",
@@ -2010,12 +2033,37 @@ class OrphanReconcileTests(unittest.TestCase):
         task: str = "start_job",
         map_index: int = -1,
         state: str = "failed",
-        evidence: str = "reports/structural-team.json#sha256=f" + "0" * 63,
+        evidence: str | None = None,
+        evidence_sha: str = "f" * 64,
+        native_run: str | None = None,
+        native_sha: str = "f" * 64,
         with_binding: bool = True,
     ) -> None:
+        """One whole reconcile action through the one canonical entry.
+
+        Without ``reconcile_operation_id`` the action carries its own
+        registration (key plus parameter digest): the maintenance registration,
+        the binding and the settlement commit or roll back as one short unit.
+        With it, the schema-visible pre-registered intent is named by id.
+        """
+
+        evidence = evidence if evidence is not None else (
+            f"runs/{NATIVE_RUNS[run_id]}/reports/structural-team.json#sha256={evidence_sha}"
+        )
+        reconcile: dict = {"evidence": [evidence]}
         if reconcile_operation_id is None:
-            reconcile_operation_id = self._registered_reconcile(run_id, state)
-        reconcile = {"operation_id": reconcile_operation_id, "evidence": [evidence]}
+            reconcile["operation_key"] = f"operatorctl-reconcile:{run_id}:freeze:{state}"
+            reconcile["params_digest"] = digest(
+                {
+                    "outcome": state,
+                    "evidence": [evidence],
+                    "operation": dispatch_id,
+                    "task": task,
+                    "map_index": map_index,
+                }
+            )
+        else:
+            reconcile["operation_id"] = reconcile_operation_id
         if with_binding:
             reconcile["binding"] = {"operation_id": dispatch_id, "task_id": task, "map_index": map_index}
         receipt = {
@@ -2026,21 +2074,17 @@ class OrphanReconcileTests(unittest.TestCase):
             "state": "failed",
             "passed": False,
             "error": "SelectionError: two open errors",
-            "native_run_id": NATIVE_RUNS[run_id],
-            "native_receipt_sha256": "f" * 64,
+            "native_run_id": native_run if native_run is not None else NATIVE_RUNS[run_id],
+            "native_receipt_sha256": native_sha,
         }
         self.store.confirm_stage(
             run_id=run_id, stage="freeze", state=state, receipt=receipt, reconcile=reconcile
         )
 
     def _snapshot(self):
-        return (
-            dict(self.world.operation_bindings),
-            dict(self.world.run_states),
-            dict(self.world.stages),
-            len(self.world.events),
-            {key: value[1] for key, value in self.world.operations.items()},
-        )
+        """The complete world state (rows, bindings, events) for zero-change proofs."""
+
+        return self.world.snapshot_state()
 
     # ------------------------------------------------------------------ positive
     def test_an_orphan_reconciliation_binds_the_real_key_and_records_the_failure(self) -> None:
@@ -2058,6 +2102,8 @@ class OrphanReconcileTests(unittest.TestCase):
                 self.assertEqual(stage[0], "failed")
                 self.assertEqual(stage[1]["error"], "SelectionError: two open errors")
                 self.assertEqual(stage[1]["reconciliation"]["binding"]["task_id"], "start_job")
+                self.assertEqual(stage[1]["native_run_id"], NATIVE_RUNS[run_id])
+                self.assertEqual(stage[1]["native_receipt_sha256"], "f" * 64)
                 self.assertEqual(
                     self.world.operations[f"portal-{run_id}/capture:0"][1], "failed", "the intent settles"
                 )
@@ -2069,34 +2115,157 @@ class OrphanReconcileTests(unittest.TestCase):
                 self.assertEqual(binding_payload["task_id"], "start_job")
                 self.assertEqual(binding_payload["map_index"], -1)
                 self.assertEqual(binding_payload["operation_key"], f"portal-{run_id}/capture:0")
+                self.assertEqual(binding_payload["intent_stage"], "capture")
                 self.assertEqual(binding_payload["reconciled_stage"], "freeze")
+                self.assertEqual(binding_payload["reconciled_state"], "failed")
+                self.assertEqual(binding_payload["dag_id"], "solidworks_to_urdf")
+                self.assertEqual(binding_payload["dag_run_id"], run_id)
+                self.assertEqual(binding_payload["native_run_id"], NATIVE_RUNS[run_id])
+                self.assertEqual(binding_payload["native_receipt_sha256"], "f" * 64)
 
-    def test_a_repeat_of_the_same_reconciliation_changes_nothing(self) -> None:
+    def test_a_repeat_of_the_same_whole_action_changes_nothing(self) -> None:
         dispatch_id = self._legacy_orphan(RUN_A)
         self._call(RUN_A, dispatch_id)
         before = self._snapshot()
         self._call(RUN_A, dispatch_id)
-        self.assertEqual(self._snapshot(), before, "identical identity/evidence/outcome repeats as a no-op")
+        self.assertEqual(self._snapshot(), before, "the identical whole action repeats as a no-op")
 
     # ------------------------------------------------------------------ refusals
     def test_unprovable_or_conflicting_bindings_change_nothing(self) -> None:
         cases = {
-            "tampered_key": dict(task="ghost_task"),
-            "ambiguous_live": dict(task="fetch_capture"),
+            "ghost_task": dict(task="ghost_task"),
+            # upstream_failed never executed: the sibling's existence is not intent binding.
+            "unexecuted_sibling": dict(task="run_publish"),
+            "live_task": dict(task="fetch_capture"),
             "green_task": dict(task="resolve_handoff"),
             "wrong_map_index": dict(map_index=0),
+            "foreign_native_uuid": dict(native_run="deadbeef-0000-4000-8000-000000000000"),
+            "foreign_receipt_digest": dict(native_sha="0" * 64),
         }
         for name, overrides in cases.items():
             with self.subTest(name=name):
                 self.setUp()
                 dispatch_id = self._legacy_orphan(RUN_A)
-                if name == "ambiguous_live":
+                if name == "live_task":
                     self.world.task_instances[("solidworks_to_urdf", "fetch_capture", RUN_A, -1)] = "running"
-                reconcile_id = self._registered_reconcile(RUN_A)
                 before = self._snapshot()
                 with self.assertRaises(PlatformStoreError):
-                    self._call(RUN_A, dispatch_id, reconcile_operation_id=reconcile_id, **overrides)
-                self.assertEqual(self._snapshot(), before, "refused binding leaves zero change")
+                    self._call(RUN_A, dispatch_id, **overrides)
+                self.assertEqual(self._snapshot(), before, "a refused whole action leaves zero change")
+                self.assertNotIn(
+                    f"operatorctl-reconcile:{RUN_A}:freeze:failed",
+                    self.world.operations,
+                    "the maintenance registration rolls back with the refused action",
+                )
+
+    def test_a_foreign_native_uuid_never_settles_the_run(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(
+                RUN_A,
+                dispatch_id,
+                native_run="deadbeef-0000-4000-8000-000000000000",
+                native_sha="0" * 64,
+            )
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self.world.run_states.get(RUN_A), "queued")
+        self.assertEqual(self.world.events, [])
+        self.assertEqual(
+            self.world.operation_bindings[dispatch_id],
+            ("solidworks_to_urdf", RUN_A, None, None),
+            "the intent stays unbound and queued",
+        )
+
+    def test_the_native_identity_must_derive_from_the_runs_own_dag_run(self) -> None:
+        for name, overrides in {
+            "empty": dict(native_run=""),
+            "not_a_uuid": dict(native_run="not-a-uuid"),
+            "another_runs_job": dict(native_run=NATIVE_RUNS[RUN_B]),
+        }.items():
+            with self.subTest(name=name):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, dispatch_id, **overrides)
+                self.assertEqual(self._snapshot(), before)
+        with self.subTest(name="dag_run_id_belongs_to_another_attempt"):
+            self.setUp()
+            dispatch_id = self._legacy_orphan(RUN_A, dag_run_id=RUN_B)
+            before = self._snapshot()
+            with self.assertRaises(PlatformStoreError):
+                self._call(RUN_A, dispatch_id)
+            self.assertEqual(self._snapshot(), before)
+
+    def test_the_failed_receipt_digest_must_be_the_evidence_bound_one(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, native_sha="0" * 64)
+        # an evidence entry without any digest fragment binds nothing either
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, evidence="runs/note.json")
+        self.assertEqual(self._snapshot(), before)
+
+    def test_a_live_or_unknown_dag_run_never_authorizes_recovery(self) -> None:
+        for name, dag_state in (("live", "running"), ("green", "success")):
+            with self.subTest(name=name):
+                self.setUp()
+                dispatch_id = self._legacy_orphan(RUN_A)
+                self.world.dag_runs[("solidworks_to_urdf", RUN_A)] = dag_state
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._call(RUN_A, dispatch_id)
+                self.assertEqual(self._snapshot(), before)
+        with self.subTest(name="unreadable"):
+            self.setUp()
+            dispatch_id = self._legacy_orphan(RUN_A)
+            del self.world.dag_runs[("solidworks_to_urdf", RUN_A)]
+            before = self._snapshot()
+            with self.assertRaises(PlatformStoreError):
+                self._call(RUN_A, dispatch_id)
+            self.assertEqual(self._snapshot(), before)
+
+    def test_a_repeat_that_renames_the_native_identity_changes_nothing(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
+        with self.assertRaises(PlatformStoreError):
+            self._call(
+                RUN_A,
+                dispatch_id,
+                native_run="deadbeef-0000-4000-8000-000000000000",
+                native_sha="0" * 64,
+            )
+        self.assertEqual(self._snapshot(), before, "a conflicting native identity is never an idempotent repeat")
+
+    def test_a_repeat_that_conflicts_with_the_recorded_outcome_changes_nothing(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
+        recorded = self.world.operations[f"operatorctl-reconcile:{RUN_A}:freeze:failed"][0]
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, reconcile_operation_id=recorded, state="cancelled")
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, state="cancelled")
+        with self.assertRaises(PlatformStoreError):
+            self._call(RUN_A, dispatch_id, evidence="reports/other.json#sha256=" + "0" * 64)
+        self.assertEqual(self._snapshot(), before, "a conflicting outcome or evidence is never a repeat")
+
+    def test_a_registered_intent_refuses_the_same_conflicts_with_zero_change(self) -> None:
+        dispatch_id = self._legacy_orphan(RUN_A)
+        registered = self._registered_reconcile(RUN_A)
+        before = self._snapshot()
+        for overrides in (
+            dict(native_run="deadbeef-0000-4000-8000-000000000000"),
+            dict(task="run_publish"),
+        ):
+            with self.assertRaises(PlatformStoreError):
+                self._call(RUN_A, dispatch_id, reconcile_operation_id=registered, **overrides)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_structurally_invalid_intents_change_nothing(self) -> None:
         for name, setup in (
             ("foreign_operation", None),
             ("missing_dag_run_evidence", "missing"),
@@ -2120,26 +2289,26 @@ class OrphanReconcileTests(unittest.TestCase):
                     key = f"portal-{RUN_A}/capture:0"
                     record = self.world.operations[key]
                     self.world.operations[key] = (*record[:1], "running", *record[2:])
-                reconcile_id = self._registered_reconcile(RUN_A)
                 before = self._snapshot()
                 target = "deadbeef-0000-0000-0000-000000000000" if name == "foreign_operation" else dispatch_id
                 with self.assertRaises(PlatformStoreError):
-                    self._call(RUN_A, target, reconcile_operation_id=reconcile_id)
+                    self._call(RUN_A, target)
                 self.assertEqual(self._snapshot(), before, "refused binding leaves zero change")
 
     def test_non_failed_or_unbound_reconciles_keep_the_classic_rules(self) -> None:
         dispatch_id = self._legacy_orphan(RUN_A)
-        reconcile_id = self._registered_reconcile(RUN_A)
         before = self._snapshot()
         with self.assertRaises(PlatformStoreError):
-            self._call(RUN_A, dispatch_id, reconcile_operation_id=reconcile_id, state="completed")
+            self._call(RUN_A, dispatch_id, state="completed")
         with self.assertRaises(PlatformStoreError):
-            self._call(RUN_A, dispatch_id, reconcile_operation_id=reconcile_id, with_binding=False)
+            self._call(RUN_A, dispatch_id, with_binding=False)
         self.assertEqual(self._snapshot(), before)
         # A recorded orphan stage never takes a different binding later.
         self._call(RUN_A, dispatch_id)
+        before = self._snapshot()
         with self.assertRaises(PlatformStoreError):
-            self._call(RUN_A, dispatch_id, evidence="reports/other.json#sha256=e" + "0" * 63)
+            self._call(RUN_A, dispatch_id, task="ghost_task")
+        self.assertEqual(self._snapshot(), before)
 
 
 if __name__ == "__main__":

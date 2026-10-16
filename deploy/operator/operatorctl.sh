@@ -8,11 +8,15 @@
 #   status    systemctl --user is-active for every managed unit
 #   health    deploy/operator/health.sh (static checks plus live service/HTTP checks)
 #   reconcile confirm and register external outcomes; never repeats unknown side effects
+#             (--install-id runs it from a staged candidate in a closed admission window)
 #   stage     build the two-end candidate installation (isolated targets)
 #   promote   switch both ends to the staged candidate (admission closed until verified)
 #   rollback  restore both ends from the recorded previous installation
 #
 #   operatorctl.sh <verb> --config FILE
+#   orphan recovery: reconcile --run-id R --stage S --outcome failed --evidence FILE... \
+#     --native-receipt FILE --native-run-id UUID --orphan-operation-id OP \
+#     --orphan-task-id TASK --orphan-map-index N
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
@@ -28,6 +32,8 @@ usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
+reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
+orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2
@@ -44,6 +50,11 @@ RELEASE_FILE=""
 RUN_ID=""
 STAGE=""
 OUTCOME=""
+NATIVE_RECEIPT=""
+NATIVE_RUN_ID=""
+ORPHAN_OPERATION_ID=""
+ORPHAN_TASK_ID=""
+ORPHAN_MAP_INDEX=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,6 +66,11 @@ while [ $# -gt 0 ]; do
     --run-id) RUN_ID="${2:-}"; shift 2 ;;
     --stage) STAGE="${2:-}"; shift 2 ;;
     --outcome) OUTCOME="${2:-}"; shift 2 ;;
+    --native-receipt) NATIVE_RECEIPT="${2:-}"; shift 2 ;;
+    --native-run-id) NATIVE_RUN_ID="${2:-}"; shift 2 ;;
+    --orphan-operation-id) ORPHAN_OPERATION_ID="${2:-}"; shift 2 ;;
+    --orphan-task-id) ORPHAN_TASK_ID="${2:-}"; shift 2 ;;
+    --orphan-map-index) ORPHAN_MAP_INDEX="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
     *) usage ;;
   esac
@@ -419,10 +435,16 @@ drift_check() {
 }
 
 [ -n "$CONFIG_FILE" ] || usage
-if [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ] \
+if [ "$ACTION" = "reconcile" ]; then
+  # The maintenance reconcile may name a staged generation (--install-id); the install asset
+  # inputs belong to the install/stage family alone.
+  [ -z "$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] || usage
+elif [ -n "$INSTALL_ID$WHEEL_FILE$ENDPOINT_IDENTITY$RELEASE_FILE" ] && [ "$ACTION" != "install" ] \
    && [ "$ACTION" != "stage" ] && [ "$ACTION" != "promote" ] && [ "$ACTION" != "rollback" ]; then
   usage
 fi
+[ -z "$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX" ] \
+  || [ "$ACTION" = "reconcile" ] || usage
 [ -f "$CONFIG_FILE" ] || die "config file not found: $CONFIG_FILE"
 # Every verb passes the same static config gate first; the install record and its derived
 # per-generation environment stay the single authority for the operational verbs.
@@ -448,7 +470,30 @@ case "$ACTION" in
     platform_close_admission "start-window" "operatorctl start"
     load_active_env ;;
   drain|stop|status|health|reconcile)
-    load_active_env ;;
+    if [ "$ACTION" != "reconcile" ] || [ -z "$INSTALL_ID" ]; then
+      load_active_env
+    else
+      # The bootstrap maintenance window: the staged candidate generation runs the canonical
+      # recovery against the same real database.  The running record stays the reference; the
+      # staged artifacts (promotion receipt, snapshot-derived environment) are re-checked here
+      # and the active pointer, units and admission are untouched.  The channel is closed-window
+      # only: it refuses while the admission is open.
+      load_running_env
+      CANDIDATE_ID="$INSTALL_ID"
+      RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
+      [ -f "$RECEIPT_DIR/receipt.json" ] \
+        || die "no stage receipt for $CANDIDATE_ID; run stage first"
+      CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
+      [ -f "$CANDIDATE_ENV" ] || die "the staged generation $CANDIDATE_ID is incomplete; re-run stage"
+      set -a
+      # shellcheck disable=SC1090
+      source "$CANDIDATE_ENV"
+      set +a
+      [ -x "$AIRFLOW_VENV/bin/python" ] || die "the staged generation runtime is missing; re-run stage"
+      "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.lifecycle_state report \
+        --require-admission-closed >/dev/null \
+        || die "the staged-candidate reconcile runs only while the admission is closed"
+    fi ;;
   stage|promote|rollback)
     load_running_env ;;
   *)
@@ -1130,14 +1175,29 @@ PY
       completed|failed|cancelled) ;;
       *) die "unresolved is not a result; --outcome must be completed, failed or cancelled" ;;
     esac
+    ORPHAN_INPUTS="$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX"
+    if [ -n "$ORPHAN_INPUTS" ]; then
+      [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] && [ -n "$ORPHAN_OPERATION_ID" ] \
+        && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
+        || die "orphan recovery requires --native-receipt, --native-run-id, --orphan-operation-id --orphan-task-id and --orphan-map-index together"
+      [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
+      [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
+      [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
+    fi
     RECONCILE_RUN_ID="$RUN_ID" RECONCILE_STAGE="$STAGE" RECONCILE_OUTCOME="$OUTCOME" \
     RECONCILE_EVIDENCE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
+    RECONCILE_NATIVE_RECEIPT="$NATIVE_RECEIPT" RECONCILE_NATIVE_RUN_ID="$NATIVE_RUN_ID" \
+    RECONCILE_ORPHAN_OPERATION_ID="$ORPHAN_OPERATION_ID" RECONCILE_ORPHAN_TASK_ID="$ORPHAN_TASK_ID" \
+    RECONCILE_ORPHAN_MAP_INDEX="$ORPHAN_MAP_INDEX" \
       "$AIRFLOW_VENV/bin/python" - <<'PY' || die "reconcile refused"
 # platform-reconcile
+import hashlib
 import json
 import os
+from pathlib import Path
 
 from description_pipeline import io
+from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
 from description_pipeline.platform.store import PlatformStore
 
 run_id = os.environ["RECONCILE_RUN_ID"]
@@ -1145,22 +1205,78 @@ stage = os.environ["RECONCILE_STAGE"]
 outcome = os.environ["RECONCILE_OUTCOME"]
 evidence = json.loads(os.environ["RECONCILE_EVIDENCE"])
 
-# The confirmation binds the same registered reconcile operation it carries as evidence: the
-# store refuses an unbound dict, a foreign run/stage, or a stage without an unresolved original
-# operation.  A retry with the same outcome reuses the same operation key - none is re-sent.
+# One canonical action: the maintenance intent registers, the orphan binding backfills and the
+# settlement commits - or the whole action rolls back - inside one short store transaction.  A
+# retry with the same operation key, evidence, binding and outcome reuses the recorded result;
+# any conflict refuses with zero change and no maintenance row left behind.
+binding = None
+receipt = None
+native_receipt = os.environ.get("RECONCILE_NATIVE_RECEIPT") or ""
+if native_receipt:
+    raw = Path(native_receipt).read_bytes()
+    digest_sha = hashlib.sha256(raw).hexdigest()
+    document = json.loads(raw)
+    if not isinstance(document, dict):
+        raise SystemExit("the native failed receipt must be a JSON object")
+    explicit_run = os.environ.get("RECONCILE_NATIVE_RUN_ID") or None
+    recorded_run = document.get("native_run_id") or None
+    if explicit_run and recorded_run and explicit_run != recorded_run:
+        raise SystemExit("the named endpoint job UUID contradicts the receipt document")
+    native_run = explicit_run or recorded_run
+    if not native_run:
+        raise SystemExit("the failed receipt names no endpoint job UUID (--native-run-id is required)")
+    # The receipt bytes are the authority for their own digest; a self-contradicting document
+    # or a contradictory evidence entry refuses instead of recording a split identity.
+    if isinstance(document.get("native_receipt_sha256"), str) and document["native_receipt_sha256"] != digest_sha:
+        raise SystemExit("the native receipt's recorded digest contradicts its own bytes")
+    contradicting = [
+        item
+        for item in evidence
+        if isinstance(item, str)
+        and item.startswith(f"{native_receipt}#sha256=")
+        and item.split("#sha256=", 1)[1] != digest_sha
+    ]
+    if contradicting:
+        raise SystemExit(f"the evidence entry contradicts the receipt bytes: {contradicting[0]}")
+    evidence = [
+        item
+        for item in evidence
+        if not (isinstance(item, str) and (item == native_receipt or item.startswith(f"{native_receipt}#")))
+    ] + [f"{native_receipt}#sha256={digest_sha}"]
+    binding = {
+        "operation_id": os.environ["RECONCILE_ORPHAN_OPERATION_ID"],
+        "task_id": os.environ["RECONCILE_ORPHAN_TASK_ID"],
+        "map_index": int(os.environ["RECONCILE_ORPHAN_MAP_INDEX"]),
+    }
+    receipt = {
+        "schema_version": BUNDLE_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "run_id": run_id,
+        "stage": stage,
+        "state": "failed",
+        "passed": False,
+        "native_run_id": native_run,
+        "native_receipt_sha256": digest_sha,
+    }
+    for key in ("error", "error_code", "detail"):
+        value = document.get(key)
+        if isinstance(value, str) and value:
+            receipt[key] = value
+
+reconcile = {
+    "operation_key": f"operatorctl-reconcile:{run_id}:{stage}:{outcome}",
+    "evidence": evidence,
+    "params_digest": io.digest({"outcome": outcome, "evidence": evidence, "binding": binding}),
+}
+if binding is not None:
+    reconcile["binding"] = binding
 store = PlatformStore.from_environment()
-operation = store.register_operation(
-    run_id=run_id,
-    stage=stage,
-    kind="reconcile",
-    operation_key=f"operatorctl-reconcile:{run_id}:{stage}:{outcome}",
-    params_digest=io.digest({"outcome": outcome, "evidence": evidence}),
-)
 store.confirm_stage(
     run_id=run_id,
     stage=stage,
     state=outcome,
-    reconcile={"operation_id": operation.operation_id, "evidence": evidence},
+    receipt=receipt,
+    reconcile=reconcile,
 )
 print(f"reconciled={run_id}:{stage} outcome={outcome}")
 PY

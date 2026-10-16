@@ -28,6 +28,7 @@ from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
+from ..orchestration.airflow_client import native_run_id
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -235,6 +236,10 @@ _READ_ORPHAN_SCHEDULING = (
     "SELECT state, bucket FROM lifecycle_projection"
     " WHERE object_kind = 'scheduling' AND object_id = %s"
 )
+_READ_ORPHAN_DAGRUN = (
+    "SELECT state, bucket FROM lifecycle_projection"
+    " WHERE object_kind = 'dag_run' AND object_id = %s"
+)
 _SETTLE_ORPHAN_INTENT = (
     "UPDATE operation SET state = %s, updated_at = now()"
     " WHERE operation_id = %s AND run_id = %s AND state = 'queued'"
@@ -284,8 +289,8 @@ _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
 REUSE_LINEAGE_DEPTH = 256
 
 
-def _stored_reconciliation(row) -> object:
-    """The recorded reconciliation of one locked stage row, for idempotent repeats."""
+def _stored_receipt(row) -> dict | None:
+    """The parsed receipt of one locked stage row (jsonb arrives as text or a mapping)."""
 
     receipt = row[1] if row and len(row) > 1 else None
     if isinstance(receipt, str):
@@ -293,7 +298,51 @@ def _stored_reconciliation(row) -> object:
             receipt = json.loads(receipt)
         except ValueError:
             return None
-    return receipt.get("reconciliation") if isinstance(receipt, dict) else None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _stored_reconciliation(row) -> object:
+    """The recorded reconciliation of one locked stage row, for idempotent repeats."""
+
+    receipt = _stored_receipt(row)
+    return receipt.get("reconciliation") if receipt is not None else None
+
+
+def _native_receipt_identity(receipt: object) -> tuple:
+    """The bound native identity of one receipt: endpoint job UUID plus failed receipt digest.
+
+    A repeat is only the same recorded fact when this identity is unchanged;
+    a receipt that renames the native job or its digest is a conflicting
+    submission, never an idempotent one.
+    """
+
+    if not isinstance(receipt, dict):
+        return (None, None)
+    return (receipt.get("native_run_id"), receipt.get("native_receipt_sha256"))
+
+
+def _evidence_digests(entries: object) -> set:
+    """The ``path#sha256=...`` digest fragments a reconciliation's evidence entries bind."""
+
+    digests = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, str) and "#sha256=" in entry:
+            fragment = entry.split("#sha256=", 1)[1]
+            if _is_sha256(fragment):
+                digests.add(fragment)
+    return digests
+
+
+def _is_canonical_uuid(value: object) -> bool:
+    """One canonical lowercase UUID string, the endpoint job identity shape."""
+
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return value == parsed
 
 
 def _json(value: Any) -> str | None:
@@ -494,16 +543,7 @@ class PlatformStore:
             return existing
         binding = self._rebind_predecessor(run_id=run_id, stage=stage, kind=kind)
         with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute(_FIND_OPERATION, (operation_key,))
-            row = cursor.fetchone()
-            if row is not None:
-                return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
-            if stage not in STAGE_IDS:
-                raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
-            self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind, claiming=False)
-            _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
-            return self._insert_operation(
+            return self._register_operation_locked(
                 connection,
                 run_id=run_id,
                 stage=stage,
@@ -511,7 +551,48 @@ class PlatformStore:
                 operation_key=operation_key,
                 params_digest=params_digest,
                 dispatch=dispatch or {},
+                binding=binding,
             )
+
+    def _register_operation_locked(
+        self,
+        connection,
+        *,
+        run_id: str,
+        stage: str,
+        kind: str,
+        operation_key: str,
+        params_digest: str,
+        dispatch: dict,
+        binding: dict | None = None,
+    ) -> OperationRecord:
+        """The in-transaction core of ``register_operation``.
+
+        The same key with the same scope and parameters returns the recorded
+        operation; a conflict refuses without touching anything else.  The
+        reconcile confirmation calls this core inside its own write
+        transaction, so the maintenance registration, the binding backfill and
+        the settlement commit or roll back as one short unit.
+        """
+
+        cursor = connection.cursor()
+        cursor.execute(_FIND_OPERATION, (operation_key,))
+        row = cursor.fetchone()
+        if row is not None:
+            return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
+        if stage not in STAGE_IDS:
+            raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
+        self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind, claiming=False)
+        _require_successor(self, connection, run_id=run_id, kind=kind, stage=stage, binding=binding)
+        return self._insert_operation(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind=kind,
+            operation_key=operation_key,
+            params_digest=params_digest,
+            dispatch=dispatch,
+        )
 
     def claim_operation(self, *, run_id: str, stage: str, operation_key: str) -> OperationClaim:
         """Claim a registered operation as ``running`` (queued -> running; idempotent).
@@ -859,6 +940,10 @@ class PlatformStore:
             if run_row is None:
                 raise PlatformStoreError(f"The run {run_id!r} is not admitted")
             run_state = run_row[0]
+            if reconcile is not None:
+                reconcile = self._reconcile_operation(
+                    connection, run_id=run_id, stage=stage, reconcile=reconcile
+                )
             cursor.execute(_LOCK_STAGE, (run_id, stage))
             row = cursor.fetchone()
             current = row[0] if row else None
@@ -867,8 +952,14 @@ class PlatformStore:
                     if reconcile is not None:
                         cursor.execute(_READ_STAGE_ROW, (run_id, stage))
                         stored = cursor.fetchone()
-                        if _stored_reconciliation(stored) == reconcile:
-                            # The same identity, evidence and outcome repeated: nothing changes.
+                        stored_receipt = _stored_receipt(stored)
+                        if (
+                            current == state
+                            and _stored_reconciliation(stored) == reconcile
+                            and _native_receipt_identity(stored_receipt) == _native_receipt_identity(receipt)
+                        ):
+                            # The same operation, evidence, binding, native identity and outcome
+                            # repeated: return the recorded result and change nothing.
                             return
                     raise PlatformStoreError(
                         f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
@@ -984,6 +1075,45 @@ class PlatformStore:
             )
             self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
 
+    def _reconcile_operation(self, connection, *, run_id: str, stage: str, reconcile: dict) -> dict:
+        """Resolve the reconciliation's registered operation inside the write transaction.
+
+        The caller either names an already-registered reconcile operation, or
+        carries the registration itself (its key plus parameter digest); the
+        registration then travels in the same short locked transaction as the
+        binding and the settlement, so a refused reconciliation leaves no
+        maintenance row behind and a retry reuses the same operation identity.
+        """
+
+        operation_id = reconcile.get("operation_id")
+        operation_key = reconcile.get("operation_key")
+        params_digest = reconcile.get("params_digest")
+        if operation_id is not None and (operation_key is not None or params_digest is not None):
+            raise PlatformStoreError("A reconciliation names its operation or its registration, not both")
+        if operation_id is not None:
+            return reconcile
+        if not (
+            isinstance(operation_key, str)
+            and operation_key
+            and isinstance(params_digest, str)
+            and params_digest
+        ):
+            raise PlatformStoreError(
+                "A reconciliation must name its registered reconcile operation or carry its registration key"
+            )
+        record = self._register_operation_locked(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="reconcile",
+            operation_key=operation_key,
+            params_digest=params_digest,
+            dispatch={},
+        )
+        resolved = {key: value for key, value in reconcile.items() if key not in {"operation_key", "params_digest"}}
+        resolved["operation_id"] = record.operation_id
+        return resolved
+
     def _reconcile_orphan_binding(
         self,
         connection,
@@ -1001,13 +1131,17 @@ class PlatformStore:
         """Controlled orphan recovery: bind a queued intent's missing Airflow key, then confirm.
 
         The one reconcile entry may fill only the missing binding columns of a
-        never-started queued intent (the 1.4.3 pre-candidate shape), from the
-        caller-provided real Airflow full key; the binding is accepted only
-        after the lifecycle view itself shows that operation's scheduling as a
-        terminal failed fact.  Conflict, foreign, missing, ambiguous, live or
-        success facts refuse with zero change (the tentative binding rolls back
-        with the transaction), and no unresolved intermediate state is ever
-        fabricated.
+        never-started queued intent (the 1.4.3 pre-candidate shape) from the
+        real Airflow full key the caller evidences.  The receipt must name this
+        run's own endpoint job - checked against the one canonical
+        ``native_run_id`` derivation from the operation's recorded DagRun -
+        and its failed-receipt digest must be the digest the reconciliation's
+        evidence entries bind.  The binding is accepted only after the lifecycle
+        view itself shows the bound task actually failed (never an unexecuted
+        ``upstream_failed`` sibling) and the DagRun is terminal failed: conflict,
+        foreign, missing, ambiguous, live or success facts refuse with zero
+        change (the tentative binding rolls back with the transaction), and no
+        unresolved intermediate state is ever fabricated.
         """
 
         if state != "failed":
@@ -1028,13 +1162,16 @@ class PlatformStore:
             or not isinstance(task_id, str)
             or not task_id
             or type(map_index) is not int
+            or map_index < -1
         ):
             raise PlatformStoreError("An orphan binding names its operation, task id and integer map index")
         native_run = receipt.get("native_run_id")
         native_sha = receipt.get("native_receipt_sha256")
-        if not isinstance(native_run, str) or not native_run or not _is_sha256(native_sha):
+        if not _is_canonical_uuid(native_run) or not _is_sha256(native_sha):
+            raise PlatformStoreError("An orphan reconciliation binds its native run UUID and failed receipt digest")
+        if native_sha not in _evidence_digests(reconcile.get("evidence")):
             raise PlatformStoreError(
-                "An orphan reconciliation binds its native run id and failed receipt digest"
+                "The failed receipt digest must be the one the reconciliation evidence entries bind"
             )
         reconcile_operation = reconcile.get("operation_id")
         cursor.execute(_FIND_RECONCILE, (reconcile_operation, run_id, stage))
@@ -1052,23 +1189,29 @@ class PlatformStore:
         if op_state != "queued" or bound_task is not None or bound_map is not None:
             raise PlatformStoreError("The named operation is not an unstarted unbound orphan; refused")
         if not (isinstance(dag_id, str) and dag_id and isinstance(dag_run_id, str) and dag_run_id):
-            raise PlatformStoreError("The operation lacks its recorded Airflow binding evidence")
+            raise PlatformStoreError("The operation lacks its recorded Airflow DagRun identity evidence")
+        if native_run != native_run_id(dag_run_id):
+            # The endpoint job identity is fixed by the run's own recorded DagRun id
+            # through the one canonical derivation: a foreign, copied or merely
+            # UUID-shaped value never authorizes recovery.
+            raise PlatformStoreError("The native receipt names another run's endpoint job; refused")
         cursor.execute(_BIND_ORPHAN_OPERATION, (task_id, map_index, operation_id, run_id))
         if cursor.fetchone() is None:
             raise PlatformStoreError("The orphan binding lost its operation to another writer")
         cursor.execute(_READ_ORPHAN_SCHEDULING, (operation_id,))
         scheduling = cursor.fetchone()
-        if (
-            scheduling is None
-            or scheduling[1] != "terminal"
-            or scheduling[0] not in {"failed", "upstream_failed"}
-        ):
-            # A fabricated or ambiguous key joins nothing (unknown), a live task is in
+        if scheduling is None or scheduling[1] != "terminal" or scheduling[0] != "failed":
+            # A fabricated or ambiguous key joins nothing (unknown), an unexecuted
+            # upstream_failed sibling never sent the native request, a live task is in
             # flight and a green task contradicts the failure: all refuse, and the
             # tentative binding rolls back with this transaction.
-            raise PlatformStoreError(
-                "The bound Airflow task does not prove a terminal failed scheduling fact; refused"
-            )
+            raise PlatformStoreError("The bound Airflow task does not prove its own failed fact; refused")
+        cursor.execute(_READ_ORPHAN_DAGRUN, (f"{dag_id}/{dag_run_id}",))
+        dag_run = cursor.fetchone()
+        if dag_run is None or dag_run[1] != "terminal" or dag_run[0] != "failed":
+            # A live or unknown DagRun is not a settled external failure: the
+            # binding waits until the DagRun's own terminal failed fact is visible.
+            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact; refused")
         payload_receipt = {**receipt, "reconciliation": reconcile}
         cursor.execute(_INSERT_STAGE, (run_id, stage, state, _json(payload_receipt), None, None, None))
         if cursor.fetchone() is None:
@@ -1076,17 +1219,18 @@ class PlatformStore:
         self._insert_event(
             connection,
             run_id=run_id,
-            stage=op_stage if isinstance(op_stage, str) and op_stage else stage,
+            stage=stage,
             kind="binding",
             operation_id=operation_id,
             payload={
                 "operation_key": operation_key,
+                "intent_stage": op_stage,
+                "reconciled_stage": stage,
+                "reconciled_state": state,
                 "dag_id": dag_id,
                 "dag_run_id": dag_run_id,
                 "task_id": task_id,
                 "map_index": map_index,
-                "reconciled_stage": stage,
-                "reconciled_state": state,
                 "native_run_id": native_run,
                 "native_receipt_sha256": native_sha,
             },
