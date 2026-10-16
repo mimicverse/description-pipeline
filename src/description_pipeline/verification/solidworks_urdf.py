@@ -25,7 +25,16 @@ from ..io import PipelineError, confined, digest, file_digest, inventory, read_d
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.snapshot import verify_snapshot
-from ..interface_records import CHECK_POLICY_V1, QUALIFICATION_SCHEMA, qualification_facts, validate_qualification
+from ..interface_records import (
+    CHECK_POLICY_V1,
+    PURPOSE_INSPECTION_PREVIEW,
+    QUALIFICATION_SCHEMA,
+    preview_revolute_window_rad,
+    preview_sampling_interval_fraction,
+    qualification_facts,
+    validate_qualification,
+)
+from ..request_evidence import read_request_evidence
 from ..stages import required_rows_complete
 from . import native_discovery as evidence
 from .consumer import load as load_consumer
@@ -898,15 +907,27 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics):
     )
     limits = {key: float(value) for key, value in _one(node, "limit").attrib.items()}
     _require(limits == authored["limits"] == canonical["limits"], "Joint limits differ from author inputs")
+    _require(all(math.isfinite(value) for value in limits.values()), "Invalid joint limits")
     _require(
-        all(math.isfinite(value) for value in limits.values()) and limits["effort"] >= 0 and limits["velocity"] >= 0,
+        all(limits.get(key, 0.0) >= 0 for key in ("effort", "velocity")),
         "Invalid joint limits",
     )
+    _require(
+        canonical.get("limit_source") == authored.get("limit_source"),
+        "Joint limit source changed between author inputs and the canonical model",
+    )
     if authored["type"] in {"revolute", "prismatic"}:
+        _require("lower" in limits and "upper" in limits, "Missing position limits")
         _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
-    unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
+    if authored.get("limit_source") == "policy_preview_window":
+        radius = preview_revolute_window_rad()
+        _require(
+            authored["type"] == "revolute" and limits.get("lower") == -radius and limits.get("upper") == radius,
+            "The inspection-preview window does not equal the frozen policy radius",
+        )
+    unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
         unqualified.append("degenerate_position_range")
     if unqualified:
@@ -965,7 +986,13 @@ def _unit_axis(value):
 
 
 def _joint_sample(joint, sign):
-    """One pose value for a delivered moving joint, from its own evidence only."""
+    """One pose value for a delivered moving joint, from its own evidence only.
+
+    The offset inside the joint's ordered interval is the canonical policy's
+    analytical sampling fraction of the quarter-interval point (the frozen
+    policy fixes 1.0 today); a missing-drive joint samples identically - this
+    is an analysis pose, not an engineering claim.
+    """
 
     if joint["type"] == "continuous":
         return 0.3 if sign > 0 else -0.4
@@ -980,7 +1007,7 @@ def _joint_sample(joint, sign):
         f"Joint {joint['name']} has no usable ordered limits",
     )
     middle = (float(lower) + float(upper)) / 2
-    quarter = (float(upper) - float(lower)) / 4
+    quarter = (float(upper) - float(lower)) / 4 * preview_sampling_interval_fraction()
     return middle + sign * quarter
 
 
@@ -1009,7 +1036,7 @@ def _joint_combined_sample(joint, sign):
     )
     lower, upper = float(lower), float(upper)
     middle = (lower + upper) / 2
-    quarter = (upper - lower) / 4
+    quarter = (upper - lower) / 4 * preview_sampling_interval_fraction()
     if quarter == 0:
         _require(lower <= 0.0 <= upper, f"Joint {joint['name']} has a zero-width range that excludes its zero")
         return 0.0
@@ -1602,16 +1629,45 @@ def qualifications(root, definition, checks):
 
     Two objects of one fact stay two identities; an absent optional budget is
     ``out_of_scope``; a fact whose gate did not establish its conclusion is
-    ``unqualified``.  Evidence references bind the sealed records the conclusion
-    is read from; when a required record is absent the item carries no evidence,
-    and the check boundary refuses it as ungrounded rather than downgrading it.
+    ``unqualified``.  The engineering facts (B family) never take a gate's
+    colour: their conclusion is read from authoritative evidence - an
+    inspection-preview delivery states all three explicitly ``unqualified``.
+    Evidence references bind the sealed records the conclusion is read from;
+    when a required record is absent the item carries no evidence, and the
+    check boundary refuses it as ungrounded rather than downgrading it.
     """
 
     rows = {check["id"]: check for check in checks}
     expectations = definition.get("checks") or {}
+    purpose = _request_purpose(root)
+    preview = purpose == PURPOSE_INSPECTION_PREVIEW
+    joints = {joint["name"]: joint for joint in (definition.get("source") or {}).get("joints", [])}
     items = []
     for fact in qualification_facts(definition):
         fact_id = fact["fact_id"]
+        if fact_id in _ENGINEERING_FACTS:
+            status = _engineering_status(fact_id, fact["object_id"], joints, preview)
+            evidence = []
+            if all((root / record).is_file() for record in _ENGINEERING_FACT_RECORDS):
+                evidence = [
+                    {"record": record, "sha256": file_digest(root / record)} for record in _ENGINEERING_FACT_RECORDS
+                ]
+                evidence.extend(
+                    {"record": extra, "sha256": file_digest(root / extra)}
+                    for extra in _ENGINEERING_FACT_EXTRAS
+                    if (root / extra).is_file()
+                )
+            items.append(
+                {
+                    "schema_version": QUALIFICATION_SCHEMA,
+                    "fact_id": fact_id,
+                    "scope": fact["scope"],
+                    "object_id": fact["object_id"],
+                    "status": status,
+                    "evidence": evidence,
+                }
+            )
+            continue
         budget = {
             "physics.expected_mass": "expected_mass_kg",
             "geometry.expected_extent": "expected_extent_m",
@@ -1636,6 +1692,46 @@ def qualifications(root, definition, checks):
             }
         )
     return items
+
+
+#: The engineering qualification facts (IF-14, B family): authoritative-evidence
+#: conclusions only - a passing model-consistency check never establishes them.
+_ENGINEERING_FACTS = frozenset(
+    (*CHECK_POLICY_V1["engineering_facts"]["per_joint"], *CHECK_POLICY_V1["engineering_facts"]["per_subject"])
+)
+_ENGINEERING_FACT_RECORDS = ("input/handoff.json",)
+_ENGINEERING_FACT_EXTRAS = ("input/request.json", "model/robot.json")
+
+
+def _request_purpose(root) -> str | None:
+    """The submission purpose of the frozen request, or ``None`` when unreadable."""
+
+    request = Path(root) / "input" / "request.json"
+    if not request.is_file():
+        return None
+    try:
+        return str(read_request_evidence(request)[0].get("purpose") or "")
+    except PipelineError:
+        return None
+
+
+def _engineering_status(fact_id: str, object_id: str, joints: dict, preview: bool) -> str:
+    """The evidence-grounded state of one engineering fact.
+
+    Inspection-preview deliveries state all three explicitly ``unqualified``;
+    under the engineering purpose the per-joint range is established only by a
+    native/controlled range source and drive sizing only by a present drive
+    specification.  Machine qualification has no establishment channel here:
+    a passing consistency check never grants it.
+    """
+
+    if preview or fact_id == "machine_qualification":
+        return "unqualified"
+    joint = joints.get(object_id) or {}
+    if fact_id == "engineering_position_range":
+        return "established" if joint.get("limit_source") in ("native", "controlled") else "unqualified"
+    limits = joint.get("limits") or {}
+    return "established" if "effort" in limits and "velocity" in limits else "unqualified"
 
 
 def _mass_closure_equality(root, definition=None):

@@ -790,6 +790,9 @@ def _build_joints(
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
             entry["provenance"]["limits_evidence"] = {str(key): str(value) for key, value in limit_evidence.items()}
+        limit_source = joint.get("limit_source")
+        if isinstance(limit_source, str) and limit_source:
+            entry["limit_source"] = limit_source
         if movable:
             entry["axis"] = [float(value) for value in axis]
         limits = joint.get("limits")
