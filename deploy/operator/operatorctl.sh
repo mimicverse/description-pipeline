@@ -797,7 +797,7 @@ PY
     [ -f "$CANDIDATE_ENV" ] || die "candidate derived environment was not written"
     python3 "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --from "$STATE_ROOT/install-records/$ACTIVE_ID.json" --to "$SNAPSHOT_PATH" \
-      --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,windows-switch,endpoint-identity,switch-pointer,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-verify" \
+      --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-verify" \
       >/dev/null
     printf '%s\n' "$CANDIDATE_WHEEL" > "$RECEIPT_DIR/candidate-wheel"
     set -a
@@ -823,6 +823,25 @@ PY
     fi
     python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --verb promote --step windows-generation --status completed --evidence "$WINDOWS_STAGE" >/dev/null
+    # The staged release's platform objects travel to the live authority now, inside the
+    # maintenance window and in the installer's canonical order (airflow-side boundary
+    # grants, then the platform schema/views/roles): they are additive and idempotent, no
+    # pointer, unit or admission changes, and the staged read model is exactly what the
+    # window's recovery reads before any switch.  promote records the same migrations
+    # again as its own verified step.
+    ensure_postgres_ready
+    if ! {
+      PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
+        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+        --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" \
+      && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
+        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+        --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}"
+    } > "$RECEIPT_DIR/stage-schema-migration.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" stage schema-migration failed "$RECEIPT_DIR/stage-schema-migration.out"
+      die "the staged generation's schema objects were not applied (the active generation is unchanged)"
+    fi
+    promotion_step "$CANDIDATE_ID" stage schema-migration completed "$RECEIPT_DIR/stage-schema-migration.out"
     echo "stage complete: $CANDIDATE_ID (active pointer and admission unchanged)"
     ;;
   promote)
@@ -962,7 +981,27 @@ PY
       die "the execution services did not stop (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote stop-services completed "$EVIDENCE_DIR/stop-services.out"
-    # 5. the Windows end switches through the single lifecycle script (stop, task+config, IF-09 health)
+    # 5. the candidate release's verified schema migrations run in the closed window, in the
+    #    canonical order the installer uses: the Airflow metadata migration (the candidate
+    #    runtime's own `airflow db migrate`), then the airflow-side boundary grants, then the
+    #    platform objects and consumer grants - all idempotent and re-verified per release.
+    CANDIDATE_RUNTIME_VENV="$(derived_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
+    [ -x "$CANDIDATE_RUNTIME_VENV/bin/airflow" ] \
+      || die "the staged runtime provides no Airflow entry; re-run stage"
+    if ! {
+      AIRFLOW_HOME="$AIRFLOW_HOME" "$CANDIDATE_RUNTIME_VENV/bin/airflow" db migrate \
+      && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
+        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+        --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" \
+      && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
+        --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+        --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}"
+    } > "$EVIDENCE_DIR/schema-migration.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote schema-migration failed "$EVIDENCE_DIR/schema-migration.out"
+      die "the verified schema migrations failed (the admission stays closed)"
+    fi
+    promotion_step "$CANDIDATE_ID" promote schema-migration completed "$EVIDENCE_DIR/schema-migration.out"
+    # 6. the Windows end switches through the single lifecycle script (stop, task+config, IF-09 health)
     [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
     [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
     WINDOWS_PROMOTE=""
