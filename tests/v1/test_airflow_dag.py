@@ -654,9 +654,10 @@ class PlatformRegistrationTests(unittest.TestCase):
         (intake / "cad" / "part.sldprt").write_bytes(b"cad-bytes")
         (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
         upload_files = {"assembly.sldasm": "a" * 64, "cad/part.sldprt": "b" * 64}
-        stages = run_dir / "stages"
-        store = SimpleNamespace(run_dir=lambda _run: run_dir, stage_dir=lambda _run, stage: stages / stage)
-        self.module._register_freeze_stage(store, "run-1", intake=intake, upload_files=upload_files)
+        from description_pipeline.platform import flow
+
+        paths = flow.RunPaths(run_dir.parent, "run-1")
+        self.module._register_freeze_stage(paths, "run-1", intake=intake, upload_files=upload_files)
         call = self.calls[0]
         self.assertEqual(call["stage"], "freeze")
         self.assertEqual(call["state"], "completed")
@@ -676,10 +677,11 @@ class PlatformRegistrationTests(unittest.TestCase):
         intake = Path(self.temporary.name) / "intake-start"
         intake.mkdir()
         (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
-        stages = run_dir / "stages"
-        store = SimpleNamespace(run_dir=lambda _run: run_dir, stage_dir=lambda _run, stage: stages / stage)
+        from description_pipeline.platform import flow
+
+        paths = flow.RunPaths(run_dir.parent, "run-1")
         self.module._register_freeze_stage(
-            store, "run-1", intake=intake, upload_files={"assembly.sldasm": "a" * 64}
+            paths, "run-1", intake=intake, upload_files={"assembly.sldasm": "a" * 64}
         )
         self.assertEqual(self.started, ["run-1"])
 
@@ -923,8 +925,9 @@ class PlatformRegistrationTests(unittest.TestCase):
         intake.mkdir()
         (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
         upload_files = {"assembly.sldasm": "a" * 64}
-        stages = run_dir / "stages"
-        store = SimpleNamespace(run_dir=lambda _run: run_dir, stage_dir=lambda _run, stage: stages / stage)
+        from description_pipeline.platform import flow
+
+        paths = flow.RunPaths(run_dir.parent, "run-1")
 
         records: dict[tuple[str, str], dict] = {}
         confirmations: list[str] = []
@@ -942,8 +945,8 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         platform = _RetainingPlatform()
         with patch.object(self.module, "_platform_binding", return_value=(platform, self.root)):
-            self.module._register_freeze_stage(store, "run-1", intake=intake, upload_files=upload_files)
-            self.module._register_freeze_stage(store, "run-1", intake=intake, upload_files=upload_files)
+            self.module._register_freeze_stage(paths, "run-1", intake=intake, upload_files=upload_files)
+            self.module._register_freeze_stage(paths, "run-1", intake=intake, upload_files=upload_files)
         self.assertEqual(confirmations, ["freeze"])
 
     def test_a_failed_registration_tolerates_a_malformed_handoff(self) -> None:
