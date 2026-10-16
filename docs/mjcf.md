@@ -24,7 +24,15 @@ URDF 是拓扑、关节原点/有向轴/范围、质量、COM、完整惯量和�
 
 不新增通用机器人类、第二份完整模型、插件注册器、任务数据库、调度器或发布器。URDF 树只在一次调用的内存中解析。共用现有规范数值格式、摘要、路径边界和 MuJoCo 版本锁。
 
-直接投影 XML 是必要的有限复杂度：锁定 MuJoCo 的原生 XML 导出会把部分数值缩减至约 6 位有效数字；质量、惯量和坐标保存重载后不能维持本模块的精度要求。投影使用现有可往返 binary64 的数值格式，惯量写为 `fullinertia`，不自行求主惯量。MuJoCo 负责物理编译，独立检查使用编译后模型还原张量。
+直接投影 XML 是必要的有限复杂度：锁定 MuJoCo 的原生 XML 导出会把部分数值缩减至约 6 位有效数字（实测 `MjSpec.to_xml()` 相对误差 7.1e-8）；质量、惯量和坐标保存重载后不能维持本模块的精度要求。投影使用现有可往返 binary64 的数值格式。
+
+三条投影规则由在锁定 MuJoCo 上的实测确定，均有回归锁定：
+
+- 根元素带 `<compiler angle="radian" inertiafromgeom="false" balanceinertia="false"/>`。MJCF 角度默认是度、URDF 是弧度，缺省会让限位与旋转静默错 57.3 倍；`inertiafromgeom` 缺省为 `auto` 会按几何体积臆造质量，与"不推定密度"冲突；`balanceinertia` 保持关闭，避免静默改写交付的物理量。
+- URDF `rpy` 一律转成显式 `quat`（`Rz·Ry·Rx`）。MuJoCo 的 `euler` 与 `mju_euler2Quat` 的约定与 URDF 不同（同角序列下相差 8.8°），而 MuJoCo 自己的 URDF 导入器与 `Rz·Ry·Rx` 完全一致。
+- 惯量写为 `diaginertia` 加 `quat`：投影侧用自身双精度对称特征分解，把 link 系完整张量无损重参数化到主轴系。不丢弃非对角项、不改质量、不修正物理量。若改写 `fullinertia`，MuJoCo 会用 `mju_eig3` 再分解，特征向量精度约 2.4e-8，编译模型还原后相对误差可达 1.2e-6，与 `INERTIA_REL` 不相容；自行分解后同一门残差约 1e-15。二进制 STL 的 `mesh_vert` 是 float32 且已按 MuJoCo 规则居中，世界顶点比较必须补偿 `mesh_pos`，并采用 `MESH_ABS`/`MESH_REL`。
+
+MuJoCo 负责物理编译，独立检查使用编译后模型还原张量。
 
 ## 使用与配置
 
@@ -109,9 +117,9 @@ reports/quality.json       # 独立重算的确定性报告
 | 身份与闭包 | 清单、输入、配置、XML、实际网格、引擎版本与报告绑定；未登记文件拒绝 |
 | 拓扑与自由度 | link/joint 集合、父子关系、固定 frame、关节类型；浮动基座恰增加 7 个位置量和 6 个速度量 |
 | 运动学 | 零位和确定的非零单关节/组合样本；独立 URDF FK 对比实际 MuJoCo link 世界位姿与有向关节轴 |
-| 惯性 | 逐 link 质量、COM 和由主轴还原的完整张量；整机质量、COM、平行轴合成张量 |
+| 惯性 | 逐 link 质量、COM 和由主轴还原的完整张量；整机质量、COM、平行轴合成张量；编码必须让还原残差落在 `INERTIA_REL`/`INERTIA_ABS` 内，不得依赖 MuJoCo 对 `fullinertia` 的再分解 |
 | 几何 | primitive 尺寸、实例变换、STL 顶点尺度和编译网格变换补偿；视觉/碰撞角色及数量 |
-| 关节与配置 | 上下限、连续关节无限位、damping/frictionloss、无隐式 actuator、基座、site 与接触位掩码 |
+| 关节与配置 | 上下限与 `quat` 逐位等于 URDF 弧度值、`compiler/@angle` 为 `radian`、连续关节无限位、damping/frictionloss、无隐式 actuator、基座、site 与接触位掩码 |
 | 场景 | include 的实际机器人、地面高度/法向/摩擦、照明、求解器参数；无自动零位漂移 |
 | 运行 | 零状态 forward 与短时零驱动步进无 NaN/Inf；不以短时稳定替代站立、控制或训练资格 |
 | 可复现性 | 不同绝对路径的双构建字节相同；保存/重新加载后仍符合全部数值门 |

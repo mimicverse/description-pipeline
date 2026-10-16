@@ -36,6 +36,26 @@ SEALED_EXCLUDE = (MANIFEST_JSON, REPORT_JSON)
 REQUIRED_FILES = (SIMULATION_JSON, ROBOT_XML, MANIFEST_JSON, REPORT_JSON)
 
 # --------------------------------------------------------------------------- #
+# Element naming (shared so a delivered element binds back to the URI/URDF entry it came from)
+# --------------------------------------------------------------------------- #
+
+VISUAL_ROLE = "visual"
+COLLISION_ROLE = "collision"
+
+
+def geom_name(link: str, role: str, index: int) -> str:
+    """The delivered geom name for one URDF visual or collision entry of one link."""
+
+    return f"{role}_{index}_{link}"
+
+
+def mesh_name(index: int) -> str:
+    """The delivered mesh-asset name for one distinct (file, scale) pair."""
+
+    return f"mesh_{index}"
+
+
+# --------------------------------------------------------------------------- #
 # Numeric acceptance constants (declared once; every check reports its residual)
 # --------------------------------------------------------------------------- #
 

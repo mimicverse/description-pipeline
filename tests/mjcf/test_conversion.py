@@ -292,6 +292,68 @@ class ConversionTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(main(["mjcf", "check", str(self.output)]), 0)
 
+    def test_units_rotations_and_compiler_are_pinned(self):
+        """rpy is radians, rpy becomes an explicit Rz·Ry·Rx quat, and no compiler default drifts."""
+
+        import mujoco
+        import numpy as np
+
+        self.build()
+        compiler = ET.parse(self.output / "robot.xml").getroot().find("compiler")
+        self.assertEqual(compiler.get("angle"), "radian")
+        self.assertEqual(compiler.get("inertiafromgeom"), "false")
+        self.assertEqual(compiler.get("balanceinertia"), "false")
+        model = mujoco.MjModel.from_xml_path(str(self.output / "robot.xml"))
+        hinge = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "hinge")
+        self.assertAlmostEqual(model.jnt_range[hinge][0], -0.37, places=12)
+        self.assertAlmostEqual(model.jnt_range[hinge][1], 1.23, places=12)
+        slide = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "slide")
+        self.assertTrue(bool(model.jnt_limited[slide]))
+        spin = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "spin")
+        self.assertFalse(bool(model.jnt_limited[spin]))
+        roll, pitch, yaw = 0.2, -0.3, 0.4
+
+        def product(left, right):
+            lw, lx, ly, lz = left
+            rw, rx, ry, rz = right
+            return np.array(
+                [
+                    lw * rw - lx * rx - ly * ry - lz * rz,
+                    lw * rx + lx * rw + ly * rz - lz * ry,
+                    lw * ry - lx * rz + ly * rw + lz * rx,
+                    lw * rz + lx * ry - ly * rx + lz * rw,
+                ]
+            )
+
+        expected = product(
+            product(
+                np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]),
+                np.array([np.cos(pitch / 2), 0, np.sin(pitch / 2), 0]),
+            ),
+            np.array([np.cos(roll / 2), np.sin(roll / 2), 0, 0]),
+        )
+        arm = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "arm")
+        self.assertTrue(np.allclose(np.abs(model.body_quat[arm] @ expected), 1.0, atol=1e-12))
+
+    def test_resealed_range_and_rotation_tampering_are_rejected(self):
+        """A silently rescaled range or a dropped body rotation only shows up in the compiled model."""
+
+        edits = [
+            lambda root: root.find(".//joint[@name='hinge']").set("range", "-0.37 1.30"),
+            lambda root: root.find(".//body[@name='arm']").set("quat", "1 0 0 0"),
+        ]
+        for index, edit in enumerate(edits):
+            with self.subTest(index=index):
+                self.output = self.root / f"edit-{index}"
+                self.build()
+                self.alter_xml(edit)
+                with self.assertRaises(PipelineError):
+                    self.check(compare_saved=False)
+
+    def test_the_inertia_encoding_keeps_the_declared_margin(self):
+        report = self.build()
+        self.assertLess(report["checks"]["inertia"]["tensor_residual"], 1e-12)
+
 
 if __name__ == "__main__":
     unittest.main()
