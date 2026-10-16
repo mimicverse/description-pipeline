@@ -15,7 +15,8 @@ from description_pipeline.stages import CONTRACT, STAGE_IDS
 from tests.v1.protocol_support import protocol_events
 from description_pipeline.io import write_json
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.orchestration.linux_store import LinuxStore
+
+from .portal_read_support import RegisteredPlatform
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_ID = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
@@ -67,6 +68,41 @@ def _passing_publish_receipt() -> dict:
         },
         "events": protocol_events(subject=SUBJECT),
     }
+
+
+def _registered_delivery(
+    platform: RegisteredPlatform, *, quality_subject: str = SUBJECT, submission_state: str = "published"
+) -> None:
+    """Register the six-stage records of one passing delivery over the platform store.
+
+    The confirmation consumes exactly these records: the run row, the six stage
+    receipts (the publish receipt carries the delivered quality and submission),
+    the recorded check events and the capture tree that binds hardware/revision.
+    """
+    platform.admit(RUN_ID)
+    capture = platform.tree(RUN_ID, "capture")
+    (capture / "input").mkdir(parents=True, exist_ok=True)
+    write_json(
+        capture / "input/source.json",
+        {"identity": {"hardware_id": "robot"}, "metadata": {"revision": "r1"}},
+    )
+    for stage in ("freeze", "discover", "capture", "generate"):
+        platform.stage(RUN_ID, stage)
+    platform.stage(
+        RUN_ID,
+        "verify",
+        receipt={
+            "subject_sha256": SUBJECT,
+            "handoff_sha256": "b" * 64,
+            "quality": {"passed": True, "subject_sha256": SUBJECT},
+        },
+    )
+    receipt = _passing_publish_receipt()
+    receipt["handoff_sha256"] = "b" * 64
+    receipt["quality"] = {"passed": True, "subject_sha256": quality_subject}
+    receipt["submission"] = {**receipt["submission"], "state": submission_state}
+    platform.stage(RUN_ID, "publish", receipt=receipt)
+    platform.events(RUN_ID, protocol_events(subject=SUBJECT))
 
 
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
@@ -128,7 +164,6 @@ class SplitWorkflowTests(unittest.TestCase):
     def test_confirmation_consumes_bound_linux_results_for_every_publication_outcome(self):
         module = self.module()
         run_id = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
-        subject = "a" * 64
         request = {
             "run_id": run_id,
             "package": "control",
@@ -137,52 +172,46 @@ class SplitWorkflowTests(unittest.TestCase):
             "linux_owned": True,
         }
         with tempfile.TemporaryDirectory() as tmp:
-            store = LinuxStore(Path(tmp))
-            store.update_meta(
-                run_id,
-                state="published",
-                subject_sha256=subject,
-                repository_slug="example/robot",
-                repository_base="feature/robot",
-            )
-            capture = store.capture_dir(run_id)
-            write_json(
-                capture / "input/source.json",
-                {"identity": {"hardware_id": "robot"}, "metadata": {"revision": "r1"}},
-            )
-            output = store.output_dir(run_id)
-            (output / "input").mkdir(parents=True)
-            write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": subject})
-            store.append_events(run_id, protocol_events(subject=subject))
+            platform = RegisteredPlatform(Path(tmp) / "platform")
+            _registered_delivery(platform)
+            # The run's bound routing rides the chain; hardware/revision keep the
+            # registered capture identity as their authority.
+            published = {
+                "request": request,
+                "hardware_id": "chain-value",
+                "revision": "chain-value",
+                "repository_slug": "example/robot",
+                "repository_base": "feature/robot",
+            }
             confirm = module._confirm_delivery
             with (
-                patch.object(module, "_linux_store", return_value=store),
+                patch.object(module, "_platform_binding", return_value=(platform.store, platform.root)),
                 patch.object(module, "_endpoint", side_effect=AssertionError("Linux confirmation must not open CAD")),
             ):
                 for state in ("published", "updated", "noop"):
                     with self.subTest(state=state):
-                        write_json(
-                            output / "reports/pr.json",
-                            {
-                                "state": state,
-                                "passed": True,
-                                "subject_sha256": subject,
-                                "url": "https://github.com/example/robot/pull/1",
-                                "commit": "c" * 40,
-                                "base": "feature/robot",
-                                "repository_slug": "example/robot",
-                                "branch": "work/solidworks/robot",
-                            },
-                        )
-                        result = confirm({"request": request})
+                        receipt = _passing_publish_receipt()
+                        receipt["handoff_sha256"] = "b" * 64
+                        receipt["quality"] = {"passed": True, "subject_sha256": SUBJECT}
+                        receipt["submission"] = {**receipt["submission"], "state": state}
+                        platform.stage(run_id, "publish", receipt=receipt)
+                        result = confirm(published)
                         self.assertEqual(result["pipeline_id"], PIPELINE_ID)
                         self.assertEqual(result["submission"]["state"], state)
-                write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": "d" * 64})
-                self.assertFalse(store.merged_job(run_id)["result"]["passed"])
+                        # The registered capture identity outranks the chain claim.
+                        self.assertEqual(result["handoff"]["hardware_id"], "robot")
+                        self.assertEqual(result["handoff"]["revision"], "r1")
+                receipt = _passing_publish_receipt()
+                receipt["handoff_sha256"] = "b" * 64
+                receipt["quality"] = {"passed": True, "subject_sha256": "d" * 64}
+                platform.stage(run_id, "publish", receipt=receipt)
+                from description_pipeline.platform import flow as flow_module
+
+                self.assertFalse(flow_module.registered_delivery_snapshot(platform.store, run_id)["result"]["passed"])
                 from description_pipeline.orchestration.airflow_client import ResultNotPublishable
 
                 with self.assertRaises(ResultNotPublishable):
-                    confirm({"request": request})
+                    confirm(published)
 
     def test_engineering_failure_fails_its_airflow_task_even_with_a_retained_subject(self):
         from airflow.sdk.exceptions import AirflowFailException
@@ -260,11 +289,6 @@ class SplitWorkflowTests(unittest.TestCase):
             "from_stage": None,
         }
         with (
-            patch.object(
-                module,
-                "_linux_store",
-                return_value=SimpleNamespace(stage_dir=lambda _run, stage: Path("/nonexistent") / RUN_ID / stage),
-            ),
             patch.object(module.flow, "run_stage", return_value=_failed_verify_receipt()),
             patch.object(
                 module,
@@ -305,44 +329,11 @@ class SplitWorkflowTests(unittest.TestCase):
             store_root=Path("/nonexistent-work"),
         )
         with tempfile.TemporaryDirectory() as tmp:
-            store = LinuxStore(Path(tmp))
-            store.update_meta(
-                RUN_ID,
-                state="published",
-                subject_sha256=SUBJECT,
-                repository_slug="example/robot",
-                repository_base="feature/robot",
-            )
-            capture = store.capture_dir(RUN_ID)
-            write_json(
-                capture / "input/source.json",
-                {"identity": {"hardware_id": "robot"}, "metadata": {"revision": "r1"}},
-            )
-            output = store.output_dir(RUN_ID)
-            (output / "input").mkdir(parents=True)
-            write_json(output / "reports/quality.json", {"passed": True, "subject_sha256": SUBJECT})
-            write_json(
-                output / "reports/pr.json",
-                {
-                    "state": "published",
-                    "passed": True,
-                    "subject_sha256": SUBJECT,
-                    "url": "https://github.com/example/robot/pull/1",
-                    "commit": "c" * 40,
-                    "base": "feature/robot",
-                    "repository_slug": "example/robot",
-                    "branch": "work/solidworks/robot",
-                },
-            )
-            store.append_events(RUN_ID, protocol_events(subject=SUBJECT))
+            platform = RegisteredPlatform(Path(tmp) / "platform")
+            _registered_delivery(platform)
             with (
-                patch.object(module, "_linux_store", return_value=store),
                 patch.object(module.flow, "run_stage", return_value=_passing_publish_receipt()),
-                patch.object(
-                    module,
-                    "_platform_binding",
-                    return_value=(SimpleNamespace(append_event=lambda *args, **kwargs: None), Path("/nonexistent")),
-                ),
+                patch.object(module, "_platform_binding", return_value=(platform.store, platform.root)),
                 patch.object(module, "_register_completed_stage", side_effect=lambda *args, **kwargs: None),
                 patch.object(module, "config_from_airflow_connection", return_value=config),
             ):

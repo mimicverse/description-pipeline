@@ -24,8 +24,7 @@ from description_pipeline.orchestration.airflow_client import (
     WindowsEndpoint,
     _validate_activity,
 )
-from description_pipeline.orchestration.linux_store import LinuxStore
-from tests.v1.portal_read_support import StoreProjection
+from tests.v1.portal_read_support import RegisteredPlatform
 from description_pipeline.orchestration.windows import handler
 from description_pipeline.sources.solidworks.discovery import _guarded_sink
 from description_pipeline.stages import activity_view, merge_activity, normalize_activity
@@ -423,17 +422,16 @@ class PortalActivityExposureTests(unittest.TestCase):
         consume that one instance instead of re-reading the config."""
 
         with TemporaryDirectory() as tmp:
-            store = LinuxStore(Path(tmp) / "store")
             run_id = str(uuid.uuid4())
-            store.update_meta(run_id, state="running", handoff_sha256="b" * 64)
-            projection = StoreProjection(store)
+            platform = RegisteredPlatform(Path(tmp) / "platform")
+            platform.admit(run_id, state="running")
             app = portal_module.PortalApp(
                 portal_module.PortalConfig(airflow=object(), endpoint=lambda: None, platform_store=None)
             )
             with mock.patch.object(
-                portal_module.PlatformStore, "from_environment", return_value=projection
+                portal_module.PlatformStore, "from_environment", return_value=platform.store
             ) as factory:
-                self.assertIs(app._platform(), projection)
+                self.assertIs(app._platform(), platform.store)
                 self.assertEqual(factory.call_count, 1)
                 record = app._read_projection(run_id)
             self.assertIsNotNone(record)
@@ -441,13 +439,11 @@ class PortalActivityExposureTests(unittest.TestCase):
 
     def test_job_snapshot_keeps_activity_and_the_final_observation(self):
         with TemporaryDirectory() as tmp:
-            store = LinuxStore(Path(tmp) / "store")
             run_id = str(uuid.uuid4())
-            store.update_meta(run_id, state="running", handoff_sha256="b" * 64)
+            platform = RegisteredPlatform(Path(tmp) / "platform")
+            platform.admit(run_id, state="running")
             app = portal_module.PortalApp(
-                portal_module.PortalConfig(
-                    airflow=object(), endpoint=lambda: None, platform_store=StoreProjection(store)
-                )
+                portal_module.PortalConfig(airflow=object(), endpoint=lambda: None, platform_store=platform.store)
             )
             native = {
                 "status": "running",

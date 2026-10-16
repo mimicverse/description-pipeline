@@ -715,9 +715,23 @@ class FakePlatformStore:
         return stages
 
     def run_events(self, run_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict]:
+        """The recorded events in their database row shape (stage plus payload)."""
         entry = self._entry(run_id) or {}
         events = (entry.get("merged") or {}).get("events")
-        return list(events) if isinstance(events, list) else []
+        rows = []
+        for index, event in enumerate(events if isinstance(events, list) else [], start=1):
+            event = event if isinstance(event, dict) else {}
+            rows.append(
+                {
+                    "seq": index,
+                    "at": event.get("at"),
+                    "kind": "stage",
+                    "stage": event.get("stage"),
+                    "operation_id": None,
+                    "payload": event,
+                }
+            )
+        return rows
 
     def sealed_path(self, checkpoint_uri: str):
         """Materialize the registered checkpoint members and return their root."""
