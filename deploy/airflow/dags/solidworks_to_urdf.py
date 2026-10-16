@@ -60,6 +60,7 @@ from description_pipeline.interface_records import (
     check_policy_digest,
 )
 from description_pipeline.platform.storage import seal_stage_confirmation, sealed_resolver
+from description_pipeline.orchestration.freeze_retry import FreezeRetryRefusal, resolve_freeze_retry_identity
 from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 from description_pipeline.runtime import tool_record
 from description_pipeline.stages import (
@@ -968,11 +969,11 @@ def _linked_freeze_request(context, linked: dict) -> dict:
     """The freeze-stage request of a Linux-managed linked retry.
 
     The admitted child and the parent's registered facts are the only authority:
-    the child's own admission must bind this parent and the freeze boundary, the
-    parent request must carry a sealed upload identity, and the sealed intake
-    must still recompute to exactly that identity.  No Windows job is contacted
-    and no upload is repeated; the freeze stage then seals these same originals
-    as the new run's own frozen request.
+    the child's own admission must bind this parent and the freeze boundary, and
+    the one resolver re-proves the sealed intake identity against the parent's
+    registered evidence (the request baseline, or the bound failure log for the
+    old-shape parents) before the same originals are sealed as the new run's own
+    frozen request.  No Windows job is contacted and no upload is repeated.
     """
 
     run_id = _run_uuid(context)
@@ -986,56 +987,59 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         and isinstance(child.get("request_id"), str)
     ):
         raise AirflowFailException("The admitted child does not bind this parent and the freeze boundary")
-    parent = platform.run_record(linked["parent_run"])
-    if not (isinstance(parent, dict) and parent.get("state") == "failed"):
-        raise AirflowFailException("The linked parent is not a terminal failed run")
-    parent_request = (
-        platform.request_record(parent.get("request_id")) if isinstance(parent.get("request_id"), str) else None
-    )
-    if not isinstance(parent_request, dict):
-        raise AirflowFailException("The linked parent has no admitted request to reuse")
-    baseline = parent_request.get("baseline")
-    handoff_sha256 = baseline.get("handoff_sha256") if isinstance(baseline, dict) else None
-    parent_main = parent_request.get("main_assembly")
-    parent_purpose = parent_request.get("purpose")
-    if not (
-        isinstance(handoff_sha256, str)
-        and len(handoff_sha256) == 64
-        and all(character in "0123456789abcdef" for character in handoff_sha256)
-        and isinstance(parent_main, str)
-        and parent_main
-        and isinstance(parent_purpose, str)
-        and parent_purpose in REQUEST_PURPOSES
-    ):
-        raise AirflowFailException("The linked parent carries no sealed upload identity to reuse")
+    conf = getattr(context["dag_run"], "conf", None)
+    conf = conf if isinstance(conf, dict) else {}
+    parent_dag_run_id = str(conf.get("parent_dag_run_id") or "").strip()
+    if not parent_dag_run_id:
+        raise AirflowFailException("A linked freeze retry needs its parent dag run binding")
+    handoff_path = str(conf.get("handoff_path") or context["params"].get("handoff_path") or "").strip()
+    if not handoff_path:
+        raise AirflowFailException("A linked freeze retry needs handoff_path with the original sealed intake")
+    try:
+        resolved = resolve_freeze_retry_identity(
+            platform,
+            linked["parent_run"],
+            parent_dag_run_id=parent_dag_run_id,
+            expected_dag_id=DAG_ID,
+            intake_path=Path(handoff_path),
+        )
+    except FreezeRetryRefusal as refusal:
+        raise AirflowFailException(str(refusal)) from refusal
+    purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
+    if purpose != resolved.purpose:
+        raise AirflowFailException("A linked freeze retry must keep the parent's purpose")
+    supplied = conf.get("main_assembly") or context["params"].get("main_assembly") or None
+    if supplied and validate_main_assembly(supplied) != resolved.main_assembly:
+        raise AirflowFailException("A linked freeze retry must keep the parent's main assembly")
+    intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+    if Path(intake).resolve() != resolved.intake_path.resolve():
+        raise AirflowFailException("The sealed intake is not the registered evidence intake")
     child_request = platform.request_record(child["request_id"])
     if not isinstance(child_request, dict):
         raise AirflowFailException("The admitted child carries no request row")
     child_baseline = child_request.get("baseline")
-    child_digest = child_baseline.get("handoff_sha256") if isinstance(child_baseline, dict) else None
-    if child_digest not in (None, handoff_sha256):
+    if not isinstance(child_baseline, dict):
+        raise AirflowFailException("The admitted child carries no sealed intake identity")
+    if child_baseline.get("handoff_sha256") != resolved.handoff_sha256:
         raise AirflowFailException("The admitted child binds a different upload identity")
-    if child_request.get("main_assembly") not in (None, "", parent_main):
+    if child_baseline.get("files") not in (None, resolved.files):
+        raise AirflowFailException("The admitted child binds a different intake inventory")
+    if child_request.get("main_assembly") not in (None, "", resolved.main_assembly):
         raise AirflowFailException("The admitted child binds a different main assembly")
-    if child_request.get("purpose") not in (None, parent_purpose):
+    if child_request.get("purpose") not in (None, resolved.purpose):
         raise AirflowFailException("The admitted child binds a different purpose")
-    conf = getattr(context["dag_run"], "conf", None)
-    conf = conf if isinstance(conf, dict) else {}
-    handoff_path = str(conf.get("handoff_path") or context["params"].get("handoff_path") or "").strip()
-    if not handoff_path:
-        raise AirflowFailException("A linked freeze retry needs handoff_path with the original sealed intake")
-    purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
-    if purpose != parent_purpose:
-        raise AirflowFailException("A linked freeze retry must keep the parent's purpose")
-    supplied = conf.get("main_assembly") or context["params"].get("main_assembly") or None
-    if supplied and validate_main_assembly(supplied) != parent_main:
-        raise AirflowFailException("A linked freeze retry must keep the parent's main assembly")
-    intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
-    upload_files = validate_file_index(package_inventory(intake))
-    if parent_main not in upload_files:
-        raise AirflowFailException("The sealed intake no longer carries the parent's main assembly")
-    if digest(upload_files) != handoff_sha256:
-        raise AirflowFailException("The sealed intake no longer matches the parent's admitted upload identity")
+    provenance = child_baseline.get("provenance")
+    if resolved.provenance is None:
+        if provenance is not None:
+            raise AirflowFailException("The admitted child carries provenance without resolved evidence")
+    elif not (
+        isinstance(provenance, dict)
+        and provenance.get("source") == resolved.provenance["source"]
+        and provenance.get("path") == resolved.provenance["path"]
+        and provenance.get("sha256") == resolved.provenance["sha256"]
+        and provenance.get("parent_run_id") == resolved.provenance["parent_run_id"]
+    ):
+        raise AirflowFailException("The admitted child provenance does not match the resolved evidence")
     config_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
     if not config_digest:
         raise AirflowFailException(
@@ -1054,21 +1058,21 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         request_id=child["request_id"],
         target_hardware=identity["hardware_id"],
         change_summary=identity.get("change_summary") or "",
-        main_assembly=parent_main,
-        handoff_digest=handoff_sha256,
+        main_assembly=resolved.main_assembly,
+        handoff_digest=resolved.handoff_sha256,
         platform_config_digest=config_digest,
     )
     return {
         "run_id": run_id,
-        "upload_files": upload_files,
-        "upload_sha256": digest(upload_files),
-        "main_assembly": parent_main,
+        "upload_files": resolved.upload_files,
+        "upload_sha256": resolved.handoff_sha256,
+        "main_assembly": resolved.main_assembly,
         "intake_dir": str(intake),
         "conn_id": CONN_ID,
         "purpose": purpose,
         "request_id": child["request_id"],
         "request_evidence": str(evidence),
-        "identity": {**identity, "control_reference": digest(upload_files)},
+        "identity": {**identity, "control_reference": resolved.handoff_sha256},
     }
 
 

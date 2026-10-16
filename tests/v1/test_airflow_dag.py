@@ -834,7 +834,15 @@ class DagTests(unittest.TestCase):
                 return requests.get(request_id)
 
             def stage_records(self, run_id):
-                return {}
+                return {
+                    parent_run_id: {
+                        "freeze": {
+                            "stage": "freeze",
+                            "state": "failed",
+                            "receipt": {"error": "early freeze refusal"},
+                        }
+                    }
+                }.get(run_id, {})
 
             def confirmed_stage(self, run_id, stage):
                 return None
@@ -905,6 +913,193 @@ class DagTests(unittest.TestCase):
         self.assertTrue(any(row["state"] == "failed" for row in confirmed))
         # A tampered intake refuses and converges instead of resealing changed bytes.
         (intake / "3.0 总装.SLDASM").write_bytes(b"tampered-bytes")
+        with (
+            patch.object(module, "_endpoint", return_value=Stub()),
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+            self.assertRaises(AirflowFailException),
+        ):
+            dag.task_dict["freeze"].python_callable(**context)
+        self.assertTrue(any(row["state"] == "failed" for row in confirmed))
+
+    def test_linked_freeze_retry_old_shape_reseals_from_the_bound_evidence(self) -> None:
+        import hashlib
+        import json as json_module
+        import os as os_module
+        import shutil
+        import tempfile
+        from types import SimpleNamespace
+
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.io import digest, read_data
+        from description_pipeline.orchestration.airflow_client import EndpointConfig, native_run_id
+        from description_pipeline.sources.solidworks.revision import package_inventory
+        from description_pipeline.sources.solidworks.selection import validate_file_index
+
+        module = self._module()
+        dag = module.dag
+        parent_dag_run_id = "portal-parent-freeze-old"
+        parent_run_id = native_run_id(parent_dag_run_id)
+        child_dag_run_id = "portal-child-freeze-old"
+        child_run_id = native_run_id(child_dag_run_id)
+        store_root = Path(tempfile.mkdtemp(prefix="dag-freeze-retry-old-"))
+        self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
+        intake = store_root / "intake" / "M3.0.3_20261016"
+        (intake / "parts").mkdir(parents=True)
+        (intake / "3.0 总装.SLDASM").write_bytes(b"assembly-bytes")
+        (intake / "parts" / "bracket.SLDPRT").write_bytes(b"part-bytes")
+        upload_files = validate_file_index(package_inventory(intake))
+        upload_sha = digest(upload_files)
+        selection = (
+            f"selection intake={intake} files={len(upload_files)} upload_sha256={upload_sha} "
+            "main_assembly=3.0 总装.SLDASM endpoint_conn=solidworks_windows"
+        )
+        log_record = {
+            "timestamp": "2026-10-16T13:51:10.237754Z",
+            "level": "info",
+            "event": selection,
+            "logger": "unusual_prefix_solidworks_to_urdf",
+            "try_number": 1,
+            "run_id": parent_dag_run_id,
+            "ti_id": "01a144fb-1252-77b2-b363-12c7beb80fad",
+            "task_id": "freeze",
+            "dag_id": "solidworks_to_urdf",
+            "map_index": -1,
+            "filename": "solidworks_to_urdf.py",
+            "lineno": 1505,
+        }
+        log_bytes = (json_module.dumps(log_record, ensure_ascii=False) + "\n").encode()
+        log_path = store_root / "freeze-attempt-1.log"
+        log_path.write_bytes(log_bytes)
+        log_sha = hashlib.sha256(log_bytes).hexdigest()
+        provenance = {
+            "source": "parent_freeze_failure_log",
+            "path": str(log_path),
+            "sha256": log_sha,
+            "parent_run_id": parent_run_id,
+        }
+        baseline = {
+            "handoff_sha256": upload_sha,
+            "files": len(upload_files),
+            "bytes": sum(entry.stat().st_size for entry in intake.rglob("*") if entry.is_file()),
+            "folder": intake.name,
+            "provenance": provenance,
+        }
+        confirmed: list[dict] = []
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            store_root=store_root,
+        )
+        runs = {
+            child_run_id: {
+                "run_id": child_run_id,
+                "state": "queued",
+                "request_id": f"portal-{child_dag_run_id}",
+                "parent_run_id": parent_run_id,
+                "from_stage": "freeze",
+                "tool_identity": None,
+            },
+            parent_run_id: {
+                "run_id": parent_run_id,
+                "state": "failed",
+                "request_id": f"portal-{parent_dag_run_id}",
+                "parent_run_id": None,
+                "from_stage": None,
+                "tool_identity": None,
+            },
+        }
+        requests = {
+            f"portal-{parent_dag_run_id}": {
+                "request_id": f"portal-{parent_dag_run_id}",
+                "principal": "cli_smoke:smoke-tenant:ou_smoke",
+                "target_hardware": "m3.0",
+                "main_assembly": "3.0 总装.SLDASM",
+                "sealed_at": None,
+                "purpose": "engineering",
+                "baseline": None,
+            },
+            f"portal-{child_dag_run_id}": {
+                "request_id": f"portal-{child_dag_run_id}",
+                "principal": "cli_smoke:smoke-tenant:ou_smoke",
+                "target_hardware": "m3.0",
+                "main_assembly": "3.0 总装.SLDASM",
+                "sealed_at": None,
+                "purpose": "engineering",
+                "baseline": dict(baseline),
+            },
+        }
+
+        class _Platform:
+            def start_run(self, run_id):
+                return None
+
+            def run_record(self, run_id):
+                return runs.get(run_id)
+
+            def request_record(self, request_id):
+                return requests.get(request_id)
+
+            def stage_records(self, run_id):
+                if run_id != parent_run_id:
+                    return {}
+                return {
+                    "freeze": {
+                        "stage": "freeze",
+                        "state": "failed",
+                        "receipt": {
+                            "error": "AirflowFailException: PLATFORM_CONFIG_DIGEST is unavailable",
+                            "airflow_failure": {"path": str(log_path), "sha256": log_sha},
+                        },
+                    }
+                }
+
+            def confirmed_stage(self, run_id, stage):
+                return None
+
+            def confirm_stage(self, **kwargs):
+                confirmed.append(kwargs)
+
+        class Stub:
+            def authorized_intake_dir(self, handoff_path):
+                return intake
+
+        context = {
+            "dag_run": SimpleNamespace(
+                conf={
+                    "parent_dag_run_id": parent_dag_run_id,
+                    "resume_from": "freeze",
+                    "handoff_path": str(intake),
+                    "purpose": "engineering",
+                    "target_hardware": "m3.0",
+                    "change_summary": "freeze retry",
+                },
+                run_id=child_dag_run_id,
+                triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+            ),
+            "params": {"handoff_path": "", "main_assembly": ""},
+        }
+        with (
+            patch.object(module, "_endpoint", return_value=Stub()),
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+        ):
+            request = dag.task_dict["freeze"].python_callable(**context)
+        self.assertEqual(request["upload_sha256"], upload_sha)
+        self.assertEqual(request["main_assembly"], "3.0 总装.SLDASM")
+        self.assertNotIn("resume", request)
+        self.assertIs(confirmed[-1]["state"], "completed")
+        sealed_request = read_data(store_root / "sealed" / child_run_id / "freeze" / "input" / "request.json")
+        self.assertEqual(sealed_request["handoff_digest"], upload_sha)
+        # A child whose recorded provenance disagrees with the re-resolved evidence refuses
+        # and converges the child as a failed freeze.
+        requests[f"portal-{child_dag_run_id}"]["baseline"]["provenance"] = {
+            **provenance,
+            "sha256": "d" * 64,
+        }
         with (
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),

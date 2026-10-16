@@ -59,8 +59,6 @@ from .airflow_client import (
 )
 from ..io import PipelineError, digest
 from ..interface_records import REQUEST_PURPOSES
-from ..sources.solidworks.revision import package_inventory
-from ..sources.solidworks.selection import validate_file_index
 from ..delivery import PIPELINE_ID
 from ..platform import flow
 from ..platform.store import (
@@ -72,6 +70,7 @@ from ..platform.store import (
 )
 from ..ports import PORTAL_HTTP_PORT
 from .stage_transfer import TEAM_REPORTS
+from .freeze_retry import FreezeRetryRefusal, resolve_freeze_retry_identity
 from .feishu_oauth import (
     TRIGGERING_USER_NAME_DELIMITER,
     TRIGGERING_USER_NAME_LIMIT,
@@ -2024,31 +2023,15 @@ class PortalApp:
 
     # ------------------------------------------------------------- rerun
     # ------------------------------------------------- freeze retry stand
-    def _intake_dir(self, handoff_path: object) -> Path | None:
-        """The sealed intake folder under the portal upload root, or ``None``."""
-
-        if not isinstance(handoff_path, str) or not handoff_path:
-            return None
-        root = self.config.upload_root
-        if root is None:
-            return None
-        try:
-            candidate = Path(handoff_path).resolve()
-            confined_root = Path(root).resolve()
-        except OSError:
-            return None
-        if not candidate.is_relative_to(confined_root) or not candidate.is_dir():
-            return None
-        return candidate
-
     def _freeze_retry_stand(self, native_id: str, conf: dict | None) -> tuple[bool, str, str] | None:
         """The Linux-owned freeze-retry stand of one parent, from registered facts only.
 
         ``None`` keeps the existing stage row untouched (the parent is not a
         terminal freeze failure).  Otherwise the verdict replaces the freeze row:
-        eligible only when the admitted request carries a sealed upload identity
-        and the sealed intake still recomputes to exactly that identity - a
-        missing or changed original refuses instead of being silently resealed.
+        the one resolver proves the sealed intake against the registered identity
+        (the request baseline when present, the bound failure evidence otherwise)
+        and any missing or changed original refuses instead of being silently
+        resealed.
         """
 
         record = self._platform_read(lambda: self._platform().run_record(native_id))
@@ -2058,43 +2041,27 @@ class PortalApp:
         freeze_row = stages.get("freeze") if isinstance(stages, dict) else None
         if not (isinstance(freeze_row, dict) and freeze_row.get("state") == "failed"):
             return None
-        request_id = record.get("request_id")
-        request = (
-            self._platform_read(lambda: self._platform().request_record(request_id))
-            if isinstance(request_id, str)
-            else None
-        )
-        baseline = request.get("baseline") if isinstance(request, dict) else None
-        handoff_sha256 = baseline.get("handoff_sha256") if isinstance(baseline, dict) else None
-        expected_main = request.get("main_assembly") if isinstance(request, dict) else None
-        if not (
-            isinstance(handoff_sha256, str)
-            and re.fullmatch(r"[0-9a-f]{64}", handoff_sha256) is not None
-            and isinstance(expected_main, str)
-            and expected_main
-        ):
-            return (
-                False,
-                "originals_identity_missing",
-                "该运行未登记原始上传身份，无法校验原件；拒绝从“冻结输入”重跑",
-            )
+        parent_dag_run_id = self._admitted_dag_run_id(record.get("request_id"))
+        if parent_dag_run_id is None:
+            return (False, "originals_identity_missing", "原运行缺少可恢复的调度身份，拒绝从“冻结输入”重跑")
         handoff_path = _optional_str(conf.get("handoff_path")) if isinstance(conf, dict) else None
         if handoff_path is None:
             return (False, "incomplete", "原运行缺少可复用的上传目录，无法从此步骤重新运行")
-        intake = self._intake_dir(handoff_path)
-        if intake is None:
-            return (False, "originals_missing", "原始上传目录不可用；拒绝从“冻结输入”重跑")
         try:
-            upload_files = validate_file_index(package_inventory(intake))
-        except (PipelineError, OSError, ValueError):
-            return (False, "originals_missing", "原始上传原件缺失或无法完整读取；拒绝重跑")
-        recorded_files = baseline.get("files") if isinstance(baseline, dict) else None
-        if isinstance(recorded_files, int) and len(upload_files) != recorded_files:
-            return (False, "originals_missing", "原始上传文件数与已接纳身份不符；拒绝重跑")
-        if digest(upload_files) != handoff_sha256:
-            return (False, "originals_mismatch", "原始上传字节与已接纳身份不一致；拒绝复用")
-        if expected_main not in upload_files:
-            return (False, "originals_missing", "主装配不在原件清单中；拒绝重跑")
+            resolve_freeze_retry_identity(
+                self._platform(),
+                native_id,
+                parent_dag_run_id=parent_dag_run_id,
+                expected_dag_id=self.config.dag_id,
+                intake_path=Path(handoff_path),
+                intake_root=self.config.upload_root,
+            )
+        except FreezeRetryRefusal as refusal:
+            return (False, refusal.reason, refusal.reason_zh)
+        except PlatformStoreError as error:
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+            ) from error
         return (True, "linux_ready", "可在 Linux 重跑“冻结输入”并复用已封存原件")
 
     def _rerun_rows(self, native_id: str, conf: dict | None = None) -> list[dict] | None:
@@ -2479,27 +2446,32 @@ class PortalApp:
                     conf["main_assembly"] = parent_assembly
                 admit_baseline: dict | None = None
                 if reserved_id is None and stage == "freeze":
-                    parent_record = self._platform_read(
-                        lambda: self._platform().run_record(native_run_id(dag_run_id))
-                    )
-                    parent_request_id = (
-                        parent_record.get("request_id") if isinstance(parent_record, dict) else None
-                    )
-                    parent_request = (
-                        self._platform_read(lambda: self._platform().request_record(parent_request_id))
-                        if isinstance(parent_request_id, str)
-                        else None
-                    )
-                    admit_baseline = (
-                        parent_request.get("baseline") if isinstance(parent_request, dict) else None
-                    )
-                    if not isinstance(admit_baseline, dict):
-                        return self._rerun_refusal(
-                            start_response,
-                            "originals_identity_missing",
-                            "原运行缺少已登记的原始上传身份，拒绝从“冻结输入”重跑",
-                            None,
+                    try:
+                        resolved = resolve_freeze_retry_identity(
+                            self._platform(),
+                            native_run_id(dag_run_id),
+                            parent_dag_run_id=dag_run_id,
+                            expected_dag_id=self.config.dag_id,
+                            intake_path=Path(handoff_path),
+                            intake_root=self.config.upload_root,
                         )
+                    except FreezeRetryRefusal as refusal:
+                        return self._rerun_refusal(start_response, refusal.reason, refusal.reason_zh, None)
+                    except PlatformStoreError:
+                        return _json_response(
+                            start_response,
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "平台服务暂不可用，本次重新运行未接纳"},
+                            self.config,
+                        )
+                    admit_baseline = {
+                        "handoff_sha256": resolved.handoff_sha256,
+                        "files": resolved.files,
+                        "bytes": resolved.bytes,
+                        "folder": resolved.folder,
+                    }
+                    if resolved.provenance is not None:
+                        admit_baseline["provenance"] = resolved.provenance
                 if reserved_id is None:
                     # The canonical admission registers the new request, its linked run and
                     # the initial dispatch intent in one gate-locked transaction - before
