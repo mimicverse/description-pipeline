@@ -16,6 +16,7 @@ closes the connection again; no transaction ever spans an external call.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -89,6 +90,86 @@ class OperationClaim:
 
     record: OperationRecord
     granted: bool
+
+
+@dataclass(frozen=True)
+class NativeReceiptEvidence:
+    """The immutable, byte-bound native failed-receipt fact a maintenance action carries.
+
+    Produced only by :func:`load_native_failed_receipt`: the original receipt bytes are
+    read once, their SHA-256 is computed from those bytes, and the native identity fields
+    are validated against the bound run, stage and endpoint job UUID before this value
+    exists.  The reconcile action consumes exactly this fact; nothing downstream
+    re-derives, fills in or rewrites its terminal state.
+    """
+
+    path: str
+    sha256: str
+    run_id: str
+    stage: str
+    native_run_id: str
+    state: str
+    passed: bool
+    error: str | None
+    error_code: str | None
+    detail: str | None
+
+
+def load_native_failed_receipt(
+    path: object, *, run_id: str, stage: str, native_run_id: str
+) -> NativeReceiptEvidence:
+    """Load and validate one original native failed receipt - the single acceptance source.
+
+    The bytes on disk are the authority: they are read once, the receipt digest is
+    computed from them, and the parsed document must be the bound run's own terminal
+    failure - ``run_id``, ``stage`` and ``native_run_id`` all naming exactly the bound
+    facts, ``state`` a failed state and ``passed`` its consistent ``False``.  A missing
+    file, malformed bytes or any other identity/state refuses here, before the store
+    transaction is ever entered; every caller (the operator entry and the maintenance
+    route alike) shares this one implementation.
+    """
+
+    receipt_path = Path(str(path))
+    try:
+        raw = receipt_path.read_bytes()
+    except OSError as error:
+        raise PlatformStoreError(f"The native failed receipt is unreadable: {error}") from error
+    sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        document = json.loads(raw)
+    except ValueError as error:
+        raise PlatformStoreError("The native failed receipt is not a JSON document") from error
+    if not isinstance(document, dict):
+        raise PlatformStoreError("The native failed receipt must be a JSON object")
+    if not isinstance(run_id, str) or not run_id:
+        raise PlatformStoreError("The native receipt check requires the bound run id")
+    if document.get("run_id") != run_id:
+        raise PlatformStoreError("The native failed receipt names another run")
+    if document.get("stage") != stage:
+        raise PlatformStoreError("The native failed receipt names another stage")
+    if not _is_canonical_uuid(native_run_id):
+        raise PlatformStoreError("The bound endpoint job UUID is not canonical")
+    if document.get("native_run_id") != native_run_id:
+        raise PlatformStoreError("The native failed receipt names another endpoint job")
+    if document.get("state") != "failed" or document.get("passed") is not False:
+        raise PlatformStoreError("The native receipt is not the bound run's failed terminal fact")
+
+    def text(key: str) -> str | None:
+        value = document.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return NativeReceiptEvidence(
+        path=str(receipt_path),
+        sha256=sha256,
+        run_id=run_id,
+        stage=stage,
+        native_run_id=native_run_id,
+        state="failed",
+        passed=False,
+        error=text("error"),
+        error_code=text("error_code"),
+        detail=text("detail") or text("details"),
+    )
 
 
 def _report_member(path: object) -> bool:
@@ -235,10 +316,6 @@ _BIND_ORPHAN_OPERATION = (
 _READ_ORPHAN_SCHEDULING = (
     "SELECT state, bucket FROM lifecycle_projection"
     " WHERE object_kind = 'scheduling' AND object_id = %s"
-)
-_READ_ORPHAN_DAGRUN = (
-    "SELECT state, bucket FROM lifecycle_projection"
-    " WHERE object_kind = 'dag_run' AND object_id = %s"
 )
 _SETTLE_ORPHAN_INTENT = (
     "UPDATE operation SET state = %s, updated_at = now()"
@@ -1138,10 +1215,12 @@ class PlatformStore:
         and its failed-receipt digest must be the digest the reconciliation's
         evidence entries bind.  The binding is accepted only after the lifecycle
         view itself shows the bound task actually failed (never an unexecuted
-        ``upstream_failed`` sibling) and the DagRun is terminal failed: conflict,
-        foreign, missing, ambiguous, live or success facts refuse with zero
-        change (the tentative binding rolls back with the transaction), and no
-        unresolved intermediate state is ever fabricated.
+        ``upstream_failed`` sibling); the action's own pre-transaction check
+        refuses a DagRun that is not the settled failed fact before this
+        transaction opens.  Conflict, foreign, missing, ambiguous, live or
+        success facts refuse with zero change (the tentative binding rolls back
+        with the transaction), and no unresolved intermediate state is ever
+        fabricated.
         """
 
         if state != "failed":
@@ -1206,12 +1285,6 @@ class PlatformStore:
             # flight and a green task contradicts the failure: all refuse, and the
             # tentative binding rolls back with this transaction.
             raise PlatformStoreError("The bound Airflow task does not prove its own failed fact; refused")
-        cursor.execute(_READ_ORPHAN_DAGRUN, (f"{dag_id}/{dag_run_id}",))
-        dag_run = cursor.fetchone()
-        if dag_run is None or dag_run[1] != "terminal" or dag_run[0] != "failed":
-            # A live or unknown DagRun is not a settled external failure: the
-            # binding waits until the DagRun's own terminal failed fact is visible.
-            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact; refused")
         payload_receipt = {**receipt, "reconciliation": reconcile}
         cursor.execute(_INSERT_STAGE, (run_id, stage, state, _json(payload_receipt), None, None, None))
         if cursor.fetchone() is None:

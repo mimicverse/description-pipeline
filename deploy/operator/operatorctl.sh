@@ -474,10 +474,11 @@ case "$ACTION" in
       load_active_env
     else
       # The bootstrap maintenance window: the staged candidate generation runs the canonical
-      # recovery against the same real database.  The running record stays the reference; the
-      # staged artifacts (promotion receipt, snapshot-derived environment) are re-checked here
-      # and the active pointer, units and admission are untouched.  The channel is closed-window
-      # only: it refuses while the admission is open.
+      # recovery against the same real database.  The running record stays the reference, the
+      # staged generation itself is re-verified below (recorded snapshot, wheel binding to the
+      # release manifest, the runtime the reconcile executes), and the active pointer, units
+      # and admission stay untouched.  The channel is closed-window only: it refuses while
+      # the admission is open.
       load_running_env
       CANDIDATE_ID="$INSTALL_ID"
       RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
@@ -493,6 +494,52 @@ case "$ACTION" in
       "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.lifecycle_state report \
         --require-admission-closed >/dev/null \
         || die "the staged-candidate reconcile runs only while the admission is closed"
+      python3 - "$HERE/../../release.json" "$OPERATOR_STATE" "$CANDIDATE_ID" "$CANDIDATE_ENV" "$AIRFLOW_VENV" \
+        "$HERE" <<'PY' || die "the staged generation identity did not verify; re-run stage"
+# staged-generation identity: the recorded snapshot, the wheel binding and the real runtime
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[6])
+from install_record import release_identity, wheel_binding  # noqa: E402  (canonical owners)
+
+release_file, state_root, candidate_id, env_file, venv = (Path(value) for value in sys.argv[1:6])
+release = release_identity(json.loads(release_file.read_text(encoding="utf-8")))
+receipt = json.loads((state_root / "promotions" / candidate_id / "receipt.json").read_text(encoding="utf-8"))
+snapshot = Path(receipt["to"])
+if not snapshot.is_file() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != receipt["to_sha256"]:
+    raise SystemExit("the staged snapshot is missing or no longer matches its recorded digest")
+steps = {step.get("step"): step.get("status") for step in receipt.get("steps", [])}
+for name in ("linux-generation", "windows-generation"):
+    if steps.get(name) != "completed":
+        raise SystemExit(f"the staged generation has no completed {name} step")
+environment = {}
+for line in env_file.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        environment[key] = value
+if environment.get("PLATFORM_CONFIG_DIGEST") != receipt["to_sha256"]:
+    raise SystemExit("the staged environment binds another snapshot generation")
+recorded_wheel = state_root / "promotions" / candidate_id / "candidate-wheel"
+if recorded_wheel.is_file() and recorded_wheel.read_text(encoding="utf-8").strip() != environment.get("PIPELINE_WHEEL"):
+    raise SystemExit("the staged wheel does not match the recorded candidate wheel")
+wheel_binding(release, wheel=Path(environment["PIPELINE_WHEEL"]))
+runtime = subprocess.run(
+    [str(venv / "bin" / "python"), "-c",
+     "import importlib.metadata as m, pathlib, description_pipeline as p;"
+     "print(m.version('mimicverse-description')); print(pathlib.Path(p.__file__).resolve())"],
+    capture_output=True, text=True,
+)
+if runtime.returncode != 0:
+    raise SystemExit(f"the staged runtime cannot report its identity: {runtime.stderr.strip()}")
+version, module_file = runtime.stdout.splitlines()[:2]
+if version != release["version"] or not Path(module_file).is_relative_to(venv):
+    raise SystemExit("the staged runtime does not carry the staged release's installed package")
+print(f"staged generation verified: {candidate_id}")
+PY
     fi ;;
   stage|promote|rollback)
     load_running_env ;;
@@ -1191,14 +1238,12 @@ PY
     RECONCILE_ORPHAN_MAP_INDEX="$ORPHAN_MAP_INDEX" \
       "$AIRFLOW_VENV/bin/python" - <<'PY' || die "reconcile refused"
 # platform-reconcile
-import hashlib
 import json
 import os
-from pathlib import Path
 
 from description_pipeline import io
 from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
-from description_pipeline.platform.store import PlatformStore
+from description_pipeline.platform.store import PlatformStore, load_native_failed_receipt
 
 run_id = os.environ["RECONCILE_RUN_ID"]
 stage = os.environ["RECONCILE_STAGE"]
@@ -1213,54 +1258,71 @@ binding = None
 receipt = None
 native_receipt = os.environ.get("RECONCILE_NATIVE_RECEIPT") or ""
 if native_receipt:
-    raw = Path(native_receipt).read_bytes()
-    digest_sha = hashlib.sha256(raw).hexdigest()
-    document = json.loads(raw)
-    if not isinstance(document, dict):
-        raise SystemExit("the native failed receipt must be a JSON object")
-    explicit_run = os.environ.get("RECONCILE_NATIVE_RUN_ID") or None
-    recorded_run = document.get("native_run_id") or None
-    if explicit_run and recorded_run and explicit_run != recorded_run:
-        raise SystemExit("the named endpoint job UUID contradicts the receipt document")
-    native_run = explicit_run or recorded_run
-    if not native_run:
-        raise SystemExit("the failed receipt names no endpoint job UUID (--native-run-id is required)")
-    # The receipt bytes are the authority for their own digest; a self-contradicting document
-    # or a contradictory evidence entry refuses instead of recording a split identity.
-    if isinstance(document.get("native_receipt_sha256"), str) and document["native_receipt_sha256"] != digest_sha:
-        raise SystemExit("the native receipt's recorded digest contradicts its own bytes")
+    # The one canonical loader owns every acceptance rule for the original bytes: it reads them
+    # once, validates the native schema and the bound run/stage/job identity, and computes the
+    # digest from those bytes.  Nothing here fills in, rewrites or guesses the native fact.
+    loaded = load_native_failed_receipt(
+        native_receipt,
+        run_id=run_id,
+        stage=stage,
+        native_run_id=os.environ["RECONCILE_NATIVE_RUN_ID"],
+    )
     contradicting = [
         item
         for item in evidence
         if isinstance(item, str)
-        and item.startswith(f"{native_receipt}#sha256=")
-        and item.split("#sha256=", 1)[1] != digest_sha
+        and item.startswith(f"{loaded.path}#sha256=")
+        and item.split("#sha256=", 1)[1] != loaded.sha256
     ]
     if contradicting:
         raise SystemExit(f"the evidence entry contradicts the receipt bytes: {contradicting[0]}")
     evidence = [
         item
         for item in evidence
-        if not (isinstance(item, str) and (item == native_receipt or item.startswith(f"{native_receipt}#")))
-    ] + [f"{native_receipt}#sha256={digest_sha}"]
+        if not (isinstance(item, str) and (item == loaded.path or item.startswith(f"{loaded.path}#")))
+    ] + [f"{loaded.path}#sha256={loaded.sha256}"]
     binding = {
         "operation_id": os.environ["RECONCILE_ORPHAN_OPERATION_ID"],
         "task_id": os.environ["RECONCILE_ORPHAN_TASK_ID"],
         "map_index": int(os.environ["RECONCILE_ORPHAN_MAP_INDEX"]),
     }
+    # The settled-external-failure check: the bound operation's own DagRun must be the real
+    # terminal failed fact in the Airflow metadata - a live or unknown DagRun refuses before
+    # the store action is entered.  The operation's DagRun key comes from the platform
+    # authority itself; the state comes from the Airflow runtime identity's own metadata.
+    import psycopg2
+
+    with psycopg2.connect(os.environ["PLATFORM_SERVICE_DSN"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT dag_id, dag_run_id FROM operation WHERE operation_id = %s AND run_id = %s",
+                (binding["operation_id"], run_id),
+            )
+            bound = cursor.fetchone()
+    if bound is None or not all(bound):
+        raise SystemExit("The orphan binding names no registered operation with a DagRun identity")
+    runtime_dsn = os.environ["AIRFLOW_RUNTIME_DB_URL"].replace("postgresql+psycopg2://", "postgresql://", 1)
+    with psycopg2.connect(runtime_dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT state FROM airflow.dag_run WHERE dag_id = %s AND run_id = %s", (bound[0], bound[1])
+            )
+            settled = cursor.fetchone()
+    if settled is None or settled[0] != "failed":
+        raise SystemExit("The bound DagRun does not prove its terminal failed fact; refused")
     receipt = {
         "schema_version": BUNDLE_SCHEMA,
         "pipeline_id": PIPELINE_ID,
-        "run_id": run_id,
-        "stage": stage,
-        "state": "failed",
-        "passed": False,
-        "native_run_id": native_run,
-        "native_receipt_sha256": digest_sha,
+        "run_id": loaded.run_id,
+        "stage": loaded.stage,
+        "state": loaded.state,
+        "passed": loaded.passed,
+        "native_run_id": loaded.native_run_id,
+        "native_receipt_sha256": loaded.sha256,
     }
     for key in ("error", "error_code", "detail"):
-        value = document.get(key)
-        if isinstance(value, str) and value:
+        value = getattr(loaded, key)
+        if value is not None:
             receipt[key] = value
 
 reconcile = {
