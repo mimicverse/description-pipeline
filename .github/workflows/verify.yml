@@ -271,8 +271,8 @@ jobs:
             "$AIRFLOW_VENV/bin/airflow" db migrate
       - name: Create the Feishu sign-in state in the migration window
         run: |
-          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN="$AIRFLOW_MIGRATE_DSN" "$AIRFLOW_VENV/bin/python" -c \
-            'from description_pipeline.orchestration.feishu_auth import MetadataStateStore; MetadataStateStore()'
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN="$AIRFLOW_MIGRATE_DSN" \
+            "$AIRFLOW_VENV/bin/python" -m description_pipeline.orchestration.feishu_auth
       - name: Grant the airflow-side boundary (one owner, after the migration)
         run: |
           bash deploy/platform/apply.sh --airflow-grants --psql psql --database postgres \
