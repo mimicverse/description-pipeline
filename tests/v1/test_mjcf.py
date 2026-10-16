@@ -1018,6 +1018,21 @@ class BuildStabilityTests(unittest.TestCase):
             self.assertIn("simulation configuration changed", str(caught.exception))
             self.assertFalse((source.config_path.parent / "delivery").exists())
 
+    def test_an_unstable_runtime_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="mjcf-unstable-") as directory:
+            source = _Source(
+                Path(directory),
+                config=configuration(
+                    simulation={"timestep": 0.1, "gravity": [0.0, 0.0, -1e12], "integrator": "implicitfast"},
+                    support_sites=[],
+                    floor={"height": -1.0, "friction": [0.9, 0.005, 0.0001]},
+                ),
+            )
+            with self.assertRaises(PipelineError) as caught:
+                source.build()
+            self.assertIn("runtime.steps", str(caught.exception))
+            self.assertFalse((source.config_path.parent / "delivery").exists())
+
 
 class EmittedAssetTests(unittest.TestCase):
     def test_a_collision_only_mesh_is_sealed_but_not_registered_for_visual_convex(self):

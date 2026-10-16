@@ -2026,31 +2026,67 @@ def _gate_scene(state: dict) -> dict:
 def _runtime_of(model, steps: int) -> dict:
     import mujoco
 
+    warnings: list[str] = []
     data = mujoco.MjData(model)
-    mujoco.mj_forward(model, data)
-    forward_finite = bool(
-        np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all() and np.isfinite(data.xpos).all()
-    )
-    steps_finite = True
-    for _ in range(steps):
-        mujoco.mj_step(model, data)
-        if not (np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()):
-            steps_finite = False
-            break
-    return {"forward_finite": forward_finite, "steps": steps, "steps_finite": steps_finite}
+    mujoco.set_mju_user_warning(lambda text: warnings.append(text) or 0)
+    try:
+        mujoco.mj_forward(model, data)
+        finite = bool(
+            np.isfinite(data.qpos).all()
+            and np.isfinite(data.qvel).all()
+            and np.isfinite(data.qacc).all()
+            and np.isfinite(data.xpos).all()
+        )
+        for _ in range(steps):
+            mujoco.mj_step(model, data)
+            # An implicit instability reset restores finite state and would fake
+            # a passing run; the engine warning is the reliable signal.
+            if warnings:
+                finite = False
+                break
+            if not (
+                np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all() and np.isfinite(data.qacc).all()
+            ):
+                finite = False
+                break
+        counters = [int(entry.number) for entry in data.warning]
+        expected = steps * float(model.opt.timestep)
+        advanced = abs(float(data.time) - expected) <= 1e-6 * max(1.0, expected)
+        return {
+            "steps": steps,
+            "finite": finite,
+            "time": float(data.time),
+            "time_advanced": advanced,
+            "warnings": warnings[:3],
+            "warning_counts": counters,
+        }
+    finally:
+        mujoco.set_mju_user_warning(None)
 
 
 def _gate_runtime(state: dict) -> dict:
     policy = state["policy"]
     model = _need(state, "robot_model")
     runtime = _runtime_of(model, policy["runtime_steps"])
-    if not runtime["forward_finite"] or not runtime["steps_finite"]:
+    if runtime["warnings"]:
+        raise CheckError(f"the engine reported an unstable runtime: {runtime['warnings'][0]}")
+    if any(runtime["warning_counts"]):
+        raise CheckError(f"the engine counted instability warnings: {runtime['warning_counts']}")
+    if not runtime["finite"]:
         raise CheckError("the zero state produced non-finite values")
-    details = {"steps": runtime["steps"], "robot_finite": True}
+    if not runtime["time_advanced"]:
+        raise CheckError("the simulation time did not advance as expected; the state was implicitly reset")
+    details = {"steps": runtime["steps"], "time": runtime["time"], "robot_finite": True}
     if "scene_model" in state:
         scene_runtime = _runtime_of(state["scene_model"], policy["runtime_steps"])
-        if not scene_runtime["forward_finite"] or not scene_runtime["steps_finite"]:
+        if scene_runtime["warnings"]:
+            raise CheckError(f"the scene reported an unstable runtime: {scene_runtime['warnings'][0]}")
+        if any(scene_runtime["warning_counts"]):
+            raise CheckError(f"the scene counted instability warnings: {scene_runtime['warning_counts']}")
+        if not scene_runtime["finite"]:
             raise CheckError("the scene zero state produced non-finite values")
+        if not scene_runtime["time_advanced"]:
+            raise CheckError("the scene simulation time did not advance as expected")
         details["scene_finite"] = True
     return details
 
