@@ -1504,12 +1504,10 @@ class InstallOrderingTests(unittest.TestCase):
             + 'case "$*" in\n'
             '  *-f*platform/bootstrap.sql*)\n'
             '    echo "psql_platform_bootstrap" >> "$ORDER_LOG"; exit 0 ;;\n'
+            '  *-f*platform/grants-airflow.sql*)\n'
+            '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             '  *-f*platform/schema.sql*|*-f*platform/views.sql*|*-f*platform/roles.sql*)\n'
             '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit 0 ;;\n'
-            '  *-c*platform_migrate*)\n'
-            '    echo "psql_airflow_reader_grant" >> "$ORDER_LOG"; exit 0 ;;\n'
-            '  *-v*ON_ERROR_STOP=1*q*)\n'
-            '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             "esac\n"
             'echo "psql_db_query" >> "$ORDER_LOG"\n'
             'rc="${PSQL_QUERY_RC:-0}"\n'
@@ -1635,10 +1633,9 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertLess(lines.index("createdb"), lines.index("psql_platform_bootstrap"))
             self.assertLess(lines.index("psql_platform_bootstrap"), lines.index("airflow_install"))
             self.assertLess(lines.index("createdb"), lines.index("airflow_install"))
-            self.assertLess(lines.index("airflow_install"), lines.index("psql_airflow_reader_grant"))
-            self.assertLess(lines.index("psql_airflow_reader_grant"), lines.index("psql_platform_apply"))
+            self.assertLess(lines.index("airflow_install"), lines.index("psql_airflow_grants"))
+            self.assertLess(lines.index("psql_airflow_grants"), lines.index("psql_platform_apply"))
             self.assertLess(lines.index("airflow_install"), lines.index("psql_platform_apply"))
-            self.assertLess(lines.index("psql_platform_apply"), lines.index("psql_airflow_grants"))
             self.assertEqual(
                 [line for line in lines if line.startswith("pg_isready ")], ["pg_isready 1", "pg_isready 2"]
             )

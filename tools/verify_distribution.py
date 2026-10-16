@@ -105,6 +105,12 @@ def verify_release(directory, identity):
     for name in complete:
         if name not in artifacts:
             raise PipelineError(f"Release is incomplete: {name} is missing")
+    # The manifest closes over exactly the five canonical assets: an extra entry is refused even
+    # when its digest in the manifest is correct (a seventh asset, manifest-bound or not, is a
+    # release the verifier does not know).
+    extras = sorted(set(artifacts) - set(complete))
+    if extras:
+        raise PipelineError(f"Release carries assets outside the canonical five: {extras}")
     deployment_name = f"description-{version}-deployment.zip"
     with zipfile.ZipFile(directory / deployment_name) as archive:
         safe_members(archive.namelist())

@@ -502,33 +502,21 @@ case "$ACTION" in
       AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_RUNTIME_DB_URL="$AIRFLOW_RUNTIME_DB_URL" \
       AIRFLOW_API_PORT="$AIRFLOW_API_PORT" \
       bash "$AIRFLOW_HERE/install.sh"
-    # The platform view owner reads the real Airflow metadata (owner-privilege views): the
-    # platform migration identity receives exactly that read grant, nothing else.
-    "$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
-      -v ON_ERROR_STOP=1 -q \
-      -c "GRANT USAGE ON SCHEMA ${AIRFLOW_SCHEMA:-airflow} TO platform_migrate; \
-          GRANT SELECT ON ${AIRFLOW_SCHEMA:-airflow}.task_instance TO platform_migrate" \
-      || die "could not grant the platform read boundary"
+    # The airflow-side boundary grants have one owner: apply.sh --airflow-grants (schema-variable
+    # aware).  The platform view owner reads the real Airflow metadata under owner privileges;
+    # the runtime identity stays DML-only inside the airflow schema.
+    PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
+      --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
+      --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
+      || die "could not grant the airflow-side boundaries"
     # The platform objects and the consumer grants run as the platform migration identity
     # (idempotent); the admission starts closed until "start" opens it.
     PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
       --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
       --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" >&2 \
       || die "platform apply failed"
-    # The runtime identity is least privilege: DML inside the airflow schema only, no DDL
-    # anywhere.  Grants are re-applied after every migration (new tables included).
-    "$PG_BIN/psql" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
-      -v ON_ERROR_STOP=1 -q <<'SQL' || die "grants for airflow_runtime failed"
-ALTER ROLE airflow_runtime LOGIN;
-GRANT USAGE ON SCHEMA airflow TO airflow_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA airflow TO airflow_runtime;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA airflow TO airflow_runtime;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA airflow TO airflow_runtime;
-ALTER DEFAULT PRIVILEGES FOR ROLE airflow_migrate IN SCHEMA airflow
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO airflow_runtime;
-ALTER DEFAULT PRIVILEGES FOR ROLE airflow_migrate IN SCHEMA airflow
-    GRANT USAGE, SELECT ON SEQUENCES TO airflow_runtime;
-SQL
+    # The runtime/DML grants and the default privileges travel with the same
+    # apply.sh --airflow-grants step above (re-applied after every migration).
     # The wheel must provide the portal and the Feishu auth manager before the units start.
     if ! "$AIRFLOW_VENV/bin/python" -c 'import importlib.util, sys; sys.exit(0 if all(
         importlib.util.find_spec(name) for name in

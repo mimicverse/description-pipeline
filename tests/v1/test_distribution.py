@@ -149,6 +149,28 @@ class DistributionTests(unittest.TestCase):
                 verify_release(root, identity)
             self.assertIn("Release assets differ", str(raised.exception))
 
+    def test_a_manifest_registered_seventh_asset_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = complete_release(root)
+            extra = root / "unexpected-review-note.txt"
+            extra.write_text("A seventh asset with a valid manifest digest.\n", encoding="utf-8")
+            manifest = json.loads((root / "release.json").read_text(encoding="utf-8"))
+            manifest["artifacts"][extra.name] = hashlib.sha256(extra.read_bytes()).hexdigest()
+            write_json(root / "release.json", manifest)
+            with self.assertRaises(PipelineError) as raised:
+                verify_release(root, identity)
+            self.assertIn("outside the canonical five", str(raised.exception))
+
+    def test_an_unregistered_seventh_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = complete_release(root)
+            (root / "unexpected-review-note.txt").write_text("seventh file\n", encoding="utf-8")
+            with self.assertRaises(PipelineError) as raised:
+                verify_release(root, identity)
+            self.assertIn("Release assets differ", str(raised.exception))
+
     def test_deployment_members_are_bound_to_the_source_release(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
