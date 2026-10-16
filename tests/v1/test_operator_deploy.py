@@ -1479,6 +1479,7 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "airflow" / "scripts").mkdir(parents=True)
         (release / "airflow" / "dags").mkdir()
         (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
+        (release / "operator" / "health.sh").write_bytes(HEALTH.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
         for module in ("platform_config.py", "platform_env.py", "install_record.py", "promotion.py", "backup.py"):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
@@ -1923,6 +1924,12 @@ class InstallOrderingTests(unittest.TestCase):
                     else:
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn("managed nginx binary missing or not executable", result.stdout)
+                    if verb == "health":
+                        # The real health battery (not a stub) fails on the bound, missing binary.
+                        self.assertIn(
+                            f"FAIL     managed nginx binary missing or not executable: {binary}",
+                            result.stdout,
+                        )
                     self.assertEqual(before, tree_state(work), f"{verb} wrote into the deployment tree")
                     self.assertEqual(
                         list((scratch / "tmp").iterdir()), [], f"{verb} left temporary files behind"
