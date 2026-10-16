@@ -9,6 +9,34 @@ export function purposeLabel(value) {
   return value === "engineering" || value === "inspection_preview" ? value : "未记录";
 }
 
+export function statusLabel(status) {
+  return status === "unqualified"
+    ? "未建立"
+    : status === "established"
+      ? "已建立"
+      : status === "out_of_scope"
+        ? "不适用"
+        : "?";
+}
+
+export function qualificationRows(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((item) => item && typeof item.fact_id === "string")
+    .map((item) => {
+      const objectId = typeof item.object_id === "string" ? item.object_id : "";
+      return {
+        fact_id: item.fact_id,
+        scope: typeof item.scope === "string" ? item.scope : "",
+        object_id: objectId,
+        status: item.status,
+        label: objectId ? `${item.fact_id}[${objectId}]` : item.fact_id,
+      };
+    })
+    .sort((a, b) =>
+      a.object_id === b.object_id ? a.fact_id.localeCompare(b.fact_id) : a.object_id.localeCompare(b.object_id),
+    );
+}
+
 // ----------------------------------------------------------------------------- interaction
 
 // The exact orbit model viewer.js renders with: rotate/pan/zoom in one pure state
@@ -106,13 +134,9 @@ export function infoPanelRows({ runId, subjectSha256, purpose, tool, qualitySche
   const toolIdentity = tool
     ? [tool.version, tool.source_sha256].filter((value) => typeof value === "string" && value).join(" / ")
     : "";
-  const statusLabel = (status) =>
-    status === "unqualified" ? "未建立" : status === "established" ? "已建立" : status === "out_of_scope" ? "不适用" : "?";
-  const states = Array.isArray(qualificationStates)
-    ? qualificationStates
-        .map((item) => `${item?.fact_id || "?"}=${item?.status ? statusLabel(item.status) : "?"}`)
-        .join(", ")
-    : "";
+  const states = qualificationRows(qualificationStates)
+    .map((row) => `${row.label}=${row.status ? statusLabel(row.status) : "?"}`)
+    .join(", ");
   return [
     { key: "run_id", value: typeof runId === "string" ? runId : "" },
     { key: "subject_sha256", value: typeof subjectSha256 === "string" ? subjectSha256 : "" },

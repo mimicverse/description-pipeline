@@ -482,22 +482,29 @@ def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> t
 
 def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
     checks = report.get("checks") or []
-    facts = {
-        item.get("fact_id"): item.get("status")
+    # Every (fact_id, scope, object_id) identity prints independently in a stable
+    # order (object_id, then fact_id): a two-joint fact never collapses to one
+    # line, so flipping the report order cannot flip a conclusion.
+    qualifications = sorted(
+        (
+            str(item.get("object_id") or ""),
+            str(item.get("fact_id") or ""),
+            str(item.get("status") or ""),
+        )
         for item in (report.get("qualifications") or [])
         if isinstance(item, dict)
-    }
-    qualifications = "".join(
-        f"- {fact_id}: {facts.get(fact_id) or 'unqualified'}"
-        f"{'（未建立）' if facts.get(fact_id) in (None, 'unqualified') else ''}\n"
-        for fact_id in ("engineering_position_range", "drive_sizing", "machine_qualification")
+    )
+    qualification_lines = "".join(
+        f"- {fact_id}{f'[{object_id}]' if object_id else ''}: {status}"
+        f"{'（未建立）' if status == 'unqualified' else ''}\n"
+        for object_id, fact_id, status in qualifications
     )
     return (
         f"Automatic SolidWorks-to-URDF publication.\n\n"
         f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
         f"- purpose: `{purpose}`\n"
         f"- verifier: recomputed, passed ({len(checks)} checks)\n"
-        f"{qualifications}"
+        f"{qualification_lines}"
     )
 
 

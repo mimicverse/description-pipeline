@@ -22,9 +22,11 @@ const {
   infoPanelRows,
   interactionEffect,
   jointRows,
+  qualificationRows,
   linkRows,
   previewExpansion,
   purposeLabel,
+  statusLabel,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
@@ -86,6 +88,20 @@ const {
   assert.equal(purposeLabel("inspection_preview"), "inspection_preview");
   assert.equal(purposeLabel("unknown"), "未记录");
   assert.equal(infoPanelRows({ runId: "", subjectSha256: "", tool: null }).length, MACHINE_FIELD_KEYS.length + 2);
+  // Every (fact_id, scope, object_id) identity renders independently in a stable
+  // order: flipping the input order cannot flip a conclusion.
+  {
+    const rows = (items) =>
+      qualificationRows(items).map((row) => `${row.label}=${statusLabel(row.status)}`);
+    const established = { fact_id: "drive_sizing", object_id: "arm-a", status: "established" };
+    const missing = { fact_id: "drive_sizing", object_id: "arm-b", status: "unqualified" };
+    assert.deepEqual(rows([missing, established]), ["drive_sizing[arm-a]=已建立", "drive_sizing[arm-b]=未建立"]);
+    assert.deepEqual(rows([established, missing]), rows([missing, established]));
+    const panel = (items) =>
+      infoPanelRows({ qualificationStates: items }).find((row) => row.key === "qualification_states").value;
+    assert.equal(panel([missing, established]), panel([established, missing]));
+    assert.equal(panel([missing, established]), "drive_sizing[arm-a]=已建立, drive_sizing[arm-b]=未建立");
+  }
 }
 
 // Static display seams (no browser): missing drive stays absent and labelled, the

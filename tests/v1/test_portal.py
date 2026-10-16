@@ -722,6 +722,27 @@ class FakePlatformStore:
             }
             for stage in entry.get("checkpoints") or ()
         }
+        if isinstance(entry.get("preview"), dict) and "freeze" in (entry.get("checkpoints") or ()):
+            request_digest = (entry["preview"].get("files") or {}).get("input/request.json")
+            if isinstance(request_digest, str):
+                request_bytes = (entry.get("artifacts") or {}).get("input/request.json")
+                stages["freeze"] = {
+                    "stage": "freeze",
+                    "state": "completed",
+                    "receipt": {
+                        "subject_sha256": None,
+                        "artifacts": [
+                            {
+                                "path": "input/request.json",
+                                "bytes": len(request_bytes) if isinstance(request_bytes, (bytes, bytearray)) else 0,
+                                "sha256": request_digest,
+                            }
+                        ],
+                    },
+                    "checkpoint_uri": f"store://sealed/{run_id}/freeze",
+                    "reused_from_run": None,
+                    "original_executed_at": None,
+                }
         preview = entry.get("preview")
         if isinstance(preview, dict):
             verified = preview.get("verified") is not False
@@ -1142,13 +1163,57 @@ class PortalTests(unittest.TestCase):
         )
         self._record_fixture_events(run_id)
 
-    def test_run_detail_carries_the_declared_purpose_and_unknown_is_not_recorded(self) -> None:
-        self._seed_airflow_run(DAG_RUN_ID, state="success")
+    def test_run_and_preview_read_the_registered_freeze_purpose_not_the_conf(self) -> None:
+        import hashlib
+
+        from description_pipeline import request_evidence
+
+        payload_bytes = request_evidence.request_evidence_bytes(
+            request_evidence.build_request_evidence(
+                purpose="inspection_preview",
+                request_id="fixture-freeze",
+                target_hardware="m3.0",
+                change_summary="fixture",
+                main_assembly="assembly.SLDASM",
+                handoff_digest="a" * 64,
+                platform_config_digest="c" * 64,
+            )
+        )
+        digest = hashlib.sha256(payload_bytes).hexdigest()
+        self.store.add(
+            native_run_id(DAG_RUN_ID),
+            meta={"handoff_sha256": "e" * 64},
+            checkpoints=("freeze",),
+            preview={
+                "subject_sha256": "d" * 64,
+                "verified": True,
+                "files": {"urdf/robot.urdf": "f" * 64, "input/request.json": digest},
+                "report_files": {},
+            },
+            artifacts={"urdf/robot.urdf": b"<robot/>", "input/request.json": payload_bytes},
+        )
+        # A stale/mutable conf echo must never decide either page: the registered
+        # freeze request carries inspection_preview while conf says engineering.
+        self._seed_airflow_run(
+            DAG_RUN_ID,
+            state="success",
+            conf={
+                "handoff_path": "/incoming/folder",
+                "target_hardware": "m3.0",
+                "change_summary": "x",
+                "purpose": "engineering",
+            },
+        )
         self.client.login()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["purpose"], "engineering")
-        self._seed_airflow_run(DAG_RUN_ID, state="success", conf={})
+        self.assertEqual(json.loads(body)["purpose"], "inspection_preview")
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["purpose"], "inspection_preview")
+        # An unfinished registration reads as 未记录 on both pages - the conf echo
+        # does not leak into the run page.
+        self.store.runs[native_run_id(DAG_RUN_ID)]["checkpoints"] = ()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200)
         self.assertIsNone(json.loads(body)["purpose"])

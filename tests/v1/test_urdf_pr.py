@@ -156,6 +156,7 @@ class PublishTests(unittest.TestCase):
         self.gh_mode = "ok"
         self.branch = BRANCH
         self.prs: dict[str, dict] = {}
+        self.qualification_reversed = False
 
         def fake_gh(repository: Path, *args: str) -> str:
             self.gh_calls.append(args)
@@ -215,21 +216,30 @@ class PublishTests(unittest.TestCase):
                     "bodies": [],
                     "joints": [
                         {
-                            "name": "slide",
+                            "name": "arm-a",
                             "type": "revolute",
                             "limit_source": "native",
                             "limits": {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0},
+                        },
+                        {
+                            "name": "arm-b",
+                            "type": "revolute",
+                            "limit_source": "native",
+                            "limits": {"lower": -1.0, "upper": 1.0},
                         }
                     ],
                     "frames": [],
                 },
             }
             read_data(bundle / "input/request.json")
+            qualifications = _verification.qualifications(bundle, definition, checks)
+            if self.qualification_reversed:
+                qualifications = list(reversed(qualifications))
             report = {
                 "passed": True,
                 "subject_sha256": subject_digest(bundle),
                 "checks": checks,
-                "qualifications": _verification.qualifications(bundle, definition, checks),
+                "qualifications": qualifications,
             }
             (bundle / "reports/quality.json").write_text(urdf_pr._serialize(report), encoding="utf-8")
             return report
@@ -564,8 +574,9 @@ class PublishTests(unittest.TestCase):
         self.assertIn(f"subject: `{result['subject']}`", self.rest_payloads[-1]["body"])
         body = self.rest_payloads[-1]["body"]
         self.assertIn("- purpose: `engineering`", body)
-        self.assertIn("- engineering_position_range: established", body)
-        self.assertIn("- drive_sizing: established", body)
+        self.assertIn("- engineering_position_range[arm-a]: established", body)
+        self.assertIn("- drive_sizing[arm-a]: established", body)
+        self.assertIn("- drive_sizing[arm-b]: unqualified（未建立）", body)
         self.assertIn("- machine_qualification: unqualified（未建立）", body)
         self.assertEqual(result["purpose"], "engineering")
         self.assertFalse(any(call[:2] == ("pr", "edit") for call in self.gh_calls))
@@ -877,8 +888,31 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(INSPECTION_BRANCH), third["commit"])
         body = self.rest_payloads[-1]["body"]
         self.assertIn("- purpose: `inspection_preview`", body)
-        for fact_id in ("engineering_position_range", "drive_sizing", "machine_qualification"):
-            self.assertIn(f"- {fact_id}: unqualified（未建立）", body)
+        self.assertIn("- drive_sizing[arm-a]: unqualified（未建立）", body)
+        self.assertIn("- machine_qualification: unqualified（未建立）", body)
+
+    def test_pr_body_lists_each_qualification_identity_independent_of_order(self) -> None:
+        def qualification_lines(body: str) -> list[str]:
+            return [
+                line
+                for line in body.splitlines()
+                if line.startswith("- ") and not line.startswith(("- subject:", "- verified commit:", "- purpose:"))
+            ]
+
+        self.qualification_reversed = False
+        self.submit()
+        self.submit()
+        forward = self.rest_payloads[-1]["body"]
+        self.assertIn("- drive_sizing[arm-a]: established", forward)
+        self.assertIn("- drive_sizing[arm-b]: unqualified（未建立）", forward)
+        self.assertLess(forward.index("[arm-a]"), forward.index("[arm-b]"))
+        self.qualification_reversed = True
+        result = self.submit()
+        self.assertIn(result["state"], {"updated", "noop"})
+        self.assertEqual(
+            qualification_lines(self.rest_payloads[-1]["body"]),
+            qualification_lines(forward),
+        )
 
 
 if __name__ == "__main__":

@@ -1816,9 +1816,11 @@ class PortalApp:
                 pr = None
         stage_view_payload = stage_view(job)
         report = build_report(job, view=stage_view_payload)
-        purpose = _optional_str(conf.get("purpose"))
-        if purpose not in REQUEST_PURPOSES:
-            purpose = None
+        # The purpose authority of both pages is the registered freeze request: a
+        # mutable conf echo never decides the display, and an unfinished
+        # registration reads as "未记录".
+        projection = self._read_projection(run_id)
+        purpose = self._registered_purpose(projection) if projection is not None else None
         payload = {
             "dag_run_id": dag_run_id,
             "state": airflow_run.get("state"),
