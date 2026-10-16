@@ -460,7 +460,6 @@ def _start_portal_server(
     root: Path,
     airflow_base: str,
     upload_root: Path,
-    store_root: Path,
     repository: Path,
     targets: dict,
     dag_id: str,
@@ -469,7 +468,10 @@ def _start_portal_server(
     """Start the real portal in-process (admission through the operator HTTP surface).
 
     The endpoint is bound lazily: the portal is up before the mocked Windows endpoint exists
-    (admission happens while the DAG is still paused, so no task can call it yet).
+    (admission happens while the DAG is still paused, so no task can call it yet).  The
+    platform store, and with it the sealed store root, derives from the same deploy environment
+    the smoke published (``PLATFORM_SERVICE_DSN`` + ``PIPELINE_STORE_ROOT``) - the portal
+    carries no second store-root channel.
     """
 
     from wsgiref.simple_server import make_server  # noqa: PLC0415
@@ -481,7 +483,6 @@ def _start_portal_server(
         endpoint=lambda: endpoint_holder["endpoint"],
         static_dir=root / "src/description_pipeline/orchestration/static",
         upload_root=upload_root,
-        pipeline_store_root=store_root,
         pipeline_repositories={REPOSITORY_SLUG: repository},
         pipeline_targets=targets,
         dag_id=dag_id,
@@ -900,7 +901,17 @@ def main() -> int:
             bundle_dir=args.airflow_home / "smoke" / "definition",
         )
         port = server.server_address[1]
+    # The one canonical smoke store root.  The directory is created once here (the operator
+    # convention: a dedicated directory under the isolated home, mode 0700) and published to
+    # every consumer of this smoke: the in-process admission and the lazily bound portal read
+    # it from the environment, the scheduler reads the same path from the connection extra
+    # below, and the child processes inherit it through ``env``.
+    # ``PlatformStore.from_environment`` keeps requiring it - there is no implicit fallback
+    # and no second root.
     store_root = args.airflow_home / "smoke-store"
+    store_root.mkdir(parents=True, exist_ok=True)
+    store_root.chmod(0o700)
+    os.environ["PIPELINE_STORE_ROOT"] = str(store_root)
     connection = json.dumps(
         {
             "conn_type": "http",
@@ -921,6 +932,7 @@ def main() -> int:
         AIRFLOW_HOME=str(args.airflow_home),
         PYTHONPATH=os.pathsep.join(filter(None, [str(args.root / "src"), os.environ.get("PYTHONPATH")])),
         AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
+        PIPELINE_STORE_ROOT=str(store_root),
         AIRFLOW__CORE__AUTH_MANAGER="description_pipeline.orchestration.feishu_auth.FeishuAuthManager",
         AIRFLOW__CORE__LOAD_EXAMPLES="false",
         AIRFLOW__API_AUTH__JWT_SECRET=JWT_SECRET,
@@ -1038,7 +1050,6 @@ def main() -> int:
                 args.root,
                 f"http://127.0.0.1:{api_port}",
                 intake_root,
-                store_root,
                 args.airflow_home / "smoke-repository",
                 {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
                 DAG_ID,
