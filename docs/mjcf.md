@@ -33,32 +33,47 @@ URDF 是拓扑、关节原点/有向轴/范围、质量、COM、完整惯量和�
 
 ```sh
 description mjcf build /path/to/source --urdf urdf/robot.urdf \
-  --config /path/to/simulation.json --output /path/to/new-mjcf
+  --output /path/to/new-mjcf
 description mjcf check /path/to/new-mjcf
 ```
 
 输入根目录必须包含 URDF 与它引用的全部网格；`--urdf` 是根目录内的相对路径。允许 URDF 通过 `../meshes/` 引用根内资源。拒绝绝对网格路径、远端/`package://` URI、符号链接、路径逃逸、重复或大小写冲突路径。源文件在冻结前后核对摘要，不改写源目录。
 
-配置只支持如下字段；未知键、重复 JSON 键、非有限数字和未知枚举均拒绝。本接口允许改变的物理选项都显式提供，不按机器人名称套用默认参数；未开放的求解器选项由锁定 MuJoCo 版本及封闭 XML 约定固定，禁止私下覆盖。
+常规转换不需要配置文件；省略 `--config` 等价于空对象。只有需要覆盖默认策略时才提供 `--config /path/to/simulation.json`。配置、嵌套对象和各个可覆盖字段都可省略；未知键、重复 JSON 键、非有限数字、错误类型和未知枚举仍拒绝。显式写入 `null` 不等于省略，也不能绕过校验。
+
+默认值由 `mjcf_contract.py` 中唯一、版本化的机器策略定义，不按机器人名称猜测。机械事实仍只来自 URDF；仿真默认值不是对机器人用途或物理参数的推断。
+
+| 可覆盖项 | 省略时的行为 |
+|---|---|
+| `schema_version` | `1`；显式提供时必须为 `1` |
+| `base` | `floating`；需要台架或固定基座时才填写 `fixed` |
+| `collision.source` | `urdf`，只使用源 collision；源中没有 collision 就保持零碰撞体，不自动用视觉网格补造 |
+| `collision.self_collision` | `true`，遵循锁定引擎的标准相邻刚体过滤 |
+| `collision.friction` | `[0.8, 0.005, 0.0001]`；通用转换预设，不代表实物摩擦标定 |
+| `simulation.timestep` | `0.001` 秒 |
+| `simulation.gravity` | `[0, 0, -9.81]` |
+| `simulation.integrator` | `implicitfast` |
+| `sites` / `support_sites` | 空列表；不猜测支撑 link 的身份 |
+| 显式 site 的 `xyz` / `rpy` | `[0, 0, 0]`，即指定 link 自身的坐标系；`name` 和 `link` 必填 |
+| 支撑 site 的 `name` | `<link>__support`；只需填写 `link`，坐标和姿态从源几何推导 |
+| `floor` | 不生成场景；填写空对象 `{}` 即请求地面和灯光 |
+| 已请求地面的 `height` | 有支撑 site 时为 `"supports"`；否则为世界 `Z=0` |
+| 已请求地面的 `friction` | 继承本次解析后的 `collision.friction` |
+
+例如，没有源 collision 的机器人需要显式授权视觉凸包碰撞，并指定两个支撑 link 和请求场景，只需：
 
 ```json
 {
-  "schema_version": 1,
-  "base": "floating",
-  "collision": {
-    "source": "visual_convex",
-    "self_collision": true,
-    "friction": [0.8, 0.005, 0.0001]
-  },
-  "simulation": {
-    "timestep": 0.001,
-    "gravity": [0, 0, -9.81],
-    "integrator": "implicitfast"
-  },
-  "sites": [],
-  "floor": {"height": 0, "friction": [0.8, 0.005, 0.0001]}
+  "collision": {"source": "visual_convex"},
+  "support_sites": [
+    {"link": "left_foot_link"},
+    {"link": "right_foot_link"}
+  ],
+  "floor": {}
 }
 ```
+
+默认策略也受工具源码哈希约束。交付只保留一份原始用户覆盖项 `simulation.json`；未提供配置文件时封存固定的空对象。独立验证器从这份配置及唯一默认策略重新解析，并在质量报告的 `facts.effective_simulation` 中展示实际使用的完整选项。该报告只是可重建的只读投影，不是第二份配置权威；派生地面高度另见场景检查结果。
 
 `base` 为 `fixed` 或 `floating`；浮动模式只给根刚体添加自由关节，保留根惯量；固定模式用于机械臂、台架或固定基座检查，两种模式共用同一转换入口。机器人零位与 URDF 根坐标一致，不因添加地面自动抬升或修改零姿态。
 
@@ -66,15 +81,15 @@ description mjcf check /path/to/new-mjcf
 
 `self_collision: false` 通过接触位掩码禁用机器人内部接触，仍允许地面接触；`true` 使用 MuJoCo 的标准自碰撞规则，包括其相邻刚体过滤。摩擦依次是滑动、扭转和滚动系数，必须非负，接触维数固定为 3。凸包不是原始凹表面的精确接触表示；使用者需独立验证其对目标任务的适用性。
 
-`sites` 为显式标记列表，每项为 `{"name":"left_sole","link":"left_foot_link","xyz":[0,0,0],"rpy":[0,0,0]}`。位置和姿态相对于指定 URDF link，米/弧度；名称必须唯一，link 必须存在。可表达倾斜足底坐标系，但不按左右脚名称猜测支撑面。site 只是坐标标记，不是传感器。
+`sites` 为显式标记列表，例如 `{"name":"tool","link":"tool_link"}`；只有需要偏离 link 坐标系时才提供 `xyz` 或 `rpy`。位置和姿态相对于指定 URDF link，米/弧度；名称必须唯一，link 必须存在。可表达倾斜足底坐标系，但不按左右脚名称猜测支撑面。site 只是坐标标记，不是传感器。
 
-为保留参考流水线的自动足底能力，可另外给出 `support_sites: [{"name":"left_sole","link":"left_foot_link"}]`；默认空列表。调用方显式指定 link，不依名称猜测。流水线在 URDF 零位从该 link 的接触几何推导标记：`collision.source=urdf` 使用原 collision，`visual_convex` 使用 visual；`none` 或所选 link 无可用三角网格时明确拒绝。自动支撑面目前只接受二进制 STL，其他几何可用显式 `sites`。
+为保留参考流水线的自动足底能力，可另外给出 `support_sites: [{"link":"left_foot_link"}]`；默认空列表，名称自动取 `left_foot_link__support`，需要对接指定名称时才提供 `name`。调用方显式指定 link，不依名称猜测。流水线在 URDF 零位从该 link 的接触几何推导标记：`collision.source=urdf` 使用原 collision，`visual_convex` 使用 visual；`none` 或所选 link 无可用三角网格时明确拒绝。自动支撑面目前只接受二进制 STL，其他几何可用显式 `sites`。
 
 在世界 Z 向上、地面水平的约定下，支撑面必须是来自原始三角形且位于所选 link 全部几何下方的平面。共面候选合并。每个候选平面的接触顶点取所选 link 全部 STL 几何中、距平面不超过支持容差的顶点，不限于提供候选的共面三角片；采用这些接触顶点凸包面积最大的唯一平面；面积并列但平面不同、退化或无解时失败，不取任意面。标记原点取该接触凸包的面积质心，Z 轴为向上法向，X 轴为世界 X 在平面的投影，最后表达回指定 link 坐标。该结果是绑定源几何的派生辅助坐标，不是传感器标定或工程批准。`support_sites` 与 `sites` 的名称不能冲突。判定与容差只有一个机器定义；独立验证从源几何重新验算，禁止导入生成侧支撑算法。
 
-`floor.height` 可为明确数值或 `"supports"`；后者要求非空 `support_sites`，取指定支撑 link 在零位的所选几何的最低世界 Z 值，与参考实现的贴地规则对应。不移动机器人、不改变关节零位。数值 `0` 只表示世界坐标 Z=0，不表示自动贴合足底。
+`floor.height` 可为明确数值或 `"supports"`；后者要求非空 `support_sites`，取指定支撑 link 在零位的所选几何的最低世界 Z 值，与参考实现的贴地规则对应。不移动机器人、不改变关节零位。数值 `0` 只表示世界坐标 Z=0，不表示自动贴合足底；请求地面且已有支撑 site 时无需手填高度。
 
-`floor` 可省略，省略时只交付机器人模型；提供时额外生成 `scene.xml`，包含机器人、指定高度的水平地面和一盏灯。地面高度或其源几何推导规则属于场景配置，不改动机器人。`sites`、`support_sites` 可省略，等价于空列表。除此之外，示例中所有字段均必填。没有驱动器、控制器、armature、训练奖励或传感器的隐式生成。
+`floor` 可省略，省略时只交付机器人模型；提供时额外生成 `scene.xml`，包含机器人、指定高度的水平地面和一盏灯。地面高度或其源几何推导规则属于场景配置，不改动机器人。`sites`、`support_sites` 可省略，等价于空列表。所有数值项和可选开关只在需要覆盖默认策略时填写。没有驱动器、控制器、armature、训练奖励或传感器的隐式生成。
 
 ## 支持边界
 
@@ -98,7 +113,7 @@ description mjcf check /path/to/new-mjcf
 
 ```text
 input/<原根内路径>          # 原始 URDF 及实际引用的网格字节，仅一份
-simulation.json            # 原始仿真配置字节
+simulation.json            # 唯一原始用户覆盖项；无配置文件时为空对象
 robot.xml                  # 可独立加载的机器人
 scene.xml                  # 仅在指定 floor 时生成
 manifest.json              # 输入身份、输出文件清单、工具与锁定引擎身份
@@ -144,4 +159,4 @@ reports/quality.json       # 独立重算的确定性报告
 
 以上模块范围为 `src/description_pipeline/mjcf*.py` 与 `src/description_pipeline/verification/mjcf.py`；检索结果应结合源码职责表检查，不能单凭无匹配证明独立性。
 
-新增复杂度只为无损物理投影、显式场景来源、可携带引用闭包和独立数值验收服务。封闭 XML 预检用于拒绝未授权动力学及包外资源；容差内双向顶点匹配处理 MuJoCo 的顶点焊接与排序变化；Linux `renameat2(RENAME_NOREPLACE)` 防止提交时覆盖并发出现的目标目录。它们均无额外服务或持久状态。任何额外框架必须先证明必要性。
+新增复杂度只为无损物理投影、显式场景来源、可携带引用闭包和独立数值验收服务。封闭 XML 预检用于拒绝未授权动力学及包外资源；容差内双向顶点匹配处理 MuJoCo 的顶点焊接与排序变化；Linux `renameat2(RENAME_NOREPLACE)` 防止提交时覆盖并发出现的目标目录。默认补全只处理仿真格式和策略，不引入新配置文件、机器人名称规则或持久状态。它们均无额外服务或持久状态。任何额外框架必须先证明必要性。
