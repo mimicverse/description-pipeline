@@ -174,6 +174,51 @@ generation_env_value() {
   printf '%s' "$value"
 }
 
+# The declared-value reader: one generation environment decoded as DATA through the renderer's
+# canonical decoder - never sourced, so no shell state, ambient or inherited, can leak into
+# the value.  The bootstrap window reads the RUNNING side with this reader: a pre-contract
+# generation holds its values in that writer's own format (bare single words), and the running
+# deployment's declared authority must be read, not rewritten or inherited.  A value that is
+# missing, empty or not exactly one shell word refuses; nothing is ever defaulted.
+generation_env_declared_value() {
+  local file="$1" key="$2" value
+  value="$(python3 - "$HERE/render_operator.py" "$file" "$key" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("operator_env_decoder", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+seen = False
+value = ""
+for number, line in enumerate(Path(sys.argv[2]).read_text(encoding="utf-8").splitlines(), 1):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    key, separator, raw = stripped.partition("=")
+    if not separator or key.strip() != sys.argv[3]:
+        continue
+    seen = True
+    try:
+        value = module.decode_env_value(raw.strip())
+    except ValueError as error:
+        raise SystemExit(f"{sys.argv[2]}:{number}: {error}")
+    break
+if not seen or value == "":
+    raise SystemExit(3)
+sys.stdout.write(value)
+PY
+  )" || {
+    code=$?
+    if [ "$code" = 3 ]; then
+      die "the generation environment $file does not declare $key"
+    fi
+    die "the generation environment $file has an unreadable $key declaration"
+  }
+  printf '%s' "$value"
+}
+
 # The gates read the platform authority from the managed database, so the start window must
 # begin by bringing that database up and confirming its socket.  The cluster identity never
 # runs here; this is the same managed unit the installation created.
@@ -511,14 +556,20 @@ case "$ACTION" in
       AIRFLOW_VENV="$(generation_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
       CANDIDATE_WHEEL_PATH="$(generation_env_value "$CANDIDATE_ENV" PIPELINE_WHEEL)"
       CANDIDATE_DIGEST="$(generation_env_value "$CANDIDATE_ENV" PLATFORM_CONFIG_DIGEST)"
+      # The running side of the authority check stays bound to the verified active record:
+      # ACTIVE_ID comes from `install_record.py verify-running` (the active record checked
+      # against its frozen snapshot), and its generation environment is the path read here.
+      # Its values are decoded as data (never sourced, so nothing can inherit into them); the
+      # pre-contract writer's bare single-word values are that generation's declared values and
+      # decode exactly, while a missing, empty or ambiguous declaration refuses.
       RUNNING_ENV="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
       [ -f "$RUNNING_ENV" ] || die "the running generation environment is missing: $RUNNING_ENV"
       CAND_SERVICE_DSN="$(generation_env_value "$CANDIDATE_ENV" PLATFORM_SERVICE_DSN)"
       CAND_OPERATOR_DSN="$(generation_env_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN)"
       CAND_RUNTIME_DSN="$(generation_env_value "$CANDIDATE_ENV" AIRFLOW_RUNTIME_DB_URL)"
-      RUN_SERVICE_DSN="$(generation_env_value "$RUNNING_ENV" PLATFORM_SERVICE_DSN)"
-      RUN_OPERATOR_DSN="$(generation_env_value "$RUNNING_ENV" PLATFORM_OPERATOR_DSN)"
-      RUN_RUNTIME_DSN="$(generation_env_value "$RUNNING_ENV" AIRFLOW_RUNTIME_DB_URL)"
+      RUN_SERVICE_DSN="$(generation_env_declared_value "$RUNNING_ENV" PLATFORM_SERVICE_DSN)"
+      RUN_OPERATOR_DSN="$(generation_env_declared_value "$RUNNING_ENV" PLATFORM_OPERATOR_DSN)"
+      RUN_RUNTIME_DSN="$(generation_env_declared_value "$RUNNING_ENV" AIRFLOW_RUNTIME_DB_URL)"
       [ -n "$CAND_SERVICE_DSN" ] && [ "$CAND_SERVICE_DSN" = "$RUN_SERVICE_DSN" ] \
         && [ "$CAND_OPERATOR_DSN" = "$RUN_OPERATOR_DSN" ] && [ "$CAND_RUNTIME_DSN" = "$RUN_RUNTIME_DSN" ] \
         || die "the staged generation names another database authority than the running generation; refused"

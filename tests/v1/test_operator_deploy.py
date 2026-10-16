@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -1915,6 +1916,122 @@ class InstallOrderingTests(unittest.TestCase):
                         f"{label}: the guarded migration never ran",
                     )
             candidate_env.write_text(original, encoding="utf-8")
+
+    def test_maintenance_reconcile_reads_a_legacy_running_environment(self) -> None:
+        """A pre-contract running generation (bare, unsourceable DSN lines) must not block the
+        route: the running side of the authority check comes from its canonical rendering."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            # Degrade the running generation's derived env to the pre-contract writer's shape:
+            # bare DSN values whose "&" no shell can source (the running deployment's canonical
+            # rendering, resolved.env, is untouched and stays the route's running authority).
+            running_env = state / "derived" / "gen-1" / "operator.env"
+            legacy_lines = []
+            for line in running_env.read_text(encoding="utf-8").splitlines():
+                key = line.split("=", 1)[0]
+                if "=" in line and key.endswith(("_DSN", "_DB_URL")):
+                    legacy_lines.append(f"{key}={decode_env_value(line.split('=', 1)[1].strip())}")
+                else:
+                    legacy_lines.append(line)
+            running_env.write_text("\n".join(legacy_lines) + "\n", encoding="utf-8")
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            snapshot = Path(receipt["to"])
+            snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+            refused = run(
+                [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                    "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                    "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                    "--evidence", "receipt.json",
+                ],
+                control_env,
+            )
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            # The route passed the environment reads (the legacy running side included) and
+            # reached the staged-identity guard - the same failure point as with a canonical
+            # running environment.
+            self.assertIn("snapshot", refused.stderr)
+            self.assertNotIn("does not declare", refused.stderr)
+
+    def test_maintenance_reconcile_refuses_a_corrupt_running_environment(self) -> None:
+        """The running side is decoded as data: missing, empty, malformed and foreign
+        declarations all refuse explicitly, with nothing inherited and no live DDL."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")  # the fixture's closed gate
+            running_env = state / "derived" / "gen-1" / "operator.env"
+            original = running_env.read_text(encoding="utf-8")
+            dsn_line = next(line for line in original.splitlines() if line.startswith("PLATFORM_SERVICE_DSN="))
+            foreign = decode_env_value(dsn_line.split("=", 1)[1].strip()).replace("airflow_meta", "another_meta")
+            cases = {
+                "missing_key": (
+                    "does not declare PLATFORM_SERVICE_DSN",
+                    "\n".join(
+                        line for line in original.splitlines() if not line.startswith("PLATFORM_SERVICE_DSN=")
+                    )
+                    + "\n",
+                ),
+                "empty_file": ("does not declare PLATFORM_SERVICE_DSN", ""),
+                "malformed": (
+                    "not one shell word",
+                    original.replace(dsn_line, "PLATFORM_SERVICE_DSN=one two"),
+                ),
+                "foreign_authority": (
+                    "another database authority",
+                    original.replace(dsn_line, f"PLATFORM_SERVICE_DSN={shlex.quote(foreign)}"),
+                ),
+            }
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            for label, (message, document) in cases.items():
+                with self.subTest(label):
+                    running_env.write_text(document, encoding="utf-8")
+                    receipt_before = receipt_path.read_bytes()
+                    before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+                    refused = run(
+                        [
+                            "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                            "--config", str(release.parent / "platform.json"), "--install-id", "gen-2",
+                            "--run-id", "portal-1", "--stage", "freeze", "--outcome", "failed",
+                            "--evidence", "receipt.json",
+                        ],
+                        control_env,
+                    )
+                    self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                    self.assertIn(message, refused.stderr)
+                    self.assertEqual(
+                        order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                        before,
+                        f"{label}: no live DDL may run for a corrupt running declaration",
+                    )
+                    self.assertEqual(
+                        receipt_path.read_bytes(), receipt_before, f"{label}: the receipt is untouched"
+                    )
+                    self.assertFalse(
+                        (state / "promotions" / "gen-2" / "reconcile-schema-migration.out").exists(),
+                        f"{label}: the guarded migration never ran",
+                    )
+            running_env.write_text(original, encoding="utf-8")
 
     def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
