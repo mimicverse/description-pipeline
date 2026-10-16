@@ -20,14 +20,17 @@ Nothing here publishes or deploys: the diagnostic preview never authorizes publi
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 import shutil
 from pathlib import Path
 
+from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
 from description_pipeline.io import write_json
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
+from tests.v1.test_platform_store import build_sealed_delivery
 
 from .portal_read_support import RegisteredPlatform
 
@@ -179,22 +182,28 @@ class DiagnosticPreviewTests(unittest.TestCase):
             app._artifact(environ, start_response, DAG_RUN_ID, "reports/stages.json")
 
     def test_a_linked_child_serves_its_diagnostic_with_the_parent_transfer(self) -> None:
-        """The child's reused verify registration serves the parent's sealed
-        transfer: the diagnostic comes from the registered source tree, never a
-        re-materialized copy or a second store."""
-        platform = self._registered_failed_verify()
+        """A reachable linked failure: the child really registers its reuse of the
+        parent's completed capture and really registers its own failed verify; the
+        diagnostic is then served from the child's registered tree with the
+        parent's sealed transfer behind it."""
+        platform = RegisteredPlatform(self.tmp / "linked-platform")
+        platform.admit(RUN)
+        platform.register_capture(RUN)
         child_dag = "portal-20261010T000001-abcdef02"
         child = native_run_id(child_dag)
-        platform.admit(child, from_stage="publish", parent_run_id=RUN)
-        parent_row = platform.store.stage_records(RUN)["verify"]
-        platform.stage(
-            child,
-            "verify",
-            state="failed",
+        platform.admit(child, from_stage="verify", parent_run_id=RUN)
+        parent_row = platform.store.stage_records(RUN)["capture"]
+        # The real reuse registration: the writer itself validates the completed
+        # source row and re-verifies its sealed receipt.
+        platform.store.confirm_stage(
+            run_id=child,
+            stage="capture",
+            state="completed",
             receipt=parent_row["receipt"],
             checkpoint_uri=parent_row["checkpoint_uri"],
             reused_from_run=RUN,
         )
+        self._register_child_failed_verify(platform, child)
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
                 airflow=_PermissiveAirflow(),
@@ -216,9 +225,58 @@ class DiagnosticPreviewTests(unittest.TestCase):
         def start_response(status, headers):
             captured["status"] = status
 
+        child_urdf = (platform.sealed(f"store://sealed/{child}/verify") / "urdf/robot.urdf").read_bytes()
         body = b"".join(app._artifact(environ, start_response, child_dag, "urdf/robot.urdf"))
         self.assertEqual(captured["status"], "200 OK")
-        self.assertEqual(body, URDF)
+        self.assertEqual(body, child_urdf)
+
+    def _register_child_failed_verify(self, platform: RegisteredPlatform, child: str) -> None:
+        """The child's own executed-and-failed verify stage, registered through the writer."""
+        tree = platform.sealed(f"store://sealed/{child}/verify")
+        tree.mkdir(parents=True)
+        build_sealed_delivery(tree)
+        manifest = read_delivery_manifest(tree)
+        write_json(
+            tree / "reports/quality.json",
+            {
+                "passed": False,
+                "subject_sha256": hashlib.sha256(URDF).hexdigest(),
+                "checks": FAILING_CHECKS,
+            },
+        )
+        handoff = json.loads((tree / "input/handoff.json").read_text(encoding="utf-8"))
+        handoff["warnings"] = INPUT_WARNINGS["warnings"]
+        write_json(tree / "input/handoff.json", handoff)
+        discovery = json.loads((tree / "evidence/discovery.json").read_text(encoding="utf-8"))
+        discovery["findings"] = DISCOVERY_FINDINGS["findings"]
+        write_json(tree / "evidence/discovery.json", discovery)
+        write_delivery_manifest(tree, contract=manifest["contract"], policy=manifest["policy"])
+        manifest = read_delivery_manifest(tree)
+        report = (tree / "reports/quality.json").read_bytes()
+        artifacts = [dict(record) for record in manifest["subject"]["files"]] + [
+            {
+                "path": "reports/quality.json",
+                "bytes": len(report),
+                "sha256": hashlib.sha256(report).hexdigest(),
+            }
+        ]
+        platform.store.confirm_stage(
+            run_id=child,
+            stage="verify",
+            state="failed",
+            receipt={
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": child,
+                "stage": "verify",
+                "state": "failed",
+                "passed": False,
+                "error": "URDF verification failed; see reports/quality.json",
+                "subject_sha256": manifest["subject"]["digest"],
+                "artifacts": artifacts,
+            },
+            checkpoint_uri=f"store://sealed/{child}/verify",
+        )
 
     def test_failing_checks_accept_the_state_failed_convention(self) -> None:
         from description_pipeline.orchestration.portal import _failing_checks
