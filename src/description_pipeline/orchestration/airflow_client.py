@@ -567,9 +567,16 @@ def _linux_targets(values) -> dict[str, dict]:
 def _discovery_path(value, label: str) -> Path:
     if not isinstance(value, (str, Path)) or not str(value):
         raise EndpointProtocolError(f"discovery {label} must be an absolute path")
-    candidate = Path(str(value))
+    text = str(value)
+    candidate = Path(text)
     if not candidate.is_absolute():
         raise EndpointProtocolError(f"discovery {label} must be an absolute path")
+    # The same dedicated-directory rule the handoff roots carry, judged on the RAW spelling:
+    # ``Path`` collapses ``//`` before any parts check, so the segment check must see the
+    # original text.  A filesystem root, a ``..`` segment or an empty segment (``a//b``,
+    # ``/a/``) refuses; the text is never silently rewritten (no ``resolve()``).
+    if any(segment in {"..", ""} for segment in text[1:].split("/")):
+        raise EndpointProtocolError(f"discovery {label} must be a dedicated absolute path: {value}")
     if candidate.is_symlink() or candidate.is_junction():
         raise EndpointProtocolError(f"discovery {label} must not be a link")
     return candidate

@@ -240,6 +240,25 @@ def platform_fixture(
         key, _, value = line.partition("=")
         if key:
             env[key] = value
+    # One managed proxy binary for the whole fixture: the lifecycle resolves NGINX_BIN from
+    # resolved.env, so the render pins the same stubbed executable the control verbs see.
+    (tmp / "bin").mkdir(exist_ok=True)
+    fixture_nginx = tmp / "bin" / "nginx"
+    write_stub(fixture_nginx, "#!/bin/bash\nexit 0\n")
+    env["NGINX_BIN"] = str(fixture_nginx)
+    repinned = run(
+        [
+            sys.executable,
+            str(OPERATOR / "render_operator.py"),
+            "--env-file",
+            env_path,
+            "--nginx-bin",
+            str(fixture_nginx),
+        ],
+        {},
+    )
+    if repinned.returncode != 0:
+        raise AssertionError(repinned.stderr)
     venv_bin = Path(env["AIRFLOW_VENV"]) / "bin"
     venv_bin.mkdir(parents=True, exist_ok=True)
     write_stub(venv_bin / "python", '#!/bin/bash\nexec python3 "$@"\n')
@@ -292,6 +311,23 @@ def platform_fixture(
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tree_state(root: Path) -> dict:
+    """Every path under ``root`` with its mtime, size and content digest (read-only snapshot)."""
+
+    state = {}
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        if path.is_file():
+            state[str(path.relative_to(root))] = (
+                metadata.st_mtime_ns,
+                metadata.st_size,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        else:
+            state[str(path.relative_to(root))] = ("dir", metadata.st_mtime_ns)
+    return state
 
 
 def write_stub(path: Path, body: str) -> None:
@@ -636,7 +672,16 @@ class LifecycleTests(unittest.TestCase):
         target = config_home / "systemd" / "user"
         target.mkdir(parents=True)
         rendered = run(
-            [sys.executable, str(RENDER), "--env-file", str(env_path), "--units-dir", str(target)],
+            [
+                sys.executable,
+                str(RENDER),
+                "--env-file",
+                str(env_path),
+                "--nginx-bin",
+                env["NGINX_BIN"],
+                "--units-dir",
+                str(target),
+            ],
             {"XDG_CONFIG_HOME": str(config_home)},
         )
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
@@ -657,7 +702,7 @@ class LifecycleTests(unittest.TestCase):
             if key:
                 derived_env[key] = decode_env_value(value.strip())
         bindir = tmp / "bin"
-        bindir.mkdir()
+        bindir.mkdir(exist_ok=True)
         pgbin = state / "airflow-pg" / "root" / "usr" / "lib" / "postgresql" / "14" / "bin"
         pgbin.mkdir(parents=True, exist_ok=True)
         write_stub(pgbin / "pg_isready", '#!/bin/bash\necho "pg_isready" >> "$ORDER_LOG"\nexit 0\n')
@@ -924,6 +969,81 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("description-portal.service", order.read_text())
             self.assertNotIn("description-operator-proxy.service", order.read_text())
 
+    def test_start_keep_admission_closed_starts_the_services_without_opening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            result = run(
+                ["bash", str(CONTROL), "start", "--config", str(config_path), "--keep-admission-closed"], env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("services are running; the platform admission stays closed", result.stdout)
+            self.assertEqual(admission.read_text().strip(), "true")
+            lines = order.read_text().splitlines()
+            self.assertIn("platform close_admission", lines)
+            self.assertNotIn("platform open_admission", lines)
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", lines)
+            self.assertIn("systemctl --user enable --now description-airflow-api-server", lines)
+            self.assertIn(
+                "systemctl --user enable --now description-portal.service description-operator-proxy.service",
+                lines,
+            )
+        # Default behavior is unchanged: without the switch the verified start opens the gate.
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            default = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
+            self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+            self.assertEqual(admission.read_text().strip(), "false")
+            default_calls = order.read_text()
+            self.assertIn("platform open_admission", default_calls)
+            self.assertIn("airflow dags unpause solidworks_to_urdf", default_calls)
+
+    def test_start_keep_admission_closed_failure_stays_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            admission.write_text("false")  # a leftover open gate from an interrupted window
+            env["START_INGRESS_RC"] = "7"
+            result = run(
+                ["bash", str(CONTROL), "start", "--config", str(config_path), "--keep-admission-closed"], env
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("platform admission stays closed", result.stderr)
+            self.assertEqual(admission.read_text().strip(), "true")
+            lines = order.read_text().splitlines()
+            self.assertIn("platform close_admission", lines)
+            self.assertNotIn("platform open_admission", lines)
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", lines)
+
+    def test_keep_admission_closed_flag_is_refused_by_other_verbs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            untouched = admission.read_text(encoding="utf-8")
+            before = order.read_text(encoding="utf-8") if order.exists() else None
+            for action in (
+                "validate",
+                "install",
+                "drain",
+                "stop",
+                "status",
+                "health",
+                "reconcile",
+                "stage",
+                "promote",
+                "rollback",
+            ):
+                with self.subTest(action=action):
+                    result = run(
+                        ["bash", str(CONTROL), action, "--config", str(config_path), "--keep-admission-closed"],
+                        env,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--keep-admission-closed is only accepted by start", result.stderr)
+                    self.assertEqual(admission.read_text(encoding="utf-8"), untouched)
+                    after = order.read_text(encoding="utf-8") if order.exists() else None
+                    self.assertEqual(before, after, f"{action} performed a side effect before the refusal")
+        usage = run(["bash", str(CONTROL)], {})
+        self.assertEqual(usage.returncode, 2)
+        self.assertIn("--keep-admission-closed", usage.stderr)
+
     def _project(self, env: dict, data: dict, rc: int) -> None:
         Path(env["PROJECTION_FILE"]).write_text(json.dumps(data), encoding="utf-8")
         env["PROJECTION_RC"] = str(rc)
@@ -1132,6 +1252,29 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("DRIFT", result.stdout)
             self.assertEqual(before, {path: digest(path) for path in before})
 
+    def test_status_reports_a_proxy_unit_that_executes_another_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, state, config_home, target = self._render_units(Path(tmp))
+            bound = ""
+            for line in (state / "resolved.env").read_text(encoding="utf-8").splitlines():
+                key, _, raw = line.partition("=")
+                if key == "NGINX_BIN" and raw:
+                    bound = decode_env_value(raw)
+            self.assertTrue(bound, "the fixture must bind an NGINX_BIN")
+            other = Path(tmp) / "other-nginx"
+            write_stub(other, "#!/bin/bash\nexit 0\n")
+            proxy = target / "description-operator-proxy.service"
+            proxy.write_text(proxy.read_text(encoding="utf-8").replace(bound, str(other)), encoding="utf-8")
+            result = run(
+                ["bash", str(CONTROL), "status", "--config", str(config_path)],
+                {"XDG_CONFIG_HOME": str(config_home)},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                "DRIFT the installed proxy unit does not execute the bound nginx binary", result.stdout
+            )
+            self.assertTrue(Path(bound).exists(), "the bound binary must not be touched")
+
     def test_operational_entry_requires_the_complete_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, state, config_home, target = self._render_units(Path(tmp))
@@ -1309,6 +1452,8 @@ class LifecycleTests(unittest.TestCase):
             HEALTH,
             OPERATOR / "scripts" / "install_toolchain.sh",
             OPERATOR / "scripts" / "install_proxy.sh",
+            OPERATOR / "scripts" / "ensure_proxy_binary.sh",
+            OPERATOR / "scripts" / "check_proxy_binary.sh",
         ):
             result = run(["bash", "-n", str(script)], {})
             self.assertEqual(result.returncode, 0, f"{script}: {result.stderr}")
@@ -1334,6 +1479,7 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "airflow" / "scripts").mkdir(parents=True)
         (release / "airflow" / "dags").mkdir()
         (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
+        (release / "operator" / "health.sh").write_bytes(HEALTH.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
         for module in ("platform_config.py", "platform_env.py", "install_record.py", "promotion.py", "backup.py"):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
@@ -1350,7 +1496,21 @@ class InstallOrderingTests(unittest.TestCase):
             release / "operator" / "scripts" / "install_toolchain.sh",
             '#!/usr/bin/env bash\necho "AIRFLOW_PYTHON=/usr/bin/python3"\n',
         )
-        write_stub(release / "operator" / "scripts" / "install_proxy.sh", "#!/usr/bin/env bash\nexit 0\n")
+        write_stub(
+            release / "operator" / "scripts" / "install_proxy.sh",
+            "#!/usr/bin/env bash\n"
+            'BIN="$OPERATOR_STATE/toolchain/nginx/root/usr/sbin/nginx"\n'
+            'mkdir -p "$(dirname "$BIN")"\n'
+            'printf "#!/usr/bin/env bash\\nexit 0\\n" > "$BIN"\n'
+            'chmod +x "$BIN"\n'
+            'echo "$BIN"\n',
+        )
+        (release / "operator" / "scripts" / "ensure_proxy_binary.sh").write_bytes(
+            (OPERATOR / "scripts" / "ensure_proxy_binary.sh").read_bytes()
+        )
+        (release / "operator" / "scripts" / "check_proxy_binary.sh").write_bytes(
+            (OPERATOR / "scripts" / "check_proxy_binary.sh").read_bytes()
+        )
         write_stub(
             release / "airflow" / "services.sh",
             '#!/usr/bin/env bash\necho "services_$1" >> "$ORDER_LOG"\n'
@@ -1715,6 +1875,69 @@ class InstallOrderingTests(unittest.TestCase):
                 lines.index("systemctl --user start description-postgres.service"), lines.index("pg_isready 1")
             )
             self.assertLess(lines.index("psql_db_query"), lines.index("airflow_install"))
+
+    def test_status_and_health_diagnose_a_missing_binary_without_reinstalling_it(self) -> None:
+        """The read verbs only report drift: no installer run, no repair, no write at all."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = Path(tmp)
+            work = outer / "work"
+            work.mkdir()
+            scratch = outer / "scratch"
+            (scratch / "tmp").mkdir(parents=True)
+            release, control_env, _ = self._prepare(work, fresh=False, ready_after=1, db_exists=True)
+            # Probe instrumentation stays outside the snapshotted deployment tree.
+            order = scratch / "order.log"
+            control_env["ORDER_LOG"] = str(order)
+            control_env["TMPDIR"] = str(scratch / "tmp")
+            control_env["NGINX_BIN"] = str(work / "absent-system-nginx")
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            values = {}
+            for line in (work / "state" / "resolved.env").read_text(encoding="utf-8").splitlines():
+                key, _, raw = line.partition("=")
+                if key and raw:
+                    values[key] = decode_env_value(raw)
+            binary = Path(values["NGINX_BIN"])
+            self.assertTrue(binary.is_relative_to(work), binary)
+            self.assertTrue(binary.is_file(), binary)
+            # Tripwires in the preparation chain: any call would land in the order log.
+            for name, marker in (
+                ("install_proxy.sh", "proxy-installer-invoked"),
+                ("ensure_proxy_binary.sh", "proxy-prepare-invoked"),
+            ):
+                script = release / "operator" / "scripts" / name
+                script.write_text(
+                    script.read_text(encoding="utf-8").replace("\n", f'\necho {marker} >> "$ORDER_LOG"\n', 1),
+                    encoding="utf-8",
+                )
+            binary.rename(work / "saved-nginx")
+            operatorctl = ["bash", str(release / "operator" / "operatorctl.sh")]
+            config = str(release.parent / "platform.json")
+            for verb, expect_failure in (("status", False), ("health", True)):
+                with self.subTest(verb=verb):
+                    order.write_text("", encoding="utf-8")
+                    before = tree_state(work)
+                    result = run([*operatorctl, verb, "--config", config], control_env)
+                    if expect_failure:
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("managed nginx binary missing or not executable", result.stdout)
+                    if verb == "health":
+                        # The real health battery (not a stub) fails on the bound, missing binary.
+                        self.assertIn(
+                            f"FAIL     managed nginx binary missing or not executable: {binary}",
+                            result.stdout,
+                        )
+                    self.assertEqual(before, tree_state(work), f"{verb} wrote into the deployment tree")
+                    self.assertEqual(
+                        list((scratch / "tmp").iterdir()), [], f"{verb} left temporary files behind"
+                    )
+                    calls = order.read_text(encoding="utf-8")
+                    self.assertNotIn("proxy-installer-invoked", calls, f"{verb} ran the installer")
+                    self.assertNotIn("proxy-prepare-invoked", calls, f"{verb} ran the preparation")
+                    self.assertFalse(binary.exists(), f"{verb} recreated the removed binary")
 
     def test_stage_builds_both_candidate_generations_without_switching(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

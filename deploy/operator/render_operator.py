@@ -284,6 +284,10 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--state", help="override OPERATOR_STATE")
     parser.add_argument("--check-paths", action="store_true", help="require runtime paths to exist")
+    parser.add_argument(
+        "--nginx-bin",
+        help="the managed proxy binary path decided by the installer; overrides NGINX_BIN in the env file",
+    )
     parser.add_argument("--units-dir", type=Path, help="also render the two operator unit files here")
     parser.add_argument(
         "--dry-run",
@@ -438,7 +442,7 @@ def main() -> int:
             path = private_dir(registry, "frozen-name registry")
             if any(parent.is_symlink() for parent in path.parents):
                 die("Frozen-name registry cannot traverse a symlink")
-    nginx_bin = values.get("NGINX_BIN", "/usr/sbin/nginx")
+    nginx_bin = args.nginx_bin or values.get("NGINX_BIN", "/usr/sbin/nginx")
     if args.check_paths:
         for path, where in ((Path(values["PIPELINE_WHEEL"]), "PIPELINE_WHEEL"), (Path(nginx_bin), "NGINX_BIN")):
             if not path.is_file():
