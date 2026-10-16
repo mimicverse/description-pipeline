@@ -2475,6 +2475,8 @@ def _declared_preview_range(
     zero = _preview_number(value.get("zero")) if numbers else math.nan
     direction = value.get("direction") if numbers else None
     sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
+    first = sign * (lower - zero)
+    second = sign * (upper - zero)
     configuration = str((payload.get("raw") or {}).get("saved_configuration") or "")
     valid = (
         isinstance(value, dict)
@@ -2490,6 +2492,11 @@ def _declared_preview_range(
         and math.isfinite(upper)
         and math.isfinite(zero)
         and lower < upper
+        # The canonical endpoints the mapping actually produces must stay finite
+        # and strictly ordered: an overflowing or collapsing transform is refused.
+        and math.isfinite(first)
+        and math.isfinite(second)
+        and first != second
     )
     _require(
         valid,
@@ -2503,7 +2510,6 @@ def _declared_preview_range(
         "sha256": entry["entry"].get("sha256"),
         "anchor": entry["entry"].get("anchor"),
     }
-    first, second = sign * (lower - zero), sign * (upper - zero)
     return {"lower": min(first, second), "upper": max(first, second)}, evidence
 
 

@@ -1711,6 +1711,7 @@ def _declared_preview_range(
     zero = _preview_number(value["zero"])
     direction = value["direction"]
     sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
+    first, second = sign * (lower - zero), sign * (upper - zero)
     configuration = str(record.get("saved_configuration") or "")
     if (
         value["schema_version"] != PREVIEW_RANGE_SCHEMA
@@ -1722,6 +1723,9 @@ def _declared_preview_range(
         or value["purpose"] != PURPOSE_INSPECTION_PREVIEW
         or not (math.isfinite(lower) and math.isfinite(upper) and math.isfinite(zero))
         or not lower < upper
+        # The canonical endpoints the mapping actually produces must stay finite
+        # and strictly ordered: an overflowing or collapsing transform is refused.
+        or not (math.isfinite(first) and math.isfinite(second) and first != second)
     ):
         findings.append(
             _finding(
@@ -1733,7 +1737,6 @@ def _declared_preview_range(
             )
         )
         return None, None
-    first, second = sign * (lower - zero), sign * (upper - zero)
     return {"lower": min(first, second), "upper": max(first, second)}, resolved
 
 

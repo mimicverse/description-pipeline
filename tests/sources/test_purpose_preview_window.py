@@ -140,6 +140,8 @@ class DeclaredPreviewRangeTests(unittest.TestCase):
             {"zero": True},
             {"lower": False},
             {"direction": True},
+            {"lower": 1e308, "upper": 1.1e308, "zero": -1e308},
+            {"lower": 0.0, "upper": 1.0, "zero": 1e308},
             {"extra": 1},
         )
         for overrides in cases:
@@ -231,8 +233,8 @@ class DeclaredPrismaticFullFlowTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="prismatic-flow-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def _run(self, purpose: str, declaration: dict | None = None):
-        suffix = f"{purpose}-{'default' if declaration is None else 'mutated'}"
+    def _run(self, purpose: str, declaration: dict | None = None, tag: str | None = None):
+        suffix = f"{purpose}-{tag or ('default' if declaration is None else 'mutated')}"
         frozen = self.tmp / f"native-{suffix}"
         for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
             path = frozen / name
@@ -285,10 +287,25 @@ class DeclaredPrismaticFullFlowTests(unittest.TestCase):
         self.assertIn("discovery.joint_limits_missing", blocking)
 
     def test_boolean_zero_in_the_bound_declaration_is_refused(self) -> None:
-        prepared, _output = self._run(PURPOSE_INSPECTION_PREVIEW, {"zero": True})
+        prepared, _output = self._run(PURPOSE_INSPECTION_PREVIEW, {"zero": True}, tag="boolean-zero")
         self.assertFalse(prepared.passed)
         blocking = {finding["code"] for finding in prepared.findings if finding.get("blocking")}
         self.assertIn("discovery.joint_preview_range_invalid", blocking)
+
+    def test_transformed_endpoints_must_stay_finite_and_strictly_ordered(self) -> None:
+        for tag, overrides in (
+            ("overflow", {"lower": 1e308, "upper": 1.1e308, "zero": -1e308}),
+            ("collapse", {"lower": 0.0, "upper": 1.0, "zero": 1e308}),
+        ):
+            with self.subTest(tag=tag):
+                prepared, output = self._run(PURPOSE_INSPECTION_PREVIEW, overrides, tag=tag)
+                self.assertFalse(prepared.passed)
+                blocking = {finding["code"] for finding in prepared.findings if finding.get("blocking")}
+                self.assertIn("discovery.joint_preview_range_invalid", blocking)
+                if (output / "discovery/native-discovery.json").is_file():
+                    payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+                    with self.assertRaises(_Failure):
+                        rebuild_joint_facts(payload, output, purpose=PURPOSE_INSPECTION_PREVIEW)
 
 
 if __name__ == "__main__":
