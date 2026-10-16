@@ -96,7 +96,6 @@ def capture_root(base: Path, *, run_id: str = RUN_ID, handoff: str = HANDOFF, ma
     (evidence / "source").mkdir(parents=True)
     (evidence / "source/base.SLDPRT").write_bytes(b"PART-BYTES")
     write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
-    write_json(evidence / "raw/source_config.json", {})
     (evidence / "evidence").mkdir()
     identity = {
         "provider": "solidworks",

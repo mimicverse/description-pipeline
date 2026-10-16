@@ -299,7 +299,12 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
                 }
                 for name in (DEV, PCB, CHASSIS)
             ],
-            "coordinate_systems": {"base_datum": np.eye(4).ravel().tolist()},
+            "coordinate_systems": {
+                "base_datum": np.eye(4).ravel().tolist(),
+                # The carrier naming convention: CS_<link> owns the body frame the
+                # sealed derivation rebuilds from this same capture.
+                "CS_base_link": np.eye(4).ravel().tolist(),
+            },
             "mass_properties": copy.deepcopy(self.masses),
             "notes": {
                 "bodies:" + DEV: {"solid": 12, "sheet": 0},
@@ -477,29 +482,123 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             encoding="utf-8",
         )
         support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
+        # Seal the carrier inputs through the canonical producer: a fixture backend emits the
+        # native observation record for this nested scene and the real
+        # ``prepare_native_package`` derives the sealed payload consumers rebuild from
+        # (fixture inputs only; no consumer output is injected).
+        from description_pipeline.io import file_digest as _file_digest
+        from description_pipeline.io import read_data as _read_data
+        from description_pipeline.io import write_json as _write_json
+        from description_pipeline.sources.solidworks.discovery import prepare_native_package
+        from tests.sources.selection_support import sealed_selection
+
+        producer = self.bundle / "producer"
+        frozen = self.bundle / "input" / "cad"
+        documents = {
+            "top": "3.0 总装1008.SLDASM",
+            PARENT: "board.SLDASM",
+            DEV: "Dev_Board-1.SLDPRT",
+            PCB: "EasyEDA_PCB_Model.SLDPRT",
+            CHASSIS: "chassis.SLDPRT",
+        }
+        files: dict[str, str] = {}
+        for name, document in documents.items():
+            relative = document if name == "top" else "cad/" + document
+            target = frozen / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(("control fixture " + name).encode("utf-8"))
+            files[relative] = _file_digest(target)
+        source_selection = sealed_selection(
+            files,
+            "3.0 总装1008.SLDASM",
+            edges={
+                "3.0 总装1008.SLDASM": ["cad/board.SLDASM"],
+                "cad/board.SLDASM": ["cad/Dev_Board-1.SLDPRT", "cad/EasyEDA_PCB_Model.SLDPRT"],
+                "cad/Dev_Board-1.SLDPRT": [],
+                "cad/EasyEDA_PCB_Model.SLDPRT": [],
+                "cad/chassis.SLDPRT": [],
+            },
+        )
+
+        def component(name, document, transform, fixed=False):
+            return {
+                "name2": name,
+                "lightweight": False,
+                "suppression_state": 2,
+                "instance_id": name,
+                "document": document,
+                "configuration": "Default",
+                "fixed": fixed,
+                "suppressed": False,
+                "transform": [float(value) for value in transform],
+            }
+
+        identity4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+        native = {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "contract": "native-discovery/v1",
+            "namespace": "dp",
+            "identity": {
+                "hardware_id": None,
+                "revision": None,
+                "owner": None,
+                "change_summary": None,
+                "control": None,
+                "robot_name": "robot",
+                "main_assembly": "3.0 总装1008.SLDASM",
+                "delivery_configuration": "Default",
+            },
+            "saved_configuration": "Default",
+            "components": [
+                component(PARENT, "cad/board.SLDASM", identity4, fixed=True),
+                component(DEV, "cad/Dev_Board-1.SLDPRT", self.transforms[DEV]),
+                component(PCB, "cad/EasyEDA_PCB_Model.SLDPRT", self.transforms[PCB]),
+                component(CHASSIS, "cad/chassis.SLDPRT", self.transforms[CHASSIS], fixed=True),
+            ],
+            "mates": [
+                {
+                    "name": "board_dev_lock", "type": "lock", "suppressed": False, "error_code": 0,
+                    "scope": "", "limits": None,
+                    "entities": [{"component": PARENT}, {"component": DEV}],
+                },
+                {
+                    "name": "board_pcb_lock", "type": "lock", "suppressed": False, "error_code": 0,
+                    "scope": "", "limits": None,
+                    "entities": [{"component": PARENT}, {"component": PCB}],
+                },
+                {
+                    "name": "board_chassis_lock", "type": "lock", "suppressed": False, "error_code": 0,
+                    "scope": "", "limits": None,
+                    "entities": [{"component": PARENT}, {"component": CHASSIS}],
+                },
+            ],
+            "datums": [{"name": "CS_base_link", "owner": CHASSIS, "array": [float(value) for value in identity4]}],
+            "masses": [
+                {"component": PARENT, "mass_kg": float(self.parent_reading["mass"]), "material": "Alloy Steel"},
+                {"component": DEV, "mass_kg": float(self.dev_payload["mass"]), "material": "Alloy Steel"},
+                {"component": PCB, "mass_kg": float(self.pcb_payload["mass"]), "material": "Alloy Steel"},
+                {"component": CHASSIS, "mass_kg": float(self.chassis_payload["mass"]), "material": "Alloy Steel"},
+            ],
+            "assembly_mass_kg": float(self.parent_reading["mass"]) + float(self.chassis_payload["mass"]),
+            "assembly_extent_m": 1.0,
+            "properties": {"document": {}, "components": {}, "mates": {}},
+            "files": files,
+            "source_selection": source_selection,
+        }
+
+        class _NestedBackend:
+            def discover_native(self, frozen_source, settings, *, on_activity=None):
+                return copy.deepcopy(native)
+
+        prepared = prepare_native_package(
+            frozen, producer / "prepared", "fixture-run", backend=_NestedBackend(), configuration="Default"
+        )
+        _write_json(self.bundle / "evidence" / "discovery.json", _read_data(prepared.discovery_path))
         write_manifest(
             self.evidence,
             kind="solidworks",
             identity={"assembly": ORIGINAL, "configuration": "Default", "provider": "solidworks"},
             evidence_class="cad",
-        )
-        # Seal the carrier inputs the closure rebuild consumes: the raw native record, the
-        # full upload index and the CAD bytes (fixture plumbing only - no consumer output).
-        from tests.sources.support import compose_delivery_inputs
-
-        cad_sources: dict[str, Path] = {}
-        for row in self.raw_scene["components"]:
-            relative = str(row["path"]).replace("\\", "/").rsplit("/", 1)[-1]
-            source = self.bundle / "fixture-cad" / relative
-            source.parent.mkdir(parents=True, exist_ok=True)
-            source.write_bytes(("control fixture " + str(row["name"])).encode("utf-8"))
-            cad_sources[relative] = source
-        compose_delivery_inputs(
-            self.bundle,
-            main_assembly=str(COLLECTED).replace("\\", "/").rsplit("/", 1)[-1],
-            configuration="Default",
-            record=self.raw_scene,
-            cad_files=cad_sources,
         )
         report = closure_module.derive_mass_closure(self.evidence)
         _publish(self.bundle, self.evidence)
@@ -758,7 +857,8 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
                     )()
                 ],
                 "coordinate_systems": {
-                    "base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                    "base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                    "CS_base_link": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
                 },
                 "mass_properties": {self.PART: copy.deepcopy(self.part_row)},
                 "notes": {},
@@ -779,7 +879,8 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
                 }
             ],
             "coordinate_systems": {
-                "base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                "base_datum": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                "CS_base_link": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             },
             "mass_properties": {self.PART: copy.deepcopy(self.part_row)},
             "notes": {
@@ -821,6 +922,82 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             encoding="utf-8",
         )
         support.write_link_group_mass_record_from_recombination(self.bundle, self.source)
+        # Seal the carrier inputs through the canonical producer (fixture backend emits the
+        # native observation; inputs only - no consumer output is injected).
+        from description_pipeline.io import file_digest as _file_digest
+        from description_pipeline.io import read_data as _read_data
+        from description_pipeline.io import write_json as _write_json
+        from description_pipeline.sources.solidworks.discovery import prepare_native_package
+        from tests.sources.selection_support import sealed_selection
+
+        producer = self.bundle / "producer"
+        frozen = self.bundle / "input" / "cad"
+        documents = {"top": "3.0 总装1008.SLDASM", self.PART: "np-f550.step.SLDPRT"}
+        files: dict[str, str] = {}
+        for name, document in documents.items():
+            relative = document if name == "top" else "cad/" + document
+            target = frozen / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(("control fixture " + name).encode("utf-8"))
+            files[relative] = _file_digest(target)
+        source_selection = sealed_selection(
+            files,
+            "3.0 总装1008.SLDASM",
+            edges={"3.0 总装1008.SLDASM": ["cad/np-f550.step.SLDPRT"], "cad/np-f550.step.SLDPRT": []},
+        )
+        identity4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+        native = {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "contract": "native-discovery/v1",
+            "namespace": "dp",
+            "identity": {
+                "hardware_id": None,
+                "revision": None,
+                "owner": None,
+                "change_summary": None,
+                "control": None,
+                "robot_name": "robot",
+                "main_assembly": "3.0 总装1008.SLDASM",
+                "delivery_configuration": "Default",
+            },
+            "saved_configuration": "Default",
+            "components": [
+                {
+                    "name2": self.PART,
+                    "lightweight": False,
+                    "suppression_state": 2,
+                    "instance_id": self.PART,
+                    "document": "cad/np-f550.step.SLDPRT",
+                    "configuration": "Default",
+                    "fixed": False,
+                    "suppressed": False,
+                    "transform": [float(value) for value in identity4],
+                }
+            ],
+            "mates": [],
+            "datums": [{"name": "CS_base_link", "owner": self.PART, "array": [float(value) for value in identity4]}],
+            "masses": [
+                {
+                    "component": self.PART,
+                    "mass_kg": float(self.singleton["mass"]),
+                    "material": "Alloy Steel",
+                }
+            ],
+            "assembly_mass_kg": float(self.singleton["mass"]),
+            "assembly_extent_m": 1.0,
+            "properties": {"document": {}, "components": {}, "mates": {}},
+            "files": files,
+            "source_selection": source_selection,
+        }
+
+        class _PartBackend:
+            def discover_native(self, frozen_source, settings, *, on_activity=None):
+                return copy.deepcopy(native)
+
+        prepared = prepare_native_package(
+            frozen, producer / "prepared", "fixture-run", backend=_PartBackend(), configuration="Default"
+        )
+        _write_json(self.bundle / "evidence" / "discovery.json", _read_data(prepared.discovery_path))
         write_manifest(
             self.evidence,
             kind="solidworks",
