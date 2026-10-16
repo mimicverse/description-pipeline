@@ -58,6 +58,22 @@ except Exception:  # pragma: no cover - exercised only without Airflow installed
     AIRFLOW_AVAILABLE = False
 
 
+class _OperationRecorder:
+    """Minimal operation-family double for task-level tests (no SQL involved)."""
+
+    def __init__(self) -> None:
+        self.registered: list[dict] = []
+        self.claimed: list[dict] = []
+
+    def register_operation(self, **kwargs):
+        self.registered.append(dict(kwargs))
+        return SimpleNamespace(state="queued")
+
+    def claim_operation(self, **kwargs):
+        self.claimed.append(dict(kwargs))
+        return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
+
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
 class DagTests(unittest.TestCase):
     def test_submission_frame_requires_a_configured_target_and_summary(self) -> None:
@@ -305,7 +321,11 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "assembly.SLDASM",
                 "conn_id": "solidworks_windows",
             }
-            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
+            operations = _OperationRecorder()
+            with (
+                patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
+                patch.object(module, "_platform_binding", return_value=(operations, None)),
+            ):
                 started = dag.task_dict["discover"].python_callable(request)
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
                 polled = False
@@ -332,6 +352,21 @@ class DagTests(unittest.TestCase):
             self.assertEqual(job["hardware_id"], "m3.0")
             self.assertEqual(job["repository_slug"], "example/m3.0")
             self.assertEqual(job["repository_base"], "feature/m3.0")
+            self.assertEqual([call["kind"] for call in operations.registered], ["native"])
+            self.assertEqual(
+                [call["operation_key"] for call in operations.registered], [f"{request['run_id']}/native:0"]
+            )
+            self.assertRegex(operations.registered[0]["params_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                operations.claimed,
+                [
+                    {
+                        "run_id": request["run_id"],
+                        "stage": "discover",
+                        "operation_key": f"{request['run_id']}/native:0",
+                    }
+                ],
+            )
 
     def test_linked_conf_binding_is_validated(self) -> None:
         from types import SimpleNamespace
@@ -393,7 +428,11 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装1008.SLDASM",
                 "conn_id": "solidworks_windows",
             }
-            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
+            operations = _OperationRecorder()
+            with (
+                patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
+                patch.object(module, "_platform_binding", return_value=(operations, None)),
+            ):
                 started = dag.task_dict["discover"].python_callable(request)
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
             self.assertEqual(len(server.jobs), 1)
@@ -406,6 +445,17 @@ class DagTests(unittest.TestCase):
                     "upload_sha256": digest(upload),
                     "main_assembly": "3.0 总装1008.SLDASM",
                 },
+            )
+            self.assertEqual([call["kind"] for call in operations.registered], ["native"])
+            self.assertEqual(
+                operations.claimed,
+                [
+                    {
+                        "run_id": request["run_id"],
+                        "stage": "discover",
+                        "operation_key": f"{request['run_id']}/native:0",
+                    }
+                ],
             )
 
     def test_linked_run_reuses_the_parent_selection_payload(self) -> None:
@@ -478,6 +528,13 @@ class DagTests(unittest.TestCase):
 
             def sealed_path(self, uri):
                 return store_root / "sealed" / uri.removeprefix("store://sealed/")
+
+            def register_operation(self, **kwargs):
+                return SimpleNamespace(state="queued")
+
+            def claim_operation(self, **kwargs):
+                return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
         config = EndpointConfig(
             "http://127.0.0.1:1",
             "t" * 32,
@@ -623,6 +680,19 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.calls: list[dict] = []
         self.started: list[str] = []
         self.live_events: list[dict] = []
+        self.registered: list[dict] = []
+        self.claimed: list[dict] = []
+        self.sequence: list[str] = []
+
+        def register_operation(**payload):
+            self.registered.append(payload)
+            self.sequence.append("register")
+
+        def claim_operation(**payload):
+            self.claimed.append(payload)
+            self.sequence.append("claim")
+            return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
         platform = SimpleNamespace(
             confirm_stage=lambda **payload: self.calls.append(payload),
             confirmed_stage=lambda *args, **kwargs: None,
@@ -630,6 +700,8 @@ class PlatformRegistrationTests(unittest.TestCase):
             append_event=lambda run_id, *, stage, kind, payload=None: self.live_events.append(
                 {"run_id": run_id, "stage": stage, "kind": kind, "payload": payload}
             ),
+            register_operation=register_operation,
+            claim_operation=claim_operation,
         )
         binding = patch.object(self.module, "_platform_binding", return_value=(platform, self.root))
         binding.start()
@@ -664,6 +736,37 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertIn("model/robot.json", paths)
         self.assertIn("reports/quality.json", paths)
         self.assertTrue((self.root / "sealed" / "run-1" / "generate" / "manifest.json").is_file())
+
+    def test_the_publish_intent_is_registered_and_claimed_before_the_stage(self) -> None:
+        tree = self._tree(stage="publish")
+        receipt = {
+            "run_id": "run-1",
+            "state": "published",
+            "passed": True,
+            "subject_sha256": "a" * 64,
+            "submission": {"state": "created"},
+        }
+
+        def run_stage(*_args, **_kwargs):
+            self.sequence.append("stage")
+            return receipt
+
+        with patch.object(self.module.flow, "run_stage", side_effect=run_stage):
+            result = self.module._portable_registered(
+                "run-1", "publish", tree=tree, expected_subject="a" * 64, base="main"
+            )
+        self.assertEqual(result, receipt)
+        # The registered and claimed intent precedes the one external write.
+        self.assertEqual(self.sequence, ["register", "claim", "stage"])
+        self.assertEqual(
+            [(call["stage"], call["kind"], call["operation_key"]) for call in self.registered],
+            [("publish", "publish", "run-1/publish:0")],
+        )
+        self.assertRegex(self.registered[0]["params_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            self.claimed,
+            [{"run_id": "run-1", "stage": "publish", "operation_key": "run-1/publish:0"}],
+        )
 
     def test_a_stage_failure_converges_with_the_actual_products(self) -> None:
         tree = self._tree(stage="generate")

@@ -59,7 +59,7 @@ from description_pipeline.interface_records import (
     check_policy_digest,
 )
 from description_pipeline.platform.storage import seal_stage_confirmation, sealed_resolver
-from description_pipeline.platform.store import PlatformStore
+from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 from description_pipeline.runtime import tool_record
 from description_pipeline.stages import (
     CONFIRMED_STAGE_PASSED,
@@ -388,6 +388,26 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
     source_run_id = kwargs.get("source_run_id")
     if source_run_id:
         _materialize_linked_attempt(platform, store_root, run_id, source_run_id)
+    if stage == "publish":
+        # The ONE external write of this workflow: register its intent with the real
+        # Airflow binding and claim it immediately before the stage's side effect.
+        _claim_operation_intent(
+            platform,
+            run_id=run_id,
+            stage="publish",
+            kind="publish",
+            operation_key=f"{run_id}/publish:0",
+            params_digest=digest(
+                {
+                    "run_id": run_id,
+                    "source_run_id": source_run_id,
+                    "expected_subject": kwargs.get("expected_subject"),
+                    "base": kwargs.get("base"),
+                }
+            ),
+            what="publication",
+            context=context,
+        )
 
     def live(event: dict) -> None:
         try:
@@ -413,6 +433,47 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
         )
         raise
     return receipt
+
+
+def _claim_operation_intent(
+    platform: PlatformStore,
+    *,
+    run_id: str,
+    stage: str,
+    kind: str,
+    operation_key: str,
+    params_digest: str,
+    what: str,
+    context: dict | None,
+) -> None:
+    """Register one side-effect intent with its real Airflow binding, then claim it.
+
+    The registration is idempotent on the same key and parameter digest; only the
+    claiming call may perform the side effect, and a repeat claim of a still-running
+    operation is the controlled reconciliation replay.  A settled state refuses
+    here - repeating an uncontrolled write is never a fallback.
+    """
+    context = context if isinstance(context, dict) else {}
+    task_instance = context.get("ti") or context.get("task_instance")
+    platform.register_operation(
+        run_id=run_id,
+        stage=stage,
+        kind=kind,
+        operation_key=operation_key,
+        params_digest=params_digest,
+        dispatch={
+            "dag_id": DAG_ID,
+            "dag_run_id": getattr(context.get("dag_run"), "run_id", None),
+            "task_id": stage,
+            "map_index": getattr(task_instance, "map_index", None),
+        },
+    )
+    try:
+        claim = platform.claim_operation(run_id=run_id, stage=stage, operation_key=operation_key)
+    except PlatformStoreError as error:
+        raise AirflowFailException(f"the registered {what} intent cannot be claimed: {error}") from error
+    if not claim.granted and claim.record.state != "running":
+        raise AirflowFailException(f"the registered {what} intent is not claimable")
 
 
 def _register_freeze_stage(paths: flow.RunPaths, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
@@ -1405,6 +1466,25 @@ def solidworks_to_urdf():
         try:
             endpoint.get_job(request["run_id"])
         except EndpointNotFound:
+            platform, _store_root = _platform_binding()
+            _claim_operation_intent(
+                platform,
+                run_id=request["run_id"],
+                stage="discover",
+                kind="native",
+                operation_key=f"{request['run_id']}/native:0",
+                params_digest=digest(
+                    {
+                        "run_id": request["run_id"],
+                        "upload_sha256": request["upload_sha256"],
+                        "main_assembly": request["main_assembly"],
+                        "resume": request.get("resume"),
+                        "conn_id": request["conn_id"],
+                    }
+                ),
+                what="native submission",
+                context=context,
+            )
             job = endpoint.start_staging_job(
                 run_id=request["run_id"],
                 upload_files=request["upload_files"],
