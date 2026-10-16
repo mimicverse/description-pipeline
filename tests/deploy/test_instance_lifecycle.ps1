@@ -12,10 +12,17 @@
 # observer/ownership gates must make that run fail.
 [CmdletBinding()]
 param(
-  [string]$ScriptPath = (Join-Path $PSScriptRoot '..' '..' 'deploy' 'windows' 'instance-lifecycle.ps1'),
+  [string]$ScriptPath = '',
   [switch]$StaticOnly
 )
 $ErrorActionPreference = 'Stop'
+if (-not $ScriptPath) {
+  # Windows PowerShell 5.1 does not populate $PSScriptRoot while parameter defaults evaluate and
+  # has no multi-child Join-Path (PowerShell 6+ -AdditionalChildPath): the repository-relative
+  # default resolves here, after the parameter block.
+  $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+  $ScriptPath = Join-Path (Join-Path (Join-Path $repositoryRoot 'deploy') 'windows') 'instance-lifecycle.ps1'
+}
 $script:checks = 0
 $script:failures = [System.Collections.Generic.List[string]]::new()
 function Check([string]$name, [bool]$condition, [string]$detail = '') {
@@ -46,6 +53,11 @@ Check 'wording.stage_candidate_transform' ($source.Contains('Get-EndpointConfigT
   $source.Contains('candidate_config_mismatch'))
 Check 'wording.old_copy_removed' (-not $source.Contains('Copy-Item -LiteralPath (Action-Config $task)')) 'the byte-copy stage path is still present'
 Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath $lock')) 'never delete the ownership lock'
+Check 'wording.no_system_text_json' (-not $source.Contains('System.Text.Json')) 'a Core-only JSON type the Desktop PowerShell 5.1 lifecycle cannot load is still present'
+Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfigScanPython') -and
+  $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
+Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
+  $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
 if ($StaticOnly) {
   Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
   exit ([int]($script:failures.Count -gt 0))
@@ -56,8 +68,44 @@ if ($StaticOnly) {
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram',
-  'Get-ServedStateRoot'
+  'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
+  'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
+
+# ---- strict JSON boundary on the bound CPython 3.12 (PowerShell 5.1-compatible path) --------
+$scanPython = Get-EndpointConfigScanPython
+Check 'json.scan_python_312' ($null -ne $scanPython) 'no CPython 3.12 interpreter is available for the strict scan'
+$jsonRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('il-json-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $jsonRoot -Force
+function Write-IJson([string]$name, [string]$text) {
+  $path = Join-Path $jsonRoot $name
+  [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+  return $path
+}
+$validPath = Write-IJson 'valid.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","package_root":"C:/pkg","output_root":"C:/out","state_root":"C:/state","token_file":"C:/state/token","host":"127.0.0.1","port":8765,"targets":{}}'
+$problems = Get-EndpointConfigEarlyProblems $validPath
+Check 'json.valid_clean' (($problems.unreadable -eq '') -and (@($problems.duplicates).Count -eq 0) -and (@($problems.unknown).Count -eq 0))
+$duplicatePath = Write-IJson 'duplicate.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","port":8765,"port":8766}'
+$problems = Get-EndpointConfigEarlyProblems $duplicatePath
+Check 'json.duplicate_detected' (($problems.unreadable -eq '') -and (@($problems.duplicates) -contains 'port'))
+$unknownPath = Write-IJson 'unknown.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","bogus_key":1}'
+$problems = Get-EndpointConfigEarlyProblems $unknownPath
+Check 'json.unknown_detected' (($problems.unreadable -eq '') -and (@($problems.unknown) -contains 'bogus_key'))
+$malformedPath = Write-IJson 'malformed.json' '{"port": '
+$problems = Get-EndpointConfigEarlyProblems $malformedPath
+Check 'json.malformed_unreadable' ($problems.unreadable -ne '')
+$constantPath = Write-IJson 'constant.json' '{"port": NaN}'
+$problems = Get-EndpointConfigEarlyProblems $constantPath
+Check 'json.nonfinite_unreadable' ($problems.unreadable -ne '')
+$arrayPath = Write-IJson 'array.json' '[1, 2]'
+$problems = Get-EndpointConfigEarlyProblems $arrayPath
+Check 'json.nonobject_unreadable' ($problems.unreadable -ne '')
+$removedPath = Write-IJson 'removed.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","targets":{}}'
+$problems = Get-EndpointConfigEarlyProblems $removedPath
+Check 'json.removed_key_tolerated' (($problems.unreadable -eq '') -and (@($problems.unknown).Count -eq 0))
+$problems = Get-EndpointConfigEarlyProblems (Join-Path $jsonRoot 'missing.json')
+Check 'json.missing_silent' (($problems.unreadable -eq '') -and (@($problems.duplicates).Count -eq 0) -and (@($problems.unknown).Count -eq 0))
+Remove-Item -LiteralPath $jsonRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # In-process refusal cases need the script's top-level Die to throw instead of exiting the
 # harness; every existing check exercises throwing interpreters, never Die itself.
@@ -230,6 +278,73 @@ $message = ''
 try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
 Check 'pins.served_state_root_mismatch_refused' ($message -match 'state_root_mismatch')
 $script:ServedStateRoot = $root
+# Representation-insensitive: the official reader reports backslashes on Windows while the
+# binding and platform.json declare forward slashes; the same root in either spelling passes.
+$script:ServedStateRoot = $root.Replace('/', '\')
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_insensitive_pass' (($null -ne $pins) -and ($message -eq ''))
+$script:ServedStateRoot = $root
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins ($root.Replace('/', '\')) $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_variant_state_root_pass' (($null -ne $pins) -and ($message -eq ''))
+# A genuinely different path still refuses after normalization (a near miss, not a separator).
+$script:ServedStateRoot = ($root + '-other')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.true_mismatch_after_normalization_refused' ($message -match 'state_root_mismatch')
+$script:ServedStateRoot = $root
+# The account pins may carry either spelling too: the same generation restated with backslashes
+# passes; a different generation still refuses.
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation.Replace('/', '\')
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical.Replace('/', '\')
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.pin_representation_restates_pass' (($null -ne $pins) -and ($message -eq ''))
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = ($generation + '-other')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_true_root_change_refused' ($message -match 'cad_domain_override_refused')
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical
+
+# ---- writer residue: the stop gate scans path identity, not path spelling ----
+# Win32_Process reports backslash images while the binding's roots travel slash-normalized; a
+# writer that keeps its image under the root in either spelling must count as residue, while a
+# neighbouring directory never may (the separator stays a boundary).
+$script:WriterImages = @()
+function Get-CimInstance {
+  param($ClassName, $ErrorAction)
+  foreach ($image in $script:WriterImages) { [pscustomobject]@{ ExecutablePath = $image } }
+}
+$residueRoot = 'C:\description-v1-review\endpoint-state'
+$residueGeneration = $residueRoot + '\lifecycle\gen140\generation'
+$residueBinding = @{ state_root = $residueRoot; generation = $residueGeneration }
+$residueImage = $residueGeneration + '\runtime\Scripts\python.exe'
+$script:WriterImages = @($residueImage)
+Check 'writer_residue.same_spelling_counts' ((@(Get-WriterResidue $residueBinding)).Count -eq 1)
+# The regression counterexample: a slash-normalized binding must count the backslash image too.
+$residueForward = @{ state_root = $residueRoot.Replace('\', '/'); generation = $residueGeneration.Replace('\', '/') }
+Check 'writer_residue.forward_binding_backslash_process_counts' ((@(Get-WriterResidue $residueForward)).Count -eq 1)
+# And the reverse spelling agrees.
+$script:WriterImages = @($residueImage.Replace('\', '/'))
+Check 'writer_residue.backslash_binding_forward_process_counts' ((@(Get-WriterResidue $residueBinding)).Count -eq 1)
+# A process under a different root is somebody else's writer.
+$script:WriterImages = @('C:\another-root\runtime\Scripts\python.exe')
+Check 'writer_residue.different_root_ignored' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
+# A near-neighbour prefix is not inside the root: the separator stays the boundary.
+$script:WriterImages = @('C:\description-v1-review\endpoint-state-other\python.exe')
+Check 'writer_residue.near_neighbour_ignored' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
+# The generation prefix counts its writers even outside the state root.
+$script:WriterImages = @($residueImage)
+$residueGenerationOnly = @{ state_root = 'C:\description-v1-review\other-state'; generation = $residueGeneration }
+Check 'writer_residue.generation_prefix_counts' ((@(Get-WriterResidue $residueGenerationOnly)).Count -eq 1)
+# An empty sweep is clean.
+$script:WriterImages = @()
+Check 'writer_residue.empty_sweep_clean' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
 
 Reset-State
 $facts = Get-OwnershipRefusalFacts $generation $binding

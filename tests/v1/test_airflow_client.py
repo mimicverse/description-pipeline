@@ -556,6 +556,63 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(EndpointProtocolError):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [str(link)]})
 
+    def test_discovery_paths_reject_root_and_dotdot_segments(self) -> None:
+        """The handoff-root rule, applied to discovery paths on the raw spelling.
+
+        ``Path`` collapses ``//`` before any parts check, so the guard judges the original
+        segments: ``..`` refuses whether or not it resolves, and empty segments (``a//b``)
+        refuse too - one clear message per label, the text is never silently rewritten, and a
+        clean absolute path still passes unchanged.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records"
+            records.mkdir()
+            nested = root / "sub"
+            nested.mkdir()
+            registry = root / "names.json"
+            registry.write_text("{}", encoding="utf-8")
+            config = EndpointConfig(
+                base_url="http://127.0.0.1",
+                token=TOKEN,
+                discovery={"record_roots": [str(records)], "frozen_names_file": str(registry)},
+            )
+            self.assertEqual(config.discovery["record_roots"], (records,))
+            self.assertEqual(config.discovery["frozen_names_file"], registry)
+            for value in (
+                str(records / ".." / "records"),  # resolvable: previously accepted unnormalized
+                str(nested / ".." / "records"),
+                str(nested / ".." / "missing"),
+                str(nested) + "/../records",  # raw '..' spelling (Path would keep it too)
+                str(nested) + "/..",  # trailing '/..'
+                str(nested) + "//records",  # raw empty segment (Path would collapse it)
+                "/" + str(records),  # raw '//' root spelling
+                "/",
+            ):
+                with self.subTest(record_root=value):
+                    with self.assertRaises(EndpointProtocolError) as caught:
+                        EndpointConfig(
+                            base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [value]}
+                        )
+                    self.assertIn(
+                        "discovery record root must be a dedicated absolute path", str(caught.exception)
+                    )
+            for value in (
+                str(records / ".." / "names.json"),
+                str(records) + "//names.json",
+                "/",
+            ):
+                with self.subTest(registry=value):
+                    with self.assertRaises(EndpointProtocolError) as caught:
+                        EndpointConfig(
+                            base_url="http://127.0.0.1", token=TOKEN, discovery={"frozen_names_file": value}
+                        )
+                    self.assertIn(
+                        "discovery frozen-name registry must be a dedicated absolute path",
+                        str(caught.exception),
+                    )
+
     def test_connection_extra_supplies_handoff_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "handoffs"

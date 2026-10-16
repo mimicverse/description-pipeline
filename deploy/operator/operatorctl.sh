@@ -3,6 +3,7 @@
 #   validate  static platform.json checks (schema/paths/targets/ports; no probes)
 #   install   render the immutable config snapshot, then install the pinned runtime
 #   start     enable/start PostgreSQL, Airflow, tunnel, portal and the HTTPS proxy
+#             (start --keep-admission-closed: services up, the platform admission stays closed)
 #   drain     close submissions and DAG admission, keep in-flight, return active/unresolved
 #   stop      disable/stop them in reverse order (only when drained and settled)
 #   status    systemctl --user is-active for every managed unit
@@ -32,6 +33,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
+start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
 orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
@@ -55,6 +57,7 @@ NATIVE_RUN_ID=""
 ORPHAN_OPERATION_ID=""
 ORPHAN_TASK_ID=""
 ORPHAN_MAP_INDEX=""
+KEEP_ADMISSION_CLOSED=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -72,6 +75,7 @@ while [ $# -gt 0 ]; do
     --orphan-task-id) ORPHAN_TASK_ID="${2:-}"; shift 2 ;;
     --orphan-map-index) ORPHAN_MAP_INDEX="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
+    --keep-admission-closed) KEEP_ADMISSION_CLOSED=1; shift ;;
     *) usage ;;
   esac
 done
@@ -80,6 +84,11 @@ case "$ACTION" in
   validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback) ;;
   *) usage ;;
 esac
+# Only start owns this switch; every other verb refuses it here, before any side effect runs.
+if [ -n "$KEEP_ADMISSION_CLOSED" ] && [ "$ACTION" != "start" ]; then
+  echo "operatorctl: --keep-admission-closed is only accepted by start" >&2
+  exit 2
+fi
 
 install_from_config() {
   [ -f "$ENDPOINT_IDENTITY" ] || die "--endpoint-identity FILE is required for install"
@@ -221,6 +230,24 @@ PY
     die "the generation environment $file has an unreadable $key declaration"
   }
   printf '%s' "$value"
+}
+
+# The ONE managed proxy binary has two duties, split by side effect.
+#   ensure_proxy_binary  PREPARE: decides the actual result (an executable configured/system
+#     binary, else the toolchain nginx ``install_proxy.sh`` lands and prints) and may install
+#     or download.  It runs only inside the controlled change entries that re-render and
+#     re-bind a generation: install, promote and rollback.
+#   check_proxy_binary   VALIDATE, read-only: the bound value from resolved.env must exist, be
+#     executable and be the binary the installed proxy unit executes.  A read verb reports that
+#     as drift and never repairs it, so a missing binary cannot be masked by an implicit
+#     install.
+ensure_proxy_binary() {
+  NGINX_BIN="${NGINX_BIN:-}" OPERATOR_STATE="${OPERATOR_STATE:-}" \
+    bash "$HERE/scripts/ensure_proxy_binary.sh"
+}
+
+check_proxy_binary() {
+  NGINX_BIN="${NGINX_BIN:-}" bash "$HERE/scripts/check_proxy_binary.sh" "$@"
 }
 
 # The gates read the platform authority from the managed database, so the start window must
@@ -471,11 +498,19 @@ load_installed() {
 # compare with the installed deployment. Missing installed files, missing renders and render
 # failures count as drift, not as silent passes.
 drift_check() {
-  local rc=0 tmp_xdg drift_log tmp_state
+  local rc=0 tmp_xdg drift_log tmp_state proxy_bin="${NGINX_BIN:-}" extra=() proxy_issue
+  # Read-only: the bound binary must exist, be executable and be the one the installed proxy
+  # unit executes.  A missing or mismatched binary is drift; reading never installs, downloads
+  # or repairs (the side-effectful preparation belongs to install / promote / rollback only).
+  if ! proxy_issue="$(check_proxy_binary --unit-file "$TARGET/description-operator-proxy.service" 2>&1)"; then
+    echo "DRIFT $proxy_issue"
+    rc=1
+  fi
+  [ -n "$proxy_bin" ] && extra=(--nginx-bin "$proxy_bin")
   drift_log="$(mktemp)"
   tmp_xdg="$(mktemp -d)"
   if ! python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --dry-run \
-        --units-dir "$tmp_xdg/systemd/user" > "$drift_log"; then rc=1; fi
+        "${extra[@]}" --units-dir "$tmp_xdg/systemd/user" > "$drift_log"; then rc=1; fi
   grep -v -e '^DRIFT none$' -e '^OPERATOR_UNITS=' "$drift_log" || true
   # The operator units carry the temporary render state; normalize it before comparing.
   tmp_state="$(sed -n 's/^Environment=OPERATOR_STATE=//p' \
@@ -528,7 +563,8 @@ case "$ACTION" in
     # Cold-start order inside the single entry: bring the managed database up and confirm its
     # socket, then actually close the platform admission through the controlled entry (BEFORE
     # any identity/drift verification, so a failed start attempt cannot leave a leftover open
-    # gate), then run the preconditions; the gate reopens only after everything is ready.
+    # gate), then run the preconditions; the gate reopens only after everything is ready (under
+    # --keep-admission-closed it stays closed once everything is ready).
     START_STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
       python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
     [ -f "$START_STATE_ROOT/resolved.env" ] \
@@ -687,7 +723,12 @@ case "$ACTION" in
     RENDER_LOG="$(mktemp)"
     TOOLCHAIN_LOG="$(mktemp)"
     trap 'rm -f "$RENDER_LOG" "$TOOLCHAIN_LOG"' EXIT
-    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" > "$RENDER_LOG"
+    # The managed proxy binary is decided before any render: whichever binary this
+    # installation actually lands (or an already-executable system one) becomes the NGINX_BIN
+    # written into resolved.env, the units and health - one path, one source.
+    OPERATOR_STATE="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
+    PROXY_BIN="$(ensure_proxy_binary)" || die "the managed proxy binary is unavailable; nothing was installed"
+    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" > "$RENDER_LOG"
     cat "$RENDER_LOG"
     # shellcheck disable=SC1090
     source "$(sed -n 's/^OPERATOR_STATE=//p' "$RENDER_LOG" | head -1)/resolved.env"
@@ -696,7 +737,8 @@ case "$ACTION" in
     cat "$TOOLCHAIN_LOG"
     # shellcheck disable=SC1090
     source "$TOOLCHAIN_LOG"
-    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" >/dev/null
+    python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+      --units-dir "$TARGET" >/dev/null
     airflow_render
     if [ -n "${POSTGRES_ROOT:-}" ]; then
       if [ ! -f "$POSTGRES_ROOT/data/PG_VERSION" ]; then
@@ -758,9 +800,8 @@ case "$ACTION" in
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
       --token-file "$ENDPOINT_TOKEN_FILE" --host 127.0.0.1 --port "$TUNNEL_LOOPBACK_PORT" \
       --handoff-root "$SOLIDWORKS_HANDOFF_ROOT" --pipeline-config "$PORTAL_CONFIG"
-    if [ ! -x "${NGINX_BIN:-/usr/sbin/nginx}" ]; then
-      OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/scripts/install_proxy.sh" >/dev/null
-    fi
+    # The binary decided above is the one everything rendered; it may not vanish mid-install.
+    [ -x "$PROXY_BIN" ] || die "the managed proxy binary is missing: $PROXY_BIN"
     systemctl --user daemon-reload
     # The install record binds this generation to its snapshot, release identity and both ends;
     # it is written only after the installation legs are ready.
@@ -785,15 +826,27 @@ case "$ACTION" in
     load_installed
     drift_check || die "configuration drift detected; run install before start"
     airflow_lifecycle start
-    airflow_unpause_dag
+    # --keep-admission-closed keeps BOTH scheduling and platform admission closed: the DAG
+    # unpause and the platform open are the two state transitions of a plain start, and the
+    # flagged start skips both (services up, admission closed; a later plain start re-verifies
+    # and opens).  A failure above this point never opens anything.
+    if [ -z "$KEEP_ADMISSION_CLOSED" ]; then
+      airflow_unpause_dag
+    fi
     systemctl --user enable --now description-portal.service description-operator-proxy.service \
       || die "ingress services failed to start; the platform admission stays closed"
     systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
       || die "ingress services are not active; the platform admission stays closed"
-    # The gate opens only after every precondition, the identity check, the services and the
-    # ingress readiness confirmation succeeded; any failure above leaves it closed.
-    platform_open_admission
-    echo "start complete: admission open"
+    if [ -n "$KEEP_ADMISSION_CLOSED" ]; then
+      # Identical checks and services, but nothing is opened (never open-then-close): the
+      # start-window close above is the only admission transition that was written.
+      echo "start complete: services are running; the platform admission stays closed (--keep-admission-closed)"
+    else
+      # The gate opens only after every precondition, the identity check, the services and the
+      # ingress readiness confirmation succeeded; any failure above leaves it closed.
+      platform_open_admission
+      echo "start complete: admission open"
+    fi
     ;;
   drain)
     load_installed
@@ -1146,8 +1199,11 @@ PY
     # 8. the switched generation starts through its own derived environment
     load_active_env
     load_installed
+    PROXY_BIN="$(ensure_proxy_binary)" \
+      || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
+      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+        --units-dir "$TARGET" \
       && source "$STATE_ROOT/resolved.env" \
       && airflow_render \
       && systemctl --user daemon-reload \
@@ -1353,8 +1409,11 @@ PY
     # platform.json may already describe a candidate).
     load_running_env
     load_installed
+    PROXY_BIN="$(ensure_proxy_binary)" \
+      || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
-      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --units-dir "$TARGET" \
+      python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
+        --units-dir "$TARGET" \
       && airflow_render \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \

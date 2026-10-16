@@ -320,37 +320,17 @@ function Get-PreviousGenerationBinding([string]$generation, [object]$binding) {
             port=$binding.port; version=$record.version; source_commit=$record.source_commit;
             source_sha256=$record.source_sha256 }
 }
-function Get-EndpointConfigEarlyProblems([string]$configPath) {
-  # Early fail-closed scan for the 1.5.0 upgrade path: the known removed key set (currently
-  # targets) is transformed away by the single candidate generation; any other top-level key -
-  # or a repeated key - stops the stage explicitly and is never silently dropped.  The running
-  # file itself is never modified.
-  $allowed = @('schema_version','package_root','output_root','state_root','token_file','host','port')
-  $removed = @('targets')
-  if (-not (Test-Path -LiteralPath $configPath)) { return @{unreadable=''; duplicates=@(); unknown=@()} }
-  $raw = [System.IO.File]::ReadAllText($configPath)
-  $document = $null
-  try { $document = [System.Text.Json.JsonDocument]::Parse($raw) } catch {
-    return @{unreadable=$_.Exception.Message; duplicates=@(); unknown=@()}
-  }
-  $names = @()
-  foreach ($property in $document.RootElement.EnumerateObject()) { $names += $property.Name }
-  $duplicates = @($names | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name } | Sort-Object)
-  $unknown = @($names | Sort-Object -Unique | Where-Object { ($allowed -notcontains $_) -and ($removed -notcontains $_) })
-  return @{unreadable=''; duplicates=$duplicates; unknown=$unknown}
-}
-function Get-EndpointConfigTransformProgram {
-  # The single generator of the 1.5.0 candidate configuration.  It runs with the staged runtime so
-  # the candidate is serialized and digested by the release's own canonical writer; the policy is
-  # deliberately minimal - drop the known removed keys, keep every other field's value, refuse
-  # anything else (unknown keys, duplicate keys, malformed values) instead of guessing.
+function Get-EndpointConfigStrictPrelude {
+  # The ONE strict JSON policy for endpoint configurations, shared by the early scan (bound
+  # CPython, below) and the candidate generator (staged runtime, next): duplicate keys are
+  # rejected through object_pairs_hook - never ConvertFrom-Json, which collapses them - and the
+  # allowed/removed key sets live here only.  The scan additionally mirrors the foundation
+  # reader's rejection of the non-finite constants; value checks stay with the single
+  # transform/read_config chain and are never duplicated here.
   return @'
-import hashlib
 import json
 import sys
 from pathlib import Path
-
-from description_pipeline import io
 
 
 def fail(code, detail):
@@ -358,20 +338,129 @@ def fail(code, detail):
     raise SystemExit(1)
 
 
-def pairs_hook(pairs):
+def strict_object(pairs, duplicates=None):
     document = {}
     for key, value in pairs:
         if key in document:
-            raise ValueError("duplicate key: %s" % key)
+            if duplicates is None:
+                raise ValueError("duplicate key: %s" % key)
+            duplicates.append(key)
         document[key] = value
     return document
+
+
+ALLOWED_KEYS = ("schema_version", "package_root", "output_root", "state_root", "token_file", "host", "port")
+REMOVED_KEYS = ("targets",)
+
+'@
+}
+function Get-EndpointConfigScanPython {
+  # The strict scan runs on the bound CPython 3.12 generation the stage installs with: the
+  # py -3.12 launcher on the Windows endpoint hosts (the same interpreter `py -3.12 -m venv`
+  # binds later) and python3.12/python3/python elsewhere.  The version is asserted, so a host
+  # without CPython 3.12 refuses the scan instead of silently re-parsing with another rule set.
+  foreach ($candidate in @(@('py', '-3.12'), @('python3.12'), @('python3'), @('python'))) {
+    $executable = [string]$candidate[0]
+    if (-not (Get-Command $executable -ErrorAction SilentlyContinue)) { continue }
+    $probe = ''
+    try {
+      $probe = & $executable @($candidate | Select-Object -Skip 1) -c "import sys;print(('%d.%d') % sys.version_info[:2])" 2>$null |
+        Select-Object -Last 1
+    } catch {
+      continue
+    }
+    if ($LASTEXITCODE -eq 0 -and ([string]$probe).Trim() -eq '3.12') {
+      return @{ executable = $executable; prefix = @($candidate | Select-Object -Skip 1) }
+    }
+  }
+  return $null
+}
+function Get-EndpointConfigEarlyScanProgram {
+  # The early fail-closed verdict as data: parse, duplicate keys, unknown keys.  The scan is
+  # host-portable PowerShell 5.1-safe: Desktop PowerShell carries no Core-only JSON parser, so
+  # the strict read runs on the bound CPython with the shared prelude above.
+  return (Get-EndpointConfigStrictPrelude) + @'
+def reject_constant(name):
+    raise ValueError("non-JSON numeric constant: %s" % name)
+
+
+duplicates = []
+verdict = {"unreadable": "", "duplicates": [], "unknown": []}
+try:
+    document = json.loads(
+        Path(sys.argv[1]).read_text(encoding="utf-8"),
+        object_pairs_hook=lambda pairs: strict_object(pairs, duplicates),
+        parse_constant=reject_constant,
+    )
+    if not isinstance(document, dict):
+        raise ValueError("the endpoint configuration is not a JSON object")
+except Exception as error:
+    verdict["unreadable"] = str(error)
+else:
+    verdict["duplicates"] = sorted(set(duplicates))
+    verdict["unknown"] = sorted(set(document) - set(ALLOWED_KEYS) - set(REMOVED_KEYS))
+print(json.dumps(verdict, sort_keys=True))
+'@
+}
+function Get-EndpointConfigEarlyProblems([string]$configPath) {
+  # Early fail-closed scan for the 1.5.0 upgrade path: the known removed key set (currently
+  # targets) is transformed away by the single candidate generation; any other top-level key -
+  # or a repeated key - stops the stage explicitly and is never silently dropped.  The running
+  # file itself is never modified.  Runs on the bound CPython 3.12 so the check works on
+  # PowerShell 5.1 Desktop; the previous implementation required a Core-only JSON API that
+  # Desktop PowerShell does not carry.
+  if (-not (Test-Path -LiteralPath $configPath)) { return @{unreadable=''; duplicates=@(); unknown=@()} }
+  $python = Get-EndpointConfigScanPython
+  if (-not $python) {
+    return @{unreadable='no CPython 3.12 interpreter is available for the strict configuration scan';
+             duplicates=@(); unknown=@()}
+  }
+  # PowerShell 5.1 mangles embedded double quotes when a -c program travels as one argv element;
+  # the program travels as a real file instead (both strict-read programs do).
+  $programPath = Write-PythonProgram 'endpoint-scan' (Get-EndpointConfigEarlyScanProgram)
+  $scanRc = 1
+  $scanOutput = @()
+  try {
+    $scanOutput = & $python.executable @($python.prefix) -I $programPath $configPath 2>&1
+    $scanRc = $LASTEXITCODE
+  } finally {
+    Remove-Item -LiteralPath $programPath -Force -ErrorAction SilentlyContinue
+  }
+  if ($scanRc -ne 0) {
+    return @{unreadable=('the strict configuration scan failed: ' + [string]($scanOutput | Select-Object -Last 1));
+             duplicates=@(); unknown=@()}
+  }
+  $verdict = $null
+  try { $verdict = ([string]($scanOutput | Select-Object -Last 1)) | ConvertFrom-Json } catch {
+    return @{unreadable='the strict configuration scan returned no verdict'; duplicates=@(); unknown=@()}
+  }
+  return @{unreadable=[string]$verdict.unreadable; duplicates=@($verdict.duplicates); unknown=@($verdict.unknown)}
+}
+function Write-PythonProgram([string]$name, [string]$program) {
+  # PowerShell 5.1 mangles embedded double quotes when a multi-line program is passed to a
+  # native interpreter as one -c argument; every strict-read program therefore travels as a
+  # real file (UTF-8, no BOM) and is removed by its caller after the run.
+  $path = Join-Path ([System.IO.Path]::GetTempPath()) ($name + '-' + [guid]::NewGuid().ToString('N') + '.py')
+  [System.IO.File]::WriteAllText($path, $program, (New-Object System.Text.UTF8Encoding($false)))
+  return $path
+}
+function Get-EndpointConfigTransformProgram {
+  # The single generator of the 1.5.0 candidate configuration.  It runs with the staged runtime so
+  # the candidate is serialized and digested by the release's own canonical writer; the policy is
+  # deliberately minimal - drop the known removed keys, keep every other field's value, refuse
+  # anything else (unknown keys, duplicate keys, malformed values) instead of guessing.
+  # Its strict-read policy is the shared prelude above (one copy with the early scan).
+  return (Get-EndpointConfigStrictPrelude) + @'
+import hashlib
+
+from description_pipeline import io
 
 
 source = Path(sys.argv[1])
 target = Path(sys.argv[2])
 raw = source.read_bytes()
 try:
-    document = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs_hook)
+    document = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
 except ValueError as error:
     duplicated = "duplicate key" in str(error)
     fail("endpoint_config_duplicate_keys" if duplicated else "endpoint_config_unreadable", str(error))
@@ -380,9 +469,7 @@ except Exception as error:
 if not isinstance(document, dict):
     fail("endpoint_config_invalid", "the endpoint configuration is not an object")
 
-allowed = ("schema_version", "package_root", "output_root", "state_root", "token_file", "host", "port")
-removed = ("targets",)
-unknown = sorted(set(document) - set(allowed) - set(removed))
+unknown = sorted(set(document) - set(ALLOWED_KEYS) - set(REMOVED_KEYS))
 if unknown:
     fail("endpoint_config_unknown_keys", ", ".join(unknown))
 if document.get("schema_version") != "solidworks-to-urdf.endpoint/v1":
@@ -394,7 +481,7 @@ port = document.get("port")
 if port is not None and (not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535):
     fail("endpoint_config_invalid_values", "port")
 
-candidate = {key: document[key] for key in allowed if key in document}
+candidate = {key: document[key] for key in ALLOWED_KEYS if key in document}
 io.write_json(target, candidate)
 
 try:
@@ -414,7 +501,7 @@ result = {
     "candidate_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
     "canonical_digest": io.digest(candidate),
     "config_digest": loaded_digest,
-    "removed_keys": [key for key in removed if key in document],
+    "removed_keys": [key for key in REMOVED_KEYS if key in document],
     "read_config": "passed",
 }
 print(json.dumps(result, sort_keys=True))
@@ -475,11 +562,14 @@ function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$
 function Get-WriterResidue([object]$binding) {
   # The endpoint's own writers keep their image under the generation or the instance state root;
   # the sweep loop ends only with no listener AND no such process left (deployment.md settle).
-  $prefixState = ([string]$binding.state_root).TrimEnd('\').ToLower()
-  $prefixGeneration = ([string]$binding.generation).TrimEnd('\').ToLower()
+  # Path identity, not path spelling: the declared roots travel slash-normalized while
+  # Win32_Process reports backslash images, so both sides compare normalized; the separator
+  # stays a boundary and a neighbouring directory never counts.
+  $prefixState = (Normalize-PathIdentity $binding.state_root).ToLower()
+  $prefixGeneration = (Normalize-PathIdentity $binding.generation).ToLower()
   Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $image = if ($_.ExecutablePath) { ([string]$_.ExecutablePath).ToLower() } else { '' }
-    ($image.StartsWith($prefixState + '\')) -or ($image.StartsWith($prefixGeneration + '\'))
+    $image = if ($_.ExecutablePath) { (Normalize-PathIdentity $_.ExecutablePath).ToLower() } else { '' }
+    ($image.StartsWith($prefixState + '/')) -or ($image.StartsWith($prefixGeneration + '/'))
   }
 }
 function Stop-Endpoint([object]$binding) {
@@ -520,21 +610,31 @@ function Get-ServedStateRoot([string]$configPath) {
   }
   return [string]((($output | Select-Object -Last 1) | ConvertFrom-Json).state_root)
 }
+function Normalize-PathIdentity([string]$value) {
+  # Windows path declarations travel in more than one legal spelling: the platform.json wire
+  # format and the rendered bindings use forward slashes, while the official reader
+  # (windows.read_config -> Path.resolve()) reports backslash-normalized paths.  Identity
+  # comparisons are representation-insensitive over the two separators and a trailing slash;
+  # genuinely different paths still differ.
+  if ($null -eq $value) { return '' }
+  return ([string]$value).Replace('\', '/').TrimEnd('/')
+}
 function Assert-DomainPins([string]$StateRoot, [string]$ServedGeneration) {
   $officialRoot = ''
   if ($ServedGeneration) {
     $officialRoot = Get-ServedStateRoot (Config-Path $ServedGeneration)
-    if ($officialRoot -ne $StateRoot) {
+    if ((Normalize-PathIdentity $officialRoot) -ne (Normalize-PathIdentity $StateRoot)) {
       Die 'state_root_mismatch' ('the served configuration binds another state root: ' + $officialRoot)
     }
   }
   $canonical = Domain-OwnershipPath $StateRoot
   $pinned = [string](Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE')
-  if ($pinned -and ($pinned -ne $canonical)) {
+  if ($pinned -and ((Normalize-PathIdentity $pinned) -ne (Normalize-PathIdentity $canonical))) {
     Die 'cad_domain_override_refused' ('the bound CAD domain does not match this installation: ' + $pinned)
   }
   $pinnedRoot = [string](Get-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT')
-  if ($pinnedRoot -and $ServedGeneration -and ($pinnedRoot -ne $ServedGeneration)) {
+  if ($pinnedRoot -and $ServedGeneration -and
+      ((Normalize-PathIdentity $pinnedRoot) -ne (Normalize-PathIdentity $ServedGeneration))) {
     Die 'cad_domain_override_refused' ('the endpoint-root pin does not restate the served generation: ' + $pinnedRoot)
   }
   return @{ canonical=$canonical; previous_ownership=$pinned; previous_root=$pinnedRoot }
@@ -633,8 +733,16 @@ if ($Verb -eq 'stage') {
   # endpoint refuses the removed keys, so the former byte copy would ship a configuration the new
   # validator rejects - one deterministic generation replaces it.)
   $transformProgram = Get-EndpointConfigTransformProgram
-  $transform = & $runtime -I -c $transformProgram $runningConfig (Config-Path $StageDir)
-  if ($LASTEXITCODE -ne 0) {
+  $transformPath = Write-PythonProgram 'endpoint-transform' $transformProgram
+  $transformRc = 1
+  $transform = @()
+  try {
+    $transform = & $runtime -I $transformPath $runningConfig (Config-Path $StageDir)
+    $transformRc = $LASTEXITCODE
+  } finally {
+    Remove-Item -LiteralPath $transformPath -Force -ErrorAction SilentlyContinue
+  }
+  if ($transformRc -ne 0) {
     $problem = ($transform | Select-Object -Last 1)
     $code = 'endpoint_config_transform_failed'
     $detail = [string]$problem
