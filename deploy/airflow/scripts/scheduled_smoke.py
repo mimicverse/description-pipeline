@@ -366,15 +366,27 @@ def _feishu_env(home: Path, https_port: int) -> dict[str, str]:
     }
 
 
-def _config_snapshot_environment(args, *, target: str) -> dict[str, str]:
-    """The controlled platform-configuration identity of this isolated smoke world.
+def _config_snapshot_environment(
+    args,
+    *,
+    target: str,
+    state_root: Path,
+    handoff_root: Path,
+    workspace_root: Path,
+    record_roots: list[str],
+    endpoint_port: int,
+) -> tuple[dict[str, str], dict]:
+    """The controlled platform-configuration identity that governs THIS smoke run.
 
-    One IF-16 snapshot fixture is built by the deploy-side owner's own mechanism
-    (``validate_platform`` then ``build_snapshot``), re-validated by the package's
-    IF-16 validator, serialized with the one canonical serializer and digested over
-    exactly those bytes - the same derivation the operator environment and the
-    install record bind.  The package-side snapshot digest must agree, otherwise the
-    smoke refuses instead of fabricating a second identity.
+    The IF-16 snapshot is built by the deploy-side owner's own mechanism
+    (``validate_platform`` then ``build_snapshot``) from the exact inputs this run
+    consumes - its state/handoff/workspace roots, its record roots, its targets and
+    its real endpoint port - re-validated by the package's IF-16 validator,
+    serialized with the one canonical serializer and digested over exactly those
+    bytes (the same derivation the operator environment and the install record
+    bind).  The package-side snapshot digest must agree, otherwise the smoke
+    refuses instead of fabricating a second identity.  The resolved tree is
+    returned so every consumer below reads the snapshot's declared values.
     """
     from description_pipeline import interface_records  # noqa: PLC0415
     from description_pipeline.io import canonical  # noqa: PLC0415
@@ -393,16 +405,16 @@ def _config_snapshot_environment(args, *, target: str) -> dict[str, str]:
             "private_key_file": str(fixture_root / "secrets/tls.key"),
         },
         "storage": {
-            "state_root": str(fixture_root / "state"),
-            "handoff_root": str(fixture_root / "handoffs"),
-            "artifact_root": str(fixture_root / "artifacts"),
-            "workspace_root": str(fixture_root / "workspaces"),
-            "release_root": str(fixture_root / "releases"),
+            "state_root": str(state_root),
+            "handoff_root": str(handoff_root),
+            "artifact_root": str(args.airflow_home / "smoke-artifacts"),
+            "workspace_root": str(workspace_root),
+            "release_root": str(args.airflow_home / "smoke-releases"),
         },
         "database": {"dsn_file": str(fixture_root / "secrets/postgres.dsn")},
         "windows": {
             "ssh_host": "smoke-windows",
-            "endpoint_port": 9765,
+            "endpoint_port": endpoint_port,
             "token_file": str(fixture_root / "secrets/endpoint.token"),
             "instance": {
                 "task_name": "description-smoke-endpoint",
@@ -412,12 +424,12 @@ def _config_snapshot_environment(args, *, target: str) -> dict[str, str]:
             },
         },
         "auth": {
-            "feishu_secret_file": str(fixture_root / "secrets/feishu.json"),
+            "feishu_secret_file": str(args.airflow_home / "feishu.json"),
             "tenant_keys": [FEISHU_TENANT],
             "admin_open_ids": [FEISHU_OPERATOR],
         },
         "targets": {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
-        "specifications": {"record_roots": [str(fixture_root / "specifications")]},
+        "specifications": {"record_roots": list(record_roots)},
     }
     resolved = platform_config.validate_platform(document)
     platform_json_bytes = canonical(document)
@@ -436,7 +448,7 @@ def _config_snapshot_environment(args, *, target: str) -> dict[str, str]:
     fixture_root.mkdir(parents=True, exist_ok=True)
     (fixture_root / "platform.json").write_bytes(platform_json_bytes)
     platform_config.atomic_write_once(fixture_root / "snapshots" / f"{install_id}.json", snapshot_bytes)
-    return {"PLATFORM_CONFIG_DIGEST": digest_value}
+    return {"PLATFORM_CONFIG_DIGEST": digest_value}, resolved
 
 
 def _plugin_preflight(venv: Path, env: dict[str, str], home: Path) -> str | None:
@@ -956,16 +968,6 @@ def main() -> int:
     # run as an identity conflict.
     target = str(fixture["hardware_id"])
 
-    # The controlled platform-configuration identity of this smoke world: one canonical
-    # IF-16 snapshot fixture built/digested by the deploy-side mechanism, published to
-    # the child Airflow services through the environment (same key the operator env
-    # exports).  The runtime freeze still refuses a missing or mismatched digest.
-    try:
-        os.environ.update(_config_snapshot_environment(args, target=target))
-    except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
-        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": f"{type(error).__name__}: {error}"}))
-        return 1
-
     api_port = args.api_port or _free_port()
     intake_root = args.airflow_home / "smoke" / "intake"
     intake = intake_root / HANDOFF_PATH
@@ -985,14 +987,42 @@ def main() -> int:
             bundle_dir=args.airflow_home / "smoke" / "definition",
         )
         port = server.server_address[1]
-    # The one canonical smoke store root.  The directory is created once here (the operator
-    # convention: a dedicated directory under the isolated home, mode 0700) and published to
-    # every consumer of this smoke: the in-process admission and the lazily bound portal read
-    # it from the environment, the scheduler reads the same path from the connection extra
-    # below, and the child processes inherit it through ``env``.
-    # ``PlatformStore.from_environment`` keeps requiring it - there is no implicit fallback
-    # and no second root.
-    store_root = args.airflow_home / "smoke-store"
+    # The controlled platform-configuration identity of this smoke world: one canonical
+    # IF-16 snapshot built by the deploy-side mechanism from THIS run's exact inputs
+    # (paths, ports, records, targets), published to the child Airflow services through
+    # the environment.  Every consumer below reads the snapshot's resolved values - the
+    # snapshot governs the deployed fixture instead of declaring a parallel one, and
+    # the runtime freeze still refuses a missing or mismatched digest.
+    try:
+        snapshot_env, resolved = _config_snapshot_environment(
+            args,
+            target=target,
+            state_root=args.airflow_home / "smoke-state",
+            handoff_root=intake_root,
+            workspace_root=args.airflow_home / "smoke-workspaces",
+            record_roots=[str(fixture_root / "records")],
+            endpoint_port=port,
+        )
+    except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": f"{type(error).__name__}: {error}"}))
+        if server is not None:
+            server.close()
+        return 1
+    os.environ.update(snapshot_env)
+    # The one canonical smoke store root: the snapshot's derived store root, created once
+    # here (the operator convention: a dedicated directory under the isolated home, mode
+    # 0700) and published to every consumer of this smoke: the in-process admission and
+    # the lazily bound portal read it from the environment, the scheduler reads the same
+    # path from the connection extra below, and the child processes inherit it through
+    # ``env``.  ``PlatformStore.from_environment`` keeps requiring it - there is no
+    # implicit fallback and no second root.
+    store_root = Path(resolved["derived"]["store_root"])
+    repository_path = Path(resolved["derived"]["repositories"][REPOSITORY_SLUG])
+    if Path(resolved["storage"]["handoff_root"]) != intake_root:
+        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": "the snapshot handoff root diverged"}))
+        if server is not None:
+            server.close()
+        return 1
     store_root.mkdir(parents=True, exist_ok=True)
     store_root.chmod(0o700)
     os.environ["PIPELINE_STORE_ROOT"] = str(store_root)
@@ -1004,10 +1034,10 @@ def main() -> int:
             "password": TOKEN,
             "extra": {
                 "store_root": str(store_root),
-                "repositories": {REPOSITORY_SLUG: str(args.airflow_home / "smoke-repository")},
-                "targets": {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
-                "handoff_roots": [str(intake_root)],
-                "discovery": {"record_roots": [str(fixture_root / "records")]},
+                "repositories": {REPOSITORY_SLUG: str(repository_path)},
+                "targets": resolved["targets"],
+                "handoff_roots": [resolved["storage"]["handoff_root"]],
+                "discovery": {"record_roots": list(resolved["specifications"]["record_roots"])},
             },
         }
     )
@@ -1134,8 +1164,8 @@ def main() -> int:
                 args.root,
                 f"http://127.0.0.1:{api_port}",
                 intake_root,
-                args.airflow_home / "smoke-repository",
-                {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
+                repository_path,
+                resolved["targets"],
                 DAG_ID,
                 endpoint_holder,
             )
