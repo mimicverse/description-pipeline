@@ -138,6 +138,29 @@ class CapturePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "no sealed source identity"):
             steps._consume_sealed_definition(self.root)
 
+    def test_a_plan_with_an_unknown_axis_request_field_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan["axis_requests"][0].update(invented=1))
+        with self.assertRaisesRegex(PipelineError, "unusable native axis requests"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_the_retired_carrier_keys_are_refused_by_the_freeze_contract(self) -> None:
+        from description_pipeline.sources.solidworks.errors import ConfigError
+        from description_pipeline.sources.solidworks.freeze import validate_source_config
+
+        base = {
+            "provider": "solidworks",
+            "assembly": "/tmp/a/robot.SLDASM",
+            "configuration": "Default",
+            "require_saved": True,
+            "groups": [{"name": "base_link", "components": ["base-1"]}],
+            "axis_requests": [],
+        }
+        validate_source_config(base)
+        for retired in ("bodies", "joints", "frames"):
+            with self.subTest(retired=retired):
+                with self.assertRaisesRegex(ConfigError, "unknown keys"):
+                    validate_source_config({**base, retired: []})
+
 
 if __name__ == "__main__":
     unittest.main()
