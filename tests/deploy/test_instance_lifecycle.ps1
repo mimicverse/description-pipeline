@@ -69,7 +69,7 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
-  'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity'
+  'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
 # ---- strict JSON boundary on the bound CPython 3.12 (PowerShell 5.1-compatible path) --------
@@ -310,6 +310,41 @@ try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Except
 Check 'pins.representation_true_root_change_refused' ($message -match 'cad_domain_override_refused')
 $script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation
 $script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical
+
+# ---- writer residue: the stop gate scans path identity, not path spelling ----
+# Win32_Process reports backslash images while the binding's roots travel slash-normalized; a
+# writer that keeps its image under the root in either spelling must count as residue, while a
+# neighbouring directory never may (the separator stays a boundary).
+$script:WriterImages = @()
+function Get-CimInstance {
+  param($ClassName, $ErrorAction)
+  foreach ($image in $script:WriterImages) { [pscustomobject]@{ ExecutablePath = $image } }
+}
+$residueRoot = 'C:\description-v1-review\endpoint-state'
+$residueGeneration = $residueRoot + '\lifecycle\gen140\generation'
+$residueBinding = @{ state_root = $residueRoot; generation = $residueGeneration }
+$residueImage = $residueGeneration + '\runtime\Scripts\python.exe'
+$script:WriterImages = @($residueImage)
+Check 'writer_residue.same_spelling_counts' ((@(Get-WriterResidue $residueBinding)).Count -eq 1)
+# The regression counterexample: a slash-normalized binding must count the backslash image too.
+$residueForward = @{ state_root = $residueRoot.Replace('\', '/'); generation = $residueGeneration.Replace('\', '/') }
+Check 'writer_residue.forward_binding_backslash_process_counts' ((@(Get-WriterResidue $residueForward)).Count -eq 1)
+# And the reverse spelling agrees.
+$script:WriterImages = @($residueImage.Replace('\', '/'))
+Check 'writer_residue.backslash_binding_forward_process_counts' ((@(Get-WriterResidue $residueBinding)).Count -eq 1)
+# A process under a different root is somebody else's writer.
+$script:WriterImages = @('C:\another-root\runtime\Scripts\python.exe')
+Check 'writer_residue.different_root_ignored' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
+# A near-neighbour prefix is not inside the root: the separator stays the boundary.
+$script:WriterImages = @('C:\description-v1-review\endpoint-state-other\python.exe')
+Check 'writer_residue.near_neighbour_ignored' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
+# The generation prefix counts its writers even outside the state root.
+$script:WriterImages = @($residueImage)
+$residueGenerationOnly = @{ state_root = 'C:\description-v1-review\other-state'; generation = $residueGeneration }
+Check 'writer_residue.generation_prefix_counts' ((@(Get-WriterResidue $residueGenerationOnly)).Count -eq 1)
+# An empty sweep is clean.
+$script:WriterImages = @()
+Check 'writer_residue.empty_sweep_clean' ((@(Get-WriterResidue $residueBinding)).Count -eq 0)
 
 Reset-State
 $facts = Get-OwnershipRefusalFacts $generation $binding
