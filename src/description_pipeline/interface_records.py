@@ -349,6 +349,21 @@ CHECK_POLICY_V1 = {
     "schema_version": CHECK_POLICY_SCHEMA,
     "fixed_checks": sorted(FIXED_REQUIRED_CHECKS),
     "dynamic_expansions": [dict(rule) for rule in CHECK_POLICY_EXPANSIONS],
+    # The one owner of the inspection-preview window: value, applicability and
+    # the analytical sampling rule all live here, inside the same policy digest.
+    "preview": {
+        "revolute_window_rad": math.pi,
+        "applies_when": "inspection_preview_and_engineering_range_proven_missing_and_revolute",
+        "sampling": {"interval_fraction": 1.0},
+    },
+    # The engineering-qualification facts (distinct from model-consistency facts):
+    # per-joint range authority and drive sizing, plus the per-subject machine
+    # qualification.  Only authoritative native/controlled evidence can establish
+    # them; a passing consistency check never does.
+    "engineering_facts": {
+        "per_joint": ["engineering_position_range", "drive_sizing"],
+        "per_subject": ["machine_qualification"],
+    },
 }
 
 
@@ -356,7 +371,12 @@ def validate_check_policy(policy) -> dict:
     """Shape of the frozen check strategy (fixed gates + expansion rules)."""
 
     code = "check_policy_invalid"
-    _exact_keys(policy, {"schema_version", "fixed_checks", "dynamic_expansions"}, code, "policy")
+    _exact_keys(
+        policy,
+        {"schema_version", "fixed_checks", "dynamic_expansions", "preview", "engineering_facts"},
+        code,
+        "policy",
+    )
     _require(policy["schema_version"] == CHECK_POLICY_SCHEMA, code, {"where": "schema_version"})
     fixed = policy["fixed_checks"]
     _require(
@@ -376,10 +396,51 @@ def validate_check_policy(policy) -> dict:
             _require(isinstance(rule.get(key), str) and rule[key], code, {"where": f"{where}.{key}"})
         if "when" in rule:
             _require(isinstance(rule["when"], str) and rule["when"], code, {"where": f"{where}.when"})
+    preview = policy["preview"]
+    _exact_keys(preview, {"revolute_window_rad", "applies_when", "sampling"}, code, "preview")
+    radius = preview["revolute_window_rad"]
+    _require(
+        isinstance(radius, (int, float)) and not isinstance(radius, bool) and math.isfinite(radius) and radius > 0.0,
+        code,
+        {"where": "preview.revolute_window_rad"},
+    )
+    _require(
+        isinstance(preview["applies_when"], str) and preview["applies_when"].strip() != "",
+        code,
+        {"where": "preview.applies_when"},
+    )
+    _exact_keys(preview["sampling"], {"interval_fraction"}, code, "preview.sampling")
+    fraction = preview["sampling"]["interval_fraction"]
+    _require(
+        isinstance(fraction, (int, float))
+        and not isinstance(fraction, bool)
+        and math.isfinite(fraction)
+        and fraction > 0.0,
+        code,
+        {"where": "preview.sampling.interval_fraction"},
+    )
+    facts = policy["engineering_facts"]
+    _exact_keys(facts, {"per_joint", "per_subject"}, code, "engineering_facts")
+    for key in ("per_joint", "per_subject"):
+        values = facts[key]
+        _require(
+            isinstance(values, list)
+            and values
+            and all(isinstance(name, str) and name for name in values)
+            and len(set(values)) == len(values),
+            code,
+            {"where": f"engineering_facts.{key}"},
+        )
     return policy
 
 
 validate_check_policy(CHECK_POLICY_V1)
+
+
+def preview_revolute_window_rad() -> float:
+    """The finite canonical inspection-preview window radius, read from the one policy."""
+
+    return float(CHECK_POLICY_V1["preview"]["revolute_window_rad"])
 
 
 def check_policy_digest() -> str:
@@ -1348,10 +1409,16 @@ def validate_source_record(record) -> dict:
     return record
 
 
-REQUEST_RECORD_SCHEMA = "solidworks-to-urdf.request/v1"
+REQUEST_RECORD_SCHEMA = "solidworks-to-urdf.request/v2"
+
+#: The only two purposes an admitted request may declare.  The frozen request
+#: record is the single purpose authority; the freeze writer and every reader
+#: carry the value explicitly and never default it.
+REQUEST_PURPOSES = ("engineering", "inspection_preview")
 
 _REQUEST_RECORD_KEYS = {
     "schema_version",
+    "purpose",
     "request_id",
     "target_hardware",
     "change_summary",
@@ -1362,12 +1429,15 @@ _REQUEST_RECORD_KEYS = {
 
 
 def validate_request_record(record) -> dict:
-    """``input/request.json``: the freeze-formed request record, before the generator ran.
+    """``input/request.json``: the v2 freeze-formed request record, before the generator ran.
 
     One strict shape shared by the freeze writer and the offline verifier: all
-    seven fields required, no unknown keys (the foundation reader additionally
+    eight fields required, no unknown keys (the foundation reader additionally
     rejects duplicate keys and non-finite numbers while parsing), no null
-    values, strict types - ``request_id`` is non-empty text carried unchanged
+    values, strict types - ``purpose`` is required and must be one of
+    ``engineering``/``inspection_preview`` (a v1 record refuses on its version
+    field: there is no lenient or mixed parsing) - ``request_id`` is non-empty
+    text carried unchanged
     across reuse and never compared with the current run UUID,
     ``main_assembly`` is an engineering-relative portable path (the one
     ``artifact_path_parts`` rule; absolute, UNC and escaping paths refuse), and
@@ -1377,6 +1447,11 @@ def validate_request_record(record) -> dict:
     code = "request_record_invalid"
     _exact_keys(record, _REQUEST_RECORD_KEYS, code, "request")
     _require(record["schema_version"] == REQUEST_RECORD_SCHEMA, code, {"where": "schema_version"})
+    _require(
+        isinstance(record["purpose"], str) and record["purpose"] in REQUEST_PURPOSES,
+        code,
+        {"where": "purpose", "values": list(REQUEST_PURPOSES)},
+    )
     for key in ("request_id", "target_hardware"):
         value = _text(record[key], code, key)
         _require(value.strip() != "", code, {"where": key})

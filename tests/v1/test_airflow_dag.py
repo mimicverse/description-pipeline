@@ -414,6 +414,7 @@ class DagTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
         freeze_request_evidence(
             store_root / "sealed" / parent_run_id / "freeze",
+            purpose="engineering",
             request_id=parent_dag_run_id,
             target_hardware="m3.0",
             change_summary="linked capture rerun",
@@ -502,6 +503,7 @@ class DagTests(unittest.TestCase):
         parent_run_id = native_run_id("portal-parent-2")
         freeze_request_evidence(
             store_root / "sealed" / parent_run_id / "freeze",
+            purpose="engineering",
             request_id="portal-parent-2",
             target_hardware="m3.0",
             change_summary="rebound publish",

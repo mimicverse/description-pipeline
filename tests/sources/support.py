@@ -890,7 +890,8 @@ def write_target_delivery(
     if request is None:
         payload_handoff = (discovery or {}).get("handoff_sha256") if isinstance(discovery, dict) else None
         request = {
-            "schema_version": "solidworks-to-urdf.request/v1",
+            "schema_version": "solidworks-to-urdf.request/v2",
+            "purpose": "engineering",
             "request_id": "00000000-0000-4000-8000-000000000000",
             "target_hardware": str(selection["hardware_id"]),
             "change_summary": str((source.get("metadata") or {}).get("change_summary") or "fixture"),

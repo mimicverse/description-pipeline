@@ -25,6 +25,7 @@ DIGEST = "a" * 64
 
 def record(**overrides) -> dict:
     payload = {
+        "purpose": "engineering",
         "request_id": "portal-20261016T000000-abcdef01",
         "target_hardware": "m3.0",
         "change_summary": "one line",
@@ -43,11 +44,23 @@ class RequestEvidenceTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.path = self.root / "input" / "request.json"
 
-    def test_builds_exactly_the_seven_fields_in_canonical_bytes(self) -> None:
+    def test_builds_exactly_the_eight_fields_in_canonical_bytes(self) -> None:
         evidence = record()
         self.assertEqual(set(evidence), set(REQUEST_FIELDS))
         self.assertEqual(evidence["schema_version"], REQUEST_SCHEMA)
         self.assertEqual(request_evidence_bytes(evidence), canonical(evidence))
+
+    def test_purpose_is_required_explicit_and_only_the_two_values(self) -> None:
+        base = record()
+        self.assertEqual(base["purpose"], "engineering")
+        self.assertEqual(record(purpose="inspection_preview")["purpose"], "inspection_preview")
+        without = {key: value for key, value in base.items() if key != "purpose"}
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
+            request_evidence_bytes(without)
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
+            request_evidence_bytes({**base, "purpose": "preview"})
+        with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
+            request_evidence_bytes({**base, "purpose": None})
 
     def test_change_summary_is_lf_normalized_and_other_controls_are_refused(self) -> None:
         self.assertEqual(record(change_summary="line1\r\nline2\rline3")["change_summary"], "line1\nline2\nline3")
@@ -64,7 +77,7 @@ class RequestEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             record(platform_config_digest="F" * 64)
         with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
-            request_evidence_bytes({**record(), "schema_version": "solidworks-to-urdf.request/v2"})
+            request_evidence_bytes({**record(), "schema_version": "solidworks-to-urdf.request/v1"})
         extra = {**record(), "secret": "nope"}
         with self.assertRaisesRegex(PipelineError, "request_record_invalid"):
             request_evidence_bytes(extra)
@@ -115,6 +128,7 @@ class RequestEvidenceTests(unittest.TestCase):
         run_dir = self.root / "run-1"
         written = freeze_request_evidence(
             run_dir,
+            purpose="engineering",
             request_id="portal-20261016T000000-abcdef01",
             target_hardware="m3.0",
             change_summary="freeze first",

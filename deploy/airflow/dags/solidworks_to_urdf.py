@@ -53,6 +53,7 @@ from description_pipeline.delivery import (
 from description_pipeline.interface_records import (
     CACHE_IMPORT_CONFIRMATION_SCHEMA,
     CHECK_POLICY_SCHEMA,
+    REQUEST_PURPOSES,
     cache_import_confirmation_digest,
     cache_release_params_digest,
     check_policy_digest,
@@ -1361,9 +1362,15 @@ def solidworks_to_urdf():
             raise AirflowFailException(
                 "conf platform_config_digest does not match the controlled platform configuration identity"
             )
+        purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
+        if purpose not in REQUEST_PURPOSES:
+            raise AirflowFailException(
+                "purpose is required: the admitted request must declare engineering or inspection_preview"
+            )
         paths = _work_paths(CONN_ID, run_id)
         evidence = freeze_request_evidence(
             paths.run_dir,
+            purpose=purpose,
             request_id=request_id,
             target_hardware=identity["hardware_id"],
             change_summary=identity.get("change_summary") or "",
@@ -1373,6 +1380,7 @@ def solidworks_to_urdf():
         )
         request["request_evidence"] = str(evidence)
         request["request_id"] = request_id
+        request["purpose"] = purpose
         _register_freeze_stage(paths, run_id, intake=intake, upload_files=upload_files)
         return request
 

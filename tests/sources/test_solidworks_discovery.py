@@ -2193,7 +2193,8 @@ class DiscoveryTests(unittest.TestCase):
         payload = json.loads((delivery / "evidence" / "discovery.json").read_text(encoding="utf-8"))
         original = json.dumps(
             {
-                "schema_version": "solidworks-to-urdf.request/v1",
+                "schema_version": "solidworks-to-urdf.request/v2",
+                "purpose": "engineering",
                 "request_id": "89e1c51f-e6c9-4d01-9467-f3c403c081e1",
                 "target_hardware": target,
                 "change_summary": "真实提交说明\n第二行",

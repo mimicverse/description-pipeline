@@ -1,12 +1,16 @@
-"""The one frozen request evidence: ``input/request.json`` (schema ``solidworks-to-urdf.request/v1``).
+"""The one frozen request evidence: ``input/request.json`` (schema ``solidworks-to-urdf.request/v2``).
 
 ``freeze`` forms this record before the derivation or generator runs, and every
 later stage carries its original bytes verbatim; the freeze receipt binds the
-file digest.  The record binds only intake-visible facts: the authenticated
-request id, the verified selected target, the LF-normalized submission summary,
-the explicit main assembly, the full upload index digest and the actual platform
-config snapshot identity - never secrets or credentials.  A delivery that lacks
-the file is refused; there is no fallback to any earlier representation.
+file digest.  The record binds only intake-visible facts: the declared purpose
+(the single purpose authority every stage and verifier consumes), the
+authenticated request id, the verified selected target, the LF-normalized
+submission summary, the explicit main assembly, the full upload index digest and
+the actual platform config snapshot identity - never secrets or credentials.
+Writers and readers carry the purpose explicitly and never default it; a v1
+record refuses on its version field (no lenient or mixed parsing).  A delivery
+that lacks the file is refused; there is no fallback to any earlier
+representation.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ REQUEST_SCHEMA = REQUEST_RECORD_SCHEMA
 REQUEST_RELATIVE = "input/request.json"
 REQUEST_FIELDS = (
     "schema_version",
+    "purpose",
     "request_id",
     "target_hardware",
     "change_summary",
@@ -28,6 +33,8 @@ REQUEST_FIELDS = (
     "handoff_digest",
     "platform_config_digest",
 )
+
+
 def normalize_change_summary(value: str) -> str:
     """Fold CRLF (and a lone CR) into LF before the evidence is frozen."""
 
@@ -36,6 +43,7 @@ def normalize_change_summary(value: str) -> str:
 
 def build_request_evidence(
     *,
+    purpose,
     request_id,
     target_hardware,
     change_summary,
@@ -43,10 +51,11 @@ def build_request_evidence(
     handoff_digest,
     platform_config_digest,
 ) -> dict:
-    """The validated seven-field record, minus every secret the platform holds."""
+    """The validated eight-field v2 record, minus every secret the platform holds."""
 
     record = {
         "schema_version": REQUEST_SCHEMA,
+        "purpose": purpose.strip() if isinstance(purpose, str) else purpose,
         "request_id": request_id.strip() if isinstance(request_id, str) else request_id,
         "target_hardware": target_hardware.strip() if isinstance(target_hardware, str) else target_hardware,
         "change_summary": (
@@ -108,6 +117,7 @@ def verify_request_evidence(path: str | Path, *, expected_sha256: str) -> dict:
 def freeze_request_evidence(
     run_dir: str | Path,
     *,
+    purpose,
     request_id,
     target_hardware,
     change_summary,
@@ -124,6 +134,7 @@ def freeze_request_evidence(
     """
 
     record = build_request_evidence(
+        purpose=purpose,
         request_id=request_id,
         target_hardware=target_hardware,
         change_summary=change_summary,

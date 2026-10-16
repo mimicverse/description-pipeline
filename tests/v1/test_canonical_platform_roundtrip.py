@@ -71,6 +71,7 @@ def _run_scenario(root: Path) -> dict:
     )
     freeze_request_evidence(
         paths.run_dir,
+        purpose="engineering",
         request_id="independent-real-roundtrip",
         target_hardware="nd_fixture",
         change_summary="Independent control roundtrip",
