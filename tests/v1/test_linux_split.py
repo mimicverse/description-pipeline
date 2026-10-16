@@ -44,6 +44,7 @@ from .test_platform_store import FakeWorld
 from .test_stage_transfer import capture_root, native_tool
 
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
+NEGATIVE = "8d7f2a55-6c1b-4e3a-9f20-5a4b6c7d8e9f"
 
 
 class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
@@ -77,8 +78,8 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
     def _portable(self, **overrides):
         return portable_record(self.tool, **overrides)
 
-    def _record_generate(self, run_id: str = RUN) -> str:
-        """A real generated-shaped registered checkpoint (reuse fixture)."""
+    def _generate_tree(self, run_id: str) -> Path:
+        """A generated-shaped stage tree: the admitted capture plus derived products (fixture)."""
         paths = self._paths(run_id)
         output = self.tmp / f"fixture-generate-{run_id}"
         shutil.copytree(paths.capture_dir, output)
@@ -86,6 +87,11 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
         write_json(output / "model" / "robot.json", {"model": "fixture"})
         (output / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
         (output / "meshes" / "base.stl").write_bytes(b"STL-BYTES")
+        return output
+
+    def _record_generate(self, run_id: str = RUN) -> str:
+        """A real generated-shaped registered checkpoint (reuse fixture)."""
+        output = self._generate_tree(run_id)
         completed = self._register_stage(run_id, "generate", output, state="generated")
         return completed["subject_sha256"]
 
@@ -259,7 +265,9 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
 
         A registered verify checkpoint whose claimed qualification no longer
         resolves against its own sealed records is refused at replay without
-        rerunning the driver; the qualified receipt reads back and is reused.
+        rerunning the driver (the negative keeps the report file, the receipt
+        payload and the artifact records mutually consistent and drifts only the
+        claimed evidence digest); the qualified receipt reads back and is reused.
         The sealed report-file-bytes vs receipt-payload consistency checked by
         the retired LinuxStore is a separate obligation and is tracked as an
         open item in the wave-2 mapping (C3): the platform store validates the
@@ -288,6 +296,7 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
             write_json(tree / "reports" / "quality.json", quality)
             completed = self._register_stage(RUN, "verify", tree, state="verified", quality=quality)
             uri = self.store.stage_records(RUN)["verify"]["checkpoint_uri"]
+            self.assertEqual(uri, f"store://sealed/{RUN}/verify")
             # Positive control: the qualified receipt reads back and the flow reuses it.
             self.assertEqual(self.store.confirmed_stage(RUN, "verify"), completed)
             with (
@@ -296,18 +305,53 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
             ):
                 reused = flow.run_stage(self.store, self.store_root, RUN, "verify", expected_subject=subject)
             self.assertEqual(reused, completed)
-            # Only one evidence digest drifts away from the sealed bytes; the claimed
-            # qualification is now ungrounded and the replay refuses it.
-            ungrounded_quality = json.loads(json.dumps(quality))
-            ungrounded_quality["qualifications"][0]["evidence"][0]["sha256"] = "0" * 64
-            ungrounded = {**completed, "quality": ungrounded_quality}
-            self.world.stages[(RUN, "verify")] = ("completed", ungrounded, uri)
+
+        # Negative: a second, otherwise-valid attempt whose reported-evidence digest
+        # drifts away from the real sealed record.  The report file, the receipt
+        # payload and the artifact records stay mutually consistent; only the claimed
+        # qualification is ungrounded, so the replay must refuse with
+        # ``qualification_invalid`` (never rerunning the driver) even under a
+        # report/receipt consistency gate.
+        self.store.admit_run(
+            request_id="q-reground-negative",
+            run_id=NEGATIVE,
+            principal="portal",
+            target_hardware="nd",
+            main_assembly=MAIN_ASSEMBLY,
+            dispatch={"stage": "capture", "operation_key": f"{NEGATIVE}/capture:0", "params_digest": "a" * 64},
+        )
+        negative_archive = self.tmp / "negative-evidence.zip"
+        seal_capture(
+            capture_root(self.tmp / "negative-native", run_id=NEGATIVE, handoff=HANDOFF),
+            negative_archive,
+            run_id=NEGATIVE,
+            handoff_sha256=HANDOFF,
+            main_assembly=MAIN_ASSEMBLY,
+            native_tool=self.tool,
+        )
+        self.admit(NEGATIVE, archive=negative_archive)
+        negative_tree = self._generate_tree(NEGATIVE)
+        negative_subject = subject_digest(negative_tree)
+        with mock.patch.object(solidworks_urdf, "rebuilt_definition", return_value=definition):
+            drifted = {
+                "passed": True,
+                "subject_sha256": negative_subject,
+                "checks": checks,
+                "required_checks": expected,
+                "qualifications": json.loads(json.dumps(qualifications(negative_tree, definition, checks))),
+            }
+            drifted["qualifications"][0]["evidence"][0]["sha256"] = "0" * 64
+            write_json(negative_tree / "reports" / "quality.json", drifted)
+            negative_uri, negative_receipt = self._seal_stage(
+                NEGATIVE, "verify", negative_tree, state="verified", quality=drifted
+            )
+            self.world.stages[(NEGATIVE, "verify")] = ("completed", negative_receipt, negative_uri)
             with (
                 mock.patch.object(flow, "tool_record", return_value=self._portable()),
                 mock.patch.object(flow.solidworks, "verify", side_effect=AssertionError("must not rerun")),
                 self.assertRaisesRegex(PipelineError, "qualification_invalid"),
             ):
-                flow.run_stage(self.store, self.store_root, RUN, "verify", expected_subject=subject)
+                flow.run_stage(self.store, self.store_root, NEGATIVE, "verify", expected_subject=negative_subject)
 
     def test_stage_guards_and_identity_gate_fail_closed(self) -> None:
         self.admit(RUN)
