@@ -842,8 +842,11 @@ case "$ACTION" in
       # start-window close above is the only admission transition that was written.
       echo "start complete: services are running; the platform admission stays closed (--keep-admission-closed)"
     else
-      # The gate opens only after every precondition, the identity check, the services and the
-      # ingress readiness confirmation succeeded; any failure above leaves it closed.
+      # The gate opens only after every precondition, the identity check, the services, the
+      # ingress readiness confirmation and the bounded Linux health gate (HTTP included)
+      # succeeded; any failure above leaves it closed.
+      OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/health_gate.sh" "$OPERATOR_STATE/health-gate/start-$(date -u +%Y%m%dT%H%M%SZ)" \
+        || die "the Linux health gate did not pass; the platform admission stays closed"
       platform_open_admission
       echo "start complete: admission open"
     fi
@@ -1224,7 +1227,8 @@ PY
       && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/final-health.json" \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/final-health.json" --release-file "$RELEASE_FILE" \
-        --record "$STATE_ROOT/install-record.json" --out "$EVIDENCE_DIR/final-identity.json"
+        --record "$STATE_ROOT/install-record.json" --out "$EVIDENCE_DIR/final-identity.json" \
+      && OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/health_gate.sh" "$EVIDENCE_DIR/linux-health-$(date -u +%Y%m%dT%H%M%SZ)"
     } > "$EVIDENCE_DIR/verify.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote verify failed "$EVIDENCE_DIR/verify.out"
       die "the switched ends did not verify (the admission stays closed)"

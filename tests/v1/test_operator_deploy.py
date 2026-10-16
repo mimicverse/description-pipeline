@@ -51,6 +51,7 @@ def encode_env_value(value: str) -> str:
 RENDER = OPERATOR / "render_operator.py"
 CONTROL = OPERATOR / "operatorctl.sh"
 HEALTH = OPERATOR / "health.sh"
+HEALTH_GATE = OPERATOR / "health_gate.sh"
 
 
 def base_env(state: Path, **overrides: str) -> dict[str, str]:
@@ -665,6 +666,31 @@ class RenderTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+
+    def _control_tree(self, tmp: Path) -> Path:
+        """A release-local operator mirror: real siblings, a stub health probe.
+
+        The lifecycle calls its own sibling health_gate.sh whose probe is the sibling
+        health.sh; the mirror keeps every real file while the probe becomes a stub, so the
+        suite exercises the real gate wiring without live HTTP services.
+        """
+        release = tmp / "release"
+        op = release / "deploy" / "operator"
+        op.mkdir(parents=True)
+        (release / "release.json").write_text("{}\n", encoding="utf-8")
+        for name in ("airflow", "platform"):
+            os.symlink(OPERATOR.parent / name, release / "deploy" / name)
+        for item in OPERATOR.iterdir():
+            if item.name in {"operatorctl.sh", "health_gate.sh", "health.sh"}:
+                continue
+            os.symlink(item, op / item.name)
+        (op / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
+        (op / "health_gate.sh").write_bytes(HEALTH_GATE.read_bytes())
+        write_stub(
+            op / "health.sh",
+            '#!/usr/bin/env bash\necho "health-gate probe" >> "$ORDER_LOG"\nexit "${HEALTH_GATE_RC:-0}"\n',
+        )
+        return op / "operatorctl.sh"
     def _render_units(self, tmp: Path) -> tuple[Path, Path, Path, Path]:
         config_path, env_path, env = platform_fixture(tmp)
         state = Path(env["OPERATOR_STATE"])
@@ -865,13 +891,16 @@ class LifecycleTests(unittest.TestCase):
             "EXPECTED_PLATFORM_DSN": derived_env["PLATFORM_OPERATOR_DSN"],
             "FIXTURE_HEALTH_FILE": str(health_file),
         }
-        return config_path, env, admission, order
+        control = self._control_tree(tmp)
+        return config_path, env, admission, order, control
 
     def test_start_opens_the_admission_only_after_the_ingress_is_ready(self) -> None:
         for register_after in (0, 1):
             with self.subTest(register_after=register_after), tempfile.TemporaryDirectory() as tmp:
-                config_path, env, admission, order = self._admission_fixture(Path(tmp), register_after=register_after)
-                result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
+                config_path, env, admission, order, control = self._admission_fixture(
+                    Path(tmp), register_after=register_after
+                )
+                result = run(["bash", str(control), "start", "--config", str(config_path)], env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(admission.read_text().strip(), "false")
                 lines = order.read_text().splitlines()
@@ -889,13 +918,15 @@ class LifecycleTests(unittest.TestCase):
                     "systemctl --user is-active --quiet description-portal.service description-operator-proxy.service"
                 )
                 self.assertLess(ingress, ready)
-                self.assertLess(ready, lines.index("platform open_admission"))
+                probe = lines.index("health-gate probe")
+                self.assertLess(ready, probe, "the Linux health gate runs after the ingress is ready")
+                self.assertLess(probe, lines.index("platform open_admission"), "the open waits for a passed gate")
                 self.assertEqual(lines.count("airflow dags unpause solidworks_to_urdf"), register_after + 1)
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             admission.write_text("false")  # a leftover open gate from an interrupted window
             env["START_INGRESS_RC"] = "7"
-            result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
+            result = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("platform admission stays closed", result.stderr)
             # The DAG scheduling unpause already happened (a recorded fact); the PLATFORM gate
@@ -909,20 +940,21 @@ class LifecycleTests(unittest.TestCase):
                 "the start window closes the leftover gate before scheduling changes",
             )
             self.assertNotIn("is-active", order_text)
+            self.assertNotIn("health-gate probe", order_text)
             self.assertNotIn("platform open_admission", order_text)
 
     def test_promote_and_rollback_refuse_before_any_side_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, _, order = self._admission_fixture(Path(tmp))
-            missing_id = run(["bash", str(CONTROL), "promote", "--config", str(config_path)], env)
+            config_path, env, _, order, control = self._admission_fixture(Path(tmp))
+            missing_id = run(["bash", str(control), "promote", "--config", str(config_path)], env)
             self.assertEqual(missing_id.returncode, 1)
             self.assertIn("requires --install-id", missing_id.stderr)
             no_receipt = run(
-                ["bash", str(CONTROL), "promote", "--config", str(config_path), "--install-id", "gen-9"], env
+                ["bash", str(control), "promote", "--config", str(config_path), "--install-id", "gen-9"], env
             )
             self.assertEqual(no_receipt.returncode, 1)
             self.assertIn("run stage first", no_receipt.stderr)
-            rollback = run(["bash", str(CONTROL), "rollback", "--config", str(config_path)], env)
+            rollback = run(["bash", str(control), "rollback", "--config", str(config_path)], env)
             self.assertEqual(rollback.returncode, 1)
             self.assertIn("no promotion receipt", rollback.stderr)
             lines = order.read_text(encoding="utf-8").splitlines() if order.exists() else []
@@ -931,13 +963,13 @@ class LifecycleTests(unittest.TestCase):
 
     def test_reconcile_binds_a_registered_operation_and_refuses_unbound_claims(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, _, order = self._admission_fixture(Path(tmp))
-            refused = run(["bash", str(CONTROL), "reconcile", "--config", str(config_path)], env)
+            config_path, env, _, order, control = self._admission_fixture(Path(tmp))
+            refused = run(["bash", str(control), "reconcile", "--config", str(config_path)], env)
             self.assertEqual(refused.returncode, 1)
             self.assertIn("reconcile requires", refused.stderr)
             bad = run(
                 [
-                    "bash", str(CONTROL), "reconcile", "--config", str(config_path),
+                    "bash", str(control), "reconcile", "--config", str(config_path),
                     "--run-id", "run-1", "--stage", "capture", "--outcome", "unresolved",
                     "--evidence", "receipt.json",
                 ],
@@ -947,7 +979,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("unresolved is not a result", bad.stderr)
             reconciled = run(
                 [
-                    "bash", str(CONTROL), "reconcile", "--config", str(config_path),
+                    "bash", str(control), "reconcile", "--config", str(config_path),
                     "--run-id", "run-1", "--stage", "capture", "--outcome", "completed",
                     "--evidence", "receipt.json",
                 ],
@@ -962,8 +994,8 @@ class LifecycleTests(unittest.TestCase):
 
     def test_unpause_failure_does_not_start_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp), unpause_rc=7)
-            result = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp), unpause_rc=7)
+            result = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
             self.assertEqual(admission.read_text().strip(), "true")
             self.assertNotIn("description-portal.service", order.read_text())
@@ -971,9 +1003,9 @@ class LifecycleTests(unittest.TestCase):
 
     def test_start_keep_admission_closed_starts_the_services_without_opening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             result = run(
-                ["bash", str(CONTROL), "start", "--config", str(config_path), "--keep-admission-closed"], env
+                ["bash", str(control), "start", "--config", str(config_path), "--keep-admission-closed"], env
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("services are running; the platform admission stays closed", result.stdout)
@@ -989,8 +1021,8 @@ class LifecycleTests(unittest.TestCase):
             )
         # Default behavior is unchanged: without the switch the verified start opens the gate.
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
-            default = run(["bash", str(CONTROL), "start", "--config", str(config_path)], env)
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
+            default = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
             self.assertEqual(admission.read_text().strip(), "false")
             default_calls = order.read_text()
@@ -999,11 +1031,11 @@ class LifecycleTests(unittest.TestCase):
 
     def test_start_keep_admission_closed_failure_stays_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             admission.write_text("false")  # a leftover open gate from an interrupted window
             env["START_INGRESS_RC"] = "7"
             result = run(
-                ["bash", str(CONTROL), "start", "--config", str(config_path), "--keep-admission-closed"], env
+                ["bash", str(control), "start", "--config", str(config_path), "--keep-admission-closed"], env
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("platform admission stays closed", result.stderr)
@@ -1013,9 +1045,62 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("platform open_admission", lines)
             self.assertNotIn("airflow dags unpause solidworks_to_urdf", lines)
 
+    def test_start_health_gate_failure_keeps_the_admission_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, _admission, order, control = self._admission_fixture(Path(tmp))
+            # The explicit internal path: the mirror carries the real gate with explicit small
+            # bounds, the probe always fails.  The lifecycle itself stays on the fixed policy.
+            mirror_gate = (
+                HEALTH_GATE.read_text(encoding="utf-8")
+                .replace('DEADLINE_S="${2:-180}"', 'DEADLINE_S="${2:-0.5}"')
+                .replace('PER_PROBE_S="${3:-60}"', 'PER_PROBE_S="${3:-0.5}"')
+                .replace('INTERVAL_S="${4:-5}"', 'INTERVAL_S="${4:-0.1}"')
+            )
+            write_stub(control.parent / "health_gate.sh", mirror_gate)
+            write_stub(
+                control.parent / "health.sh",
+                '#!/usr/bin/env bash\necho "health-gate probe" >> "$ORDER_LOG"\nexit 5\n',
+            )
+            result = run(["bash", str(control), "start", "--config", str(config_path)], env)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Linux health gate did not pass", result.stderr)
+            lines = order.read_text().splitlines()
+            self.assertIn("health-gate probe", lines)
+            self.assertNotIn("platform open_admission", lines)
+            state_dir = Path(env["ORDER_LOG"]).parent / "state"
+            summaries = sorted((state_dir / "health-gate").glob("start-*/run-*/summary.txt"))
+            self.assertEqual(len(summaries), 1)
+            self.assertIn("linux_health_gate=FAIL", summaries[0].read_text(encoding="utf-8"))
+
+    def test_start_keep_admission_closed_does_not_consult_the_health_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
+            env["HEALTH_GATE_RC"] = "5"  # would fail the open if it were (wrongly) consulted
+            result = run(
+                ["bash", str(control), "start", "--config", str(config_path), "--keep-admission-closed"], env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("health-gate probe", order.read_text(encoding="utf-8"))
+            self.assertEqual(admission.read_text().strip(), "true")
+
+    def test_promote_verify_gates_the_linux_health_before_its_open(self) -> None:
+        control = CONTROL.read_text(encoding="utf-8")
+        self.assertEqual(
+            control.count('bash "$HERE/health_gate.sh"'),
+            2,
+            "the one gate serves both the plain start and promote's verify step",
+        )
+        verify_anchor = control.index('--out "$EVIDENCE_DIR/final-identity.json"')
+        gate_in_promote = control.index('bash "$HERE/health_gate.sh" "$EVIDENCE_DIR/linux-health-')
+        open_in_promote = control.index('platform_open_admission > "$EVIDENCE_DIR/open-admission.out"')
+        self.assertLess(verify_anchor, gate_in_promote, "the promote gate runs inside the verify step")
+        self.assertLess(gate_in_promote, open_in_promote, "the promote opens only after the gate")
+        start_gate = control.index('bash "$HERE/health_gate.sh" "$OPERATOR_STATE/health-gate/start-')
+        self.assertLess(start_gate, control.rindex("platform_open_admission"), "the start opens only after the gate")
+
     def test_keep_admission_closed_flag_is_refused_by_other_verbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             untouched = admission.read_text(encoding="utf-8")
             before = order.read_text(encoding="utf-8") if order.exists() else None
             for action in (
@@ -1032,7 +1117,7 @@ class LifecycleTests(unittest.TestCase):
             ):
                 with self.subTest(action=action):
                     result = run(
-                        ["bash", str(CONTROL), action, "--config", str(config_path), "--keep-admission-closed"],
+                        ["bash", str(control), action, "--config", str(config_path), "--keep-admission-closed"],
                         env,
                     )
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -1040,6 +1125,7 @@ class LifecycleTests(unittest.TestCase):
                     self.assertEqual(admission.read_text(encoding="utf-8"), untouched)
                     after = order.read_text(encoding="utf-8") if order.exists() else None
                     self.assertEqual(before, after, f"{action} performed a side effect before the refusal")
+        # The usage probe runs outside the temporary fixture: the real control script.
         usage = run(["bash", str(CONTROL)], {})
         self.assertEqual(usage.returncode, 2)
         self.assertIn("--keep-admission-closed", usage.stderr)
@@ -1050,14 +1136,14 @@ class LifecycleTests(unittest.TestCase):
 
     def test_stop_requires_closed_admission_and_settled_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             admission.write_text("false")
-            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            result = run(["bash", str(control), "stop", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 1)
             self.assertIn("run drain first", result.stderr)
             self.assertFalse(order.exists())
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             self._project(
                 env,
                 {
@@ -1068,12 +1154,12 @@ class LifecycleTests(unittest.TestCase):
                 },
                 1,
             )
-            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            result = run(["bash", str(control), "stop", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 1)
             self.assertIn("stop refused", result.stderr)
             self.assertFalse(order.exists())
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             self._project(
                 env,
                 {
@@ -1084,13 +1170,13 @@ class LifecycleTests(unittest.TestCase):
                 },
                 1,
             )
-            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            result = run(["bash", str(control), "stop", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 1)
             self.assertIn("stop refused", result.stderr)
             self.assertFalse(order.exists())
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
-            result = run(["bash", str(CONTROL), "stop", "--config", str(config_path)], env)
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
+            result = run(["bash", str(control), "stop", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             lines = order.read_text().splitlines()
             self.assertEqual(
@@ -1103,20 +1189,20 @@ class LifecycleTests(unittest.TestCase):
 
     def test_drain_closes_admission_and_requires_resolved_outcomes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             admission.write_text("false")
-            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(admission.read_text().strip(), "true")
             self.assertIn("airflow dags pause solidworks_to_urdf", order.read_text())
             self.assertIn('"settled": true', result.stdout)
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp), pause_rc=9)
-            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp), pause_rc=9)
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("could not pause the DAG scheduling", result.stderr)
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             self._project(
                 env,
                 {
@@ -1127,12 +1213,12 @@ class LifecycleTests(unittest.TestCase):
                 },
                 1,
             )
-            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 1)
             self.assertIn("reconcile must close them", result.stderr)
             self.assertIn('"unresolved"', result.stdout)
         with tempfile.TemporaryDirectory() as tmp:
-            config_path, env, admission, order = self._admission_fixture(Path(tmp))
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
             self._project(
                 env,
                 {
@@ -1143,15 +1229,15 @@ class LifecycleTests(unittest.TestCase):
                 },
                 0,
             )
-            result = run(["bash", str(CONTROL), "drain", "--config", str(config_path)], env)
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('"run_id": "run-active"', result.stdout)
 
     def test_gates_query_with_the_installed_platform_dsn(self) -> None:
         for action in ("drain", "stop"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
-                config_path, env, _, _ = self._admission_fixture(Path(tmp))
-                result = run(["bash", str(CONTROL), action, "--config", str(config_path)], env)
+                config_path, env, _, _, control = self._admission_fixture(Path(tmp))
+                result = run(["bash", str(control), action, "--config", str(config_path)], env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 observed = json.loads(Path(env["LIFECYCLE_ENV_LOG"]).read_text(encoding="utf-8"))
                 self.assertEqual(observed["dsn"], observed["expected_dsn"])
@@ -1450,6 +1536,7 @@ class LifecycleTests(unittest.TestCase):
         for script in (
             CONTROL,
             HEALTH,
+            HEALTH_GATE,
             OPERATOR / "scripts" / "install_toolchain.sh",
             OPERATOR / "scripts" / "install_proxy.sh",
             OPERATOR / "scripts" / "ensure_proxy_binary.sh",
@@ -1480,6 +1567,7 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "airflow" / "dags").mkdir()
         (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
         (release / "operator" / "health.sh").write_bytes(HEALTH.read_bytes())
+        (release / "operator" / "health_gate.sh").write_bytes(HEALTH_GATE.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
         for module in ("platform_config.py", "platform_env.py", "install_record.py", "promotion.py", "backup.py"):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
@@ -2036,6 +2124,10 @@ class InstallOrderingTests(unittest.TestCase):
         health_file.write_text(json.dumps({"passed": True, "verb": "health", "health": health}), encoding="utf-8")
         env["FIXTURE_HEALTH_FILE"] = str(health_file)
 
+    def _linux_health_double(self, release: Path) -> None:
+        """The gate runs for real; its Linux probe is a bound double (no live HTTP services)."""
+        write_stub(release / "operator" / "health.sh", "#!/usr/bin/env bash\nexit 0\n")
+
     def test_maintenance_reconcile_verifies_the_candidate_before_any_ddl(self) -> None:
         """A tampered staged snapshot refuses with zero live-DDL calls."""
 
@@ -2315,6 +2407,7 @@ class InstallOrderingTests(unittest.TestCase):
             staged = self._maintenance(release, control_env, "stage", "gen-2")
             self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
             self._clone_generation_stubs(state)
+            self._linux_health_double(release)
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
             self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
             active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
@@ -2622,6 +2715,7 @@ class InstallOrderingTests(unittest.TestCase):
                 json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
             )
             self._clone_generation_stubs(state)
+            self._linux_health_double(release)
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
             self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
             self.assertEqual(
