@@ -20,6 +20,18 @@ Linux 负责上传冻结、受控规格、结构推导、模型生成、独立�
 
 验证通过表示[规定检查](docs/quality.md)通过。工程批准、仿真、训练与实机控制分别验收；候选 PR 不赋予这些资格，且绑定所选用途——不同用途的候选与发布恢复身份相互隔离。模型交付包含视觉网格和物理属性，碰撞模型及控制接口由对应用途的工程流程负责。
 
+## URDF → MJCF
+
+已交付的 URDF 与其引用的本地网格可在锁定环境中投影为高精度 MuJoCo 机器人和可选基础场景：
+
+```sh
+description mjcf build /path/to/source --urdf urdf/robot.urdf \
+  --config /path/to/simulation.json --output /path/to/new-mjcf
+description mjcf check /path/to/new-mjcf
+```
+
+URDF 是机械事实的唯一来源；`simulation.json` 只提供基座模式、碰撞来源与接触参数、显式 `sites` 或由几何推导的 `support_sites`（显式选择 link，结果不明确时报错），以及数值或 `"supports"`（贴地）的地面高度。构建只写入新目录，并在提交前由独立进程重新加载实际 MJCF 完成全部检查；领域契约、支持边界与验收判据见 [URDF 转 MJCF](docs/mjcf.md)。
+
 ## 文档
 
 本文档集规定系统的目标行为。实现、机器契约、命令帮助和验收必须与其一致。
@@ -31,6 +43,7 @@ Linux 负责上传冻结、受控规格、结构推导、模型生成、独立�
 | [机械交付规范](docs/mechanical-handoff-spec.md) | 原生工程要求及工程责任 |
 | [质量规范](docs/quality.md) | 独立验证、数值判据与资格边界 |
 | [操作指南](docs/operations.md) | 提交、检查、修正、重跑与模型评审 |
+| [URDF 转 MJCF](docs/mjcf.md) | 仿真配置、支撑推导、支持边界与独立验收判据 |
 | [部署指南](docs/deployment.md) | 安装、配置、验收、升级与恢复 |
 | [开发指南](CONTRIBUTING.md) | 代码组织、测试与文档维护 |
 | [工具发布](RELEASING.md) | 构建、原生验收与发行物发布 |

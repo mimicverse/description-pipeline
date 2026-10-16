@@ -35,6 +35,15 @@ def parser() -> argparse.ArgumentParser:
     serve = operations.add_parser("serve", help="run the authenticated Windows endpoint used by Apache Airflow")
     serve.add_argument("--config", type=Path, required=True)
     operations.add_parser("doctor", help="check this host's native or portable runtime")
+    mjcf = operations.add_parser("mjcf", help="freeze, project and verify a MuJoCo delivery from a delivered URDF")
+    mjcf_commands = mjcf.add_subparsers(dest="mjcf_operation", required=True)
+    mjcf_build = mjcf_commands.add_parser("build", help="project a new checked MJCF delivery from a URDF tree")
+    mjcf_build.add_argument("root", type=Path, help="directory holding the URDF and every mesh it references")
+    mjcf_build.add_argument("--urdf", required=True, help="URDF path relative to the root")
+    mjcf_build.add_argument("--config", type=Path, required=True, help="simulation configuration JSON")
+    mjcf_build.add_argument("--output", type=Path, required=True, help="new output directory (must not exist)")
+    mjcf_check = mjcf_commands.add_parser("check", help="independently verify an MJCF delivery")
+    mjcf_check.add_argument("bundle", type=Path)
     return commands
 
 
@@ -53,6 +62,15 @@ def main(argv: list[str] | None = None) -> int:
             result = check_bundle(arguments.bundle)
             if arguments.report:
                 _write_report(arguments.report, result, arguments.bundle)
+        elif arguments.operation == "mjcf":
+            if arguments.mjcf_operation == "build":
+                from . import mjcf
+
+                result = mjcf.build(arguments.root, arguments.urdf, arguments.config, arguments.output)
+            else:
+                from .verification.mjcf import check_bundle
+
+                result = check_bundle(arguments.bundle)
         else:
             from . import solidworks
 
