@@ -26,14 +26,25 @@ CREATE_BODY_SCOPE_KEY = "description_pipeline_create_body"
 _CLEAR_BODY_LIMIT = 4096
 _CLEAR_BODY_FIELDS = frozenset({"dry_run", "only_failed", "only_new", "run_on_latest_version"})
 #: The create body carries exactly the submission frame the DAG understands: the
-#: frozen intake path, the optional linked-attempt linkage, the selected main
-#: assembly and the publish target with its multi-line change summary.  The
-#: recorded submitter identity is never a create-body field: ownership comes
-#: from the run's stored actor, never from a client-provided identity claim.
+#: frozen intake path, the frozen request identity the DAG intake requires, the
+#: optional linked-attempt linkage, the selected main assembly and the publish
+#: target with its multi-line change summary.  The recorded submitter identity is
+#: never a create-body field: ownership comes from the run's stored actor and
+#: the Airflow-authenticated actor, never from a client-provided identity claim.
 _CREATE_FIELDS = frozenset(
-    {"handoff_path", "parent_dag_run_id", "resume_from", "target_hardware", "change_summary", "main_assembly"}
+    {
+        "handoff_path",
+        "parent_dag_run_id",
+        "resume_from",
+        "target_hardware",
+        "change_summary",
+        "main_assembly",
+        # The portal-issued frozen request identity of one submission
+        # (``portal-<dag_run_id>``); the DAG intake refuses a run without it.
+        "request_id",
+    }
 )
-_CREATE_SINGLE_LINE_FIELDS = ("handoff_path", "target_hardware", "main_assembly")
+_CREATE_SINGLE_LINE_FIELDS = ("handoff_path", "target_hardware", "main_assembly", "request_id")
 _CREATE_SINGLE_LINE_LIMIT = 1024
 _CREATE_SUMMARY_LIMIT = 2048
 

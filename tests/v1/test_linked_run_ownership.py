@@ -94,6 +94,12 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             self.candidate({"handoff_path": "/input", "main_assembly": "model.SLDASM"}),
             {"safe": True, "parent_dag_run_id": None},
         )
+        # The portal-issued frozen request identity is part of the admitted frame: the DAG
+        # intake refuses a run without it, so the create validator must admit it.
+        self.assertEqual(
+            self.candidate({"handoff_path": "/input", "request_id": "portal-20261016T000000-abcdef12"}),
+            {"safe": True, "parent_dag_run_id": None},
+        )
         # CRLF folds to LF exactly like the portal and the DAG intake fold it.
         self.assertIs(self.candidate({"change_summary": "a\r\nb\r"})["safe"], True)
         for conf in (
@@ -103,6 +109,11 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             {"change_summary": "bad\x01value"},
             {"change_summary": "x" * 4096},
             {"handoff_path": "x" * 5000},
+            # The request identity stays a bounded single line.
+            {"request_id": ""},
+            {"request_id": "x" * 2000},
+            {"request_id": "portal-\x01id"},
+            {"request_id": "line1\nline2"},
             # A client-provided identity claim is not a submission frame field.
             {"submission_principal": "forged:tenant-a:ou_attacker"},
             {"target_hardware": "m3.0", "owner": "admin"},

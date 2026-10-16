@@ -94,6 +94,36 @@ class DagTests(unittest.TestCase):
         self.assertIsNone(identity["parent_revision"])
         self.assertEqual(multiline["change_summary"], "第一行\n第二行\n第三行")
 
+    def test_submission_frame_uses_only_the_authenticated_actor(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+
+        bag = DagBag(str(DAG_DIR))
+        resolve = bag.dags["solidworks_to_urdf"].task_dict["freeze"].python_callable
+        module = sys.modules[resolve.__module__]
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+        forged = {
+            "target_hardware": "m3.0",
+            "change_summary": "x",
+            # A client-shaped conf claim must never name the submitter.
+            "submission_principal": "cli_forged:tenant-a:ou_attacker",
+        }
+
+        def context(actor):
+            return {"dag_run": SimpleNamespace(conf=forged, triggering_user_name=actor), "params": {}}
+
+        with patch.object(module, "config_from_airflow_connection", return_value=config):
+            identity, _routing = module._submission_frame(context("cli_smoke:smoke-tenant:ou_smoke"))
+            self.assertEqual(identity["owner"], "cli_smoke:smoke-tenant:ou_smoke")
+            for actor in ("", "   ", None):
+                with self.subTest(actor=actor), self.assertRaisesRegex(
+                    AirflowFailException, "authenticated submitter identity"
+                ):
+                    module._submission_frame(context(actor))
+
     def test_freeze_fails_before_any_endpoint_contact(self) -> None:
         from types import SimpleNamespace
 
@@ -404,6 +434,7 @@ class DagTests(unittest.TestCase):
                     "change_summary": "linked capture rerun",
                 },
                 run_id="portal-child-1",
+                triggering_user_name="ops",
             ),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
@@ -538,6 +569,7 @@ class DagTests(unittest.TestCase):
                     "change_summary": "rebound publish",
                 },
                 run_id="portal-child-2",
+                triggering_user_name="ops",
             ),
             "params": {},
         }

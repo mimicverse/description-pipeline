@@ -702,9 +702,12 @@ def _submission_frame(context) -> tuple[dict, dict]:
         )
     if not summary:
         raise AirflowFailException("change_summary is required: the run carries no nonempty change summary")
-    principal = conf.get("submission_principal")
-    if not isinstance(principal, str) or not principal.strip():
-        principal = str(getattr(context["dag_run"], "triggering_user_name", "") or "").strip()
+    # The submitter identity is never read from conf: it is the Airflow-authenticated actor
+    # of this run, stamped by the auth manager from the signed session.  A missing actor
+    # refuses - there is no fallback to a username, client text or a parent run's owner.
+    principal = str(getattr(context["dag_run"], "triggering_user_name", "") or "").strip()
+    if not principal:
+        raise AirflowFailException("the run carries no authenticated submitter identity")
     config = config_from_airflow_connection(CONN_ID)
     routing = config.targets.get(target)
     if routing is None:

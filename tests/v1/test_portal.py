@@ -2701,7 +2701,6 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
-                "submission_principal": FEISHU_PRINCIPAL,
                 "main_assembly": "parts/arm.SLDASM",
             },
         )
@@ -2710,15 +2709,18 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.airflow.dag_runs[DAG_RUN_ID]["state"], "failed")
         self.assertEqual(set(self.endpoint_server.jobs), jobs_before)
 
-    def test_rerun_attempt_carries_the_parent_publish_choices(self) -> None:
+    def test_rerun_attempt_never_copies_the_parent_submitter_identity(self) -> None:
         self._seed_retryable_run()
+        # Even a parent conf that carries a submitter claim is never copied: the child's
+        # initiator is the authenticated actor of THIS request, and the original submitter
+        # stays lineage via the parent linkage - an administrator re-running someone else's
+        # parent can never impersonate the original user.
         self.airflow.dag_runs[DAG_RUN_ID]["conf"]["submission_principal"] = VIEWER_PRINCIPAL
         self.client.login()
         rows = self._rerun_rows()
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
             status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
         self.assertEqual(status, 202, body)
-        # The child keeps the original submission identity, not the acting operator's.
         self.assertEqual(
             self.airflow.trigger_payloads[-1]["conf"],
             {
@@ -2727,7 +2729,6 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
-                "submission_principal": VIEWER_PRINCIPAL,
             },
         )
 
@@ -2750,7 +2751,6 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": "m3.1",
                 "change_summary": "rebound\nsummary",
-                "submission_principal": FEISHU_PRINCIPAL,
             },
         )
 

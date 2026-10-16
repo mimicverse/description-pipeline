@@ -1465,8 +1465,9 @@ class PortalApp:
         main_assembly: str | None = None,
     ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
-        # The recorded submitter of a run is its stored actor: the create body
-        # never carries a client-provided identity claim.
+        # The submitter of a run is its Airflow-authenticated actor, recorded on
+        # the run itself; the create body never carries an identity claim - not
+        # the acting operator's, and never a client-provided one.
         conf = {
             "handoff_path": handoff_path,
             "request_id": f"portal-{dag_run_id}",
@@ -2237,19 +2238,20 @@ class PortalApp:
                 )
                 if not change_summary:
                     raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
-                principal = _optional_str(parent_conf.get("submission_principal"))
-                if principal is None or not principal.strip():
-                    principal = session.principal
                 new_run_id = reserved_id or f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
                 if reserved_id is None:
                     self._write_rerun_journal(dag_run_id, new_run_id, stage)
+                # The child's initiator is the authenticated actor of THIS request (Airflow
+                # stamps it as the run's triggering user); the parent's original submitter
+                # stays lineage via parent_dag_run_id and the parent's own record - it is
+                # never copied into the create body, so an administrator re-running someone
+                # else's parent can never impersonate the original user.
                 conf = {
                     "handoff_path": handoff_path,
                     "parent_dag_run_id": dag_run_id,
                     "resume_from": stage,
                     "target_hardware": target_hardware,
                     "change_summary": change_summary,
-                    "submission_principal": principal,
                 }
                 parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 if parent_assembly is not None:
