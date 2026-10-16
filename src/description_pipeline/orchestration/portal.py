@@ -60,6 +60,7 @@ from .airflow_client import (
 )
 from ..io import PipelineError, digest
 from ..delivery import PIPELINE_ID
+from ..platform.flow import registered_delivery_events
 from ..platform.store import AdmissionClosedError, PlatformStore, PlatformStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
 from .stage_transfer import TEAM_REPORTS
@@ -588,7 +589,12 @@ def _endpoint_from_config(section: dict) -> WindowsEndpoint:
 
 
 def load_portal_config(path: Path) -> PortalConfig:
-    """Load the one JSON config file; see ``portal.example.json`` in this package."""
+    """Load the deployed portal configuration rendered by the operator install.
+
+    The install renders ``portal.json`` from ``deploy/operator/portal.json.template``
+    with the resolved generation's values; this parser is the only reader of the
+    rendered file (this package ships no example copy of it).
+    """
     data = _read_config(path)
     unknown = set(data) - set(_CONFIG_KEYS)
     if unknown:
@@ -2510,7 +2516,7 @@ class PortalApp:
         record = self._platform_read(lambda: self._platform().run_record(run_id))
         if not isinstance(record, dict):
             return native
-        events = self._platform_read(lambda: self._platform().run_events(run_id, limit=200))
+        events = self._platform_read(lambda: registered_delivery_events(self._platform(), run_id))
         detail = dict(native) if isinstance(native, dict) else {}
         state = record.get("state")
         status = (

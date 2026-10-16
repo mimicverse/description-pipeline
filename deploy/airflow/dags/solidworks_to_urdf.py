@@ -41,7 +41,6 @@ from description_pipeline.orchestration.airflow_client import (
     submission_identity,
     validate_main_assembly,
 )
-from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST
 from description_pipeline.platform import capture as native_capture
 from description_pipeline.platform import flow
@@ -92,15 +91,6 @@ log = logging.getLogger(__name__)
 
 def _endpoint(conn_id: str) -> WindowsEndpoint:
     return WindowsEndpoint(config_from_airflow_connection(conn_id))
-
-
-def _linux_store(conn_id: str) -> LinuxStore:
-    config = config_from_airflow_connection(conn_id)
-    if config.store_root is None:
-        raise AirflowFailException(
-            "pipeline.store_root / PIPELINE_STORE_ROOT is not configured; the Linux portable half cannot run"
-        )
-    return LinuxStore(config.store_root)
 
 
 def _work_paths(conn_id: str, run_id: str) -> flow.RunPaths:
@@ -1073,18 +1063,23 @@ def _same_request(job: dict, request: dict) -> None:
 
 
 def _confirm_delivery(published: dict) -> dict:
-    """Confirm the six-stage receipt and report the delivery (PR, commit, subject)."""
+    """Confirm the six-stage receipt and report the delivery (PR, commit, subject).
+
+    The platform registration is the run's authority: the snapshot is composed
+    from the registered run/stage/event records and the sealed stage receipts -
+    the store's working directories and the legacy file projection stay unread.
+    The native endpoint is only consulted for a native half that is still alive.
+    """
 
     request = published["request"]
     run_id = request["run_id"]
-    native = None
     if not request.get("linux_owned"):
         native = _endpoint(request["conn_id"]).get_job(run_id)
         _same_request(native, request)
         if native["status"] == "failed":
             raise AirflowFailException(f"native job {run_id} failed: {native.get('error')}")
-    store = _linux_store(request["conn_id"])
-    snapshot = store.merged_job(run_id, native)
+    platform, _store_root = _platform_binding()
+    snapshot = flow.registered_delivery_snapshot(platform, run_id)
     for key in ("hardware_id", "revision", "repository_slug", "repository_base"):
         if not isinstance(snapshot.get(key), str) or not snapshot.get(key):
             value = published.get(key)

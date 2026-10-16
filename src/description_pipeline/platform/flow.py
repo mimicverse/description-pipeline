@@ -9,14 +9,16 @@ bytes - no state file is business authority.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 import logging
 
 from packaging.utils import canonicalize_name
 
 from .. import solidworks
+from ..delivery import PIPELINE_ID
 from ..io import PipelineError, file_digest, read_data
-from ..orchestration.airflow_client import validate_run_id
+from ..orchestration.airflow_client import JOB_SCHEMA, validate_run_id
 from ..orchestration.stage_transfer import CAPTURE_MANIFEST, verify_transfer
 from ..runtime import RUNTIME_VERSIONS, required_packages, tool_record
 from ..stages import DELIVERY_STAGES, STAGE_IDS
@@ -289,3 +291,102 @@ def run_stage(
             _write_failure_products(platform, paths, run_id, stage, error)
             raise
     return receipt
+
+
+def _event_instant(value) -> str | None:
+    """The recorded instant as canonical second-resolution text; other shapes stay absent."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        stamped = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return stamped.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
+
+
+def registered_delivery_events(platform: PlatformStore, run_id: str) -> list[dict]:
+    """The recorded display events of one registered attempt, in recorded order.
+
+    Every recorded payload that carries display meaning is kept; a stage
+    confirmation row whose payload has no stage key renders as that stage's own
+    state event (its recorded instant included), so the registered stage
+    outcomes render without inventing anything the stream does not carry.
+    """
+    run_id = validate_run_id(run_id)
+    events: list[dict] = []
+    for row in platform.run_events(run_id):
+        payload = row.get("payload") if isinstance(row, dict) else None
+        event = dict(payload) if isinstance(payload, dict) else {}
+        if not isinstance(event.get("stage"), str) or not event["stage"]:
+            stage = row.get("stage") if isinstance(row, dict) else None
+            if not isinstance(stage, str) or not stage:
+                continue
+            event["stage"] = stage
+            if not isinstance(event.get("at"), str):
+                instant = _event_instant(row.get("at"))
+                if instant is not None:
+                    event["at"] = instant
+        events.append(event)
+    return events
+
+
+def _registered_capture_identity(platform: PlatformStore, rows: dict[str, dict]) -> tuple[str | None, str | None]:
+    """The hardware/revision identity read back from the registered capture tree."""
+    row = rows.get("capture") or {}
+    uri = row.get("checkpoint_uri")
+    if not isinstance(uri, str) or not uri:
+        return None, None
+    from .capture import source_identity
+
+    return source_identity(Path(platform.sealed_path(uri)))
+
+
+def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
+    """The job-shaped snapshot of one registered delivery, read from the platform records.
+
+    The registered run row, the recorded event stream and the sealed stage
+    receipts are the only sources: the delivery result is the publish receipt's
+    quality and submission bound to the recorded subject, and hardware/revision
+    are read back from the registered capture tree.  A run that never entered
+    the register refuses - there is no working-directory or file fallback and
+    no fabricated snapshot.
+    """
+    run_id = validate_run_id(run_id)
+    record = platform.run_record(run_id)
+    if record is None:
+        raise PipelineError(f"The run {run_id!r} has no platform registration")
+    rows = platform.stage_records(run_id)
+    receipt = (rows.get("publish") or {}).get("receipt") or {}
+    quality = receipt.get("quality") if isinstance(receipt.get("quality"), dict) else {}
+    submission = receipt.get("submission") if isinstance(receipt.get("submission"), dict) else {}
+    subject = receipt.get("subject_sha256")
+    submission_bound = (
+        submission.get("state") in {"published", "updated", "noop"}
+        and submission.get("passed") is True
+        and bool(submission.get("url"))
+        and submission.get("subject_sha256") == subject
+    )
+    result = {
+        "pipeline_id": PIPELINE_ID,
+        "passed": bool(
+            submission_bound and quality.get("passed") is True and quality.get("subject_sha256") == subject
+        ),
+        "quality": quality,
+        "subject_sha256": subject,
+        "handoff_sha256": receipt.get("handoff_sha256"),
+    }
+    if submission:
+        result["submission"] = submission
+    hardware, revision = _registered_capture_identity(platform, rows)
+    state = record.get("state")
+    return {
+        "schema_version": JOB_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "run_id": run_id,
+        "status": "passed" if result["passed"] else ("failed" if state == "failed" else "running"),
+        "request": {"handoff_sha256": receipt.get("handoff_sha256")},
+        "events": registered_delivery_events(platform, run_id),
+        "result": result,
+        "error": None,
+        "hardware_id": hardware,
+        "revision": revision,
+    }
