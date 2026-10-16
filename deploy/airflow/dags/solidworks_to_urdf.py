@@ -113,6 +113,19 @@ def _work_paths(conn_id: str, run_id: str) -> flow.RunPaths:
     return flow.RunPaths(config.store_root, run_id)
 
 
+class _FreezePaths:
+    """The legacy freezer path signature over the flow layout; carries no business state."""
+
+    def __init__(self, root: str | Path) -> None:
+        self._root = Path(root)
+
+    def stage_dir(self, run_id: str, stage: str) -> Path:
+        return flow.RunPaths(self._root, run_id).stage_dir(stage)
+
+    def run_dir(self, run_id: str) -> Path:
+        return flow.RunPaths(self._root, run_id).run_dir
+
+
 def _platform_binding() -> tuple[PlatformStore, Path]:
     """The platform registration binding: service DSN plus the sealed resolver over the store root."""
     config = config_from_airflow_connection(CONN_ID)
@@ -422,7 +435,7 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
     return receipt
 
 
-def _register_freeze_stage(store: LinuxStore, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
+def _register_freeze_stage(store: _FreezePaths, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
     """Seal the admitted originals with the frozen request evidence and confirm the freeze stage."""
     platform, store_root = _platform_binding()
     platform.start_run(run_id)  # the first driver action claims the admitted run
@@ -797,8 +810,7 @@ def _store_failure_report(endpoint: WindowsEndpoint, request: dict, job: dict) -
         return
     run_id = request["run_id"]
     try:
-        store = _linux_store(request["conn_id"])
-        run_dir = store.run_dir(run_id)
+        run_dir = _work_paths(request["conn_id"], run_id).run_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".failure-diagnostics-", dir=run_dir))
         try:
@@ -892,8 +904,7 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
 
     run_id = request["run_id"]
     snapshot = endpoint.definition_snapshot(run_id, upload_files=request["upload_files"])
-    store = _linux_store(request["conn_id"])
-    work = store.run_dir(run_id) / "definition"
+    work = _work_paths(request["conn_id"], run_id).run_dir / "definition"
     bundle = work / "raw-record.zip"
     derived = work / "derived"
     capture_request = work / "capture-request.zip"
@@ -1335,7 +1346,7 @@ def solidworks_to_urdf():
             raise AirflowFailException(
                 "conf platform_config_digest does not match the controlled platform configuration identity"
             )
-        store = _linux_store(CONN_ID)
+        store = _FreezePaths(_work_paths(CONN_ID, run_id).root)
         evidence = freeze_request_evidence(
             store.run_dir(run_id),
             request_id=request_id,

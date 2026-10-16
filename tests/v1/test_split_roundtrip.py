@@ -19,15 +19,12 @@ from unittest.mock import patch
 from description_pipeline import solidworks, steps
 from description_pipeline.io import digest, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
-from description_pipeline.orchestration import linux_runner
-from description_pipeline.orchestration.linux_store import LinuxStore
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend, record as native_record
-from .test_linux_split import portable_record
 from .test_stage_transfer import native_tool
 
 
@@ -228,85 +225,6 @@ class SplitRoundtripTests(unittest.TestCase):
         self.assertEqual(native_stages["execution_scope"], ["freeze", "discover", "capture"])
         self.assertTrue(native_stages["events"])
         return native_stages
-
-    def test_real_freeze_seals_and_the_real_tail_verifies(self) -> None:
-        events: list[dict] = []
-        prepared_package, _target, prepared_files = self._prepare(events)
-        native_stages = self._capture(events, prepared_package, prepared_files)
-
-        # The real Linux boundary: store admission seeds the raw native events, then the
-        # portable runner drives generate and verify as their own staged checkpoints with
-        # the actual generator and verifier (MuJoCo consumer gate included).
-        store = LinuxStore(self.root / "linux-store")
-        admitted = store.import_capture(
-            self.run_id,
-            self.capture_output / transfer.CAPTURE_ARCHIVE,
-            expected_handoff_sha256=self.handoff,
-            expected_main_assembly="cad/robot.SLDASM",
-            expected_native_tool=native_tool(),
-        )
-        self.assertEqual(admitted.get("state"), "capture_admitted")
-        seeded = [
-            event for event in store.events(self.run_id) if event.get("stage") in {"freeze", "discover", "capture"}
-        ]
-        self.assertEqual(seeded, native_stages["events"])
-        from tests.v1.request_support import install_request_authority
-
-        install_request_authority(self, store, self.run_id)
-
-        with patch.object(linux_runner, "tool_record", return_value=portable_record(native_tool())):
-            generated = linux_runner.run_portable_stage(store, self.run_id, "generate")
-            self.assertEqual(generated.get("state"), "generated", generated.get("error"))
-            subject = generated.get("subject_sha256")
-            self.assertTrue(subject)
-            result = linux_runner.run_portable_stage(store, self.run_id, "verify", expected_subject=subject)
-        # The control fixture is explicitly NOT native CAD qualification: the release-only
-        # gates below can never pass on it.  Everything else must, and any drift beyond the
-        # documented control limit set fails this test.
-        control_limits = {
-            "source.native",  # control fixture is not native CAD qualification
-            "source.dependencies",  # fixture closure has no top_level mapping row
-            "physics.mass_closure_equality",  # fixture backend has no assembly_mass_properties
-            "physics.independent",  # fixture inertia payload carries no qualified API receipt
-            "geometry.base_link",
-            "geometry.arm_link",
-            "geometry.assets",
-            "geometry.expected_extent",
-        }
-        diagnostic = Path(result["diagnostic_path"])
-        quality = json.loads((diagnostic / "reports/quality.json").read_text(encoding="utf-8"))
-        failed = {
-            check["id"] for check in quality["checks"] if check.get("passed") is False or check.get("state") == "failed"
-        }
-        offenders = {check["id"]: check for check in quality["checks"] if check["id"] in failed - control_limits}
-        self.assertTrue(failed <= control_limits, json.dumps(offenders, ensure_ascii=False)[:2400])
-        gates = {check.get("id"): check for check in quality["checks"]}
-        for required in (
-            "bundle.subject",
-            "input.valid",
-            "source.native_discovery",
-            "frames.native",
-            "urdf.syntax_names",
-            "joints.shoulder_pitch_joint",
-            "urdf.topology",
-            "consumer.urdf",
-            "verification.complete",
-        ):
-            self.assertTrue(gates[required].get("passed"), gates[required])
-        self.assertEqual(quality["subject_sha256"], gates["bundle.subject"]["details"]["sha256"])
-        self.assertEqual(quality["subject_sha256"], subject)
-        self.assertEqual(result["state"], "failed")
-        self.assertIn("URDF verification failed", result["error"])
-        self.assertEqual(store.receipt_path(self.run_id, "generate").is_file(), True)
-        stored_verify = json.loads(store.receipt_path(self.run_id, "verify").read_text(encoding="utf-8"))
-        self.assertEqual(stored_verify["state"], "failed")
-
-        # The real generator ran and the transfer provenance survived the portable tail.
-        self.assertTrue((diagnostic / "urdf/robot.urdf").is_file())
-        self.assertTrue((diagnostic / "transfer-manifest.json").is_file())
-        self.assertTrue((diagnostic / "reports/native-tool.json").is_file())
-        carried = json.loads((diagnostic / "reports/native-stages.json").read_text(encoding="utf-8"))
-        self.assertEqual(carried["events"], native_stages["events"])
 
     def _windows_resume_seed(
         self, events: list[dict], prepared_package: Path, prepared_files: dict
