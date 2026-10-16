@@ -41,6 +41,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
@@ -363,6 +364,79 @@ def _feishu_env(home: Path, https_port: int) -> dict[str, str]:
         "FEISHU_TENANT_KEYS": FEISHU_TENANT,
         "FEISHU_REDIRECT_URI": f"https://127.0.0.1:{https_port}/auth/feishu/callback",
     }
+
+
+def _config_snapshot_environment(args, *, target: str) -> dict[str, str]:
+    """The controlled platform-configuration identity of this isolated smoke world.
+
+    One IF-16 snapshot fixture is built by the deploy-side owner's own mechanism
+    (``validate_platform`` then ``build_snapshot``), re-validated by the package's
+    IF-16 validator, serialized with the one canonical serializer and digested over
+    exactly those bytes - the same derivation the operator environment and the
+    install record bind.  The package-side snapshot digest must agree, otherwise the
+    smoke refuses instead of fabricating a second identity.
+    """
+    from description_pipeline import interface_records  # noqa: PLC0415
+    from description_pipeline.io import canonical  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location(
+        "deploy_platform_config", args.root / "deploy/operator/platform_config.py"
+    )
+    platform_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(platform_config)
+    fixture_root = args.airflow_home / "smoke-config"
+    document = {
+        "schema_version": platform_config.PLATFORM_SCHEMA,
+        "operator": {
+            "origin": f"https://127.0.0.1:{_operator_https_port(args.root)}",
+            "certificate_file": str(fixture_root / "secrets/tls.crt"),
+            "private_key_file": str(fixture_root / "secrets/tls.key"),
+        },
+        "storage": {
+            "state_root": str(fixture_root / "state"),
+            "handoff_root": str(fixture_root / "handoffs"),
+            "artifact_root": str(fixture_root / "artifacts"),
+            "workspace_root": str(fixture_root / "workspaces"),
+            "release_root": str(fixture_root / "releases"),
+        },
+        "database": {"dsn_file": str(fixture_root / "secrets/postgres.dsn")},
+        "windows": {
+            "ssh_host": "smoke-windows",
+            "endpoint_port": 9765,
+            "token_file": str(fixture_root / "secrets/endpoint.token"),
+            "instance": {
+                "task_name": "description-smoke-endpoint",
+                "package_root": "C:/description-smoke/packages",
+                "output_root": "C:/description-smoke/results",
+                "state_root": "C:/description-smoke/state",
+            },
+        },
+        "auth": {
+            "feishu_secret_file": str(fixture_root / "secrets/feishu.json"),
+            "tenant_keys": [FEISHU_TENANT],
+            "admin_open_ids": [FEISHU_OPERATOR],
+        },
+        "targets": {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
+        "specifications": {"record_roots": [str(fixture_root / "specifications")]},
+    }
+    resolved = platform_config.validate_platform(document)
+    platform_json_bytes = canonical(document)
+    install_id = f"smoke-{uuid.uuid4().hex[:12]}"
+    snapshot = platform_config.build_snapshot(
+        resolved,
+        platform_json_sha256=hashlib.sha256(platform_json_bytes).hexdigest(),
+        install_id=install_id,
+        generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    interface_records.validate_config_snapshot(snapshot)
+    snapshot_bytes = canonical(snapshot)
+    digest_value = hashlib.sha256(snapshot_bytes).hexdigest()
+    if digest_value != interface_records.config_snapshot_digest(snapshot):
+        raise RuntimeError("the snapshot digest owners disagree; refusing a second identity")
+    fixture_root.mkdir(parents=True, exist_ok=True)
+    (fixture_root / "platform.json").write_bytes(platform_json_bytes)
+    platform_config.atomic_write_once(fixture_root / "snapshots" / f"{install_id}.json", snapshot_bytes)
+    return {"PLATFORM_CONFIG_DIGEST": digest_value}
 
 
 def _plugin_preflight(venv: Path, env: dict[str, str], home: Path) -> str | None:
@@ -881,6 +955,16 @@ def main() -> int:
     # exactly that identity (and the connection must route it), or the derivation refuses the
     # run as an identity conflict.
     target = str(fixture["hardware_id"])
+
+    # The controlled platform-configuration identity of this smoke world: one canonical
+    # IF-16 snapshot fixture built/digested by the deploy-side mechanism, published to
+    # the child Airflow services through the environment (same key the operator env
+    # exports).  The runtime freeze still refuses a missing or mismatched digest.
+    try:
+        os.environ.update(_config_snapshot_environment(args, target=target))
+    except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": f"{type(error).__name__}: {error}"}))
+        return 1
 
     api_port = args.api_port or _free_port()
     intake_root = args.airflow_home / "smoke" / "intake"

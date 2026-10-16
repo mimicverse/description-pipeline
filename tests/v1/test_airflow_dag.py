@@ -181,6 +181,58 @@ class DagTests(unittest.TestCase):
                 with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
                     dag.task_dict["freeze"].python_callable(**context(conf))
 
+    def test_freeze_requires_the_controlled_config_digest(self) -> None:
+        import shutil
+        import tempfile
+
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+        dag = module.dag
+        root = Path(tempfile.mkdtemp(prefix="freeze-digest-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        intake = root / "handoff"
+        intake.mkdir()
+        (intake / "assembly.SLDASM").write_bytes(b"<assembly/>")
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+
+        class Stub:
+            def authorized_intake_dir(self, path):
+                return intake
+
+        def context(conf):
+            return {
+                "dag_run": SimpleNamespace(
+                    conf=conf,
+                    run_id="portal-upload-digest",
+                    triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+                ),
+                "params": {"handoff_path": str(intake)},
+            }
+
+        base = {
+            "target_hardware": "m3.0",
+            "change_summary": "x",
+            "request_id": "portal-upload-digest",
+        }
+        with (
+            patch.object(module, "_endpoint", return_value=Stub()),
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("PLATFORM_CONFIG_DIGEST", None)
+            with self.assertRaisesRegex(AirflowFailException, "PLATFORM_CONFIG_DIGEST is unavailable"):
+                dag.task_dict["freeze"].python_callable(**context(dict(base)))
+            with (
+                self.assertRaisesRegex(AirflowFailException, "does not match"),
+                patch.dict(os.environ, {"PLATFORM_CONFIG_DIGEST": "a" * 64}),
+            ):
+                dag.task_dict["freeze"].python_callable(**context({**base, "platform_config_digest": "b" * 64}))
+
     def test_dag_parses(self) -> None:
         bag = DagBag(str(DAG_DIR))
         self.assertEqual(bag.import_errors, {})
