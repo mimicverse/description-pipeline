@@ -545,6 +545,17 @@ class PlatformStoreTests(unittest.TestCase):
         payload.update(overrides)
         return payload
 
+    def sealed_report_member(self) -> dict:
+        """The registered byte-bound report member of this fixture's sealed tree."""
+
+        path = self.delivery / "reports" / "quality.json"
+        return {"path": "reports/quality.json", "bytes": path.stat().st_size, "sha256": file_digest(path)}
+
+    def registered_verify_receipt(self, **overrides) -> dict:
+        payload = {"artifacts": [*self.artifacts, self.sealed_report_member()]}
+        payload.update(overrides)
+        return self.verify_receipt(**payload)
+
     def admit(self, **overrides):
         payload = {
             **NAMED,
@@ -557,7 +568,11 @@ class PlatformStoreTests(unittest.TestCase):
         self.admit(from_stage=from_stage)
         self.world.run_states["r-1"] = "running"
         if verify_done:
-            self.world.stages[("r-1", "verify")] = ("completed", self.verify_receipt(), CHECKPOINT)
+            self.world.stages[("r-1", "verify")] = (
+                "completed",
+                self.registered_verify_receipt(),
+                CHECKPOINT,
+            )
 
     def _publish_registration(self, **overrides):
         payload = {
@@ -721,7 +736,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.world.stages[("r-1", "verify")] = ("completed", {"run_id": "r-1", "stage": "verify"}, CHECKPOINT)
         with self.assertRaisesRegex(PlatformStoreError, "sealed"):
             self._publish_registration()
-        self.world.stages[("r-1", "verify")] = ("completed", self.verify_receipt(), CHECKPOINT)
+        self.world.stages[("r-1", "verify")] = ("completed", self.registered_verify_receipt(), CHECKPOINT)
         self.assertEqual(self._publish_registration().stage, "publish")
 
     def test_terminal_runs_only_continue_via_cancel_or_reconcile(self) -> None:
@@ -1413,7 +1428,7 @@ class PlatformStoreTests(unittest.TestCase):
             stage="verify",
             state="completed",
             checkpoint_uri=CHECKPOINT,
-            receipt=self.verify_receipt(),
+            receipt=self.registered_verify_receipt(),
         )
         self.assertEqual(self.world.stages[("r-1", "verify")][0], "completed")
 
@@ -1621,7 +1636,7 @@ class PlatformStoreTests(unittest.TestCase):
 
     def test_a_confirmed_publication_ends_its_run_successfully(self) -> None:
         self._running_run()
-        receipt = self.verify_receipt(
+        receipt = self.registered_verify_receipt(
             stage="publish",
             state="published",
             passed=True,
@@ -1636,6 +1651,100 @@ class PlatformStoreTests(unittest.TestCase):
             run_id="r-1", stage="publish", state="completed", checkpoint_uri=CHECKPOINT, receipt=receipt
         )
         self.assertEqual(self.world.run_states["r-1"], "succeeded")
+
+    # -------------------------------------- completed report binding (owned)
+
+    def test_completed_verify_accepts_the_matching_registered_report(self) -> None:
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="verify",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self.registered_verify_receipt(),
+        )
+        self.assertEqual(self.store.confirmed_stage("r-1", "verify")["quality"]["passed"], True)
+
+    def test_completed_publish_accepts_the_matching_registered_report(self) -> None:
+        self._running_run()
+        receipt = self.registered_verify_receipt(
+            stage="publish",
+            state="published",
+            passed=True,
+            submission={
+                "passed": True,
+                "state": "published",
+                "url": "https://example.test/repo/pull/1",
+                "subject_sha256": self.subject,
+            },
+        )
+        self.store.confirm_stage(
+            run_id="r-1", stage="publish", state="completed", checkpoint_uri=CHECKPOINT, receipt=receipt
+        )
+        self.assertEqual(self.world.run_states["r-1"], "succeeded")
+
+    def test_completed_verify_refuses_a_changed_check_detail(self) -> None:
+        import copy
+
+        self._running_run()
+        report = copy.deepcopy(self.qualified_quality())
+        report["checks"][0]["details"] = {"observation": "different report evidence statement"}
+        write_json(self.delivery / "reports" / "quality.json", report)
+        with self.assertRaisesRegex(PlatformStoreError, "contradicts the receipt"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self.registered_verify_receipt(),
+            )
+        self.assertNotIn(("r-1", "verify"), self.world.stages)
+
+    def test_completed_verify_refuses_an_unregistered_report_member(self) -> None:
+        self._running_run()
+        with self.assertRaisesRegex(PlatformStoreError, "lack the byte-bound"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self.verify_receipt(),
+            )
+        self.assertNotIn(("r-1", "verify"), self.world.stages)
+
+    def test_completed_verify_refuses_a_sealed_passed_flip(self) -> None:
+        import copy
+
+        self._running_run()
+        report = copy.deepcopy(self.qualified_quality())
+        report["passed"] = False
+        write_json(self.delivery / "reports" / "quality.json", report)
+        with self.assertRaisesRegex(PlatformStoreError, "no qualified reports/quality.json"):
+            self.store.confirm_stage(
+                run_id="r-1",
+                stage="verify",
+                state="completed",
+                checkpoint_uri=CHECKPOINT,
+                receipt=self.registered_verify_receipt(),
+            )
+        self.assertNotIn(("r-1", "verify"), self.world.stages)
+
+    def test_confirmed_stage_rechecks_the_report_after_registration(self) -> None:
+        import copy
+
+        self._running_run()
+        self.store.confirm_stage(
+            run_id="r-1",
+            stage="verify",
+            state="completed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self.registered_verify_receipt(),
+        )
+        report = copy.deepcopy(self.qualified_quality())
+        report["checks"][0]["details"] = {"observation": "tampered after registration"}
+        write_json(self.delivery / "reports" / "quality.json", report)
+        with self.assertRaisesRegex(PlatformStoreError, "does not bind|contradicts the receipt"):
+            self.store.confirmed_stage("r-1", "verify")
 
     def test_append_event_sequences_observed_events_and_refuses_unknown_runs(self) -> None:
         with self.assertRaisesRegex(PlatformStoreError, "not admitted"):

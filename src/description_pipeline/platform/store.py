@@ -1580,23 +1580,40 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
             raise PlatformStoreError("The sealed receipt's quality payload is bound to another subject")
         if root is not None:
             # The sealed report bytes are the delivery's own record: the file in
-            # the sealed tree must itself be a qualified report for this subject
-            # and must agree with the inline payload.  Flipping the sealed passed
-            # bit (with its artifact digest synced) refuses instead of
-            # registering a contradictory success; the read-back and reuse paths
-            # run this same check.
+            # the sealed tree must itself be a qualified report for this
+            # subject, its full deterministic payload (every check and detail)
+            # must equal the inline quality payload, and the report member must
+            # be registered with byte binding.  A sealed passed-bit flip, a
+            # changed check detail or an unregistered report member refuses
+            # instead of registering a contradictory success; the read-back and
+            # reuse paths run this same check.
             try:
                 sealed_quality = require_qualified_report(
                     read_data(confined(root, "reports/quality.json")), definition, root=root
                 )
             except (PipelineError, OSError) as error:
                 raise PlatformStoreError("The sealed tree carries no qualified reports/quality.json") from error
-            if (
-                sealed_quality.get("passed") != quality.get("passed")
-                or sealed_quality.get("subject_sha256") != quality.get("subject_sha256")
-                or sealed_quality.get("subject_sha256") != subject
-            ):
+            if canonical(sealed_quality) != canonical(quality):
                 raise PlatformStoreError("The sealed quality report contradicts the receipt's quality payload")
+            artifacts = receipt.get("artifacts")
+            members = (
+                [
+                    record
+                    for record in artifacts
+                    if isinstance(record, dict) and record.get("path") == "reports/quality.json"
+                ]
+                if isinstance(artifacts, list)
+                else []
+            )
+            if not members:
+                raise PlatformStoreError("The registered objects lack the byte-bound reports/quality.json member")
+            report_path = root / "reports" / "quality.json"
+            if not any(
+                record.get("bytes") == report_path.stat().st_size
+                and record.get("sha256") == file_digest(report_path)
+                for record in members
+            ):
+                raise PlatformStoreError("The registered reports/quality.json member does not bind the sealed bytes")
     if stage == "publish":
         submission = receipt.get("submission")
         if (
