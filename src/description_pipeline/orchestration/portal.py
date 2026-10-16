@@ -2397,6 +2397,11 @@ class PortalApp:
                 if isinstance(quality_member, dict)
                 else {}
             )
+            if report.get("passed") is True:
+                # A failed-verify registration whose report claims success contradicts
+                # the registered stage outcome: the diagnostic is refused, while the
+                # failed products stay registered and downloadable.
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断报告与失败阶段登记不一致，已拒绝提供")
             failing = _failing_checks(report)
             warnings = _delivery_warnings(
                 {
