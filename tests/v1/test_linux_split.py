@@ -7,10 +7,13 @@ The artifact-read case (preview/open_artifact byte streaming) has no subject
 on the platform read face yet and is tracked as a reported gap, not silently
 dropped.
 
-The quality-binding reuse case is retired to its owned successor,
-``tests.v1.test_platform_store.test_the_quality_inventory_binds_the_rebuilt_definition``,
-which drives an otherwise-valid sealed checkpoint with only the quality
-attribute changed (and a valid receipt as the positive control).
+The quality-binding reuse case is re-expressed as
+``test_verify_reuse_regrounds_the_claimed_quality_in_the_sealed_bytes`` for
+the semantics the platform enforces (replay re-grounds the claimed
+qualification in the sealed bytes; zero rerun).  The legacy sealed report-file
+bytes vs receipt-payload consistency is a separate obligation the platform
+store does not currently enforce; it is tracked as an open item in the wave-2
+mapping (section C3), not silently claimed here.
 """
 
 from __future__ import annotations
@@ -250,6 +253,61 @@ class LinuxSplitTests(SplitAdmissionMixin, unittest.TestCase):
             self.assertRaisesRegex(PipelineError, "differs from the native capture"),
         ):
             flow.run_stage(self.store, self.store_root, RUN, "generate")
+
+    def test_verify_reuse_regrounds_the_claimed_quality_in_the_sealed_bytes(self) -> None:
+        """A verified reuse re-grounds the receipt's quality claim in the sealed bytes.
+
+        A registered verify checkpoint whose claimed qualification no longer
+        resolves against its own sealed records is refused at replay without
+        rerunning the driver; the qualified receipt reads back and is reused.
+        The sealed report-file-bytes vs receipt-payload consistency checked by
+        the retired LinuxStore is a separate obligation and is tracked as an
+        open item in the wave-2 mapping (C3): the platform store validates the
+        receipt payload, not the delivered report file, for that comparison.
+        """
+
+        from description_pipeline.delivery import subject_digest
+        from description_pipeline.verification import solidworks_urdf
+        from description_pipeline.verification.solidworks_urdf import qualifications, required_checks
+
+        self.admit(RUN)
+        self._record_generate()
+        tree = self.tmp / f"fixture-generate-{RUN}"
+        definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+        subject = subject_digest(tree)
+        with mock.patch.object(solidworks_urdf, "rebuilt_definition", return_value=definition):
+            expected = required_checks(definition)
+            checks = [{"id": name, "state": "passed", "passed": True, "details": {}} for name in expected]
+            quality = {
+                "passed": True,
+                "subject_sha256": subject,
+                "checks": checks,
+                "required_checks": expected,
+                "qualifications": qualifications(tree, definition, checks),
+            }
+            write_json(tree / "reports" / "quality.json", quality)
+            completed = self._register_stage(RUN, "verify", tree, state="verified", quality=quality)
+            uri = self.store.stage_records(RUN)["verify"]["checkpoint_uri"]
+            # Positive control: the qualified receipt reads back and the flow reuses it.
+            self.assertEqual(self.store.confirmed_stage(RUN, "verify"), completed)
+            with (
+                mock.patch.object(flow, "tool_record", return_value=self._portable()),
+                mock.patch.object(flow.solidworks, "verify", side_effect=AssertionError("must not rerun")),
+            ):
+                reused = flow.run_stage(self.store, self.store_root, RUN, "verify", expected_subject=subject)
+            self.assertEqual(reused, completed)
+            # Only one evidence digest drifts away from the sealed bytes; the claimed
+            # qualification is now ungrounded and the replay refuses it.
+            ungrounded_quality = json.loads(json.dumps(quality))
+            ungrounded_quality["qualifications"][0]["evidence"][0]["sha256"] = "0" * 64
+            ungrounded = {**completed, "quality": ungrounded_quality}
+            self.world.stages[(RUN, "verify")] = ("completed", ungrounded, uri)
+            with (
+                mock.patch.object(flow, "tool_record", return_value=self._portable()),
+                mock.patch.object(flow.solidworks, "verify", side_effect=AssertionError("must not rerun")),
+                self.assertRaisesRegex(PipelineError, "qualification_invalid"),
+            ):
+                flow.run_stage(self.store, self.store_root, RUN, "verify", expected_subject=subject)
 
     def test_stage_guards_and_identity_gate_fail_closed(self) -> None:
         self.admit(RUN)
