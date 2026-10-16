@@ -18,6 +18,7 @@ from pathlib import Path
 from description_pipeline.io import PipelineError
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import EndpointError, native_run_id
+from description_pipeline.orchestration.feishu_oauth import build_actor_name
 from description_pipeline.platform import flow
 from description_pipeline.stages import require_complete, stage_view
 
@@ -331,6 +332,119 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         self.assertEqual(payload["job"]["status"], "passed")
         self.assertEqual(payload["job"]["error"], "RuntimeError: stale native failure")
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/robot/pull/1")
+
+
+class _RetryAirflow(_PermissiveAirflow):
+    """A retry-capable Airflow double that records every clear it is asked for."""
+
+    def __init__(self) -> None:
+        self.clears: list[dict] = []
+
+    def dag_run(self, token, dag_id, dag_run_id):
+        return {
+            "dag_run_id": dag_run_id,
+            "state": "failed",
+            "conf": {},
+            "triggering_user_name": build_actor_name("fixture:local:reader", "synthetic"),
+        }
+
+    def task_instances(self, token, dag_id, dag_run_id):
+        return [
+            {
+                "task_id": stage,
+                "state": (
+                    "failed"
+                    if stage == "capture"
+                    else "upstream_failed"
+                    if stage in {"generate", "verify", "publish"}
+                    else "success"
+                ),
+            }
+            for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")
+        ]
+
+    def clear_dag_run(self, token, dag_id, dag_run_id, *, dry_run):
+        self.clears.append({"dry_run": dry_run})
+        selected = [row for row in self.task_instances(token, dag_id, dag_run_id) if row["state"] != "success"]
+        return {
+            "dag_id": dag_id,
+            "dag_run_id": dag_run_id,
+            "state": "queued",
+            "task_instances": selected,
+            "total_entries": len(selected),
+        }
+
+
+class _RunningEndpoint:
+    def get_job(self, run_id):
+        assert run_id == WSGI_RUN
+        return {"run_id": run_id, "status": "running", "events": []}
+
+
+class RegisteredRetryAuthorityTests(unittest.TestCase):
+    """The registered terminal outcome owns the retry decision before any clear."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="registered-retry-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _post_retry(self, platform: RegisteredPlatform) -> tuple[int, dict, list]:
+        airflow = _RetryAirflow()
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(airflow=airflow, endpoint=_RunningEndpoint(), platform_store=platform.store)
+        )
+        session = app.sessions.create("user", "token", principal="fixture:local:reader")
+        response: dict = {}
+
+        def start(status, headers):
+            response["status"] = int(status.split()[0])
+
+        body = b"".join(
+            app(
+                {
+                    "REQUEST_METHOD": "POST",
+                    "PATH_INFO": f"/api/runs/{DAG}/retry",
+                    "HTTP_COOKIE": f"{portal_module.DEFAULT_SESSION_COOKIE}={session.session_id}",
+                    "HTTP_X_CSRF_TOKEN": session.csrf_token,
+                    "CONTENT_LENGTH": "2",
+                    "wsgi.input": io.BytesIO(b"{}"),
+                },
+                start,
+            )
+        )
+        return response["status"], json.loads(body), airflow.clears
+
+    def test_registered_terminal_outcomes_refuse_retry_without_clearing(self) -> None:
+        """failed/cancelled/unresolved registrations all refuse before any clear."""
+        for state in ("failed", "cancelled", "unresolved"):
+            with self.subTest(state=state):
+                platform = RegisteredPlatform(self.tmp / f"terminal-{state}")
+                platform.admit(WSGI_RUN)
+                platform.store.confirm_stage(
+                    run_id=WSGI_RUN,
+                    stage="capture",
+                    state=state,
+                    receipt={
+                        "schema_version": "solidworks-to-urdf.bundle/v1",
+                        "pipeline_id": "solidworks-to-urdf",
+                        "run_id": WSGI_RUN,
+                        "stage": "capture",
+                        "state": state,
+                        "passed": False,
+                        "error": "Registered authoritative native outcome",
+                    },
+                )
+                status, payload, clears = self._post_retry(platform)
+                self.assertEqual(status, 409, payload)
+                self.assertEqual(payload.get("reason"), f"registered_{state}")
+                self.assertEqual(clears, [], "no dry-run and no clear may touch a registered terminal run")
+
+    def test_an_unregistered_failure_keeps_its_retry_positive(self) -> None:
+        platform = RegisteredPlatform(self.tmp / "running")
+        platform.admit(WSGI_RUN)
+        status, payload, clears = self._post_retry(platform)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual([entry["dry_run"] for entry in clears], [True, False])
 
 
 if __name__ == "__main__":

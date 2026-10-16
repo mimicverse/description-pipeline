@@ -1066,6 +1066,11 @@ class PortalTests(unittest.TestCase):
 
     def _seed_retryable_run(self) -> None:
         self._seed_passed_job()
+        # A retryable attempt is interrupted, not delivered: its registration is
+        # non-terminal (the terminal immutability gate owns everything else).
+        merged = self.store.runs[native_run_id(DAG_RUN_ID)]["merged"]
+        merged["status"] = "running"
+        merged.pop("result", None)
         self.airflow.dag_runs[DAG_RUN_ID]["state"] = "failed"
         self.airflow.task_states[DAG_RUN_ID] = [
             {"task_id": "freeze", "state": "success"},

@@ -1758,6 +1758,25 @@ class PortalApp:
                         {"error": "已删除的运行不能重试，请先恢复", "reason": "deleted"},
                         self.config,
                     )
+                # The registered outcome is the terminal authority: a registered
+                # terminal run refuses in-place retry BEFORE any Airflow clear
+                # (dry-run included) - a stale native observation never reopens it.
+                run_id = native_run_id(dag_run_id)
+                record = self._platform_read(lambda: self._platform().run_record(run_id))
+                registered_state = record.get("state") if isinstance(record, dict) else None
+                if registered_state in {"failed", "succeeded", "cancelled", "unresolved"}:
+                    return _json_response(
+                        start_response,
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                "该运行已登记为终态：不可原地清除重试；"
+                                "未决结果请先完成对账，其余请按登记结果修复后新建关联运行"
+                            ),
+                            "reason": f"registered_{registered_state}",
+                        },
+                        self.config,
+                    )
                 tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
                 job = None
                 try:
