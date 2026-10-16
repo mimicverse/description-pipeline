@@ -59,7 +59,6 @@ class NativeEvidenceKindTests(unittest.TestCase):
         )
         write_json(root / "evidence/native-runtime.json", environment)
         (root / "evidence/raw/scene_raw.json").write_text('{"scene": "raw"}', encoding="utf-8")
-        (root / "evidence/raw/source_config.json").write_text('{"material_source": "cad"}', encoding="utf-8")
         write_json(
             root / "evidence/manifest.json",
             {
@@ -68,7 +67,6 @@ class NativeEvidenceKindTests(unittest.TestCase):
                 "evidence_class": manifest_class,
                 "identity": identity,
                 "scene": "raw/scene_raw.json",
-                "source_config": "raw/source_config.json",
                 "files": inventory(root / "evidence", exclude=("manifest.json",)),
             },
         )
