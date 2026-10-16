@@ -56,6 +56,8 @@ Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath
 Check 'wording.no_system_text_json' (-not $source.Contains('System.Text.Json')) 'a Core-only JSON type the Desktop PowerShell 5.1 lifecycle cannot load is still present'
 Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfigScanPython') -and
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
+Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
+  $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
 if ($StaticOnly) {
   Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
   exit ([int]($script:failures.Count -gt 0))
@@ -67,7 +69,7 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
-  'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram'
+  'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 
 # ---- strict JSON boundary on the bound CPython 3.12 (PowerShell 5.1-compatible path) --------
@@ -276,6 +278,38 @@ $message = ''
 try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
 Check 'pins.served_state_root_mismatch_refused' ($message -match 'state_root_mismatch')
 $script:ServedStateRoot = $root
+# Representation-insensitive: the official reader reports backslashes on Windows while the
+# binding and platform.json declare forward slashes; the same root in either spelling passes.
+$script:ServedStateRoot = $root.Replace('/', '\')
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_insensitive_pass' (($null -ne $pins) -and ($message -eq ''))
+$script:ServedStateRoot = $root
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins ($root.Replace('/', '\')) $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_variant_state_root_pass' (($null -ne $pins) -and ($message -eq ''))
+# A genuinely different path still refuses after normalization (a near miss, not a separator).
+$script:ServedStateRoot = ($root + '-other')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.true_mismatch_after_normalization_refused' ($message -match 'state_root_mismatch')
+$script:ServedStateRoot = $root
+# The account pins may carry either spelling too: the same generation restated with backslashes
+# passes; a different generation still refuses.
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation.Replace('/', '\')
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical.Replace('/', '\')
+$message = ''
+$pins = $null
+try { $pins = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.pin_representation_restates_pass' (($null -ne $pins) -and ($message -eq ''))
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = ($generation + '-other')
+$message = ''
+try { $null = Assert-DomainPins $root $generation } catch { $message = $_.Exception.Message }
+Check 'pins.representation_true_root_change_refused' ($message -match 'cad_domain_override_refused')
+$script:AccountEnv['DESCRIPTION_ENDPOINT_ROOT'] = $generation
+$script:AccountEnv['DESCRIPTION_CAD_OWNERSHIP_FILE'] = $canonical
 
 Reset-State
 $facts = Get-OwnershipRefusalFacts $generation $binding
