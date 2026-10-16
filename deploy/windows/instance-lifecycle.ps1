@@ -6,8 +6,15 @@
 #   promote stops the old endpoint (no listener AND no writer residue under the generation or
 #           state root), switches the task to the generation runtime + config, starts it and
 #           settles it for >=180s (task Running + listener PID constant + token-authenticated
-#           /health ready); a start refused by the ownership lock is recorded, waited out for
-#           >=60s and retried exactly once, and a second refusal stops with lock_refused
+#           /health ready); a start refused by the ownership lock is recorded together with the
+#           lock owner's process facts, and the >=60s-later retry happens exactly once and only
+#           after the owner is PROVEN ended.  Owner state and lock probe are three-valued
+#           (alive/ended/unknown; refused/free/observer-failed): an unknown owner, a failed
+#           observer or a second refusal stops with lock_refused_unproven / lock_refused for
+#           diagnosis, never by killing an unknown process or deleting the lock; every failure
+#           path restores the previous task definition but starts it only on startable evidence
+#           (lock free, or refused with a proven-ended owner) and verifies health against the
+#           previous generation's own pinned release identity
 #   rollback restores exactly the previous generation directory the caller bounds
 #   health  relays the running endpoint's own /health payload
 # Each invocation prints one JSON object; receipts stay under the instance state root.
@@ -138,19 +145,332 @@ function Wait-Settled([string]$configPath, [object]$binding) {
   $health = Health-Probe $configPath $binding
   return @{health=$health; settled_seconds=[int][math]::Round($timer.Elapsed.TotalSeconds); listener_pid=$listenerPid}
 }
-function Test-OwnershipLockRefusal([string]$generation, [object]$binding) {
-  # The scheduler does not capture the launcher's stderr, so the documented refusal is proven by
-  # the condition its message describes: the launcher exited without answering /health while the
-  # endpoint ownership lock under the instance state root is held elsewhere.  The probe acquires
-  # the same lock through the staged runtime's own owner function (released on probe exit).
+function Get-ProcessFacts([int]$ownerPid) {
+  # Three states with positive evidence only: 'alive' (the OS returned the process), 'ended' (the
+  # OS answered that no such process exists) and 'unknown' (every other outcome - a permission
+  # error or any query failure is never proof that the owner exited).
+  try {
+    $process = Get-Process -Id $ownerPid -ErrorAction Stop
+  } catch {
+    $message = [string]$_.Exception.Message
+    if ($message -match '(?i)cannot find (a|the) process') {
+      return @{state='ended'; alive=$false; image=''; started=''; error=''}
+    }
+    return @{state='unknown'; alive=$null; image=''; started=''; error=$message}
+  }
+  if ($null -eq $process) {
+    return @{state='unknown'; alive=$null; image=''; started=''; error='the process query returned nothing'}
+  }
+  $image = ''
+  $started = ''
+  try { $image = [string]$process.Path } catch { }
+  try { $started = $process.StartTime.ToUniversalTime().ToString('o') } catch { }
+  return @{state='alive'; alive=$true; image=$image; started=$started; error=''}
+}
+function Read-LockOwner([string]$lockPath) {
+  # The lock file carries the owner PID as a diagnostic record (io.acquire_process_lock); the
+  # kernel lock itself lives in the descriptor and dies with the process.
+  if (-not (Test-Path -LiteralPath $lockPath)) { return @{present=$false; pid=$null; valid=$false} }
+  $raw = ''
+  try { $raw = ([string](Get-Content -LiteralPath $lockPath -Raw -ErrorAction Stop)).Trim() } catch {
+    return @{present=$true; pid=$null; valid=$false}
+  }
+  $ownerPid = 0
+  $valid = [int]::TryParse($raw, [ref]$ownerPid) -and $ownerPid -gt 0
+  return @{present=$true; pid=$(if ($valid) { $ownerPid } else { $null }); valid=$valid}
+}
+function Test-LockProbeHeld([string]$generation, [string]$lockPath) {
+  # Three outcomes from the staged runtime itself: $true = the lock refused the acquire (marker
+  # plus the dedicated exit code), $false = the lock is free, $null = the observer failed
+  # (missing runtime, import or other error, unknown exit) - never folded into either answer.
+  $probeSource = @'
+import sys
+from pathlib import Path
+try:
+    from description_pipeline.io import acquire_process_lock
+except Exception as error:  # an observer failure, never a lock state
+    print("PROBE_IMPORT_FAILED: %s" % error, file=sys.stderr)
+    sys.exit(7)
+try:
+    acquire_process_lock(Path(sys.argv[1]))
+except Exception as error:
+    if "ownership lock is unavailable" in str(error):
+        print("LOCK_REFUSED")
+        sys.exit(3)
+    print("PROBE_FAILED: %s" % error, file=sys.stderr)
+    sys.exit(7)
+sys.exit(0)
+'@
+  $probePath = Join-Path ([System.IO.Path]::GetTempPath()) ('endpoint-lock-probe-' + [guid]::NewGuid().ToString('N') + '.py')
+  [System.IO.File]::WriteAllText($probePath, $probeSource, (New-Object System.Text.UTF8Encoding($false)))
+  $output = ''
+  $exitCode = -1
+  try {
+    $output = [string]((cmd /c "`"$(Runtime-Python $generation)`" -I `"$probePath`" `"$lockPath`" 2>nul") | Out-String)
+    $exitCode = [int]$LASTEXITCODE
+  } catch {
+    $output = ''
+    $exitCode = -1
+  } finally {
+    Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+  }
+  if ($exitCode -eq 0) { return $false }
+  if ($exitCode -eq 3 -and $output -match 'LOCK_REFUSED') { return $true }
+  return $null
+}
+function Get-OwnershipRefusalFacts([string]$generation, [object]$binding) {
+  # deployment.md settle: only positive evidence may license a retry.  Refusal, owner process
+  # state and probe observer state are three-valued; a failed observation is unknown /
+  # observer_failed and stops the switch instead of being read as a pass.  Nothing here kills a
+  # process or deletes the lock.
   $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
-  if ($taskNow -and [string]$taskNow.State -eq 'Running') { return $false }
+  if ($taskNow -and [string]$taskNow.State -eq 'Running') {
+    return @{refused=$false; state='task_running'; reason='task_running'}
+  }
   $config = Read-Json (Config-Path $generation)
-  $lock = Join-Path ([string]$config.state_root) '.endpoint.lock'
-  if (-not (Test-Path -LiteralPath $lock)) { return $false }
-  $probe = 'import sys;from pathlib import Path;from description_pipeline.io import acquire_process_lock;acquire_process_lock(Path(sys.argv[1]))'
-  cmd /c "`"$(Runtime-Python $generation)`" -I -c `"$probe`" `"$lock`" 2>nul" | Out-Null
-  return ($LASTEXITCODE -ne 0)
+  $lockPath = Join-Path ([string]$config.state_root) '.endpoint.lock'
+  $owner = Read-LockOwner $lockPath
+  if (-not $owner.present) {
+    return @{refused=$false; state='no_lock_file'; reason='no_lock_file'; lock_path=$lockPath}
+  }
+  $probe = Test-LockProbeHeld $generation $lockPath
+  if ($null -eq $probe) {
+    return @{refused=$false; state='observer_failed'; reason='observer_failed'; lock_path=$lockPath;
+             owner_pid=$owner.pid}
+  }
+  if (-not $probe) { return @{refused=$false; state='lock_free'; reason='lock_free'; lock_path=$lockPath} }
+  if (-not $owner.valid) {
+    return @{refused=$true; state='refused'; reason='owner_unreadable'; lock_path=$lockPath; owner_pid=$null;
+             owner_state='unknown'; owner_process_alive=$null; owner_ended=$false}
+  }
+  $facts = Get-ProcessFacts ([int]$owner.pid)
+  return @{refused=$true; state='refused'; reason='lock_held'; lock_path=$lockPath; owner_pid=[int]$owner.pid;
+           owner_state=[string]$facts.state; owner_process_alive=$facts.alive;
+           owner_process_image=$facts.image; owner_process_started=$facts.started;
+           owner_process_error=$facts.error; owner_ended=([string]$facts.state -eq 'ended')}
+}
+function Wait-SettleRetryDelay([int]$Seconds = 60) {
+  # Reached only after the recorded owner is proven ended (deployment.md settle).
+  Start-Sleep -Seconds $Seconds
+}
+function Write-LockRefusalReceipt([string]$promotions, [string]$stageDir, [hashtable]$refusal, [bool]$retryable) {
+  Write-Receipt (Join-Path $promotions 'lock-refusal.json') @{
+    verb='promote'; at=$refusal.at; generation=$stageDir; message=$refusal.message; reason=$refusal.reason;
+    owner_pid=$refusal.owner_pid; owner_state=$refusal.owner_state; owner_process_alive=$refusal.owner_process_alive;
+    owner_ended=$refusal.owner_ended; retry_after_s=60; retryable=$retryable}
+}
+function Start-OrRefuse([string]$configPath, [object]$binding, [string]$stageDir, [string]$promotions) {
+  # Start the switched task and settle it.  A refusal by the ownership lock may be retried exactly
+  # once, >=60s after the recorded owner is PROVEN ended; an unknown owner state, a failed lock
+  # observer and a second refusal stop the switch for diagnosis.  The refusal facts are recorded
+  # on every path; nothing kills processes or deletes the lock.
+  $script:SettleRefusal = @{lock_refusal=$null; retried_after_s=$null}
+  $result = @{settled=$null; lock_refusal=$null; retried_after_s=$null}
+  Start-ScheduledTask -TaskName $binding.task_name
+  try { $result.settled = Wait-Settled $configPath $binding; return $result }
+  catch {
+    $facts = Get-OwnershipRefusalFacts $stageDir $binding
+    if ([string]$facts.state -eq 'observer_failed') {
+      $refusal = @{
+        message='Another endpoint owns the state root or its ownership lock is unavailable';
+        at=(Get-Date).ToUniversalTime().ToString('o'); reason='observer_failed'; lock_path=$facts.lock_path;
+        owner_pid=$facts.owner_pid; owner_state='unknown'; owner_process_alive=$null; owner_ended=$false}
+      $result.lock_refusal = $refusal
+      $script:SettleRefusal = @{lock_refusal=$refusal; retried_after_s=$null}
+      Write-LockRefusalReceipt $promotions $stageDir $refusal $false
+      throw 'lock_refused_unproven: the lock observer failed; the refusal cannot be interpreted [observer_failed]'
+    }
+    if (-not $facts.refused) { throw }
+    $refusal = @{
+      message='Another endpoint owns the state root or its ownership lock is unavailable';
+      at=(Get-Date).ToUniversalTime().ToString('o'); reason=[string]$facts.reason; lock_path=$facts.lock_path;
+      owner_pid=$facts.owner_pid; owner_state=[string]$facts.owner_state; owner_process_alive=$facts.owner_process_alive;
+      owner_process_image=$facts.owner_process_image; owner_process_started=$facts.owner_process_started;
+      owner_process_error=$facts.owner_process_error;
+      owner_ended=[bool]$facts.owner_ended}
+    $result.lock_refusal = $refusal
+    $script:SettleRefusal = @{lock_refusal=$refusal; retried_after_s=$null}
+    Write-LockRefusalReceipt $promotions $stageDir $refusal $refusal.owner_ended
+    if (-not $facts.owner_ended) {
+      throw ('lock_refused_unproven: the endpoint lock owner is not proven ended [owner_state=' +
+             [string]$facts.owner_state + ' / ' + [string]$facts.reason + ']')
+    }
+    Wait-SettleRetryDelay 60
+    $result.retried_after_s = 60
+    $script:SettleRefusal.retried_after_s = 60
+    Start-ScheduledTask -TaskName $binding.task_name
+    try { $result.settled = Wait-Settled $configPath $binding; return $result }
+    catch {
+      $second = Get-OwnershipRefusalFacts $stageDir $binding
+      if (-not $second.refused) { throw }
+      throw ('lock_refused: the ownership lock was refused twice; stopping for diagnosis [owner_state=' +
+             [string]$second.owner_state + ']')
+    }
+  }
+}
+function Get-PreviousGenerationBinding([string]$generation, [object]$binding) {
+  # The previous generation's own pinned release identity, read from its stage receipt; without a
+  # receipt the binding stays unavailable instead of borrowing the candidate's new identity.
+  if (-not $generation) { return $null }
+  $receipt = Join-Path $generation 'stage-receipt.json'
+  if (-not (Test-Path -LiteralPath $receipt)) { return $null }
+  try { $record = Read-Json $receipt } catch { return $null }
+  if (-not ($record.version -and $record.source_commit -and $record.source_sha256)) { return $null }
+  return @{ task_name=$binding.task_name; state_root=$binding.state_root; generation=$generation;
+            port=$binding.port; version=$record.version; source_commit=$record.source_commit;
+            source_sha256=$record.source_sha256 }
+}
+function Get-EndpointConfigEarlyProblems([string]$configPath) {
+  # Early fail-closed scan for the 1.5.0 upgrade path: the known removed key set (currently
+  # targets) is transformed away by the single candidate generation; any other top-level key -
+  # or a repeated key - stops the stage explicitly and is never silently dropped.  The running
+  # file itself is never modified.
+  $allowed = @('schema_version','package_root','output_root','state_root','token_file','host','port')
+  $removed = @('targets')
+  if (-not (Test-Path -LiteralPath $configPath)) { return @{unreadable=''; duplicates=@(); unknown=@()} }
+  $raw = [System.IO.File]::ReadAllText($configPath)
+  $document = $null
+  try { $document = [System.Text.Json.JsonDocument]::Parse($raw) } catch {
+    return @{unreadable=$_.Exception.Message; duplicates=@(); unknown=@()}
+  }
+  $names = @()
+  foreach ($property in $document.RootElement.EnumerateObject()) { $names += $property.Name }
+  $duplicates = @($names | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name } | Sort-Object)
+  $unknown = @($names | Sort-Object -Unique | Where-Object { ($allowed -notcontains $_) -and ($removed -notcontains $_) })
+  return @{unreadable=''; duplicates=$duplicates; unknown=$unknown}
+}
+function Get-EndpointConfigTransformProgram {
+  # The single generator of the 1.5.0 candidate configuration.  It runs with the staged runtime so
+  # the candidate is serialized and digested by the release's own canonical writer; the policy is
+  # deliberately minimal - drop the known removed keys, keep every other field's value, refuse
+  # anything else (unknown keys, duplicate keys, malformed values) instead of guessing.
+  return @'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from description_pipeline import io
+
+
+def fail(code, detail):
+    print(json.dumps({"error": code, "detail": detail}, sort_keys=True))
+    raise SystemExit(1)
+
+
+def pairs_hook(pairs):
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError("duplicate key: %s" % key)
+        document[key] = value
+    return document
+
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+raw = source.read_bytes()
+try:
+    document = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs_hook)
+except ValueError as error:
+    duplicated = "duplicate key" in str(error)
+    fail("endpoint_config_duplicate_keys" if duplicated else "endpoint_config_unreadable", str(error))
+except Exception as error:
+    fail("endpoint_config_unreadable", str(error))
+if not isinstance(document, dict):
+    fail("endpoint_config_invalid", "the endpoint configuration is not an object")
+
+allowed = ("schema_version", "package_root", "output_root", "state_root", "token_file", "host", "port")
+removed = ("targets",)
+unknown = sorted(set(document) - set(allowed) - set(removed))
+if unknown:
+    fail("endpoint_config_unknown_keys", ", ".join(unknown))
+if document.get("schema_version") != "solidworks-to-urdf.endpoint/v1":
+    fail("endpoint_config_invalid_values", "schema_version")
+for key in ("package_root", "output_root", "state_root", "token_file", "host"):
+    if key in document and not isinstance(document[key], str):
+        fail("endpoint_config_invalid_values", key)
+port = document.get("port")
+if port is not None and (not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535):
+    fail("endpoint_config_invalid_values", "port")
+
+candidate = {key: document[key] for key in allowed if key in document}
+io.write_json(target, candidate)
+
+try:
+    from description_pipeline.orchestration.windows import read_config
+except Exception as error:
+    fail("endpoint_config_validator_unavailable", str(error))
+try:
+    loaded = read_config(target)
+except Exception as error:
+    fail("candidate_rejected_by_read_config", str(error))
+loaded_digest = loaded.get("config_digest") if isinstance(loaded, dict) else None
+if not isinstance(loaded_digest, str) or len(loaded_digest) != 64:
+    fail("candidate_digest_unrecorded", repr(loaded_digest))
+
+result = {
+    "source_sha256": hashlib.sha256(raw).hexdigest(),
+    "candidate_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+    "canonical_digest": io.digest(candidate),
+    "config_digest": loaded_digest,
+    "removed_keys": [key for key in removed if key in document],
+    "read_config": "passed",
+}
+print(json.dumps(result, sort_keys=True))
+'@
+}
+function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$previousConfig, [string]$stageDir, [string]$sourceLauncher) {
+  # The safe stop/restore every promote failure path runs: stop whatever now serves the task,
+  # restore the task snapshot, then start the previous generation only on startable evidence
+  # (lock free, no lock file, or refused with a proven-ended owner) - an unknown owner or a
+  # failed observer keeps the endpoint stopped for diagnosis.  Health is verified against the
+  # previous generation's own pinned release identity; without that receipt the health stays
+  # unjudged instead of being misfired at the new binding.  The facts land in the failure
+  # receipt; the admission stays closed regardless.
+  $restore = @{stopped=$false; restored=$false; start_gate=''; startable=$false; started=$false;
+               healthy=$null; previous_generation=''; error=''}
+  try {
+    Stop-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
+    $restore.stopped = $true
+  } catch { if (-not $restore.error) { $restore.error = 'stop: ' + $_.Exception.Message } }
+  try {
+    Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
+    $restore.restored = $true
+  } catch { if (-not $restore.error) { $restore.error = 'restore: ' + $_.Exception.Message } }
+  $previousGeneration = ''
+  if ($sourceLauncher) {
+    try {
+      $directory = [System.IO.Path]::GetDirectoryName($sourceLauncher)
+      $directory = if ($directory) { [System.IO.Path]::GetDirectoryName($directory) } else { '' }
+      $previousGeneration = if ($directory) { [System.IO.Path]::GetDirectoryName($directory) } else { '' }
+    } catch { $previousGeneration = '' }
+  }
+  $restore.previous_generation = [string]$previousGeneration
+  $gate = Get-OwnershipRefusalFacts $stageDir $binding
+  $restore.start_gate = [string]$gate.state
+  $restore.startable = ($gate.state -in @('lock_free', 'no_lock_file')) -or
+    (($gate.state -eq 'refused') -and [bool]$gate.owner_ended)
+  if ($restore.restored) {
+    if ($restore.startable) {
+      try {
+        Start-ScheduledTask -TaskName $binding.task_name
+        $restore.started = $true
+        $pinned = Get-PreviousGenerationBinding $previousGeneration $binding
+        if ($null -eq $pinned) {
+          if (-not $restore.error) {
+            $restore.error = 'the previous generation receipt is unavailable; the health probe stays unbound'
+          }
+        } else {
+          $null = Health-Probe $previousConfig $pinned
+          $restore.healthy = $true
+        }
+      } catch { if (-not $restore.error) { $restore.error = 'start/health: ' + $_.Exception.Message } }
+    } elseif (-not $restore.error) {
+      $restore.error = 'the previous endpoint was not started: start gate is ' + [string]$gate.state
+    }
+  }
+  return $restore
 }
 function Get-WriterResidue([object]$binding) {
   # The endpoint's own writers keep their image under the generation or the instance state root;
@@ -175,6 +495,57 @@ function Stop-Endpoint([object]$binding) {
   Die 'stop_failed' 'the old endpoint still listens or leaves a writing process under the generation/state root; refusing to switch'
 }
 
+# The execution account's canonical domain pins: the endpoint service and same-host independent
+# calls resolve the one CAD domain through these; an existing pin may only restate the bound
+# canonical path - never create a second domain or silently re-point the served generation.
+function Get-AccountEnvironment([string]$Name) {
+  return [string][Environment]::GetEnvironmentVariable($Name, 'User')
+}
+function Set-AccountEnvironment([string]$Name, [string]$Value) {
+  [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
+}
+function Domain-OwnershipPath([string]$StateRoot) {
+  return (Join-Path $StateRoot 'cad-ownership.json')
+}
+function Get-ServedStateRoot([string]$configPath) {
+  # The served generation's own runtime reads its endpoint.json through the official parser;
+  # the binding's state_root never self-grants - it must equal what the configuration declares.
+  $generation = Split-Path -Parent $configPath
+  $runtime = Runtime-Python $generation
+  $program = "import json,sys;from description_pipeline.orchestration import windows;" +
+    "config=windows.read_config(sys.argv[1]);print(json.dumps({'state_root':str(config['state_root'])}))"
+  $output = & $runtime -I -c $program $configPath
+  if ($LASTEXITCODE -ne 0) {
+    Die 'served_config_unreadable' ('the served endpoint configuration cannot be read officially: ' + $configPath)
+  }
+  return [string]((($output | Select-Object -Last 1) | ConvertFrom-Json).state_root)
+}
+function Assert-DomainPins([string]$StateRoot, [string]$ServedGeneration) {
+  $officialRoot = ''
+  if ($ServedGeneration) {
+    $officialRoot = Get-ServedStateRoot (Config-Path $ServedGeneration)
+    if ($officialRoot -ne $StateRoot) {
+      Die 'state_root_mismatch' ('the served configuration binds another state root: ' + $officialRoot)
+    }
+  }
+  $canonical = Domain-OwnershipPath $StateRoot
+  $pinned = [string](Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE')
+  if ($pinned -and ($pinned -ne $canonical)) {
+    Die 'cad_domain_override_refused' ('the bound CAD domain does not match this installation: ' + $pinned)
+  }
+  $pinnedRoot = [string](Get-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT')
+  if ($pinnedRoot -and $ServedGeneration -and ($pinnedRoot -ne $ServedGeneration)) {
+    Die 'cad_domain_override_refused' ('the endpoint-root pin does not restate the served generation: ' + $pinnedRoot)
+  }
+  return @{ canonical=$canonical; previous_ownership=$pinned; previous_root=$pinnedRoot }
+}
+function Set-DomainPins([string]$StateRoot, [string]$Generation) {
+  Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $Generation
+  Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' (Domain-OwnershipPath $StateRoot)
+}
+
+function Invoke-Main {
+# (Body intentionally kept unindented so this refactor's diff stays reviewable.)
 $binding = Read-Json $Binding
 foreach ($field in ('task_name','state_root','generation','dir','archive','artifact_sha256','port',
                     'package_root','output_root','version','source_commit','source_sha256')) {
@@ -214,6 +585,28 @@ if ($Verb -eq 'stage') {
   if (-not $StageDir) { Die 'stage_dir_required' 'stage needs -StageDir (the new generation directory)' }
   if (Test-Path -LiteralPath $StageDir) { Die 'stage_exists' "preserve the existing generation: $StageDir" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  # Early fail-closed scan (A8 upgrade path): the known removed key set (targets) is transformed
+  # away by the single candidate generation below, but anything the 1.5.0 schema does not define -
+  # including duplicate keys - stops the stage here, before any heavy work, and is never silently
+  # dropped.
+  $runningConfig = Action-Config $task
+  $early = Get-EndpointConfigEarlyProblems $runningConfig
+  if ($early.unreadable) {
+    Die 'endpoint_config_unreadable' ('the running endpoint configuration cannot be parsed: ' +
+      $runningConfig + ' (' + $early.unreadable + ')')
+  }
+  if (@($early.duplicates).Count -gt 0) {
+    Die 'endpoint_config_duplicate_keys' ('the running endpoint configuration repeats keys: ' +
+      ($early.duplicates -join ', ') + ' in ' + $runningConfig)
+  }
+  if (@($early.unknown).Count -gt 0) {
+    Die 'endpoint_config_unknown_keys' ('the running endpoint configuration carries keys the 1.5.0 ' +
+      'schema does not define: ' + ($early.unknown -join ', ') + ' in ' + $runningConfig +
+      '; remove them under change control and re-run stage')
+  }
+  # The canonical domain pins are validated now (an existing pin may only restate the canonical
+  # path and the served generation); stage only plans them - promote performs the switch.
+  $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $runningConfig)
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
   New-Item -ItemType Directory -Path $StageDir | Out-Null
@@ -233,20 +626,40 @@ if ($Verb -eq 'stage') {
   if ($identity.tool.version -ne $binding.version -or $identity.tool.source_sha256 -ne $binding.source_sha256 -or $identity.tool.release.source_commit -ne $binding.source_commit -or -not $identity.doctor.passed) {
     Die 'identity_mismatch' 'the staged runtime identity differs from the release manifest'
   }
-  # The generation carries its own minimal endpoint configuration; the token path stays the one
-  # the running instance already uses.  The expected config digest is computed by the staged
-  # runtime's own canonical owner - the endpoint's own /health stays the only install identity.
-  # The generation configuration is a byte copy of the running instance's own configuration
-  # (token path and roots preserved; no re-serialization, no BOM).
-  Copy-Item -LiteralPath (Action-Config $task) -Destination (Config-Path $StageDir)
-  $expected = & $runtime -I -c "import json,sys;from description_pipeline import io;print(io.digest(json.load(open(sys.argv[1],encoding='utf-8'))))" (Config-Path $StageDir)
-  if ($LASTEXITCODE -ne 0) { Die 'config_digest_failed' 'the staged runtime could not digest the generation configuration' }
+  # The generation consumes a generated 1.5.0 candidate configuration: the staged runtime's own
+  # canonical writer drops the known removed key set (targets), keeps every other field's value
+  # and meaning, and the release's own read_config test-loads the candidate before stage accepts
+  # it; the running file stays byte-sealed for controlled recovery.  (Necessity: the 1.5.0
+  # endpoint refuses the removed keys, so the former byte copy would ship a configuration the new
+  # validator rejects - one deterministic generation replaces it.)
+  $transformProgram = Get-EndpointConfigTransformProgram
+  $transform = & $runtime -I -c $transformProgram $runningConfig (Config-Path $StageDir)
+  if ($LASTEXITCODE -ne 0) {
+    $problem = ($transform | Select-Object -Last 1)
+    $code = 'endpoint_config_transform_failed'
+    $detail = [string]$problem
+    try {
+      $parsed = $problem | ConvertFrom-Json
+      if ($parsed.error) { $code = [string]$parsed.error; $detail = [string]$parsed.detail }
+    } catch { }
+    Die $code $detail
+  }
+  $transformInfo = ($transform | Select-Object -Last 1) | ConvertFrom-Json
+  $expected = [string]$transformInfo.config_digest
+  Write-Receipt (Join-Path $StageDir 'config-transformation.json') @{
+    verb='stage-config-transform'; at=(Get-Date).ToUniversalTime().ToString('o'); source=$runningConfig;
+    source_sha256=[string]$transformInfo.source_sha256; candidate_sha256=[string]$transformInfo.candidate_sha256;
+    canonical_digest=[string]$transformInfo.canonical_digest; config_digest=$expected;
+    removed_keys=@($transformInfo.removed_keys); read_config=[string]$transformInfo.read_config}
   Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{
-    expected=$true; config_digest=("$expected".Trim()); version=$binding.version;
+    expected=$true; config_digest=$expected; config_sha256=[string]$transformInfo.candidate_sha256;
+    source_config=$runningConfig; source_config_sha256=[string]$transformInfo.source_sha256;
+    removed_keys=@($transformInfo.removed_keys); version=$binding.version;
     source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
   Write-Receipt (Join-Path $StageDir 'stage-receipt.json') @{
     passed=$true; verb='stage'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-    version=$binding.version; source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
+    version=$binding.version; source_commit=$binding.source_commit; source_sha256=$binding.source_sha256;
+    pins=@{ endpoint_root=$StageDir; ownership=$pins.canonical }}
   Emit @{passed=$true; verb='stage'; generation=$StageDir; receipt=(Join-Path $StageDir 'stage-receipt.json')}
   exit 0
 }
@@ -258,7 +671,26 @@ if ($Verb -eq 'promote') {
   if (-not (Test-Path -LiteralPath (Config-Path $StageDir))) { Die 'generation_config_missing' 'the generation carries no endpoint configuration' }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered; install the instance before promoting' }
   if (@($task.Actions).Count -ne 1) { Die 'task_ambiguous' 'the instance task must carry exactly one action' }
+  # The candidate configuration is consumed, never regenerated here: the staged bytes must match
+  # the digest the stage recorded, and that record must belong to the configuration that is
+  # running right now.
+  $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
+  if (-not $candidate.config_sha256) {
+    Die 'candidate_config_unrecorded' 'the staged generation records no candidate configuration digest; re-run stage with the 1.5.0 toolchain'
+  }
+  if ((Sha256 (Config-Path $StageDir)) -ne [string]$candidate.config_sha256) {
+    Die 'candidate_config_mismatch' ('the staged candidate configuration differs from the staged digest: ' + (Config-Path $StageDir))
+  }
   $previousConfig = Action-Config $task
+  if (-not $candidate.source_config_sha256) {
+    Die 'candidate_source_unrecorded' 'the staged generation records no source configuration digest; re-run stage with the 1.5.0 toolchain'
+  }
+  if ((Sha256 $previousConfig) -ne [string]$candidate.source_config_sha256) {
+    Die 'candidate_source_mismatch' ('the staged candidate belongs to another running configuration: ' + $previousConfig)
+  }
+  # The equality check runs before any disruption: a pin that is not the canonical domain, or an
+  # endpoint-root pin that does not restate the served generation, refuses the promotion.
+  $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $previousConfig)
   $sourceExecute = $task.Actions[0].Execute
   $sourceConfig = $previousConfig
   Stop-Endpoint $binding
@@ -276,40 +708,15 @@ if ($Verb -eq 'promote') {
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
     -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
-  $lockRefusal = $null
-  $retriedAfter = $null
+  # The service reads the pins at start: set them for the execution account before starting the
+  # new generation; a failed promotion restores the previous values below.
+  Set-DomainPins $binding.state_root $StageDir
   try {
-    Start-ScheduledTask -TaskName $binding.task_name
-    try {
-      $settled = Wait-Settled (Config-Path $StageDir) $binding
-    } catch {
-      if (-not (Test-OwnershipLockRefusal $StageDir $binding)) { throw }
-      # Documented transient refusal (deployment.md settle): record it durably, wait at least
-      # 60 seconds and retry exactly once.
-      $lockRefusal = @{
-        message='Another endpoint owns the state root or its ownership lock is unavailable';
-        at=(Get-Date).ToUniversalTime().ToString('o')}
-      Write-Receipt (Join-Path $promotions 'lock-refusal.json') @{
-        verb='promote'; at=$lockRefusal.at; generation=$StageDir; message=$lockRefusal.message; retry_after_s=60}
-      Start-Sleep -Seconds 60
-      $retriedAfter = 60
-      Start-ScheduledTask -TaskName $binding.task_name
-      try {
-        $settled = Wait-Settled (Config-Path $StageDir) $binding
-      } catch {
-        if (-not (Test-OwnershipLockRefusal $StageDir $binding)) { throw }
-        # A second refusal is stop-and-diagnose, never a third attempt.
-        Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
-        Start-ScheduledTask -TaskName $binding.task_name
-        Write-Receipt (Join-Path $previous 'failed-promotion.json') @{
-          passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-          lock_refusal=$lockRefusal; retried=@{after_s=$retriedAfter};
-          second_refusal_at=(Get-Date).ToUniversalTime().ToString('o'); message=$_.Exception.Message}
-        Die 'lock_refused' ('the ownership lock was refused twice; stopping for diagnosis: ' + $_.Exception.Message)
-      }
-    }
+    $started = Start-OrRefuse (Config-Path $StageDir) $binding $StageDir $promotions
+    $settled = $started.settled
+    $lockRefusal = $started.lock_refusal
+    $retriedAfter = $started.retried_after_s
     $health = $settled.health
-    $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
     if ($health.install.config_digest -ne $candidate.config_digest) {
       throw 'the running endpoint config digest differs from the staged generation configuration'
     }
@@ -322,14 +729,21 @@ if ($Verb -eq 'promote') {
     Emit @{passed=$true; verb='promote'; generation=$StageDir; previous=$previous}
     exit 0
   } catch {
-    Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
-    Start-ScheduledTask -TaskName $binding.task_name
+    Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $pins.previous_root
+    Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' $pins.previous_ownership
+    $restore = Restore-PreviousEndpoint $binding $previous $previousConfig $StageDir $sourceExecute
     $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-      message=$_.Exception.Message}
-    if ($lockRefusal) { $failed['lock_refusal']=$lockRefusal; $failed['retried']=@{after_s=$retriedAfter} }
+      message=$_.Exception.Message; restore=$restore}
+    $failureCode = 'promote_failed'
+    if ($_.Exception.Message.StartsWith('lock_refused_unproven:')) { $failureCode = 'lock_refused_unproven' }
+    elseif ($_.Exception.Message.StartsWith('lock_refused:')) { $failureCode = 'lock_refused' }
+    if ($script:SettleRefusal -and $script:SettleRefusal.lock_refusal) {
+      $failed['lock_refusal']=$script:SettleRefusal.lock_refusal
+      if ($script:SettleRefusal.retried_after_s) { $failed['retried']=@{after_s=$script:SettleRefusal.retried_after_s} }
+    }
     Write-Receipt (Join-Path $previous 'failed-promotion.json') $failed
-    Die 'promote_failed' ('the promotion failed and the previous task was restored: ' + $_.Exception.Message)
+    Die $failureCode ('the promotion failed and the previous task was restored: ' + $_.Exception.Message)
   }
 }
 
@@ -338,6 +752,10 @@ if ($Verb -eq 'rollback') {
   if (-not $Previous) { Die 'previous_required' 'rollback needs -Previous (the bound previous generation directory)' }
   if (-not (Test-Path -LiteralPath (Join-Path $Previous 'task.xml'))) { Die 'previous_missing' "the bound previous generation carries no task snapshot: $Previous" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  # The pin must restate the generation being served right now; the rollback then re-points the
+  # pins to the restored generation - a legitimate switch, never a divergent override.
+  $servingConfig = Action-Config $task
+  $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $servingConfig)
   Stop-Endpoint $binding
   Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $Previous 'task.xml') -Raw) -Force | Out-Null
   # The restored task names the previous generation's own configuration; that file is the one
@@ -345,6 +763,7 @@ if ($Verb -eq 'rollback') {
   $restored = Get-ScheduledTask -TaskName $binding.task_name
   $previousConfig = Action-Config $restored
   Copy-Item -LiteralPath (Join-Path $Previous 'endpoint-before.json') -Destination $previousConfig -Force
+  Set-DomainPins $binding.state_root (Split-Path -Parent $previousConfig)
   Start-ScheduledTask -TaskName $binding.task_name
   try { $health = Health-Probe $previousConfig $binding } catch {
     Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{
@@ -357,3 +776,6 @@ if ($Verb -eq 'rollback') {
   Emit @{passed=$true; verb='rollback'; restored_from=$Previous}
   exit 0
 }
+
+}
+if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }

@@ -34,6 +34,7 @@ Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -258,6 +259,9 @@ def derive(
         "PLATFORM_OPERATOR_DSN": (
             f"postgresql://operator_ro@/airflow_meta?host={postgres_root}/socket&port={postgres_port}"
         ),
+        # The runtime freeze reads the platform configuration identity from the same snapshot
+        # bytes the install record digests; this is the same source, never a parallel copy.
+        "PLATFORM_CONFIG_DIGEST": hashlib.sha256(snapshot_bytes).hexdigest(),
         "PIPELINE_WHEEL": str(wheel_path),
         "PIPELINE_STORE_ROOT": store_root,
         "SOLIDWORKS_SSH_HOST": ssh_host,
