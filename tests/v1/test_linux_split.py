@@ -23,57 +23,7 @@ from description_pipeline.stages import STAGE_IDS
 from .test_stage_transfer import MAIN_ASSEMBLY, capture_root, native_tool
 
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
-SELECTED = {MAIN_ASSEMBLY: hashlib.sha256(b"CAD-BYTES").hexdigest()}
-UPLOAD = {**SELECTED, "unrelated.txt": hashlib.sha256(b"not selected").hexdigest()}
-HANDOFF = digest(SELECTED)
-
-
-def capture_job(run_id: str, archive: Path, tool: dict) -> dict:
-    """A current server receipt whose upload differs from its selected closure."""
-    from tests.sources.selection_support import sealed_selection
-
-    selection = sealed_selection(
-        UPLOAD,
-        MAIN_ASSEMBLY,
-        reader_sha256=tool["source_sha256"],
-        stage_root=r"C:\stage",
-        edges={MAIN_ASSEMBLY: []},
-    )
-    with zipfile.ZipFile(archive) as packed:
-        manifest_sha256 = hashlib.sha256(packed.read("transfer-manifest.json")).hexdigest()
-    return {
-        "status": "native_complete",
-        "run_id": run_id,
-        "main_assembly": MAIN_ASSEMBLY,
-        "native_tool": tool,
-        "handoff_sha256": HANDOFF,
-        "package_files": dict(SELECTED),
-        "request": {
-            "run_id": run_id,
-            "upload_files": dict(UPLOAD),
-            "upload_sha256": digest(UPLOAD),
-            "main_assembly": MAIN_ASSEMBLY,
-        },
-        "selection": {
-            "state": "sealed",
-            "reader_sha256": tool["source_sha256"],
-            "upload_sha256": digest(UPLOAD),
-            "staged_files": dict(UPLOAD),
-            "manifest": selection,
-        },
-        "result": {
-            "native_complete": True,
-            "native_tool": tool,
-            "capture_archive": {
-                "name": "native-evidence.zip",
-                "sha256": file_digest(archive),
-                "size": archive.stat().st_size,
-                "manifest_sha256": manifest_sha256,
-            },
-        },
-    }
-
-
+from .linux_split_support import HANDOFF, SELECTED, UPLOAD, capture_job
 def portable_record(native: dict, *, source_sha256: str | None = None, mujoco: str = "3.13.0") -> dict:
     record = json.loads(json.dumps(native))
     packages = {canonicalize_name(name): RUNTIME_VERSIONS[name] for name in required_packages("portable")}
