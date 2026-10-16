@@ -36,6 +36,7 @@ from description_pipeline.orchestration.airflow_client import (
 )
 from description_pipeline.orchestration.feishu_oauth import TRIGGERING_USER_NAME_LIMIT
 from description_pipeline.orchestration.portal import (
+    _attempt_frame_digest,
     AirflowApi,
     AirflowApiError,
     DEFAULT_DAG_ID,
@@ -45,7 +46,11 @@ from description_pipeline.orchestration.portal import (
 )
 from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
 from description_pipeline.io import PipelineError
-from description_pipeline.platform.store import AdmissionClosedError, PlatformStoreError
+from description_pipeline.platform.store import (
+    AdmissionClosedError,
+    OpenAttemptConflictError,
+    PlatformStoreError,
+)
 from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import CONTRACT
 
@@ -640,6 +645,8 @@ class FakePlatformStore:
         self.admits: list[dict] = []
         #: Admitted run rows as the read side sees them: the DB reservation authority.
         self.runs: dict[str, dict] = {}
+        #: Admitted request rows as the read side sees them (the immutable frame).
+        self.requests: dict[str, dict] = {}
         self.displays: dict[str, object] = {}
         #: The one preview fixture this double projects registered reads from.
         self.fixtures: PreviewStore | None = None
@@ -811,9 +818,30 @@ class FakePlatformStore:
                 "from_stage": kwargs.get("from_stage"),
                 "tool_identity": None,
             }
+            request_id = kwargs.get("request_id")
+            if isinstance(request_id, str) and request_id:
+                self.requests[request_id] = {
+                    "request_id": request_id,
+                    "principal": kwargs.get("principal"),
+                    "target_hardware": kwargs.get("target_hardware"),
+                    "main_assembly": kwargs.get("main_assembly"),
+                    "sealed_at": None,
+                    "dispatch_digest": (kwargs.get("dispatch") or {}).get("params_digest"),
+                }
 
     def seed_open_child(
-        self, parent_run_id: str, dag_run_id: str, *, from_stage: str = "generate", state: str = "queued"
+        self,
+        parent_run_id: str,
+        dag_run_id: str,
+        *,
+        from_stage: str = "generate",
+        state: str = "queued",
+        principal: str = FEISHU_PRINCIPAL,
+        target_hardware: str = TEST_TARGET,
+        main_assembly: str | None = None,
+        change_summary: str = TEST_SUMMARY,
+        handoff_path: str = "/srv/robot-cell",
+        dispatch_digest: str | None = None,
     ) -> str:
         """One already-admitted child exactly as the read side finds it (no file state)."""
         native = native_run_id(dag_run_id)
@@ -825,7 +853,29 @@ class FakePlatformStore:
             "from_stage": from_stage,
             "tool_identity": None,
         }
+        self.requests[f"portal-{dag_run_id}"] = {
+            "request_id": f"portal-{dag_run_id}",
+            "principal": principal,
+            "target_hardware": target_hardware,
+            "main_assembly": main_assembly or "",
+            "sealed_at": None,
+            "dispatch_digest": (
+                dispatch_digest
+                if dispatch_digest is not None
+                else _attempt_frame_digest(
+                    handoff_path=handoff_path,
+                    stage=from_stage,
+                    target_hardware=target_hardware,
+                    change_summary=change_summary,
+                    parent_assembly=main_assembly,
+                )
+            ),
+        }
         return native
+
+    def request_record(self, request_id: str) -> dict | None:
+        record = self.requests.get(request_id)
+        return dict(record) if isinstance(record, dict) else None
 
     def lifecycle_rows(self) -> list[dict]:
         buckets = {"queued": "in_flight", "running": "in_flight", "unresolved": "unresolved"}
@@ -3103,6 +3153,63 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(self.platform.admits, [])
         self.assertFalse((self.upload_root / ".rerun-attempts").exists())
         self.assertIn(reserved, self.airflow.dag_runs)
+
+    def test_rerun_attempt_refuses_a_changed_frame_of_an_admitted_reservation(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        reserved = "portal-20261009T000000-dddd1111"
+        self.platform.seed_open_child(native_run_id(DAG_RUN_ID), reserved, from_stage="generate")
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            before = len(self.airflow.trigger_payloads)
+            for changed in (
+                {"stage": "generate", "target_hardware": "m3.1"},
+                {"stage": "generate", "change_summary": "another summary"},
+            ):
+                with self.subTest(changed=sorted(changed)):
+                    status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", changed)
+                    self.assertEqual(status, 409, body)
+                    self.assertEqual(json.loads(body)["reason"], "attempt_mismatch")
+                    self.assertEqual(json.loads(body)["active_dag_run_id"], reserved)
+            self.assertEqual(len(self.airflow.trigger_payloads), before)
+            self.assertEqual(self.platform.admits, [])
+            # The exact admitted request still reuses the reservation.
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+            self.assertEqual(status, 202, body)
+            self.assertEqual(json.loads(body)["dag_run_id"], reserved)
+            self.assertEqual(self.airflow.trigger_payloads[-1]["dag_run_id"], reserved)
+
+    def test_rerun_attempt_refuses_a_cross_session_retry_of_an_admitted_reservation(self) -> None:
+        self._seed_retryable_run()
+        admin = PortalClient(self.client.base)
+        admin.login(ADMIN_TOKEN)
+        rows = self._rerun_rows()
+        reserved = "portal-20261009T000000-dddd2222"
+        self.platform.seed_open_child(native_run_id(DAG_RUN_ID), reserved, from_stage="generate")
+        before = len(self.airflow.trigger_payloads)
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = admin.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "attempt_mismatch")
+        self.assertEqual(json.loads(body)["active_dag_run_id"], reserved)
+        self.assertEqual(len(self.airflow.trigger_payloads), before)
+        self.assertEqual(self.platform.admits, [])
+
+    def test_rerun_attempt_answers_a_concurrent_reservation_with_the_winner(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        rows = self._rerun_rows()
+        winner = "portal-20261009T000000-dddd3333"
+        self.platform.admit_error = OpenAttemptConflictError(
+            native_run_id(DAG_RUN_ID), native_run_id(winner), f"portal-{winner}"
+        )
+        with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
+            status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 409, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["reason"], "already_active")
+        self.assertEqual(payload["active_dag_run_id"], winner)
+        self.assertEqual(self.airflow.trigger_payloads, [])
 
     def test_rerun_attempt_reuses_the_child_the_scheduler_already_knows(self) -> None:
         self._seed_retryable_run()

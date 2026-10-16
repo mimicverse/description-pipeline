@@ -52,6 +52,25 @@ class AdmissionClosedError(PlatformStoreError):
     code = "admission_closed"
 
 
+class OpenAttemptConflictError(PlatformStoreError):
+    """A parent run already holds a non-terminal linked attempt.
+
+    The reservation is enforced inside the admission transaction (under the
+    admission row lock), so two concurrent submissions can never each admit a
+    child of the same parent.
+    """
+
+    code = "open_attempt_conflict"
+
+    def __init__(self, parent_run_id: str, run_id: str, request_id: str):
+        super().__init__(
+            f"The parent run {parent_run_id!r} already holds the open attempt {run_id!r} ({request_id!r})"
+        )
+        self.parent_run_id = parent_run_id
+        self.run_id = run_id
+        self.request_id = request_id
+
+
 class RunNotAdmittedError(PlatformStoreError):
     """A display write named a run that has no platform row."""
 
@@ -297,6 +316,19 @@ _READ_RUN_RECORD = (
     "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
 )
 _READ_RUN_PARENT = "SELECT parent_run_id FROM run WHERE run_id = %s"
+_OPEN_CHILD_RUN = (
+    "SELECT run_id, request_id FROM run WHERE parent_run_id = %s"
+    " AND state NOT IN ('succeeded', 'failed', 'cancelled')"
+    " ORDER BY created_at, run_id LIMIT 1"
+)
+_READ_REQUEST_RECORD = (
+    "SELECT principal, target_hardware, main_assembly, sealed_at,"
+    " (SELECT o.params_digest FROM operation o"
+    "  JOIN run u ON u.run_id = o.run_id"
+    "  WHERE u.request_id = request.request_id AND o.kind = 'dispatch'"
+    "  ORDER BY o.updated_at, o.operation_id LIMIT 1)"
+    " FROM request WHERE request_id = %s"
+)
 _READ_STAGE_RECORDS = (
     "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
     " FROM stage WHERE run_id = %s"
@@ -571,6 +603,9 @@ class PlatformStore:
         ``map_index`` (bound later by reconciliation when unknown).  The
         admission row lock is taken inside the same transaction that inserts
         all three rows: a closed gate (or any failure) leaves nothing behind.
+        A linked admission additionally requires that its parent holds no
+        non-terminal child: the reservation check runs under the same lock, so
+        concurrent submissions can never each admit one.
         """
 
         if not isinstance(dispatch, dict):
@@ -582,6 +617,11 @@ class PlatformStore:
         with self._transaction() as connection:
             _require_open(connection)
             cursor = connection.cursor()
+            if parent_run_id is not None:
+                cursor.execute(_OPEN_CHILD_RUN, (parent_run_id,))
+                open_child = cursor.fetchone()
+                if open_child is not None:
+                    raise OpenAttemptConflictError(parent_run_id, open_child[0], open_child[1])
             cursor.execute(
                 _INSERT_REQUEST,
                 (request_id, principal, target_hardware, main_assembly, _json(configuration), _json(baseline)),
@@ -1859,6 +1899,29 @@ class PlatformStore:
             "parent_run_id": row[2],
             "from_stage": row[3],
             "tool_identity": row[4],
+        }
+
+    def request_record(self, request_id: str) -> dict | None:
+        """One admitted request's immutable identity and its initial dispatch digest.
+
+        ``principal``/``target_hardware``/``main_assembly`` are the sealed acceptance
+        facts; ``dispatch_digest`` is the initial dispatch intent's parameter digest,
+        so an uncertain retry can prove the requested frame equals the immutable
+        admission before re-triggering.  ``None`` means the request row is absent.
+        """
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_REQUEST_RECORD, (request_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "request_id": request_id,
+            "principal": row[0],
+            "target_hardware": row[1],
+            "main_assembly": row[2],
+            "sealed_at": row[3],
+            "dispatch_digest": row[4],
         }
 
     def stage_records(self, run_id: str) -> dict[str, dict]:

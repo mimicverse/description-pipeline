@@ -31,6 +31,7 @@ from description_pipeline.io import PipelineError, digest, file_digest, read_dat
 from description_pipeline.platform import store as store_module
 from description_pipeline.platform.store import (
     AdmissionClosedError,
+    OpenAttemptConflictError,
     OperationConflictError,
     PlatformStore,
     PlatformStoreError,
@@ -252,6 +253,33 @@ class FakeCursor:
             if world.run_states.get(run_id) not in {"succeeded", "failed", "cancelled", None}:
                 world.run_states[run_id] = outcome
             self._rows = []
+        elif normalized.startswith("SELECT run_id, request_id FROM run WHERE parent_run_id"):
+            parent = params[0]
+            open_child = next(
+                (
+                    row
+                    for row in world.runs
+                    if row[2] == parent
+                    and world.run_states.get(row[0]) not in {"succeeded", "failed", "cancelled"}
+                ),
+                None,
+            )
+            self._rows = [(open_child[0], open_child[1])] if open_child is not None else []
+        elif normalized.startswith("SELECT principal, target_hardware, main_assembly"):
+            entry = next((row for row in world.requests if row[0] == params[0]), None)
+            if entry is None:
+                self._rows = []
+            else:
+                run_ids = {row[0] for row in world.runs if row[1] == entry[0]}
+                dispatch_digest = next(
+                    (
+                        record[3]
+                        for record in world.operations.values()
+                        if record[4] in run_ids and record[6] == "dispatch"
+                    ),
+                    None,
+                )
+                self._rows = [(entry[1], entry[2], entry[3], NOW, dispatch_digest)]
         elif normalized.startswith(
             "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
         ):
@@ -829,6 +857,60 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(
             self.world.transactions - transactions, 1, "request+run+intent share one admission transaction"
         )
+
+    def test_request_record_reads_the_sealed_admission_identity(self) -> None:
+        self.admit()
+        self.assertEqual(
+            self.store.request_record("q-1"),
+            {
+                "request_id": "q-1",
+                "principal": "portal",
+                "target_hardware": "nd",
+                "main_assembly": "cad/robot.SLDASM",
+                "sealed_at": NOW,
+                "dispatch_digest": "a" * 64,
+            },
+        )
+        self.assertIsNone(self.store.request_record("q-missing"))
+
+    def test_a_parent_holds_at_most_one_open_linked_attempt(self) -> None:
+        self.admit()  # the parent r-1
+
+        def child(run_id: str, request_id: str, digest: str) -> None:
+            self.admit(
+                run_id=run_id,
+                request_id=request_id,
+                parent_run_id="r-1",
+                from_stage="capture",
+                dispatch={"stage": "capture", "operation_key": f"{run_id}/capture:0", "params_digest": digest},
+            )
+
+        child("r-child-1", "q-child-1", "c" * 64)
+        with self.assertRaises(OpenAttemptConflictError) as raised:
+            child("r-child-2", "q-child-2", "d" * 64)
+        self.assertEqual(raised.exception.parent_run_id, "r-1")
+        self.assertEqual(raised.exception.run_id, "r-child-1")
+        self.assertEqual(raised.exception.request_id, "q-child-1")
+        # The refused admission left nothing behind.
+        self.assertIsNone(self.store.run_record("r-child-2"))
+        self.assertIsNone(self.store.request_record("q-child-2"))
+        # A different parent stays free.
+        self.admit(
+            run_id="r-other",
+            request_id="q-other",
+            dispatch={"stage": "capture", "operation_key": "r-other/capture:0", "params_digest": "e" * 64},
+        )
+        # Only a non-terminal child reserves the parent: once it is terminal, a new
+        # linked attempt is admitted.
+        self.store.confirm_stage(
+            run_id="r-child-1",
+            stage="generate",
+            state="failed",
+            checkpoint_uri=CHECKPOINT,
+            receipt=self.generate_receipt(run_id="r-child-1", state="failed", passed=False),
+        )
+        child("r-child-3", "q-child-3", "f" * 64)
+        self.assertIsNotNone(self.store.run_record("r-child-3"))
 
     def test_a_missing_dispatch_intent_is_refused_and_writes_nothing(self) -> None:
         with self.assertRaises(PlatformStoreError):
