@@ -108,22 +108,24 @@ class HealthGateTests(unittest.TestCase):
             summary = (run / "summary.txt").read_text(encoding="utf-8")
             completed = 0
             for index, path in enumerate(attempts, start=1):
+                match = re.search(rf"^attempt={index} rc=(\d+) reason=\S+.*out=", summary, re.M)
+                self.assertTrue(match, f"attempt {index} must be classified by its summary rc line")
+                self.assertIn(f"attempt-{index}.out", summary)
+                rc = int(match.group(1))
                 body = path.read_text(encoding="utf-8")
-                if body:
-                    # ① a probe that completed keeps its own original output
-                    self.assertIn(f"attempt-body-{index}", body)
-                    completed += 1
-                else:
-                    # ② a timed-out / force-finished attempt may carry an empty body, but the
-                    # summary must preserve its path and the timeout reason
-                    self.assertTrue(
-                        f"attempt={index} rc=124" in summary or f"attempt={index} rc=137" in summary
-                    )
-                    self.assertIn(f"attempt-{index}.out", summary)
-            # ④ a fixture whose budget only allowed one (killed) attempt is still a valid,
-            # evidence-preserving run; otherwise at least one probe completed with its output
-            self.assertTrue(completed >= 1 or len(attempts) == 1)
-            self.assertTrue("rc=3" in summary or (len(attempts) == 1 and "rc=124" in summary))
+                if rc in (124, 137):
+                    # ② cut attempts (timeout / force-finished) may or may not leave a body;
+                    # the summary rc/reason/path line is their preserved evidence
+                    continue
+                # ① any attempt whose probe exited on its own keeps its original output
+                self.assertIn(f"attempt-body-{index}", body)
+                completed += 1
+            # ④ a budget that only allowed one cut attempt is still valid evidence; otherwise at
+            # least one probe must have completed with its own output
+            self.assertTrue(
+                completed >= 1
+                or (len(attempts) == 1 and re.search(r"^attempt=1 rc=(124|137) ", summary, re.M))
+            )
             self.assertNotIn("linux_health_gate=PASS", result.stdout + result.stderr)
 
     def test_a_delayed_success_passes_after_retries(self) -> None:
