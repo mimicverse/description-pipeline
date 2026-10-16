@@ -26,25 +26,42 @@ CREATE_BODY_SCOPE_KEY = "description_pipeline_create_body"
 _CLEAR_BODY_LIMIT = 4096
 _CLEAR_BODY_FIELDS = frozenset({"dry_run", "only_failed", "only_new", "run_on_latest_version"})
 #: The create body carries exactly the submission frame the DAG understands: the
-#: frozen intake path, the optional linked-attempt linkage, the selected main
-#: assembly and the publish target with its multi-line change summary.  The
-#: recorded submitter identity is never a create-body field: ownership comes
-#: from the run's stored actor, never from a client-provided identity claim.
+#: frozen intake path, the frozen request identity the DAG intake requires, the
+#: optional linked-attempt linkage, the selected main assembly and the publish
+#: target with its multi-line change summary.  The recorded submitter identity is
+#: never a create-body field: ownership comes from the run's stored actor and
+#: the Airflow-authenticated actor, never from a client-provided identity claim.
 _CREATE_FIELDS = frozenset(
-    {"handoff_path", "parent_dag_run_id", "resume_from", "target_hardware", "change_summary", "main_assembly"}
+    {
+        "handoff_path",
+        "parent_dag_run_id",
+        "resume_from",
+        "target_hardware",
+        "change_summary",
+        "main_assembly",
+        # The portal-issued frozen request identity of one submission
+        # (``portal-<dag_run_id>``); the DAG intake refuses a run without it.
+        "request_id",
+    }
 )
-_CREATE_SINGLE_LINE_FIELDS = ("handoff_path", "target_hardware", "main_assembly")
+_CREATE_SINGLE_LINE_FIELDS = ("handoff_path", "target_hardware", "main_assembly", "request_id")
 _CREATE_SINGLE_LINE_LIMIT = 1024
 _CREATE_SUMMARY_LIMIT = 2048
 
 
 def _safe_single_line(value: object) -> bool:
-    """One bounded, control-character-free line of submission frame text."""
+    """One bounded, control-character-free line of submission frame text.
+
+    The text must carry a non-whitespace character and rejects C0 controls and DEL, exactly
+    like the frozen frame contract: an all-whitespace or C0/DEL-carrying field is not a
+    nameable path, identity or target.
+    """
 
     return (
         isinstance(value, str)
         and 0 < len(value) <= _CREATE_SINGLE_LINE_LIMIT
-        and all(ord(char) >= 32 for char in value)
+        and bool(value.strip())
+        and all(ord(char) >= 32 and ord(char) != 127 for char in value)
     )
 
 

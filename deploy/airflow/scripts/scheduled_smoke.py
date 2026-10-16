@@ -41,6 +41,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
@@ -363,6 +364,91 @@ def _feishu_env(home: Path, https_port: int) -> dict[str, str]:
         "FEISHU_TENANT_KEYS": FEISHU_TENANT,
         "FEISHU_REDIRECT_URI": f"https://127.0.0.1:{https_port}/auth/feishu/callback",
     }
+
+
+def _config_snapshot_environment(
+    args,
+    *,
+    target: str,
+    state_root: Path,
+    handoff_root: Path,
+    workspace_root: Path,
+    record_roots: list[str],
+    endpoint_port: int,
+) -> tuple[dict[str, str], dict]:
+    """The controlled platform-configuration identity that governs THIS smoke run.
+
+    The IF-16 snapshot is built by the deploy-side owner's own mechanism
+    (``validate_platform`` then ``build_snapshot``) from the exact inputs this run
+    consumes - its state/handoff/workspace roots, its record roots, its targets and
+    its real endpoint port - re-validated by the package's IF-16 validator,
+    serialized with the one canonical serializer and digested over exactly those
+    bytes (the same derivation the operator environment and the install record
+    bind).  The package-side snapshot digest must agree, otherwise the smoke
+    refuses instead of fabricating a second identity.  The resolved tree is
+    returned so every consumer below reads the snapshot's declared values.
+    """
+    from description_pipeline import interface_records  # noqa: PLC0415
+    from description_pipeline.io import canonical  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location(
+        "deploy_platform_config", args.root / "deploy/operator/platform_config.py"
+    )
+    platform_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(platform_config)
+    fixture_root = args.airflow_home / "smoke-config"
+    document = {
+        "schema_version": platform_config.PLATFORM_SCHEMA,
+        "operator": {
+            "origin": f"https://127.0.0.1:{_operator_https_port(args.root)}",
+            "certificate_file": str(fixture_root / "secrets/tls.crt"),
+            "private_key_file": str(fixture_root / "secrets/tls.key"),
+        },
+        "storage": {
+            "state_root": str(state_root),
+            "handoff_root": str(handoff_root),
+            "artifact_root": str(args.airflow_home / "smoke-artifacts"),
+            "workspace_root": str(workspace_root),
+            "release_root": str(args.airflow_home / "smoke-releases"),
+        },
+        "database": {"dsn_file": str(fixture_root / "secrets/postgres.dsn")},
+        "windows": {
+            "ssh_host": "smoke-windows",
+            "endpoint_port": endpoint_port,
+            "token_file": str(fixture_root / "secrets/endpoint.token"),
+            "instance": {
+                "task_name": "description-smoke-endpoint",
+                "package_root": "C:/description-smoke/packages",
+                "output_root": "C:/description-smoke/results",
+                "state_root": "C:/description-smoke/state",
+            },
+        },
+        "auth": {
+            "feishu_secret_file": str(args.airflow_home / "feishu.json"),
+            "tenant_keys": [FEISHU_TENANT],
+            "admin_open_ids": [FEISHU_OPERATOR],
+        },
+        "targets": {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
+        "specifications": {"record_roots": list(record_roots)},
+    }
+    resolved = platform_config.validate_platform(document)
+    platform_json_bytes = canonical(document)
+    install_id = f"smoke-{uuid.uuid4().hex[:12]}"
+    snapshot = platform_config.build_snapshot(
+        resolved,
+        platform_json_sha256=hashlib.sha256(platform_json_bytes).hexdigest(),
+        install_id=install_id,
+        generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    interface_records.validate_config_snapshot(snapshot)
+    snapshot_bytes = canonical(snapshot)
+    digest_value = hashlib.sha256(snapshot_bytes).hexdigest()
+    if digest_value != interface_records.config_snapshot_digest(snapshot):
+        raise RuntimeError("the snapshot digest owners disagree; refusing a second identity")
+    fixture_root.mkdir(parents=True, exist_ok=True)
+    (fixture_root / "platform.json").write_bytes(platform_json_bytes)
+    platform_config.atomic_write_once(fixture_root / "snapshots" / f"{install_id}.json", snapshot_bytes)
+    return {"PLATFORM_CONFIG_DIGEST": digest_value}, resolved
 
 
 def _plugin_preflight(venv: Path, env: dict[str, str], home: Path) -> str | None:
@@ -901,14 +987,75 @@ def main() -> int:
             bundle_dir=args.airflow_home / "smoke" / "definition",
         )
         port = server.server_address[1]
-    # The one canonical smoke store root.  The directory is created once here (the operator
-    # convention: a dedicated directory under the isolated home, mode 0700) and published to
-    # every consumer of this smoke: the in-process admission and the lazily bound portal read
-    # it from the environment, the scheduler reads the same path from the connection extra
-    # below, and the child processes inherit it through ``env``.
-    # ``PlatformStore.from_environment`` keeps requiring it - there is no implicit fallback
-    # and no second root.
-    store_root = args.airflow_home / "smoke-store"
+    # The controlled platform-configuration identity of this smoke world: one canonical
+    # IF-16 snapshot built by the deploy-side mechanism from THIS run's exact inputs
+    # (paths, ports, records, targets), published to the child Airflow services through
+    # the environment.  Every consumer below reads the snapshot's resolved values - the
+    # snapshot governs the deployed fixture instead of declaring a parallel one, and
+    # the runtime freeze still refuses a missing or mismatched digest.
+    try:
+        snapshot_env, resolved = _config_snapshot_environment(
+            args,
+            target=target,
+            state_root=args.airflow_home / "smoke-state",
+            handoff_root=intake_root,
+            workspace_root=args.airflow_home / "smoke-workspaces",
+            record_roots=[str(fixture_root / "records")],
+            endpoint_port=port,
+        )
+    except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
+        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": f"{type(error).__name__}: {error}"}))
+        if server is not None:
+            server.close()
+        return 1
+    os.environ.update(snapshot_env)
+    # The snapshot's secret references must be the real ones this run uses: the endpoint
+    # token file is materialized (0600) and read back for the connection, and the platform
+    # database reference is the actual PLATFORM_SERVICE_DSN this smoke was given -
+    # materialized as the referenced file and re-published from it.  Nothing secret is
+    # printed or copied into evidence.
+    secrets_dir = args.airflow_home / "smoke-config" / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(secrets_dir, 0o700)
+    token_file = Path(resolved["windows"]["token_file"])
+    token_file.write_text(TOKEN, encoding="utf-8")
+    os.chmod(token_file, 0o600)
+    endpoint_token = token_file.read_text(encoding="utf-8")
+    supplied_dsn = os.environ.get("PLATFORM_SERVICE_DSN", "")
+    if not supplied_dsn:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "stage": "platform_dsn",
+                    "error": (
+                        "PLATFORM_SERVICE_DSN is required: the platform database reference "
+                        "must be the real connection this run uses"
+                    ),
+                }
+            )
+        )
+        if server is not None:
+            server.close()
+        return 1
+    dsn_file = Path(resolved["database"]["dsn_file"])
+    dsn_file.write_text(supplied_dsn, encoding="utf-8")
+    os.chmod(dsn_file, 0o600)
+    os.environ["PLATFORM_SERVICE_DSN"] = dsn_file.read_text(encoding="utf-8")
+    # The one canonical smoke store root: the snapshot's derived store root, created once
+    # here (the operator convention: a dedicated directory under the isolated home, mode
+    # 0700) and published to every consumer of this smoke: the in-process admission and
+    # the lazily bound portal read it from the environment, the scheduler reads the same
+    # path from the connection extra below, and the child processes inherit it through
+    # ``env``.  ``PlatformStore.from_environment`` keeps requiring it - there is no
+    # implicit fallback and no second root.
+    store_root = Path(resolved["derived"]["store_root"])
+    repository_path = Path(resolved["derived"]["repositories"][REPOSITORY_SLUG])
+    if Path(resolved["storage"]["handoff_root"]) != intake_root:
+        print(json.dumps({"ok": False, "stage": "config_snapshot", "error": "the snapshot handoff root diverged"}))
+        if server is not None:
+            server.close()
+        return 1
     store_root.mkdir(parents=True, exist_ok=True)
     store_root.chmod(0o700)
     os.environ["PIPELINE_STORE_ROOT"] = str(store_root)
@@ -917,13 +1064,13 @@ def main() -> int:
             "conn_type": "http",
             "host": "127.0.0.1",
             "port": port,
-            "password": TOKEN,
+            "password": endpoint_token,
             "extra": {
                 "store_root": str(store_root),
-                "repositories": {REPOSITORY_SLUG: str(args.airflow_home / "smoke-repository")},
-                "targets": {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
-                "handoff_roots": [str(intake_root)],
-                "discovery": {"record_roots": [str(fixture_root / "records")]},
+                "repositories": {REPOSITORY_SLUG: str(repository_path)},
+                "targets": resolved["targets"],
+                "handoff_roots": [resolved["storage"]["handoff_root"]],
+                "discovery": {"record_roots": list(resolved["specifications"]["record_roots"])},
             },
         }
     )
@@ -1050,8 +1197,8 @@ def main() -> int:
                 args.root,
                 f"http://127.0.0.1:{api_port}",
                 intake_root,
-                args.airflow_home / "smoke-repository",
-                {target: {"repository_slug": REPOSITORY_SLUG, "base": REPOSITORY_BASE}},
+                repository_path,
+                resolved["targets"],
                 DAG_ID,
                 endpoint_holder,
             )

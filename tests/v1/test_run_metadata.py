@@ -105,7 +105,7 @@ class RunMetadataTests(unittest.TestCase):
         self.airflow.task_states[dag_run_id] = [
             {"task_id": f"task-{index}", "state": value} for index, value in enumerate(tasks)
         ]
-        self.world.run_display_rows[dag_run_id] = [None, None, None, NOW]
+        self.world.run_display_rows[native_run_id(dag_run_id)] = [None, None, None, NOW]
         return dag_run_id
 
     @staticmethod
@@ -362,7 +362,7 @@ class RunMetadataTests(unittest.TestCase):
 
     def test_runs_without_a_platform_row_refuse_display_writes(self) -> None:
         run_id = self._seed(self._uuid())
-        self.world.run_display_rows.pop(run_id)
+        self.world.run_display_rows.pop(native_run_id(run_id))
         for method, path, payload in (
             ("PATCH", f"/api/runs/{run_id}", {"title": "x"}),
             ("DELETE", f"/api/runs/{run_id}", None),

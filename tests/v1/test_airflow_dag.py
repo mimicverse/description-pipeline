@@ -16,6 +16,7 @@ from tests.v1._airflow_env import pinned_airflow_home
 
 from description_pipeline.io import digest
 from description_pipeline.orchestration.airflow_client import EndpointConfig
+from description_pipeline.orchestration.feishu_oauth import build_actor_name
 
 ROOT = Path(__file__).resolve().parents[2]
 DAG_DIR = ROOT / "deploy/airflow/dags"
@@ -57,6 +58,22 @@ except Exception:  # pragma: no cover - exercised only without Airflow installed
     AIRFLOW_AVAILABLE = False
 
 
+class _OperationRecorder:
+    """Minimal operation-family double for task-level tests (no SQL involved)."""
+
+    def __init__(self) -> None:
+        self.registered: list[dict] = []
+        self.claimed: list[dict] = []
+
+    def register_operation(self, **kwargs):
+        self.registered.append(dict(kwargs))
+        return SimpleNamespace(state="queued")
+
+    def claim_operation(self, **kwargs):
+        self.claimed.append(dict(kwargs))
+        return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
+
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
 class DagTests(unittest.TestCase):
     def test_submission_frame_requires_a_configured_target_and_summary(self) -> None:
@@ -70,7 +87,12 @@ class DagTests(unittest.TestCase):
         )
 
         def context(conf):
-            return {"dag_run": SimpleNamespace(conf=conf, triggering_user_name="ops"), "params": {}}
+            return {
+                "dag_run": SimpleNamespace(
+                    conf=conf, triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke")
+                ),
+                "params": {},
+            }
 
         with patch.object(module, "config_from_airflow_connection", return_value=config):
             for conf in (
@@ -93,6 +115,47 @@ class DagTests(unittest.TestCase):
         self.assertEqual(identity["change_summary"], "rebind")
         self.assertIsNone(identity["parent_revision"])
         self.assertEqual(multiline["change_summary"], "第一行\n第二行\n第三行")
+
+    def test_submission_frame_uses_only_the_authenticated_actor(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+
+        bag = DagBag(str(DAG_DIR))
+        resolve = bag.dags["solidworks_to_urdf"].task_dict["freeze"].python_callable
+        module = sys.modules[resolve.__module__]
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+        forged = {
+            "target_hardware": "m3.0",
+            "change_summary": "x",
+            # A client-shaped conf claim must never name the submitter.
+            "submission_principal": "cli_forged:tenant-a:ou_attacker",
+        }
+
+        def context(actor):
+            return {"dag_run": SimpleNamespace(conf=forged, triggering_user_name=actor), "params": {}}
+
+        with patch.object(module, "config_from_airflow_connection", return_value=config):
+            identity, _routing = module._submission_frame(
+                context(build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"))
+            )
+            self.assertEqual(identity["owner"], "cli_smoke:smoke-tenant:ou_smoke")
+            for actor in (
+                "",
+                "   ",
+                None,
+                "ops",
+                42,
+                "cli_smoke:smoke-tenant:ou_smoke",
+                "cli_smoke:smoke-tenant:ou_smoke|not-json",
+                'cli_smoke:smoke-tenant:ou_smoke|" smoke"',
+            ):
+                with self.subTest(actor=actor), self.assertRaisesRegex(
+                    AirflowFailException, "authenticated submitter identity"
+                ):
+                    module._submission_frame(context(actor))
 
     def test_freeze_fails_before_any_endpoint_contact(self) -> None:
         from types import SimpleNamespace
@@ -117,6 +180,58 @@ class DagTests(unittest.TestCase):
             for conf in ({}, {"target_hardware": "m3.0"}, {"change_summary": "x"}):
                 with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
                     dag.task_dict["freeze"].python_callable(**context(conf))
+
+    def test_freeze_requires_the_controlled_config_digest(self) -> None:
+        import shutil
+        import tempfile
+
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+        dag = module.dag
+        root = Path(tempfile.mkdtemp(prefix="freeze-digest-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        intake = root / "handoff"
+        intake.mkdir()
+        (intake / "assembly.SLDASM").write_bytes(b"<assembly/>")
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+        )
+
+        class Stub:
+            def authorized_intake_dir(self, path):
+                return intake
+
+        def context(conf):
+            return {
+                "dag_run": SimpleNamespace(
+                    conf=conf,
+                    run_id="portal-upload-digest",
+                    triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+                ),
+                "params": {"handoff_path": str(intake)},
+            }
+
+        base = {
+            "target_hardware": "m3.0",
+            "change_summary": "x",
+            "request_id": "portal-upload-digest",
+        }
+        with (
+            patch.object(module, "_endpoint", return_value=Stub()),
+            patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("PLATFORM_CONFIG_DIGEST", None)
+            with self.assertRaisesRegex(AirflowFailException, "PLATFORM_CONFIG_DIGEST is unavailable"):
+                dag.task_dict["freeze"].python_callable(**context(dict(base)))
+            with (
+                self.assertRaisesRegex(AirflowFailException, "does not match"),
+                patch.dict(os.environ, {"PLATFORM_CONFIG_DIGEST": "a" * 64}),
+            ):
+                dag.task_dict["freeze"].python_callable(**context({**base, "platform_config_digest": "b" * 64}))
 
     def test_dag_parses(self) -> None:
         bag = DagBag(str(DAG_DIR))
@@ -261,8 +376,16 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "assembly.SLDASM",
                 "conn_id": "solidworks_windows",
             }
-            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
-                started = dag.task_dict["discover"].python_callable(request)
+            operations = _OperationRecorder()
+            with (
+                patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
+                patch.object(module, "_platform_binding", return_value=(operations, None)),
+            ):
+                started = dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-native-half"),
+                    ti=SimpleNamespace(task_id="discover", map_index=-1),
+                )
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
                 polled = False
                 for _ in range(8):
@@ -288,6 +411,77 @@ class DagTests(unittest.TestCase):
             self.assertEqual(job["hardware_id"], "m3.0")
             self.assertEqual(job["repository_slug"], "example/m3.0")
             self.assertEqual(job["repository_base"], "feature/m3.0")
+            self.assertEqual([call["kind"] for call in operations.registered], ["native"])
+            self.assertEqual(
+                [call["operation_key"] for call in operations.registered], [f"{request['run_id']}/native:0"]
+            )
+            self.assertRegex(operations.registered[0]["params_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                operations.claimed,
+                [
+                    {
+                        "run_id": request["run_id"],
+                        "stage": "discover",
+                        "operation_key": f"{request['run_id']}/native:0",
+                    }
+                ],
+            )
+            self.assertEqual(
+                operations.registered[0]["dispatch"],
+                {
+                    "dag_id": "solidworks_to_urdf",
+                    "dag_run_id": "portal-native-half",
+                    "task_id": "discover",
+                    "map_index": -1,
+                },
+            )
+
+    def test_a_contextless_native_intent_is_refused_before_any_operation(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+        dag = module.dag
+        request = {
+            "run_id": module.native_run_id("dag-run-binding"),
+            "upload_files": {"assembly.SLDASM": "a" * 64},
+            "upload_sha256": "a" * 64,
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "solidworks_windows",
+        }
+
+        class UnknownEndpoint:
+            def get_job(self, run_id):
+                raise module.EndpointNotFound(run_id)
+
+        operations = _OperationRecorder()
+        with (
+            patch.object(module, "_endpoint", return_value=UnknownEndpoint()),
+            patch.object(module, "_platform_binding", return_value=(operations, None)),
+        ):
+            with self.assertRaisesRegex(AirflowFailException, "DagRun binding"):
+                dag.task_dict["discover"].python_callable(request)
+            with self.assertRaisesRegex(AirflowFailException, "task identity"):
+                dag.task_dict["discover"].python_callable(request, dag_run=SimpleNamespace(run_id="portal-binding"))
+            with self.assertRaisesRegex(AirflowFailException, "task-instance key"):
+                dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-binding"),
+                    task_instance=SimpleNamespace(task_id="discover"),
+                )
+            with self.assertRaisesRegex(AirflowFailException, "task identity"):
+                dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-binding"),
+                    ti=SimpleNamespace(task_id="  ", map_index=-1),
+                )
+            with self.assertRaisesRegex(AirflowFailException, "task-instance key"):
+                dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-binding"),
+                    ti=SimpleNamespace(task_id="discover", map_index=-2),
+                )
+        self.assertEqual(operations.registered, [])
+        self.assertEqual(operations.claimed, [])
 
     def test_linked_conf_binding_is_validated(self) -> None:
         from types import SimpleNamespace
@@ -349,8 +543,16 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装1008.SLDASM",
                 "conn_id": "solidworks_windows",
             }
-            with patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}):
-                started = dag.task_dict["discover"].python_callable(request)
+            operations = _OperationRecorder()
+            with (
+                patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
+                patch.object(module, "_platform_binding", return_value=(operations, None)),
+            ):
+                started = dag.task_dict["discover"].python_callable(
+                    request,
+                    dag_run=SimpleNamespace(run_id="portal-selection"),
+                    task_instance=SimpleNamespace(task_id="discover", map_index=-1),
+                )
                 self.assertFalse(started)  # first poke submits; the reschedule poll continues
             self.assertEqual(len(server.jobs), 1)
             job = next(iter(server.jobs.values()))
@@ -362,6 +564,17 @@ class DagTests(unittest.TestCase):
                     "upload_sha256": digest(upload),
                     "main_assembly": "3.0 总装1008.SLDASM",
                 },
+            )
+            self.assertEqual([call["kind"] for call in operations.registered], ["native"])
+            self.assertEqual(
+                operations.claimed,
+                [
+                    {
+                        "run_id": request["run_id"],
+                        "stage": "discover",
+                        "operation_key": f"{request['run_id']}/native:0",
+                    }
+                ],
             )
 
     def test_linked_run_reuses_the_parent_selection_payload(self) -> None:
@@ -407,6 +620,7 @@ class DagTests(unittest.TestCase):
                     "change_summary": "linked capture rerun",
                 },
                 run_id="portal-child-1",
+                triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
@@ -425,6 +639,9 @@ class DagTests(unittest.TestCase):
             handoff_digest=digest(upload),
             platform_config_digest="c" * 64,
         )
+
+        started_child_runs: list[str] = []
+
         class _Platform:
             def confirmed_stage(self, run_id, stage):
                 return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
@@ -434,6 +651,16 @@ class DagTests(unittest.TestCase):
 
             def sealed_path(self, uri):
                 return store_root / "sealed" / uri.removeprefix("store://sealed/")
+
+            def register_operation(self, **kwargs):
+                return SimpleNamespace(state="queued")
+
+            def claim_operation(self, **kwargs):
+                return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
+            def start_run(self, run_id):
+                started_child_runs.append(run_id)
+
         config = EndpointConfig(
             "http://127.0.0.1:1",
             "t" * 32,
@@ -450,7 +677,10 @@ class DagTests(unittest.TestCase):
             self.assertEqual(request["upload_sha256"], digest(upload))
             self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
-            started = dag.task_dict["discover"].python_callable(request)
+            self.assertEqual(started_child_runs, [request["run_id"]])
+            started = dag.task_dict["discover"].python_callable(
+                request, dag_run=context["dag_run"], ti=SimpleNamespace(task_id="discover", map_index=-1)
+            )
         self.assertEqual(
             (store_root / request["run_id"] / "input" / "request.json").read_bytes(),
             (store_root / "sealed" / parent_run_id / "freeze" / "input" / "request.json").read_bytes(),
@@ -521,6 +751,8 @@ class DagTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        started_child_runs: list[str] = []
+
         class _Platform:
             def confirmed_stage(self, run_id, stage):
                 return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
@@ -534,6 +766,9 @@ class DagTests(unittest.TestCase):
             def sealed_path(self, uri):
                 return store_root / "sealed" / uri.removeprefix("store://sealed/")
 
+            def start_run(self, run_id):
+                started_child_runs.append(run_id)
+
         context = {
             "dag_run": SimpleNamespace(
                 conf={
@@ -543,6 +778,7 @@ class DagTests(unittest.TestCase):
                     "change_summary": "rebound publish",
                 },
                 run_id="portal-child-2",
+                triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
             "params": {},
         }
@@ -554,6 +790,7 @@ class DagTests(unittest.TestCase):
             self.assertTrue(request["linux_owned"])
             self.assertEqual(request["repository_slug"], "mimicverse/description")
             self.assertEqual(request["repository_base"], "main")
+            self.assertEqual(started_child_runs, [request["run_id"]])
             binding = dag.task_dict["capture"].python_callable(request)
         self.assertEqual(binding["repository_slug"], "mimicverse/description")
         self.assertEqual(binding["repository_base"], "main")
@@ -579,6 +816,19 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.calls: list[dict] = []
         self.started: list[str] = []
         self.live_events: list[dict] = []
+        self.registered: list[dict] = []
+        self.claimed: list[dict] = []
+        self.sequence: list[str] = []
+
+        def register_operation(**payload):
+            self.registered.append(payload)
+            self.sequence.append("register")
+
+        def claim_operation(**payload):
+            self.claimed.append(payload)
+            self.sequence.append("claim")
+            return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
         platform = SimpleNamespace(
             confirm_stage=lambda **payload: self.calls.append(payload),
             confirmed_stage=lambda *args, **kwargs: None,
@@ -586,6 +836,8 @@ class PlatformRegistrationTests(unittest.TestCase):
             append_event=lambda run_id, *, stage, kind, payload=None: self.live_events.append(
                 {"run_id": run_id, "stage": stage, "kind": kind, "payload": payload}
             ),
+            register_operation=register_operation,
+            claim_operation=claim_operation,
         )
         binding = patch.object(self.module, "_platform_binding", return_value=(platform, self.root))
         binding.start()
@@ -620,6 +872,54 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertIn("model/robot.json", paths)
         self.assertIn("reports/quality.json", paths)
         self.assertTrue((self.root / "sealed" / "run-1" / "generate" / "manifest.json").is_file())
+
+    def test_the_publish_intent_is_registered_and_claimed_before_the_stage(self) -> None:
+        tree = self._tree(stage="publish")
+        receipt = {
+            "run_id": "run-1",
+            "state": "published",
+            "passed": True,
+            "subject_sha256": "a" * 64,
+            "submission": {"state": "created"},
+        }
+
+        def run_stage(*_args, **_kwargs):
+            self.sequence.append("stage")
+            return receipt
+
+        with patch.object(self.module.flow, "run_stage", side_effect=run_stage):
+            result = self.module._portable_registered(
+                "run-1",
+                "publish",
+                tree=tree,
+                expected_subject="a" * 64,
+                base="main",
+                context={
+                    "dag_run": SimpleNamespace(run_id="portal-publish-1"),
+                    "ti": SimpleNamespace(task_id="publish", map_index=-1, xcom_push=lambda **kwargs: None),
+                },
+            )
+        self.assertEqual(result, receipt)
+        # The registered and claimed intent precedes the one external write.
+        self.assertEqual(self.sequence, ["register", "claim", "stage"])
+        self.assertEqual(
+            [(call["stage"], call["kind"], call["operation_key"]) for call in self.registered],
+            [("publish", "publish", "run-1/publish:0")],
+        )
+        self.assertRegex(self.registered[0]["params_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            self.registered[0]["dispatch"],
+            {
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": "portal-publish-1",
+                "task_id": "publish",
+                "map_index": -1,
+            },
+        )
+        self.assertEqual(
+            self.claimed,
+            [{"run_id": "run-1", "stage": "publish", "operation_key": "run-1/publish:0"}],
+        )
 
     def test_a_stage_failure_converges_with_the_actual_products(self) -> None:
         tree = self._tree(stage="generate")
@@ -1175,6 +1475,10 @@ class LinkedMaterializationTests(unittest.TestCase):
                 expected_subject=subject,
                 repository=repository,
                 base="main",
+                context={
+                    "dag_run": SimpleNamespace(run_id=f"portal-{run_id}"),
+                    "ti": SimpleNamespace(task_id=stage, map_index=-1, xcom_push=lambda **kwargs: None),
+                },
             )
 
     def _registered_parent(self) -> None:
@@ -1248,6 +1552,42 @@ class LinkedMaterializationTests(unittest.TestCase):
         self.assertEqual(seeds, [("publish", self.root / "sealed" / self.GRANDCHILD / "verify")])
         self.assertEqual({owner for _, owner in gates}, {self.CHILD})
         self.assertEqual(self.store.stage_records(self.GRANDCHILD)["publish"]["state"], "completed")
+
+    def test_a_confirmed_publication_replays_its_registered_receipt(self) -> None:
+        self._registered_parent()
+        self._admit(self.CHILD, parent=self.PARENT, from_stage="verify")
+        self._linked_stage(self.CHILD, "verify", source=self.PARENT, seeds=[], gates=[], subject="b" * 64)
+        receipt = self._linked_stage(
+            self.CHILD,
+            "publish",
+            source=self.PARENT,
+            seeds=[],
+            gates=[],
+            subject="c" * 64,
+            repository=self.root / "model-repository",
+        )
+        self.assertEqual(receipt["state"], "published")
+        sealed = self.store.confirmed_stage(self.CHILD, "publish")
+        self.assertIsNotNone(sealed)
+        # A retry of the exact confirmed publication replays the registered receipt and
+        # never re-sends the side effect.
+        tree = self.module.flow.RunPaths(self.root, self.CHILD).stage_output("publish")
+        with (
+            patch.object(self.module, "_platform_binding", return_value=(self.store, self.root)),
+            patch.object(self.module.flow, "run_stage", side_effect=AssertionError("publication re-sent")),
+        ):
+            replayed = self.module._portable_registered(
+                self.CHILD,
+                "publish",
+                tree=tree,
+                expected_subject="c" * 64,
+                repository=self.root / "model-repository",
+                base="main",
+                source_run_id=self.PARENT,
+            )
+        self.assertEqual(replayed, sealed, "the replay returns the registered sealed receipt")
+        self.assertEqual(replayed["submission"]["state"], sealed["submission"]["state"])
+        self.assertEqual(self.store.confirmed_stage(self.CHILD, "publish"), sealed)
 
     def test_a_removed_parent_work_tree_leaves_the_linked_attempt_intact(self):
         import shutil as _shutil

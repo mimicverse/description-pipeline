@@ -41,6 +41,7 @@ from description_pipeline.orchestration.airflow_client import (
     submission_identity,
     validate_main_assembly,
 )
+from description_pipeline.orchestration.run_ownership import recorded_actor_principal
 from description_pipeline.orchestration.stage_transfer import CAPTURE_MANIFEST
 from description_pipeline.platform import capture as native_capture
 from description_pipeline.platform import flow
@@ -59,7 +60,7 @@ from description_pipeline.interface_records import (
     check_policy_digest,
 )
 from description_pipeline.platform.storage import seal_stage_confirmation, sealed_resolver
-from description_pipeline.platform.store import PlatformStore
+from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 from description_pipeline.runtime import tool_record
 from description_pipeline.stages import (
     CONFIRMED_STAGE_PASSED,
@@ -386,8 +387,35 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
     """
     platform, store_root = _platform_binding()
     source_run_id = kwargs.get("source_run_id")
+    if stage == "publish":
+        confirmed = platform.confirmed_stage(run_id, "publish")
+        if confirmed is not None:
+            # A confirmed publication is never re-sent: the registered sealed receipt
+            # IS the replay's result (terminal replay is idempotent by construction).
+            log.info("publication already confirmed run_id=%s; returning the registered receipt", run_id)
+            return confirmed
     if source_run_id:
         _materialize_linked_attempt(platform, store_root, run_id, source_run_id)
+    if stage == "publish":
+        # The ONE external write of this workflow: register its intent with the real
+        # Airflow binding and claim it immediately before the stage's side effect.
+        _claim_operation_intent(
+            platform,
+            run_id=run_id,
+            stage="publish",
+            kind="publish",
+            operation_key=f"{run_id}/publish:0",
+            params_digest=digest(
+                {
+                    "run_id": run_id,
+                    "source_run_id": source_run_id,
+                    "expected_subject": kwargs.get("expected_subject"),
+                    "base": kwargs.get("base"),
+                }
+            ),
+            what="publication",
+            context=context,
+        )
 
     def live(event: dict) -> None:
         try:
@@ -413,6 +441,66 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
         )
         raise
     return receipt
+
+
+def _claim_operation_intent(
+    platform: PlatformStore,
+    *,
+    run_id: str,
+    stage: str,
+    kind: str,
+    operation_key: str,
+    params_digest: str,
+    what: str,
+    context: dict | None,
+) -> None:
+    """Register one side-effect intent with its real Airflow binding, then claim it.
+
+    A new production intent requires the real, complete Airflow key (dag_id,
+    task_id, run_id, map_index) BEFORE anything is persisted: a missing or
+    malformed binding refuses here, and nothing is written with unknown binding
+    fields - legacy unbound rows continue only through the controlled reconcile
+    path.  The registration is idempotent on the same key and parameter digest;
+    only the claiming call may perform the side effect, and a repeat claim of a
+    still-running operation is the controlled reconciliation replay.  A settled
+    state refuses here - repeating an uncontrolled write is never a fallback.
+    """
+    context = context if isinstance(context, dict) else {}
+    dag_run = context.get("dag_run")
+    task_instance = context.get("ti") or context.get("task_instance")
+    bound_run_id = getattr(dag_run, "run_id", None)
+    task_id = getattr(task_instance, "task_id", None)
+    map_index = getattr(task_instance, "map_index", None)
+    if not isinstance(bound_run_id, str) or not bound_run_id:
+        raise AirflowFailException(
+            f"the {what} intent requires the triggering DagRun binding; a contextless "
+            "execution never registers a new production intent"
+        )
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise AirflowFailException(f"the {what} intent requires the executing task identity")
+    if type(map_index) is not int or map_index < -1:
+        raise AirflowFailException(
+            f"the {what} intent requires the real task-instance key of the executing task"
+        )
+    platform.register_operation(
+        run_id=run_id,
+        stage=stage,
+        kind=kind,
+        operation_key=operation_key,
+        params_digest=params_digest,
+        dispatch={
+            "dag_id": DAG_ID,
+            "dag_run_id": bound_run_id,
+            "task_id": task_id,
+            "map_index": map_index,
+        },
+    )
+    try:
+        claim = platform.claim_operation(run_id=run_id, stage=stage, operation_key=operation_key)
+    except PlatformStoreError as error:
+        raise AirflowFailException(f"the registered {what} intent cannot be claimed: {error}") from error
+    if not claim.granted and claim.record.state != "running":
+        raise AirflowFailException(f"the registered {what} intent is not claimable")
 
 
 def _register_freeze_stage(paths: flow.RunPaths, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
@@ -703,9 +791,14 @@ def _submission_frame(context) -> tuple[dict, dict]:
         )
     if not summary:
         raise AirflowFailException("change_summary is required: the run carries no nonempty change summary")
-    principal = conf.get("submission_principal")
-    if not isinstance(principal, str) or not principal.strip():
-        principal = str(getattr(context["dag_run"], "triggering_user_name", "") or "").strip()
+    # The submitter identity is never read from conf: it is the auth-owned
+    # ``triggering_user_name`` envelope of this run, and only the one canonical ownership
+    # parser may turn it into a principal.  A missing, damaged or non-canonical actor
+    # refuses - there is no fallback to a username, client text or a parent run's owner,
+    # and the raw envelope (name suffix included) never becomes the owner.
+    principal = recorded_actor_principal(getattr(context["dag_run"], "triggering_user_name", None))
+    if principal is None:
+        raise AirflowFailException("the run carries no authenticated submitter identity")
     config = config_from_airflow_connection(CONN_ID)
     routing = config.targets.get(target)
     if routing is None:
@@ -1261,13 +1354,15 @@ def solidworks_to_urdf():
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
                 # contacts Windows: the parent's registered capture is the authority.
                 platform, store_root = _platform_binding()
+                run_id = _run_uuid(context)
+                platform.start_run(run_id)  # the first driver action claims the admitted child
                 receipt = platform.confirmed_stage(linked["parent_run"], "capture")
                 if receipt is None or not receipt.get("handoff_sha256"):
                     raise AirflowFailException(
                         f"Linked parent {linked['parent_run']} has no admitted Linux capture to resume"
                     )
                 request = {
-                    "run_id": _run_uuid(context),
+                    "run_id": run_id,
                     "package": str(_sealed_stage_tree(platform, linked["parent_run"], "capture")),
                     "handoff_sha256": str(receipt["handoff_sha256"]),
                     "conn_id": CONN_ID,
@@ -1313,6 +1408,7 @@ def solidworks_to_urdf():
                 "conn_id": CONN_ID,
             }
             platform, store_root = _platform_binding()
+            platform.start_run(request["run_id"])  # the first driver action claims the admitted child
             carried = carry_request_evidence(
                 _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
                 flow.RunPaths(store_root, request["run_id"]).run_dir,
@@ -1417,6 +1513,25 @@ def solidworks_to_urdf():
         try:
             endpoint.get_job(request["run_id"])
         except EndpointNotFound:
+            platform, _store_root = _platform_binding()
+            _claim_operation_intent(
+                platform,
+                run_id=request["run_id"],
+                stage="discover",
+                kind="native",
+                operation_key=f"{request['run_id']}/native:0",
+                params_digest=digest(
+                    {
+                        "run_id": request["run_id"],
+                        "upload_sha256": request["upload_sha256"],
+                        "main_assembly": request["main_assembly"],
+                        "resume": request.get("resume"),
+                        "conn_id": request["conn_id"],
+                    }
+                ),
+                what="native submission",
+                context=context,
+            )
             job = endpoint.start_staging_job(
                 run_id=request["run_id"],
                 upload_files=request["upload_files"],

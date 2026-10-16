@@ -19,7 +19,6 @@ Run ``python -m description_pipeline.orchestration.portal --help`` for the confi
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import hmac
 import json
@@ -104,8 +103,6 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
 _STAGE_IDS = tuple(stage["id"] for stage in CONTRACT["stages"])
 _STAGE_NAMES_ZH = {stage["id"]: stage.get("name_zh") or stage["id"] for stage in CONTRACT["stages"]}
-_RERUN_PAGE = 100
-_RERUN_PAGE_CAP = 10
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 #: Row overlay when a run has no platform display row (treated read-only).
 _EMPTY_OVERLAY = {"title": None, "deleted": False, "deleted_at": None, "deleted_by": None}
@@ -707,6 +704,35 @@ def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _attempt_conf_matches(
+    conf: object,
+    *,
+    handoff_path: str,
+    stage: str,
+    target_hardware: str,
+    change_summary: str,
+    parent_assembly: str | None,
+) -> bool:
+    """Whether an existing attempt's recorded conf is exactly this request's frame.
+
+    A retry may only ride an existing attempt when every frame field equals what
+    that attempt recorded: a different target, summary, source or selection names
+    a different request and must never be answered by the other attempt's run.
+    """
+    if not isinstance(conf, dict):
+        return False
+    recorded_summary = conf.get("change_summary")
+    if isinstance(recorded_summary, str):
+        recorded_summary = normalize_change_summary(recorded_summary).strip()
+    return (
+        conf.get("handoff_path") == handoff_path
+        and conf.get("resume_from") == stage
+        and _optional_str(conf.get("target_hardware")) == target_hardware
+        and recorded_summary == change_summary
+        and _optional_str(conf.get("main_assembly")) == parent_assembly
+    )
+
+
 def _stage_name_zh(value: object) -> str | None:
     stage = _optional_str(value)
     return _STAGE_NAMES_ZH.get(stage) if stage is not None else None
@@ -1232,7 +1258,7 @@ class PortalApp:
                 record = local.get(dag_run_id)
                 conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
                 owner, name = _run_identity(item.get("triggering_user_name"), record)
-                overlay = metadata.get(dag_run_id) or _EMPTY_OVERLAY
+                overlay = metadata.get(native_run_id(dag_run_id)) or _EMPTY_OVERLAY
                 if overlay["deleted"] and not include_deleted:
                     continue
                 runs.append(
@@ -1258,7 +1284,7 @@ class PortalApp:
                 break
         for record in sorted(local.values(), key=lambda item: item.started_at, reverse=True):
             if record.dag_run_id not in seen:
-                overlay = metadata.get(record.dag_run_id) or _EMPTY_OVERLAY
+                overlay = metadata.get(native_run_id(record.dag_run_id)) or _EMPTY_OVERLAY
                 if overlay["deleted"] and not include_deleted:
                     continue
                 runs.append(
@@ -1292,6 +1318,11 @@ class PortalApp:
     def _start_run(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         """One uploaded SolidWorks folder starts one run; manual platform paths are gone."""
         session = self._session(environ, csrf=True)
+        principal = session.principal or ""
+        if not principal:
+            # The submitter identity is the strict profile principal only - never a
+            # username fallback and never client text.
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
         content_type = str(environ.get("CONTENT_TYPE") or "")
         if not content_type.lower().startswith("multipart/form-data"):
             raise PortalError(HTTPStatus.BAD_REQUEST, "请通过页面上的文件夹按钮上传工程文件夹后启动运行")
@@ -1337,7 +1368,7 @@ class PortalApp:
                 environ,
                 intake_root=self.config.upload_root,
                 run_id=dag_run_id,
-                principal=session.principal,
+                principal=principal,
                 gate=self._upload_gate,
             )
         except UploadRejected as error:
@@ -1366,8 +1397,10 @@ class PortalApp:
         try:
             self._platform().admit_run(
                 request_id=f"portal-{dag_run_id}",
-                run_id=dag_run_id,
-                principal=session.principal or session.user or "",
+                # The store's run identity is the same canonical native UUID the DAG
+                # derives; the raw dag_run_id stays only as the Airflow binding.
+                run_id=native_run_id(dag_run_id),
+                principal=principal,
                 target_hardware=receipt.target_hardware or "",
                 main_assembly=receipt.main_assembly or "",
                 dispatch={
@@ -1465,8 +1498,9 @@ class PortalApp:
         main_assembly: str | None = None,
     ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
-        # The recorded submitter of a run is its stored actor: the create body
-        # never carries a client-provided identity claim.
+        # The submitter of a run is its Airflow-authenticated actor, recorded on
+        # the run itself; the create body never carries an identity claim - not
+        # the acting operator's, and never a client-provided one.
         conf = {
             "handoff_path": handoff_path,
             "request_id": f"portal-{dag_run_id}",
@@ -1524,7 +1558,7 @@ class PortalApp:
 
     def _metadata_overlay(self, dag_run_id: str) -> dict:
         try:
-            display = self._platform().run_display(dag_run_id)
+            display = self._platform().run_display(native_run_id(dag_run_id))
         except PlatformStoreError as error:
             log.error("run display state unavailable: %s", error)
             raise PortalError(
@@ -1564,7 +1598,7 @@ class PortalApp:
         except TitleError as error:
             raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
         try:
-            display = self._platform().set_run_display(dag_run_id, title)
+            display = self._platform().set_run_display(native_run_id(dag_run_id), title)
         except RunNotAdmittedError as error:
             raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法重命名") from error
         except PlatformStoreError as error:
@@ -1598,7 +1632,9 @@ class PortalApp:
                     start_response, HTTPStatus.CONFLICT, {"error": message, "reason": reason}, self.config
                 )
             try:
-                display = self._platform().hide_run(dag_run_id, actor=self._actor_label(session, dag_run_id, run))
+                display = self._platform().hide_run(
+                    native_run_id(dag_run_id), actor=self._actor_label(session, dag_run_id, run)
+                )
             except RunNotAdmittedError as error:
                 raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法删除") from error
             except PlatformStoreError as error:
@@ -1651,7 +1687,7 @@ class PortalApp:
         if not self._can_manage(session, run):
             raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可恢复此运行")
         try:
-            overlay = _display_overlay(self._platform().restore_run(dag_run_id))
+            overlay = _display_overlay(self._platform().restore_run(native_run_id(dag_run_id)))
         except RunNotAdmittedError as error:
             raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法恢复") from error
         except PlatformStoreError as error:
@@ -1949,38 +1985,6 @@ class PortalApp:
             )
         return rows
 
-    def _scan_active_attempt(
-        self, session: PortalSession, parent_dag_run_id: str
-    ) -> tuple[str, str | None, str | None] | None:
-        """Paged scan of every run; unknown coverage refuses instead of failing open."""
-        offset = 0
-        for _ in range(_RERUN_PAGE_CAP):
-            try:
-                items = self.config.airflow.list_dag_runs(
-                    session.token, self.config.dag_id, limit=_RERUN_PAGE, offset=offset
-                )
-            except AirflowAuthError:
-                raise
-            except AirflowApiError as error:
-                raise RerunUncertainty("active-attempt scan failed") from error
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
-                if conf.get("parent_dag_run_id") != parent_dag_run_id:
-                    continue
-                state = item.get("state")
-                if state is not None and state not in {"queued", "running"}:
-                    continue
-                child = _optional_str(item.get("dag_run_id"))
-                if child is None:
-                    continue
-                return child, _optional_str(conf.get("resume_from")), _optional_str(state)
-            if len(items) < _RERUN_PAGE:
-                return None
-            offset += len(items)
-        raise RerunUncertainty("active-attempt scan exceeded the page cap")
-
     def _child_run(self, session: PortalSession, dag_run_id: str) -> dict | None:
         """One authoritative Airflow run, or None on a clean 404; anything else is uncertain."""
         try:
@@ -1993,64 +1997,53 @@ class PortalApp:
                 return None
             raise RerunUncertainty("linked run lookup failed") from error
 
-    def _rerun_journal_dir(self) -> Path | None:
-        root = self.config.upload_root
-        return None if root is None else Path(root) / ".rerun-attempts"
+    @staticmethod
+    def _admitted_dag_run_id(request_id: object) -> str | None:
+        """The Airflow id of an admitted run, recovered from the portal's request identity.
 
-    def _rerun_journal_path(self, parent_dag_run_id: str) -> Path | None:
-        folder = self._rerun_journal_dir()
-        return None if folder is None else folder / f"{parent_dag_run_id}.json"
-
-    def _read_rerun_journal(self, parent_dag_run_id: str) -> dict | None:
-        path = self._rerun_journal_path(parent_dag_run_id)
-        if path is None:
+        The portal mints ``request_id = "portal-" + dag_run_id`` for every admitted run,
+        so the read side recovers the exact Airflow binding without a second mapping.
+        Anything else is unreadable and refuses upstream.
+        """
+        if not isinstance(request_id, str) or not request_id.startswith("portal-"):
             return None
+        candidate = request_id[len("portal-"):]
+        return candidate if _RUN_ID.fullmatch(candidate) is not None else None
+
+    def _open_linked_child(self, parent_dag_run_id: str) -> tuple[str, str | None] | None:
+        """The one open (in-flight or unresolved) admitted child of this parent, or ``None``.
+
+        The platform run rows are the reservation authority: every attempt is admitted
+        before its trigger, so an open admitted child IS the durable reservation.  No
+        state file and no Airflow run-list scan is consulted, and more than one open
+        child of a parent is unresolvable rather than guessed.
+        """
+        native_parent = native_run_id(parent_dag_run_id)
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+            rows = self._platform().lifecycle_rows()
+            candidates: list[tuple[str, str | None]] = []
+            for row in rows:
+                if not isinstance(row, dict) or row.get("object_kind") != "run":
+                    continue
+                if row.get("bucket") not in {"in_flight", "unresolved"}:
+                    continue
+                native_child = row.get("run_id")
+                if not isinstance(native_child, str) or not native_child:
+                    continue
+                record = self._platform().run_record(native_child)
+                if not isinstance(record, dict) or record.get("parent_run_id") != native_parent:
+                    continue
+                child = self._admitted_dag_run_id(record.get("request_id"))
+                if child is None:
+                    raise RerunUncertainty("the open attempt carries no recoverable run identity")
+                candidates.append((child, _optional_str(record.get("from_stage"))))
+        except PlatformStoreError as error:
+            raise RerunUncertainty("active-attempt read failed") from error
+        if not candidates:
             return None
-        except (OSError, ValueError) as error:
-            raise RerunUncertainty("the rerun reservation cannot be read") from error
-        if (
-            not isinstance(data, dict)
-            or not isinstance(data.get("attempt_id"), str)
-            or _RUN_ID.fullmatch(data["attempt_id"]) is None
-            or data.get("stage") not in _STAGE_IDS
-        ):
-            raise RerunUncertainty("the rerun reservation is invalid")
-        return data
-
-    def _write_rerun_journal(self, parent_dag_run_id: str, attempt_id: str, stage: str) -> None:
-        """Durable reservation written before the trigger so a 502 retry reuses one run id."""
-        path = self._rerun_journal_path(parent_dag_run_id)
-        if path is None:
-            raise RerunUncertainty("no durable rerun journal location")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(
-                    {
-                        "attempt_id": attempt_id,
-                        "stage": stage,
-                        "state": "attempting",
-                        "updated_at": datetime.now(UTC).isoformat(),
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-        except OSError as error:
-            raise RerunUncertainty("cannot persist the rerun reservation") from error
-
-    def _clear_rerun_journal(self, parent_dag_run_id: str) -> None:
-        path = self._rerun_journal_path(parent_dag_run_id)
-        if path is None:
-            return
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        if len(candidates) > 1:
+            raise RerunUncertainty("several open attempts of one parent")
+        return candidates[0]
 
     def _trigger_linked_attempt(self, session: PortalSession, dag_run_id: str, conf: dict) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
@@ -2113,6 +2106,9 @@ class PortalApp:
     def _rerun_attempt(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         """One linked attempt from a chosen stage; only the stage is client-provided."""
         session = self._session(environ, csrf=True)
+        principal = session.principal or ""
+        if not principal:
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
         body = self._body(environ)
@@ -2139,83 +2135,12 @@ class PortalApp:
                     "原运行缺少可复用的上传目录，无法从此步骤重新运行",
                     None,
                 )
-            if self._rerun_journal_dir() is None:
-                return self._rerun_refusal(
-                    start_response,
-                    "incomplete",
-                    "服务端未配置上传目录，无法创建关联尝试",
-                    None,
-                )
             with self._rerun_lock:
                 if self._metadata_overlay(dag_run_id)["deleted"]:
                     # Readable evidence, but not a valid starting point until restored.
                     return self._rerun_refusal(start_response, "deleted", "已删除的运行不能重新运行，请先恢复", None)
-                journal = self._read_rerun_journal(dag_run_id)
-                reserved_id = _optional_str(journal.get("attempt_id")) if journal is not None else None
-                reserved_stage = _optional_str(journal.get("stage")) if journal is not None else None
-                if reserved_id is not None:
-                    child = self._child_run(session, reserved_id)
-                    if child is not None:
-                        child_state = _optional_str(child.get("state"))
-                        if child_state is None or child_state in {"queued", "running"}:
-                            self._clear_rerun_journal(dag_run_id)
-                            if reserved_stage == stage:
-                                return self._accepted_attempt(
-                                    start_response, reserved_id, dag_run_id, stage, child_state
-                                )
-                            return self._rerun_refusal(
-                                start_response,
-                                "already_active",
-                                "已有正在执行的关联尝试，请等待其结束",
-                                None,
-                                active_dag_run_id=reserved_id,
-                            )
-                        # The reserved child already finished; this click starts a fresh attempt.
-                        self._clear_rerun_journal(dag_run_id)
-                        reserved_id = None
-                    elif reserved_stage is not None and reserved_stage != stage:
-                        return self._rerun_refusal(
-                            start_response,
-                            "already_active",
-                            "已有未完成的关联尝试，请稍后重试",
-                            None,
-                            active_dag_run_id=reserved_id,
-                        )
-                    # Same stage and the trigger outcome is still unknown: reuse the exact id.
-                if reserved_id is None:
-                    active = self._scan_active_attempt(session, dag_run_id)
-                    if active is not None:
-                        active_id, active_stage, active_state = active
-                        if active_stage == stage:
-                            return self._accepted_attempt(start_response, active_id, dag_run_id, stage, active_state)
-                        return self._rerun_refusal(
-                            start_response,
-                            "already_active",
-                            "已有正在执行的关联尝试，请等待其结束",
-                            None,
-                            active_dag_run_id=active_id,
-                        )
-                rows = self._rerun_rows(native_run_id(dag_run_id))
-                if rows is None:
-                    return self._rerun_refusal(
-                        start_response,
-                        "endpoint_evidence_unavailable",
-                        "暂时无法确认可复用的检查点，请稍后重试",
-                        None,
-                    )
-                row = next((item for item in rows if isinstance(item, dict) and item.get("stage") == stage), None)
-                if row is None or row.get("eligible") is not True:
-                    prerequisites = (
-                        row.get("prerequisites")
-                        if isinstance(row, dict) and isinstance(row.get("prerequisites"), dict)
-                        else {}
-                    )
-                    return self._rerun_refusal(
-                        start_response,
-                        str((row or {}).get("reason") or "not_ready") if isinstance(row, dict) else "not_ready",
-                        str((row or {}).get("reason_zh") or "当前无法从此步骤重新运行"),
-                        _optional_str(prerequisites.get("earliest_required")),
-                    )
+                # This request's effective frame, validated once here and reused by the
+                # existing-attempt comparison and by the trigger itself.
                 target_hardware = (
                     overrides["target_hardware"]
                     if "target_hardware" in overrides
@@ -2237,30 +2162,140 @@ class PortalApp:
                 )
                 if not change_summary:
                     raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
-                principal = _optional_str(parent_conf.get("submission_principal"))
-                if principal is None or not principal.strip():
-                    principal = session.principal
+                parent_assembly = _optional_str(parent_conf.get("main_assembly"))
+                # The platform admission of the child IS the reservation: an open admitted
+                # child of this parent is the one existing attempt to ride, conflict with
+                # or reconcile - there is no state file and no run-list scan.
+                open_child = self._open_linked_child(dag_run_id)
+                reserved_id: str | None = None
+                if open_child is not None:
+                    child_id, child_stage = open_child
+                    child_run = self._child_run(session, child_id)
+                    child_state = _optional_str(child_run.get("state")) if child_run is not None else None
+                    if child_run is not None and (child_state is None or child_state in {"queued", "running"}):
+                        if child_stage != stage:
+                            return self._rerun_refusal(
+                                start_response,
+                                "already_active",
+                                "已有正在执行的关联尝试，请等待其结束",
+                                None,
+                                active_dag_run_id=child_id,
+                            )
+                        if not _attempt_conf_matches(
+                            child_run.get("conf"),
+                            handoff_path=handoff_path,
+                            stage=stage,
+                            target_hardware=target_hardware,
+                            change_summary=change_summary,
+                            parent_assembly=parent_assembly,
+                        ):
+                            return self._rerun_refusal(
+                                start_response,
+                                "attempt_mismatch",
+                                "已存在的关联尝试与本次参数不一致，请等待其结束或恢复原参数",
+                                None,
+                                active_dag_run_id=child_id,
+                            )
+                        return self._accepted_attempt(start_response, child_id, dag_run_id, stage, child_state)
+                    if child_run is not None:
+                        # The scheduler says the attempt ended while the registration is
+                        # still open: only reconciliation may decide, never a second run.
+                        raise RerunUncertainty("the open attempt disagrees with the recorded scheduler state")
+                    if child_stage is not None and child_stage != stage:
+                        return self._rerun_refusal(
+                            start_response,
+                            "already_active",
+                            "已有未完成的关联尝试，请稍后重试",
+                            None,
+                            active_dag_run_id=child_id,
+                        )
+                    # Same stage and the trigger outcome is still unknown: reuse the exact
+                    # admitted id, never a second admission.
+                    reserved_id = child_id
+                rows = self._rerun_rows(native_run_id(dag_run_id))
+                if rows is None:
+                    return self._rerun_refusal(
+                        start_response,
+                        "endpoint_evidence_unavailable",
+                        "暂时无法确认可复用的检查点，请稍后重试",
+                        None,
+                    )
+                row = next((item for item in rows if isinstance(item, dict) and item.get("stage") == stage), None)
+                if row is None or row.get("eligible") is not True:
+                    prerequisites = (
+                        row.get("prerequisites")
+                        if isinstance(row, dict) and isinstance(row.get("prerequisites"), dict)
+                        else {}
+                    )
+                    return self._rerun_refusal(
+                        start_response,
+                        str((row or {}).get("reason") or "not_ready") if isinstance(row, dict) else "not_ready",
+                        str((row or {}).get("reason_zh") or "当前无法从此步骤重新运行"),
+                        _optional_str(prerequisites.get("earliest_required")),
+                    )
                 new_run_id = reserved_id or f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
-                if reserved_id is None:
-                    self._write_rerun_journal(dag_run_id, new_run_id, stage)
+                # The child's initiator is the authenticated actor of THIS request (Airflow
+                # stamps it as the run's triggering user); the parent's original submitter
+                # stays lineage via parent_dag_run_id and the parent's own record - it is
+                # never copied into the create body, so an administrator re-running someone
+                # else's parent can never impersonate the original user.
                 conf = {
                     "handoff_path": handoff_path,
                     "parent_dag_run_id": dag_run_id,
                     "resume_from": stage,
                     "target_hardware": target_hardware,
                     "change_summary": change_summary,
-                    "submission_principal": principal,
                 }
-                parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 if parent_assembly is not None:
                     conf["main_assembly"] = parent_assembly
+                if reserved_id is None:
+                    # The canonical admission registers the new request, its linked run and
+                    # the initial dispatch intent in one gate-locked transaction - before
+                    # any trigger; a closed gate refuses here with nothing left behind.
+                    try:
+                        self._platform().admit_run(
+                            request_id=f"portal-{new_run_id}",
+                            run_id=native_run_id(new_run_id),
+                            principal=principal,
+                            target_hardware=target_hardware,
+                            main_assembly=parent_assembly or "",
+                            dispatch={
+                                "stage": stage,
+                                "operation_key": f"portal-{new_run_id}/{stage}:0",
+                                "params_digest": digest(
+                                    {
+                                        "handoff_path": handoff_path,
+                                        "main_assembly": parent_assembly,
+                                        "target_hardware": target_hardware,
+                                        "resume_from": stage,
+                                    }
+                                ),
+                                "dag_id": self.config.dag_id,
+                                "dag_run_id": new_run_id,
+                            },
+                            from_stage=stage,
+                            parent_run_id=native_run_id(dag_run_id),
+                        )
+                    except AdmissionClosedError:
+                        return _json_response(
+                            start_response,
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "平台准入窗口已关闭，本次重新运行未接纳"},
+                            self.config,
+                        )
+                    except PlatformStoreError:
+                        return _json_response(
+                            start_response,
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "平台服务暂不可用，本次重新运行未接纳"},
+                            self.config,
+                        )
                 outcome = self._trigger_linked_attempt(session, new_run_id, conf)
                 if outcome == "auth":
                     raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
-                if outcome == "created":
-                    self._clear_rerun_journal(dag_run_id)
                 if outcome == "absent":
-                    # The durable reservation stays so a retry reuses the exact same run id.
+                    # The durable reservation is the platform admission itself; a retry
+                    # reuses the exact admitted child id.
                     return _json_response(
                         start_response,
                         HTTPStatus.BAD_GATEWAY,
