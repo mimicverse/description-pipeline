@@ -562,11 +562,14 @@ function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$
 function Get-WriterResidue([object]$binding) {
   # The endpoint's own writers keep their image under the generation or the instance state root;
   # the sweep loop ends only with no listener AND no such process left (deployment.md settle).
-  $prefixState = ([string]$binding.state_root).TrimEnd('\').ToLower()
-  $prefixGeneration = ([string]$binding.generation).TrimEnd('\').ToLower()
+  # Path identity, not path spelling: the declared roots travel slash-normalized while
+  # Win32_Process reports backslash images, so both sides compare normalized; the separator
+  # stays a boundary and a neighbouring directory never counts.
+  $prefixState = (Normalize-PathIdentity $binding.state_root).ToLower()
+  $prefixGeneration = (Normalize-PathIdentity $binding.generation).ToLower()
   Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $image = if ($_.ExecutablePath) { ([string]$_.ExecutablePath).ToLower() } else { '' }
-    ($image.StartsWith($prefixState + '\')) -or ($image.StartsWith($prefixGeneration + '\'))
+    $image = if ($_.ExecutablePath) { (Normalize-PathIdentity $_.ExecutablePath).ToLower() } else { '' }
+    ($image.StartsWith($prefixState + '/')) -or ($image.StartsWith($prefixGeneration + '/'))
   }
 }
 function Stop-Endpoint([object]$binding) {
