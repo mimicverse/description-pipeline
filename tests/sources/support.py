@@ -1084,8 +1084,9 @@ def capture_requests(config: dict) -> dict:
     """Translate a fixture config's carriers into the minimal native request sets.
 
     The product consumes ``groups``/``axis_requests`` only; fixtures keep their
-    bodies/joints data structures and translate at the call boundary.  No
-    product code carries a compatibility fallback.
+    bodies/joints/frames authoring structures and translate at the call
+    boundary (interface frames come from the native ``TCP_``/``SCS_`` datums).
+    No product code carries a compatibility fallback.
     """
 
     cfg = dict(config)
@@ -1105,6 +1106,7 @@ def capture_requests(config: dict) -> dict:
             for joint in joints
             if isinstance(joint.get("axis_reference"), dict)
         ]
+    cfg.pop("frames", None)
     return cfg
 
 
