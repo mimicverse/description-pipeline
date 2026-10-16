@@ -1,6 +1,9 @@
 """The managed-nginx closure: the installer's actual binary feeds resolved.env, the units and
 health - one path, one source - and a missing result refuses instead of rendering a path that
-was never installed.
+was never installed.  The duties are split by side effect: ``ensure_proxy_binary.sh`` prepares
+(reuse or install; controlled change entries only) while ``check_proxy_binary.sh`` only
+validates the bound value (exists, executable, the binary the installed unit executes) - a
+read-only verb reports drift and can never trigger an install.
 
 Runs on the standard-library interpreter; the toolchain install leg is exercised through the
 real scripts with disposable fixture state (a pre-seeded toolchain binary stands in for the
@@ -9,6 +12,7 @@ downloaded package, and a failing ``apt-get`` stub covers the refusal path).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -20,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 SCRIPTS = OPERATOR / "scripts"
 ENSURE = SCRIPTS / "ensure_proxy_binary.sh"
+CHECK = SCRIPTS / "check_proxy_binary.sh"
 RENDER = OPERATOR / "render_operator.py"
 HEALTH = OPERATOR / "health.sh"
 
@@ -58,6 +63,23 @@ def base_env(state: Path, **overrides: str) -> dict[str, str]:
     }
     env.update(overrides)
     return env
+
+
+def tree_state(root: Path) -> dict:
+    """Every path under ``root`` with its mtime, size and content digest (read-only snapshot)."""
+
+    state = {}
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        if path.is_file():
+            state[str(path.relative_to(root))] = (
+                metadata.st_mtime_ns,
+                metadata.st_size,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        else:
+            state[str(path.relative_to(root))] = ("dir", metadata.st_mtime_ns)
+    return state
 
 
 class EnsureProxyBinaryTests(unittest.TestCase):
@@ -100,6 +122,59 @@ class EnsureProxyBinaryTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("ensure_proxy_binary", result.stderr)
+
+
+class CheckProxyBinaryTests(unittest.TestCase):
+    """The read-only validator: present, executable and the binary the installed unit executes."""
+
+    def test_bound_executable_binary_validates_and_is_printed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = write_executable(Path(tmp) / "nginx")
+            result = run(["bash", CHECK], {"NGINX_BIN": str(binary)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(binary))
+
+    def test_missing_unexecutable_relative_and_unset_refuse_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "absent" / "nginx"
+            plain = root / "plain"
+            plain.write_text("not executable\n", encoding="utf-8")
+            before = tree_state(root)
+            cases = (
+                (str(missing), "managed nginx binary missing or not executable"),
+                (str(plain), "managed nginx binary missing or not executable"),
+                ("relative/nginx", "not an absolute path"),
+                ("", "no NGINX_BIN is bound"),
+            )
+            for value, message in cases:
+                with self.subTest(value=value):
+                    result = run(["bash", CHECK], {"NGINX_BIN": value})
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(message, result.stderr)
+            self.assertEqual(before, tree_state(root), "validation must not write anything")
+
+    def test_unit_file_must_execute_the_bound_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = write_executable(root / "nginx")
+            other = write_executable(root / "other-nginx")
+            unit = root / "description-operator-proxy.service"
+            unit.write_text(
+                f"[Service]\nExecStartPre={binary} -t -c /x\nExecStart={binary} -c /x\n",
+                encoding="utf-8",
+            )
+            ok = run(["bash", CHECK, "--unit-file", str(unit)], {"NGINX_BIN": str(binary)})
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            unit.write_text(f"[Service]\nExecStart={other} -c /x\n", encoding="utf-8")
+            mismatch = run(["bash", CHECK, "--unit-file", str(unit)], {"NGINX_BIN": str(binary)})
+            self.assertEqual(mismatch.returncode, 1)
+            self.assertIn("does not execute the bound nginx binary", mismatch.stderr)
+            missing = run(
+                ["bash", CHECK, "--unit-file", str(root / "absent.service")], {"NGINX_BIN": str(binary)}
+            )
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn("proxy unit is missing", missing.stderr)
 
 
 class RenderClosureTests(unittest.TestCase):

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The ONE managed proxy binary for this deployment: prints its absolute path.
+# The ONE managed proxy binary for this deployment: PREPARE mode, prints its absolute path.
 #
 # The resolved configuration, the systemd units and health all read the same ``NGINX_BIN``
 # value, so this script is the single place that decides it: an already-executable configured
@@ -7,6 +7,10 @@
 # ``install_proxy.sh`` and the path IT actually landed is the value - the installer's own
 # output is consumed here, never discarded.  A missing or non-executable result refuses; no
 # path that was never installed is ever rendered.
+#
+# This mode may install or download, so it is called only from the controlled change entries
+# (install, promote, rollback) that re-render and re-bind the deployment; read-only verbs
+# validate the bound value with ``check_proxy_binary.sh`` instead.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

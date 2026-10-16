@@ -223,13 +223,22 @@ PY
   printf '%s' "$value"
 }
 
-# The ONE managed proxy binary: the installer's actual result (a system binary or the
-# toolchain nginx ``install_proxy.sh`` lands) is decided in scripts/ensure_proxy_binary.sh
-# and feeds every render (resolved.env, the units) and therefore health; a missing or
-# non-executable result refuses instead of rendering a path that was never installed.
+# The ONE managed proxy binary has two duties, split by side effect.
+#   ensure_proxy_binary  PREPARE: decides the actual result (an executable configured/system
+#     binary, else the toolchain nginx ``install_proxy.sh`` lands and prints) and may install
+#     or download.  It runs only inside the controlled change entries that re-render and
+#     re-bind a generation: install, promote and rollback.
+#   check_proxy_binary   VALIDATE, read-only: the bound value from resolved.env must exist, be
+#     executable and be the binary the installed proxy unit executes.  A read verb reports that
+#     as drift and never repairs it, so a missing binary cannot be masked by an implicit
+#     install.
 ensure_proxy_binary() {
   NGINX_BIN="${NGINX_BIN:-}" OPERATOR_STATE="${OPERATOR_STATE:-}" \
     bash "$HERE/scripts/ensure_proxy_binary.sh"
+}
+
+check_proxy_binary() {
+  NGINX_BIN="${NGINX_BIN:-}" bash "$HERE/scripts/check_proxy_binary.sh" "$@"
 }
 
 # The gates read the platform authority from the managed database, so the start window must
@@ -480,8 +489,14 @@ load_installed() {
 # compare with the installed deployment. Missing installed files, missing renders and render
 # failures count as drift, not as silent passes.
 drift_check() {
-  local rc=0 tmp_xdg drift_log tmp_state proxy_bin extra=()
-  proxy_bin="$(ensure_proxy_binary)" || { echo "DRIFT managed proxy binary unavailable"; rc=1; proxy_bin=""; }
+  local rc=0 tmp_xdg drift_log tmp_state proxy_bin="${NGINX_BIN:-}" extra=() proxy_issue
+  # Read-only: the bound binary must exist, be executable and be the one the installed proxy
+  # unit executes.  A missing or mismatched binary is drift; reading never installs, downloads
+  # or repairs (the side-effectful preparation belongs to install / promote / rollback only).
+  if ! proxy_issue="$(check_proxy_binary --unit-file "$TARGET/description-operator-proxy.service" 2>&1)"; then
+    echo "DRIFT $proxy_issue"
+    rc=1
+  fi
   [ -n "$proxy_bin" ] && extra=(--nginx-bin "$proxy_bin")
   drift_log="$(mktemp)"
   tmp_xdg="$(mktemp -d)"
