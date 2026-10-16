@@ -197,6 +197,7 @@ class PointOnAxisConcentricTests(unittest.TestCase):
         point_point = {
             "name": "point__point",
             "type": "concentric",
+            "limits": None,
             "entities": [dict(point_entity), {"component": "body-c", "point": [0.0, 0.0, 0.0]}],
         }
         self.assertIsNone(V._rows_for(point_point, extra_frames))
@@ -207,18 +208,21 @@ class PointOnAxisConcentricTests(unittest.TestCase):
         plane_point = {
             "name": "plane__point",
             "type": "concentric",
+            "limits": None,
             "entities": [plane_entity, dict(point_entity)],
         }
         self.assertIsNone(V._rows_for(plane_point, frames))
         malformed_point = {
             "name": "cylinder__malformed",
             "type": "concentric",
+            "limits": None,
             "entities": [dict(cylinder_entity), {"component": "body-b", "point": [0.0, 0.0]}],
         }
         self.assertIsNone(V._rows_for(malformed_point, frames))
         missing_frame = {
             "name": "cylinder__missing-frame",
             "type": "concentric",
+            "limits": None,
             "entities": [dict(cylinder_entity), {"component": "nowhere", "point": [0.0, 0.0, 0.0]}],
         }
         self.assertIsNone(V._rows_for(missing_frame, frames))

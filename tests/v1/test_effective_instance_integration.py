@@ -163,6 +163,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.bundle = Path(directory.name)
+        support.write_fixture_request(self.bundle, main_assembly="3.0 总装1008.SLDASM")
         self.evidence = self.bundle / "evidence"
         (self.evidence / "raw").mkdir(parents=True)
 
@@ -717,6 +718,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.bundle = Path(directory.name)
+        support.write_fixture_request(self.bundle, main_assembly="3.0 总装1008.SLDASM")
         self.evidence = self.bundle / "evidence"
         (self.evidence / "raw").mkdir(parents=True)
         self.part_row = {

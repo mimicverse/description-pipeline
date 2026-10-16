@@ -126,6 +126,7 @@ class SplitAdmissionMixin:
     def _frozen_payload(self) -> bytes:
         return request_evidence_bytes(
             build_request_evidence(
+                purpose="engineering",
                 request_id="fixture-frozen-request",
                 target_hardware="nd_fixture",
                 change_summary="fixture frozen original",

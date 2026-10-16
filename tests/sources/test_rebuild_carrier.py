@@ -118,7 +118,7 @@ class RebuildCarrierTests(unittest.TestCase):
                 payload, output = self._prepared(record)
                 actual = sorted(
                     (joint["name"], joint["type"], joint["parent"], joint["child"], joint["axis"], joint["limits"])
-                    for joint in rebuild_joint_facts(payload, output)
+                    for joint in rebuild_joint_facts(payload, output, purpose="engineering")
                 )
                 expected = (
                     [

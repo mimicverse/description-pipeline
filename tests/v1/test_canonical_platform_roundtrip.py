@@ -71,6 +71,7 @@ def _run_scenario(root: Path) -> dict:
     )
     freeze_request_evidence(
         paths.run_dir,
+        purpose="engineering",
         request_id="independent-real-roundtrip",
         target_hardware="nd_fixture",
         change_summary="Independent control roundtrip",
@@ -91,7 +92,7 @@ def _run_scenario(root: Path) -> dict:
             report["calls"].append("DAG._register_freeze_stage")
             phase = "producer"
             with patch.object(producer, "capture_record", return_value=raw):
-                native = producer.build_fixture_capture(root / "producer", run_id=RUN)
+                native = producer.build_fixture_capture(root / "producer", run_id=RUN, purpose="engineering")
             assert inventory(native_root) == upload
             report["calls"].append("shared.build_fixture_capture: real freeze/discover/capture")
             phase = "import"

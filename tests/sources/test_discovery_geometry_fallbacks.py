@@ -50,6 +50,7 @@ def mate(name: str, kind: str, first: dict, second: dict) -> dict:
         "error_code": 0,
         "suppressed": False,
         "scope": "",
+        "limits": None,
         "entities": [first, second],
     }
 
