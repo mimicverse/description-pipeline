@@ -310,12 +310,15 @@ async function loadTargets(pick) {
   }
   select.onchange = updateStartEnabled;
   if (summary) summary.oninput = updateStartEnabled;
+  const purpose = $("purpose-select");
+  if (purpose) purpose.onchange = updateStartEnabled;
   updateStartEnabled();
 }
 
 function updateStartEnabled() {
   const target = $("target-select");
   const summary = $("change-summary");
+  const purpose = $("purpose-select");
   $("start-button").disabled = !(
     state.folderPick &&
     !state.blockedPick &&
@@ -323,6 +326,8 @@ function updateStartEnabled() {
     state.assemblyChoice &&
     target &&
     target.value &&
+    purpose &&
+    purpose.value &&
     summary &&
     summary.value.trim()
   );
@@ -339,6 +344,12 @@ function submitRun(pick, { onProgress } = {}) {
       return;
     }
     form.append("target_hardware", targetSelect.value);
+    const purposeSelect = $("purpose-select");
+    if (!purposeSelect || !purposeSelect.value) {
+      reject(new Error("用途为必填：请选择用途后重试"));
+      return;
+    }
+    form.append("purpose", purposeSelect.value);
     const summaryInput = $("change-summary");
     if (!summaryInput || !summaryInput.value.trim()) {
       reject(new Error("变更说明为必填：请填写后重试"));

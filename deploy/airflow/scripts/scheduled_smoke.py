@@ -631,7 +631,7 @@ def _http_json(
 
 
 def _portal_admit(
-    portal_base: str, token: str, intake_dir: Path, folder_name: str, target: str, summary: str
+    portal_base: str, token: str, intake_dir: Path, folder_name: str, target: str, summary: str, purpose: str
 ) -> tuple[str, str, dict]:
     """Adopt an operator session (Airflow SSO cookie) and submit the folder through the portal.
 
@@ -653,7 +653,7 @@ def _portal_admit(
     body = _upload_body(
         folder=folder_name,
         files=files,
-        fields=[("target_hardware", target), ("change_summary", summary)],
+        fields=[("target_hardware", target), ("change_summary", summary), ("purpose", purpose)],
     )
     status, payload, _ = _http_json(
         "POST",
@@ -681,9 +681,14 @@ def _portal_negative_checks(
 
     results = []
     checks = (
-        ("missing_target", multipart([("change_summary", "x")])),
-        ("unconfigured_target", multipart([("target_hardware", "not-configured"), ("change_summary", "x")])),
-        ("missing_summary", multipart([("target_hardware", target)])),
+        ("missing_target", multipart([("change_summary", "x"), ("purpose", "engineering")])),
+        (
+            "unconfigured_target",
+            multipart([("target_hardware", "not-configured"), ("change_summary", "x"), ("purpose", "engineering")]),
+        ),
+        ("missing_summary", multipart([("target_hardware", target), ("purpose", "engineering")])),
+        ("missing_purpose", multipart([("target_hardware", target), ("change_summary", "x")])),
+        ("unknown_purpose", multipart([("target_hardware", target), ("change_summary", "x"), ("purpose", "ghost")])),
     )
     for name, body in checks:
         status, payload, _ = _http_json(
@@ -915,6 +920,12 @@ def main() -> int:
         "--portal-admission",
         action="store_true",
         help="submit through a locally started real portal (HTTP multipart) instead of the client trigger",
+    )
+    parser.add_argument(
+        "--purpose",
+        required=True,
+        choices=["engineering", "inspection_preview"],
+        help="the declared purpose of this smoke run (never defaulted)",
     )
     parser.add_argument("--platform-schema", default="", help="platform schema for the SQL evidence queries")
     parser.add_argument("--airflow-schema", default="", help="the Airflow schema this run's metadata lives in")
@@ -1210,6 +1221,7 @@ def main() -> int:
                     Path(HANDOFF_PATH).name,
                     target,
                     "scheduled control-fixture smoke",
+                    args.purpose,
                 )
                 portal_csrf = str(portal_session.get("csrf_token") or "")
             except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
@@ -1277,6 +1289,7 @@ def main() -> int:
                         "handoff_path": str(intake),
                         "target_hardware": target,
                         "change_summary": "scheduled control-fixture smoke",
+                        "purpose": args.purpose,
                     },
                 )
             except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage

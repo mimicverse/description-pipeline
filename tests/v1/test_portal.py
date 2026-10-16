@@ -71,7 +71,11 @@ _DEFAULT_ACTOR = object()
 TEST_TARGETS = {"m3.0": {"base": "main"}, "m3.1": {"base": "main"}}
 TEST_TARGET = "m3.0"
 TEST_SUMMARY = "control fixture change summary"
-UPLOAD_CHOICES = [("target_hardware", TEST_TARGET), ("change_summary", TEST_SUMMARY)]
+UPLOAD_CHOICES = [
+    ("target_hardware", TEST_TARGET),
+    ("change_summary", TEST_SUMMARY),
+    ("purpose", "engineering"),
+]
 
 
 def _feishu_profile(name: str, principal: str, open_id: str) -> dict:
@@ -431,6 +435,8 @@ def _upload_body(
     fields: list[tuple[str, str]] | None = None,
 ) -> bytes:
     """One browser-shaped multipart folder body (top folder included, ``/`` separators)."""
+    if fields is None:
+        fields = list(UPLOAD_CHOICES)
     entries = files or [("model.SLDASM", b"<assembly/>"), ("parts/p1.SLDPRT", b"<part1/>")]
     chunks = []
     for rel, data in entries:
@@ -820,6 +826,7 @@ class FakePlatformStore:
             }
             request_id = kwargs.get("request_id")
             if isinstance(request_id, str) and request_id:
+                configuration = kwargs.get("configuration")
                 self.requests[request_id] = {
                     "request_id": request_id,
                     "principal": kwargs.get("principal"),
@@ -827,6 +834,7 @@ class FakePlatformStore:
                     "main_assembly": kwargs.get("main_assembly"),
                     "sealed_at": None,
                     "dispatch_digest": (kwargs.get("dispatch") or {}).get("params_digest"),
+                    "purpose": (configuration or {}).get("purpose") if isinstance(configuration, dict) else None,
                 }
 
     def seed_open_child(
@@ -840,6 +848,7 @@ class FakePlatformStore:
         target_hardware: str = TEST_TARGET,
         main_assembly: str | None = None,
         change_summary: str = TEST_SUMMARY,
+        purpose: str = "engineering",
         handoff_path: str = "/srv/robot-cell",
         dispatch_digest: str | None = None,
     ) -> str:
@@ -859,6 +868,7 @@ class FakePlatformStore:
             "target_hardware": target_hardware,
             "main_assembly": main_assembly or "",
             "sealed_at": None,
+            "purpose": purpose,
             "dispatch_digest": (
                 dispatch_digest
                 if dispatch_digest is not None
@@ -868,6 +878,7 @@ class FakePlatformStore:
                     target_hardware=target_hardware,
                     change_summary=change_summary,
                     parent_assembly=main_assembly,
+                    purpose=purpose,
                 )
             ),
         }
@@ -1144,7 +1155,12 @@ class PortalTests(unittest.TestCase):
             "dag_id": "solidworks_to_urdf",
             "state": state,
             "conf": (
-                {"handoff_path": "/srv/robot-cell", "target_hardware": TEST_TARGET, "change_summary": TEST_SUMMARY}
+                {
+                    "handoff_path": "/srv/robot-cell",
+                    "target_hardware": TEST_TARGET,
+                    "change_summary": TEST_SUMMARY,
+                    "purpose": "engineering",
+                }
                 if conf is None
                 else conf
             ),
@@ -1363,6 +1379,7 @@ class PortalTests(unittest.TestCase):
         expected_conf = {
             "handoff_path": str(stored),
             "main_assembly": "model.SLDASM",
+            "purpose": "engineering",
             "request_id": f"portal-{dag_run_id}",
             "target_hardware": TEST_TARGET,
             "change_summary": TEST_SUMMARY,
@@ -1417,6 +1434,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(admit["run_id"], native_run_id(dag_run_id))
         self.assertEqual(admit["principal"], FEISHU_PRINCIPAL)
         self.assertEqual(admit["main_assembly"], "model.SLDASM")
+        self.assertEqual(admit["configuration"], {"purpose": "engineering"})
         dispatch = admit["dispatch"]
         self.assertEqual(dispatch["stage"], "capture")
         self.assertEqual(dispatch["operation_key"], f"portal-{dag_run_id}/capture:0")
@@ -1425,6 +1443,28 @@ class PortalTests(unittest.TestCase):
         self.assertRegex(dispatch["params_digest"], r"^[0-9a-f]{64}$")
         self.assertEqual(len(self.airflow.trigger_payloads), 1)
         self.assertEqual(self.airflow.trigger_payloads[0]["dag_run_id"], dag_run_id)
+        self.assertEqual(self.airflow.trigger_payloads[0]["conf"]["purpose"], "engineering")
+
+    def test_upload_requires_a_known_purpose(self) -> None:
+        self.client.login()
+        files = [("model.SLDASM", b"<assembly/>")]
+        for label, fields in (
+            ("missing", [("target_hardware", TEST_TARGET), ("change_summary", TEST_SUMMARY)]),
+            (
+                "unknown",
+                [("target_hardware", TEST_TARGET), ("change_summary", TEST_SUMMARY), ("purpose", "ghost")],
+            ),
+        ):
+            with self.subTest(case=label):
+                status, _, body = self.client.request_raw(
+                    "POST",
+                    "/api/runs",
+                    _upload_body(files=files, fields=fields),
+                    "multipart/form-data; boundary=portal-boundary",
+                )
+                self.assertEqual(status, 400, body)
+        self.assertEqual(self.platform.admits, [])
+        self.assertEqual(self.airflow.trigger_payloads, [])
 
     def test_an_admission_that_closes_after_upload_removes_the_intake(self) -> None:
         self.client.login()
@@ -1485,6 +1525,7 @@ class PortalTests(unittest.TestCase):
                 fields=[
                     ("target_hardware", TEST_TARGET),
                     ("change_summary", "第一行\r\n第二行\r第三行\n第四行"),
+                    ("purpose", "engineering"),
                 ]
             ),
             "multipart/form-data; boundary=portal-boundary",
@@ -1530,6 +1571,7 @@ class PortalTests(unittest.TestCase):
             {
                 "handoff_path": str(stored),
                 "main_assembly": "model.SLDASM",
+                "purpose": "engineering",
                 "request_id": f"portal-{json.loads(body)['dag_run_id']}",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
@@ -1573,6 +1615,7 @@ class PortalTests(unittest.TestCase):
             {
                 "handoff_path": str(stored),
                 "main_assembly": "parts/arm.SLDASM",
+                "purpose": "engineering",
                 "request_id": f"portal-{dag_run_id}",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
@@ -2805,6 +2848,7 @@ class PortalTests(unittest.TestCase):
                 "handoff_path": "/srv/robot-cell",
                 "parent_dag_run_id": DAG_RUN_ID,
                 "resume_from": "generate",
+                "purpose": "engineering",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
                 "main_assembly": "parts/arm.SLDASM",
@@ -2833,6 +2877,7 @@ class PortalTests(unittest.TestCase):
                 "handoff_path": "/srv/robot-cell",
                 "parent_dag_run_id": DAG_RUN_ID,
                 "resume_from": "generate",
+                "purpose": "engineering",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
             },
@@ -2855,6 +2900,7 @@ class PortalTests(unittest.TestCase):
                 "handoff_path": "/srv/robot-cell",
                 "parent_dag_run_id": DAG_RUN_ID,
                 "resume_from": "generate",
+                "purpose": "engineering",
                 "target_hardware": "m3.1",
                 "change_summary": "rebound\nsummary",
             },
@@ -2903,6 +2949,7 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
+                "purpose": "engineering",
             },
         )
         self.client.login()
@@ -3004,6 +3051,7 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "verify",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
+                "purpose": "engineering",
             },
         )
         self.client.login()
@@ -3057,6 +3105,7 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "verify",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
+                "purpose": "engineering",
             },
         )
         self.airflow.dag_runs[child]["start_date"] = "2026-10-05T00:00:00Z"
@@ -3154,6 +3203,29 @@ class PortalTests(unittest.TestCase):
         self.assertFalse((self.upload_root / ".rerun-attempts").exists())
         self.assertIn(reserved, self.airflow.dag_runs)
 
+    def test_a_rerun_parent_without_a_purpose_refuses(self) -> None:
+        self._seed_retryable_run()
+        self.airflow.dag_runs[DAG_RUN_ID]["conf"].pop("purpose")
+        self.client.login()
+        before = len(self.airflow.trigger_payloads)
+        status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "incomplete")
+        self.assertEqual(len(self.airflow.trigger_payloads), before)
+        self.assertEqual(self.platform.admits, [])
+
+    def test_rerun_attempt_rejects_a_purpose_change_in_the_body(self) -> None:
+        self._seed_retryable_run()
+        self.client.login()
+        status, _, body = self.client.request(
+            "POST",
+            f"/api/runs/{DAG_RUN_ID}/attempts",
+            {"stage": "generate", "purpose": "inspection_preview"},
+        )
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.platform.admits, [])
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
     def test_rerun_attempt_refuses_a_changed_frame_of_an_admitted_reservation(self) -> None:
         self._seed_retryable_run()
         self.client.login()
@@ -3224,6 +3296,7 @@ class PortalTests(unittest.TestCase):
                 "resume_from": "generate",
                 "target_hardware": TEST_TARGET,
                 "change_summary": TEST_SUMMARY,
+                "purpose": "engineering",
             },
         )
         self.client.login()

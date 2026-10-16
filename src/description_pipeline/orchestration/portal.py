@@ -58,6 +58,7 @@ from .airflow_client import (
     verified_result,
 )
 from ..io import PipelineError, digest
+from ..interface_records import REQUEST_PURPOSES
 from ..delivery import PIPELINE_ID
 from ..platform import flow
 from ..platform.store import (
@@ -718,6 +719,7 @@ def _attempt_conf_matches(
     target_hardware: str,
     change_summary: str,
     parent_assembly: str | None,
+    purpose: str,
 ) -> bool:
     """Whether an existing attempt's recorded conf is exactly this request's frame.
 
@@ -733,6 +735,7 @@ def _attempt_conf_matches(
     return (
         conf.get("handoff_path") == handoff_path
         and conf.get("resume_from") == stage
+        and conf.get("purpose") == purpose
         and _optional_str(conf.get("target_hardware")) == target_hardware
         and recorded_summary == change_summary
         and _optional_str(conf.get("main_assembly")) == parent_assembly
@@ -746,12 +749,14 @@ def _attempt_frame_digest(
     target_hardware: str,
     change_summary: str,
     parent_assembly: str | None,
+    purpose: str,
 ) -> str:
     """The sealed frame digest of one linked attempt: the admission's own identity."""
     return digest(
         {
             "handoff_path": handoff_path,
             "main_assembly": parent_assembly,
+            "purpose": purpose,
             "target_hardware": target_hardware,
             "resume_from": stage,
             "change_summary": change_summary,
@@ -766,6 +771,7 @@ def _admission_matches(
     target_hardware: str,
     parent_assembly: str | None,
     frame_digest: str,
+    purpose: str,
 ) -> bool:
     """Whether an uncertain retry equals the immutable admitted request exactly.
 
@@ -778,6 +784,7 @@ def _admission_matches(
         return False
     return (
         admission.get("principal") == principal
+        and admission.get("purpose") == purpose
         and admission.get("target_hardware") == target_hardware
         and admission.get("main_assembly") == (parent_assembly or "")
         and admission.get("dispatch_digest") == frame_digest
@@ -1444,6 +1451,11 @@ class PortalApp:
         )
         if not change_summary:
             raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请填写后重试")
+        purpose = receipt.purpose.strip() if isinstance(receipt.purpose, str) else ""
+        if not purpose:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "用途为必填：请在页面上选择用途后重试")
+        if purpose not in REQUEST_PURPOSES:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "用途不在平台配置中，请重新选择后再提交")
         handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
         try:
             self._platform().admit_run(
@@ -1454,6 +1466,7 @@ class PortalApp:
                 principal=principal,
                 target_hardware=receipt.target_hardware or "",
                 main_assembly=receipt.main_assembly or "",
+                configuration={"purpose": purpose},
                 dispatch={
                     "stage": "capture",
                     "operation_key": f"portal-{dag_run_id}/capture:0",
@@ -1498,6 +1511,7 @@ class PortalApp:
             target_hardware,
             change_summary,
             receipt.main_assembly,
+            purpose=purpose,
         )
         if outcome == "auth":
             return _json_response(
@@ -1547,6 +1561,8 @@ class PortalApp:
         target_hardware: str,
         change_summary: str,
         main_assembly: str | None = None,
+        *,
+        purpose: str,
     ) -> str:
         """Trigger once; an ambiguous failure is reconciled on the exact run id, never blind-retried."""
         # The submitter of a run is its Airflow-authenticated actor, recorded on
@@ -1554,6 +1570,7 @@ class PortalApp:
         # the acting operator's, and never a client-provided one.
         conf = {
             "handoff_path": handoff_path,
+            "purpose": purpose,
             "request_id": f"portal-{dag_run_id}",
             "target_hardware": target_hardware,
             "change_summary": change_summary,
@@ -2214,6 +2231,16 @@ class PortalApp:
                 if not change_summary:
                     raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
                 parent_assembly = _optional_str(parent_conf.get("main_assembly"))
+                # The linked attempt inherits the parent's declared purpose and never
+                # accepts a new one; a parent without it cannot be re-run.
+                purpose = _optional_str(parent_conf.get("purpose"))
+                if purpose not in REQUEST_PURPOSES:
+                    return self._rerun_refusal(
+                        start_response,
+                        "incomplete",
+                        "原运行缺少用途标识（purpose），无法从此步骤重新运行",
+                        None,
+                    )
                 # The platform admission of the child IS the reservation: an open admitted
                 # child of this parent is the one existing attempt to ride, conflict with
                 # or reconcile - there is no state file and no run-list scan.
@@ -2239,6 +2266,7 @@ class PortalApp:
                             target_hardware=target_hardware,
                             change_summary=change_summary,
                             parent_assembly=parent_assembly,
+                            purpose=purpose,
                         ):
                             return self._rerun_refusal(
                                 start_response,
@@ -2277,12 +2305,14 @@ class PortalApp:
                         principal=principal,
                         target_hardware=target_hardware,
                         parent_assembly=parent_assembly,
+                        purpose=purpose,
                         frame_digest=_attempt_frame_digest(
                             handoff_path=handoff_path,
                             stage=stage,
                             target_hardware=target_hardware,
                             change_summary=change_summary,
                             parent_assembly=parent_assembly,
+                            purpose=purpose,
                         ),
                     ):
                         return self._rerun_refusal(
@@ -2324,6 +2354,7 @@ class PortalApp:
                     "handoff_path": handoff_path,
                     "parent_dag_run_id": dag_run_id,
                     "resume_from": stage,
+                    "purpose": purpose,
                     "target_hardware": target_hardware,
                     "change_summary": change_summary,
                 }
@@ -2340,6 +2371,7 @@ class PortalApp:
                             principal=principal,
                             target_hardware=target_hardware,
                             main_assembly=parent_assembly or "",
+                            configuration={"purpose": purpose},
                             dispatch={
                                 "stage": stage,
                                 "operation_key": f"portal-{new_run_id}/{stage}:0",
@@ -2349,6 +2381,7 @@ class PortalApp:
                                     target_hardware=target_hardware,
                                     change_summary=change_summary,
                                     parent_assembly=parent_assembly,
+                                    purpose=purpose,
                                 ),
                                 "dag_id": self.config.dag_id,
                                 "dag_run_id": new_run_id,

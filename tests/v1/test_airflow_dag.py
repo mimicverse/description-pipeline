@@ -618,6 +618,7 @@ class DagTests(unittest.TestCase):
                     "resume_from": "capture",
                     "target_hardware": "m3.0",
                     "change_summary": "linked capture rerun",
+                    "purpose": "engineering",
                 },
                 run_id="portal-child-1",
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
@@ -677,7 +678,28 @@ class DagTests(unittest.TestCase):
             self.assertEqual(request["upload_sha256"], digest(upload))
             self.assertEqual(request["main_assembly"], "3.0 总装1008.SLDASM")
             self.assertEqual(request["resume"], {"parent_run": parent_run_id, "from_stage": "capture"})
-            self.assertEqual(started_child_runs, [request["run_id"]])
+            self.assertEqual(request["purpose"], "engineering")
+            # The linked attempt must declare the parent's purpose: absence and a
+            # different inspection class both refuse before any native submission.
+            for label, purpose in (("missing", None), ("changed", "inspection_preview")):
+                forged_conf = {**context["dag_run"].conf}
+                forged_conf.pop("purpose", None)
+                if purpose is not None:
+                    forged_conf["purpose"] = purpose
+                forged = {
+                    "dag_run": SimpleNamespace(
+                        conf=forged_conf,
+                        run_id="portal-child-1",
+                        triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+                    ),
+                    "params": {"handoff_path": "", "main_assembly": ""},
+                }
+                with self.subTest(purpose=label), self.assertRaisesRegex(AirflowFailException, "purpose"):
+                    dag.task_dict["freeze"].python_callable(**forged)
+            # Every forged refusal below still claims the same admitted child id first;
+            # the idempotent start_run proof is the single distinct id.
+            self.assertIn(request["run_id"], started_child_runs)
+            self.assertEqual(set(started_child_runs), {request["run_id"]})
             started = dag.task_dict["discover"].python_callable(
                 request, dag_run=context["dag_run"], ti=SimpleNamespace(task_id="discover", map_index=-1)
             )
@@ -776,6 +798,7 @@ class DagTests(unittest.TestCase):
                     "resume_from": "publish",
                     "target_hardware": "m3.0",
                     "change_summary": "rebound publish",
+                    "purpose": "engineering",
                 },
                 run_id="portal-child-2",
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
@@ -791,6 +814,18 @@ class DagTests(unittest.TestCase):
             self.assertEqual(request["repository_slug"], "mimicverse/description")
             self.assertEqual(request["repository_base"], "main")
             self.assertEqual(started_child_runs, [request["run_id"]])
+            forged = {
+                **context,
+                "dag_run": SimpleNamespace(
+                    conf={**context["dag_run"].conf, "purpose": "inspection_preview"},
+                    run_id="portal-child-2",
+                    triggering_user_name=context["dag_run"].triggering_user_name,
+                ),
+            }
+            from airflow.sdk.exceptions import AirflowFailException
+
+            with self.assertRaisesRegex(AirflowFailException, "purpose"):
+                dag.task_dict["freeze"].python_callable(**forged)
             binding = dag.task_dict["capture"].python_callable(request)
         self.assertEqual(binding["repository_slug"], "mimicverse/description")
         self.assertEqual(binding["repository_base"], "main")
