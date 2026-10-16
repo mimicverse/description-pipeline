@@ -464,6 +464,12 @@ def preview_revolute_window_rad() -> float:
     return float(CHECK_POLICY_V1["preview"]["revolute_window_rad"])
 
 
+def preview_sampling_interval_fraction() -> float:
+    """The analytical sampling fraction of the preview window, from the same policy."""
+
+    return float(CHECK_POLICY_V1["preview"]["sampling"]["interval_fraction"])
+
+
 def check_policy_digest() -> str:
     """Stable digest of the canonical check policy (manifests and reports bind it)."""
 

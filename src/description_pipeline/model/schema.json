@@ -434,6 +434,14 @@
             "required": [],
             "additionalProperties": false
           },
+          "limit_source": {
+            "enum": [
+              "native",
+              "controlled",
+              "policy_preview_window",
+              "declared_preview_window"
+            ]
+          },
           "dynamics": {
             "type": "object",
             "properties": {

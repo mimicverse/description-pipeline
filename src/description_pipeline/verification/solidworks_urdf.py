@@ -25,7 +25,14 @@ from ..io import PipelineError, confined, digest, file_digest, inventory, read_d
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.snapshot import verify_snapshot
-from ..interface_records import CHECK_POLICY_V1, QUALIFICATION_SCHEMA, qualification_facts, validate_qualification
+from ..interface_records import (
+    CHECK_POLICY_V1,
+    QUALIFICATION_SCHEMA,
+    preview_revolute_window_rad,
+    preview_sampling_interval_fraction,
+    qualification_facts,
+    validate_qualification,
+)
 from ..stages import required_rows_complete
 from . import native_discovery as evidence
 from .consumer import load as load_consumer
@@ -898,15 +905,27 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics):
     )
     limits = {key: float(value) for key, value in _one(node, "limit").attrib.items()}
     _require(limits == authored["limits"] == canonical["limits"], "Joint limits differ from author inputs")
+    _require(all(math.isfinite(value) for value in limits.values()), "Invalid joint limits")
     _require(
-        all(math.isfinite(value) for value in limits.values()) and limits["effort"] >= 0 and limits["velocity"] >= 0,
+        all(limits.get(key, 0.0) >= 0 for key in ("effort", "velocity")),
         "Invalid joint limits",
     )
+    _require(
+        canonical.get("limit_source") == authored.get("limit_source"),
+        "Joint limit source changed between author inputs and the canonical model",
+    )
     if authored["type"] in {"revolute", "prismatic"}:
+        _require("lower" in limits and "upper" in limits, "Missing position limits")
         _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
-    unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
+    if authored.get("limit_source") == "policy_preview_window":
+        radius = preview_revolute_window_rad()
+        _require(
+            authored["type"] == "revolute" and limits.get("lower") == -radius and limits.get("upper") == radius,
+            "The inspection-preview window does not equal the frozen policy radius",
+        )
+    unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
         unqualified.append("degenerate_position_range")
     if unqualified:
@@ -965,7 +984,13 @@ def _unit_axis(value):
 
 
 def _joint_sample(joint, sign):
-    """One pose value for a delivered moving joint, from its own evidence only."""
+    """One pose value for a delivered moving joint, from its own evidence only.
+
+    The offset inside the joint's ordered interval is the canonical policy's
+    analytical sampling fraction of the quarter-interval point (the frozen
+    policy fixes 1.0 today); a missing-drive joint samples identically - this
+    is an analysis pose, not an engineering claim.
+    """
 
     if joint["type"] == "continuous":
         return 0.3 if sign > 0 else -0.4
@@ -980,7 +1005,7 @@ def _joint_sample(joint, sign):
         f"Joint {joint['name']} has no usable ordered limits",
     )
     middle = (float(lower) + float(upper)) / 2
-    quarter = (float(upper) - float(lower)) / 4
+    quarter = (float(upper) - float(lower)) / 4 * preview_sampling_interval_fraction()
     return middle + sign * quarter
 
 
@@ -1009,7 +1034,7 @@ def _joint_combined_sample(joint, sign):
     )
     lower, upper = float(lower), float(upper)
     middle = (lower + upper) / 2
-    quarter = (upper - lower) / 4
+    quarter = (upper - lower) / 4 * preview_sampling_interval_fraction()
     if quarter == 0:
         _require(lower <= 0.0 <= upper, f"Joint {joint['name']} has a zero-width range that excludes its zero")
         return 0.0
