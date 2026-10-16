@@ -2058,12 +2058,14 @@ class OrphanReconcileTests(unittest.TestCase):
             self.addCleanup(shutil.rmtree, self._receipt_dir_path, ignore_errors=True)
         receipt_path = self._receipt_dir_path / "native-failed-receipt.json"
         document = native_document if native_document is not None else {
-            "run_id": run_id,
-            "stage": "freeze",
-            "native_run_id": binding_native,
-            "state": "failed",
-            "passed": False,
+            "schema_version": "solidworks-to-urdf.job/v1",
+            "pipeline_id": PIPELINE_ID,
+            "run_id": binding_native,
+            "request": {"run_id": binding_native, "main_assembly": "3.0 总装.SLDASM"},
+            "status": "failed",
+            "events": [{"stage": "freeze", "state": "failed", "error": "SelectionError: two open errors"}],
             "error": "SelectionError: two open errors",
+            "error_code": "selection_open_errors",
         }
         receipt_path.write_text(json.dumps(document) + "\n", encoding="utf-8")
         if claimed_sha is not None:
@@ -2072,7 +2074,7 @@ class OrphanReconcileTests(unittest.TestCase):
             entry = evidence if evidence is not None else str(receipt_path)
         named = entry.split("#", 1)[0]
         loaded = store_module.load_native_failed_receipt(
-            named, run_id=run_id, stage="freeze", native_run_id=binding_native
+            named, stage="freeze", native_run_id=binding_native
         )
         if "#sha256=" in entry and entry.split("#sha256=", 1)[1] != loaded.sha256:
             raise store_module.PlatformStoreError("The evidence entry contradicts the receipt bytes")
@@ -2097,10 +2099,10 @@ class OrphanReconcileTests(unittest.TestCase):
         receipt = {
             "schema_version": store_module.BUNDLE_SCHEMA,
             "pipeline_id": PIPELINE_ID,
-            "run_id": loaded.run_id,
+            "run_id": run_id,
             "stage": loaded.stage,
             "state": loaded.state,
-            "passed": loaded.passed,
+            "passed": False,
             "native_run_id": loaded.native_run_id,
             "native_receipt_sha256": loaded.sha256,
         }
@@ -2226,54 +2228,59 @@ class OrphanReconcileTests(unittest.TestCase):
         )
 
     def test_the_original_receipt_bytes_are_the_only_evidence_source(self) -> None:
+        def job_document(**overrides) -> dict:
+            document = {
+                "schema_version": "solidworks-to-urdf.job/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": NATIVE_RUNS[RUN_A],
+                "request": {"run_id": NATIVE_RUNS[RUN_A]},
+                "status": "failed",
+                "events": [
+                    {"stage": "freeze", "state": "failed", "error": "SelectionError: two open errors"}
+                ],
+                "error": "SelectionError: two open errors",
+                "error_code": "selection_open_errors",
+            }
+            document.update(overrides)
+            return document
+
         cases = {
             # A shaped digest string over a file that does not exist proves nothing.
             "missing_file": dict(evidence="/nonexistent/review/native.json#sha256=" + "f" * 64),
             "empty_document": dict(native_document={}),
-            "completed_receipt": dict(
-                native_document={
-                    "run_id": RUN_A,
-                    "stage": "freeze",
-                    "native_run_id": NATIVE_RUNS[RUN_A],
-                    "state": "completed",
-                    "passed": True,
-                }
+            "report_shaped_document": dict(
+                native_document={"schema_version": "solidworks-to-urdf.structural-report/v1", "passed": True}
             ),
-            "passed_true": dict(
-                native_document={
-                    "run_id": RUN_A,
-                    "stage": "freeze",
-                    "native_run_id": NATIVE_RUNS[RUN_A],
-                    "state": "failed",
-                    "passed": True,
-                }
+            "completed_receipt": dict(
+                native_document=job_document(status="passed", events=[{"stage": "freeze", "state": "passed"}])
+            ),
+            "passed_terminal_event": dict(
+                native_document=job_document(
+                    events=[{"stage": "freeze", "state": "passed", "error": None}, {"stage": "capture", "state": "failed"}]
+                )
+            ),
+            "no_terminal_event": dict(native_document=job_document(events=[])),
+            "ambiguous_terminal_events": dict(
+                native_document=job_document(
+                    events=[
+                        {"stage": "freeze", "state": "failed"},
+                        {"stage": "capture", "state": "failed"},
+                    ]
+                )
             ),
             "foreign_receipt_run": dict(
-                native_document={
-                    "run_id": "deadbeef-0000-4000-8000-000000000000",
-                    "stage": "freeze",
-                    "native_run_id": NATIVE_RUNS[RUN_A],
-                    "state": "failed",
-                    "passed": False,
-                }
+                native_document=job_document(
+                    run_id="deadbeef-0000-4000-8000-000000000000",
+                    request={"run_id": "deadbeef-0000-4000-8000-000000000000"},
+                )
             ),
             "foreign_receipt_stage": dict(
-                native_document={
-                    "run_id": RUN_A,
-                    "stage": "capture",
-                    "native_run_id": NATIVE_RUNS[RUN_A],
-                    "state": "failed",
-                    "passed": False,
-                }
+                native_document=job_document(events=[{"stage": "capture", "state": "failed"}])
             ),
             "foreign_receipt_job": dict(
-                native_document={
-                    "run_id": RUN_A,
-                    "stage": "freeze",
-                    "native_run_id": NATIVE_RUNS[RUN_B],
-                    "state": "failed",
-                    "passed": False,
-                }
+                native_document=job_document(
+                    run_id=NATIVE_RUNS[RUN_B], request={"run_id": NATIVE_RUNS[RUN_B]}
+                )
             ),
         }
         for name, overrides in cases.items():

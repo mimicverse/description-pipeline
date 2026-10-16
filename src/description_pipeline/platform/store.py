@@ -29,7 +29,7 @@ from typing import Any
 
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
-from ..orchestration.airflow_client import native_run_id
+from ..orchestration.airflow_client import JOB_SCHEMA, native_run_id
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -98,35 +98,40 @@ class NativeReceiptEvidence:
 
     Produced only by :func:`load_native_failed_receipt`: the original receipt bytes are
     read once, their SHA-256 is computed from those bytes, and the native identity fields
-    are validated against the bound run, stage and endpoint job UUID before this value
+    are validated against the bound endpoint-job UUID and stage before this value
     exists.  The reconcile action consumes exactly this fact; nothing downstream
     re-derives, fills in or rewrites its terminal state.
     """
 
     path: str
     sha256: str
-    run_id: str
-    stage: str
     native_run_id: str
+    stage: str
     state: str
-    passed: bool
     error: str | None
     error_code: str | None
-    detail: str | None
+    detail: object
+
+
+#: The job contract's final states: a terminal event row is one of these, and only a
+#: ``failed`` terminal row authorizes the failure reconciliation.
+NATIVE_TERMINAL_STATES = frozenset({"passed", "failed"})
 
 
 def load_native_failed_receipt(
-    path: object, *, run_id: str, stage: str, native_run_id: str
+    path: object, *, stage: str, native_run_id: str
 ) -> NativeReceiptEvidence:
     """Load and validate one original native failed receipt - the single acceptance source.
 
     The bytes on disk are the authority: they are read once, the receipt digest is
-    computed from them, and the parsed document must be the bound run's own terminal
-    failure - ``run_id``, ``stage`` and ``native_run_id`` all naming exactly the bound
-    facts, ``state`` a failed state and ``passed`` its consistent ``False``.  A missing
-    file, malformed bytes or any other identity/state refuses here, before the store
-    transaction is ever entered; every caller (the operator entry and the maintenance
-    route alike) shares this one implementation.
+    computed from them, and the parsed document must be the bound endpoint job's own
+    terminal failure under the real native job contract (``JOB_SCHEMA``): its identity
+    fields name exactly the bound UUID, its request carries the same UUID, its status is
+    ``failed``, and its events carry exactly one terminal row - ``failed`` at the bound
+    stage.  A missing file, malformed bytes, a report-shaped document or any other
+    identity/state refuses here, before the store transaction is ever entered; every
+    caller (the operator entry and the maintenance route alike) shares this one
+    implementation.
     """
 
     receipt_path = Path(str(path))
@@ -141,34 +146,43 @@ def load_native_failed_receipt(
         raise PlatformStoreError("The native failed receipt is not a JSON document") from error
     if not isinstance(document, dict):
         raise PlatformStoreError("The native failed receipt must be a JSON object")
-    if not isinstance(run_id, str) or not run_id:
-        raise PlatformStoreError("The native receipt check requires the bound run id")
-    if document.get("run_id") != run_id:
-        raise PlatformStoreError("The native failed receipt names another run")
-    if document.get("stage") != stage:
-        raise PlatformStoreError("The native failed receipt names another stage")
+    if document.get("schema_version") != JOB_SCHEMA:
+        raise PlatformStoreError("The native receipt is not a native job document under the job contract")
+    if document.get("pipeline_id") != PIPELINE_ID:
+        raise PlatformStoreError("The native failed receipt names another pipeline")
     if not _is_canonical_uuid(native_run_id):
         raise PlatformStoreError("The bound endpoint job UUID is not canonical")
-    if document.get("native_run_id") != native_run_id:
+    if document.get("run_id") != native_run_id:
         raise PlatformStoreError("The native failed receipt names another endpoint job")
-    if document.get("state") != "failed" or document.get("passed") is not False:
-        raise PlatformStoreError("The native receipt is not the bound run's failed terminal fact")
+    request = document.get("request")
+    if not isinstance(request, dict) or request.get("run_id") != native_run_id:
+        raise PlatformStoreError("The native receipt's request does not carry the bound endpoint job")
+    if document.get("status") != "failed":
+        raise PlatformStoreError("The native receipt is not the bound job's failed terminal fact")
+    events = [event for event in document.get("events") or [] if isinstance(event, dict)]
+    terminal = [event for event in events if event.get("state") in NATIVE_TERMINAL_STATES]
+    if len(terminal) != 1:
+        raise PlatformStoreError("The native receipt must carry exactly one terminal event row")
+    if terminal[0].get("state") != "failed":
+        raise PlatformStoreError("The native receipt's terminal event is not a failure")
+    if terminal[0].get("stage") != stage:
+        raise PlatformStoreError("The native receipt's terminal event names another stage")
 
-    def text(key: str) -> str | None:
-        value = document.get(key)
-        return value if isinstance(value, str) and value else None
+    detail = document.get("detail")
+    error = terminal[0].get("error")
+    if not isinstance(error, str) or not error:
+        error = document.get("error")
+    error_code = document.get("error_code")
 
     return NativeReceiptEvidence(
         path=str(receipt_path),
         sha256=sha256,
-        run_id=run_id,
-        stage=stage,
         native_run_id=native_run_id,
+        stage=stage,
         state="failed",
-        passed=False,
-        error=text("error"),
-        error_code=text("error_code"),
-        detail=text("detail") or text("details"),
+        error=error if isinstance(error, str) and error else None,
+        error_code=error_code if isinstance(error_code, str) and error_code else None,
+        detail=detail,
     )
 
 

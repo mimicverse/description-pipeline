@@ -1263,7 +1263,6 @@ if native_receipt:
     # digest from those bytes.  Nothing here fills in, rewrites or guesses the native fact.
     loaded = load_native_failed_receipt(
         native_receipt,
-        run_id=run_id,
         stage=stage,
         native_run_id=os.environ["RECONCILE_NATIVE_RUN_ID"],
     )
@@ -1313,10 +1312,10 @@ if native_receipt:
     receipt = {
         "schema_version": BUNDLE_SCHEMA,
         "pipeline_id": PIPELINE_ID,
-        "run_id": loaded.run_id,
+        "run_id": run_id,
         "stage": loaded.stage,
         "state": loaded.state,
-        "passed": loaded.passed,
+        "passed": False,
         "native_run_id": loaded.native_run_id,
         "native_receipt_sha256": loaded.sha256,
     }
