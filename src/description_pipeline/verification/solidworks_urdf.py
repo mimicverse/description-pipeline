@@ -27,12 +27,14 @@ from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
+    PURPOSE_INSPECTION_PREVIEW,
     QUALIFICATION_SCHEMA,
     preview_revolute_window_rad,
     preview_sampling_interval_fraction,
     qualification_facts,
     validate_qualification,
 )
+from ..request_evidence import read_request_evidence
 from ..stages import required_rows_complete
 from . import native_discovery as evidence
 from .consumer import load as load_consumer
@@ -1627,16 +1629,45 @@ def qualifications(root, definition, checks):
 
     Two objects of one fact stay two identities; an absent optional budget is
     ``out_of_scope``; a fact whose gate did not establish its conclusion is
-    ``unqualified``.  Evidence references bind the sealed records the conclusion
-    is read from; when a required record is absent the item carries no evidence,
-    and the check boundary refuses it as ungrounded rather than downgrading it.
+    ``unqualified``.  The engineering facts (B family) never take a gate's
+    colour: their conclusion is read from authoritative evidence - an
+    inspection-preview delivery states all three explicitly ``unqualified``.
+    Evidence references bind the sealed records the conclusion is read from;
+    when a required record is absent the item carries no evidence, and the
+    check boundary refuses it as ungrounded rather than downgrading it.
     """
 
     rows = {check["id"]: check for check in checks}
     expectations = definition.get("checks") or {}
+    purpose = _request_purpose(root)
+    preview = purpose == PURPOSE_INSPECTION_PREVIEW
+    joints = {joint["name"]: joint for joint in (definition.get("source") or {}).get("joints", [])}
     items = []
     for fact in qualification_facts(definition):
         fact_id = fact["fact_id"]
+        if fact_id in _ENGINEERING_FACTS:
+            status = _engineering_status(fact_id, fact["object_id"], joints, preview)
+            evidence = []
+            if all((root / record).is_file() for record in _ENGINEERING_FACT_RECORDS):
+                evidence = [
+                    {"record": record, "sha256": file_digest(root / record)} for record in _ENGINEERING_FACT_RECORDS
+                ]
+                evidence.extend(
+                    {"record": extra, "sha256": file_digest(root / extra)}
+                    for extra in _ENGINEERING_FACT_EXTRAS
+                    if (root / extra).is_file()
+                )
+            items.append(
+                {
+                    "schema_version": QUALIFICATION_SCHEMA,
+                    "fact_id": fact_id,
+                    "scope": fact["scope"],
+                    "object_id": fact["object_id"],
+                    "status": status,
+                    "evidence": evidence,
+                }
+            )
+            continue
         budget = {
             "physics.expected_mass": "expected_mass_kg",
             "geometry.expected_extent": "expected_extent_m",
@@ -1661,6 +1692,46 @@ def qualifications(root, definition, checks):
             }
         )
     return items
+
+
+#: The engineering qualification facts (IF-14, B family): authoritative-evidence
+#: conclusions only - a passing model-consistency check never establishes them.
+_ENGINEERING_FACTS = frozenset(
+    (*CHECK_POLICY_V1["engineering_facts"]["per_joint"], *CHECK_POLICY_V1["engineering_facts"]["per_subject"])
+)
+_ENGINEERING_FACT_RECORDS = ("input/handoff.json",)
+_ENGINEERING_FACT_EXTRAS = ("input/request.json", "model/robot.json")
+
+
+def _request_purpose(root) -> str | None:
+    """The submission purpose of the frozen request, or ``None`` when unreadable."""
+
+    request = Path(root) / "input" / "request.json"
+    if not request.is_file():
+        return None
+    try:
+        return str(read_request_evidence(request)[0].get("purpose") or "")
+    except PipelineError:
+        return None
+
+
+def _engineering_status(fact_id: str, object_id: str, joints: dict, preview: bool) -> str:
+    """The evidence-grounded state of one engineering fact.
+
+    Inspection-preview deliveries state all three explicitly ``unqualified``;
+    under the engineering purpose the per-joint range is established only by a
+    native/controlled range source and drive sizing only by a present drive
+    specification.  Machine qualification has no establishment channel here:
+    a passing consistency check never grants it.
+    """
+
+    if preview or fact_id == "machine_qualification":
+        return "unqualified"
+    joint = joints.get(object_id) or {}
+    if fact_id == "engineering_position_range":
+        return "established" if joint.get("limit_source") in ("native", "controlled") else "unqualified"
+    limits = joint.get("limits") or {}
+    return "established" if "effort" in limits and "velocity" in limits else "unqualified"
 
 
 def _mass_closure_equality(root, definition=None):

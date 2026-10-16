@@ -578,6 +578,17 @@ def qualification_facts(definition) -> list:
                 add(family.split(".", 1)[0], family.format(frame=frame["name"]), frame["name"])
         else:
             raise PipelineError(f"Unknown check-policy selector: {selector}")
+    # The engineering facts (B family) are appended beside the check-driven
+    # facts: no consistency gate feeds their conclusion, so ``check`` is None
+    # and only authoritative evidence may establish them downstream.
+    engineering = CHECK_POLICY_V1["engineering_facts"]
+    for fact_id in engineering["per_joint"]:
+        for joint in source.get("joints", []):
+            if joint["type"] == "fixed":
+                continue
+            add(fact_id, None, joint["name"])
+    for fact_id in engineering["per_subject"]:
+        add(fact_id, None)
     return facts
 
 
