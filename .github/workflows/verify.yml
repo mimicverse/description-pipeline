@@ -59,8 +59,20 @@ jobs:
             exit 1
           fi
           echo "node identity: $actual"
+      - name: Install the hash-locked Airflow runtime
+        env:
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow-home
+          AIRFLOW_VENV: ${{ runner.temp }}/airflow-venv
+        run: |
+          set -eu
+          echo "AIRFLOW_HOME=$AIRFLOW_HOME" >> "$GITHUB_ENV"
+          echo "AIRFLOW_VENV=$AIRFLOW_VENV" >> "$GITHUB_ENV"
+          python -m venv "$AIRFLOW_VENV"
+          "$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
+            -r deploy/airflow/requirements.lock
+          "$AIRFLOW_VENV/bin/python" -m pip install --no-deps -e .
       - name: Regression suite
-        run: python -B -m unittest discover -s tests -t .
+        run: "$AIRFLOW_VENV/bin/python" -B -m unittest discover -s tests -t .
       - name: The Windows settle semantics (offline pwsh matrix)
         run: pwsh -NoProfile -File tests/deploy/test_instance_lifecycle.ps1
 
