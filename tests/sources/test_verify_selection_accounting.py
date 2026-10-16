@@ -1,7 +1,6 @@
 """The verifier recomputes the producer's selection accounting from the sealed facts."""
 
 import copy
-import hashlib
 import json
 import tempfile
 import unittest
@@ -139,48 +138,12 @@ def _write_evidence(root: Path, bodies, *, top_mass, clear_parent):
     (root / "raw/mass_closure.json").write_text(json.dumps(native), encoding="utf-8")
     (root / "raw/scene_raw.json").write_text(json.dumps(scene), encoding="utf-8")
     record, controlled = _carrier_record(bodies)
-    payload_records = []
-    for relative, text in controlled.items():
-        path = root / "input" / "records" / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        payload_records.append(
-            {
-                "file": relative,
-                "package_file": relative,
-                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                "key": "limits",
-            }
-        )
-    (root / "evidence").mkdir(parents=True, exist_ok=True)
-    (root / "evidence/discovery.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "solidworks-to-urdf.native-discovery/v1",
-                "run_id": "fixture-run",
-                "derivation": {
-                    "main_assembly": "robot.SLDASM",
-                    "configuration": "Default",
-                    "frozen_names": {},
-                    "record_roots": [],
-                },
-                "identity": {
-                    "main_assembly": "robot.SLDASM",
-                    "delivery_configuration": "Default",
-                    "robot_name": "robot",
-                },
-                "records": payload_records,
-                "raw": record,
-                "native_files": {},
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    support.stage_discovery_inputs(
+        root,
+        record=record,
+        controlled=controlled,
+        record_keys={"joints/hinge.json": "limits"} if controlled else None,
     )
-    assembly = root / "input" / "cad" / "robot.SLDASM"
-    assembly.parent.mkdir(parents=True, exist_ok=True)
-    assembly.write_bytes(b"fixture assembly")
     delivery = root / "delivery"
     return support.write_target_delivery(delivery, capture={"scene": scene, "mass_closure": native})
 

@@ -17,13 +17,11 @@ import numpy as np
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.io import file_digest  # noqa: E402
-from description_pipeline.sources.solidworks.discovery import CONTRACT, DISCOVERY_SCHEMA  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
 
 from . import support  # noqa: E402
-from .selection_support import sealed_selection  # noqa: E402
 
 
 def freeze(config, *args, **kwargs):  # noqa: F811 - fixture adapter for the request sets
@@ -95,97 +93,29 @@ def _native_record(*, files: dict[str, str]) -> dict:
     datum name alone.
     """
 
-    translated = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-    component = {
-        "name2": "base-1",
-        "lightweight": False,
-        "suppression_state": 2,
-        "instance_id": "base-1",
-        "document": "base.SLDPRT",
-        "configuration": "Default",
-        "fixed": True,
-        "suppressed": False,
-        "transform": translated,
-    }
-    assembly_mass = BENCHMARK["base-1"]["mass"]
-    return {
-        "schema_version": DISCOVERY_SCHEMA,
-        "contract": CONTRACT,
-        "namespace": "dp",
-        "identity": {
-            "hardware_id": "product_convention_fixture",
-            "revision": "r1",
-            "owner": "mechanical-team",
-            "change_summary": "product convention module fixture",
-            "control": {"system": "handoff", "reference": "product-convention-run"},
-            "delivery_configuration": "Default",
-            "main_assembly": "robot.SLDASM",
-            "robot_name": "robot",
-        },
-        "saved_configuration": "Default",
-        "document_state": support.saved_document_state(),
-        "components": [component],
-        "mates": [],
-        "datums": [{"name": "CS_base_link", "owner": "base-1", "array": translated}],
-        "masses": [{"component": "base-1", "mass_kg": float(assembly_mass), "material": "Alloy Steel"}],
-        "assembly_mass_kg": float(assembly_mass),
-        "assembly_extent_m": 0.5,
-        "properties": {
-            "document": {"dp.design_budget_record": "budget.json#robot"},
-            "components": {},
-            "mates": {},
-        },
-        "files": dict(files),
-        "source_selection": sealed_selection(
-            files,
-            "robot.SLDASM",
-            edges={"robot.SLDASM": ["base.SLDPRT"], "base.SLDPRT": []},
-        ),
-    }
+    return support.native_record(
+        hardware_id="product_convention_fixture",
+        change_summary="product convention module fixture",
+        control_reference="product-convention-run",
+        components=[support.native_component("base-1")],
+        datums=[support.native_datum("CS_base_link", "base-1", support.placement())],
+        masses=[{"component": "base-1", "mass_kg": float(BENCHMARK["base-1"]["mass"]), "material": "Alloy Steel"}],
+        files=files,
+    )
 
 
 def _compose_scene_inputs(destination: Path, cad_root: Path) -> None:
-    """Fixture plumbing: seal the consumer inputs the Linux scene rebuild reads.
-
-    Synthetic test-only composition (the canonical/E2E producers build their
-    own evidence and never use this helper): CAD bytes, the discovery payload
-    with its raw native record and controlled records, and a re-sealed
-    snapshot manifest so the added members stay bound by the verified
-    inventory.
-    """
-
-    import hashlib
+    """Seal the consumer inputs the Linux scene rebuild reads (fixture plumbing)."""
 
     names = ["robot.SLDASM", "base.SLDPRT"]
-    cad_files = {name: cad_root / name for name in names}
-    files = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in cad_files.items()}
+    files = support.native_files(cad_root, names)
     record = _native_record(files=files)
-    controlled = {
-        "budget.json": json.dumps(
-            {
-                "robot": {
-                    "expected_mass_kg": [record["assembly_mass_kg"] - 0.1, record["assembly_mass_kg"] + 0.1],
-                    "expected_extent_m": [0.2, 0.8],
-                }
-            }
-        )
-    }
-    support.compose_delivery_inputs(
+    support.seal_scene_inputs(
         destination,
-        main_assembly="robot.SLDASM",
-        configuration="Default",
+        cad_root=cad_root,
+        cad_names=names,
         record=record,
-        cad_files=cad_files,
-        records=controlled,
-    )
-    from description_pipeline.sources.snapshot import write_manifest
-
-    manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
-    write_manifest(
-        destination,
-        kind=manifest["kind"],
-        identity=manifest["identity"],
-        evidence_class=manifest["evidence_class"],
+        controlled={"budget.json": support.native_budget_record(record)},
     )
 
 

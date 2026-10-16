@@ -16,7 +16,6 @@ from pathlib import Path
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.discovery import CONTRACT, DISCOVERY_SCHEMA  # noqa: E402
 from description_pipeline.sources.solidworks.closure import derive_mass_closure  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import _component_context_record  # noqa: E402
 
@@ -119,127 +118,46 @@ def _carrier_record(bodies: list[dict]) -> tuple[dict, dict[str, str]]:
     names = [str(member) for body in bodies for member in (body.get("components") or [])]
     if not names:
         names = [DEV]
-    components = [
-        {
-            "name2": name,
-            "instance_id": name,
-            "document": name.split("/")[-1].split("~")[0] + ".SLDPRT",
-            "configuration": "Default",
-            "fixed": True,
-            "suppressed": False,
-            "lightweight": False,
-            "suppression_state": 2,
-            "transform": _carrier_transform(name),
-        }
-        for name in dict.fromkeys(names)
-    ]
+    components = [support.native_component(name, transform=_carrier_transform(name)) for name in dict.fromkeys(names)]
     datums = [
-        {"name": "CS_" + str(body["name"]), "owner": str(members[0]), "array": _carrier_transform(str(members[0]))}
+        support.native_datum("CS_" + str(body["name"]), str(members[0]), _carrier_transform(str(members[0])))
         for body in bodies
         if (members := list(body.get("components") or []))
     ]
     if not datums:
-        datums = [{"name": "CS_base_link", "owner": DEV, "array": _carrier_transform(DEV)}]
+        datums = [support.native_datum("CS_base_link", DEV, _carrier_transform(DEV))]
     mates: list[dict] = []
-    mate_properties: dict = {}
+    joint_claims = None
     controlled: dict[str, str] = {}
     for body in bodies:
         members = [str(member) for member in (body.get("components") or [])]
         if len(members) > 1:
-            mates.append(
-                {
-                    "name": "board_rigid",
-                    "type": "lock",
-                    "suppressed": False,
-                    "error_code": 0,
-                    "scope": "",
-                    "limits": None,
-                    "entities": [{"component": member} for member in members],
-                }
-            )
+            mates.append(support.native_lock(members))
     named = [body for body in bodies if body.get("components")]
     if len(named) > 1:
         left, right = str(named[0]["components"][0]), str(named[1]["components"][0])
-        mates += [
-            {
-                "name": "hinge_joint__coaxial",
-                "type": "concentric",
-                "suppressed": False,
-                "error_code": 0,
-                "scope": "",
-                "limits": None,
-                "entities": [
-                    {
-                        "component": left,
-                        "feature": "Cyl1",
-                        "face_index": 3,
-                        "cylinder": {"point": _hinge_point(left), "direction": [0.0, 0.0, 1.0], "radius": 0.005},
-                    },
-                    {
-                        "component": right,
-                        "feature": "Cyl2",
-                        "face_index": 7,
-                        "cylinder": {"point": _hinge_point(right), "direction": [0.0, 0.0, 1.0], "radius": 0.005},
-                    },
-                ],
-            },
-            {
-                "name": "hinge_joint__locate",
-                "type": "coincident",
-                "suppressed": False,
-                "error_code": 0,
-                "scope": "",
-                "limits": None,
-                "entities": [
-                    {
-                        "component": left,
-                        "feature": "Plane1",
-                        "plane": {"point": _hinge_point(left), "normal": [0.0, 0.0, 1.0]},
-                    },
-                    {
-                        "component": right,
-                        "feature": "Plane2",
-                        "plane": {"point": _hinge_point(right), "normal": [0.0, 0.0, -1.0]},
-                    },
-                ],
-            },
-        ]
-        mate_properties["hinge_joint__coaxial"] = {
-            "dp.joint.axis_sign": "+1",
-            "dp.joint.limits_record": "joints/hinge.json#limits",
-            "dp.joint.drive_record": "joints/hinge.json#drive",
-        }
-        controlled["joints/hinge.json"] = json.dumps(
-            {"limits": {"lower": -1.0, "upper": 1.0}, "drive": {"effort": 2.0, "velocity": 3.0}}
+        mates += support.native_hinge_mates(
+            left, right, left_point=_hinge_point(left), right_point=_hinge_point(right), radius=0.005
         )
+        joint_claims = support.native_joint_claims()
+        controlled["joints/hinge.json"] = support.native_joint_record()
     masses = [
         {"component": entry["name2"], "mass_kg": 0.035 if entry["name2"] == DEV else 0.026, "material": "FR-4"}
         for entry in components
     ]
-    record = {
-        "schema_version": DISCOVERY_SCHEMA,
-        "contract": CONTRACT,
-        "namespace": "dp",
-        "identity": {
-            "hardware_id": "closure_fixture",
-            "revision": "r1",
-            "owner": "mechanical-team",
-            "change_summary": "closure module fixture",
-            "control": {"system": "handoff", "reference": "closure-run"},
-            "delivery_configuration": "Default",
-            "main_assembly": "robot.SLDASM",
-            "robot_name": "robot",
-        },
-        "saved_configuration": "Default",
-        "document_state": support.saved_document_state(),
-        "components": components,
-        "mates": mates,
-        "datums": datums,
-        "masses": masses,
-        "assembly_mass_kg": 0.0632,
-        "assembly_extent_m": 0.2,
-        "properties": {"components": {}, "mates": mate_properties},
-    }
+    record = support.native_record(
+        hardware_id="closure_fixture",
+        change_summary="closure module fixture",
+        control_reference="closure-run",
+        components=components,
+        datums=datums,
+        masses=masses,
+        mates=mates,
+        joint_claims=joint_claims,
+        budget=False,
+        assembly_mass_kg=0.0632,
+        assembly_extent_m=0.2,
+    )
     return record, controlled
 
 
@@ -402,43 +320,12 @@ class DeriveMassClosureTests(unittest.TestCase):
         self._write("raw/mass_closure.json", native)
         self._write("raw/scene_raw.json", scene)
         record, controlled = _carrier_record(bodies)
-        payload_records = []
-        for relative, text in controlled.items():
-            path = self.tmp / "input" / "records" / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-            payload_records.append(
-                {
-                    "file": relative,
-                    "package_file": relative,
-                    "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                    "key": "limits",
-                }
-            )
-        self._write(
-            "evidence/discovery.json",
-            {
-                "schema_version": "solidworks-to-urdf.native-discovery/v1",
-                "run_id": "fixture-run",
-                "derivation": {
-                    "main_assembly": "robot.SLDASM",
-                    "configuration": "Default",
-                    "frozen_names": {},
-                    "record_roots": [],
-                },
-                "identity": {
-                    "main_assembly": "robot.SLDASM",
-                    "delivery_configuration": "Default",
-                    "robot_name": "robot",
-                },
-                "records": payload_records,
-                "raw": record,
-                "native_files": {},
-            },
+        support.stage_discovery_inputs(
+            self.tmp,
+            record=record,
+            controlled=controlled,
+            record_keys={"joints/hinge.json": "limits"} if controlled else None,
         )
-        assembly = self.tmp / "input" / "cad" / "robot.SLDASM"
-        assembly.parent.mkdir(parents=True, exist_ok=True)
-        assembly.write_bytes(b"fixture assembly")
 
     def test_derive_rebuilds_every_approved_derived_key(self):
         self._write_evidence([{"name": "base_link", "components": [DEV, EASYEDA]}])

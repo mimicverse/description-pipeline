@@ -1211,3 +1211,318 @@ def compose_delivery_inputs(
                 "warnings": [],
             }
             write_json(capture_path, capture)
+
+
+# ---------------------------------------------------------------------------
+# Fixture plumbing: the small shared producer for consumer-fixture inputs.
+#
+# The scenario facts - which occurrences, datums, mates and masses a module
+# exercises - stay with the module that builds them; these builders own the
+# record boilerplate and the sealing infrastructure only.  Synthetic
+# test-only inputs: the unchanged canonical/E2E producers build their own
+# evidence and never use any of this.  No consumer output is injected.
+# ---------------------------------------------------------------------------
+
+
+def native_component(
+    name: str, *, transform: Sequence[float] | None = None, fixed: bool = True, document: str | None = None
+) -> dict:
+    """One recorded native occurrence entry (fixture plumbing)."""
+
+    return {
+        "name2": name,
+        "lightweight": False,
+        "suppression_state": 2,
+        "instance_id": name,
+        "document": document or name.split("/")[-1].split("~")[0] + ".SLDPRT",
+        "configuration": "Default",
+        "fixed": fixed,
+        "suppressed": False,
+        "transform": [float(value) for value in (placement() if transform is None else transform)],
+    }
+
+
+def native_datum(name: str, owner: str, transform: Sequence[float]) -> dict:
+    """One recorded native coordinate system (fixture plumbing)."""
+
+    return {"name": name, "owner": owner, "array": [float(value) for value in transform]}
+
+
+def native_hinge_mates(
+    left: str,
+    right: str,
+    *,
+    left_point: Sequence[float],
+    right_point: Sequence[float],
+    radius: float,
+    name: str = "hinge_joint",
+) -> list[dict]:
+    """The solved concentric+coincident mate pair one movable hinge requires.
+
+    Both axes point along +z in their component frames; each scenario keeps
+    its own solved points and shaft radius.  A hinge axis must pass through
+    the child body's datum origin (the joint frame check requires it).
+    """
+
+    def cylinder(component: str, feature: str, face_index: int, point: Sequence[float]) -> dict:
+        return {
+            "component": component,
+            "feature": feature,
+            "face_index": face_index,
+            "cylinder": {
+                "point": [float(value) for value in point],
+                "direction": [0.0, 0.0, 1.0],
+                "radius": float(radius),
+            },
+        }
+
+    def plane(component: str, feature: str, point: Sequence[float], normal: float) -> dict:
+        return {
+            "component": component,
+            "feature": feature,
+            "plane": {"point": [float(value) for value in point], "normal": [0.0, 0.0, normal]},
+        }
+
+    return [
+        {
+            "name": f"{name}__coaxial",
+            "type": "concentric",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [cylinder(left, "Cyl1", 3, left_point), cylinder(right, "Cyl2", 7, right_point)],
+        },
+        {
+            "name": f"{name}__locate",
+            "type": "coincident",
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [plane(left, "Plane1", left_point, 1.0), plane(right, "Plane2", right_point, -1.0)],
+        },
+    ]
+
+
+def native_lock(members: Sequence[str], *, name: str = "board_rigid") -> dict:
+    """One solved lock mate merging the occurrences into a rigid body (fixture plumbing)."""
+
+    return {
+        "name": name,
+        "type": "lock",
+        "suppressed": False,
+        "error_code": 0,
+        "scope": "",
+        "limits": None,
+        "entities": [{"component": str(member)} for member in members],
+    }
+
+
+def native_joint_claims(*, record_file: str = "joints/hinge.json", mate: str = "hinge_joint__coaxial") -> dict:
+    """The dp.joint.* claims a hinge's name and limits/drive travel through (fixture plumbing)."""
+
+    return {
+        mate: {
+            "dp.joint.axis_sign": "+1",
+            "dp.joint.limits_record": f"{record_file}#limits",
+            "dp.joint.drive_record": f"{record_file}#drive",
+        }
+    }
+
+
+def native_joint_record(*, lower: float = -1.0, upper: float = 1.0, effort: float = 2.0, velocity: float = 3.0) -> str:
+    """The controlled joint record text the claims resolve against (fixture plumbing)."""
+
+    import json
+
+    return json.dumps({"limits": {"lower": lower, "upper": upper}, "drive": {"effort": effort, "velocity": velocity}})
+
+
+def native_budget_record(record: dict, *, tolerance: float = 0.1) -> str:
+    """The controlled design-budget text the record's budget property binds (fixture plumbing)."""
+
+    import json
+
+    mass = float(record["assembly_mass_kg"])
+    return json.dumps(
+        {"robot": {"expected_mass_kg": [mass - tolerance, mass + tolerance], "expected_extent_m": [0.2, 0.8]}}
+    )
+
+
+def native_files(cad_root: Path, names: Sequence[str]) -> dict[str, str]:
+    """SHA-256 of the genuine CAD fixture bytes, keyed by relative name (fixture plumbing)."""
+
+    import hashlib
+
+    return {name: hashlib.sha256((Path(cad_root) / name).read_bytes()).hexdigest() for name in names}
+
+
+def native_record(
+    *,
+    hardware_id: str,
+    change_summary: str,
+    control_reference: str,
+    components: Sequence[dict],
+    datums: Sequence[dict],
+    masses: Sequence[dict],
+    mates: Sequence[dict] = (),
+    joint_claims: dict | None = None,
+    budget: bool = True,
+    assembly_mass_kg: float | None = None,
+    assembly_extent_m: float = 0.5,
+    files: dict[str, str] | None = None,
+) -> dict:
+    """The sealed native discovery record the consumer fixtures rebuild from.
+
+    Owns the record boilerplate only: the scenario facts (which occurrences,
+    datums, mates and masses) stay with the module that builds them.  A
+    ``joint_claims`` block names the controlled limits/drive records a hinge
+    travels through; ``budget`` binds the controlled design-budget record;
+    when frozen ``files`` are given, the record carries their inventory and
+    the sealed selection over the ``robot.SLDASM`` fixture tree.
+    """
+
+    from description_pipeline.sources.solidworks.discovery import CONTRACT, DISCOVERY_SCHEMA
+
+    from .selection_support import sealed_selection
+
+    properties: dict[str, Any] = {"components": {}, "mates": dict(joint_claims or {})}
+    if budget:
+        properties["document"] = {"dp.design_budget_record": "budget.json#robot"}
+    payload: dict[str, Any] = {
+        "schema_version": DISCOVERY_SCHEMA,
+        "contract": CONTRACT,
+        "namespace": "dp",
+        "identity": {
+            "hardware_id": hardware_id,
+            "revision": "r1",
+            "owner": "mechanical-team",
+            "change_summary": change_summary,
+            "control": {"system": "handoff", "reference": control_reference},
+            "delivery_configuration": "Default",
+            "main_assembly": "robot.SLDASM",
+            "robot_name": "robot",
+        },
+        "saved_configuration": "Default",
+        "document_state": saved_document_state(),
+        "components": [dict(item) for item in components],
+        "mates": [dict(item) for item in mates],
+        "datums": [dict(item) for item in datums],
+        "masses": [dict(item) for item in masses],
+        "assembly_mass_kg": float(
+            assembly_mass_kg if assembly_mass_kg is not None else sum(float(row["mass_kg"]) for row in masses)
+        ),
+        "assembly_extent_m": float(assembly_extent_m),
+        "properties": properties,
+    }
+    if files is not None:
+        payload["files"] = dict(files)
+        parts = [name for name in files if name != "robot.SLDASM"]
+        payload["source_selection"] = sealed_selection(
+            dict(files),
+            "robot.SLDASM",
+            edges={"robot.SLDASM": parts, **{name: [] for name in parts}},
+        )
+    return payload
+
+
+def seal_scene_inputs(
+    destination: Path,
+    *,
+    cad_root: Path,
+    cad_names: Sequence[str],
+    record: dict,
+    controlled: dict[str, str] | None = None,
+    record_keys: dict[str, str] | None = None,
+) -> None:
+    """Fixture plumbing: seal the consumer inputs a Linux scene rebuild reads.
+
+    Copies the genuine CAD bytes into ``input/cad`` and writes the sealed
+    discovery payload (the raw native record and any controlled records) into
+    a frozen snapshot, then re-seals the manifest so the added members stay
+    bound by the verified inventory.
+    """
+
+    import json
+
+    identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    compose_delivery_inputs(
+        destination,
+        main_assembly=str(identity.get("main_assembly") or "robot.SLDASM"),
+        configuration=str(identity.get("delivery_configuration") or "Default"),
+        record=record,
+        cad_files={name: Path(cad_root) / name for name in cad_names},
+        records=controlled,
+        record_keys=record_keys,
+    )
+    from description_pipeline.sources.snapshot import write_manifest
+
+    manifest = json.loads((Path(destination) / "manifest.json").read_text(encoding="utf-8"))
+    write_manifest(
+        Path(destination),
+        kind=manifest["kind"],
+        identity=manifest["identity"],
+        evidence_class=manifest["evidence_class"],
+    )
+
+
+def stage_discovery_inputs(
+    root: Path,
+    *,
+    record: dict,
+    controlled: dict[str, str] | None = None,
+    record_keys: dict[str, str] | None = None,
+) -> None:
+    """Fixture plumbing: stage the discovery payload for hand-built producer roots.
+
+    The controlled records land under ``input/records``, the payload binds
+    them, and the capture's base occurrence is stubbed under ``input/cad`` -
+    the raw-evidence sibling of ``compose_delivery_inputs`` for the fixture
+    roots that carry no snapshot manifest (closure and its accounting
+    consumer).
+    """
+
+    import hashlib
+
+    from description_pipeline.io import write_json
+
+    root = Path(root)
+    payload_records = []
+    for relative, text in (controlled or {}).items():
+        path = root / "input" / "records" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        entry = {
+            "file": relative,
+            "package_file": relative,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+        key = (record_keys or {}).get(relative)
+        if key is not None:
+            entry["key"] = str(key)
+        payload_records.append(entry)
+    write_json(
+        root / "evidence" / "discovery.json",
+        {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "run_id": "fixture-run",
+            "derivation": {
+                "main_assembly": "robot.SLDASM",
+                "configuration": "Default",
+                "frozen_names": {},
+                "record_roots": [],
+            },
+            "identity": {
+                "main_assembly": "robot.SLDASM",
+                "delivery_configuration": "Default",
+                "robot_name": "robot",
+            },
+            "records": payload_records,
+            "raw": record,
+            "native_files": {},
+        },
+    )
+    assembly = root / "input" / "cad" / "robot.SLDASM"
+    assembly.parent.mkdir(parents=True, exist_ok=True)
+    assembly.write_bytes(b"fixture assembly")
