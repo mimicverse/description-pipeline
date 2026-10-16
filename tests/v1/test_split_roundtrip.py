@@ -18,7 +18,9 @@ from unittest.mock import patch
 
 from description_pipeline import solidworks, steps
 from description_pipeline.io import digest
+from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.orchestration import stage_transfer as transfer
+from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
@@ -148,7 +150,7 @@ class SplitRoundtripTests(unittest.TestCase):
             expected_digest=self.handoff,
             expected_files=package_inventory(self.handoff_dir),
             main_assembly="cad/robot.SLDASM",
-            configuration={"record_roots": [str(self.records)]},
+            configuration={"record_roots": [str(self.records)], "purpose": PURPOSE_ENGINEERING},
             targets={"nd_fixture": {"repository_slug": "mimicverse/description", "base": "feature/control"}},
             preparer=lambda *args, **kwargs: prepare_native_package(*args, backend=self.discovery_backend, **kwargs),
             on_event=record,
@@ -224,6 +226,19 @@ class SplitRoundtripTests(unittest.TestCase):
         native_stages = json.loads((self.capture_output / "reports/native-stages.json").read_text(encoding="utf-8"))
         self.assertEqual(native_stages["execution_scope"], ["freeze", "discover", "capture"])
         self.assertTrue(native_stages["events"])
+        # The DAG materializes the frozen request into the capture tree; the
+        # generate reader refuses a delivery that does not carry it.
+        request = build_request_evidence(
+            purpose=PURPOSE_ENGINEERING,
+            request_id="fixture-frozen-request",
+            target_hardware="nd_fixture",
+            change_summary="split roundtrip fixture request",
+            main_assembly="cad/robot.SLDASM",
+            handoff_digest=self.handoff,
+            platform_config_digest="c" * 64,
+        )
+        (self.capture_output / "input").mkdir(parents=True, exist_ok=True)
+        (self.capture_output / "input" / "request.json").write_bytes(request_evidence_bytes(request))
         return native_stages
 
     def _windows_resume_seed(
