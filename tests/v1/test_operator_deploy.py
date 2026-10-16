@@ -1048,10 +1048,19 @@ class LifecycleTests(unittest.TestCase):
     def test_start_health_gate_failure_keeps_the_admission_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, _admission, order, control = self._admission_fixture(Path(tmp))
-            env["HEALTH_GATE_RC"] = "5"
-            env["HEALTH_GATE_DEADLINE"] = "0.5"
-            env["HEALTH_GATE_PROBE_TIMEOUT"] = "0.5"
-            env["HEALTH_GATE_INTERVAL"] = "0.1"
+            # The explicit internal path: the mirror carries the real gate with explicit small
+            # bounds, the probe always fails.  The lifecycle itself stays on the fixed policy.
+            mirror_gate = (
+                HEALTH_GATE.read_text(encoding="utf-8")
+                .replace('DEADLINE_S="${2:-180}"', 'DEADLINE_S="${2:-0.5}"')
+                .replace('PER_PROBE_S="${3:-60}"', 'PER_PROBE_S="${3:-0.5}"')
+                .replace('INTERVAL_S="${4:-5}"', 'INTERVAL_S="${4:-0.1}"')
+            )
+            write_stub(control.parent / "health_gate.sh", mirror_gate)
+            write_stub(
+                control.parent / "health.sh",
+                '#!/usr/bin/env bash\necho "health-gate probe" >> "$ORDER_LOG"\nexit 5\n',
+            )
             result = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("Linux health gate did not pass", result.stderr)
@@ -1059,7 +1068,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("health-gate probe", lines)
             self.assertNotIn("platform open_admission", lines)
             state_dir = Path(env["ORDER_LOG"]).parent / "state"
-            summaries = sorted((state_dir / "health-gate").glob("start-*/summary.txt"))
+            summaries = sorted((state_dir / "health-gate").glob("start-*/run-*/summary.txt"))
             self.assertEqual(len(summaries), 1)
             self.assertIn("linux_health_gate=FAIL", summaries[0].read_text(encoding="utf-8"))
 
