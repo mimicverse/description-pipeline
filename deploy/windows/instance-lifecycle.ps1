@@ -607,21 +607,31 @@ function Get-ServedStateRoot([string]$configPath) {
   }
   return [string]((($output | Select-Object -Last 1) | ConvertFrom-Json).state_root)
 }
+function Normalize-PathIdentity([string]$value) {
+  # Windows path declarations travel in more than one legal spelling: the platform.json wire
+  # format and the rendered bindings use forward slashes, while the official reader
+  # (windows.read_config -> Path.resolve()) reports backslash-normalized paths.  Identity
+  # comparisons are representation-insensitive over the two separators and a trailing slash;
+  # genuinely different paths still differ.
+  if ($null -eq $value) { return '' }
+  return ([string]$value).Replace('\', '/').TrimEnd('/')
+}
 function Assert-DomainPins([string]$StateRoot, [string]$ServedGeneration) {
   $officialRoot = ''
   if ($ServedGeneration) {
     $officialRoot = Get-ServedStateRoot (Config-Path $ServedGeneration)
-    if ($officialRoot -ne $StateRoot) {
+    if ((Normalize-PathIdentity $officialRoot) -ne (Normalize-PathIdentity $StateRoot)) {
       Die 'state_root_mismatch' ('the served configuration binds another state root: ' + $officialRoot)
     }
   }
   $canonical = Domain-OwnershipPath $StateRoot
   $pinned = [string](Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE')
-  if ($pinned -and ($pinned -ne $canonical)) {
+  if ($pinned -and ((Normalize-PathIdentity $pinned) -ne (Normalize-PathIdentity $canonical))) {
     Die 'cad_domain_override_refused' ('the bound CAD domain does not match this installation: ' + $pinned)
   }
   $pinnedRoot = [string](Get-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT')
-  if ($pinnedRoot -and $ServedGeneration -and ($pinnedRoot -ne $ServedGeneration)) {
+  if ($pinnedRoot -and $ServedGeneration -and
+      ((Normalize-PathIdentity $pinnedRoot) -ne (Normalize-PathIdentity $ServedGeneration))) {
     Die 'cad_domain_override_refused' ('the endpoint-root pin does not restate the served generation: ' + $pinnedRoot)
   }
   return @{ canonical=$canonical; previous_ownership=$pinned; previous_root=$pinnedRoot }
