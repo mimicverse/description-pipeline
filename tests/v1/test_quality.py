@@ -2123,6 +2123,20 @@ class QualificationItemTests(unittest.TestCase):
         write_json(root / "input/handoff.json", {"probe": "sealed input"})
         write_json(root / "model/robot.json", {"probe": "model"})
         (root / "urdf/robot.urdf").write_text("<robot/>", encoding="utf-8")
+        from description_pipeline.request_evidence import build_request_evidence, write_request_evidence
+
+        write_request_evidence(
+            root / "input" / "request.json",
+            build_request_evidence(
+                purpose="engineering",
+                request_id="fixture-quality",
+                target_hardware="nd_fixture",
+                change_summary="fixture",
+                main_assembly="cad/robot.SLDASM",
+                handoff_digest="a" * 64,
+                platform_config_digest="c" * 64,
+            ),
+        )
         return root
 
     @staticmethod

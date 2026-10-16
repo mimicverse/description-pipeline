@@ -108,6 +108,20 @@ def build_sealed_delivery(root: Path) -> tuple[str, list[dict], str, str]:
         },
     )
     write_json(root / "transfer-manifest.json", {"handoff_sha256": digest(native_inventory)})
+    from description_pipeline.request_evidence import build_request_evidence, write_request_evidence
+
+    write_request_evidence(
+        root / "input" / "request.json",
+        build_request_evidence(
+            purpose="engineering",
+            request_id="fixture-sealed-delivery",
+            target_hardware="nd",
+            change_summary="fixture",
+            main_assembly="cad/robot.SLDASM",
+            handoff_digest=digest(package_files),
+            platform_config_digest="c" * 64,
+        ),
+    )
     write_delivery_manifest(
         root,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},

@@ -34,7 +34,6 @@ from ..interface_records import (
     qualification_facts,
     validate_qualification,
 )
-from ..request_evidence import read_request_evidence
 from ..stages import required_rows_complete
 from . import native_discovery as evidence
 from .consumer import load as load_consumer
@@ -1701,18 +1700,6 @@ _ENGINEERING_FACTS = frozenset(
 )
 _ENGINEERING_FACT_RECORDS = ("input/handoff.json",)
 _ENGINEERING_FACT_EXTRAS = ("input/request.json", "model/robot.json")
-
-
-def _request_purpose(root) -> str | None:
-    """The submission purpose of the frozen request, or ``None`` when unreadable."""
-
-    request = Path(root) / "input" / "request.json"
-    if not request.is_file():
-        return None
-    try:
-        return str(read_request_evidence(request)[0].get("purpose") or "")
-    except PipelineError:
-        return None
 
 
 def _engineering_status(fact_id: str, object_id: str, joints: dict, preview: bool) -> str:

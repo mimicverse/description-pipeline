@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from description_pipeline import request_evidence
-from description_pipeline.io import write_json
+from description_pipeline.io import PipelineError, write_json
 from description_pipeline.verification import solidworks_urdf as quality
 
 
@@ -58,6 +59,7 @@ class EngineeringFactTests(unittest.TestCase):
         (self.root / "input" / "request.json").write_bytes(payload)
 
     def test_engineering_purpose_establishes_only_on_authoritative_evidence(self) -> None:
+        self._write_request("engineering")
         statuses = self._statuses(self._definition())
         self.assertEqual(statuses[("engineering_position_range", "hinge")], "established")
         self.assertEqual(statuses[("drive_sizing", "hinge")], "established")
@@ -99,9 +101,33 @@ class EngineeringFactTests(unittest.TestCase):
         validate_qualification(fact, resolve=self.root)
 
     def test_fixed_joints_carry_no_engineering_facts(self) -> None:
+        self._write_request("engineering")
         statuses = self._statuses(self._definition(fixed=True))
         self.assertNotIn(("engineering_position_range", "hinge"), statuses)
         self.assertNotIn(("drive_sizing", "hinge"), statuses)
+
+    def test_unreadable_or_undeclared_purpose_fails_closed(self) -> None:
+        target = self.root / "input" / "request.json"
+        definition = self._definition()
+        checks = self._checks(definition)
+        for name in ("missing_request", "empty_request", "unknown_purpose", "missing_purpose"):
+            with self.subTest(name=name):
+                if name == "missing_request":
+                    target.unlink(missing_ok=True)
+                elif name == "empty_request":
+                    target.write_text("{}", encoding="utf-8")
+                else:
+                    self._write_request("inspection_preview")
+                    record = json.loads(target.read_text(encoding="utf-8"))
+                    if name == "unknown_purpose":
+                        record["purpose"] = "unknown"
+                    else:
+                        record.pop("purpose")
+                    target.write_text(json.dumps(record), encoding="utf-8")
+                with self.assertRaises(PipelineError):
+                    quality._request_purpose(self.root)
+                with self.assertRaises(PipelineError):
+                    quality.qualifications(self.root, definition, checks)
 
 
 if __name__ == "__main__":
