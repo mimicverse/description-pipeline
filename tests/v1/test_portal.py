@@ -1154,11 +1154,14 @@ class PortalTests(unittest.TestCase):
         self._seed_retryable_run()
         self.client.login()
         self._fail_job()
+        # The registered terminal outcome owns the displayed retry advice exactly
+        # as it owns the POST decision: the run page never offers the refused action.
+        # (The native-side diagnostics stay covered by the classification test.)
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         self.assertEqual(
             json.loads(body)["retry"],
-            {"eligible": False, "reason": "native_terminal_failure", "classification": "engineering_terminal_failure"},
+            {"eligible": False, "reason": "registered_failed", "classification": "engineering_terminal_failure"},
         )
         self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)
         with patch.object(self.endpoint, "get_job", side_effect=EndpointError("offline")):
@@ -1168,8 +1171,8 @@ class PortalTests(unittest.TestCase):
                 json.loads(body)["retry"],
                 {
                     "eligible": False,
-                    "reason": "endpoint_evidence_unavailable",
-                    "classification": "temporary_disconnection",
+                    "reason": "registered_failed",
+                    "classification": "engineering_terminal_failure",
                 },
             )
             self.assertEqual(self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/retry", {})[0], 409)

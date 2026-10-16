@@ -75,6 +75,7 @@ from .feishu_oauth import (
 from .run_ownership import (
     AMBIGUOUS_TASK_STATE,
     RECOVERY_ENGINEERING_TERMINAL,
+    RECOVERY_TEMPORARY_DISCONNECTION,
     RECOVERY_UNKNOWN_PUBLICATION,
     RecoveryAssessment,
     classify_recovery,
@@ -863,6 +864,31 @@ _RETRY_REFUSED_MESSAGES = {
     ),
     RECOVERY_ENGINEERING_TERMINAL: ("工程阶段已终态失败：请按检查结果修复后新建关联运行；此运行不再原地重试"),
 }
+
+
+#: The recovery classification of a registered terminal outcome.
+_REGISTERED_RECOVERY_TERMINAL = {
+    "failed": RECOVERY_ENGINEERING_TERMINAL,
+    "cancelled": RECOVERY_ENGINEERING_TERMINAL,
+    "succeeded": "run_succeeded",
+    "unresolved": RECOVERY_UNKNOWN_PUBLICATION,
+}
+
+
+def _registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
+    """The (reason, classification) blocking in-place recovery, or None while it may proceed.
+
+    Only a known live admitted registration (``queued``/``running``) opens the
+    scheduling recovery: terminal outcomes refuse with their recorded reason,
+    and a missing or unproven registration fails closed - Airflow or native
+    facts never substitute for the platform admission.
+    """
+    state = record.get("state") if isinstance(record, dict) else None
+    if state in {"queued", "running"}:
+        return None
+    if isinstance(state, str) and state in _REGISTERED_RECOVERY_TERMINAL:
+        return f"registered_{state}", _REGISTERED_RECOVERY_TERMINAL[state]
+    return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
 
 
 def _retry_assessment(
@@ -1656,6 +1682,13 @@ class PortalApp:
             record = self._runs.get(dag_run_id)
         principal, operator = _run_identity(airflow_run.get("triggering_user_name"), record)
         retry = _retry_assessment(airflow_run, tasks, job, endpoint_error)
+        recovery = self._platform_read(lambda: self._platform().run_record(run_id))
+        recovery_block = _registered_recovery_block(recovery)
+        if recovery_block is not None:
+            # The same admission criterion the retry route enforces: the displayed
+            # advice never offers an action the POST would necessarily refuse.
+            reason, classification = recovery_block
+            retry = RecoveryAssessment(False, classification, reason, ())
         pr = None
         if isinstance(job, dict):
             result = job.get("result") if isinstance(job.get("result"), dict) else {}
@@ -1758,22 +1791,24 @@ class PortalApp:
                         {"error": "已删除的运行不能重试，请先恢复", "reason": "deleted"},
                         self.config,
                     )
-                # The registered outcome is the terminal authority: a registered
-                # terminal run refuses in-place retry BEFORE any Airflow clear
-                # (dry-run included) - a stale native observation never reopens it.
+                # Only a known live admitted registration opens the scheduling
+                # recovery: terminal outcomes and unproven registrations refuse
+                # BEFORE any Airflow clear (dry-run included) - a stale native
+                # observation never substitutes for the platform admission.
                 run_id = native_run_id(dag_run_id)
                 record = self._platform_read(lambda: self._platform().run_record(run_id))
-                registered_state = record.get("state") if isinstance(record, dict) else None
-                if registered_state in {"failed", "succeeded", "cancelled", "unresolved"}:
+                block = _registered_recovery_block(record)
+                if block is not None:
+                    reason, _classification = block
                     return _json_response(
                         start_response,
                         HTTPStatus.CONFLICT,
                         {
                             "error": (
-                                "该运行已登记为终态：不可原地清除重试；"
+                                "该运行没有可恢复的平台登记（缺失、未知或已终态）：不可原地清除重试；"
                                 "未决结果请先完成对账，其余请按登记结果修复后新建关联运行"
                             ),
-                            "reason": f"registered_{registered_state}",
+                            "reason": reason,
                         },
                         self.config,
                     )

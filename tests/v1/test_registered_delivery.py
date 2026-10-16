@@ -446,6 +446,60 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertEqual([entry["dry_run"] for entry in clears], [True, False])
 
+    def test_missing_or_unknown_registration_refuses_retry_without_clearing(self) -> None:
+        """Airflow and native facts never substitute for the platform admission."""
+        platform = RegisteredPlatform(self.tmp / "not-admitted")
+        status, payload, clears = self._post_retry(platform)
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload.get("reason"), "registration_missing")
+        self.assertEqual(clears, [], "no dry-run and no clear without a platform registration")
+        unknown = RegisteredPlatform(self.tmp / "unknown")
+        unknown.admit(WSGI_RUN)
+        unknown.world.run_states[WSGI_RUN] = "mystery"
+        status, payload, clears = self._post_retry(unknown)
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload.get("reason"), "registration_missing")
+        self.assertEqual(clears, [])
+
+    def test_the_displayed_retry_advice_matches_the_post_criterion(self) -> None:
+        """The run page never offers an action the POST route would necessarily refuse."""
+
+        def get_retry(platform: RegisteredPlatform) -> dict:
+            airflow = _RetryAirflow()
+            app = portal_module.PortalApp(
+                portal_module.PortalConfig(
+                    airflow=airflow, endpoint=_RunningEndpoint(), platform_store=platform.store
+                )
+            )
+            session = app.sessions.create("user", "token", principal="fixture:local:reader")
+            response: dict = {}
+
+            def start(status, headers):
+                response["status"] = int(status.split()[0])
+
+            body = b"".join(
+                app(
+                    {
+                        "REQUEST_METHOD": "GET",
+                        "PATH_INFO": f"/api/runs/{DAG}",
+                        "HTTP_COOKIE": f"{portal_module.DEFAULT_SESSION_COOKIE}={session.session_id}",
+                        "wsgi.input": io.BytesIO(b""),
+                    },
+                    start,
+                )
+            )
+            self.assertEqual(response["status"], 200)
+            return json.loads(body)["retry"]
+
+        unregistered = RegisteredPlatform(self.tmp / "advice-missing")
+        advice = get_retry(unregistered)
+        self.assertEqual(advice["eligible"], False, advice)
+        self.assertEqual(advice["reason"], "registration_missing")
+        running = RegisteredPlatform(self.tmp / "advice-running")
+        running.admit(WSGI_RUN)
+        advice = get_retry(running)
+        self.assertEqual(advice["eligible"], True, advice)
+
 
 if __name__ == "__main__":
     unittest.main()
