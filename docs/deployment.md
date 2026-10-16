@@ -9,10 +9,12 @@ Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖
 | 主机 | 必需条件 |
 |---|---|
 | Linux | 发行清单支持的 x86_64 Linux、CPython、PostgreSQL、反向代理、Git/GitHub CLI、用户级 systemd；可访问 Windows SSH、飞书与模型仓库 |
-| Windows | 发行清单支持的 Windows、CPython x86_64、licensed SolidWorks 与原生 API；OpenSSH Server、专用登录桌面和独立工程暂存目录 |
+| Windows | 发行清单支持的 Windows、CPython x86_64、licensed SolidWorks 与原生 API；Windows PowerShell 5.1 Desktop（`powershell.exe`）、OpenSSH Server、专用登录桌面和独立工程暂存目录 |
 | 外部服务 | 可信 TLS、飞书企业应用及批准租户、私有模型仓库与存在的集成 base |
 
 发行物的 `release.json` 是支持矩阵与依赖身份的权威：两端源码发行身份一致，角色依赖分别锁定。Linux 消费者验证无渲染，不要求桌面、GPU 或图形驱动。Windows 服务不能运行在 Session 0，不能复用工程师的交互 CAD 会话。
+
+Windows 安装与生命周期脚本须在 Windows PowerShell 5.1 Desktop 上通过语法、API 及实际入口验证，保留严格 JSON 和重复键拒绝语义；Linux 上的 `pwsh` 测试不能代替该兼容性证明。新发行进入部署窗口前，先在目标主机用 `powershell.exe` 完成不操作 CAD、不修改活动服务的兼容性预验。
 
 ## 配置权威
 
