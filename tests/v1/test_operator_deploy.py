@@ -3177,7 +3177,8 @@ class BackupStagingCleanupUnitTests(unittest.TestCase):
 
     def _fixture(self, tmp: Path) -> tuple[Path, Path]:
         """A promotion receipt directory with a read-only private staging (0555/0444 copies,
-        a symlink entry) and an outside tree the symlink points at."""
+        a zero-mode nested directory and a symlink entry) and an outside tree the symlink
+        points at."""
 
         receipt = tmp / "receipt"
         (receipt / "evidence").mkdir(parents=True)
@@ -3196,7 +3197,7 @@ class BackupStagingCleanupUnitTests(unittest.TestCase):
         (staging / "stale.dat").write_bytes(b"stale")
         (staging / "escape-link").symlink_to(outside, target_is_directory=True)
         (staging / "sealed" / "frozen.dat").chmod(0o444)
-        (staging / "sealed" / "deeper").chmod(0o500)
+        (staging / "sealed" / "deeper").chmod(0o000)
         (staging / "sealed").chmod(0o555)
         (staging / "stale.dat").chmod(0o444)
         return receipt, outside
@@ -3263,6 +3264,42 @@ class BackupStagingCleanupUnitTests(unittest.TestCase):
             refused = self._clean(Path("relative-receipt"))
             self.assertEqual(refused.returncode, 1)
             self.assertIn("absolute receipt directory", refused.stderr)
+
+    def test_refuses_symlinked_ancestors_and_traversal_receipts(self) -> None:
+        """The PR #61 boundary probes: <tmp>/alias/receipt (symlinked ancestor), the
+        <receipt>/child/.. traversal form and a self-loop receipt are all refused with the
+        whole target intact, while the canonical spelling still cleans."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            receipt = tmp / "real" / "receipt"
+            (receipt / "backup" / "sealed" / "deeper").mkdir(parents=True)
+            (receipt / "receipt.json").write_text("{}\n", encoding="utf-8")
+            (receipt / "backup" / "sealed" / "deeper" / "frozen.dat").write_bytes(b"frozen")
+            (receipt / "backup" / "sealed" / "deeper" / "frozen.dat").chmod(0o444)
+            (receipt / "backup" / "sealed" / "deeper").chmod(0o555)
+            (receipt / "backup" / "sealed").chmod(0o555)
+            (receipt / "child").mkdir()
+            target_before = self._snapshot(receipt)
+            alias = tmp / "alias"
+            alias.symlink_to(tmp / "real", target_is_directory=True)
+            refused = self._clean(alias / "receipt")
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("canonical", refused.stderr)
+            self.assertEqual(self._snapshot(receipt), target_before, "the aliased target must be untouched")
+            refused = self._clean(receipt / "child" / "..")
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("canonical", refused.stderr)
+            self.assertEqual(self._snapshot(receipt), target_before, "the traversal form must remove nothing")
+            loop = tmp / "loop"
+            loop.symlink_to("loop")
+            refused = self._clean(loop)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("symbolic link component", refused.stderr)
+            self.assertTrue(loop.is_symlink())
+            cleaned = self._clean(receipt)
+            self.assertEqual(cleaned.returncode, 0, cleaned.stdout + cleaned.stderr)
+            self.assertEqual(cleaned.stdout.strip(), "staging=removed")
 
 
 class InstallPostgresBehaviorTests(unittest.TestCase):

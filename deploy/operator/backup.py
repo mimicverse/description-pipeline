@@ -6,7 +6,9 @@ single artifact the promotion manifest binds, and ``open`` reproduces the sealed
 
 ``clean-staging`` is the one owner of private-staging cleanup: it removes exactly
 ``<receipt dir>/backup`` - the tree ``seal`` and ``manifest`` bind - and never a source root,
-the sealed archive, the manifest, the key reference or the recorded evidence.
+the sealed archive, the manifest, the key reference or the recorded evidence; a non-canonical
+receipt path (a ``.`` or ``..`` component, or a symlinked component) is refused before
+anything is touched.
 
 Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 """
@@ -203,20 +205,45 @@ def _remove_staging_tree(root: Path) -> None:
     os.rmdir(root)
 
 
+def _require_canonical_receipt_path(receipt: Path) -> None:
+    """The receipt path must provably name the directory it spells, before anything is touched.
+
+    A ``.`` or ``..`` component, or a symlinked component anywhere in the chain, would let the
+    cleanup resolve to another real location than the argument reads as (the PR #61 boundary
+    probes).  The raw input must equal its non-strict resolve, and every component of the chain
+    must be a real directory entry - never a symlink.  Either refusal happens ahead of any
+    chmod or unlink, so the whole target stays untouched.
+    """
+
+    require(
+        str(receipt) == os.path.realpath(receipt),
+        f"the receipt directory must be a canonical path (no '.' or '..' or symbolic link components); "
+        f"refused: {receipt}",
+    )
+    chain = Path(receipt.anchor)
+    for part in receipt.parts[1:]:
+        chain = chain / part
+        require(
+            not chain.is_symlink(),
+            f"the receipt path must not contain a symbolic link component; refused: {chain}",
+        )
+
+
 def remove_private_staging(receipt_dir: Path) -> bool:
     """The one owner of private-staging cleanup: remove ``<receipt_dir>/backup``, nothing else.
 
     The promotion flow copies the running deployment's roots into that staging with their
     original modes (``cp -a`` / ``copytree`` preserve 0555 directories and 0444 files), so a
     plain ``rm -rf`` cannot remove it and a retry's ``rmtree`` fails the same way.  The guards
-    make the target provable: the receipt directory must be a real directory carrying
+    make the target provable: the receipt path must be canonical (no '.'/'..' and no symlinked
+    component, refused ahead of any mutation), the receipt directory must carry
     ``receipt.json``, and the staging root itself must be a real directory - a symlink is
     refused, never followed.  Returns whether the staging existed.
     """
 
     receipt = Path(receipt_dir)
     require(receipt.is_absolute(), "clean-staging requires an absolute receipt directory")
-    require(not receipt.is_symlink(), f"the receipt directory is a symbolic link; refused: {receipt}")
+    _require_canonical_receipt_path(receipt)
     marker = receipt / "receipt.json"
     require(marker.is_file() and not marker.is_symlink(), f"not a promotion receipt directory: {receipt}")
     root = receipt / STAGING_DIRNAME
