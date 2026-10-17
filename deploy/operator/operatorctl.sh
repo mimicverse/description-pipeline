@@ -823,9 +823,6 @@ case "$ACTION" in
     mkdir -p "$PIPELINE_STORE_ROOT"
     chmod 700 "$PIPELINE_STORE_ROOT"
     [ -f "$ENDPOINT_TOKEN_FILE" ] || die "endpoint token file missing: $ENDPOINT_TOKEN_FILE"
-    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
-      --token-file "$ENDPOINT_TOKEN_FILE" --host 127.0.0.1 --port "$TUNNEL_LOOPBACK_PORT" \
-      --handoff-root "$SOLIDWORKS_HANDOFF_ROOT" --pipeline-config "$PORTAL_CONFIG"
     # The binary decided above is the one everything rendered; it may not vanish mid-install.
     [ -x "$PROXY_BIN" ] || die "the managed proxy binary is missing: $PROXY_BIN"
     systemctl --user daemon-reload
@@ -846,6 +843,9 @@ case "$ACTION" in
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
         --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --tree "$HERE/../.."
     fi
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
+      --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
+      || die "could not bind solidworks_windows to the installed config snapshot"
     echo "install complete: ${OPERATOR_URL:-unknown}"
     ;;
   start)
@@ -967,7 +967,7 @@ PY
     [ -f "$CANDIDATE_ENV" ] || die "candidate derived environment was not written"
     python3 "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --from "$STATE_ROOT/install-records/$ACTIVE_ID.json" --to "$SNAPSHOT_PATH" \
-      --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-verify" \
+      --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,config-reference,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-config-reference,rollback-verify" \
       >/dev/null
     printf '%s\n' "$CANDIDATE_WHEEL" > "$RECEIPT_DIR/candidate-wheel"
     set -a
@@ -1258,6 +1258,13 @@ PY
       die "the pointer switch failed (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote switch-pointer completed "$EVIDENCE_DIR/switch-pointer.out"
+    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
+        --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
+        > "$EVIDENCE_DIR/config-reference.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote config-reference failed "$EVIDENCE_DIR/config-reference.out"
+      die "the Airflow connection could not bind the switched config snapshot (the admission stays closed)"
+    fi
+    promotion_step "$CANDIDATE_ID" promote config-reference completed "$EVIDENCE_DIR/config-reference.out"
     # 8. the switched generation starts through its own derived environment
     load_active_env
     load_installed
@@ -1467,6 +1474,15 @@ PY
       # recorded with the receipt itself as evidence.
       promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$RECEIPT_DIR/receipt.json"
     fi
+    RESTORED_SNAPSHOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot"]["path"])' "$PREVIOUS_RECORD")" \
+      || die "the restored record carries no config snapshot"
+    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
+        --state-root "$STATE_ROOT" --snapshot "$RESTORED_SNAPSHOT" \
+        > "$EVIDENCE_DIR/rollback-config-reference.out" 2>&1; then
+      promotion_step "$ROLLBACK_ID" rollback rollback-config-reference failed "$EVIDENCE_DIR/rollback-config-reference.out"
+      die "the Airflow connection could not bind the restored config snapshot (the admission stays closed)"
+    fi
+    promotion_step "$ROLLBACK_ID" rollback rollback-config-reference completed "$EVIDENCE_DIR/rollback-config-reference.out"
     # The restored generation starts through its own environment and both ends re-verify; the
     # restored record is checked against its own immutable snapshot (the operator's current
     # platform.json may already describe a candidate).

@@ -92,13 +92,13 @@ NATIVE_POOL = os.environ.get("SOLIDWORKS_NATIVE_POOL", "windows_native")
 log = logging.getLogger(__name__)
 
 
-def _endpoint(conn_id: str) -> WindowsEndpoint:
-    return WindowsEndpoint(config_from_airflow_connection(conn_id))
+def _endpoint(conn_id: str, config_digest: str | None = None) -> WindowsEndpoint:
+    return WindowsEndpoint(config_from_airflow_connection(conn_id, config_digest=config_digest))
 
 
-def _work_paths(conn_id: str, run_id: str) -> flow.RunPaths:
+def _work_paths(conn_id: str, run_id: str, config_digest: str | None = None) -> flow.RunPaths:
     """The in-flight working layout of one run; no state file is business authority."""
-    config = config_from_airflow_connection(conn_id)
+    config = config_from_airflow_connection(conn_id, config_digest=config_digest)
     if config.store_root is None:
         raise AirflowFailException(
             "pipeline.store_root / PIPELINE_STORE_ROOT is not configured; the Linux portable half cannot run"
@@ -106,14 +106,50 @@ def _work_paths(conn_id: str, run_id: str) -> flow.RunPaths:
     return flow.RunPaths(config.store_root, run_id)
 
 
-def _platform_binding() -> tuple[PlatformStore, Path]:
+def _platform_binding(config_digest: str | None = None) -> tuple[PlatformStore, Path]:
     """The platform registration binding: service DSN plus the sealed resolver over the store root."""
-    config = config_from_airflow_connection(CONN_ID)
+    config = config_from_airflow_connection(CONN_ID, config_digest=config_digest)
     if config.store_root is None:
         raise AirflowFailException(
             "pipeline.store_root / PIPELINE_STORE_ROOT is not configured; the platform registration cannot run"
         )
     return PlatformStore.from_environment(sealed=sealed_resolver(config.store_root)), Path(config.store_root)
+
+
+def _linked_parent_binding(parent_run: str) -> tuple[dict, str, EndpointConfig]:
+    """Read a parent's frozen request before consulting any current active pointer.
+
+    Both the permitted state root and sealed store root come from the controlled
+    runtime environment. The frozen request supplies the bound snapshot digest;
+    the snapshot must then confirm that same store root before any parent row or
+    sealed tree is trusted.
+    """
+
+    state_root = str(os.environ.get("OPERATOR_STATE") or "").strip()
+    store_root = str(os.environ.get("PIPELINE_STORE_ROOT") or "").strip()
+    if not state_root or not store_root:
+        raise AirflowFailException(
+            "OPERATOR_STATE and PIPELINE_STORE_ROOT are required to resolve a linked parent"
+        )
+    sealed = sealed_resolver(store_root)
+    tree = sealed(f"store://sealed/{parent_run}/freeze")
+    record, _sha = read_request_evidence(tree / "input" / "request.json")
+    config_digest = str(record.get("platform_config_digest") or "").strip()
+    if not config_digest:
+        raise AirflowFailException("The linked parent freeze carries no platform configuration identity")
+    config = config_from_airflow_connection(CONN_ID, config_digest=config_digest)
+    if config.store_root != Path(store_root):
+        raise AirflowFailException("The linked parent configuration names another sealed store root")
+    return record, config_digest, config
+
+
+def _store_only_platform_binding() -> tuple[PlatformStore, Path]:
+    """Platform access for admission facts that must be read before config resolution."""
+
+    store_root = str(os.environ.get("PIPELINE_STORE_ROOT") or "").strip()
+    if not store_root:
+        raise AirflowFailException("PIPELINE_STORE_ROOT is required to read an admitted child")
+    return PlatformStore.from_environment(sealed=sealed_resolver(store_root)), Path(store_root)
 
 
 def _delivery_manifest_arguments() -> tuple[dict, dict]:
@@ -312,7 +348,13 @@ def _register_blocked_downstream(platform: PlatformStore, run_id: str, failed_st
 
 
 def _converge_failed_stage(
-    run_id: str, stage: str, error: Exception, tree: Path | None = None, *, products: bool = False
+    run_id: str,
+    stage: str,
+    error: Exception,
+    tree: Path | None = None,
+    *,
+    products: bool = False,
+    config_digest: str | None = None,
 ) -> None:
     """Best-effort failure convergence; the original stage failure is never masked.
 
@@ -320,7 +362,7 @@ def _converge_failed_stage(
     so a real failure registers what it actually produced, never less.
     """
     try:
-        platform, store_root = _platform_binding()
+        platform, store_root = _platform_binding(config_digest)
         if tree is None and products:
             try:
                 tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir, stage)
@@ -348,9 +390,11 @@ def _converge_early_freeze_failure(run_id: str, error: Exception) -> None:
         log.exception("early freeze failure convergence unavailable run=%s", run_id)
 
 
-def _register_completed_stage(run_id: str, stage: str, tree: str | Path, receipt: dict) -> None:
+def _register_completed_stage(
+    run_id: str, stage: str, tree: str | Path, receipt: dict, *, config_digest: str | None = None
+) -> None:
     """The completed-stage registration: platform binding, sealed write, stage confirmation."""
-    platform, store_root = _platform_binding()
+    platform, store_root = _platform_binding(config_digest)
     _seal_and_confirm(platform, store_root, run_id, stage, tree, receipt, state="completed")
 
 
@@ -410,7 +454,15 @@ def _materialize_linked_attempt(platform: PlatformStore, store_root: Path, run_i
     shutil.copy2(sealed_request, frozen)
 
 
-def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict | None = None, **kwargs) -> dict:
+def _portable_registered(
+    run_id: str,
+    stage: str,
+    *,
+    tree: Path,
+    context: dict | None = None,
+    config_digest: str | None = None,
+    **kwargs,
+) -> dict:
     """Run one portable stage, report its boundary, then register it through the sealed chain.
 
     The platform binding is required before the stage runs - an unavailable
@@ -418,7 +470,7 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
     is mirrored into the platform's live event stream.  The stage itself is
     produced by the registered flow from the sealed predecessor trees.
     """
-    platform, store_root = _platform_binding()
+    platform, store_root = _platform_binding(config_digest)
     source_run_id = kwargs.get("source_run_id")
     if stage == "publish":
         confirmed = platform.confirmed_stage(run_id, "publish")
@@ -463,14 +515,23 @@ def _portable_registered(run_id: str, stage: str, *, tree: Path, context: dict |
         _portable_summary(receipt, stage=stage)  # a non-confirmed receipt never reaches registration
     except Exception as error:
         _converge_failed_stage(
-            run_id, stage, error, tree=tree if Path(tree).is_dir() else None, products=True
+            run_id,
+            stage,
+            error,
+            tree=tree if Path(tree).is_dir() else None,
+            products=True,
+            config_digest=config_digest,
         )
         raise
     try:
-        _register_completed_stage(run_id, stage, tree, receipt)
+        _register_completed_stage(run_id, stage, tree, receipt, config_digest=config_digest)
     except Exception as error:
         _converge_failed_stage(
-            run_id, stage, error, tree=tree if (Path(tree) / "manifest.json").is_file() else None
+            run_id,
+            stage,
+            error,
+            tree=tree if (Path(tree) / "manifest.json").is_file() else None,
+            config_digest=config_digest,
         )
         raise
     return receipt
@@ -536,9 +597,22 @@ def _claim_operation_intent(
         raise AirflowFailException(f"the registered {what} intent is not claimable")
 
 
-def _register_freeze_stage(paths: flow.RunPaths, run_id: str, *, intake: Path, upload_files: dict[str, str]) -> None:
+def _register_freeze_stage(
+    paths: flow.RunPaths,
+    run_id: str,
+    *,
+    request_id: str,
+    intake: Path,
+    upload_files: dict[str, str],
+    config_digest: str,
+) -> None:
     """Seal the admitted originals with the frozen request evidence and confirm the freeze stage."""
-    platform, store_root = _platform_binding()
+    platform, store_root = _platform_binding(config_digest)
+    request = platform.request_record(request_id)
+    baseline = request.get("baseline") if isinstance(request, dict) else None
+    admitted_digest = str((baseline or {}).get("platform_config_digest") or "").strip()
+    if admitted_digest != config_digest:
+        raise AirflowFailException("The admitted request's configuration identity differs from its frozen binding")
     platform.start_run(run_id)  # the first driver action claims the admitted run
     tree = paths.stage_dir("freeze")
     try:
@@ -561,7 +635,13 @@ def _register_freeze_stage(paths: flow.RunPaths, run_id: str, *, intake: Path, u
         receipt = {"tool": read_data(tree / "tool.json")}
         _seal_and_confirm(platform, store_root, run_id, "freeze", tree, receipt, state="completed")
     except Exception as error:
-        _converge_failed_stage(run_id, "freeze", error, tree=tree if (tree / "manifest.json").is_file() else None)
+        _converge_failed_stage(
+            run_id,
+            "freeze",
+            error,
+            tree=tree if (tree / "manifest.json").is_file() else None,
+            config_digest=config_digest,
+        )
         raise
 
 
@@ -823,7 +903,9 @@ def _linked_purpose(context, parent_record: dict) -> str:
     return purpose
 
 
-def _submission_frame(context, purpose: str | None = None) -> tuple[dict, dict]:
+def _submission_frame(
+    context, purpose: str | None = None, *, config_digest: str | None = None
+) -> tuple[dict, dict, EndpointConfig]:
     """The submission identity and configured target routing of one trigger.
 
     The publish target and the change summary are required (conf first, then
@@ -834,7 +916,9 @@ def _submission_frame(context, purpose: str | None = None) -> tuple[dict, dict]:
     rebinds ``repository_slug``/``repository_base`` from.
     """
 
-    conf, target, summary, principal, config, routing = _submission_basics(context)
+    conf, target, summary, principal, config, routing = _submission_basics(
+        context, config_digest=config_digest
+    )
     declared_purpose = str(purpose or conf.get("purpose") or context["params"].get("purpose") or "").strip()
     if declared_purpose not in REQUEST_PURPOSES:
         raise AirflowFailException(
@@ -856,10 +940,10 @@ def _submission_frame(context, purpose: str | None = None) -> tuple[dict, dict]:
         raise AirflowFailException(str(error)) from error
     if identity is None:
         raise AirflowFailException(f"target_hardware {target!r} produced no publication identity")
-    return identity, routing
+    return identity, routing, config
 
 
-def _submission_basics(context):
+def _submission_basics(context, *, config_digest: str | None = None):
     """The validated target/summary/actor frame of one trigger, without a purpose.
 
     The target and the change summary are required (conf first, then params): a
@@ -890,7 +974,7 @@ def _submission_basics(context):
     principal = recorded_actor_principal(getattr(context["dag_run"], "triggering_user_name", None))
     if principal is None:
         raise AirflowFailException("the run carries no authenticated submitter identity")
-    config = config_from_airflow_connection(CONN_ID)
+    config = config_from_airflow_connection(CONN_ID, config_digest=config_digest)
     routing = config.targets.get(target)
     if routing is None:
         raise AirflowFailException(f"target_hardware {target!r} is not a configured publication target")
@@ -977,7 +1061,7 @@ def _linked_freeze_request(context, linked: dict) -> dict:
     """
 
     run_id = _run_uuid(context)
-    platform, _store_root = _platform_binding()
+    platform, _store_root = _store_only_platform_binding()
     platform.start_run(run_id)  # the first driver action claims the admitted child
     child = platform.run_record(run_id)
     if not (
@@ -987,6 +1071,11 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         and isinstance(child.get("request_id"), str)
     ):
         raise AirflowFailException("The admitted child does not bind this parent and the freeze boundary")
+    child_request = platform.request_record(child["request_id"])
+    baseline = child_request.get("baseline") if isinstance(child_request, dict) else None
+    config_digest = str((baseline or {}).get("platform_config_digest") or "").strip()
+    if len(config_digest) != 64 or any(character not in "0123456789abcdef" for character in config_digest):
+        raise AirflowFailException("The admitted child carries no platform configuration identity")
     conf = getattr(context["dag_run"], "conf", None)
     conf = conf if isinstance(conf, dict) else {}
     parent_dag_run_id = str(conf.get("parent_dag_run_id") or "").strip()
@@ -1005,16 +1094,20 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         )
     except FreezeRetryRefusal as refusal:
         raise AirflowFailException(str(refusal)) from refusal
+    conf_digest = str(conf.get("platform_config_digest") or "").strip()
+    if conf_digest and conf_digest != config_digest:
+        raise AirflowFailException(
+            "conf platform_config_digest does not match the parent's frozen configuration identity"
+        )
     purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
     if purpose != resolved.purpose:
         raise AirflowFailException("A linked freeze retry must keep the parent's purpose")
     supplied = conf.get("main_assembly") or context["params"].get("main_assembly") or None
     if supplied and validate_main_assembly(supplied) != resolved.main_assembly:
         raise AirflowFailException("A linked freeze retry must keep the parent's main assembly")
-    intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+    intake = _endpoint(CONN_ID, config_digest).authorized_intake_dir(handoff_path)
     if Path(intake).resolve() != resolved.intake_path.resolve():
         raise AirflowFailException("The sealed intake is not the registered evidence intake")
-    child_request = platform.request_record(child["request_id"])
     if not isinstance(child_request, dict):
         raise AirflowFailException("The admitted child carries no request row")
     child_baseline = child_request.get("baseline")
@@ -1040,18 +1133,10 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         and provenance.get("parent_run_id") == resolved.provenance["parent_run_id"]
     ):
         raise AirflowFailException("The admitted child provenance does not match the resolved evidence")
-    config_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
-    if not config_digest:
-        raise AirflowFailException(
-            "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
-        )
-    conf_digest = str(conf.get("platform_config_digest") or "").strip()
-    if conf_digest and conf_digest != config_digest:
-        raise AirflowFailException(
-            "conf platform_config_digest does not match the controlled platform configuration identity"
-        )
-    identity = _submission_frame(context, purpose=purpose)[0]
-    paths = _work_paths(CONN_ID, run_id)
+    identity, _routing, _config = _submission_frame(
+        context, purpose=purpose, config_digest=config_digest
+    )
+    paths = _work_paths(CONN_ID, run_id, config_digest)
     evidence = freeze_request_evidence(
         paths.run_dir,
         purpose=purpose,
@@ -1072,6 +1157,7 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         "purpose": purpose,
         "request_id": child["request_id"],
         "request_evidence": str(evidence),
+        "platform_config_digest": config_digest,
         "identity": {**identity, "control_reference": resolved.handoff_sha256},
     }
 
@@ -1092,7 +1178,9 @@ def _store_failure_report(endpoint: WindowsEndpoint, request: dict, job: dict) -
         return
     run_id = request["run_id"]
     try:
-        run_dir = _work_paths(request["conn_id"], run_id).run_dir
+        run_dir = _work_paths(
+            request["conn_id"], run_id, request["platform_config_digest"]
+        ).run_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".failure-diagnostics-", dir=run_dir))
         try:
@@ -1187,7 +1275,9 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
 
     run_id = request["run_id"]
     snapshot = endpoint.definition_snapshot(run_id, upload_files=request["upload_files"])
-    work = _work_paths(request["conn_id"], run_id).run_dir / "definition"
+    work = _work_paths(
+        request["conn_id"], run_id, request["platform_config_digest"]
+    ).run_dir / "definition"
     bundle = work / "raw-record.zip"
     derived = work / "derived"
     capture_request = work / "capture-request.zip"
@@ -1292,7 +1382,7 @@ def _poke(request: dict, **context) -> bool:
     if request.get("linux_owned"):
         # A linked portable attempt has no Windows job to poll.
         return True
-    endpoint = _endpoint(request["conn_id"])
+    endpoint = _endpoint(request["conn_id"], request["platform_config_digest"])
     job = endpoint.get_job(request["run_id"])
     _same_request(job, request)
     if request.get("upload_files") and job.get("status") == "selecting":
@@ -1357,7 +1447,13 @@ def _poke(request: dict, **context) -> bool:
         failure = _boundary_failure(
             f"SolidWorks job {request['run_id']} failed: {job.get('error')}", job
         )
-        _converge_failed_stage(request["run_id"], _failed_native_stage(job), failure, products=True)
+        _converge_failed_stage(
+            request["run_id"],
+            _failed_native_stage(job),
+            failure,
+            products=True,
+            config_digest=request["platform_config_digest"],
+        )
         raise failure
     return job["status"] in {"passed", "native_complete"}
 
@@ -1382,11 +1478,11 @@ def _confirm_delivery(published: dict) -> dict:
     request = published["request"]
     run_id = request["run_id"]
     if not request.get("linux_owned"):
-        native = _endpoint(request["conn_id"]).get_job(run_id)
+        native = _endpoint(request["conn_id"], request["platform_config_digest"]).get_job(run_id)
         _same_request(native, request)
         if native["status"] == "failed":
             raise AirflowFailException(f"native job {run_id} failed: {native.get('error')}")
-    platform, _store_root = _platform_binding()
+    platform, _store_root = _platform_binding(request["platform_config_digest"])
     snapshot = flow.registered_delivery_snapshot(platform, run_id)
     if snapshot["status"] == "failed":
         raise AirflowFailException(
@@ -1536,8 +1632,11 @@ def solidworks_to_urdf():
     def freeze(**context) -> dict:
         run_id = _run_uuid(context)
         try:
-            _conf, _target, _summary, _principal, _config, routing = _submission_basics(context)
             linked = _linked_conf(context)
+            if linked is None:
+                _conf, _target, _summary, _principal, active_config, routing = _submission_basics(context)
+            else:
+                _conf = _target = _summary = _principal = active_config = routing = None
         except Exception as error:
             # An admitted request must converge even when freeze is refused before its first
             # driver action; the original exception is carried and re-raised (never masked).
@@ -1554,16 +1653,19 @@ def solidworks_to_urdf():
                     _converge_early_freeze_failure(run_id, error)
                     raise
                 _register_freeze_stage(
-                    _work_paths(request["conn_id"], run_id),
+                    _work_paths(request["conn_id"], run_id, request["platform_config_digest"]),
                     run_id,
+                    request_id=request["request_id"],
                     intake=Path(request["intake_dir"]),
                     upload_files=request["upload_files"],
+                    config_digest=request["platform_config_digest"],
                 )
                 return request
             if linked["from_stage"] in DELIVERY_STAGES:
                 # A portable-linked rerun resumes from the parent's Linux attempt and never
                 # contacts Windows: the parent's registered capture is the authority.
-                platform, store_root = _platform_binding()
+                parent_record, config_digest, parent_config = _linked_parent_binding(linked["parent_run"])
+                platform, store_root = _platform_binding(config_digest)
                 run_id = _run_uuid(context)
                 platform.start_run(run_id)  # the first driver action claims the admitted child
                 receipt = platform.confirmed_stage(linked["parent_run"], "capture")
@@ -1578,13 +1680,17 @@ def solidworks_to_urdf():
                     "conn_id": CONN_ID,
                     "resume": linked,
                     "linux_owned": True,
-                    "repository_slug": routing["repository_slug"],
-                    "repository_base": routing["base"],
                 }
-                parent_record, _ = read_request_evidence(
-                    _sealed_stage_tree(platform, linked["parent_run"], "freeze") / "input" / "request.json"
-                )
+                linked_target = str(parent_record.get("target_hardware") or "").strip()
+                routing = parent_config.targets.get(linked_target)
+                if routing is None:
+                    raise AirflowFailException(
+                        f"target_hardware {linked_target!r} is not configured in the linked parent's frozen snapshot"
+                    )
                 request["purpose"] = _linked_purpose(context, parent_record)
+                request["platform_config_digest"] = config_digest
+                request["repository_slug"] = routing["repository_slug"]
+                request["repository_base"] = routing["base"]
                 carried = carry_request_evidence(
                     _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
                     flow.RunPaths(store_root, request["run_id"]).run_dir,
@@ -1598,7 +1704,9 @@ def solidworks_to_urdf():
                 return request
             # The parent native job is the only authority for the retained source
             # selection; the rerun reuses its exact files, digest and main assembly.
-            parent = _endpoint(CONN_ID).get_job(linked["parent_run"])
+            parent_record, config_digest, _parent_config = _linked_parent_binding(linked["parent_run"])
+            platform, store_root = _platform_binding(config_digest)
+            parent = _endpoint(CONN_ID, config_digest).get_job(linked["parent_run"])
             retained = parent.get("request") if isinstance(parent.get("request"), dict) else {}
             upload_files, upload_sha256, main = _linked_source(retained, context["params"].get("main_assembly"))
             log.info(
@@ -1617,12 +1725,9 @@ def solidworks_to_urdf():
                 "main_assembly": main,
                 "resume": linked,
                 "conn_id": CONN_ID,
+                "platform_config_digest": config_digest,
             }
-            platform, store_root = _platform_binding()
             platform.start_run(request["run_id"])  # the first driver action claims the admitted child
-            parent_record, _ = read_request_evidence(
-                _sealed_stage_tree(platform, linked["parent_run"], "freeze") / "input" / "request.json"
-            )
             request["purpose"] = _linked_purpose(context, parent_record)
             carried = carry_request_evidence(
                 _sealed_stage_tree(platform, linked["parent_run"], "freeze"),
@@ -1637,11 +1742,15 @@ def solidworks_to_urdf():
                     raise AirflowFailException(
                         "A linked freeze or discover rerun needs handoff_path with the original sealed intake"
                     )
-                intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+                intake = _endpoint(CONN_ID, config_digest).authorized_intake_dir(handoff_path)
                 if validate_file_index(package_inventory(intake)) != upload_files:
                     raise AirflowFailException("The linked intake no longer matches the parent's retained selection")
                 request["intake_dir"] = str(intake)
-            identity, routing = _submission_frame(context, purpose=request["purpose"])
+            identity, routing, _config = _submission_frame(
+                context, purpose=request["purpose"], config_digest=config_digest
+            )
+            request["repository_slug"] = routing["repository_slug"]
+            request["repository_base"] = routing["base"]
             request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
             return request
         try:
@@ -1649,9 +1758,21 @@ def solidworks_to_urdf():
             if not handoff_path:
                 raise AirflowFailException("handoff_path is required")
             selection = _param_selection(context)
-            intake = _endpoint(CONN_ID).authorized_intake_dir(handoff_path)
+            config_digest = str(active_config.config_digest or "").strip()
+            if not config_digest:
+                raise AirflowFailException("The active platform configuration identity is unavailable")
+            intake = _endpoint(CONN_ID, config_digest).authorized_intake_dir(handoff_path)
             upload_files = validate_file_index(package_inventory(intake))
             main = _selection_main(upload_files, selection)
+            env_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
+            if not env_digest:
+                raise AirflowFailException(
+                    "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
+                )
+            if env_digest != config_digest:
+                raise AirflowFailException(
+                    "PLATFORM_CONFIG_DIGEST does not match the active connection snapshot"
+                )
             log.info(
                 "selection intake=%s files=%d upload_sha256=%s main_assembly=%s endpoint_conn=%s",
                 intake,
@@ -1667,6 +1788,7 @@ def solidworks_to_urdf():
                 "main_assembly": main,
                 "intake_dir": str(intake),
                 "conn_id": CONN_ID,
+                "platform_config_digest": config_digest,
             }
             conf = getattr(context["dag_run"], "conf", None)
             conf = conf if isinstance(conf, dict) else {}
@@ -1674,11 +1796,6 @@ def solidworks_to_urdf():
             if not request_id:
                 raise AirflowFailException(
                     "request_id is required: the run carries no authenticated request identity"
-                )
-            config_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
-            if not config_digest:
-                raise AirflowFailException(
-                    "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
                 )
             conf_digest = str(conf.get("platform_config_digest") or "").strip()
             if conf_digest and conf_digest != config_digest:
@@ -1690,9 +1807,11 @@ def solidworks_to_urdf():
                 raise AirflowFailException(
                     "purpose is required: the admitted request must declare engineering or inspection_preview"
                 )
-            identity, routing = _submission_frame(context, purpose=purpose)
+            identity, routing, _config = _submission_frame(
+                context, purpose=purpose, config_digest=config_digest
+            )
             request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
-            paths = _work_paths(CONN_ID, run_id)
+            paths = _work_paths(CONN_ID, run_id, config_digest)
             evidence = freeze_request_evidence(
                 paths.run_dir,
                 purpose=purpose,
@@ -1711,7 +1830,14 @@ def solidworks_to_urdf():
             # action; the original exception is carried and re-raised (never masked).
             _converge_early_freeze_failure(run_id, error)
             raise
-        _register_freeze_stage(paths, run_id, intake=intake, upload_files=upload_files)
+        _register_freeze_stage(
+            paths,
+            run_id,
+            request_id=request["request_id"],
+            intake=intake,
+            upload_files=upload_files,
+            config_digest=config_digest,
+        )
         return request
 
     @task.sensor(
@@ -1733,11 +1859,11 @@ def solidworks_to_urdf():
                 (request.get("resume") or {}).get("from_stage"),
             )
             return True
-        endpoint = _endpoint(request["conn_id"])
+        endpoint = _endpoint(request["conn_id"], request["platform_config_digest"])
         try:
             endpoint.get_job(request["run_id"])
         except EndpointNotFound:
-            platform, _store_root = _platform_binding()
+            platform, _store_root = _platform_binding(request["platform_config_digest"])
             _claim_operation_intent(
                 platform,
                 run_id=request["run_id"],
@@ -1774,7 +1900,7 @@ def solidworks_to_urdf():
         resume = request.get("resume") or {}
         if request.get("linux_owned"):
             parent_run = resume["parent_run"]
-            platform, store_root = _platform_binding()
+            platform, store_root = _platform_binding(request["platform_config_digest"])
             receipt = platform.confirmed_stage(parent_run, "capture")
             if receipt is None or not receipt.get("handoff_sha256"):
                 raise AirflowFailException(f"Linked parent {parent_run} has no admitted Linux capture to resume")
@@ -1800,14 +1926,14 @@ def solidworks_to_urdf():
             }
         else:
             try:
-                endpoint = _endpoint(request["conn_id"])
+                endpoint = _endpoint(request["conn_id"], request["platform_config_digest"])
                 job = endpoint.get_job(run_id)
                 _same_request(job, request)
                 if job.get("status") != "native_complete":
                     raise AirflowFailException(
                         f"native job {run_id} is {job.get('status')}, not native_complete"
                     )
-                platform, store_root = _platform_binding()
+                platform, store_root = _platform_binding(request["platform_config_digest"])
                 paths = flow.RunPaths(store_root, run_id)
                 binding = native_capture.import_native_capture(platform, paths, run_id, job, endpoint)
                 # The frozen request evidence rides the delivery from the capture tree
@@ -1833,7 +1959,13 @@ def solidworks_to_urdf():
                     upload_files=request["upload_files"],
                 )
             except Exception as error:
-                _converge_failed_stage(run_id, "capture", error, products=True)
+                _converge_failed_stage(
+                    run_id,
+                    "capture",
+                    error,
+                    products=True,
+                    config_digest=request["platform_config_digest"],
+                )
                 raise
         log.info(
             "linux capture ready run_id=%s source=%s state=%s",
@@ -1847,16 +1979,21 @@ def solidworks_to_urdf():
     def generate(binding: dict, **context) -> dict:
         if binding.get("from_stage") in {"verify", "publish"}:
             # The linked attempt resumes past generation: reuse the parent checkpoint.
-            platform, _root = _platform_binding()
+            platform, _root = _platform_binding(binding["request"]["platform_config_digest"])
             subject = _parent_subject(platform, binding["source_run_id"], "generate")
             return {**binding, "generate": {"state": "reused", "passed": True, "subject_sha256": subject}}
-        paths = _work_paths(binding["request"]["conn_id"], binding["run_id"])
+        paths = _work_paths(
+            binding["request"]["conn_id"],
+            binding["run_id"],
+            binding["request"]["platform_config_digest"],
+        )
         receipt = _portable_registered(
             binding["run_id"],
             "generate",
             tree=paths.stage_dir("generate"),
             context=context,
             source_run_id=binding.get("source_run_id"),
+            config_digest=binding["request"]["platform_config_digest"],
         )
         return {**binding, "generate": _portable_summary(receipt, stage="generate")}
 
@@ -1864,13 +2001,17 @@ def solidworks_to_urdf():
     def verify(generated: dict, **context) -> dict:
         if generated.get("from_stage") == "publish":
             # The linked attempt resumes past verification: reuse the parent checkpoint.
-            platform, _root = _platform_binding()
+            platform, _root = _platform_binding(generated["request"]["platform_config_digest"])
             subject = _parent_subject(platform, generated["source_run_id"], "verify")
             return {**generated, "verify": {"state": "reused", "passed": True, "subject_sha256": subject}}
         subject = (generated.get("generate") or {}).get("subject_sha256")
         if not subject:
             raise AirflowFailException("generate produced no subject to verify")
-        paths = _work_paths(generated["request"]["conn_id"], generated["run_id"])
+        paths = _work_paths(
+            generated["request"]["conn_id"],
+            generated["run_id"],
+            generated["request"]["platform_config_digest"],
+        )
         receipt = _portable_registered(
             generated["run_id"],
             "verify",
@@ -1878,6 +2019,7 @@ def solidworks_to_urdf():
             context=context,
             expected_subject=subject,
             source_run_id=generated.get("source_run_id"),
+            config_digest=generated["request"]["platform_config_digest"],
         )
         return {**generated, "verify": _portable_summary(receipt, stage="verify")}
 
@@ -1891,10 +2033,16 @@ def solidworks_to_urdf():
         if not subject:
             raise AirflowFailException("verify produced no subject to publish")
         slug, base = verified.get("repository_slug"), verified.get("repository_base")
-        repository = config_from_airflow_connection(CONN_ID).repositories.get(str(slug or ""))
+        repository = config_from_airflow_connection(
+            CONN_ID, config_digest=verified["request"]["platform_config_digest"]
+        ).repositories.get(str(slug or ""))
         if repository is None:
             raise AirflowFailException(f"no configured Linux checkout for model repository {slug!r}")
-        paths = _work_paths(verified["request"]["conn_id"], verified["run_id"])
+        paths = _work_paths(
+            verified["request"]["conn_id"],
+            verified["run_id"],
+            verified["request"]["platform_config_digest"],
+        )
         receipt = _portable_registered(
             verified["run_id"],
             "publish",
@@ -1904,6 +2052,7 @@ def solidworks_to_urdf():
             repository=repository,
             base=base,
             source_run_id=verified.get("source_run_id"),
+            config_digest=verified["request"]["platform_config_digest"],
         )
         published = {**verified, "publish": _portable_summary(receipt, stage="publish")}
         return _confirm_delivery(published)

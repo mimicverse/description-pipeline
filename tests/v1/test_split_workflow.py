@@ -144,6 +144,7 @@ class SplitWorkflowTests(unittest.TestCase):
             "upload_sha256": digest(upload),
             "main_assembly": "a.SLDASM",
             "conn_id": "test",
+            "platform_config_digest": "c" * 64,
         }
         job = {
             "request": {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")},
@@ -168,6 +169,7 @@ class SplitWorkflowTests(unittest.TestCase):
             "package": "control",
             "handoff_sha256": "b" * 64,
             "conn_id": "test",
+            "platform_config_digest": "c" * 64,
             "linux_owned": True,
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -297,7 +299,7 @@ class SplitWorkflowTests(unittest.TestCase):
         ti = _RecordingTaskInstance()
         generated = {
             "run_id": RUN_ID,
-            "request": {"run_id": RUN_ID, "conn_id": "test"},
+            "request": {"run_id": RUN_ID, "conn_id": "test", "platform_config_digest": "c" * 64},
             "generate": {"state": "generated", "subject_sha256": SUBJECT},
             "from_stage": None,
         }
@@ -331,6 +333,7 @@ class SplitWorkflowTests(unittest.TestCase):
                 "handoff_sha256": "b" * 64,
                 "conn_id": "test",
                 "linux_owned": True,
+                "platform_config_digest": "c" * 64,
             },
             "verify": {"state": "verified", "passed": True, "subject_sha256": SUBJECT},
             "repository_slug": "example/robot",
@@ -340,6 +343,7 @@ class SplitWorkflowTests(unittest.TestCase):
         config = SimpleNamespace(
             repositories={"example/robot": Path("/tmp/model-repository")},
             store_root=Path("/nonexistent-work"),
+            config_digest="c" * 64,
         )
         with tempfile.TemporaryDirectory() as tmp:
             platform = RegisteredPlatform(Path(tmp) / "platform")
@@ -377,6 +381,7 @@ class SplitWorkflowTests(unittest.TestCase):
                 "handoff_sha256": "b" * 64,
                 "conn_id": "test",
                 "linux_owned": True,
+                "platform_config_digest": "c" * 64,
             },
             "verify": {"state": "verified", "passed": True, "subject_sha256": SUBJECT},
             "repository_slug": "example/robot",
@@ -386,6 +391,7 @@ class SplitWorkflowTests(unittest.TestCase):
         config = SimpleNamespace(
             repositories={"example/robot": Path("/tmp/model-repository")},
             store_root=Path("/nonexistent-work"),
+            config_digest="c" * 64,
         )
         with tempfile.TemporaryDirectory() as tmp:
             platform = RegisteredPlatform(Path(tmp) / "platform")

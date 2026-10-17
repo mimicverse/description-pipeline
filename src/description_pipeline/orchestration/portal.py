@@ -302,6 +302,15 @@ class PortalError(RuntimeError):
         self.message = message
 
 
+def _admission_config_digest() -> str:
+    """The snapshot identity every newly admitted request records."""
+
+    value = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "平台配置身份不可用，本次提交未接纳")
+    return value
+
+
 class AirflowApiError(RuntimeError):
     """The Airflow API rejected a request or returned an unexpected shape."""
 
@@ -1487,6 +1496,7 @@ class PortalApp:
                     "files": receipt.files,
                     "bytes": receipt.bytes,
                     "folder": receipt.folder,
+                    "platform_config_digest": _admission_config_digest(),
                 },
                 dispatch={
                     "stage": "capture",
@@ -2469,6 +2479,7 @@ class PortalApp:
                         "files": resolved.files,
                         "bytes": resolved.bytes,
                         "folder": resolved.folder,
+                        "platform_config_digest": _admission_config_digest(),
                     }
                     if resolved.provenance is not None:
                         admit_baseline["provenance"] = resolved.provenance

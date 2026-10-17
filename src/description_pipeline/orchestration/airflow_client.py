@@ -29,6 +29,7 @@ import hashlib
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 import unicodedata
@@ -43,13 +44,18 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from ..delivery import PIPELINE_ID
-from ..io import PipelineError, artifact_path_parts, digest
+from ..io import PipelineError, artifact_path_parts, digest, parse_data
 from ..interface_records import (
     REQUEST_PURPOSES,
     cache_import_confirmation_digest,
+    check_config_identity_file,
+    require_active_config_identity,
+    validate_config_snapshot,
     validate_cache_release_request,
+    validate_connection_config_identity,
+    validate_install_record,
 )
-from ..schemas import CACHE_IMPORT_CONFIRMATION_SCHEMA
+from ..schemas import CACHE_IMPORT_CONFIRMATION_SCHEMA, CONFIG_SNAPSHOT_SCHEMA
 from ..sources.solidworks.selection import validate_file_index
 from ..stages import STAGE_IDS
 from .selection_client import prepare_staging_archive
@@ -476,6 +482,8 @@ class EndpointConfig:
     discovery: dict = dataclass_field(default_factory=dict)
     #: Configured publication targets: hardware identity to repository slug and base branch.
     targets: dict[str, dict] = dataclass_field(default_factory=dict)
+    #: Frozen IF-16 snapshot digest that produced this runtime configuration.
+    config_digest: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _validate_base_url(self.base_url))
@@ -488,6 +496,8 @@ class EndpointConfig:
         object.__setattr__(self, "store_root", _linux_store_root(self.store_root))
         object.__setattr__(self, "discovery", _linux_discovery(self.discovery))
         object.__setattr__(self, "targets", _linux_targets(self.targets))
+        if self.config_digest and _SHA256.fullmatch(self.config_digest) is None:
+            raise EndpointProtocolError("config_digest must be a lowercase sha256 hex value")
 
 
 def _handoff_roots(values) -> tuple[Path, ...]:
@@ -607,28 +617,178 @@ def _linux_discovery(values) -> dict:
     return settings
 
 
-def config_from_airflow_connection(conn_id: str, *, timeout: float = 30.0) -> EndpointConfig:
-    """Build the endpoint config from an Airflow connection (host/port/password/extra)."""
-    from airflow.hooks.base import BaseHook
+def _airflow_connection_document(connection) -> dict:
+    """The exact IF-11 document consumed from one Airflow connection row."""
 
-    connection = BaseHook.get_connection(conn_id)
-    host = (connection.host or "").strip()
-    if not host:
-        raise EndpointProtocolError(f"Airflow connection {conn_id!r} has no host")
-    if not host.startswith(("http://", "https://")):
-        port = f":{connection.port}" if connection.port else ""
-        host = f"http://{host}{port}"
-    extra = connection.extra_dejson or {}
+    return {
+        "host": connection.host or "",
+        "port": connection.port,
+        "password": connection.password or "",
+        "extra": dict(connection.extra_dejson or {}),
+    }
+
+
+def _require_private_text_file(path, *, label: str) -> str:
+    """Read one configured 0600 regular file without following a final symlink."""
+
+    candidate = Path(path)
+    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_file():
+        raise EndpointProtocolError(f"{label} must be an absolute regular non-link file")
+    if stat.S_IMODE(candidate.stat().st_mode) != 0o600:
+        raise EndpointProtocolError(f"{label} must have mode 0600")
+    try:
+        value = candidate.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise EndpointProtocolError(f"{label} is unreadable") from error
+    if not value:
+        raise EndpointProtocolError(f"{label} is empty")
+    return value
+
+
+def _runtime_state_root(state_root: Path | None) -> Path:
+    """Resolve the one permitted state root from controlled configuration only."""
+
+    if state_root is None:
+        configured = os.environ.get("OPERATOR_STATE", "").strip()
+        if not configured:
+            raise EndpointProtocolError("OPERATOR_STATE or an explicit state_root is required")
+        state_root = Path(configured)
+    root = Path(state_root)
+    if not root.is_absolute():
+        raise EndpointProtocolError("state_root must be an absolute path")
+    return root
+
+
+def _read_install_record(state_root: Path) -> dict:
+    path = state_root / "install-record.json"
+    if not path.is_file():
+        raise EndpointProtocolError(f"active install record is missing: {path}")
+    try:
+        return validate_install_record(parse_data(path.read_bytes(), path))
+    except (OSError, PipelineError, ValueError) as error:
+        raise EndpointProtocolError(f"active install record is invalid: {error}") from error
+
+
+def _frozen_snapshot_reference(state_root: Path, config_digest: str) -> dict:
+    """Resolve one already-admitted digest without consulting the current active pointer."""
+
+    if _SHA256.fullmatch(config_digest) is None:
+        raise EndpointProtocolError("frozen config digest must be a lowercase sha256 hex value")
+    snapshots = state_root / "snapshots"
+    matches = []
+    for candidate in sorted(snapshots.glob("*.json")):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        try:
+            actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        if actual == config_digest:
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise EndpointProtocolError(
+            f"frozen config digest {config_digest} does not identify exactly one snapshot"
+        )
+    return {
+        "schema_version": CONFIG_SNAPSHOT_SCHEMA,
+        "path": str(matches[0]),
+        "sha256": config_digest,
+    }
+
+
+def _endpoint_config_from_snapshot(snapshot: dict, *, config_digest: str, timeout: float) -> EndpointConfig:
+    """Map one immutable config snapshot to the runtime endpoint configuration."""
+
+    resolved = snapshot["resolved"]
+    token = _require_private_text_file(resolved["windows"]["token_file"], label="endpoint token file")
     return EndpointConfig(
-        base_url=host,
-        token=connection.password or "",
-        timeout=float(extra.get("timeout", timeout)),
-        handoff_roots=extra.get("handoff_roots") or (),
-        repositories=extra.get("repositories") or {},
-        store_root=extra.get("store_root"),
-        discovery=extra.get("discovery") or {},
-        targets=extra.get("targets") or {},
+        base_url=f"http://127.0.0.1:{resolved['windows']['tunnel_loopback_port']}",
+        token=token,
+        timeout=timeout,
+        handoff_roots=(resolved["storage"]["handoff_root"],),
+        repositories=resolved["derived"]["repositories"],
+        store_root=resolved["derived"]["store_root"],
+        discovery=resolved["derived"]["discovery"],
+        targets=resolved["targets"],
+        config_digest=config_digest,
     )
+
+
+def config_from_airflow_connection(
+    conn_id: str,
+    *,
+    timeout: float = 30.0,
+    config_digest: str | None = None,
+    state_root: Path | None = None,
+) -> EndpointConfig:
+    """Resolve the active or frozen immutable snapshot through the Airflow connection.
+
+    A fresh admission (no ``config_digest``) must reference the exact active install
+    snapshot. A frozen request supplies its recorded digest and continues to resolve
+    that snapshot even after the active pointer moves. The Airflow row carries only
+    the reference; endpoint, routing, token-file and target values come from the
+    validated snapshot.
+    """
+    root = _runtime_state_root(state_root)
+    if config_digest is None:
+        from airflow.models.connection import Connection
+        from airflow.settings import Session
+
+        with Session() as session:
+            connection = session.query(Connection).filter(Connection.conn_id == conn_id).one_or_none()
+        if connection is None:
+            raise EndpointProtocolError(f"Airflow connection {conn_id!r} is missing")
+        try:
+            reference = validate_connection_config_identity(_airflow_connection_document(connection))
+        except PipelineError as error:
+            raise EndpointProtocolError(f"Airflow connection config identity is invalid: {error}") from error
+        record = _read_install_record(root)
+        if record["paths"].get("state_root") != str(root):
+            raise EndpointProtocolError("active install record belongs to another state root")
+        if reference["path"] != record["snapshot"]["path"] or reference["sha256"] != record["snapshot"]["digest"]:
+            raise EndpointProtocolError("Airflow connection does not reference the active config snapshot")
+        try:
+            require_active_config_identity(reference, record)
+        except PipelineError as error:
+            raise EndpointProtocolError(f"Airflow connection is not admitted for new work: {error}") from error
+        selected = dict(reference)
+    else:
+        selected = _frozen_snapshot_reference(root, config_digest)
+    try:
+        payload = check_config_identity_file(selected, allowed_root=str(root))
+        if hashlib.sha256(payload).hexdigest() != selected["sha256"]:
+            raise EndpointProtocolError("config snapshot digest does not match its reference")
+        snapshot = parse_data(payload, Path(selected["path"]))
+        validate_config_snapshot(snapshot)
+    except PipelineError as error:
+        detail = getattr(error, "detail", None)
+        suffix = f" {detail}" if detail else ""
+        raise EndpointProtocolError(f"config snapshot is invalid: {error}{suffix}") from error
+    if snapshot["resolved"]["storage"]["state_root"] != str(root):
+        raise EndpointProtocolError("config snapshot belongs to another state root")
+    return _endpoint_config_from_snapshot(
+        snapshot,
+        config_digest=selected["sha256"],
+        timeout=float(timeout),
+    )
+
+
+def config_reference_cli(argv=None) -> int:
+    """Health/operator entry for the active configuration reference."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m description_pipeline.orchestration.airflow_client")
+    parser.add_argument("--conn-id", default="solidworks_windows")
+    parser.add_argument("--state-root", type=Path, required=True)
+    args = parser.parse_args(argv)
+    config = config_from_airflow_connection(args.conn_id, state_root=args.state_root)
+    print(f"config_digest={config.config_digest}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(config_reference_cli())
 
 
 @dataclass(frozen=True, slots=True)

@@ -447,8 +447,76 @@ def _config_snapshot_environment(
         raise RuntimeError("the snapshot digest owners disagree; refusing a second identity")
     fixture_root.mkdir(parents=True, exist_ok=True)
     (fixture_root / "platform.json").write_bytes(platform_json_bytes)
-    platform_config.atomic_write_once(fixture_root / "snapshots" / f"{install_id}.json", snapshot_bytes)
-    return {"PLATFORM_CONFIG_DIGEST": digest_value}, resolved
+    snapshot_path = platform_config.atomic_write_once(
+        Path(state_root) / "snapshots" / f"{install_id}.json", snapshot_bytes
+    )
+    return {"PLATFORM_CONFIG_DIGEST": digest_value, "OPERATOR_STATE": str(state_root)}, resolved, snapshot_path
+
+
+def _write_smoke_install_record(state_root: Path, snapshot_path: Path, resolved: dict) -> None:
+    """Create the active snapshot binding the real Airflow consumers resolve."""
+
+    from description_pipeline import interface_records  # noqa: PLC0415
+    from description_pipeline.stages import STAGE_IDS  # noqa: PLC0415
+
+    snapshot_digest = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    install_id = json.loads(snapshot_path.read_text(encoding="utf-8"))["install_id"]
+    version = "1.5.0-smoke"
+    source_commit = "0" * 40
+    source_sha256 = "0" * 64
+    release = {
+        "version": version,
+        "source_commit": source_commit,
+        "source_sha256": source_sha256,
+        "artifacts": [{"name": "scheduled-smoke", "sha256": "1" * 64}],
+    }
+    dag = Path(__file__).resolve().parents[1] / "dags" / "solidworks_to_urdf.py"
+    record = {
+        "schema_version": interface_records.INSTALL_RECORD_SCHEMA,
+        "install_id": install_id,
+        "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "snapshot": {"path": str(snapshot_path), "digest": snapshot_digest, "install_id": install_id},
+        "release": release,
+        "services": [
+            "description-postgres",
+            "description-airflow-dag-processor",
+            "description-airflow-scheduler",
+            "description-airflow-api-server",
+            "description-portal",
+            "description-operator-proxy",
+        ],
+        "paths": resolved["storage"],
+        "dag": {
+            "id": DAG_ID,
+            "path": str(dag),
+            "digest": hashlib.sha256(dag.read_bytes()).hexdigest(),
+            "tasks": len(STAGE_IDS),
+        },
+        "ends": {
+            "linux": {
+                "install_id": install_id,
+                "config_digest": snapshot_digest,
+                "release": {
+                    **{key: release[key] for key in ("version", "source_commit", "source_sha256")},
+                    "role": "portable",
+                },
+            },
+            "windows": {
+                "install_id": "win-scheduled-smoke",
+                "config_digest": "2" * 64,
+                "release": {
+                    **{key: release[key] for key in ("version", "source_commit", "source_sha256")},
+                    "role": "native",
+                },
+            },
+        },
+        "previous": None,
+        "journal": [],
+    }
+    interface_records.validate_install_record(record)
+    target = state_root / "install-record.json"
+    target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    target.chmod(0o600)
 
 
 def _plugin_preflight(venv: Path, env: dict[str, str], home: Path) -> str | None:
@@ -980,7 +1048,7 @@ def main() -> int:
         print(json.dumps({"ok": False, "stage": "control_fixture", "error": f"{type(error).__name__}: {error}"}))
         return 1
     # The control fixture's CAD carries its own hardware identity; the submission must name
-    # exactly that identity (and the connection must route it), or the derivation refuses the
+    # exactly that identity (and the snapshot must route it), or the derivation refuses the
     # run as an identity conflict.
     target = str(fixture["hardware_id"])
 
@@ -1010,7 +1078,7 @@ def main() -> int:
     # snapshot governs the deployed fixture instead of declaring a parallel one, and
     # the runtime freeze still refuses a missing or mismatched digest.
     try:
-        snapshot_env, resolved = _config_snapshot_environment(
+        snapshot_env, resolved, snapshot_path = _config_snapshot_environment(
             args,
             target=target,
             state_root=args.airflow_home / "smoke-state",
@@ -1026,7 +1094,7 @@ def main() -> int:
         return 1
     os.environ.update(snapshot_env)
     # The snapshot's secret references must be the real ones this run uses: the endpoint
-    # token file is materialized (0600) and read back for the connection, and the platform
+    # token file is materialized (0600), and the platform
     # database reference is the actual PLATFORM_SERVICE_DSN this smoke was given -
     # materialized as the referenced file and re-published from it.  Nothing secret is
     # printed or copied into evidence.
@@ -1036,7 +1104,6 @@ def main() -> int:
     token_file = Path(resolved["windows"]["token_file"])
     token_file.write_text(TOKEN, encoding="utf-8")
     os.chmod(token_file, 0o600)
-    endpoint_token = token_file.read_text(encoding="utf-8")
     supplied_dsn = os.environ.get("PLATFORM_SERVICE_DSN", "")
     if not supplied_dsn:
         print(
@@ -1062,7 +1129,7 @@ def main() -> int:
     # here (the operator convention: a dedicated directory under the isolated home, mode
     # 0700) and published to every consumer of this smoke: the in-process admission and
     # the lazily bound portal read it from the environment, the scheduler reads the same
-    # path from the connection extra below, and the child processes inherit it through
+    # path from the snapshot reference below, and the child processes inherit it through
     # ``env``.  ``PlatformStore.from_environment`` keeps requiring it - there is no
     # implicit fallback and no second root.
     store_root = Path(resolved["derived"]["store_root"])
@@ -1075,19 +1142,23 @@ def main() -> int:
     store_root.mkdir(parents=True, exist_ok=True)
     store_root.chmod(0o700)
     os.environ["PIPELINE_STORE_ROOT"] = str(store_root)
+    _write_smoke_install_record(Path(resolved["storage"]["state_root"]), snapshot_path, resolved)
+    from description_pipeline import interface_records
+
+    reference = {
+        "schema_version": interface_records.CONFIG_SNAPSHOT_SCHEMA,
+        "path": str(snapshot_path),
+        "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+    }
     connection = json.dumps(
         {
             "conn_type": "http",
-            "host": "127.0.0.1",
-            "port": port,
-            "password": endpoint_token,
-            "extra": {
-                "store_root": str(store_root),
-                "repositories": {REPOSITORY_SLUG: str(repository_path)},
-                "targets": resolved["targets"],
-                "handoff_roots": [resolved["storage"]["handoff_root"]],
-                "discovery": {"record_roots": list(resolved["specifications"]["record_roots"])},
-            },
+            "host": "",
+            "port": None,
+            "login": None,
+            "password": "",
+            "schema": None,
+            "extra": {"config_identity": reference},
         }
     )
     env = dict(
@@ -1095,6 +1166,7 @@ def main() -> int:
         AIRFLOW_HOME=str(args.airflow_home),
         PYTHONPATH=os.pathsep.join(filter(None, [str(args.root / "src"), os.environ.get("PYTHONPATH")])),
         AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
+        OPERATOR_STATE=resolved["storage"]["state_root"],
         PIPELINE_STORE_ROOT=str(store_root),
         AIRFLOW__CORE__AUTH_MANAGER="description_pipeline.orchestration.feishu_auth.FeishuAuthManager",
         AIRFLOW__CORE__LOAD_EXAMPLES="false",

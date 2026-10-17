@@ -84,6 +84,7 @@ class DagTests(unittest.TestCase):
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            config_digest="c" * 64,
         )
 
         def context(conf):
@@ -105,10 +106,10 @@ class DagTests(unittest.TestCase):
             ):
                 with self.subTest(conf=str(conf)), self.assertRaises(module.AirflowFailException):
                     module._submission_frame(context(conf))
-            identity, routing = module._submission_frame(
+            identity, routing, _config = module._submission_frame(
                 context({"target_hardware": "m3.0", "change_summary": "rebind", "purpose": "engineering"})
             )
-            multiline, _routing = module._submission_frame(
+            multiline, _routing, _config = module._submission_frame(
                 context(
                     {"target_hardware": "m3.0", "change_summary": "第一行\r\n第二行\r第三行", "purpose": "engineering"}
                 )
@@ -129,6 +130,7 @@ class DagTests(unittest.TestCase):
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            config_digest="c" * 64,
         )
         forged = {
             "target_hardware": "m3.0",
@@ -142,7 +144,7 @@ class DagTests(unittest.TestCase):
             return {"dag_run": SimpleNamespace(conf=forged, triggering_user_name=actor), "params": {}}
 
         with patch.object(module, "config_from_airflow_connection", return_value=config):
-            identity, _routing = module._submission_frame(
+            identity, _routing, _config = module._submission_frame(
                 context(build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"))
             )
             self.assertEqual(identity["owner"], "cli_smoke:smoke-tenant:ou_smoke")
@@ -172,6 +174,7 @@ class DagTests(unittest.TestCase):
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            config_digest="c" * 64,
         )
 
         def context(conf):
@@ -202,6 +205,7 @@ class DagTests(unittest.TestCase):
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            config_digest="c" * 64,
         )
 
         class Stub:
@@ -306,6 +310,7 @@ class DagTests(unittest.TestCase):
             "upload_sha256": digest(upload),
             "main_assembly": "a.SLDASM",
             "conn_id": "test",
+            "platform_config_digest": "c" * 64,
         }
         job = {
             "request": {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")},
@@ -352,6 +357,7 @@ class DagTests(unittest.TestCase):
             "upload_sha256": digest(upload),
             "main_assembly": "a.SLDASM",
             "conn_id": "test",
+            "platform_config_digest": "c" * 64,
         }
         job = {
             "request": {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")},
@@ -388,11 +394,18 @@ class DagTests(unittest.TestCase):
                 "upload_sha256": digest(upload),
                 "main_assembly": "assembly.SLDASM",
                 "conn_id": "solidworks_windows",
+                "platform_config_digest": "c" * 64,
             }
             operations = _OperationRecorder()
+            config = EndpointConfig(
+                f"http://127.0.0.1:{server.server.server_address[1]}",
+                "test-token",
+                config_digest="c" * 64,
+            )
             with (
                 patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
                 patch.object(module, "_platform_binding", return_value=(operations, None)),
+                patch.object(module, "config_from_airflow_connection", return_value=config),
             ):
                 started = dag.task_dict["discover"].python_callable(
                     request,
@@ -460,6 +473,7 @@ class DagTests(unittest.TestCase):
             "upload_sha256": "a" * 64,
             "main_assembly": "assembly.SLDASM",
             "conn_id": "solidworks_windows",
+            "platform_config_digest": "c" * 64,
         }
 
         class UnknownEndpoint:
@@ -555,11 +569,18 @@ class DagTests(unittest.TestCase):
                 "upload_sha256": digest(upload),
                 "main_assembly": "3.0 总装1008.SLDASM",
                 "conn_id": "solidworks_windows",
+                "platform_config_digest": "c" * 64,
             }
             operations = _OperationRecorder()
+            config = EndpointConfig(
+                f"http://127.0.0.1:{server.server.server_address[1]}",
+                "test-token",
+                config_digest="c" * 64,
+            )
             with (
                 patch.dict(os.environ, {"AIRFLOW_CONN_SOLIDWORKS_WINDOWS": connection}),
                 patch.object(module, "_platform_binding", return_value=(operations, None)),
+                patch.object(module, "config_from_airflow_connection", return_value=config),
             ):
                 started = dag.task_dict["discover"].python_callable(
                     request,
@@ -680,11 +701,17 @@ class DagTests(unittest.TestCase):
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
             store_root=store_root,
+            config_digest="c" * 64,
         )
         with (
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os.environ,
+                {"OPERATOR_STATE": str(store_root.parent), "PIPELINE_STORE_ROOT": str(store_root)},
+            ),
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
             self.assertEqual(request["upload_files"], upload)
@@ -733,6 +760,12 @@ class DagTests(unittest.TestCase):
         with (
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os.environ,
+                {"OPERATOR_STATE": str(store_root.parent), "PIPELINE_STORE_ROOT": str(store_root)},
+            ),
             self.assertRaises(AirflowFailException),
         ):
             dag.task_dict["freeze"].python_callable(
@@ -746,6 +779,12 @@ class DagTests(unittest.TestCase):
         with (
             patch.object(module, "_endpoint", return_value=LegacyStub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
+            patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os.environ,
+                {"OPERATOR_STATE": str(store_root.parent), "PIPELINE_STORE_ROOT": str(store_root)},
+            ),
             self.assertRaises(AirflowFailException),
         ):
             dag.task_dict["freeze"].python_callable(**context)
@@ -759,6 +798,7 @@ class DagTests(unittest.TestCase):
         from airflow.sdk.exceptions import AirflowFailException
         from description_pipeline.io import digest, read_data
         from description_pipeline.orchestration.airflow_client import EndpointConfig, native_run_id
+        from description_pipeline.request_evidence import freeze_request_evidence
         from description_pipeline.sources.solidworks.revision import package_inventory
         from description_pipeline.sources.solidworks.selection import validate_file_index
 
@@ -781,13 +821,25 @@ class DagTests(unittest.TestCase):
             "files": len(upload_files),
             "bytes": sum(entry.stat().st_size for entry in intake.rglob("*") if entry.is_file()),
             "folder": "M3.0.3",
+            "platform_config_digest": "c" * 64,
         }
+        freeze_request_evidence(
+            store_root / "sealed" / parent_run_id / "freeze",
+            purpose="engineering",
+            request_id=f"portal-{parent_dag_run_id}",
+            target_hardware="m3.0",
+            change_summary="freeze retry",
+            main_assembly="3.0 总装.SLDASM",
+            handoff_digest=upload_sha,
+            platform_config_digest="c" * 64,
+        )
         confirmed: list[dict] = []
         config = EndpointConfig(
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
             store_root=store_root,
+            config_digest="c" * 64,
         )
         runs = {
             child_run_id: {
@@ -880,7 +932,15 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_endpoint", return_value=stub),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
-            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os_module.environ,
+                {
+                    "PLATFORM_CONFIG_DIGEST": "c" * 64,
+                    "OPERATOR_STATE": str(store_root.parent),
+                    "PIPELINE_STORE_ROOT": str(store_root),
+                },
+            ),
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
         self.assertEqual(stub.seen, str(intake))
@@ -911,7 +971,15 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
-            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os_module.environ,
+                {
+                    "PLATFORM_CONFIG_DIGEST": "c" * 64,
+                    "OPERATOR_STATE": str(store_root.parent),
+                    "PIPELINE_STORE_ROOT": str(store_root),
+                },
+            ),
             self.assertRaises(AirflowFailException),
         ):
             dag.task_dict["freeze"].python_callable(**forged)
@@ -922,13 +990,21 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
-            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os_module.environ,
+                {
+                    "PLATFORM_CONFIG_DIGEST": "c" * 64,
+                    "OPERATOR_STATE": str(store_root.parent),
+                    "PIPELINE_STORE_ROOT": str(store_root),
+                },
+            ),
             self.assertRaises(AirflowFailException),
         ):
             dag.task_dict["freeze"].python_callable(**context)
         self.assertTrue(any(row["state"] == "failed" for row in confirmed))
 
-    def test_linked_freeze_retry_old_shape_reseals_from_the_bound_evidence(self) -> None:
+    def test_linked_freeze_retry_without_parent_freeze_seal_uses_child_admission(self) -> None:
         import hashlib
         import json as json_module
         import os as os_module
@@ -990,6 +1066,7 @@ class DagTests(unittest.TestCase):
             "bytes": sum(entry.stat().st_size for entry in intake.rglob("*") if entry.is_file()),
             "folder": intake.name,
             "provenance": provenance,
+            "platform_config_digest": "c" * 64,
         }
         confirmed: list[dict] = []
         config = EndpointConfig(
@@ -997,6 +1074,7 @@ class DagTests(unittest.TestCase):
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
             store_root=store_root,
+            config_digest="c" * 64,
         )
         runs = {
             child_run_id: {
@@ -1086,11 +1164,20 @@ class DagTests(unittest.TestCase):
             ),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
+        self.assertFalse((store_root / "sealed" / parent_run_id / "freeze" / "input" / "request.json").exists())
         with (
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
-            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os_module.environ,
+                {
+                    "PLATFORM_CONFIG_DIGEST": "c" * 64,
+                    "OPERATOR_STATE": str(store_root.parent),
+                    "PIPELINE_STORE_ROOT": str(store_root),
+                },
+            ),
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
         self.assertEqual(request["upload_sha256"], upload_sha)
@@ -1109,7 +1196,15 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
-            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os_module.environ,
+                {
+                    "PLATFORM_CONFIG_DIGEST": "c" * 64,
+                    "OPERATOR_STATE": str(store_root.parent),
+                    "PIPELINE_STORE_ROOT": str(store_root),
+                },
+            ),
             self.assertRaises(AirflowFailException),
         ):
             dag.task_dict["freeze"].python_callable(**context)
@@ -1125,6 +1220,7 @@ class DagTests(unittest.TestCase):
         from airflow.sdk.exceptions import AirflowFailException
         from description_pipeline.io import digest, read_data
         from description_pipeline.orchestration.airflow_client import EndpointConfig, native_run_id
+        from description_pipeline.request_evidence import freeze_request_evidence
         from description_pipeline.sources.solidworks.revision import package_inventory
         from description_pipeline.sources.solidworks.selection import validate_file_index
 
@@ -1157,13 +1253,25 @@ class DagTests(unittest.TestCase):
             "bytes": sum(entry.stat().st_size for entry in intake.rglob("*") if entry.is_file()),
             "folder": intake.name,
             "provenance": provenance,
+            "platform_config_digest": "c" * 64,
         }
+        freeze_request_evidence(
+            store_root / "sealed" / parent_run_id / "freeze",
+            purpose="engineering",
+            request_id=f"portal-{parent_dag_run_id}",
+            target_hardware="m3.0",
+            change_summary="freeze retry",
+            main_assembly="3.0 总装.SLDASM",
+            handoff_digest=upload_sha,
+            platform_config_digest="c" * 64,
+        )
         confirmed: list[dict] = []
         config = EndpointConfig(
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
             store_root=store_root,
+            config_digest="c" * 64,
         )
         runs = {
             child_run_id: {
@@ -1254,7 +1362,15 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
-            patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os_module.environ,
+                {
+                    "PLATFORM_CONFIG_DIGEST": "c" * 64,
+                    "OPERATOR_STATE": str(store_root.parent),
+                    "PIPELINE_STORE_ROOT": str(store_root),
+                },
+            ),
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
         self.assertEqual(request["upload_sha256"], upload_sha)
@@ -1268,6 +1384,7 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
             patch.dict(os_module.environ, {"PLATFORM_CONFIG_DIGEST": "c" * 64}),
             self.assertRaises(AirflowFailException),
         ):
@@ -1279,11 +1396,6 @@ class DagTests(unittest.TestCase):
 
         module = self._module()
         dag = module.dag
-        config = EndpointConfig(
-            "http://127.0.0.1:1",
-            "t" * 32,
-            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
-        )
         import shutil
         import tempfile
 
@@ -1292,6 +1404,13 @@ class DagTests(unittest.TestCase):
 
         store_root = Path(tempfile.mkdtemp(prefix="dag-linked-"))
         self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            store_root=store_root,
+            config_digest="e" * 64,
+        )
         parent_run_id = native_run_id("portal-parent-2")
         freeze_request_evidence(
             store_root / "sealed" / parent_run_id / "freeze",
@@ -1345,6 +1464,10 @@ class DagTests(unittest.TestCase):
         with (
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.dict(
+                os.environ,
+                {"OPERATOR_STATE": str(store_root.parent), "PIPELINE_STORE_ROOT": str(store_root)},
+            ),
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
             self.assertTrue(request["linux_owned"])
@@ -1404,6 +1527,9 @@ class PlatformRegistrationTests(unittest.TestCase):
         platform = SimpleNamespace(
             confirm_stage=lambda **payload: self.calls.append(payload),
             confirmed_stage=lambda *args, **kwargs: None,
+            request_record=lambda request_id: {
+                "baseline": {"platform_config_digest": "c" * 64},
+            },
             start_run=lambda run_id: self.started.append(run_id),
             append_event=lambda run_id, *, stage, kind, payload=None: self.live_events.append(
                 {"run_id": run_id, "stage": stage, "kind": kind, "payload": payload}
@@ -1536,7 +1662,12 @@ class PlatformRegistrationTests(unittest.TestCase):
         paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
         stages = run_dir / "stages"
         self.module._register_freeze_stage(
-            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files
+            paths,
+            "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d",
+            request_id="portal-freeze",
+            intake=intake,
+            upload_files=upload_files,
+            config_digest="c" * 64,
         )
         call = self.calls[0]
         self.assertEqual(call["stage"], "freeze")
@@ -1561,7 +1692,12 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
         self.module._register_freeze_stage(
-            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files={"assembly.sldasm": "a" * 64}
+            paths,
+            "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d",
+            request_id="portal-freeze",
+            intake=intake,
+            upload_files={"assembly.sldasm": "a" * 64},
+            config_digest="c" * 64,
         )
         self.assertEqual(self.started, ["0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"])
 
@@ -1595,6 +1731,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            config_digest="c" * 64,
         )
         dag = self.module.dag
 
@@ -1897,14 +2034,27 @@ class PlatformRegistrationTests(unittest.TestCase):
             def confirmed_stage(self, run_id, stage):
                 return records.get((run_id, stage))
 
+            def request_record(self, request_id):
+                return {"baseline": {"platform_config_digest": "c" * 64}}
+
         platform = _RetainingPlatform()
         with patch.object(self.module, "_platform_binding", return_value=(platform, self.root)):
             self.module._register_freeze_stage(
-            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files
-        )
+                paths,
+                "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d",
+                request_id="portal-freeze",
+                intake=intake,
+                upload_files=upload_files,
+                config_digest="c" * 64,
+            )
             self.module._register_freeze_stage(
-            paths, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", intake=intake, upload_files=upload_files
-        )
+                paths,
+                "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d",
+                request_id="portal-freeze",
+                intake=intake,
+                upload_files=upload_files,
+                config_digest="c" * 64,
+            )
         self.assertEqual(confirmations, ["freeze"])
 
     def test_a_failed_registration_tolerates_a_malformed_handoff(self) -> None:

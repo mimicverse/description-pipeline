@@ -1431,17 +1431,15 @@ class LifecycleTests(unittest.TestCase):
         # IF-11 for the installed connection; no targets/repositories lexemes remain.
         self.assertIn("interface_records.validate_health", health)
         self.assertIn("require_endpoint_matches_install_record", health)
-        self.assertIn("validate_connection_config_identity", health)
-        self.assertIn("check_config_identity_file", health)
-        self.assertIn("verify_config_identity_digest", health)
-        self.assertIn("require_active_config_identity", health)
+        self.assertIn("-m description_pipeline.orchestration.airflow_client", health)
+        self.assertIn('--state-root "$OPERATOR_STATE"', health)
         self.assertNotIn("targets", health)
         self.assertNotIn("repositories", health)
         self.assertIn("/auth/feishu/health", health)
         self.assertIn("FEISHU_ENV_FILE", health)
         self.assertIn("FEISHU_APP_SECRET_FILE", health)
         self.assertIn('if status == 200 and body.get("configured") is True', health)
-        self.assertIn("connection.extra_dejson", health)
+        self.assertNotIn("extra_dejson", health)
         self.assertIn("2??|3??", health)
         self.assertIn("Airflow api-server serves its login entry", health)
         self.assertIn("non-JSON response", health)
@@ -2614,7 +2612,7 @@ class InstallOrderingTests(unittest.TestCase):
                     "linux-generation", "windows-generation",
                     "close-admission", "drain", "backup",
                     "stop-services", "schema-migration", "windows-switch", "endpoint-identity",
-                    "switch-pointer", "start-services", "verify", "open-admission",
+                    "switch-pointer", "config-reference", "start-services", "verify", "open-admission",
                 ],
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
@@ -2643,7 +2641,7 @@ class InstallOrderingTests(unittest.TestCase):
                 [row["step"] for row in final_receipt["steps"] if row["verb"] == "rollback"],
                 [
                     "rollback-close", "rollback-drain", "rollback-stop", "rollback-windows",
-                    "rollback-linux", "rollback-verify",
+                    "rollback-linux", "rollback-config-reference", "rollback-verify",
                 ],
             )
             # Real restore drill on the sealed archive: open it, then rebuild a broken record

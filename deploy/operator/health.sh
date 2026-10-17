@@ -103,39 +103,17 @@ else
   report FAIL "endpoint identity check cannot run: the deployment interpreter or token file is missing"
 fi
 
-# The installed connection is consumed through the IF-11 config-identity owner: it is a
-# reference to the active config snapshot, checked on the consuming host with the canonical
-# file/digest/admission rules.  A surviving route copy is refused by the same owner.
+# The installed connection is consumed through the same canonical resolver as the DAG:
+# exactly one IF-11 reference, resolved to the active immutable snapshot and fully checked
+# on this host. A surviving route copy is refused before any dependent service is trusted.
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
-  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - \
-      "$OPERATOR_STATE" "$OPERATOR_STATE/install-record.json" <<'PY'
-import json
-import sys
-
-from airflow.models.connection import Connection
-from airflow.settings import Session
-
-from description_pipeline import interface_records
-
-allowed_root, record_path = sys.argv[1], sys.argv[2]
-with Session() as session:
-    connection = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one_or_none()
-document = {
-    "host": (connection.host or "") if connection else "",
-    "port": connection.port if connection else None,
-    "password": (connection.password or "") if connection else "",
-    "extra": dict(connection.extra_dejson or {}) if connection else {},
-}
-identity = interface_records.validate_connection_config_identity(document)
-payload = interface_records.check_config_identity_file(identity, allowed_root=allowed_root)
-interface_records.verify_config_identity_digest(payload, identity)
-record = json.load(open(record_path, encoding="utf-8"))
-interface_records.require_active_config_identity(identity, record)
-PY
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" \
+      -m description_pipeline.orchestration.airflow_client \
+      --conn-id solidworks_windows --state-root "$OPERATOR_STATE"
   then
-    report PASS "connection solidworks_windows is an active IF-11 config-identity reference"
+    report PASS "connection solidworks_windows resolves to the active IF-11 config snapshot"
   else
-    report FAIL "connection solidworks_windows is missing, route-copied, or not the active config identity"
+    report FAIL "connection solidworks_windows is missing, malformed, route-copied, or not the active config identity"
   fi
 else
   report FAIL "connection config identity cannot be verified: AIRFLOW_VENV is not executable"

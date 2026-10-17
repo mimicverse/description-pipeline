@@ -44,6 +44,8 @@ from description_pipeline.orchestration.portal import (
     PortalConfig,
     load_portal_config,
 )
+
+os.environ.setdefault("PLATFORM_CONFIG_DIGEST", "c" * 64)
 from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
 from description_pipeline.io import PipelineError
 from description_pipeline.platform.store import (
