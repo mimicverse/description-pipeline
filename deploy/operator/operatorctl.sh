@@ -165,6 +165,18 @@ load_running_env() {
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
 }
 
+# A lifecycle transition must execute the environment of the generation named by its verified
+# record, not values inherited from the caller's previous generation. The derived file is the
+# generation-scoped authority and every key it defines replaces the ambient shell value.
+load_generation_env() {
+  [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] \
+    || die "generation environment is missing or a link: $ENV_FILE"
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+}
+
 # One env contract: platform_env and render_operator write every derived value through the
 # canonical encoding (bare when shell-safe, single-quoted otherwise - the libpq DSNs' "&"
 # above all), so any consumer can simply `source` the file.  This helper reads one generation
@@ -283,6 +295,23 @@ airflow_render() {
     bash "$AIRFLOW_HERE/services.sh" render
 }
 
+airflow_units_match_generation() {
+  local unit unit_file
+  for unit in description-airflow-dag-processor.service \
+      description-airflow-scheduler.service description-airflow-api-server.service; do
+    unit_file="$TARGET/$unit"
+    [ -f "$unit_file" ] && [ ! -L "$unit_file" ] \
+      || die "the restored unit is missing or a link: $unit_file"
+    grep -Fq "ExecStart=$AIRFLOW_VENV/" "$unit_file" \
+      || die "the restored unit does not execute the active generation runtime: $unit_file"
+    grep -Fqx "EnvironmentFile=$ENV_FILE" "$unit_file" \
+      || die "the restored unit does not load the active generation environment: $unit_file"
+    printf '%s sha256=%s ExecStart=%s\n' "$unit" \
+      "$(sha256sum "$unit_file" | awk '{print $1}')" \
+      "$(sed -n 's/^ExecStart=//p' "$unit_file" | head -1)"
+  done
+}
+
 airflow_lifecycle() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
   POSTGRES_ROOT="${POSTGRES_ROOT:-}" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
@@ -293,27 +322,140 @@ airflow_lifecycle() {
     bash "$AIRFLOW_HERE/services.sh" "$1"
 }
 
+airflow_wait_dag_state() {
+  local desired="$1" verb attempt status
+  case "$desired" in
+    true) verb=pause ;;
+    false) verb=unpause ;;
+    *) die "DAG state must be true or false, got: $desired" ;;
+  esac
+  # Airflow can report success before the DAG is registered. Confirm the persisted
+  # state before changing ingress or declaring a rollback complete.
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    if AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags "$verb" solidworks_to_urdf >/dev/null; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
+    if AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" - "$desired" <<'PY'
+# airflow-dag-state-check
+import sys
+from airflow.models.dag import DagModel
+from airflow.utils.session import create_session
+
+expected = sys.argv[1] == "true"
+with create_session() as session:
+    dag = session.get(DagModel, "solidworks_to_urdf")
+    sys.exit(0 if dag is not None and dag.is_paused is expected else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 airflow_unpause_dag() {
-  local deadline=$((SECONDS + 60))
+  local status
   # Unpause alone silently succeeds before the DAG is registered. Confirm its
   # persisted state before exposing ingress, including on a fresh installation.
-  while ((SECONDS < deadline)); do
-    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags unpause solidworks_to_urdf >/dev/null
-    if AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" - <<'PY'
+  if airflow_wait_dag_state false; then
+    return 0
+  else
+    status=$?
+  fi
+  [ "$status" = "1" ] && die "DAG admission did not open; ingress was not started"
+  return "$status"
+}
+
+airflow_pause_dag() {
+  local status
+  if airflow_wait_dag_state true; then
+    return 0
+  else
+    status=$?
+  fi
+  [ "$status" = "1" ] && die "DAG scheduling did not pause; the rollback admission remains closed"
+  return "$status"
+}
+
+airflow_capture_dag_state() {
+  local out="$1"
+  AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" - "$out" <<'PY'
+# airflow-dag-capture
+import json
 import sys
+from pathlib import Path
 from airflow.models.dag import DagModel
 from airflow.utils.session import create_session
 
 with create_session() as session:
     dag = session.get(DagModel, "solidworks_to_urdf")
-    sys.exit(0 if dag is not None and dag.is_paused is False else 1)
+    if dag is None:
+        raise SystemExit("the maintenance DAG is not registered")
+    state = {"dag_id": "solidworks_to_urdf", "paused": dag.is_paused}
+Path(sys.argv[1]).write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+print(f"dag_paused_before={str(dag.is_paused).lower()}")
 PY
-    then
-      return
-    fi
-    sleep 2
+}
+
+airflow_restore_dag_state() {
+  local state_file="$1" paused
+  paused="$(python3 - "$state_file" <<'PY'
+import json
+import sys
+
+document = json.loads(open(sys.argv[1], encoding="utf-8").read())
+if document.get("dag_id") != "solidworks_to_urdf" or type(document.get("paused")) is not bool:
+    raise SystemExit("the captured DAG state is invalid")
+print("true" if document["paused"] else "false")
+PY
+)" || die "the captured DAG state is unreadable: $state_file"
+  if [ "$paused" = "true" ]; then
+    airflow_pause_dag
+    echo "dag_paused_restored=true"
+    return
+  fi
+  if airflow_wait_dag_state false; then
+    echo "dag_paused_restored=false"
+    return
+  fi
+  AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf \
+    >/dev/null 2>&1 || true
+  die "the pre-maintenance DAG state could not be restored; the DAG was left paused and the admission remains closed"
+}
+
+airflow_runtime_matches_generation() {
+  local candidate_venv="$1" attempt
+  local unit pid state restored_maps candidate_maps cmdline ready
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    ready=1
+    for unit in description-airflow-dag-processor.service \
+        description-airflow-scheduler.service description-airflow-api-server.service; do
+      state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+      pid="$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null || true)"
+      restored_maps=0
+      candidate_maps=0
+      cmdline=""
+      if [ "$state" = "active" ] && [ -n "$pid" ] && [ "$pid" != "0" ] \
+          && [ -r "/proc/$pid/maps" ] && [ -r "/proc/$pid/cmdline" ]; then
+        restored_maps="$(grep -Fc "$AIRFLOW_VENV" "/proc/$pid/maps" 2>/dev/null || true)"
+        candidate_maps="$(grep -Fc "$candidate_venv" "/proc/$pid/maps" 2>/dev/null || true)"
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+      fi
+      printf '%s state=%s mainpid=%s restored_maps=%s candidate_maps=%s cmdline=%s\n' \
+        "$unit" "$state" "$pid" "$restored_maps" "$candidate_maps" "$cmdline"
+      if [ "$state" != "active" ] || [ -z "$pid" ] || [ "$pid" = "0" ] \
+          || [ "$restored_maps" -lt 1 ] || [ "$candidate_maps" != "0" ]; then
+        ready=0
+      fi
+    done
+    [ "$ready" = "1" ] && return 0
+    sleep 1
   done
-  die "DAG admission did not open; ingress was not started"
+  return 1
 }
 
 # The platform admission is the authority for new work; the DAG unpause above and the pause in
@@ -1048,12 +1190,19 @@ PY
     fi
     mkdir -p "$EVIDENCE_DIR"
     ensure_postgres_ready
-    # 1. the admission closes through the controlled entry before anything switches
+    # 1. capture the scheduling state rollback must restore, then close the admission through
+    #    the controlled entry before anything switches
+    DAG_STATE_FILE="$EVIDENCE_DIR/dag-before-promotion.json"
+    if ! airflow_capture_dag_state "$DAG_STATE_FILE" > "$EVIDENCE_DIR/dag-before-promotion.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote close-admission failed "$EVIDENCE_DIR/dag-before-promotion.out"
+      die "the pre-maintenance DAG state could not be captured; nothing was switched"
+    fi
     if ! platform_close_admission "promote" "operatorctl promote" > "$EVIDENCE_DIR/close-admission.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote close-admission failed "$EVIDENCE_DIR/close-admission.out"
       die "could not close the admission; nothing was switched"
     fi
-    promotion_step "$CANDIDATE_ID" promote close-admission completed "$EVIDENCE_DIR/close-admission.out"
+    promotion_step "$CANDIDATE_ID" promote close-admission completed \
+      "$EVIDENCE_DIR/dag-before-promotion.out" "$DAG_STATE_FILE" "$EVIDENCE_DIR/close-admission.out"
     # 2. drain: active or unresolved work refuses the switch (the admission stays closed)
     if ! PLATFORM_OPERATOR_DSN="${PLATFORM_OPERATOR_DSN:-}" "$AIRFLOW_VENV/bin/python" \
         -m description_pipeline.orchestration.lifecycle_state report --require-settled \
@@ -1366,6 +1515,11 @@ PY
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no promotion receipt for maintenance $ROLLBACK_ID; nothing is guessed"
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
     mkdir -p "$EVIDENCE_DIR"
+    DAG_STATE_FILE="$EVIDENCE_DIR/dag-before-promotion.json"
+    [ -f "$DAG_STATE_FILE" ] || die "the pre-maintenance DAG state is missing; rollback refuses to guess"
+    CANDIDATE_ENV="$STATE_ROOT/derived/$ROLLBACK_ID/operator.env"
+    [ -f "$CANDIDATE_ENV" ] || die "the maintenance generation has no derived environment"
+    CANDIDATE_VENV="$(generation_env_value "$CANDIDATE_ENV" AIRFLOW_VENV)"
     LINUX_SWITCHED=1
     if [ "$ROLLBACK_ID" = "$ACTIVE_ID" ]; then
       PREVIOUS_RECORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["previous"]["record"])' "$STATE_ROOT/install-record.json")" \
@@ -1477,11 +1631,13 @@ PY
       die "could not close the admission; nothing was rolled back"
     fi
     promotion_step "$ROLLBACK_ID" rollback rollback-close completed "$EVIDENCE_DIR/rollback-close.out"
-    if ! PLATFORM_OPERATOR_DSN="${PLATFORM_OPERATOR_DSN:-}" "$AIRFLOW_VENV/bin/python" \
-        -m description_pipeline.orchestration.lifecycle_state report --require-settled \
-        > "$EVIDENCE_DIR/rollback-drain.out" 2>&1; then
+    if ! {
+      airflow_pause_dag
+      PLATFORM_OPERATOR_DSN="${PLATFORM_OPERATOR_DSN:-}" "$AIRFLOW_VENV/bin/python" \
+        -m description_pipeline.orchestration.lifecycle_state report --require-settled
+    } > "$EVIDENCE_DIR/rollback-drain.out" 2>&1; then
       promotion_step "$ROLLBACK_ID" rollback rollback-drain failed "$EVIDENCE_DIR/rollback-drain.out"
-      die "rollback refused: active or unresolved work remains (the admission stays closed)"
+      die "rollback could not pause scheduling or drain settled work (the admission stays closed)"
     fi
     promotion_step "$ROLLBACK_ID" rollback rollback-drain completed "$EVIDENCE_DIR/rollback-drain.out"
     if ! {
@@ -1571,15 +1727,19 @@ PY
     # platform.json may already describe a candidate).
     load_running_env
     load_installed
+    load_generation_env
     PROXY_BIN="$(ensure_proxy_binary)" \
       || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
       python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
         --units-dir "$TARGET" \
+      && source "$STATE_ROOT/resolved.env" \
+      && load_generation_env \
       && airflow_render \
+      && airflow_units_match_generation \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
-      && airflow_unpause_dag \
+      && airflow_runtime_matches_generation "$CANDIDATE_VENV" \
       && systemctl --user enable --now description-portal.service description-operator-proxy.service \
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-running \
@@ -1588,7 +1748,10 @@ PY
       && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/rollback-health.json" \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/rollback-health.json" --release-file "$RELEASE_FILE" \
-        --record "$STATE_ROOT/install-record.json" --out "$EVIDENCE_DIR/rollback-identity.json"
+        --record "$STATE_ROOT/install-record.json" --out "$EVIDENCE_DIR/rollback-identity.json" \
+      && bash "$HERE/health_gate.sh" \
+        "$OPERATOR_STATE/health-gate/rollback-$(date -u +%Y%m%dT%H%M%SZ)" \
+      && airflow_restore_dag_state "$DAG_STATE_FILE"
     } > "$EVIDENCE_DIR/rollback-verify.out" 2>&1; then
       promotion_step "$ROLLBACK_ID" rollback rollback-verify failed "$EVIDENCE_DIR/rollback-verify.out"
       die "the restored ends did not verify (the admission stays closed)"
