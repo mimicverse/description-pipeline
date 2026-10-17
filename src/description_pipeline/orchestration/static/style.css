@@ -391,7 +391,7 @@ details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   .viewer-footer { grid-template-columns: 1fr; }
 }
 
-/* 1.4.2 preview enhancement: default-expanded workspace with the five data panels. */
+/* Default-expanded preview workspace with the five data panels. */
 .viewer-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .viewer-title { font-weight: 600; }
 .preview-info { margin: 6px 0 4px; }

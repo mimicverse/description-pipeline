@@ -6,8 +6,8 @@
 # files; the candidate's own Invoke-Main, Start-OrRefuse, refusal interpreters, restore path and
 # health probe run for real (Wait-Settled runs real and fails fast on the stub task state).
 # Scenarios: unknown_owner | startable_second_refusal | startable_missing_receipt |
-# stage_unknown_key_refused | stage_duplicate_key_refused | promote_candidate_mismatch |
-# promote_source_mismatch.
+# stage_unknown_key_refused | stage_legacy_targets_refused | stage_duplicate_key_refused |
+# promote_candidate_mismatch | promote_source_mismatch.
 # Prints one JSON object (scenario, message, calls, sleeps, receipt) and exits 0.
 param(
   [Parameter(Mandatory=$true)][string]$ScriptPath,
@@ -27,9 +27,12 @@ $token = Join-Path $Root 'local-test-token'
 [System.IO.File]::WriteAllText($token, 'synthetic-offline-token')
 $configuration = @{state_root=$Root; port=8765; token_file=$token}
 if ($Scenario -eq 'stage_unknown_key_refused') {
-  # A8: the known removable key plus a key the 1.5.0 schema does not define.
-  $configuration['targets'] = @{nd_fixture = @{repository_slug = 'a/b'; base = 'feature/arm'}}
+  # A key the endpoint schema does not define stops the stage.
   $configuration['bogus_key'] = $true
+}
+if ($Scenario -eq 'stage_legacy_targets_refused') {
+  # A retired publication-routing key is no longer a supported configuration shape.
+  $configuration['targets'] = @{nd_fixture = @{repository_slug = 'a/b'; base = 'feature/arm'}}
 }
 if ($Scenario -eq 'stage_duplicate_key_refused') {
   $configurationText = '{"schema_version":"solidworks-to-urdf.endpoint/v1","port":8765,' +
@@ -60,7 +63,7 @@ if ($Scenario -notlike 'stage_*') {
   [System.IO.File]::WriteAllText(
     (Join-Path $newGeneration 'candidate-identity.json'),
     (@{expected=$true; config_digest='digest'; config_sha256=$candidateSha; source_config=$oldConfig;
-       source_config_sha256=$sourceSha; removed_keys=@(); version='1.5.0'; source_commit=('b' * 40);
+       source_config_sha256=$sourceSha; version='1.5.0'; source_commit=('b' * 40);
        source_sha256=('b' * 64)} | ConvertTo-Json -Compress))
 }
 

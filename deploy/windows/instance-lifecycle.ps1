@@ -324,9 +324,9 @@ function Get-EndpointConfigStrictPrelude {
   # The ONE strict JSON policy for endpoint configurations, shared by the early scan (bound
   # CPython, below) and the candidate generator (staged runtime, next): duplicate keys are
   # rejected through object_pairs_hook - never ConvertFrom-Json, which collapses them - and the
-  # allowed/removed key sets live here only.  The scan additionally mirrors the foundation
+  # allowed key set lives here only.  The scan additionally mirrors the foundation
   # reader's rejection of the non-finite constants; value checks stay with the single
-  # transform/read_config chain and are never duplicated here.
+  # candidate/read_config chain and are never duplicated here.
   return @'
 import json
 import sys
@@ -350,7 +350,6 @@ def strict_object(pairs, duplicates=None):
 
 
 ALLOWED_KEYS = ("schema_version", "package_root", "output_root", "state_root", "token_file", "host", "port")
-REMOVED_KEYS = ("targets",)
 
 '@
 }
@@ -398,17 +397,15 @@ except Exception as error:
     verdict["unreadable"] = str(error)
 else:
     verdict["duplicates"] = sorted(set(duplicates))
-    verdict["unknown"] = sorted(set(document) - set(ALLOWED_KEYS) - set(REMOVED_KEYS))
+    verdict["unknown"] = sorted(set(document) - set(ALLOWED_KEYS))
 print(json.dumps(verdict, sort_keys=True))
 '@
 }
 function Get-EndpointConfigEarlyProblems([string]$configPath) {
-  # Early fail-closed scan for the 1.5.0 upgrade path: the known removed key set (currently
-  # targets) is transformed away by the single candidate generation; any other top-level key -
-  # or a repeated key - stops the stage explicitly and is never silently dropped.  The running
-  # file itself is never modified.  Runs on the bound CPython 3.12 so the check works on
-  # PowerShell 5.1 Desktop; the previous implementation required a Core-only JSON API that
-  # Desktop PowerShell does not carry.
+  # Early fail-closed scan: every key the endpoint schema does not define - `targets` among
+  # them - or a repeated key stops the stage explicitly and is never silently dropped.  The
+  # running file itself is never modified.  Runs on the bound CPython 3.12, which keeps the
+  # scan identical on PowerShell 5.1 Desktop (no Core-only JSON API is required).
   if (-not (Test-Path -LiteralPath $configPath)) { return @{unreadable=''; duplicates=@(); unknown=@()} }
   $python = Get-EndpointConfigScanPython
   if (-not $python) {
@@ -444,11 +441,12 @@ function Write-PythonProgram([string]$name, [string]$program) {
   [System.IO.File]::WriteAllText($path, $program, (New-Object System.Text.UTF8Encoding($false)))
   return $path
 }
-function Get-EndpointConfigTransformProgram {
-  # The single generator of the 1.5.0 candidate configuration.  It runs with the staged runtime so
-  # the candidate is serialized and digested by the release's own canonical writer; the policy is
-  # deliberately minimal - drop the known removed keys, keep every other field's value, refuse
-  # anything else (unknown keys, duplicate keys, malformed values) instead of guessing.
+function Get-EndpointConfigCandidateProgram {
+  # The single generator of the candidate configuration.  It runs with the staged runtime so
+  # the candidate is serialized and digested by the release's own canonical writer; the policy
+  # is deliberately minimal - keep the schema's fields and values, refuse anything else
+  # (unknown keys - `targets` among them - duplicate keys, malformed values) instead of
+  # guessing or silently dropping.
   # Its strict-read policy is the shared prelude above (one copy with the early scan).
   return (Get-EndpointConfigStrictPrelude) + @'
 import hashlib
@@ -469,7 +467,7 @@ except Exception as error:
 if not isinstance(document, dict):
     fail("endpoint_config_invalid", "the endpoint configuration is not an object")
 
-unknown = sorted(set(document) - set(ALLOWED_KEYS) - set(REMOVED_KEYS))
+unknown = sorted(set(document) - set(ALLOWED_KEYS))
 if unknown:
     fail("endpoint_config_unknown_keys", ", ".join(unknown))
 if document.get("schema_version") != "solidworks-to-urdf.endpoint/v1":
@@ -501,7 +499,6 @@ result = {
     "candidate_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
     "canonical_digest": io.digest(candidate),
     "config_digest": loaded_digest,
-    "removed_keys": [key for key in REMOVED_KEYS if key in document],
     "read_config": "passed",
 }
 print(json.dumps(result, sort_keys=True))
@@ -685,10 +682,9 @@ if ($Verb -eq 'stage') {
   if (-not $StageDir) { Die 'stage_dir_required' 'stage needs -StageDir (the new generation directory)' }
   if (Test-Path -LiteralPath $StageDir) { Die 'stage_exists' "preserve the existing generation: $StageDir" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
-  # Early fail-closed scan (A8 upgrade path): the known removed key set (targets) is transformed
-  # away by the single candidate generation below, but anything the 1.5.0 schema does not define -
-  # including duplicate keys - stops the stage here, before any heavy work, and is never silently
-  # dropped.
+  # Early fail-closed scan: anything the endpoint schema does not define - `targets` among
+  # them - or a duplicate key stops the stage here, before any heavy work, and is never
+  # silently dropped.
   $runningConfig = Action-Config $task
   $early = Get-EndpointConfigEarlyProblems $runningConfig
   if ($early.unreadable) {
@@ -700,7 +696,7 @@ if ($Verb -eq 'stage') {
       ($early.duplicates -join ', ') + ' in ' + $runningConfig)
   }
   if (@($early.unknown).Count -gt 0) {
-    Die 'endpoint_config_unknown_keys' ('the running endpoint configuration carries keys the 1.5.0 ' +
+    Die 'endpoint_config_unknown_keys' ('the running endpoint configuration carries keys the current ' +
       'schema does not define: ' + ($early.unknown -join ', ') + ' in ' + $runningConfig +
       '; remove them under change control and re-run stage')
   }
@@ -726,25 +722,24 @@ if ($Verb -eq 'stage') {
   if ($identity.tool.version -ne $binding.version -or $identity.tool.source_sha256 -ne $binding.source_sha256 -or $identity.tool.release.source_commit -ne $binding.source_commit -or -not $identity.doctor.passed) {
     Die 'identity_mismatch' 'the staged runtime identity differs from the release manifest'
   }
-  # The generation consumes a generated 1.5.0 candidate configuration: the staged runtime's own
-  # canonical writer drops the known removed key set (targets), keeps every other field's value
-  # and meaning, and the release's own read_config test-loads the candidate before stage accepts
-  # it; the running file stays byte-sealed for controlled recovery.  (Necessity: the 1.5.0
-  # endpoint refuses the removed keys, so the former byte copy would ship a configuration the new
-  # validator rejects - one deterministic generation replaces it.)
-  $transformProgram = Get-EndpointConfigTransformProgram
-  $transformPath = Write-PythonProgram 'endpoint-transform' $transformProgram
-  $transformRc = 1
-  $transform = @()
+  # The generation consumes a generated candidate configuration: the staged runtime's own
+  # canonical writer keeps the schema's fields and values, refuses unknown or duplicate keys,
+  # and the release's own read_config test-loads the candidate before stage accepts it; the
+  # running file stays byte-sealed for controlled recovery.  A configuration carrying
+  # `targets` - or any key outside the strict schema - is refused at stage.
+  $candidateProgram = Get-EndpointConfigCandidateProgram
+  $candidatePath = Write-PythonProgram 'endpoint-candidate' $candidateProgram
+  $candidateRc = 1
+  $candidateOutput = @()
   try {
-    $transform = & $runtime -I $transformPath $runningConfig (Config-Path $StageDir)
-    $transformRc = $LASTEXITCODE
+    $candidateOutput = & $runtime -I $candidatePath $runningConfig (Config-Path $StageDir)
+    $candidateRc = $LASTEXITCODE
   } finally {
-    Remove-Item -LiteralPath $transformPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue
   }
-  if ($transformRc -ne 0) {
-    $problem = ($transform | Select-Object -Last 1)
-    $code = 'endpoint_config_transform_failed'
+  if ($candidateRc -ne 0) {
+    $problem = ($candidateOutput | Select-Object -Last 1)
+    $code = 'endpoint_config_candidate_failed'
     $detail = [string]$problem
     try {
       $parsed = $problem | ConvertFrom-Json
@@ -752,17 +747,14 @@ if ($Verb -eq 'stage') {
     } catch { }
     Die $code $detail
   }
-  $transformInfo = ($transform | Select-Object -Last 1) | ConvertFrom-Json
-  $expected = [string]$transformInfo.config_digest
-  Write-Receipt (Join-Path $StageDir 'config-transformation.json') @{
-    verb='stage-config-transform'; at=(Get-Date).ToUniversalTime().ToString('o'); source=$runningConfig;
-    source_sha256=[string]$transformInfo.source_sha256; candidate_sha256=[string]$transformInfo.candidate_sha256;
-    canonical_digest=[string]$transformInfo.canonical_digest; config_digest=$expected;
-    removed_keys=@($transformInfo.removed_keys); read_config=[string]$transformInfo.read_config}
+  $candidateInfo = ($candidateOutput | Select-Object -Last 1) | ConvertFrom-Json
+  $expected = [string]$candidateInfo.config_digest
   Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{
-    expected=$true; config_digest=$expected; config_sha256=[string]$transformInfo.candidate_sha256;
-    source_config=$runningConfig; source_config_sha256=[string]$transformInfo.source_sha256;
-    removed_keys=@($transformInfo.removed_keys); version=$binding.version;
+    expected=$true; at=(Get-Date).ToUniversalTime().ToString('o'); source_config=$runningConfig;
+    source_config_sha256=[string]$candidateInfo.source_sha256;
+    config_digest=$expected; config_sha256=[string]$candidateInfo.candidate_sha256;
+    canonical_digest=[string]$candidateInfo.canonical_digest;
+    read_config=[string]$candidateInfo.read_config; version=$binding.version;
     source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
   Write-Receipt (Join-Path $StageDir 'stage-receipt.json') @{
     passed=$true; verb='stage'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
@@ -784,14 +776,14 @@ if ($Verb -eq 'promote') {
   # running right now.
   $candidate = Read-Json (Join-Path $StageDir 'candidate-identity.json')
   if (-not $candidate.config_sha256) {
-    Die 'candidate_config_unrecorded' 'the staged generation records no candidate configuration digest; re-run stage with the 1.5.0 toolchain'
+    Die 'candidate_config_unrecorded' 'the staged generation records no candidate configuration digest; re-run stage with the release toolchain'
   }
   if ((Sha256 (Config-Path $StageDir)) -ne [string]$candidate.config_sha256) {
     Die 'candidate_config_mismatch' ('the staged candidate configuration differs from the staged digest: ' + (Config-Path $StageDir))
   }
   $previousConfig = Action-Config $task
   if (-not $candidate.source_config_sha256) {
-    Die 'candidate_source_unrecorded' 'the staged generation records no source configuration digest; re-run stage with the 1.5.0 toolchain'
+    Die 'candidate_source_unrecorded' 'the staged generation records no source configuration digest; re-run stage with the release toolchain'
   }
   if ((Sha256 $previousConfig) -ne [string]$candidate.source_config_sha256) {
     Die 'candidate_source_mismatch' ('the staged candidate belongs to another running configuration: ' + $previousConfig)

@@ -1,7 +1,7 @@
-// 1.4.2 preview battery (P1-P5): the neutral fixture expectations from
-// reviews/d-acceptance-20261014/preview142-fixtures are inlined here (values only, no repo
-// coupling) and drive the same pure helpers viewer.js/app.js consume.
-// Run with: node tests/js/preview142_battery_test.mjs
+// Preview battery (P1-P5): the neutral fixture expectations are inlined here
+// (values only, no repository coupling) and drive the same pure helpers
+// viewer.js/app.js consume.
+// Run with: node tests/js/preview_battery_test.mjs
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -176,4 +176,4 @@ const {
   assert.equal(frames[0].xyz[2], 0.1);
 }
 
-console.log("preview142 battery: P1-P5 OK");
+console.log("preview battery: P1-P5 OK");

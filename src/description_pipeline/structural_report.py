@@ -16,6 +16,7 @@ from .schemas import EFFECTIVE_INSTANCES_SCHEMA
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
 JSON_PATH = "reports/structural-team.json"
+MASS_CLOSURE_REPORT = "reports/mass-closure.json"
 
 #: Diagnostic-bundle schema the native worker seals and the Linux side renders from.
 DIAGNOSTIC_SCHEMA = "solidworks-to-urdf.failure-diagnostics/v1"
@@ -30,7 +31,7 @@ REPORT_EVIDENCE_FILES = (
     "evidence/raw/effective_instances.json",
     "evidence/raw/mass_closure.json",
     "evidence/raw/geometry.json",
-    "reports/mass-closure.json",
+    MASS_CLOSURE_REPORT,
 )
 
 #: Files sealed for one failed job: the projected evidence plus the snapshot
@@ -650,7 +651,7 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "evidence": row,
                     }
                 )
-    selection_source = "reports/mass-closure.json"
+    selection_source = MASS_CLOSURE_REPORT
     selection_report = sources.get(selection_source)
     selection = None
     if isinstance(selection_report, dict):

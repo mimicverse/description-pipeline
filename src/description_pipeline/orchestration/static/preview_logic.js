@@ -1,5 +1,5 @@
-// Pure helpers for the default-expanded URDF preview workspace (1.4.2).  No DOM and no
-// three.js: tests/js/preview142_battery_test.mjs drives them directly and viewer.js/app.js
+// Pure helpers for the default-expanded URDF preview workspace.  No DOM and no
+// three.js: tests/js/preview_battery_test.mjs drives them directly and viewer.js/app.js
 // consume the same functions, so the battery measures production behaviour.
 
 //: Machine keys the information panel must show verbatim (display names never substitute).
@@ -100,7 +100,7 @@ export function stageEntersPreview(stageId) {
   return stageId === PREVIEW_STAGE_ID;
 }
 
-// The 1.4.2 headline: with a verified delivery the preview starts expanded; a collapse
+// The headline behavior: with a verified delivery the preview starts expanded; a collapse
 // control can retreat from that default (never below it for stage entry).
 export function previewExpansion({ preview, collapsed }) {
   const available = Boolean(preview && typeof preview.subject_sha256 === "string" && preview.subject_sha256);
