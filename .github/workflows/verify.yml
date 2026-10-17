@@ -317,6 +317,14 @@ jobs:
           bash deploy/platform/apply.sh --psql psql --database postgres \
             --host 127.0.0.1 --port 5432 --user platform_migrate \
             --platform-schema "$PLATFORM_SCHEMA" --airflow-schema "$AIRFLOW_SCHEMA"
+      - name: The writer to health and DAG configuration identity (real Airflow/PostgreSQL)
+        env:
+          DESCRIPTION_CONFIG_IDENTITY_DSN: ${{ env.AIRFLOW_RUNTIME_DSN }}
+        run: |
+          set -o pipefail
+          "$AIRFLOW_VENV/bin/python" -B -m unittest tests.v1.test_config_identity_real_airflow -v \
+            2>&1 | tee "$RUNNER_TEMP/config-identity-real-airflow.log"
+          ! grep -q "skipped" "$RUNNER_TEMP/config-identity-real-airflow.log"
       - name: The real-chain smoke (portal admission, six tasks, SQL settlement assertions)
         run: |
           "$AIRFLOW_VENV/bin/python" deploy/airflow/scripts/scheduled_smoke.py \
@@ -350,6 +358,7 @@ jobs:
           name: real-chain-evidence
           path: |
             ${{ runner.temp }}/real-chain-report.json
+            ${{ runner.temp }}/config-identity-real-airflow.log
             ${{ runner.temp }}/settlement-fixtures.json
             ${{ runner.temp }}/airflow-home/logs/smoke/*.log
             ${{ runner.temp }}/airflow-home/logs/dag_id=*/*/*/*.log

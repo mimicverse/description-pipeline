@@ -58,6 +58,7 @@ class FailureBoundaryFieldTests(unittest.TestCase):
                 "upload_sha256": digest(files),
                 "main_assembly": "cad/robot.SLDASM",
                 "conn_id": "owned-boundary",
+                "platform_config_digest": "b" * 64,
             }
             binding = {key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")}
             job = {**receipt, "status": "failed", "request": binding}

@@ -375,14 +375,13 @@ class LockAndScriptsTest(unittest.TestCase):
                     if keyword.arg == "default":
                         defaults[node.args[0].value] = ast.literal_eval(keyword.value)
         self.assertEqual(defaults.get("--conn-id"), "solidworks_windows")
-        self.assertIn("--handoff-root", defaults)
-        # DEP-01: the tunnel loopback port has no silent default; the lifecycle passes the
-        # rendered value from resolved.env.
-        self.assertNotIn("--port", defaults)
         control = (DEPLOY.parent / "operator" / "operatorctl.sh").read_text(encoding="utf-8")
-        self.assertIn('--port "$TUNNEL_LOOPBACK_PORT"', control)
+        self.assertIn('--snapshot "$SNAPSHOT_PATH"', control)
+        self.assertIn('--state-root "$STATE_ROOT"', control)
         source = (DEPLOY / "scripts" / "add_connection.py").read_text(encoding="utf-8")
-        self.assertIn("handoff_roots", source)
+        self.assertIn("config_identity", source)
+        for legacy in ("handoff_roots", "store_root", "repositories", "--token-file", "--port", "--host"):
+            self.assertNotIn(legacy, source)
         dag = (DEPLOY / "dags" / "solidworks_to_urdf.py").read_text(encoding="utf-8")
         self.assertIn('CONN_ID = os.environ.get("SOLIDWORKS_ENDPOINT_CONN_ID", "solidworks_windows")', dag)
         self.assertNotIn('"conn_id": Param(', dag)

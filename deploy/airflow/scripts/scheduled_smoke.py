@@ -310,6 +310,14 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
+def _distinct_free_port(*excluded: int) -> int:
+    for _ in range(50):
+        candidate = _free_port()
+        if candidate not in excluded:
+            return candidate
+    raise RuntimeError("could not find a distinct free loopback port")
+
+
 def _auth_health(port: int) -> dict:
     """The current auth manager's public health contract, as the deployment probe reads it."""
     url = f"http://127.0.0.1:{port}/auth/feishu/health"
@@ -332,6 +340,17 @@ def _auth_health(port: int) -> dict:
         return {"status": error.code}
     except (urlerror.URLError, TimeoutError, OSError) as error:
         return {"status": None, "error": str(error)}
+
+
+def _close_mock(server) -> None:
+    """Close one started mock server without masking the original failure."""
+
+    if server is None:
+        return
+    with contextlib.suppress(Exception):
+        server.shutdown()
+    with contextlib.suppress(Exception):
+        server.server_close()
 
 
 def _deploy_defaults(root: Path) -> dict:
@@ -375,6 +394,7 @@ def _config_snapshot_environment(
     workspace_root: Path,
     record_roots: list[str],
     endpoint_port: int,
+    tunnel_port: int,
 ) -> tuple[dict[str, str], dict]:
     """The controlled platform-configuration identity that governs THIS smoke run.
 
@@ -415,6 +435,7 @@ def _config_snapshot_environment(
         "windows": {
             "ssh_host": "smoke-windows",
             "endpoint_port": endpoint_port,
+            "tunnel_loopback_port": tunnel_port,
             "token_file": str(fixture_root / "secrets/endpoint.token"),
             "instance": {
                 "task_name": "description-smoke-endpoint",
@@ -447,8 +468,76 @@ def _config_snapshot_environment(
         raise RuntimeError("the snapshot digest owners disagree; refusing a second identity")
     fixture_root.mkdir(parents=True, exist_ok=True)
     (fixture_root / "platform.json").write_bytes(platform_json_bytes)
-    platform_config.atomic_write_once(fixture_root / "snapshots" / f"{install_id}.json", snapshot_bytes)
-    return {"PLATFORM_CONFIG_DIGEST": digest_value}, resolved
+    snapshot_path = platform_config.atomic_write_once(
+        Path(state_root) / "snapshots" / f"{install_id}.json", snapshot_bytes
+    )
+    return {"PLATFORM_CONFIG_DIGEST": digest_value, "OPERATOR_STATE": str(state_root)}, resolved, snapshot_path
+
+
+def _write_smoke_install_record(state_root: Path, snapshot_path: Path, resolved: dict) -> None:
+    """Create the active snapshot binding the real Airflow consumers resolve."""
+
+    from description_pipeline import interface_records  # noqa: PLC0415
+    from description_pipeline.stages import STAGE_IDS  # noqa: PLC0415
+
+    snapshot_digest = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    install_id = json.loads(snapshot_path.read_text(encoding="utf-8"))["install_id"]
+    version = "1.5.0-smoke"
+    source_commit = "0" * 40
+    source_sha256 = "0" * 64
+    release = {
+        "version": version,
+        "source_commit": source_commit,
+        "source_sha256": source_sha256,
+        "artifacts": [{"name": "scheduled-smoke", "sha256": "1" * 64}],
+    }
+    dag = Path(__file__).resolve().parents[1] / "dags" / "solidworks_to_urdf.py"
+    record = {
+        "schema_version": interface_records.INSTALL_RECORD_SCHEMA,
+        "install_id": install_id,
+        "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "snapshot": {"path": str(snapshot_path), "digest": snapshot_digest, "install_id": install_id},
+        "release": release,
+        "services": [
+            "description-postgres",
+            "description-airflow-dag-processor",
+            "description-airflow-scheduler",
+            "description-airflow-api-server",
+            "description-portal",
+            "description-operator-proxy",
+        ],
+        "paths": resolved["storage"],
+        "dag": {
+            "id": DAG_ID,
+            "path": str(dag),
+            "digest": hashlib.sha256(dag.read_bytes()).hexdigest(),
+            "tasks": len(STAGE_IDS),
+        },
+        "ends": {
+            "linux": {
+                "install_id": install_id,
+                "config_digest": snapshot_digest,
+                "release": {
+                    **{key: release[key] for key in ("version", "source_commit", "source_sha256")},
+                    "role": "portable",
+                },
+            },
+            "windows": {
+                "install_id": "win-scheduled-smoke",
+                "config_digest": "2" * 64,
+                "release": {
+                    **{key: release[key] for key in ("version", "source_commit", "source_sha256")},
+                    "role": "native",
+                },
+            },
+        },
+        "previous": None,
+        "journal": [],
+    }
+    interface_records.validate_install_record(record)
+    target = state_root / "install-record.json"
+    target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    target.chmod(0o600)
 
 
 def _plugin_preflight(venv: Path, env: dict[str, str], home: Path) -> str | None:
@@ -937,6 +1026,12 @@ def main() -> int:
     parser.add_argument("--airflow-db-conn", default="", help="Airflow metadata DSN (PostgreSQL) for this session")
     parser.add_argument("--report", type=Path, default=None, help="also write the report JSON here")
     args = parser.parse_args()
+    # The in-process portal is a control-plane reader of the same Airflow metadata
+    # database as the scheduler.  Bind that identity before any Airflow module is
+    # imported: task workers never take this ORM path, but portal admission does.
+    os.environ["AIRFLOW_HOME"] = str(args.airflow_home)
+    if args.airflow_db_conn:
+        os.environ["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = args.airflow_db_conn
     ambient_sensor_mode = os.environ.get("SOLIDWORKS_SENSOR_MODE")
     if ambient_sensor_mode not in (None, SENSOR_MODE_REQUIRED):
         print(
@@ -980,11 +1075,12 @@ def main() -> int:
         print(json.dumps({"ok": False, "stage": "control_fixture", "error": f"{type(error).__name__}: {error}"}))
         return 1
     # The control fixture's CAD carries its own hardware identity; the submission must name
-    # exactly that identity (and the connection must route it), or the derivation refuses the
+    # exactly that identity (and the snapshot must route it), or the derivation refuses the
     # run as an identity conflict.
     target = str(fixture["hardware_id"])
 
-    api_port = args.api_port or _free_port()
+    origin_port = _operator_https_port(args.root)
+    api_port = args.api_port or _distinct_free_port(origin_port)
     intake_root = args.airflow_home / "smoke" / "intake"
     intake = intake_root / HANDOFF_PATH
     shutil.copytree(fixture_root / "native", intake)
@@ -993,7 +1089,7 @@ def main() -> int:
     server = None
     portal_server = None
     state: dict = {}
-    port = _free_port() if portal_mode else 0
+    tunnel_port = _distinct_free_port(origin_port, api_port) if portal_mode else 0
     if not portal_mode:
         server, state = _mock_endpoint(
             fixture,
@@ -1002,7 +1098,8 @@ def main() -> int:
             record=record,
             bundle_dir=args.airflow_home / "smoke" / "definition",
         )
-        port = server.server_address[1]
+        tunnel_port = server.server_address[1]
+    endpoint_port = _distinct_free_port(origin_port, api_port, tunnel_port)
     # The controlled platform-configuration identity of this smoke world: one canonical
     # IF-16 snapshot built by the deploy-side mechanism from THIS run's exact inputs
     # (paths, ports, records, targets), published to the child Airflow services through
@@ -1010,23 +1107,23 @@ def main() -> int:
     # snapshot governs the deployed fixture instead of declaring a parallel one, and
     # the runtime freeze still refuses a missing or mismatched digest.
     try:
-        snapshot_env, resolved = _config_snapshot_environment(
+        snapshot_env, resolved, snapshot_path = _config_snapshot_environment(
             args,
             target=target,
             state_root=args.airflow_home / "smoke-state",
             handoff_root=intake_root,
             workspace_root=args.airflow_home / "smoke-workspaces",
             record_roots=[str(fixture_root / "records")],
-            endpoint_port=port,
+            endpoint_port=endpoint_port,
+            tunnel_port=tunnel_port,
         )
     except Exception as error:  # noqa: BLE001 - the smoke reports the exact stage
         print(json.dumps({"ok": False, "stage": "config_snapshot", "error": f"{type(error).__name__}: {error}"}))
-        if server is not None:
-            server.close()
+        _close_mock(server)
         return 1
     os.environ.update(snapshot_env)
     # The snapshot's secret references must be the real ones this run uses: the endpoint
-    # token file is materialized (0600) and read back for the connection, and the platform
+    # token file is materialized (0600), and the platform
     # database reference is the actual PLATFORM_SERVICE_DSN this smoke was given -
     # materialized as the referenced file and re-published from it.  Nothing secret is
     # printed or copied into evidence.
@@ -1036,7 +1133,6 @@ def main() -> int:
     token_file = Path(resolved["windows"]["token_file"])
     token_file.write_text(TOKEN, encoding="utf-8")
     os.chmod(token_file, 0o600)
-    endpoint_token = token_file.read_text(encoding="utf-8")
     supplied_dsn = os.environ.get("PLATFORM_SERVICE_DSN", "")
     if not supplied_dsn:
         print(
@@ -1051,8 +1147,7 @@ def main() -> int:
                 }
             )
         )
-        if server is not None:
-            server.close()
+        _close_mock(server)
         return 1
     dsn_file = Path(resolved["database"]["dsn_file"])
     dsn_file.write_text(supplied_dsn, encoding="utf-8")
@@ -1062,39 +1157,83 @@ def main() -> int:
     # here (the operator convention: a dedicated directory under the isolated home, mode
     # 0700) and published to every consumer of this smoke: the in-process admission and
     # the lazily bound portal read it from the environment, the scheduler reads the same
-    # path from the connection extra below, and the child processes inherit it through
+    # path from the snapshot reference below, and the child processes inherit it through
     # ``env``.  ``PlatformStore.from_environment`` keeps requiring it - there is no
     # implicit fallback and no second root.
     store_root = Path(resolved["derived"]["store_root"])
     repository_path = Path(resolved["derived"]["repositories"][REPOSITORY_SLUG])
     if Path(resolved["storage"]["handoff_root"]) != intake_root:
         print(json.dumps({"ok": False, "stage": "config_snapshot", "error": "the snapshot handoff root diverged"}))
-        if server is not None:
-            server.close()
+        _close_mock(server)
         return 1
     store_root.mkdir(parents=True, exist_ok=True)
     store_root.chmod(0o700)
     os.environ["PIPELINE_STORE_ROOT"] = str(store_root)
-    connection = json.dumps(
-        {
-            "conn_type": "http",
-            "host": "127.0.0.1",
-            "port": port,
-            "password": endpoint_token,
-            "extra": {
-                "store_root": str(store_root),
-                "repositories": {REPOSITORY_SLUG: str(repository_path)},
-                "targets": resolved["targets"],
-                "handoff_roots": [resolved["storage"]["handoff_root"]],
-                "discovery": {"record_roots": list(resolved["specifications"]["record_roots"])},
-            },
-        }
-    )
-    env = dict(
+    _write_smoke_install_record(Path(resolved["storage"]["state_root"]), snapshot_path, resolved)
+    from description_pipeline import interface_records
+
+    reference = {
+        "schema_version": interface_records.CONFIG_SNAPSHOT_SCHEMA,
+        "path": str(snapshot_path),
+        "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+    }
+    common_env = dict(
         os.environ,
         AIRFLOW_HOME=str(args.airflow_home),
         PYTHONPATH=os.pathsep.join(filter(None, [str(args.root / "src"), os.environ.get("PYTHONPATH")])),
-        AIRFLOW_CONN_SOLIDWORKS_WINDOWS=connection,
+        OPERATOR_STATE=resolved["storage"]["state_root"],
+        PLATFORM_CONFIG_DIGEST=reference["sha256"],
+    )
+    if args.airflow_db_conn:
+        common_env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = args.airflow_db_conn
+    writer = subprocess.run(
+        [
+            str(args.venv / "bin/python"),
+            str(args.root / "deploy/airflow/scripts/add_connection.py"),
+            "--state-root",
+            resolved["storage"]["state_root"],
+            "--snapshot",
+            str(snapshot_path),
+        ],
+        capture_output=True,
+        text=True,
+        env=common_env,
+        cwd=args.root,
+    )
+    if writer.returncode != 0:
+        print(json.dumps({"ok": False, "stage": "config_connection", "stderr": writer.stderr[-500:]}))
+        _close_mock(server)
+        return 1
+    reader = subprocess.run(
+        [
+            str(args.venv / "bin/python"),
+            "-m",
+            "description_pipeline.orchestration.airflow_client",
+            "--conn-id",
+            "solidworks_windows",
+            "--state-root",
+            resolved["storage"]["state_root"],
+        ],
+        capture_output=True,
+        text=True,
+        env=common_env,
+        cwd=args.root,
+    )
+    if reader.returncode != 0 or f"config_digest={reference['sha256']}" not in reader.stdout:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "stage": "config_connection_readback",
+                    "stderr": reader.stderr[-500:],
+                    "stdout": reader.stdout[-500:],
+                }
+            )
+        )
+        _close_mock(server)
+        return 1
+    env = dict(
+        common_env,
         PIPELINE_STORE_ROOT=str(store_root),
         AIRFLOW__CORE__AUTH_MANAGER="description_pipeline.orchestration.feishu_auth.FeishuAuthManager",
         AIRFLOW__CORE__LOAD_EXAMPLES="false",
@@ -1107,19 +1246,16 @@ def main() -> int:
         AIRFLOW__CORE__DAGS_FOLDER=str(args.root / "deploy/airflow/dags"),
         AIRFLOW__CORE__EXECUTION_API_SERVER_URL=f"http://127.0.0.1:{api_port}/execution",
     )
-    if args.airflow_db_conn:
-        env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = args.airflow_db_conn
+    env.pop("AIRFLOW_CONN_SOLIDWORKS_WINDOWS", None)
     problem = _plugin_preflight(args.venv, env, args.airflow_home)
     if problem is not None:
         print(json.dumps({"ok": False, "stage": "plugin_missing", "error": problem}))
-        if server is not None:
-            server.close()
+        _close_mock(server)
         return 1
     migrate = _run(args.venv, env, "db", "migrate")
     if migrate.returncode != 0:
         print(json.dumps({"ok": False, "stage": "db_migrate", "stderr": migrate.stderr[-500:]}))
-        if server is not None:
-            server.close()
+        _close_mock(server)
         return 1
     # The production pool entry (install.sh runs the same script): a freshly migrated home only
     # carries the stock default pool, and the DAG's native stage waits on windows_native; without
@@ -1133,8 +1269,7 @@ def main() -> int:
     )
     if pool.returncode != 0:
         print(json.dumps({"ok": False, "stage": "ensure_pool", "stderr": pool.stderr[-500:]}))
-        if server is not None:
-            server.close()
+        _close_mock(server)
         return 1
     log_dir = args.airflow_home / "logs" / "smoke"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1263,7 +1398,7 @@ def main() -> int:
                 upload_files=upload_files,
                 record=record,
                 bundle_dir=args.airflow_home / "smoke" / "definition",
-                port=port,
+                port=tunnel_port,
             )
             from description_pipeline.orchestration.airflow_client import (  # noqa: PLC0415
                 EndpointConfig,
@@ -1271,7 +1406,7 @@ def main() -> int:
             )
 
             endpoint_holder["endpoint"] = WindowsEndpoint(
-                EndpointConfig(base_url=f"http://127.0.0.1:{port}", token=TOKEN)
+                EndpointConfig(base_url=f"http://127.0.0.1:{tunnel_port}", token=TOKEN)
             )
             resume = _run(args.venv, env, "dags", "unpause", DAG_ID)
             if resume.returncode != 0:

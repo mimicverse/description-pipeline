@@ -1431,17 +1431,15 @@ class LifecycleTests(unittest.TestCase):
         # IF-11 for the installed connection; no targets/repositories lexemes remain.
         self.assertIn("interface_records.validate_health", health)
         self.assertIn("require_endpoint_matches_install_record", health)
-        self.assertIn("validate_connection_config_identity", health)
-        self.assertIn("check_config_identity_file", health)
-        self.assertIn("verify_config_identity_digest", health)
-        self.assertIn("require_active_config_identity", health)
+        self.assertIn("-m description_pipeline.orchestration.airflow_client", health)
+        self.assertIn('--state-root "$OPERATOR_STATE"', health)
         self.assertNotIn("targets", health)
         self.assertNotIn("repositories", health)
         self.assertIn("/auth/feishu/health", health)
         self.assertIn("FEISHU_ENV_FILE", health)
         self.assertIn("FEISHU_APP_SECRET_FILE", health)
         self.assertIn('if status == 200 and body.get("configured") is True', health)
-        self.assertIn("connection.extra_dejson", health)
+        self.assertNotIn("extra_dejson", health)
         self.assertIn("2??|3??", health)
         self.assertIn("Airflow api-server serves its login entry", health)
         self.assertIn("non-JSON response", health)
@@ -1761,14 +1759,59 @@ class InstallOrderingTests(unittest.TestCase):
             '#!/usr/bin/env bash\necho "install_postgres" >> "$ORDER_LOG"\n'
             'mkdir -p "$POSTGRES_ROOT/data"\n: > "$POSTGRES_ROOT/data/PG_VERSION"\nexit 0\n',
         )
-        (release / "airflow" / "scripts" / "add_connection.py").write_text("# stub\n", encoding="utf-8")
+        write_stub(
+            release / "airflow" / "scripts" / "add_connection.py",
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "with open(os.environ['ORDER_LOG'], 'a', encoding='utf-8') as stream:\n"
+            "    stream.write('add_connection\\n')\n"
+            "print('connection solidworks_windows bound')\n",
+        )
+        write_stub(
+            release / "operator" / "connection_snapshot.py",
+            "#!/usr/bin/env python3\n"
+            "import argparse\n"
+            "import json\n"
+            "import os\n"
+            "import stat\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('action', choices=('capture', 'restore', 'verify'))\n"
+            "parser.add_argument('--conn-id', default='solidworks_windows')\n"
+            "parser.add_argument('--file', type=Path, required=True)\n"
+            "parser.add_argument('--receipt', type=Path, required=True)\n"
+            "parser.add_argument('--manifest', type=Path)\n"
+            "parser.add_argument('--sealed', type=Path)\n"
+            "parser.add_argument('--member')\n"
+            "args = parser.parse_args()\n"
+            "log = Path(os.environ['ORDER_LOG'])\n"
+            "if args.action == 'capture':\n"
+            "    args.file.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    os.chmod(args.file.parent, 0o700)\n"
+            "    descriptor = os.open(args.file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)\n"
+            "    with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:\n"
+            "        json.dump({'password': 'fixture-secret', 'fields': 'complete'}, stream)\n"
+            "    with log.open('a', encoding='utf-8') as stream:\n"
+            "        stream.write('connection_capture\\n')\n"
+            "    print('connection row captured privately')\n"
+            "else:\n"
+            "    if args.manifest is None or args.sealed is None:\n"
+            "        raise SystemExit('restore requires manifest and sealed archive')\n"
+            "    if not args.manifest.is_file() or not args.sealed.is_file():\n"
+            "        raise SystemExit('restore binding is missing')\n"
+            "    if stat.S_IMODE(args.file.stat().st_mode) != 0o600:\n"
+            "        raise SystemExit('capture mode is not 0600')\n"
+            "    with log.open('a', encoding='utf-8') as stream:\n"
+            "        stream.write('connection_restore\\n')\n"
+            "    print('connection row restored exactly')\n",
+        )
 
         (tmp / "releases" / "airflow-venv-gen-1" / "bin").mkdir(parents=True)
         write_stub(
             tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python",
             "#!/usr/bin/env bash\n"
             "case \"$*\" in\n"
-            "  *install_record.py*)\n"
+            "  *install_record.py*|*add_connection.py*|*connection_snapshot.py*)\n"
             '    exec python3 "$@" ;;\n'
             '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
             "    python3 -c 'import json,os; from pathlib import Path; "
@@ -2614,10 +2657,23 @@ class InstallOrderingTests(unittest.TestCase):
                     "linux-generation", "windows-generation",
                     "close-admission", "drain", "backup",
                     "stop-services", "schema-migration", "windows-switch", "endpoint-identity",
-                    "switch-pointer", "start-services", "verify", "open-admission",
+                    "switch-pointer", "config-reference", "start-services", "verify", "open-admission",
                 ],
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
+            private_capture = (
+                state / "promotions" / "gen-2" / "evidence" / "private" / "connection-before-promotion.json"
+            )
+            self.assertEqual(stat.S_IMODE(private_capture.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(private_capture.parent.stat().st_mode), 0o700)
+            manifest_text = (
+                state / "promotions" / "gen-2" / "evidence" / "backup-manifest.json"
+            ).read_text(encoding="utf-8")
+            self.assertIn("private/connection-before-promotion.json", manifest_text)
+            self.assertNotIn("fixture-secret", manifest_text)
+            order_rows = (Path(control_env["ORDER_LOG"])).read_text(encoding="utf-8").splitlines()
+            capture_at = order_rows.index("connection_capture")
+            self.assertIn("add_connection", order_rows[capture_at:])
             self.assertEqual(
                 (state / "promotions" / "gen-2" / "windows-promote.out.ssh-rc").read_text(encoding="utf-8"),
                 "0\n",
@@ -2643,8 +2699,18 @@ class InstallOrderingTests(unittest.TestCase):
                 [row["step"] for row in final_receipt["steps"] if row["verb"] == "rollback"],
                 [
                     "rollback-close", "rollback-drain", "rollback-stop", "rollback-windows",
-                    "rollback-linux", "rollback-verify",
+                    "rollback-linux", "rollback-config-reference", "rollback-verify",
                 ],
+            )
+            self.assertIn(
+                "connection_restore",
+                (Path(control_env["ORDER_LOG"])).read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertIn(
+                "connection row restored exactly",
+                (state / "promotions" / "gen-2" / "evidence" / "rollback-config-reference.out").read_text(
+                    encoding="utf-8"
+                ),
             )
             # Real restore drill on the sealed archive: open it, then rebuild a broken record
             # from the backup bytes and re-verify the running generation.

@@ -1,92 +1,95 @@
-"""Create/update the endpoint connection from a token file (no token in argv).
+"""Bind the Airflow endpoint connection to one active immutable config snapshot.
 
-The connection's ``extra`` carries the platform-owned ``handoff_roots`` allowlist for the shared
-Linux client; the deployment installer passes the single dedicated intake directory.
+The persisted connection is only an IF-11 reference. Endpoint address, Linux
+routing, target routing and token-file references are resolved from the
+snapshot by the DAG and health consumers.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
 from pathlib import Path
 
 from airflow.models.connection import Connection
 from airflow.settings import Session
 
+from description_pipeline import interface_records
+from description_pipeline.io import parse_data
 
-def _json_safe(value):
-    """The serialization boundary for the connection ``extra`` document.
 
-    The endpoint config validates its routing into ``Path`` values (``store_root``,
-    ``repositories``, ``discovery.record_roots`` and the optional frozen-name registry), so
-    every value that lands in ``extra`` is written as its string form - a ``Path`` (or a
-    tuple/list/dict carrying one) is never handed to ``json.dumps``.  Record roots and the
-    registry are kept, only re-encoded: deleting them to serialize is not allowed.
-    """
+def _active_snapshot_reference(state_root: Path, snapshot: Path) -> dict:
+    if not state_root.is_absolute():
+        raise SystemExit("state root must be absolute")
+    if not snapshot.is_absolute():
+        raise SystemExit("snapshot path must be absolute")
+    record_path = state_root / "install-record.json"
+    if not record_path.is_file():
+        raise SystemExit(f"active install record is missing: {record_path}")
+    record = interface_records.validate_install_record(parse_data(record_path.read_bytes(), record_path))
+    if record["paths"].get("state_root") != str(state_root):
+        raise SystemExit("active install record belongs to another state root")
+    if record["snapshot"]["path"] != str(snapshot):
+        raise SystemExit("snapshot is not the active install record's snapshot")
+    reference = {
+        "schema_version": interface_records.CONFIG_SNAPSHOT_SCHEMA,
+        "path": str(snapshot),
+        "sha256": record["snapshot"]["digest"],
+    }
+    payload = interface_records.check_config_identity_file(reference, allowed_root=str(state_root))
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != reference["sha256"]:
+        raise SystemExit("snapshot digest does not match the active install record")
+    document = parse_data(payload, snapshot)
+    interface_records.validate_config_snapshot(document)
+    if document["resolved"]["storage"]["state_root"] != str(state_root):
+        raise SystemExit("snapshot belongs to another state root")
+    interface_records.require_active_config_identity(reference, record)
+    return reference
 
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _json_safe(item) for key, item in value.items()}
-    return value
+
+def _connection_document(connection: Connection) -> dict:
+    return {
+        "host": connection.host or "",
+        "port": connection.port,
+        "password": connection.password or "",
+        "extra": dict(connection.extra_dejson or {}),
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--conn-id", default="solidworks_windows")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, required=True, help="Linux loopback port of the endpoint tunnel")
-    parser.add_argument("--token-file", required=True)
-    parser.add_argument(
-        "--pipeline-config", required=True, help="rendered portal config containing Linux execution routing"
-    )
-    parser.add_argument(
-        "--handoff-root", action="append", default=[], help="absolute allowed Linux CAD source directory (repeatable)"
-    )
+    parser.add_argument("--state-root", type=Path, required=True)
+    parser.add_argument("--snapshot", type=Path, required=True)
     args = parser.parse_args()
-    for root in args.handoff_root:
-        if not root.startswith("/") or root == "/" or any(part in {"..", ""} for part in Path(root).parts[1:]):
-            raise SystemExit(f"handoff root must be a dedicated absolute directory: {root}")
-    token = Path(args.token_file).read_text(encoding="utf-8").strip()
-    if not token:
-        raise SystemExit("token file is empty")
-    from description_pipeline.orchestration.airflow_client import EndpointConfig
 
-    pipeline = json.loads(Path(args.pipeline_config).read_text(encoding="utf-8"))["pipeline"]
-    config = EndpointConfig(
-        base_url=f"http://{args.host}:{args.port}",
-        token=token,
-        store_root=pipeline["store_root"],
-        repositories=pipeline["repositories"],
-        discovery=pipeline.get("discovery", {}),
-        targets=pipeline.get("targets", {}),
-    )
+    reference = _active_snapshot_reference(args.state_root, args.snapshot)
     with Session() as session:
-        existing = session.query(Connection).filter(Connection.conn_id == args.conn_id).one_or_none()
-        if existing is None:
-            existing = Connection(conn_id=args.conn_id)
-            session.add(existing)
-        existing.conn_type = "http"
-        existing.host = args.host
-        existing.port = args.port
-        existing.password = token
-        existing.extra = json.dumps(
-            _json_safe(
-                {
-                "handoff_roots": [str(Path(root)) for root in args.handoff_root],
-                "store_root": str(config.store_root),
-                "repositories": {slug: str(path) for slug, path in config.repositories.items()},
-                "discovery": config.discovery,
-                "targets": config.targets,
-                }
-            )
-        )
+        connection = session.query(Connection).filter(Connection.conn_id == args.conn_id).one_or_none()
+        if connection is None:
+            connection = Connection(conn_id=args.conn_id)
+            session.add(connection)
+        connection.conn_type = "http"
+        connection.host = ""
+        connection.port = None
+        connection.login = None
+        # Airflow's encrypted password setter ignores an empty value, which would leave a
+        # legacy bearer token in place.  Clear the physical field explicitly.
+        connection._password = ""
+        connection.is_encrypted = False
+        connection.password = ""
+        connection.schema = None
+        connection.extra = json.dumps({"config_identity": reference}, sort_keys=True, separators=(",", ":"))
         session.commit()
-    os.chmod(Path(args.token_file), 0o600)
-    print(f"connection {args.conn_id} updated from token file")
+        stored = session.query(Connection).filter(Connection.conn_id == args.conn_id).one_or_none()
+    if stored is None:
+        raise SystemExit(f"connection {args.conn_id} was not persisted")
+    stored_reference = interface_records.validate_connection_config_identity(_connection_document(stored))
+    if stored_reference != reference:
+        raise SystemExit("persisted connection does not carry the requested config identity")
+    print(f"connection {args.conn_id} bound to config {reference['sha256']}")
     return 0
 
 

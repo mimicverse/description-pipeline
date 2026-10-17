@@ -443,7 +443,7 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
     def is_authorized_connection(
         self, *, method: ResourceMethod, user: FeishuUser, details: ConnectionDetails | None = None
     ) -> bool:
-        # The Windows endpoint token lives in the solidworks_windows Connection; operators never see it.
+        # The endpoint token stays in its controlled snapshot-referenced file; operators never see it.
         return self._is_admin(user)
 
     def is_authorized_asset(

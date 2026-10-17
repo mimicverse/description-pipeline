@@ -10,12 +10,10 @@ import subprocess
 import sys
 import tempfile
 import threading
-import types
 import uuid
 import unittest
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest import mock
 from urllib import parse as urlparse
 
 from tests.v1.protocol_support import protocol_events
@@ -32,7 +30,6 @@ from description_pipeline.orchestration.airflow_client import (
     ResultNotPublishable,
     WindowsEndpoint,
     check_result,
-    config_from_airflow_connection,
     native_run_id,
     resolved_routing,
     validate_artifact_name,
@@ -613,45 +610,6 @@ class ClientTests(unittest.TestCase):
                         str(caught.exception),
                     )
 
-    def test_connection_extra_supplies_handoff_roots(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "handoffs"
-            root.mkdir()
-            records = Path(tmp) / "records"
-            records.mkdir()
-            registry = Path(tmp) / "names.json"
-            registry.write_text("{}", encoding="utf-8")
-
-            class FakeConnection:
-                host = "127.0.0.1"
-                port = 18765
-                password = "token"
-
-                def __init__(self) -> None:
-                    self.extra_dejson = {
-                        "timeout": 5,
-                        "handoff_roots": [str(root)],
-                        "discovery": {"record_roots": [str(records)], "frozen_names_file": str(registry)},
-                    }
-
-            class FakeBaseHook:
-                @staticmethod
-                def get_connection(conn_id):
-                    return FakeConnection()
-
-            airflow = types.ModuleType("airflow")
-            hooks = types.ModuleType("airflow.hooks")
-            base = types.ModuleType("airflow.hooks.base")
-            base.BaseHook = FakeBaseHook
-            hooks.base = base
-            airflow.hooks = hooks
-            with mock.patch.dict(sys.modules, {"airflow": airflow, "airflow.hooks": hooks, "airflow.hooks.base": base}):
-                config = config_from_airflow_connection("solidworks_windows")
-            self.assertEqual(config.handoff_roots, (root.resolve(),))
-            self.assertEqual(config.base_url, "http://127.0.0.1:18765")
-            self.assertEqual(config.discovery["record_roots"], (records,))
-            self.assertEqual(config.discovery["frozen_names_file"], registry)
-
     def test_capture_archive_receipt_is_validated_exactly(self) -> None:
         from description_pipeline.orchestration.airflow_client import capture_archive_metadata
         from description_pipeline.orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST
@@ -711,34 +669,6 @@ class ClientTests(unittest.TestCase):
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(EndpointProtocolError):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, **kwargs)
-
-    def test_connection_extra_supplies_linux_routing(self) -> None:
-        class FakeConnection:
-            host = "127.0.0.1"
-            port = 18765
-            password = "token"
-
-            def __init__(self) -> None:
-                self.extra_dejson = {
-                    "repositories": {"owner/repo": "/srv/repo"},
-                    "store_root": "/srv/store",
-                }
-
-        class FakeBaseHook:
-            @staticmethod
-            def get_connection(conn_id):
-                return FakeConnection()
-
-        airflow = types.ModuleType("airflow")
-        hooks = types.ModuleType("airflow.hooks")
-        base = types.ModuleType("airflow.hooks.base")
-        base.BaseHook = FakeBaseHook
-        hooks.base = base
-        airflow.hooks = hooks
-        with mock.patch.dict(sys.modules, {"airflow": airflow, "airflow.hooks": hooks, "airflow.hooks.base": base}):
-            config = config_from_airflow_connection("solidworks_windows")
-        self.assertEqual(config.repositories, {"owner/repo": Path("/srv/repo")})
-        self.assertEqual(config.store_root, Path("/srv/store"))
 
     def test_stream_capture_archive_verifies_size_and_digest(self) -> None:
         import io as io_module

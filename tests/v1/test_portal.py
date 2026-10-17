@@ -44,6 +44,8 @@ from description_pipeline.orchestration.portal import (
     PortalConfig,
     load_portal_config,
 )
+
+os.environ.setdefault("PLATFORM_CONFIG_DIGEST", "c" * 64)
 from description_pipeline.orchestration.uploads import MAX_FILE_BYTES, MAX_FILES, MAX_TOTAL_BYTES
 from description_pipeline.io import PipelineError
 from description_pipeline.platform.store import (
@@ -363,7 +365,11 @@ class PortalClient:
     def __init__(self, base: str) -> None:
         self.base = base
         self.jar = CookieJar()
-        self.opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(self.jar))
+        # The portal tests talk to loopback fixtures; ambient HTTP(S)_PROXY must not route
+        # them through an external proxy (the production internal opener is direct too).
+        self.opener = urlrequest.build_opener(
+            urlrequest.ProxyHandler({}), urlrequest.HTTPCookieProcessor(self.jar)
+        )
         self.csrf: str | None = None
         self.login_response = b""
         self.last_set_cookies: list[str] = []
@@ -959,6 +965,7 @@ class PortalTests(unittest.TestCase):
             upload_root=self.upload_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
+            config_identity_provider=lambda: "c" * 64,
         )
         self.server = make_server(
             "127.0.0.1",
@@ -985,6 +992,7 @@ class PortalTests(unittest.TestCase):
             upload_root=self.upload_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
+            config_identity_provider=lambda: "c" * 64,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -1877,7 +1885,10 @@ class PortalTests(unittest.TestCase):
 
     def test_upload_without_configured_intake_root_fails_closed(self) -> None:
         config = PortalConfig(
-            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=self.static_dir
+            airflow=AirflowApi(self.airflow.url),
+            endpoint=lambda: self.endpoint,
+            static_dir=self.static_dir,
+            config_identity_provider=lambda: "c" * 64,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler

@@ -493,6 +493,42 @@ promotion_step() {
   python3 "$HERE/promotion.py" step "${arguments[@]}" >/dev/null
 }
 
+config_reference_recorded() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+def reject_duplicates(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate receipt key: {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+try:
+    document = json.loads(
+        open(sys.argv[1], encoding="utf-8").read(),
+        object_pairs_hook=reject_duplicates,
+    )
+except (OSError, ValueError):
+    raise SystemExit(2)
+steps = document.get("steps") if isinstance(document, dict) else None
+if not isinstance(steps, list):
+    raise SystemExit(2)
+raise SystemExit(
+    0
+    if any(
+        row.get("verb") == "promote"
+        and row.get("step") == "config-reference"
+        for row in steps
+        if isinstance(row, dict)
+    )
+    else 1
+)
+PY
+}
+
 promotion_extract_health() {
   python3 - "$1" "$2" <<'PY'
 import json
@@ -823,9 +859,6 @@ case "$ACTION" in
     mkdir -p "$PIPELINE_STORE_ROOT"
     chmod 700 "$PIPELINE_STORE_ROOT"
     [ -f "$ENDPOINT_TOKEN_FILE" ] || die "endpoint token file missing: $ENDPOINT_TOKEN_FILE"
-    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
-      --token-file "$ENDPOINT_TOKEN_FILE" --host 127.0.0.1 --port "$TUNNEL_LOOPBACK_PORT" \
-      --handoff-root "$SOLIDWORKS_HANDOFF_ROOT" --pipeline-config "$PORTAL_CONFIG"
     # The binary decided above is the one everything rendered; it may not vanish mid-install.
     [ -x "$PROXY_BIN" ] || die "the managed proxy binary is missing: $PROXY_BIN"
     systemctl --user daemon-reload
@@ -846,6 +879,9 @@ case "$ACTION" in
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
         --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --tree "$HERE/../.."
     fi
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
+      --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
+      || die "could not bind solidworks_windows to the installed config snapshot"
     echo "install complete: ${OPERATOR_URL:-unknown}"
     ;;
   start)
@@ -967,7 +1003,7 @@ PY
     [ -f "$CANDIDATE_ENV" ] || die "candidate derived environment was not written"
     python3 "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --from "$STATE_ROOT/install-records/$ACTIVE_ID.json" --to "$SNAPSHOT_PATH" \
-      --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-verify" \
+      --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,config-reference,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-config-reference,rollback-verify" \
       >/dev/null
     printf '%s\n' "$CANDIDATE_WHEEL" > "$RECEIPT_DIR/candidate-wheel"
     set -a
@@ -1039,7 +1075,20 @@ PY
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/backup-staging-clean.out"
       die "the private backup staging could not be cleaned (the admission stays closed)"
     fi
+    # The one private Connection capture is taken before the database snapshot and travels
+    # inside the same sealed backup.  Its digest is therefore bound by the existing backup
+    # manifest, not by a second public format; the evidence copy is the exact same bytes.
+    CONNECTION_PRIVATE_SNAPSHOT="$EVIDENCE_DIR/private/connection-before-promotion.json"
+    CONNECTION_BACKUP_MEMBER="private/connection-before-promotion.json"
+    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/connection_snapshot.py" capture \
+        --file "$CONNECTION_PRIVATE_SNAPSHOT" --receipt "$RECEIPT_DIR/receipt.json" \
+        > "$EVIDENCE_DIR/connection-capture.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/connection-capture.out"
+      die "the current Airflow connection row could not be captured (the admission stays closed)"
+    fi
     mkdir -p "$BACKUP_DIR/state"
+    mkdir -p "$BACKUP_DIR/private"
+    cp -p "$CONNECTION_PRIVATE_SNAPSHOT" "$BACKUP_DIR/$CONNECTION_BACKUP_MEMBER"
     cp -p "$STATE_ROOT/install-record.json" "$BACKUP_DIR/state/install-record.json"
     cp -a "$STATE_ROOT/install-records" "$BACKUP_DIR/state/install-records"
     cp -a "$STATE_ROOT/snapshots" "$BACKUP_DIR/state/snapshots"
@@ -1138,7 +1187,8 @@ PY
       die "the sealed backup staging could not be removed (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote backup completed \
-      "$EVIDENCE_DIR/backup-manifest.json" "$EVIDENCE_DIR/backup-staging-removed.out"
+      "$EVIDENCE_DIR/backup-manifest.json" "$EVIDENCE_DIR/backup-staging-removed.out" \
+      "$EVIDENCE_DIR/connection-capture.out"
     # 4. both ends' execution services stop before the pointers move, while the shared
     #    PostgreSQL (Airflow metadata + platform schema) stays up: the guarded migrations
     #    below run against that same live database authority.  services.sh stop-executors
@@ -1258,6 +1308,13 @@ PY
       die "the pointer switch failed (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote switch-pointer completed "$EVIDENCE_DIR/switch-pointer.out"
+    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
+        --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
+        > "$EVIDENCE_DIR/config-reference.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote config-reference failed "$EVIDENCE_DIR/config-reference.out"
+      die "the Airflow connection could not bind the switched config snapshot (the admission stays closed)"
+    fi
+    promotion_step "$CANDIDATE_ID" promote config-reference completed "$EVIDENCE_DIR/config-reference.out"
     # 8. the switched generation starts through its own derived environment
     load_active_env
     load_installed
@@ -1467,6 +1524,46 @@ PY
       # recorded with the receipt itself as evidence.
       promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$RECEIPT_DIR/receipt.json"
     fi
+    # The previous generation's exact Connection row is restored from the private capture
+    # already sealed in this promotion's backup.  The capture must still match the original
+    # backup manifest and the receipt's immutable generation bindings; a missing capture is
+    # fatal once config-reference began, and an unchanged row is never rewritten.
+    CONNECTION_PRIVATE_SNAPSHOT="$EVIDENCE_DIR/private/connection-before-promotion.json"
+    CONNECTION_BACKUP_MEMBER="private/connection-before-promotion.json"
+    if [ -e "$CONNECTION_PRIVATE_SNAPSHOT" ] || [ -L "$CONNECTION_PRIVATE_SNAPSHOT" ]; then
+      if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/connection_snapshot.py" restore \
+          --file "$CONNECTION_PRIVATE_SNAPSHOT" --receipt "$RECEIPT_DIR/receipt.json" \
+          --manifest "$EVIDENCE_DIR/backup-manifest.json" --sealed "$RECEIPT_DIR/backup.tar.enc" \
+          --member "$CONNECTION_BACKUP_MEMBER" \
+          > "$EVIDENCE_DIR/rollback-config-reference.out" 2>&1; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-config-reference failed "$EVIDENCE_DIR/rollback-config-reference.out"
+        die "the previous Airflow connection row could not be restored exactly (the admission stays closed)"
+      fi
+    else
+      CONFIG_REFERENCE_STATUS=0
+      config_reference_recorded "$RECEIPT_DIR/receipt.json" || CONFIG_REFERENCE_STATUS=$?
+      case "$CONFIG_REFERENCE_STATUS" in
+        0)
+          echo "the promotion recorded config-reference but its private connection capture is missing" \
+            > "$EVIDENCE_DIR/rollback-config-reference.out"
+          promotion_step "$ROLLBACK_ID" rollback rollback-config-reference failed \
+            "$EVIDENCE_DIR/rollback-config-reference.out"
+          die "the private connection capture is missing; the previous row cannot be proven (the admission stays closed)"
+          ;;
+        1)
+          echo "config-reference never began; the Airflow connection was not changed by this promotion" \
+            > "$EVIDENCE_DIR/rollback-config-reference.out"
+          ;;
+        *)
+          echo "the promotion receipt is unreadable; the Airflow connection state cannot be proven" \
+            > "$EVIDENCE_DIR/rollback-config-reference.out"
+          promotion_step "$ROLLBACK_ID" rollback rollback-config-reference failed \
+            "$EVIDENCE_DIR/rollback-config-reference.out"
+          die "the promotion receipt is unreadable (the admission stays closed)"
+          ;;
+      esac
+    fi
+    promotion_step "$ROLLBACK_ID" rollback rollback-config-reference completed "$EVIDENCE_DIR/rollback-config-reference.out"
     # The restored generation starts through its own environment and both ends re-verify; the
     # restored record is checked against its own immutable snapshot (the operator's current
     # platform.json may already describe a candidate).

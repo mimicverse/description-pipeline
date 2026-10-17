@@ -302,6 +302,23 @@ class PortalError(RuntimeError):
         self.message = message
 
 
+def _verified_admission_config_digest(provider: Callable[[], str] | None = None) -> str:
+    """The snapshot identity every newly admitted request records."""
+
+    if provider is None:
+        from .airflow_client import config_from_airflow_connection
+
+        try:
+            value = config_from_airflow_connection("solidworks_windows").config_digest
+        except Exception as error:
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "平台配置身份不可用，本次提交未接纳") from error
+    else:
+        value = str(provider()).strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "平台配置身份不可用，本次提交未接纳")
+    return value
+
+
 class AirflowApiError(RuntimeError):
     """The Airflow API rejected a request or returned an unexpected shape."""
 
@@ -544,6 +561,9 @@ class PortalConfig:
     #: environment (``PLATFORM_SERVICE_DSN``) otherwise.  Submissions are refused
     #: while the store cannot be reached - never silently ungated.
     platform_store: PlatformStore | None = None
+    #: Test/embedding seam for the already-validated active snapshot digest. Production
+    #: loading leaves this unset so admission resolves the real Connection contract.
+    config_identity_provider: Callable[[], str] | None = None
 
 
 _CONFIG_KEYS = {
@@ -1095,6 +1115,9 @@ class PortalApp:
                 self._platform_store = PlatformStore.from_environment(os.environ)
             return self._platform_store
 
+    def _admission_config_digest(self) -> str:
+        return _verified_admission_config_digest(self.config.config_identity_provider)
+
     # ------------------------------------------------------------------ WSGI
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         try:
@@ -1487,6 +1510,7 @@ class PortalApp:
                     "files": receipt.files,
                     "bytes": receipt.bytes,
                     "folder": receipt.folder,
+                    "platform_config_digest": self._admission_config_digest(),
                 },
                 dispatch={
                     "stage": "capture",
@@ -2469,6 +2493,7 @@ class PortalApp:
                         "files": resolved.files,
                         "bytes": resolved.bytes,
                         "folder": resolved.folder,
+                        "platform_config_digest": self._admission_config_digest(),
                     }
                     if resolved.provenance is not None:
                         admit_baseline["provenance"] = resolved.provenance

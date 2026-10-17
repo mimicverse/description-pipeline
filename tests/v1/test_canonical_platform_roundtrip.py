@@ -68,6 +68,7 @@ def _run_scenario(root: Path) -> dict:
         target_hardware="nd_fixture",
         main_assembly=MAIN,
         dispatch={"stage": "freeze", "operation_key": f"{RUN}/dispatch:0", "params_digest": "a" * 64},
+        baseline={"platform_config_digest": "b" * 64},
     )
     freeze_request_evidence(
         paths.run_dir,
@@ -88,7 +89,14 @@ def _run_scenario(root: Path) -> dict:
     phase = "freeze"
     with patch.object(module, "_platform_binding", return_value=(store, store_root)):
         try:
-            module._register_freeze_stage(paths, RUN, intake=native_root, upload_files=upload)
+            module._register_freeze_stage(
+                paths,
+                RUN,
+                request_id="independent-real-roundtrip",
+                intake=native_root,
+                upload_files=upload,
+                config_digest="b" * 64,
+            )
             report["calls"].append("DAG._register_freeze_stage")
             phase = "producer"
             with patch.object(producer, "capture_record", return_value=raw):
