@@ -296,7 +296,12 @@ class FakeCursor:
                 configuration = entry[4]
                 if isinstance(configuration, str):
                     configuration = json.loads(configuration)
-                self._rows = [(entry[1], entry[2], entry[3], NOW, dispatch_digest, configuration)]
+                baseline = entry[5] if len(entry) > 5 else None
+                if isinstance(baseline, str):
+                    baseline = json.loads(baseline)
+                self._rows = [
+                    (entry[1], entry[2], entry[3], NOW, dispatch_digest, configuration, baseline)
+                ]
         elif normalized.startswith(
             "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
         ):
@@ -930,6 +935,7 @@ class PlatformStoreTests(unittest.TestCase):
                 "sealed_at": NOW,
                 "dispatch_digest": "a" * 64,
                 "purpose": "engineering",
+                "baseline": None,
             },
         )
         self.assertIsNone(self.store.request_record("q-missing"))

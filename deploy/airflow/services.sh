@@ -2,11 +2,14 @@
 # Manage the user services for this deployment. Only the description-* units below are ever
 # written; unrelated units in the same directory are left untouched.
 #
-#   render   write the description-* unit files (no systemctl; used by tests and for review)
-#   install  render + reload the user manager
-#   start    enable --now postgres (if configured), dag-processor, scheduler, api-server
-#   stop     disable --now in reverse order
-#   status   systemctl --user status for the units
+#   render          write the description-* unit files (no systemctl; used by tests and for review)
+#   install         render + reload the user manager
+#   start           enable --now postgres (if configured), dag-processor, scheduler, api-server
+#   stop            disable --now every unit in reverse order (the full deployment stop)
+#   stop-executors  disable --now and prove stopped the execution units only (tunnel,
+#                   dag-processor, scheduler, api-server): the promotion window keeps the
+#                   shared PostgreSQL running and ready for its guarded migrations
+#   status          systemctl --user status for the units
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${AIRFLOW_VENV:?set AIRFLOW_VENV}"
@@ -14,10 +17,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 ACTION="${1:-install}"
 
+# The execution units are the maintenance window's stop set: they must be down while the
+# candidate switches, and they must never take the shared database down with them. The
+# database unit is managed separately because the promotion's guarded migrations run
+# against it live.
+EXECUTORS=()
+[ -n "${SOLIDWORKS_SSH_HOST:-}" ] && EXECUTORS+=(description-solidworks-tunnel)
+EXECUTORS+=(description-airflow-dag-processor description-airflow-scheduler description-airflow-api-server)
 UNITS=()
 [ -n "${POSTGRES_ROOT:-}" ] && UNITS+=(description-postgres)
-[ -n "${SOLIDWORKS_SSH_HOST:-}" ] && UNITS+=(description-solidworks-tunnel)
-UNITS+=(description-airflow-dag-processor description-airflow-scheduler description-airflow-api-server)
+UNITS+=("${EXECUTORS[@]}")
 
 render_units() {
   mkdir -p "$TARGET"
@@ -62,11 +71,28 @@ render_units() {
   done
 }
 
+# Stop verification (stop-executors): the unit must be provably not running - exactly
+# "inactive", or "failed" (not running either way). An unreadable or transient state is a
+# refusal, so a swallowed or half-completed stop can never be recorded as a successful one.
+require_stopped() {
+  local unit="$1" state
+  state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+  case "$state" in
+    inactive|failed) echo "services.sh: $unit stopped (active_state=$state)"; return 0 ;;
+  esac
+  echo "services.sh: $unit is still ${state:-unknown} after the stop" >&2
+  return 1
+}
+
 case "$ACTION" in
   render) render_units ;;
   install) render_units; systemctl --user daemon-reload ;;
   start) for u in "${UNITS[@]}"; do systemctl --user enable --now "$u"; done ;;
-  stop) for ((i=${#UNITS[@]}-1; i>=0; i--)); do systemctl --user disable --now "${UNITS[$i]}" || true; done ;;
+  stop) for ((i=${#UNITS[@]}-1; i>=0; i--)); do systemctl --user disable --now "${UNITS[$i]}"; done ;;
+  stop-executors)
+    for ((i=${#EXECUTORS[@]}-1; i>=0; i--)); do systemctl --user disable --now "${EXECUTORS[$i]}"; done
+    for u in "${EXECUTORS[@]}"; do require_stopped "$u"; done
+    ;;
   status) systemctl --user status "${UNITS[@]}" --no-pager ;;
-  *) echo "usage: $0 render|install|start|stop|status" >&2; exit 2 ;;
+  *) echo "usage: $0 render|install|start|stop|stop-executors|status" >&2; exit 2 ;;
 esac

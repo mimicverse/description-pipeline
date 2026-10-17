@@ -11,7 +11,9 @@
 #   reconcile confirm and register external outcomes; never repeats unknown side effects
 #             (--install-id runs it from a staged candidate in a closed admission window)
 #   stage     build the two-end candidate installation (isolated targets)
-#   promote   switch both ends to the staged candidate (admission closed until verified)
+#   promote   switch both ends to the staged candidate (admission closed until verified);
+#             the execution units stop mid-window while the shared database stays up for
+#             the guarded migrations
 #   rollback  restore both ends from the recorded previous installation
 #
 #   operatorctl.sh <verb> --config FILE
@@ -1117,14 +1119,35 @@ PY
     fi
     promotion_step "$CANDIDATE_ID" promote backup completed \
       "$EVIDENCE_DIR/backup-manifest.json" "$EVIDENCE_DIR/backup-staging-removed.out"
-    # 4. both ends' execution services stop before the pointers move
+    # 4. both ends' execution services stop before the pointers move, while the shared
+    #    PostgreSQL (Airflow metadata + platform schema) stays up: the guarded migrations
+    #    below run against that same live database authority.  services.sh stop-executors
+    #    refuses a swallowed stop and proves its units stopped; portal and proxy are proven
+    #    here; the database readiness is proven last - every failure is recorded under this
+    #    step and stops the run before any migration or pointer movement.
     if ! {
-      airflow_lifecycle stop \
+      airflow_lifecycle stop-executors \
       && systemctl --user disable --now description-operator-proxy.service description-portal.service
     } > "$EVIDENCE_DIR/stop-services.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote stop-services failed "$EVIDENCE_DIR/stop-services.out"
       die "the execution services did not stop (the admission stays closed)"
     fi
+    for unit in description-portal.service description-operator-proxy.service; do
+      state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+      case "$state" in
+        inactive|failed)
+          echo "operatorctl: $unit stopped (active_state=$state)" >> "$EVIDENCE_DIR/stop-services.out" ;;
+        *)
+          echo "operatorctl: $unit is still ${state:-unknown} after the stop" >> "$EVIDENCE_DIR/stop-services.out"
+          promotion_step "$CANDIDATE_ID" promote stop-services failed "$EVIDENCE_DIR/stop-services.out"
+          die "the ingress services did not stop (the admission stays closed)" ;;
+      esac
+    done
+    if ! ( ensure_postgres_ready ) >> "$EVIDENCE_DIR/stop-services.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote stop-services failed "$EVIDENCE_DIR/stop-services.out"
+      die "the shared database is not ready for the guarded migrations (the admission stays closed)"
+    fi
+    echo "operatorctl: shared database ready for the guarded migrations" >> "$EVIDENCE_DIR/stop-services.out"
     promotion_step "$CANDIDATE_ID" promote stop-services completed "$EVIDENCE_DIR/stop-services.out"
     # 5. the candidate release's verified schema migrations run in the closed window, in the
     #    canonical order the installer uses: the Airflow metadata migration (the candidate

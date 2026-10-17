@@ -70,6 +70,7 @@ from ..platform.store import (
 )
 from ..ports import PORTAL_HTTP_PORT
 from .stage_transfer import TEAM_REPORTS
+from .freeze_retry import FreezeRetryRefusal, resolve_freeze_retry_identity
 from .feishu_oauth import (
     TRIGGERING_USER_NAME_DELIMITER,
     TRIGGERING_USER_NAME_LIMIT,
@@ -1481,6 +1482,12 @@ class PortalApp:
                 target_hardware=receipt.target_hardware or "",
                 main_assembly=receipt.main_assembly or "",
                 configuration={"purpose": purpose},
+                baseline={
+                    "handoff_sha256": receipt.handoff_sha256,
+                    "files": receipt.files,
+                    "bytes": receipt.bytes,
+                    "folder": receipt.folder,
+                },
                 dispatch={
                     "stage": "capture",
                     "operation_key": f"portal-{dag_run_id}/capture:0",
@@ -1895,7 +1902,7 @@ class PortalApp:
             # Display rename / reversible tombstone; an unreadable ledger fails closed above.
             **self._metadata_overlay(dag_run_id),
         }
-        rerun_rows = self._rerun_rows(run_id)
+        rerun_rows = self._rerun_rows(run_id, conf)
         if rerun_rows is not None:
             payload["stage_reruns"] = rerun_rows
         return _json_response(start_response, 200, payload, self.config)
@@ -2015,7 +2022,49 @@ class PortalApp:
         )
 
     # ------------------------------------------------------------- rerun
-    def _rerun_rows(self, native_id: str) -> list[dict] | None:
+    # ------------------------------------------------- freeze retry stand
+    def _freeze_retry_stand(self, native_id: str, conf: dict | None) -> tuple[bool, str, str] | None:
+        """The Linux-owned freeze-retry stand of one parent, from registered facts only.
+
+        ``None`` keeps the existing stage row untouched (the parent is not a
+        terminal freeze failure).  Otherwise the verdict replaces the freeze row:
+        the one resolver proves the sealed intake against the registered identity
+        (the request baseline when present, the bound failure evidence otherwise)
+        and any missing or changed original refuses instead of being silently
+        resealed.
+        """
+
+        record = self._platform_read(lambda: self._platform().run_record(native_id))
+        if not isinstance(record, dict) or record.get("state") != "failed":
+            return None
+        stages = self._platform_read(lambda: self._platform().stage_records(native_id))
+        freeze_row = stages.get("freeze") if isinstance(stages, dict) else None
+        if not (isinstance(freeze_row, dict) and freeze_row.get("state") == "failed"):
+            return None
+        parent_dag_run_id = self._admitted_dag_run_id(record.get("request_id"))
+        if parent_dag_run_id is None:
+            return (False, "originals_identity_missing", "原运行缺少可恢复的调度身份，拒绝从“冻结输入”重跑")
+        handoff_path = _optional_str(conf.get("handoff_path")) if isinstance(conf, dict) else None
+        if handoff_path is None:
+            return (False, "incomplete", "原运行缺少可复用的上传目录，无法从此步骤重新运行")
+        try:
+            resolve_freeze_retry_identity(
+                self._platform(),
+                native_id,
+                parent_dag_run_id=parent_dag_run_id,
+                expected_dag_id=self.config.dag_id,
+                intake_path=Path(handoff_path),
+                intake_root=self.config.upload_root,
+            )
+        except FreezeRetryRefusal as refusal:
+            return (False, refusal.reason, refusal.reason_zh)
+        except PlatformStoreError as error:
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+            ) from error
+        return (True, "linux_ready", "可在 Linux 重跑“冻结输入”并复用已封存原件")
+
+    def _rerun_rows(self, native_id: str, conf: dict | None = None) -> list[dict] | None:
         """Finished stage-rerun availability rows; unavailable data is omitted, never faked."""
         plan = getattr(self._endpoint(), "rerun_plan", None)
         rows = None
@@ -2071,6 +2120,21 @@ class PortalApp:
                 # Clear it instead of inventing Linux receipt evidence.
                 prerequisites=[],
             )
+        verdict = self._freeze_retry_stand(native_id, conf) if conf is not None else None
+        if verdict is not None:
+            eligible, reason, reason_zh = verdict
+            for row in rows:
+                if row.get("stage") != "freeze":
+                    continue
+                row.update(
+                    eligible=eligible,
+                    reason=reason,
+                    reason_zh=reason_zh,
+                    recomputes=list(_STAGE_IDS) if eligible else [],
+                    retains=[],
+                    prerequisites={},
+                )
+                break
         return rows
 
     def _child_run(self, session: PortalSession, dag_run_id: str) -> dict | None:
@@ -2343,7 +2407,7 @@ class PortalApp:
                             active_dag_run_id=child_id,
                         )
                     reserved_id = child_id
-                rows = self._rerun_rows(native_run_id(dag_run_id))
+                rows = self._rerun_rows(native_run_id(dag_run_id), parent_conf)
                 if rows is None:
                     return self._rerun_refusal(
                         start_response,
@@ -2380,6 +2444,34 @@ class PortalApp:
                 }
                 if parent_assembly is not None:
                     conf["main_assembly"] = parent_assembly
+                admit_baseline: dict | None = None
+                if reserved_id is None and stage == "freeze":
+                    try:
+                        resolved = resolve_freeze_retry_identity(
+                            self._platform(),
+                            native_run_id(dag_run_id),
+                            parent_dag_run_id=dag_run_id,
+                            expected_dag_id=self.config.dag_id,
+                            intake_path=Path(handoff_path),
+                            intake_root=self.config.upload_root,
+                        )
+                    except FreezeRetryRefusal as refusal:
+                        return self._rerun_refusal(start_response, refusal.reason, refusal.reason_zh, None)
+                    except PlatformStoreError:
+                        return _json_response(
+                            start_response,
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "平台服务暂不可用，本次重新运行未接纳"},
+                            self.config,
+                        )
+                    admit_baseline = {
+                        "handoff_sha256": resolved.handoff_sha256,
+                        "files": resolved.files,
+                        "bytes": resolved.bytes,
+                        "folder": resolved.folder,
+                    }
+                    if resolved.provenance is not None:
+                        admit_baseline["provenance"] = resolved.provenance
                 if reserved_id is None:
                     # The canonical admission registers the new request, its linked run and
                     # the initial dispatch intent in one gate-locked transaction - before
@@ -2392,6 +2484,7 @@ class PortalApp:
                             target_hardware=target_hardware,
                             main_assembly=parent_assembly or "",
                             configuration={"purpose": purpose},
+                            baseline=admit_baseline,
                             dispatch={
                                 "stage": stage,
                                 "operation_key": f"portal-{new_run_id}/{stage}:0",
