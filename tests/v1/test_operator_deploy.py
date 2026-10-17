@@ -53,6 +53,14 @@ CONTROL = OPERATOR / "operatorctl.sh"
 HEALTH = OPERATOR / "health.sh"
 HEALTH_GATE = OPERATOR / "health_gate.sh"
 
+# Copied byte-for-byte from the W5 v8r5 R2 Windows response (including CRLF). The Windows
+# lifecycle's Die helper emits this passed:false object and exits 1; ssh preserves rc 1.
+CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH = (
+    '{"message":"the staged candidate configuration differs from the staged digest: '
+    'C:\\\\description-v1-review\\\\endpoint-state\\\\lifecycle\\\\gen150-f2c5463\\\\generation\\\\endpoint.json",'
+    '"code":"candidate_config_mismatch","verb":"promote","passed":false}\r\n'
+)
+
 
 def base_env(state: Path, **overrides: str) -> dict[str, str]:
     env = {
@@ -751,6 +759,10 @@ class LifecycleTests(unittest.TestCase):
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
+            '    if [ -n "${FIXTURE_PROMOTE_OUTPUT:-}" ]; then\n'
+            '      cat "$FIXTURE_PROMOTE_OUTPUT"\n'
+            '      exit "${FIXTURE_PROMOTE_RC:-0}"\n'
+            '    fi\n'
             '    if [ "${FIXTURE_FAIL_PROMOTE:-0}" = "1" ]; then\n'
             "      echo '{\"passed\":false,\"verb\":\"promote\",\"code\":\"probe\",\"message\":\"refused\"}'; exit 0\n"
             '    fi\n'
@@ -1993,6 +2005,10 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
+            '    if [ -n "${FIXTURE_PROMOTE_OUTPUT:-}" ]; then\n'
+            '      cat "$FIXTURE_PROMOTE_OUTPUT"\n'
+            '      exit "${FIXTURE_PROMOTE_RC:-0}"\n'
+            '    fi\n'
             '    if [ "${FIXTURE_FAIL_PROMOTE:-0}" = "1" ]; then\n'
             "      echo '{\"passed\":false,\"verb\":\"promote\",\"code\":\"probe\",\"message\":\"refused\"}'; exit 0\n"
             '    fi\n'
@@ -2602,6 +2618,10 @@ class InstallOrderingTests(unittest.TestCase):
                 ],
             )
             self.assertEqual({row["status"] for row in receipt["steps"]}, {"completed"})
+            self.assertEqual(
+                (state / "promotions" / "gen-2" / "windows-promote.out.ssh-rc").read_text(encoding="utf-8"),
+                "0\n",
+            )
             # The candidate's verified migrations run after both ends stopped and before
             # either pointer moves (deployment.md).
             steps = [row["step"] for row in receipt["steps"] if row["verb"] == "promote"]
@@ -2735,6 +2755,63 @@ class InstallOrderingTests(unittest.TestCase):
             )
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
 
+    def test_cold_stage_promote_uses_database_and_restarts_only_after_switch(self) -> None:
+        """The sealed recovery state can stage and promote without restoring old executors.
+
+        PostgreSQL stays authoritative and active; the Airflow, tunnel, portal and proxy units
+        are initially inactive. Stage reads the running record and database only. Promote's own
+        start-services step brings the candidate up after both pointers and identity verify.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            units = state.parent / "unit-state"
+            for unit in (
+                "description-solidworks-tunnel",
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+                "description-portal",
+                "description-operator-proxy",
+            ):
+                (units / unit).write_text("inactive", encoding="utf-8")
+            self.assertEqual((units / "description-postgres").read_text(encoding="utf-8"), "active")
+
+            order.write_text("", encoding="utf-8")
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self.assertNotIn("services_start", order.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {path.name: path.read_text(encoding="utf-8") for path in units.glob("description-*")},
+                {
+                    "description-postgres": "active",
+                    "description-solidworks-tunnel": "inactive",
+                    "description-airflow-dag-processor": "inactive",
+                    "description-airflow-scheduler": "inactive",
+                    "description-airflow-api-server": "inactive",
+                    "description-portal": "inactive",
+                    "description-operator-proxy": "inactive",
+                },
+            )
+
+            self._clone_generation_stubs(state)
+            self._health_double(release, control_env)
+            self._linux_health_double(release)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertEqual(
+                json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"],
+                "gen-2",
+            )
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["stop-services"], "completed")
+            self.assertEqual(steps["start-services"], "completed")
+            self.assertEqual(steps["open-admission"], "completed")
+
     def test_promote_failure_keeps_the_admission_closed_and_records_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
@@ -2756,6 +2833,177 @@ class InstallOrderingTests(unittest.TestCase):
             steps = {row["step"]: row["status"] for row in receipt["steps"]}
             self.assertEqual(steps["windows-switch"], "failed")
             self.assertNotIn("open-admission", steps)
+
+    def test_windows_structured_refusal_with_ssh_rc_one_is_recorded_failed(self) -> None:
+        """The real PowerShell refusal and its rc 1 are one definite pre-switch refusal.
+
+        The Windows Die helper emits the captured JSON and exits 1, which SSH preserves.
+        Parsing only after a zero-exit test previously discarded that evidence and recorded
+        the switch as unknown. The active pointer, admission and token must remain untouched.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            refusal = Path(tmp) / "captured-windows-refusal.out"
+            refusal.write_bytes(CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH.encode("utf-8"))
+            self.assertEqual(len(CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH.encode("utf-8")), 245)
+            record_before = (state / "install-record.json").read_bytes()
+            binding_before = (state / "promotions" / "gen-2" / "windows-binding.json").read_bytes()
+            token_before = (Path(tmp) / "token").read_bytes()
+            order.write_text("", encoding="utf-8")
+
+            refused = self._maintenance(
+                release,
+                dict(
+                    control_env,
+                    FIXTURE_PROMOTE_OUTPUT=str(refusal),
+                    FIXTURE_PROMOTE_RC="1",
+                ),
+                "promote",
+                "gen-2",
+            )
+
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("definite refusal", refused.stderr)
+            self.assertIn("Windows switch failed", refused.stderr)
+            self.assertNotIn("unacknowledged", refused.stderr)
+            self.assertEqual((state / "install-record.json").read_bytes(), record_before)
+            self.assertEqual((state / "promotions" / "gen-2" / "windows-binding.json").read_bytes(), binding_before)
+            self.assertEqual((Path(tmp) / "token").read_bytes(), token_before)
+            self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true")
+            self.assertEqual(
+                (state / "promotions" / "gen-2" / "windows-promote.out").read_bytes(),
+                refusal.read_bytes(),
+            )
+            self.assertEqual(
+                (state / "promotions" / "gen-2" / "windows-promote.out.ssh-rc").read_text(encoding="utf-8"),
+                "1\n",
+            )
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["windows-switch"], "failed")
+            self.assertNotIn("open-admission", steps)
+            self.assertNotIn("platform open_admission", order.read_text(encoding="utf-8"))
+
+    def test_windows_lost_or_contradictory_results_stay_unknown(self) -> None:
+        cases = (
+            ("lost-transport", 255, CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH),
+            ("malformed", 1, "not-json\r\n"),
+            ("empty", 1, ""),
+            ("wrong-verb", 1, '{"passed":false,"code":"refused","verb":"stage"}\r\n'),
+            ("success-on-nonzero", 1, '{"passed":true,"verb":"promote"}\r\n'),
+        )
+        for label, remote_rc, response in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                release, control_env, order = self._prepare(
+                    Path(tmp), fresh=False, ready_after=1, db_exists=True
+                )
+                self.assertEqual(self._install(release, control_env).returncode, 0)
+                state = Path(tmp) / "state"
+                control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                    state, "gen-1", "PLATFORM_OPERATOR_DSN"
+                )
+                self._health_double(release, control_env)
+                self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+                self._clone_generation_stubs(state)
+                output = Path(tmp) / "windows-response.out"
+                output.write_text(response, encoding="utf-8")
+                record_before = (state / "install-record.json").read_bytes()
+                token_before = (Path(tmp) / "token").read_bytes()
+                order.write_text("", encoding="utf-8")
+
+                result = self._maintenance(
+                    release,
+                    dict(
+                        control_env,
+                        FIXTURE_PROMOTE_OUTPUT=str(output),
+                        FIXTURE_PROMOTE_RC=str(remote_rc),
+                    ),
+                    "promote",
+                    "gen-2",
+                )
+
+                self.assertEqual(result.returncode, 1, f"{label}: {result.stdout}{result.stderr}")
+                self.assertIn("unacknowledged", result.stderr, label)
+                self.assertEqual((state / "install-record.json").read_bytes(), record_before, label)
+                self.assertEqual((Path(tmp) / "token").read_bytes(), token_before, label)
+                self.assertEqual((Path(tmp) / "admission").read_text().strip(), "true", label)
+                receipt = json.loads(
+                    (state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8")
+                )
+                steps = {row["step"]: row["status"] for row in receipt["steps"]}
+                self.assertEqual(steps["windows-switch"], "unknown", label)
+                self.assertNotIn("open-admission", steps, label)
+                self.assertNotIn("platform open_admission", order.read_text(encoding="utf-8"), label)
+                self.assertEqual(
+                    (state / "promotions" / "gen-2" / "windows-promote.out.ssh-rc").read_text(encoding="utf-8"),
+                    f"{remote_rc}\n",
+                    label,
+                )
+
+    def test_unwritable_existing_lifecycle_output_is_not_read_as_fresh_evidence(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root can truncate a 0444 file; the permission negative control needs an unprivileged user")
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            output = state / "promotions" / "gen-2" / "windows-promote.out"
+            output.write_bytes(CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH.encode("utf-8"))
+            output.chmod(0o444)
+            record_before = (state / "install-record.json").read_bytes()
+            token_before = (Path(tmp) / "token").read_bytes()
+            order.write_text("", encoding="utf-8")
+
+            result = self._maintenance(release, control_env, "promote", "gen-2")
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("unacknowledged", result.stderr)
+            self.assertEqual(output.read_bytes(), CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH.encode("utf-8"))
+            self.assertEqual((state / "install-record.json").read_bytes(), record_before)
+            self.assertEqual((Path(tmp) / "token").read_bytes(), token_before)
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["windows-switch"], "unknown")
+            self.assertNotIn("platform open_admission", order.read_text(encoding="utf-8"))
+
+    def test_lifecycle_exit_status_evidence_write_failure_stays_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            output = state / "promotions" / "gen-2" / "windows-promote.out"
+            output.write_bytes(CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH.encode("utf-8"))
+            (state / "promotions" / "gen-2" / "windows-promote.out.ssh-rc").mkdir()
+            record_before = (state / "install-record.json").read_bytes()
+            token_before = (Path(tmp) / "token").read_bytes()
+            order.write_text("", encoding="utf-8")
+
+            result = self._maintenance(release, control_env, "promote", "gen-2")
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("unacknowledged", result.stderr)
+            self.assertEqual(output.read_bytes(), b"", "the stale refusal must be truncated before the rc write fails")
+            self.assertEqual((state / "install-record.json").read_bytes(), record_before)
+            self.assertEqual((Path(tmp) / "token").read_bytes(), token_before)
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(steps["windows-switch"], "unknown")
+            self.assertNotIn("platform open_admission", order.read_text(encoding="utf-8"))
 
     def test_promote_stop_failure_stays_closed_without_switching(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
