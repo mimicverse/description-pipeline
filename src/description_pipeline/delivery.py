@@ -14,8 +14,8 @@ from .schemas import DELIVERY_MANIFEST_SCHEMA
 
 PIPELINE_ID = "solidworks-to-urdf"
 
-#: Publication bundle identity, retained until the producer side switches to the
-#: delivery manifest in the same integration batch.
+#: Native capture / transfer bundle identity.  The delivery manifest is the
+#: separate model-delivery authority; this identity covers the native exchange.
 BUNDLE_SCHEMA = "solidworks-to-urdf.bundle/v1"
 
 SUBJECT_DIRECTORIES = ("input", "evidence", "model", "urdf", "meshes")
@@ -27,10 +27,8 @@ QUALITY_REPORT = "reports/quality.json"
 SOURCE_RECORD = "input/source.json"
 TOOL_RECORD = "tool.json"
 
-#: Legacy receipts that now live in platform run storage.  Constants stay
-#: importable until the producer side switches in the same integration batch.
+#: The immutable native provenance triplet consumed by capture transfer.
 TRANSFER_FILES = ("reports/native-tool.json", "reports/native-stages.json", "transfer-manifest.json")
-MASS_CLOSURE_REPORT = "reports/mass-closure.json"
 
 #: Entries a stamped pipeline output root may carry beyond the strict delivery
 #: layout: the rendered reports directory, the sealed transfer sidecar and the

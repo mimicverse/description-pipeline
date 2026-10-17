@@ -48,10 +48,12 @@ Check 'wording.no_blind_sleep' (-not $source.Contains('Start-Sleep -Seconds 60')
 Check 'wording.owner_proof_gate' ($source.Contains('lock_refused_unproven') -and $source.Contains('owner_ended'))
 Check 'wording.observer_tristate' ($source.Contains('observer_failed') -and $source.Contains('PROBE_IMPORT_FAILED'))
 Check 'wording.restore_path' ($source.Contains('Restore-PreviousEndpoint') -and $source.Contains('restore=$restore'))
-Check 'wording.stage_candidate_transform' ($source.Contains('Get-EndpointConfigTransformProgram') -and
-  $source.Contains('endpoint_config_unknown_keys') -and $source.Contains('config-transformation.json') -and
+Check 'wording.stage_candidate_generation' ($source.Contains('Get-EndpointConfigCandidateProgram') -and
+  $source.Contains('endpoint_config_unknown_keys') -and $source.Contains('candidate-identity.json') -and
   $source.Contains('candidate_config_mismatch'))
 Check 'wording.old_copy_removed' (-not $source.Contains('Copy-Item -LiteralPath (Action-Config $task)')) 'the byte-copy stage path is still present'
+Check 'wording.compat_tolerance_removed' ((-not $source.Contains('REMOVED_KEYS')) -and (-not $source.Contains('removed_keys'))) 'the removed-key tolerance channel is still present'
+Check 'wording.transform_receipt_removed' ((-not $source.Contains('config-transformation.json')) -and (-not $source.Contains('stage-config-transform'))) 'the obsolete transform receipt is still present'
 Check 'wording.no_lock_or_kill' (-not $source.Contains('Remove-Item -LiteralPath $lock')) 'never delete the ownership lock'
 Check 'wording.no_system_text_json' (-not $source.Contains('System.Text.Json')) 'a Core-only JSON type the Desktop PowerShell 5.1 lifecycle cannot load is still present'
 Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfigScanPython') -and
@@ -67,7 +69,7 @@ if ($StaticOnly) {
 . $ScriptPath -Verb health -Binding @{ task_name = 'test-endpoint' }
 $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay', 'Read-LockOwner',
   'Get-ProcessFacts', 'Test-LockProbeHeld', 'Restore-PreviousEndpoint', 'Write-LockRefusalReceipt',
-  'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigTransformProgram',
+  'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
   'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
@@ -82,7 +84,7 @@ function Write-IJson([string]$name, [string]$text) {
   [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
   return $path
 }
-$validPath = Write-IJson 'valid.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","package_root":"C:/pkg","output_root":"C:/out","state_root":"C:/state","token_file":"C:/state/token","host":"127.0.0.1","port":8765,"targets":{}}'
+$validPath = Write-IJson 'valid.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","package_root":"C:/pkg","output_root":"C:/out","state_root":"C:/state","token_file":"C:/state/token","host":"127.0.0.1","port":8765}'
 $problems = Get-EndpointConfigEarlyProblems $validPath
 Check 'json.valid_clean' (($problems.unreadable -eq '') -and (@($problems.duplicates).Count -eq 0) -and (@($problems.unknown).Count -eq 0))
 $duplicatePath = Write-IJson 'duplicate.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","port":8765,"port":8766}'
@@ -100,9 +102,9 @@ Check 'json.nonfinite_unreadable' ($problems.unreadable -ne '')
 $arrayPath = Write-IJson 'array.json' '[1, 2]'
 $problems = Get-EndpointConfigEarlyProblems $arrayPath
 Check 'json.nonobject_unreadable' ($problems.unreadable -ne '')
-$removedPath = Write-IJson 'removed.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","targets":{}}'
-$problems = Get-EndpointConfigEarlyProblems $removedPath
-Check 'json.removed_key_tolerated' (($problems.unreadable -eq '') -and (@($problems.unknown).Count -eq 0))
+$retiredPath = Write-IJson 'retired.json' '{"schema_version":"solidworks-to-urdf.endpoint/v1","targets":{}}'
+$problems = Get-EndpointConfigEarlyProblems $retiredPath
+Check 'json.retired_key_refused' (($problems.unreadable -eq '') -and (@($problems.unknown) -contains 'targets') -and (@($problems.duplicates).Count -eq 0))
 $problems = Get-EndpointConfigEarlyProblems (Join-Path $jsonRoot 'missing.json')
 Check 'json.missing_silent' (($problems.unreadable -eq '') -and (@($problems.duplicates).Count -eq 0) -and (@($problems.unknown).Count -eq 0))
 Remove-Item -LiteralPath $jsonRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -225,14 +227,14 @@ function Reset-State {
 Reset-State
 $cleanConfig = Join-Path $generation 'clean-endpoint.json'
 [System.IO.File]::WriteAllText($cleanConfig, '{"schema_version":"solidworks-to-urdf.endpoint/v1","port":8765}')
-$legacyConfig = Join-Path $generation 'legacy-endpoint.json'
-[System.IO.File]::WriteAllText($legacyConfig, '{"schema_version":"solidworks-to-urdf.endpoint/v1","targets":{}}')
+$retiredConfig = Join-Path $generation 'retired-endpoint.json'
+[System.IO.File]::WriteAllText($retiredConfig, '{"schema_version":"solidworks-to-urdf.endpoint/v1","targets":{}}')
 $unknownConfig = Join-Path $generation 'unknown-endpoint.json'
 [System.IO.File]::WriteAllText($unknownConfig, '{"schema_version":"solidworks-to-urdf.endpoint/v1","bogus_key":true}')
 $duplicateConfig = Join-Path $generation 'duplicate-endpoint.json'
 [System.IO.File]::WriteAllText($duplicateConfig, '{"schema_version":"solidworks-to-urdf.endpoint/v1","port":8765,"port":8766}')
-$legacyProblems = Get-EndpointConfigEarlyProblems $legacyConfig
-Check 'early.targets_known_removable' ((@($legacyProblems.unknown).Count -eq 0) -and (@($legacyProblems.duplicates).Count -eq 0))
+$retiredProblems = Get-EndpointConfigEarlyProblems $retiredConfig
+Check 'early.retired_key_refused' (((@($retiredProblems.unknown) -contains 'targets')) -and (@($retiredProblems.duplicates).Count -eq 0))
 Check 'early.clean_config' ((@((Get-EndpointConfigEarlyProblems $cleanConfig).unknown).Count -eq 0))
 Check 'early.unknown_reported' ((@((Get-EndpointConfigEarlyProblems $unknownConfig).unknown) -contains 'bogus_key'))
 Check 'early.duplicate_reported' ((@((Get-EndpointConfigEarlyProblems $duplicateConfig).duplicates) -contains 'port'))
@@ -496,6 +498,10 @@ Check 'outer.missing_receipt_health_unjudged' ((@($outer.calls | Where-Object { 
 $outer = Invoke-Outer 'stage_unknown_key_refused'
 Check 'outer.stage_unknown_key_refused' (($outer.message -match 'endpoint_config_unknown_keys') -and
   ($outer.message -match 'bogus_key') -and (@($outer.calls).Count -eq 0))
+
+$outer = Invoke-Outer 'stage_legacy_targets_refused'
+Check 'outer.stage_legacy_targets_refused' (($outer.message -match 'endpoint_config_unknown_keys') -and
+  ($outer.message -match 'targets') -and (@($outer.calls).Count -eq 0))
 
 $outer = Invoke-Outer 'stage_duplicate_key_refused'
 Check 'outer.stage_duplicate_key_refused' (($outer.message -match 'endpoint_config_duplicate_keys') -and

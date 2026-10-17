@@ -1453,7 +1453,7 @@ function previewCollapseKey(runId) {
   return `preview-collapsed:${runId}`;
 }
 
-// The 1.4.2 default: with a verified delivery the interactive preview is expanded, and the
+// The default behavior: with a verified delivery the interactive preview is expanded, and the
 // collapse control is the only way back; entering the generate-URDF block re-expands it.
 function applyPreviewExpansion() {
   const expansion = previewExpansion({

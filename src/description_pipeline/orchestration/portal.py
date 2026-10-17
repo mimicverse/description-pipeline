@@ -679,14 +679,6 @@ def _upload_concurrency(section: dict) -> int:
     return value
 
 
-@dataclass
-class PortalRun:
-    dag_run_id: str
-    handoff_path: str
-    principal: str
-    started_at: float
-
-
 def _actor_identity(actor: object) -> tuple[str | None, str | None]:
     """Split one Airflow actor value into its stable principal and recorded display name.
 
@@ -714,18 +706,6 @@ def _actor_identity(actor: object) -> tuple[str | None, str | None]:
         # A well-formed principal plus a damaged name keeps the principal and records no name.
         return principal, name or None
     return text, None
-
-
-def _run_identity(actor: object, record: PortalRun | None) -> tuple[str | None, str | None]:
-    """One run's stable principal and recorded Feishu name, from Airflow's own record only.
-
-    The in-memory record may only supply a missing principal for a run this process just
-    started; a display name is never taken from portal memory.
-    """
-    principal, name = _actor_identity(actor)
-    if principal is None and record is not None:
-        return record.principal, None
-    return principal, name
 
 
 def _optional_str(value: object) -> str | None:
@@ -1096,7 +1076,6 @@ class PortalApp:
         self.config = config
         self.sessions = SessionStore(config.session_ttl)
         self._lock = threading.Lock()
-        self._runs: dict[str, PortalRun] = {}
         self._previews: dict[str, tuple[float, dict]] = {}
         self._upload_gate = UploadGate(config.upload_concurrency)
         self._rerun_lock = threading.Lock()
@@ -1321,8 +1300,6 @@ class PortalApp:
         include_deleted = str((query.get("include_deleted") or [""])[0]).lower() in {"1", "true"}
         metadata = self._metadata_snapshot()
         principal, is_admin = self._viewer_identity(session)
-        with self._lock:
-            local = {run.dag_run_id: run for run in self._runs.values()}
         runs: list[dict] = []
         seen: set[str] = set()
         # Scan past recently deleted runs so tombstones never push older runs off the page.
@@ -1351,16 +1328,15 @@ class PortalApp:
                 if not dag_run_id or dag_run_id in seen:
                     continue
                 seen.add(dag_run_id)
-                record = local.get(dag_run_id)
                 conf = item.get("conf") if isinstance(item.get("conf"), dict) else {}
-                owner, name = _run_identity(item.get("triggering_user_name"), record)
+                owner, name = _actor_identity(item.get("triggering_user_name"))
                 overlay = metadata.get(native_run_id(dag_run_id)) or _EMPTY_OVERLAY
                 if overlay["deleted"] and not include_deleted:
                     continue
                 runs.append(
                     {
                         "dag_run_id": dag_run_id,
-                        "handoff_path": conf.get("handoff_path") or (record.handoff_path if record else None),
+                        "handoff_path": conf.get("handoff_path"),
                         # The recorded initiator, never the current viewer; missing names stay null.
                         "user": name,
                         # Airflow's own record outlives any portal restart.
@@ -1378,28 +1354,6 @@ class PortalApp:
                 )
             if len(runs) >= required or len(items) < page_size:
                 break
-        for record in sorted(local.values(), key=lambda item: item.started_at, reverse=True):
-            if record.dag_run_id not in seen:
-                overlay = metadata.get(native_run_id(record.dag_run_id)) or _EMPTY_OVERLAY
-                if overlay["deleted"] and not include_deleted:
-                    continue
-                runs.append(
-                    {
-                        "dag_run_id": record.dag_run_id,
-                        "handoff_path": record.handoff_path,
-                        # No in-memory name fallback: the authoritative run record is the only
-                        # source for a displayed submitter.
-                        "user": None,
-                        "principal": record.principal,
-                        "state": None,
-                        "started_at": datetime.fromtimestamp(record.started_at, UTC).isoformat(),
-                        "parent_dag_run_id": None,
-                        "resume_from": None,
-                        "resume_from_name_zh": None,
-                        "can_manage": is_admin or record.principal == principal,
-                        **overlay,
-                    }
-                )
         page_runs = runs[offset : offset + limit]
         return _json_response(
             start_response,
@@ -1542,13 +1496,6 @@ class PortalApp:
                 {"error": "平台服务暂不可用，本次提交未接纳", "dag_run_id": dag_run_id},
                 self.config,
             )
-        with self._lock:
-            self._runs[dag_run_id] = PortalRun(
-                dag_run_id=dag_run_id,
-                handoff_path=handoff_path,
-                principal=session.principal,
-                started_at=time.time(),
-            )
         outcome = self._trigger_uploaded_run(
             session,
             dag_run_id,
@@ -1690,9 +1637,7 @@ class PortalApp:
             raise PortalError(HTTPStatus.NOT_FOUND if missing else HTTPStatus.BAD_GATEWAY, str(error)) from error
 
     def _actor_label(self, session: PortalSession, dag_run_id: str, run: dict) -> str:
-        with self._lock:
-            record = self._runs.get(dag_run_id)
-        principal, name = _run_identity(run.get("triggering_user_name"), record)
+        principal, name = _actor_identity(run.get("triggering_user_name"))
         return name or principal or session.principal
 
     def _rename_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
@@ -1831,9 +1776,7 @@ class PortalApp:
         except EndpointError as error:
             endpoint_error = str(error)
         conf = airflow_run.get("conf") if isinstance(airflow_run.get("conf"), dict) else {}
-        with self._lock:
-            record = self._runs.get(dag_run_id)
-        principal, operator = _run_identity(airflow_run.get("triggering_user_name"), record)
+        principal, operator = _actor_identity(airflow_run.get("triggering_user_name"))
         retry = _retry_assessment(airflow_run, tasks, job, endpoint_error)
         recovery = self._platform_read(lambda: self._platform().run_record(run_id))
         recovery_block = _registered_recovery_block(recovery)
