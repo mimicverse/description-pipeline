@@ -64,6 +64,7 @@ class RunMetadataTests(unittest.TestCase):
             upload_root=self.upload_root,
             platform_store=store if store is not None else self.platform,
             pipeline_targets=TEST_TARGETS,
+            config_identity_provider=lambda: "c" * 64,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler

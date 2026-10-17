@@ -785,12 +785,6 @@ def config_reference_cli(argv=None) -> int:
     config = config_from_airflow_connection(args.conn_id, state_root=args.state_root)
     print(f"config_digest={config.config_digest}")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(config_reference_cli())
-
-
 @dataclass(frozen=True, slots=True)
 class SelectionSnapshot:
     """Validated selection block of one endpoint job snapshot."""
@@ -1639,3 +1633,7 @@ _OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}), _SameHostRedirect
 
 def _opener(request: urlrequest.Request, timeout: float):
     return _OPENER.open(request, timeout=timeout)
+
+
+if __name__ == "__main__":
+    raise SystemExit(config_reference_cli())

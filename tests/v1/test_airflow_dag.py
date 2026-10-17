@@ -188,7 +188,7 @@ class DagTests(unittest.TestCase):
                 with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
                     dag.task_dict["freeze"].python_callable(**context(conf))
 
-    def test_freeze_requires_the_controlled_config_digest(self) -> None:
+    def test_freeze_requires_the_admitted_config_digest(self) -> None:
         import shutil
         import tempfile
 
@@ -205,7 +205,7 @@ class DagTests(unittest.TestCase):
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
-            config_digest="c" * 64,
+            config_digest="a" * 64,
         )
 
         class Stub:
@@ -227,6 +227,15 @@ class DagTests(unittest.TestCase):
             "change_summary": "x",
             "request_id": "portal-upload-digest",
         }
+        baseline: dict[str, dict | None] = {"value": None}
+
+        class Platform:
+            def run_record(self, run_id):
+                return {"request_id": "portal-upload-digest"}
+
+            def request_record(self, request_id):
+                return {"baseline": baseline["value"]}
+
         converged = []
         with (
             patch.object(
@@ -234,20 +243,21 @@ class DagTests(unittest.TestCase):
                 "_converge_early_freeze_failure",
                 side_effect=lambda run_id, error: converged.append((run_id, str(error))),
             ),
+            patch.object(
+                module,
+                "_store_only_platform_binding",
+                return_value=(Platform(), root),
+            ),
             patch.object(module, "_endpoint", return_value=Stub()),
             patch.object(module, "config_from_airflow_connection", return_value=config),
-            patch.dict(os.environ, {}, clear=False),
         ):
-            os.environ.pop("PLATFORM_CONFIG_DIGEST", None)
-            with self.assertRaisesRegex(AirflowFailException, "PLATFORM_CONFIG_DIGEST is unavailable"):
+            with self.assertRaisesRegex(AirflowFailException, "carries no platform configuration identity"):
                 dag.task_dict["freeze"].python_callable(**context(dict(base)))
-            with (
-                self.assertRaisesRegex(AirflowFailException, "does not match"),
-                patch.dict(os.environ, {"PLATFORM_CONFIG_DIGEST": "a" * 64}),
-            ):
+            baseline["value"] = {"platform_config_digest": "a" * 64}
+            with self.assertRaisesRegex(AirflowFailException, "does not match"):
                 dag.task_dict["freeze"].python_callable(**context({**base, "platform_config_digest": "b" * 64}))
         self.assertEqual(len(converged), 2, "both early refusals must converge the admitted run as failed")
-        self.assertIn("PLATFORM_CONFIG_DIGEST is unavailable", converged[0][1])
+        self.assertIn("carries no platform configuration identity", converged[0][1])
         self.assertIn("does not match", converged[1][1])
 
     def test_dag_parses(self) -> None:
@@ -547,6 +557,136 @@ class DagTests(unittest.TestCase):
             module._linked_selection(None, "other.SLDASM")
         with self.assertRaises(EndpointProtocolError):
             module._linked_selection("parent.SLDASM", "../other.SLDASM")
+
+    def test_admitted_freeze_uses_its_baseline_digest_after_active_changes(self) -> None:
+        import shutil
+        import tempfile
+        from types import SimpleNamespace
+
+        from description_pipeline.orchestration.airflow_client import EndpointConfig, native_run_id
+
+        module = self._module()
+        dag = module.dag
+        store_root = Path(tempfile.mkdtemp(prefix="dag-admitted-freeze-"))
+        self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
+        intake = store_root / "intake"
+        intake.mkdir()
+        (intake / "assembly.SLDASM").write_bytes(b"assembly")
+        dag_run_id = "portal-admitted-freeze"
+        run_id = native_run_id(dag_run_id)
+        request_id = "portal-admitted-request"
+        baseline_digest = "a" * 64
+        started: list[str] = []
+        confirmed: list[dict] = []
+        platform = SimpleNamespace(
+            run_record=lambda value: {"request_id": request_id} if value == run_id else None,
+            request_record=lambda value: {"baseline": {"platform_config_digest": baseline_digest}},
+            start_run=lambda value: started.append(value),
+            confirmed_stage=lambda *args, **kwargs: None,
+            confirm_stage=lambda **payload: confirmed.append(payload),
+            stage_records=lambda value: {},
+        )
+        config = EndpointConfig(
+            "http://127.0.0.1:1",
+            "t" * 32,
+            targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+            store_root=store_root,
+            config_digest=baseline_digest,
+        )
+        observed_digests: list[str | None] = []
+
+        def resolve(_conn_id, *, config_digest=None, **_kwargs):
+            observed_digests.append(config_digest)
+            if config_digest is None:
+                raise AssertionError("ordinary freeze consulted the changed active pointer")
+            self.assertEqual(config_digest, baseline_digest)
+            return config
+
+        endpoint = SimpleNamespace(authorized_intake_dir=lambda path: intake)
+        context = {
+            "dag_run": SimpleNamespace(
+                conf={
+                    "target_hardware": "m3.0",
+                    "change_summary": "admitted before active change",
+                    "purpose": "engineering",
+                    "request_id": request_id,
+                },
+                run_id=dag_run_id,
+                triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+            ),
+            "params": {"handoff_path": str(intake), "main_assembly": ""},
+        }
+        with (
+            patch.object(module, "_store_only_platform_binding", return_value=(platform, store_root)),
+            patch.object(module, "_platform_binding", return_value=(platform, store_root)),
+            patch.object(module, "config_from_airflow_connection", side_effect=resolve),
+            patch.object(module, "_endpoint", return_value=endpoint),
+        ):
+            request = dag.task_dict["freeze"].python_callable(**context)
+        self.assertEqual(request["platform_config_digest"], baseline_digest)
+        self.assertTrue(observed_digests)
+        self.assertEqual(set(observed_digests), {baseline_digest})
+        self.assertEqual(started, [run_id])
+        self.assertEqual([row["stage"] for row in confirmed], ["freeze"])
+
+    def test_bad_connection_failure_still_registers_failed_and_blocked_rows(self) -> None:
+        import shutil
+        import tempfile
+        from types import SimpleNamespace
+
+        from description_pipeline.orchestration.airflow_client import EndpointProtocolError, native_run_id
+
+        module = self._module()
+        dag = module.dag
+        store_root = Path(tempfile.mkdtemp(prefix="dag-bad-connection-freeze-"))
+        self.addCleanup(shutil.rmtree, store_root, ignore_errors=True)
+        dag_run_id = "portal-bad-connection"
+        run_id = native_run_id(dag_run_id)
+        request_id = "portal-bad-connection-request"
+        started: list[str] = []
+        confirmed: list[dict] = []
+        platform = SimpleNamespace(
+            run_record=lambda value: {"request_id": request_id} if value == run_id else None,
+            request_record=lambda value: {"baseline": {"platform_config_digest": "a" * 64}},
+            start_run=lambda value: started.append(value),
+            confirm_stage=lambda **payload: confirmed.append(payload),
+            stage_records=lambda value: {},
+        )
+
+        def bad_resolver(*args, **kwargs):
+            raise EndpointProtocolError("Airflow connection config identity is invalid: config_identity_legacy")
+
+        context = {
+            "dag_run": SimpleNamespace(
+                conf={
+                    "target_hardware": "m3.0",
+                    "change_summary": "bad connection",
+                    "purpose": "engineering",
+                    "request_id": request_id,
+                },
+                run_id=dag_run_id,
+                triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+            ),
+            "params": {"handoff_path": str(store_root / "missing-intake"), "main_assembly": ""},
+        }
+        with (
+            patch.object(module, "_store_only_platform_binding", return_value=(platform, store_root)),
+            patch.object(
+                module,
+                "_platform_binding",
+                side_effect=AssertionError("failure convergence must not re-resolve business config"),
+            ),
+            patch.object(module, "config_from_airflow_connection", side_effect=bad_resolver),
+            self.assertRaisesRegex(EndpointProtocolError, "config_identity_legacy"),
+        ):
+            dag.task_dict["freeze"].python_callable(**context)
+        self.assertEqual(started, [run_id])
+        states = [(row["stage"], row["state"]) for row in confirmed]
+        self.assertIn(("freeze", "failed"), states)
+        self.assertEqual(
+            [row["stage"] for row in confirmed if row["state"] == "blocked"],
+            ["discover", "capture", "generate", "verify", "publish"],
+        )
 
     def test_dag_run_with_explicit_main_assembly(self) -> None:
         from tests.v1.test_airflow_client import MockEndpoint
@@ -1712,6 +1852,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         intake = Path(self.temporary.name) / "early-intake"
         intake.mkdir()
         (intake / "assembly.SLDASM").write_bytes(b"<assembly/>")
+        (intake / "second.SLDASM").write_bytes(b"<assembly/>")
 
         class IntakeDouble:
             def __init__(self) -> None:
@@ -1722,7 +1863,10 @@ class PlatformRegistrationTests(unittest.TestCase):
                 return intake
 
         endpoint = IntakeDouble()
+        admitted_request = {"value": "portal-early-digest"}
         platform = SimpleNamespace(
+            run_record=lambda run_id: {"request_id": admitted_request["value"]},
+            request_record=lambda request_id: {"baseline": {"platform_config_digest": "a" * 64}},
             start_run=lambda run_id: self.started.append(run_id),
             confirm_stage=lambda **payload: self.calls.append(payload),
             stage_records=lambda run_id: {},
@@ -1731,7 +1875,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             "http://127.0.0.1:1",
             "t" * 32,
             targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
-            config_digest="c" * 64,
+            config_digest="a" * 64,
         )
         dag = self.module.dag
 
@@ -1739,22 +1883,22 @@ class PlatformRegistrationTests(unittest.TestCase):
             self.started.clear()
             self.calls.clear()
             endpoint.calls.clear()
+            admitted_request["value"] = str(conf.get("request_id") or params.get("request_id") or "")
             with (
                 patch.object(self.module, "_platform_binding", return_value=(platform, self.root)),
+                patch.object(self.module, "_store_only_platform_binding", return_value=(platform, self.root)),
                 patch.object(self.module, "_endpoint", return_value=endpoint),
                 patch.object(self.module, "config_from_airflow_connection", return_value=config),
-                patch.dict(os.environ, {}, clear=False),
+                self.assertRaises(AirflowFailException) as caught,
             ):
-                os.environ.pop("PLATFORM_CONFIG_DIGEST", None)
-                with self.assertRaises(AirflowFailException) as caught:
-                    dag.task_dict["freeze"].python_callable(
-                        dag_run=SimpleNamespace(
-                            conf=conf,
-                            run_id=run_id,
-                            triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
-                        ),
-                        params=params,
-                    )
+                dag.task_dict["freeze"].python_callable(
+                    dag_run=SimpleNamespace(
+                        conf=conf,
+                        run_id=run_id,
+                        triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
+                    ),
+                    params=params,
+                )
             uuid = native_run_id(run_id)
             self.assertEqual(self.started, [uuid], "the admitted run is claimed exactly once")
             failed = [call for call in self.calls if call["state"] == "failed"]
@@ -1768,7 +1912,7 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         base = {"target_hardware": "m3.0", "change_summary": "x", "request_id": "portal-early-digest"}
         message = refusal("portal-early-digest", dict(base), {"handoff_path": str(intake)})
-        self.assertIn("PLATFORM_CONFIG_DIGEST is unavailable", message)
+        self.assertIn("Select a main assembly explicitly", message)
         self.assertEqual(endpoint.calls, [f"authorized_intake_dir:{intake}"])
         # An even earlier entry refusal (before any intake contact) converges identically.
         early = {"change_summary": "x", "request_id": "portal-early-target"}

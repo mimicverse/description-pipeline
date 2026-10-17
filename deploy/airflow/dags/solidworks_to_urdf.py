@@ -152,6 +152,29 @@ def _store_only_platform_binding() -> tuple[PlatformStore, Path]:
     return PlatformStore.from_environment(sealed=sealed_resolver(store_root)), Path(store_root)
 
 
+def _admitted_request_id(context) -> str:
+    conf = getattr(context.get("dag_run"), "conf", None)
+    conf = conf if isinstance(conf, dict) else {}
+    request_id = str(conf.get("request_id") or context["params"].get("request_id") or "").strip()
+    if not request_id:
+        raise AirflowFailException("request_id is required: the run carries no authenticated request identity")
+    return request_id
+
+
+def _admitted_config_digest(platform: PlatformStore, run_id: str, request_id: str) -> str:
+    """Read the immutable snapshot digest recorded when this run was admitted."""
+
+    run = platform.run_record(run_id)
+    if not isinstance(run, dict) or run.get("request_id") != request_id:
+        raise AirflowFailException("The admitted run does not carry this request identity")
+    request = platform.request_record(request_id)
+    baseline = request.get("baseline") if isinstance(request, dict) else None
+    value = str((baseline or {}).get("platform_config_digest") or "").strip()
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise AirflowFailException("The admitted request carries no platform configuration identity")
+    return value
+
+
 def _delivery_manifest_arguments() -> tuple[dict, dict]:
     return (
         {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -355,6 +378,8 @@ def _converge_failed_stage(
     *,
     products: bool = False,
     config_digest: str | None = None,
+    bound_platform: PlatformStore | None = None,
+    bound_store_root: Path | None = None,
 ) -> None:
     """Best-effort failure convergence; the original stage failure is never masked.
 
@@ -362,7 +387,12 @@ def _converge_failed_stage(
     so a real failure registers what it actually produced, never less.
     """
     try:
-        platform, store_root = _platform_binding(config_digest)
+        if bound_platform is None:
+            platform, store_root = _platform_binding(config_digest)
+        else:
+            platform, store_root = bound_platform, bound_store_root
+            if store_root is None:
+                raise AirflowFailException("failure convergence has no controlled store root")
         if tree is None and products:
             try:
                 tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir, stage)
@@ -383,9 +413,15 @@ def _converge_early_freeze_failure(run_id: str, error: Exception) -> None:
     invented when the platform database is unreachable.
     """
     try:
-        platform, _store_root = _platform_binding()
+        platform, store_root = _store_only_platform_binding()
         platform.start_run(run_id)
-        _converge_failed_stage(run_id, "freeze", error)
+        _converge_failed_stage(
+            run_id,
+            "freeze",
+            error,
+            bound_platform=platform,
+            bound_store_root=store_root,
+        )
     except Exception:  # pragma: no cover - the original exception remains primary
         log.exception("early freeze failure convergence unavailable run=%s", run_id)
 
@@ -1071,11 +1107,8 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         and isinstance(child.get("request_id"), str)
     ):
         raise AirflowFailException("The admitted child does not bind this parent and the freeze boundary")
+    config_digest = _admitted_config_digest(platform, run_id, child["request_id"])
     child_request = platform.request_record(child["request_id"])
-    baseline = child_request.get("baseline") if isinstance(child_request, dict) else None
-    config_digest = str((baseline or {}).get("platform_config_digest") or "").strip()
-    if len(config_digest) != 64 or any(character not in "0123456789abcdef" for character in config_digest):
-        raise AirflowFailException("The admitted child carries no platform configuration identity")
     conf = getattr(context["dag_run"], "conf", None)
     conf = conf if isinstance(conf, dict) else {}
     parent_dag_run_id = str(conf.get("parent_dag_run_id") or "").strip()
@@ -1634,9 +1667,14 @@ def solidworks_to_urdf():
         try:
             linked = _linked_conf(context)
             if linked is None:
-                _conf, _target, _summary, _principal, active_config, routing = _submission_basics(context)
+                request_id = _admitted_request_id(context)
+                admitted_platform, _admitted_store = _store_only_platform_binding()
+                admitted_digest = _admitted_config_digest(admitted_platform, run_id, request_id)
+                _conf, _target, _summary, _principal, _admitted_config, routing = _submission_basics(
+                    context, config_digest=admitted_digest
+                )
             else:
-                _conf = _target = _summary = _principal = active_config = routing = None
+                _conf = _target = _summary = _principal = _admitted_config = routing = None
         except Exception as error:
             # An admitted request must converge even when freeze is refused before its first
             # driver action; the original exception is carried and re-raised (never masked).
@@ -1758,21 +1796,10 @@ def solidworks_to_urdf():
             if not handoff_path:
                 raise AirflowFailException("handoff_path is required")
             selection = _param_selection(context)
-            config_digest = str(active_config.config_digest or "").strip()
-            if not config_digest:
-                raise AirflowFailException("The active platform configuration identity is unavailable")
+            config_digest = admitted_digest
             intake = _endpoint(CONN_ID, config_digest).authorized_intake_dir(handoff_path)
             upload_files = validate_file_index(package_inventory(intake))
             main = _selection_main(upload_files, selection)
-            env_digest = str(os.environ.get("PLATFORM_CONFIG_DIGEST") or "").strip()
-            if not env_digest:
-                raise AirflowFailException(
-                    "PLATFORM_CONFIG_DIGEST is unavailable: the controlled platform configuration identity is required"
-                )
-            if env_digest != config_digest:
-                raise AirflowFailException(
-                    "PLATFORM_CONFIG_DIGEST does not match the active connection snapshot"
-                )
             log.info(
                 "selection intake=%s files=%d upload_sha256=%s main_assembly=%s endpoint_conn=%s",
                 intake,

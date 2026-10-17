@@ -281,7 +281,10 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
     def _get(self, platform: RegisteredPlatform, endpoint) -> tuple[int, bytes]:
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
-                airflow=_PermissiveAirflow(), endpoint=lambda: endpoint, platform_store=platform.store
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: endpoint,
+                platform_store=platform.store,
+                config_identity_provider=lambda: "c" * 64,
             )
         )
         session = app.sessions.create("user", "token", principal="fixture:local:reader")
@@ -403,7 +406,12 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
     def _post_retry(self, platform: RegisteredPlatform) -> tuple[int, dict, list]:
         airflow = _RetryAirflow()
         app = portal_module.PortalApp(
-            portal_module.PortalConfig(airflow=airflow, endpoint=_RunningEndpoint(), platform_store=platform.store)
+            portal_module.PortalConfig(
+                airflow=airflow,
+                endpoint=_RunningEndpoint(),
+                platform_store=platform.store,
+                config_identity_provider=lambda: "c" * 64,
+            )
         )
         session = app.sessions.create("user", "token", principal="fixture:local:reader")
         response: dict = {}
@@ -480,7 +488,10 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
             airflow = _RetryAirflow()
             app = portal_module.PortalApp(
                 portal_module.PortalConfig(
-                    airflow=airflow, endpoint=_RunningEndpoint(), platform_store=platform.store
+                    airflow=airflow,
+                    endpoint=_RunningEndpoint(),
+                    platform_store=platform.store,
+                    config_identity_provider=lambda: "c" * 64,
                 )
             )
             session = app.sessions.create("user", "token", principal="fixture:local:reader")

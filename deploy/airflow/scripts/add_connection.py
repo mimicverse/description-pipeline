@@ -75,6 +75,10 @@ def main() -> int:
         connection.host = ""
         connection.port = None
         connection.login = None
+        # Airflow's encrypted password setter ignores an empty value, which would leave a
+        # legacy bearer token in place.  Clear the physical field explicitly.
+        connection._password = ""
+        connection.is_encrypted = False
         connection.password = ""
         connection.schema = None
         connection.extra = json.dumps({"config_identity": reference}, sort_keys=True, separators=(",", ":"))

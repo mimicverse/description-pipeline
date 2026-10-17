@@ -92,6 +92,7 @@ class PortalSplitTests(unittest.TestCase):
                 airflow=self.airflow,
                 endpoint=lambda: self.windows,
                 platform_store=self.platform.store,
+                config_identity_provider=lambda: "c" * 64,
             )
         )
 
@@ -199,6 +200,7 @@ class PortalSplitTests(unittest.TestCase):
                 endpoint=lambda: self.windows,
                 platform_store=self.platform.store,
                 upload_root=upload_root,
+                config_identity_provider=lambda: "c" * 64,
             )
         )
         captured: dict = {}

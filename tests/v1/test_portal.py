@@ -961,6 +961,7 @@ class PortalTests(unittest.TestCase):
             upload_root=self.upload_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
+            config_identity_provider=lambda: "c" * 64,
         )
         self.server = make_server(
             "127.0.0.1",
@@ -987,6 +988,7 @@ class PortalTests(unittest.TestCase):
             upload_root=self.upload_root,
             platform_store=self.platform,
             pipeline_targets=TEST_TARGETS,
+            config_identity_provider=lambda: "c" * 64,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -1879,7 +1881,10 @@ class PortalTests(unittest.TestCase):
 
     def test_upload_without_configured_intake_root_fails_closed(self) -> None:
         config = PortalConfig(
-            airflow=AirflowApi(self.airflow.url), endpoint=lambda: self.endpoint, static_dir=self.static_dir
+            airflow=AirflowApi(self.airflow.url),
+            endpoint=lambda: self.endpoint,
+            static_dir=self.static_dir,
+            config_identity_provider=lambda: "c" * 64,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
