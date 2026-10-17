@@ -365,7 +365,11 @@ class PortalClient:
     def __init__(self, base: str) -> None:
         self.base = base
         self.jar = CookieJar()
-        self.opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(self.jar))
+        # The portal tests talk to loopback fixtures; ambient HTTP(S)_PROXY must not route
+        # them through an external proxy (the production internal opener is direct too).
+        self.opener = urlrequest.build_opener(
+            urlrequest.ProxyHandler({}), urlrequest.HTTPCookieProcessor(self.jar)
+        )
         self.csrf: str | None = None
         self.login_response = b""
         self.last_set_cookies: list[str] = []
