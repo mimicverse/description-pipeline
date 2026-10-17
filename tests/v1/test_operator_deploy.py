@@ -1738,9 +1738,28 @@ class InstallOrderingTests(unittest.TestCase):
         )
         write_stub(
             release / "airflow" / "services.sh",
-            '#!/usr/bin/env bash\necho "services_$1" >> "$ORDER_LOG"\n'
-            'case "$1" in\n  stop|stop-executors) exit "${FIXTURE_FAIL_STOP:-0}" ;;\n'
-            '  start) exit "${FIXTURE_FAIL_START:-0}" ;;\nesac\n'
+            "#!/usr/bin/env bash\n"
+            'echo "services_$1" >> "$ORDER_LOG"\n'
+            'mkdir -p "$SYSTEMCTL_STATE_DIR"\n'
+            'execution_units=(\n'
+            "  description-solidworks-tunnel\n"
+            "  description-airflow-dag-processor\n"
+            "  description-airflow-scheduler\n"
+            "  description-airflow-api-server\n"
+            ")\n"
+            'case "$1" in\n'
+            "  stop|stop-executors)\n"
+            '    [ "$1" = "stop" ] && printf inactive > "$SYSTEMCTL_STATE_DIR/description-postgres"\n'
+            '    for unit in "${execution_units[@]}"; do\n'
+            '      printf inactive > "$SYSTEMCTL_STATE_DIR/$unit"\n'
+            "    done\n"
+            '    exit "${FIXTURE_FAIL_STOP:-0}" ;;\n'
+            "  start)\n"
+            '    for unit in description-postgres "${execution_units[@]}"; do\n'
+            '      printf active > "$SYSTEMCTL_STATE_DIR/$unit"\n'
+            "    done\n"
+            '    exit "${FIXTURE_FAIL_START:-0}" ;;\n'
+            "esac\n"
             "exit 0\n",
         )
         write_stub(
@@ -1799,6 +1818,9 @@ class InstallOrderingTests(unittest.TestCase):
             "        raise SystemExit('restore requires manifest and sealed archive')\n"
             "    if not args.manifest.is_file() or not args.sealed.is_file():\n"
             "        raise SystemExit('restore binding is missing')\n"
+            "    postgres = Path(os.environ['SYSTEMCTL_STATE_DIR']) / 'description-postgres'\n"
+            "    if not postgres.is_file() or postgres.read_text() != 'active':\n"
+            "        raise SystemExit('restore requires the shared PostgreSQL to be running')\n"
             "    if stat.S_IMODE(args.file.stat().st_mode) != 0o600:\n"
             "        raise SystemExit('capture mode is not 0600')\n"
             "    with log.open('a', encoding='utf-8') as stream:\n"
@@ -2705,6 +2727,16 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn(
                 "connection_restore",
                 (Path(control_env["ORDER_LOG"])).read_text(encoding="utf-8").splitlines(),
+            )
+            lifecycle_calls = [
+                row
+                for row in (Path(control_env["ORDER_LOG"])).read_text(encoding="utf-8").splitlines()
+                if row in {"services_start", "services_stop", "services_stop-executors"}
+            ]
+            self.assertEqual(
+                lifecycle_calls,
+                ["services_stop-executors", "services_start", "services_stop-executors", "services_start"],
+                "promotion and rollback stop executors while PostgreSQL remains available for restore",
             )
             self.assertIn(
                 "connection row restored exactly",

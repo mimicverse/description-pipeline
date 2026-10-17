@@ -1469,7 +1469,9 @@ PY
           ;;
       esac
     fi
-    # Rollback is a maintenance switch too: the current ends close, drain and stop first.
+    # Rollback is a maintenance switch too: the current ends close, drain and stop their
+    # executors.  PostgreSQL stays live because the connection restore and the restored
+    # generation's verification both require it.
     if ! platform_close_admission "rollback" "operatorctl rollback" > "$EVIDENCE_DIR/rollback-close.out" 2>&1; then
       promotion_step "$ROLLBACK_ID" rollback rollback-close failed "$EVIDENCE_DIR/rollback-close.out"
       die "could not close the admission; nothing was rolled back"
@@ -1483,7 +1485,7 @@ PY
     fi
     promotion_step "$ROLLBACK_ID" rollback rollback-drain completed "$EVIDENCE_DIR/rollback-drain.out"
     if ! {
-      airflow_lifecycle stop \
+      airflow_lifecycle stop-executors \
       && systemctl --user disable --now description-operator-proxy.service description-portal.service
     } > "$EVIDENCE_DIR/rollback-stop.out" 2>&1; then
       promotion_step "$ROLLBACK_ID" rollback rollback-stop failed "$EVIDENCE_DIR/rollback-stop.out"
