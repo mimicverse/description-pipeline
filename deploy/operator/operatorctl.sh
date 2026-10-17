@@ -436,22 +436,42 @@ PY
   esac
   local previous_argument=""
   [ -z "$previous" ] || previous_argument=" -Previous \"$previous\""
+  # Initialise both evidence files before the remote call. A failed redirection must never
+  # leave an older valid refusal in place for this invocation to parse as fresh evidence.
+  if ! { : > "$output" && : > "$output.ssh-rc"; }; then
+    echo "instance_lifecycle: could not initialise $verb evidence in $dir" >&2
+    return 2
+  fi
+  local remote_rc=0
   ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
     "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote/instance-lifecycle.ps1\" -Verb $verb -Binding \"$remote/windows-binding.json\"$stage_argument$previous_argument" \
-    > "$output" || { echo "instance_lifecycle: $verb transport failed; see $output" >&2; return 2; }
-  # Only the script's own strict result counts: an exit-0 shell whose JSON is not a passed
-  # object of the requested verb is a failure, never a recorded success.
+    > "$output" || remote_rc=$?
+  if ! printf '%s\n' "$remote_rc" > "$output.ssh-rc"; then
+    echo "instance_lifecycle: could not persist the $verb SSH exit status in $dir" >&2
+    return 2
+  fi
+  # The remote lifecycle returns a structured passed:false object and exit 1 for a definite
+  # refusal, while rc 255 (and other transport/process failures) can lose the acknowledgement.
+  # Classify both signals together: parsing after an unconditional exit test would turn every
+  # intentional refusal into unknown before its evidence was read.
   local parse_rc=0
-  python3 - "$output" "$verb" <<'PY' || parse_rc=$?
+  python3 - "$output" "$verb" "$remote_rc" <<'PY' || parse_rc=$?
 import json
 import sys
 
+remote_rc = int(sys.argv[3])
 try:
     document = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
 except (OSError, ValueError, IndexError) as error:
     raise SystemExit(3)
-if not isinstance(document, dict) or document.get("passed") is not True or document.get("verb") != sys.argv[2]:
+if not isinstance(document, dict) or document.get("verb") != sys.argv[2]:
+    raise SystemExit(3)
+if remote_rc == 0 and document.get("passed") is True:
+    raise SystemExit(0)
+code = document.get("code")
+if remote_rc in (0, 1) and document.get("passed") is False and isinstance(code, str) and code.strip():
     raise SystemExit(1)
+raise SystemExit(3)
 PY
   if [ "$parse_rc" = "1" ]; then
     echo "instance_lifecycle: the $verb result is a definite refusal; see $output" >&2
