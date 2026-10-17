@@ -1729,7 +1729,7 @@ class InstallOrderingTests(unittest.TestCase):
         write_stub(
             release / "airflow" / "services.sh",
             '#!/usr/bin/env bash\necho "services_$1" >> "$ORDER_LOG"\n'
-            'case "$1" in\n  stop) exit "${FIXTURE_FAIL_STOP:-0}" ;;\n'
+            'case "$1" in\n  stop|stop-executors) exit "${FIXTURE_FAIL_STOP:-0}" ;;\n'
             '  start) exit "${FIXTURE_FAIL_START:-0}" ;;\nesac\n'
             "exit 0\n",
         )
@@ -1789,7 +1789,19 @@ class InstallOrderingTests(unittest.TestCase):
             "esac\n"
             "exit 0\n",
         )
-        write_stub(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "airflow", "#!/usr/bin/env bash\nexit 0\n")
+        write_stub(
+            tmp / "releases" / "airflow-venv-gen-1" / "bin" / "airflow",
+            '#!/usr/bin/env bash\necho "airflow $*" >> "$ORDER_LOG"\n'
+            'case "$*" in\n'
+            '  "db migrate")\n'
+            '    if [ "$(cat "$SYSTEMCTL_STATE_DIR/description-postgres" 2>/dev/null)" != "active" ]; then\n'
+            '      echo "psycopg2.OperationalError: connection to server on socket '
+            '$POSTGRES_ROOT/socket/.s.PGSQL.$POSTGRES_PORT failed: No such file or directory" >&2\n'
+            '      exit 1\n'
+            '    fi ;;\n'
+            'esac\n'
+            'exit 0\n',
+        )
         (tmp / "admission").write_text("true")
         (tmp / "projection.json").write_text(
             json.dumps({"in_flight": [], "unresolved": [], "unknown": [], "settled": True}), encoding="utf-8"
@@ -1885,13 +1897,41 @@ class InstallOrderingTests(unittest.TestCase):
         bindir.mkdir()
         write_stub(
             bindir / "systemctl",
-            '#!/usr/bin/env bash\necho "systemctl $*" >> "$ORDER_LOG"\n'
-            'case "$*" in\n'
-            '  "--user daemon-reload") exit 0 ;;\n'
-            '  "--user start description-postgres.service") exit "${START_RC:-0}" ;;\n'
-            '  *"disable --now"*) exit 0 ;;\n'
-            '  *"enable --now"*) exit 0 ;;\n'
-            '  *"is-active"*) exit 0 ;;\n'
+            '#!/usr/bin/env bash\n'
+            'echo "systemctl $*" >> "$ORDER_LOG"\n'
+            '# Stateful unit store: a stopped unit is really stopped (is-active and the database\n'
+            '# probes read this state), so a full stop genuinely removes database availability.\n'
+            'mkdir -p "$SYSTEMCTL_STATE_DIR"\n'
+            'if [ "${1:-} ${2:-}" = "--user daemon-reload" ]; then exit 0; fi\n'
+            'op=""; quiet=0; units=()\n'
+            'for argument in "$@"; do\n'
+            '  case "$argument" in\n'
+            '    --quiet) quiet=1 ;;\n'
+            '    start|stop|enable|disable|is-active) op="$argument" ;;\n'
+            '    -*) ;;\n'
+            '    *) units+=("${argument%.service}") ;;\n'
+            '  esac\n'
+            'done\n'
+            'case "$op" in\n'
+            '  start|enable)\n'
+            '    for unit in "${units[@]}"; do\n'
+            '      if [ "$unit" = "description-postgres" ] && [ "${START_RC:-0}" != "0" ]; then exit "$START_RC"; fi\n'
+            '      if [ -n "${FIXTURE_START_REFUSES:-}" ] && [ "$unit" = "$FIXTURE_START_REFUSES" ]; then exit 1; fi\n'
+            '      printf active > "$SYSTEMCTL_STATE_DIR/$unit"\n'
+            '    done ;;\n'
+            '  stop|disable)\n'
+            '    for unit in "${units[@]}"; do\n'
+            '      if [ -n "${FIXTURE_STOP_REFUSES:-}" ] && [ "$unit" = "$FIXTURE_STOP_REFUSES" ]; then exit 1; fi\n'
+            '      printf inactive > "$SYSTEMCTL_STATE_DIR/$unit"\n'
+            '    done ;;\n'
+            '  is-active)\n'
+            '    status=0\n'
+            '    for unit in "${units[@]}"; do\n'
+            '      state="$(cat "$SYSTEMCTL_STATE_DIR/$unit" 2>/dev/null || echo inactive)"\n'
+            '      [ "$quiet" = "1" ] || echo "$state"\n'
+            '      [ "$state" = "active" ] || status=3\n'
+            '    done\n'
+            '    exit "$status" ;;\n'
             '  *) echo "unexpected systemctl call: $*" >&2; exit 1 ;;\n'
             "esac\n",
         )
@@ -1903,7 +1943,13 @@ class InstallOrderingTests(unittest.TestCase):
         )
         write_stub(
             pgbin / "pg_isready",
-            "#!/usr/bin/env bash\n" + client_libraries + 'n=$(cat "$PG_READY_COUNT" 2>/dev/null || echo 0)\n'
+            "#!/usr/bin/env bash\n" + client_libraries +
+            '# The database is only ready while its unit state says so: a stopped server is\n'
+            '# unreachable, exactly like a missing socket.\n'
+            'if [ "$(cat "$SYSTEMCTL_STATE_DIR/description-postgres" 2>/dev/null)" != "active" ]; then\n'
+            '  echo "no response" >&2; exit 2\n'
+            "fi\n" +
+            'n=$(cat "$PG_READY_COUNT" 2>/dev/null || echo 0)\n'
             "n=$((n + 1))\n"
             'echo "$n" > "$PG_READY_COUNT"\n'
             'echo "pg_isready $n" >> "$ORDER_LOG"\n'
@@ -1993,6 +2039,7 @@ class InstallOrderingTests(unittest.TestCase):
             "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
             "XDG_CONFIG_HOME": str(tmp / "config"),
             "ORDER_LOG": str(order),
+            "SYSTEMCTL_STATE_DIR": str(tmp / "unit-state"),
             "PG_READY_COUNT": str(tmp / "ready-count"),
             "PG_READY_AFTER": str(ready_after),
             "DB_EXISTS": "1" if db_exists else "",
@@ -2105,6 +2152,7 @@ class InstallOrderingTests(unittest.TestCase):
             order = scratch / "order.log"
             control_env["ORDER_LOG"] = str(order)
             control_env["TMPDIR"] = str(scratch / "tmp")
+            control_env["SYSTEMCTL_STATE_DIR"] = str(scratch / "unit-state")
             control_env["NGINX_BIN"] = str(work / "absent-system-nginx")
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
@@ -2729,6 +2777,146 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(steps["stop-services"], "failed")
             self.assertNotIn("windows-switch", steps)
 
+    def _use_real_airflow_services(self, release: Path) -> None:
+        """Run the real services.sh in the release tree: the stop it performs decides
+        whether the shared database survives into the guarded migration (the harness
+        default is a recording stub). Only the stop phases delegate to the real script -
+        the install/start phases keep the recording stub because the real render/start
+        need the deployed environment (the changed boundary is the stop behaviour)."""
+
+        real = release / "airflow" / "services.sh.real"
+        real.write_bytes((ROOT / "deploy" / "airflow" / "services.sh").read_bytes())
+        (release / "airflow" / "services.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "${1:-}" = "stop-executors" ] || [ "${1:-}" = "stop" ]; then\n'
+            '  exec bash "$(dirname "$0")/services.sh.real" "$@"\n'
+            "fi\n"
+            'echo "services_$1" >> "$ORDER_LOG"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+
+    def test_promote_stop_keeps_the_shared_database_for_the_guarded_migrations(self) -> None:
+        """Stateful doubles make the database dependency real (a full stop removes the
+        socket and fails the next migration - see the companion test), so this regression
+        fails by construction unless promote stops only the execution services and proves
+        the shared database ready before its migrations."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            # Only the promotion stop path must run the real services.sh; the install/start
+            # phase stays on the harness stub (the real render needs the deployed env).
+            self._use_real_airflow_services(release)
+            self._linux_health_double(release)
+            order.write_text("", encoding="utf-8")
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            receipt_dir = state / "promotions" / "gen-2"
+            rows = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))["steps"]
+            steps = {row["step"]: row["status"] for row in rows}
+            self.assertEqual(steps["stop-services"], "completed")
+            self.assertEqual(steps["schema-migration"], "completed")
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertFalse(
+                [line for line in lines if "disable --now description-postgres" in line],
+                "the promotion must never stop the shared database",
+            )
+            stopped = [line for line in lines if line.startswith("systemctl --user disable --now")]
+            for unit in (
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+            ):
+                self.assertTrue(any(unit in line for line in stopped), (unit, lines))
+            migrate_at = next(index for index, line in enumerate(lines) if line == "airflow db migrate")
+            self.assertTrue(
+                all(
+                    index < migrate_at
+                    for index, line in enumerate(lines)
+                    if line.startswith("systemctl --user disable --now")
+                ),
+                "every stop precedes the guarded migration",
+            )
+            self.assertEqual(
+                (Path(control_env["SYSTEMCTL_STATE_DIR"]) / "description-postgres").read_text(),
+                "active",
+                "the shared database must stay up through the whole promotion",
+            )
+            evidence = (receipt_dir / "evidence" / "stop-services.out").read_text(encoding="utf-8")
+            self.assertIn("services.sh: description-airflow-scheduler stopped (active_state=inactive)", evidence)
+            self.assertIn("operatorctl: description-portal.service stopped (active_state=inactive)", evidence)
+            self.assertIn("shared database ready for the guarded migrations", evidence)
+
+    def test_full_stop_removes_database_availability_by_construction(self) -> None:
+        """The companion of the regression above, on the same stateful doubles: the full
+        stop (the operatorctl stop verb's semantics) really takes the database down, and
+        the very next migration fails with the incident's socket error - the exact ordering
+        the promotion must never use again."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            values = {}
+            for line in (state / "resolved.env").read_text(encoding="utf-8").splitlines():
+                key, _, raw = line.partition("=")
+                if key and raw:
+                    values[key] = decode_env_value(raw)
+            stop_env = dict(control_env)
+            stop_env.update(
+                {
+                    key: values[key]
+                    for key in (
+                        "AIRFLOW_VENV",
+                        "AIRFLOW_HOME",
+                        "POSTGRES_ROOT",
+                        "POSTGRES_MAJOR",
+                        "SOLIDWORKS_SSH_HOST",
+                        "AIRFLOW_API_PORT",
+                        "POSTGRES_PORT",
+                        "TUNNEL_LOOPBACK_PORT",
+                        "SOLIDWORKS_ENDPOINT_PORT",
+                    )
+                    if key in values
+                }
+            )
+            pg_root = Path(values["POSTGRES_ROOT"])
+            pg_bin = pg_root / "root/usr/lib/postgresql" / values.get("POSTGRES_MAJOR", "14") / "bin"
+            probe_env = dict(stop_env)
+            probe_env["LD_LIBRARY_PATH"] = f"{pg_root}/root/usr/lib/x86_64-linux-gnu:/unrelated/vendor"
+            probe = [
+                str(pg_bin / "pg_isready"),
+                "-h",
+                str(pg_root / "socket"),
+                "-p",
+                values["POSTGRES_PORT"],
+            ]
+            ready = run(probe, probe_env)
+            self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+            self._use_real_airflow_services(release)
+            stopped = run(["bash", str(release / "airflow" / "services.sh"), "stop"], stop_env)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertEqual(
+                (Path(control_env["SYSTEMCTL_STATE_DIR"]) / "description-postgres").read_text(),
+                "inactive",
+                "the full stop must actually take the database down",
+            )
+            gone = run(probe, probe_env)
+            self.assertNotEqual(gone.returncode, 0, "the stopped database can no longer be ready")
+            migrate = run(
+                [str(Path(self._derived_value(state, "gen-1", "AIRFLOW_VENV")) / "bin" / "airflow"), "db migrate"],
+                stop_env,
+            )
+            self.assertEqual(migrate.returncode, 1)
+            self.assertIn("psycopg2.OperationalError", migrate.stderr)
+            self.assertIn(".s.PGSQL.", migrate.stderr)
+
     def test_promote_seals_readonly_roots_without_changing_them(self) -> None:
         """The backup step copies the running roots with their modes (0555 directories, 0444
         files - the W5 v8 R2 stop): the copy is sealed, the single staging owner removes the
@@ -2892,7 +3080,7 @@ class InstallOrderingTests(unittest.TestCase):
                 json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
             )
             lines = order.read_text(encoding="utf-8").splitlines()
-            self.assertNotIn("services_stop", lines)
+            self.assertNotIn("services_stop-executors", lines)
             self.assertFalse([line for line in lines if line.startswith("scp ") or "psql_platform_apply" in line])
             self.assertFalse((receipt_dir / "backup.tar.enc").exists(), "no sealed artifact may exist")
             self.assertTrue((receipt_dir / "backup").is_symlink(), "the refusal never touches the link")
