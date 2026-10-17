@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -821,7 +822,8 @@ class LifecycleTests(unittest.TestCase):
             'case "$*" in\n'
             '  "dags unpause solidworks_to_urdf")\n'
             '    [ "$UNPAUSE_RC" = "0" ] || exit "$UNPAUSE_RC"\n'
-            '    if [ "$count" -ge "$REGISTER_AFTER" ]; then echo false > "$ADMISSION"; fi ;;\n'
+            '    count=$((count + 1)); echo "$count" > "$REGISTER_COUNT"\n'
+            '    if [ "$count" -gt "$REGISTER_AFTER" ]; then echo false > "$ADMISSION"; fi ;;\n'
             '  "dags pause solidworks_to_urdf")\n'
             '    [ "$PAUSE_RC" = "0" ] || exit "$PAUSE_RC"\n'
             '    echo true > "$ADMISSION" ;;\n'
@@ -849,6 +851,15 @@ class LifecycleTests(unittest.TestCase):
             "esac\n"
             'script="$(cat)"\n'
             'case "$script" in\n'
+            "  *airflow-dag-capture*)\n"
+            '    paused="$(cat "$ADMISSION")"\n'
+            "    printf '{\"dag_id\":\"solidworks_to_urdf\",\"paused\":%s}\\n' \"$paused\" > \"$2\"\n"
+            '    echo "dag_capture paused=$paused" >> "$ORDER_LOG" ;;\n'
+            "  *airflow-dag-state-check*)\n"
+            '    expected="$2"\n'
+            '    actual="$(cat "$ADMISSION")"\n'
+            '    echo "dag_state_check expected=$expected actual=$actual" >> "$ORDER_LOG"\n'
+            '    [ "$actual" = "$expected" ] || exit 1 ;;\n'
             "  *platform-close-admission*)\n"
             '    echo true > "$ADMISSION"\n'
             '    echo "platform close_admission" >> "$ORDER_LOG"\n'
@@ -930,7 +941,10 @@ class LifecycleTests(unittest.TestCase):
                 ingress = lines.index(
                     "systemctl --user enable --now description-portal.service description-operator-proxy.service"
                 )
-                self.assertLess(max(i for i, line in enumerate(lines) if line == "airflow admission check"), ingress)
+                self.assertLess(
+                    max(i for i, line in enumerate(lines) if line.startswith("dag_state_check ")),
+                    ingress,
+                )
                 ready = lines.index(
                     "systemctl --user is-active --quiet description-portal.service description-operator-proxy.service"
                 )
@@ -1104,8 +1118,8 @@ class LifecycleTests(unittest.TestCase):
         control = CONTROL.read_text(encoding="utf-8")
         self.assertEqual(
             control.count('bash "$HERE/health_gate.sh"'),
-            2,
-            "the one gate serves both the plain start and promote's verify step",
+            3,
+            "the one gate serves the plain start, promote verify and rollback verify",
         )
         verify_anchor = control.index('--out "$EVIDENCE_DIR/final-identity.json"')
         gate_in_promote = control.index('bash "$HERE/health_gate.sh" "$EVIDENCE_DIR/linux-health-')
@@ -1114,6 +1128,13 @@ class LifecycleTests(unittest.TestCase):
         self.assertLess(gate_in_promote, open_in_promote, "the promote opens only after the gate")
         start_gate = control.index('bash "$HERE/health_gate.sh" "$OPERATOR_STATE/health-gate/start-')
         self.assertLess(start_gate, control.rindex("platform_open_admission"), "the start opens only after the gate")
+        rollback_identity = control.index('--out "$EVIDENCE_DIR/rollback-identity.json"')
+        rollback_gate = control.index('bash "$HERE/health_gate.sh" \\\n        "$OPERATOR_STATE/health-gate/rollback-')
+        rollback_dag_state = control.index(
+            'airflow_restore_dag_state "$DAG_STATE_FILE"', rollback_gate
+        )
+        self.assertLess(rollback_identity, rollback_gate, "rollback health follows the restored identity")
+        self.assertLess(rollback_gate, rollback_dag_state, "DAG state is restored only after health")
 
     def test_keep_admission_closed_flag_is_refused_by_other_verbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1747,16 +1768,50 @@ class InstallOrderingTests(unittest.TestCase):
             "  description-airflow-scheduler\n"
             "  description-airflow-api-server\n"
             ")\n"
+            'stop_runtime() {\n'
+            '  local unit="$1" pidfile="$SYSTEMCTL_STATE_DIR/$1.pid" pid\n'
+            '  [ -f "$pidfile" ] || return 0\n'
+            '  pid="$(cat "$pidfile")"\n'
+            '  kill "$pid" 2>/dev/null || true\n'
+            '  rm -f "$pidfile"\n'
+            '}\n'
+            'spawn_runtime() {\n'
+            '  local unit="$1" marker pidfile\n'
+            '  [ "${FIXTURE_RUNTIME_PROCESS:-0}" = "1" ] || return 0\n'
+            '  case "$unit" in description-airflow-*) ;; *) return 0 ;; esac\n'
+            '  stop_runtime "$unit"\n'
+            '  mkdir -p "$AIRFLOW_VENV/lib"\n'
+            '  marker="$AIRFLOW_VENV/lib/runtime-$unit.map"\n'
+            '  printf "runtime map for %s\\n" "$unit" > "$marker"\n'
+            '  FIXTURE_RUNTIME_MARKER="$marker" python3 -c '
+            '\'import mmap,os,time; f=open(os.environ["FIXTURE_RUNTIME_MARKER"],"r+b"); '
+            'm=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); time.sleep(300)\' '
+            '</dev/null >/dev/null 2>&1 &\n'
+            '  pidfile="$SYSTEMCTL_STATE_DIR/$unit.pid"\n'
+            '  echo $! > "$pidfile"\n'
+            '}\n'
             'case "$1" in\n'
+            "  render)\n"
+            '    target="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"\n'
+            '    mkdir -p "$target"\n'
+            '    echo "services_render venv=$AIRFLOW_VENV derived=$OPERATOR_DERIVED_ENV" >> "$ORDER_LOG"\n'
+            '    for unit in description-airflow-dag-processor description-airflow-scheduler '
+            'description-airflow-api-server; do\n'
+            '      printf "[Service]\\nEnvironmentFile=%s\\nExecStart=%s/bin/airflow fixture\\n" '
+            '"$OPERATOR_DERIVED_ENV" "$AIRFLOW_VENV" > "$target/$unit.service"\n'
+            '    done\n'
+            "    exit 0 ;;\n"
             "  stop|stop-executors)\n"
             '    [ "$1" = "stop" ] && printf inactive > "$SYSTEMCTL_STATE_DIR/description-postgres"\n'
             '    for unit in "${execution_units[@]}"; do\n'
+            '      stop_runtime "$unit"\n'
             '      printf inactive > "$SYSTEMCTL_STATE_DIR/$unit"\n'
             "    done\n"
             '    exit "${FIXTURE_FAIL_STOP:-0}" ;;\n'
             "  start)\n"
             '    for unit in description-postgres "${execution_units[@]}"; do\n'
             '      printf active > "$SYSTEMCTL_STATE_DIR/$unit"\n'
+            '      spawn_runtime "$unit"\n'
             "    done\n"
             '    exit "${FIXTURE_FAIL_START:-0}" ;;\n'
             "esac\n"
@@ -1850,6 +1905,15 @@ class InstallOrderingTests(unittest.TestCase):
             "esac\n"
             'script="$(cat)"\n'
             'case "$script" in\n'
+            "  *airflow-dag-capture*)\n"
+            '    paused="$(cat "$ADMISSION")"\n'
+            "    printf '{\"dag_id\":\"solidworks_to_urdf\",\"paused\":%s}\\n' \"$paused\" > \"$2\"\n"
+            '    echo "dag_capture paused=$paused" >> "$ORDER_LOG" ;;\n'
+            "  *airflow-dag-state-check*)\n"
+            '    expected="$2"\n'
+            '    actual="$(cat "$ADMISSION")"\n'
+            '    echo "dag_state_check expected=$expected actual=$actual" >> "$ORDER_LOG"\n'
+            '    [ "$actual" = "$expected" ] || exit 1 ;;\n'
             "  *platform-close-admission*)\n"
             '    echo true > "$ADMISSION"\n'
             '    echo "platform close_admission" >> "$ORDER_LOG"\n'
@@ -1870,6 +1934,12 @@ class InstallOrderingTests(unittest.TestCase):
             tmp / "releases" / "airflow-venv-gen-1" / "bin" / "airflow",
             '#!/usr/bin/env bash\necho "airflow $*" >> "$ORDER_LOG"\n'
             'case "$*" in\n'
+            '  "dags unpause solidworks_to_urdf")\n'
+            '    [ "${UNPAUSE_RC:-0}" = "0" ] || exit "$UNPAUSE_RC"\n'
+            '    echo false > "$ADMISSION" ;;\n'
+            '  "dags pause solidworks_to_urdf")\n'
+            '    [ "${PAUSE_RC:-0}" = "0" ] || exit "$PAUSE_RC"\n'
+            '    echo true > "$ADMISSION" ;;\n'
             '  "db migrate")\n'
             '    if [ "$(cat "$SYSTEMCTL_STATE_DIR/description-postgres" 2>/dev/null)" != "active" ]; then\n'
             '      echo "psycopg2.OperationalError: connection to server on socket '
@@ -1980,6 +2050,33 @@ class InstallOrderingTests(unittest.TestCase):
             '# probes read this state), so a full stop genuinely removes database availability.\n'
             'mkdir -p "$SYSTEMCTL_STATE_DIR"\n'
             'if [ "${1:-} ${2:-}" = "--user daemon-reload" ]; then exit 0; fi\n'
+            'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+            '  for argument in "$@"; do unit="${argument%.service}"; done\n'
+            '  cat "$SYSTEMCTL_STATE_DIR/$unit.pid" 2>/dev/null || echo 0\n'
+            '  exit 0\n'
+            'fi\n'
+            'stop_runtime() {\n'
+            '  local unit="$1" pidfile="$SYSTEMCTL_STATE_DIR/$1.pid" pid\n'
+            '  [ -f "$pidfile" ] || return 0\n'
+            '  pid="$(cat "$pidfile")"\n'
+            '  kill "$pid" 2>/dev/null || true\n'
+            '  rm -f "$pidfile"\n'
+            '}\n'
+            'spawn_runtime() {\n'
+            '  local unit="$1" marker pidfile\n'
+            '  [ "${FIXTURE_RUNTIME_PROCESS:-0}" = "1" ] || return 0\n'
+            '  case "$unit" in description-airflow-*) ;; *) return 0 ;; esac\n'
+            '  stop_runtime "$unit"\n'
+            '  mkdir -p "$AIRFLOW_VENV/lib"\n'
+            '  marker="$AIRFLOW_VENV/lib/runtime-$unit.map"\n'
+            '  printf "runtime map for %s\\n" "$unit" > "$marker"\n'
+            '  FIXTURE_RUNTIME_MARKER="$marker" python3 -c '
+            '\'import mmap,os,time; f=open(os.environ["FIXTURE_RUNTIME_MARKER"],"r+b"); '
+            'm=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); time.sleep(300)\' '
+            '</dev/null >/dev/null 2>&1 &\n'
+            '  pidfile="$SYSTEMCTL_STATE_DIR/$unit.pid"\n'
+            '  echo $! > "$pidfile"\n'
+            '}\n'
             'op=""; quiet=0; units=()\n'
             'for argument in "$@"; do\n'
             '  case "$argument" in\n'
@@ -1995,10 +2092,12 @@ class InstallOrderingTests(unittest.TestCase):
             '      if [ "$unit" = "description-postgres" ] && [ "${START_RC:-0}" != "0" ]; then exit "$START_RC"; fi\n'
             '      if [ -n "${FIXTURE_START_REFUSES:-}" ] && [ "$unit" = "$FIXTURE_START_REFUSES" ]; then exit 1; fi\n'
             '      printf active > "$SYSTEMCTL_STATE_DIR/$unit"\n'
+            '      spawn_runtime "$unit"\n'
             '    done ;;\n'
             '  stop|disable)\n'
             '    for unit in "${units[@]}"; do\n'
             '      if [ -n "${FIXTURE_STOP_REFUSES:-}" ] && [ "$unit" = "$FIXTURE_STOP_REFUSES" ]; then exit 1; fi\n'
+            '      stop_runtime "$unit"\n'
             '      printf inactive > "$SYSTEMCTL_STATE_DIR/$unit"\n'
             '    done ;;\n'
             '  is-active)\n'
@@ -2345,6 +2444,12 @@ class InstallOrderingTests(unittest.TestCase):
                 return decode_env_value(line.split("=", 1)[1].strip())
         raise AssertionError(f"the derived environment carries no {key}")
 
+    @staticmethod
+    def _stop_runtime_processes(root: Path) -> None:
+        for pidfile in (root / "unit-state").glob("*.pid"):
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pidfile.read_text(encoding="utf-8").strip()), 15)
+
     def _clone_generation_stubs(self, state: Path) -> None:
         source = Path(self._derived_value(state, "gen-1", "AIRFLOW_VENV")) / "bin"
         target = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV")) / "bin"
@@ -2650,7 +2755,8 @@ class InstallOrderingTests(unittest.TestCase):
 
     def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             state = Path(tmp) / "state"
@@ -2668,6 +2774,17 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
             active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
             self.assertEqual(active["install_id"], "gen-2")
+            restored_venv = self._derived_value(state, "gen-1", "AIRFLOW_VENV")
+            candidate_venv = self._derived_value(state, "gen-2", "AIRFLOW_VENV")
+            restored_env = state / "derived" / "gen-1" / "operator.env"
+            candidate_unit = Path(tmp) / "config" / "systemd" / "user" / "description-airflow-scheduler.service"
+            self.assertIn(candidate_venv, candidate_unit.read_text(encoding="utf-8"))
+            captured_dag = json.loads(
+                (state / "promotions" / "gen-2" / "evidence" / "dag-before-promotion.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(captured_dag, {"dag_id": "solidworks_to_urdf", "paused": True})
             self.assertEqual([row["step"] for row in active["journal"]], ["promotion-receipt"])
             self.assertTrue(active["previous"]["record"].endswith("install-records/gen-1.json"))
             admission = Path(tmp) / "admission"
@@ -2711,11 +2828,51 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn("platform.pgc", backup_manifest["files"])
             self.assertIn("state/resolved.env", backup_manifest["files"])
             self.assertFalse((state / "promotions" / "gen-2" / "backup").exists())
-            rolled = self._maintenance(release, control_env, "rollback")
+            rolled = self._maintenance(
+                release,
+                dict(
+                    control_env,
+                    AIRFLOW_VENV=candidate_venv,
+                    FIXTURE_RUNTIME_PROCESS="1",
+                ),
+                "rollback",
+            )
             self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
             restored = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
             self.assertEqual(restored["install_id"], "gen-1")
             self.assertEqual(admission.read_text().strip(), "true", "rollback keeps the admission closed")
+            unit_dir = Path(tmp) / "config" / "systemd" / "user"
+            for unit in (
+                "description-airflow-dag-processor.service",
+                "description-airflow-scheduler.service",
+                "description-airflow-api-server.service",
+            ):
+                text = (unit_dir / unit).read_text(encoding="utf-8")
+                self.assertIn(f"ExecStart={restored_venv}/", text)
+                self.assertIn(f"EnvironmentFile={restored_env}", text)
+                self.assertNotIn(candidate_venv, text)
+            render_lines = [
+                row
+                for row in order.read_text(encoding="utf-8").splitlines()
+                if row.startswith("services_render ")
+            ]
+            self.assertTrue(render_lines)
+            self.assertIn(f"venv={restored_venv}", render_lines[-1])
+            self.assertIn(f"derived={restored_env}", render_lines[-1])
+            rollback_verify = (
+                state / "promotions" / "gen-2" / "evidence" / "rollback-verify.out"
+            ).read_text(encoding="utf-8")
+            self.assertIn("restored_maps=", rollback_verify)
+            self.assertNotIn("restored_maps=0", rollback_verify)
+            self.assertIn("candidate_maps=0", rollback_verify)
+            self.assertIn("dag_paused_restored=true", rollback_verify)
+            live_maps = []
+            for pidfile in (Path(tmp) / "unit-state").glob("description-airflow-*.pid"):
+                pid = int(pidfile.read_text(encoding="utf-8").strip())
+                live_maps.append(Path(f"/proc/{pid}/maps").read_text(encoding="utf-8"))
+            self.assertEqual(len(live_maps), 3)
+            self.assertTrue(all(restored_venv in document for document in live_maps))
+            self.assertTrue(all(candidate_venv not in document for document in live_maps))
             final_receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
             self.assertEqual(
                 [row["step"] for row in final_receipt["steps"] if row["verb"] == "rollback"],
@@ -2852,6 +3009,94 @@ class InstallOrderingTests(unittest.TestCase):
                 {},
             )
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
+    def test_rollback_restores_the_pre_maintenance_unpaused_dag_state(self) -> None:
+        """Rollback restores the captured DAG state instead of toggling a constant."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            admission = Path(tmp) / "admission"
+            admission.write_text("false", encoding="utf-8")
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            captured = json.loads(
+                (state / "promotions" / "gen-2" / "evidence" / "dag-before-promotion.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(captured, {"dag_id": "solidworks_to_urdf", "paused": False})
+            candidate_venv = self._derived_value(state, "gen-2", "AIRFLOW_VENV")
+            rolled = self._maintenance(
+                release,
+                dict(
+                    control_env,
+                    AIRFLOW_VENV=candidate_venv,
+                    FIXTURE_RUNTIME_PROCESS="1",
+                ),
+                "rollback",
+            )
+            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            self.assertEqual(admission.read_text(encoding="utf-8").strip(), "false")
+            verify = (
+                state / "promotions" / "gen-2" / "evidence" / "rollback-verify.out"
+            ).read_text(encoding="utf-8")
+            self.assertIn("dag_paused_restored=false", verify)
+
+    def test_rollback_health_failure_leaves_safe_paused_evidence(self) -> None:
+        """A failed restored-system health check never silently re-enables scheduling."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            write_stub(
+                release / "operator" / "health_gate.sh",
+                '#!/usr/bin/env bash\necho "rollback health gate failure" >> "$ORDER_LOG"\nexit 7\n',
+            )
+            candidate_venv = self._derived_value(state, "gen-2", "AIRFLOW_VENV")
+            rolled = self._maintenance(
+                release,
+                dict(
+                    control_env,
+                    AIRFLOW_VENV=candidate_venv,
+                    FIXTURE_RUNTIME_PROCESS="1",
+                ),
+                "rollback",
+            )
+            self.assertEqual(rolled.returncode, 1)
+            self.assertIn("rollback health gate failure", order.read_text(encoding="utf-8"))
+            admission = Path(tmp) / "admission"
+            self.assertEqual(admission.read_text(encoding="utf-8").strip(), "true")
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            verify = (evidence / "rollback-verify.out").read_text(encoding="utf-8")
+            self.assertIn("restored_maps=", verify)
+            self.assertIn("candidate_maps=0", verify)
+            self.assertNotIn("dag_paused_restored=", verify)
+            self.assertTrue((evidence / "rollback-health.json").is_file())
+            self.assertTrue((evidence / "rollback-identity.json").is_file())
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            steps = {row["step"]: row["status"] for row in receipt["steps"] if row["verb"] == "rollback"}
+            self.assertEqual(steps["rollback-verify"], "failed")
 
     def test_cold_stage_promote_uses_database_and_restarts_only_after_switch(self) -> None:
         """The sealed recovery state can stage and promote without restoring old executors.
@@ -3435,12 +3680,14 @@ class InstallOrderingTests(unittest.TestCase):
     def test_promote_start_failure_stays_closed_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
             self.assertEqual(self._install(release, control_env).returncode, 0)
             state = Path(tmp) / "state"
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
             self._health_double(release, control_env)
             self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
             self._clone_generation_stubs(state)
+            self._linux_health_double(release)
             failed = self._maintenance(release, dict(control_env, FIXTURE_FAIL_START="1"), "promote", "gen-2")
             self.assertEqual(failed.returncode, 1)
             self.assertIn("did not start", failed.stderr)
@@ -3451,7 +3698,9 @@ class InstallOrderingTests(unittest.TestCase):
             steps = {row["step"]: row["status"] for row in receipt["steps"]}
             self.assertEqual(steps["start-services"], "failed")
             self.assertNotIn("open-admission", steps)
-            rolled = self._maintenance(release, control_env, "rollback")
+            rolled = self._maintenance(
+                release, dict(control_env, FIXTURE_RUNTIME_PROCESS="1"), "rollback"
+            )
             self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
             restored = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
             self.assertEqual(restored["install_id"], "gen-1")
@@ -3460,12 +3709,14 @@ class InstallOrderingTests(unittest.TestCase):
     def test_ack_loss_records_unknown_and_reconciles_from_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
             self.assertEqual(self._install(release, control_env).returncode, 0)
             state = Path(tmp) / "state"
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
             self._health_double(release, control_env)
             self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
             self._clone_generation_stubs(state)
+            self._linux_health_double(release)
             lost = self._maintenance(release, dict(control_env, FIXTURE_ACK_LOSS="1"), "promote", "gen-2")
             self.assertEqual(lost.returncode, 1)
             self.assertIn("unacknowledged", lost.stderr)
@@ -3475,7 +3726,12 @@ class InstallOrderingTests(unittest.TestCase):
             receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
             steps = {row["step"]: row["status"] for row in receipt["steps"]}
             self.assertEqual(steps["windows-switch"], "unknown")
-            reconciled = self._maintenance(release, control_env, "rollback", "gen-2")
+            reconciled = self._maintenance(
+                release,
+                dict(control_env, FIXTURE_RUNTIME_PROCESS="1"),
+                "rollback",
+                "gen-2",
+            )
             self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
             self.assertEqual(
                 json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
@@ -3503,6 +3759,7 @@ class InstallOrderingTests(unittest.TestCase):
             self._health_double(release, control_env)
             self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
             self._clone_generation_stubs(state)
+            self._linux_health_double(release)
             lost = self._maintenance(release, dict(control_env, FIXTURE_ACK_LOSS="1"), "promote", "gen-2")
             self.assertEqual(lost.returncode, 1)
             # The endpoint runs a foreign launcher: neither the target nor the bound source.
@@ -3563,16 +3820,25 @@ class InstallOrderingTests(unittest.TestCase):
     def test_ack_loss_with_live_before_state_records_never_switched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
             self.assertEqual(self._install(release, control_env).returncode, 0)
             state = Path(tmp) / "state"
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
             self._health_double(release, control_env)
             self.assertEqual(self._maintenance(release, control_env, "stage", "gen-2").returncode, 0)
             self._clone_generation_stubs(state)
+            self._linux_health_double(release)
             lost = self._maintenance(release, dict(control_env, FIXTURE_ACK_LOSS="1"), "promote", "gen-2")
             self.assertEqual(lost.returncode, 1)
             reconciled = self._maintenance(
-                release, dict(control_env, FIXTURE_STATUS="before"), "rollback", "gen-2"
+                release,
+                dict(
+                    control_env,
+                    FIXTURE_STATUS="before",
+                    FIXTURE_RUNTIME_PROCESS="1",
+                ),
+                "rollback",
+                "gen-2",
             )
             self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
             self.assertEqual(
