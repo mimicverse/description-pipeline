@@ -348,7 +348,7 @@ airflow_here_for_record() {
 }
 
 airflow_render_generation_config() {
-  local record_path="$1" venv="$2" env_file="$3" dag_path airflow_here runtime_dsn api_port
+  local record_path="$1" venv="$2" env_file="$3" dag_path airflow_here renderer runtime_dsn api_port
   dag_path="$(airflow_record_dag "$record_path")" \
     || die "the active generation has no usable DAG path"
   airflow_here="$(dirname "$(dirname "$dag_path")")"
@@ -356,9 +356,25 @@ airflow_render_generation_config() {
     || die "the active generation has no config renderer: $airflow_here/render_config.py"
   [ -f "$airflow_here/airflow.cfg.template" ] && [ ! -L "$airflow_here/airflow.cfg.template" ] \
     || die "the active generation has no Airflow config template"
+  renderer="$airflow_here/../operator/render_operator.py"
+  [ -f "$renderer" ] && [ ! -L "$renderer" ] \
+    || die "the target generation has no operator env renderer: $renderer"
   runtime_dsn="$(generation_env_value "$env_file" AIRFLOW_RUNTIME_DB_URL)" || return 1
-  api_port="${AIRFLOW_API_PORT:-}"
-  [ -n "$api_port" ] || die "the active deployment has no Airflow API port"
+  # Resolve the port through the target controller's own env parser and default, so the
+  # generated execution URL cannot fall back to the resident generation's ambient value.
+  api_port="$(python3 - "$renderer" "$env_file" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("generation_render_operator", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+values = module.load_env(Path(sys.argv[2]))
+print(module.integer(values, "AIRFLOW_API_PORT", module.PORT_DEFAULTS["AIRFLOW_API_PORT"]))
+PY
+)" || return 1
+  [ -n "$api_port" ] || die "the target generation has no Airflow API port"
   AIRFLOW_DB_URL="$runtime_dsn" AIRFLOW_API_PORT="$api_port" \
     "$venv/bin/python" "$airflow_here/render_config.py" \
       --home "$AIRFLOW_HOME" --venv "$venv" \

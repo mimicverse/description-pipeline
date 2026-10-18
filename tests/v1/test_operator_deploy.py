@@ -2977,6 +2977,72 @@ class InstallOrderingTests(unittest.TestCase):
                 path = root / "unit-state" / unit
                 self.assertEqual(path.read_text(encoding="utf-8"), "inactive", unit)
 
+    def test_promote_renders_the_candidate_api_port_not_the_ambient_port(self) -> None:
+        """The target renderer default and explicit target port both beat the ambient port."""
+
+        def replace_env_value(path: Path, key: str, value: str) -> None:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            replacement = f"{key}={encode_env_value(value)}"
+            found = False
+            updated = []
+            for line in lines:
+                if line.startswith(f"{key}="):
+                    updated.append(replacement)
+                    found = True
+                else:
+                    updated.append(line)
+            if not found:
+                updated.append(replacement)
+            path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+        for label, explicit_port in (("default", None), ("explicit", "18991")):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                release, control_env, _order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+                installed = self._install(release, control_env)
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                state = root / "state"
+                control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                    state, "gen-1", "PLATFORM_OPERATOR_DSN"
+                )
+                self._health_double(release, control_env)
+                (root / "handoffs").mkdir(exist_ok=True)
+                (root / "specifications").mkdir(exist_ok=True)
+                staged = self._maintenance(release, control_env, "stage", "gen-2")
+                self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+                ambient = "47001"
+                replace_env_value(state / "resolved.env", "AIRFLOW_API_PORT", ambient)
+                candidate_env = state / "derived" / "gen-2" / "operator.env"
+                if explicit_port is not None:
+                    replace_env_value(candidate_env, "AIRFLOW_API_PORT", explicit_port)
+                self._clone_generation_stubs(state)
+                candidate_venv = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV"))
+                candidate_python = candidate_venv / "bin" / "python"
+                preserved_python = candidate_venv / "bin" / "python.fixture"
+                shutil.copyfile(candidate_python, preserved_python)
+                preserved_python.chmod(0o755)
+                write_stub(
+                    candidate_python,
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in\n'
+                    '  *render_config.py*|*render_operator.py*)\n'
+                    '    exec python3 "$@" ;;\n'
+                    "esac\n"
+                    'exec "$0.fixture" "$@"\n',
+                )
+                self._linux_health_double(release)
+                promoted = self._maintenance(release, control_env, "promote", "gen-2")
+                detail = promoted.stdout + promoted.stderr
+                for name in ("config-reference.out", "start-services.out", "verify.out"):
+                    path = state / "promotions" / "gen-2" / "evidence" / name
+                    if path.is_file():
+                        detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+                self.assertEqual(promoted.returncode, 0, detail)
+                expected = explicit_port or str(_render_module().PORT_DEFAULTS["AIRFLOW_API_PORT"])
+                cfg = (state / "airflow-home" / "airflow.cfg").read_text(encoding="utf-8")
+                self.assertIn(f"http://127.0.0.1:{expected}/execution", cfg)
+                self.assertNotIn(f"http://127.0.0.1:{ambient}/execution", cfg)
+
     def test_promote_refuses_a_generation_switch_while_a_dag_reader_is_alive(self) -> None:
         """The pointer switch has a no-reader barrier; a surviving reader keeps the old record."""
 
