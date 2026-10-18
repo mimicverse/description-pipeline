@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -817,7 +819,14 @@ class LifecycleTests(unittest.TestCase):
             "    fi ;;\n"
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
-            "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
+            "  *\"-Verb health\"*)\n"
+            '    case "$*" in\n'
+            '      *"/lifecycle/gen-1/windows-health-binding.json"*)\n'
+            '        cat "${FIXTURE_HEALTH_FILE_PREVIOUS:-$FIXTURE_HEALTH_FILE}" ;;\n'
+            '      *"/lifecycle/gen-2/windows-health-binding.json"*)\n'
+            '        cat "${FIXTURE_HEALTH_FILE_CANDIDATE:-$FIXTURE_HEALTH_FILE}" ;;\n'
+            '      *) cat "$FIXTURE_HEALTH_FILE" ;;\n'
+            "    esac ;;\n"
             "esac\n"
             "exit 0\n",
         )
@@ -2184,10 +2193,19 @@ class InstallOrderingTests(unittest.TestCase):
             'echo "scp $*" >> "$ORDER_LOG"\n'
             'src=""\n'
             'for argument in "$@"; do case "$argument" in *.zip) src="$argument" ;; esac; done\n'
-            'if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -n "$src" ]; then\n'
-            '  mkdir -p "$(dirname "$FIXTURE_REMOTE_ARCHIVE")"\n'
-            '  cp "$src" "$FIXTURE_REMOTE_ARCHIVE"\n'
-            '  chmod 0444 "$FIXTURE_REMOTE_ARCHIVE"\n'
+            'dest="${FIXTURE_REMOTE_ARCHIVE:-}"\n'
+            'gen=""\n'
+            'case "$*" in\n'
+            '  *"/lifecycle/gen-1/"*) gen="gen-1"; dest="${FIXTURE_REMOTE_ARCHIVE_GEN1:-$dest}" ;;\n'
+            '  *"/lifecycle/gen-2/"*) gen="gen-2"; dest="${FIXTURE_REMOTE_ARCHIVE_GEN2:-$dest}" ;;\n'
+            'esac\n'
+            'if [ -n "$gen" ] && [ -z "$dest" ] && [ -n "$src" ]; then\n'
+            '  dest="$FIXTURE_REMOTE_ARCHIVE_DIR/$gen/$(basename "$src")"\n'
+            'fi\n'
+            'if [ -n "$dest" ] && [ -n "$src" ]; then\n'
+            '  mkdir -p "$(dirname "$dest")"\n'
+            '  cp "$src" "$dest"\n'
+            '  chmod 0444 "$dest"\n'
             'fi\n'
             'exit 0\n',
         )
@@ -2196,9 +2214,19 @@ class InstallOrderingTests(unittest.TestCase):
             '#!/usr/bin/env bash\necho "ssh $*" >> "$ORDER_LOG"\n'
             'case "$*" in\n'
             '  *"Get-FileHash"*)\n'
-            '    if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -f "$FIXTURE_REMOTE_ARCHIVE" ]; then\n'
-            '      printf "%s|%s\\n" "$(stat -c %s "$FIXTURE_REMOTE_ARCHIVE")" \\\n'
-            '        "$(sha256sum "$FIXTURE_REMOTE_ARCHIVE" | cut -d" " -f1)"\n'
+            '    file="${FIXTURE_REMOTE_ARCHIVE:-}"\n'
+            '    gen=""\n'
+            '    case "$*" in\n'
+            '      *"/lifecycle/gen-1/"*) gen="gen-1"; file="${FIXTURE_REMOTE_ARCHIVE_GEN1:-$file}" ;;\n'
+            '      *"/lifecycle/gen-2/"*) gen="gen-2"; file="${FIXTURE_REMOTE_ARCHIVE_GEN2:-$file}" ;;\n'
+            '    esac\n'
+            '    if [ -z "$file" ] && [ -n "$gen" ]; then\n'
+            '      file="$(find "$FIXTURE_REMOTE_ARCHIVE_DIR/$gen" -maxdepth 1 -type f '
+            '-name "*.zip" -print -quit 2>/dev/null)"\n'
+            '    fi\n'
+            '    if [ -n "$file" ] && [ -f "$file" ]; then\n'
+            '      printf "%s|%s\\n" "$(stat -c %s "$file")" \\\n'
+            '        "$(sha256sum "$file" | cut -d" " -f1)"\n'
             '    else echo absent; fi ;;\n'
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
@@ -2214,7 +2242,14 @@ class InstallOrderingTests(unittest.TestCase):
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
-            "  *\"-Verb health\"*) cat \"$FIXTURE_HEALTH_FILE\" ;;\n"
+            "  *\"-Verb health\"*)\n"
+            '    case "$*" in\n'
+            '      *"/lifecycle/gen-1/windows-health-binding.json"*)\n'
+            '        cat "${FIXTURE_HEALTH_FILE_PREVIOUS:-$FIXTURE_HEALTH_FILE}" ;;\n'
+            '      *"/lifecycle/gen-2/windows-health-binding.json"*)\n'
+            '        cat "${FIXTURE_HEALTH_FILE_CANDIDATE:-$FIXTURE_HEALTH_FILE}" ;;\n'
+            '      *) cat "$FIXTURE_HEALTH_FILE" ;;\n'
+            "    esac ;;\n"
             "  *\"-Verb status\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
@@ -2267,6 +2302,7 @@ class InstallOrderingTests(unittest.TestCase):
             "REGISTER_AFTER": "0",
             "UNPAUSE_RC": "0",
             "PAUSE_RC": "0",
+            "FIXTURE_REMOTE_ARCHIVE_DIR": str(tmp / "remote-archives"),
             "FIXTURE_STUB_PYTHON": str(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python"),
             "PROJECTION_FILE": str(tmp / "projection.json"),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
@@ -2518,6 +2554,14 @@ class InstallOrderingTests(unittest.TestCase):
         health_file = release.parent / "windows-health.json"
         health_file.write_text(json.dumps({"passed": True, "verb": "health", "health": health}), encoding="utf-8")
         env["FIXTURE_HEALTH_FILE"] = str(health_file)
+        # The installed endpoint is the resident previous generation before any maintenance.
+        # Seed its immutable Windows archive in the fake remote generation directory so a
+        # rollback health check exercises the same size/digest identity as production.
+        remote_previous = Path(env["FIXTURE_REMOTE_ARCHIVE_DIR"]) / "gen-1"
+        remote_previous.mkdir(parents=True, exist_ok=True)
+        for archive in release.parent.glob("*-windows-*.zip"):
+            shutil.copyfile(archive, remote_previous / archive.name)
+            (remote_previous / archive.name).chmod(0o444)
 
     def _linux_health_double(self, release: Path) -> None:
         """The gate runs for real; its Linux probe is a bound double (no live HTTP services)."""
@@ -3106,6 +3150,165 @@ class InstallOrderingTests(unittest.TestCase):
                 {},
             )
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
+    def test_rollback_health_binds_the_restored_resident_release_not_the_candidate(self) -> None:
+        """A rollback verifies the previous endpoint with its own archive identity.
+
+        Candidate and resident deliberately carry different Windows archive sizes and digests.
+        The candidate generation keeps the candidate archive, while the restored generation
+        keeps the resident archive; health must bind the latter from the restored install
+        record and reach the real rollback health gate.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+
+            archive_name = "description-1.4.0-windows-cp312-x86_64.zip"
+            previous_archive = (release.parent / archive_name).read_bytes()
+            candidate_archive = b"candidate-windows-archive-with-a-distinct-size-and-digest"
+            self.assertNotEqual(len(previous_archive), len(candidate_archive))
+            self.assertNotEqual(
+                hashlib.sha256(previous_archive).digest(),
+                hashlib.sha256(candidate_archive).digest(),
+            )
+
+            candidate_root = root / "candidate-release"
+            shutil.copytree(release.parent, candidate_root)
+            candidate = candidate_root / "deploy"
+            (candidate_root / archive_name).write_bytes(candidate_archive)
+            candidate_manifest = json.loads(
+                (candidate_root / "release.json").read_text(encoding="utf-8")
+            )
+            candidate_manifest["source_commit"] = "d" * 40
+            candidate_manifest["source_sha256"] = "b" * 64
+            candidate_manifest["artifacts"][archive_name] = hashlib.sha256(
+                candidate_archive
+            ).hexdigest()
+            (candidate_root / "release.json").write_text(
+                json.dumps(candidate_manifest), encoding="utf-8"
+            )
+
+            previous_health = json.loads(
+                (release.parent / "windows-health.json").read_text(encoding="utf-8")
+            )
+            candidate_health = json.loads(json.dumps(previous_health))
+            candidate_health["health"]["release"]["source_commit"] = "d" * 40
+            candidate_health["health"]["release"]["source_sha256"] = "b" * 64
+            candidate_health_path = root / "candidate-windows-health.json"
+            candidate_health_path.write_text(json.dumps(candidate_health), encoding="utf-8")
+            control_env["FIXTURE_HEALTH_FILE_PREVIOUS"] = str(
+                release.parent / "windows-health.json"
+            )
+            control_env["FIXTURE_HEALTH_FILE_CANDIDATE"] = str(candidate_health_path)
+            control_env["FIXTURE_HEALTH_FILE"] = str(candidate_health_path)
+
+            remote_previous_archive = root / "remote-gen-1" / archive_name
+            remote_candidate_archive = root / "remote-gen-2" / archive_name
+            remote_previous_archive.parent.mkdir(parents=True)
+            remote_previous_archive.write_bytes(previous_archive)
+            remote_previous_archive.chmod(0o444)
+            control_env["FIXTURE_REMOTE_ARCHIVE_GEN1"] = str(remote_previous_archive)
+            control_env["FIXTURE_REMOTE_ARCHIVE_GEN2"] = str(remote_candidate_archive)
+            resident_binding_path = state / "promotions" / "gen-1" / "windows-binding.json"
+            resident_binding_path.parent.mkdir(parents=True, exist_ok=True)
+            resident_binding_bytes = b'{"resident":"canonical-binding-sentinel"}\n'
+            resident_binding_path.write_bytes(resident_binding_bytes)
+            resident_binding_path.chmod(0o600)
+            resident_binding_mode = stat.S_IMODE(resident_binding_path.stat().st_mode)
+
+            staged = self._maintenance(candidate, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(candidate)
+            promoted = self._maintenance(candidate, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            promoted_record = json.loads(
+                (state / "install-record.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(promoted_record["install_id"], "gen-2")
+
+            candidate_venv = self._derived_value(state, "gen-2", "AIRFLOW_VENV")
+            rolled = self._maintenance(
+                candidate,
+                dict(
+                    control_env,
+                    AIRFLOW_VENV=candidate_venv,
+                    FIXTURE_RUNTIME_PROCESS="1",
+                ),
+                "rollback",
+            )
+            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            restored_record = json.loads(
+                (state / "install-record.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(restored_record["install_id"], "gen-1")
+            self.assertEqual(
+                restored_record["release"]["source_commit"],
+                "c" * 40,
+            )
+
+            previous_health_binding = json.loads(
+                (state / "promotions" / "gen-1" / "windows-health-binding.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(previous_health_binding["source_commit"], "c" * 40)
+            self.assertEqual(previous_health_binding["source_sha256"], "a" * 64)
+            self.assertEqual(
+                previous_health_binding["artifact_sha256"],
+                hashlib.sha256(previous_archive).hexdigest(),
+            )
+            self.assertEqual(
+                resident_binding_path.read_bytes(),
+                resident_binding_bytes,
+                "health must not rewrite the restored resident's lifecycle binding",
+            )
+            self.assertEqual(stat.S_IMODE(resident_binding_path.stat().st_mode), resident_binding_mode)
+            candidate_health_binding = json.loads(
+                (state / "promotions" / "gen-2" / "windows-health-binding.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(candidate_health_binding["source_commit"], "d" * 40)
+            self.assertEqual(
+                candidate_health_binding["artifact_sha256"],
+                hashlib.sha256(candidate_archive).hexdigest(),
+            )
+
+            rollback_health = json.loads(
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "rollback-health.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(rollback_health["release"]["source_commit"], "c" * 40)
+            rollback_verify = (
+                state / "promotions" / "gen-2" / "evidence" / "rollback-verify.out"
+            ).read_text(encoding="utf-8")
+            self.assertIn("linux_health_gate=PASS", rollback_verify)
+            final_receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [(row["step"], row["status"]) for row in final_receipt["steps"] if row["verb"] == "rollback"][-1],
+                ("rollback-verify", "completed"),
+            )
 
     def test_rollback_restores_the_pre_maintenance_unpaused_dag_state(self) -> None:
         """Rollback restores the captured DAG state instead of toggling a constant."""
@@ -4044,6 +4247,254 @@ class InstallOrderingTests(unittest.TestCase):
                 )
                 self.assertFalse((state / "install-record.json").exists())
                 self.assertFalse(order.exists(), "no installation leg may run")
+
+
+class BackupStreamingUnitTests(unittest.TestCase):
+    """Seal and open stream tar bytes through OpenSSL without a plaintext temp archive."""
+
+    CONTROL = OPERATOR / "backup.py"
+
+    def test_seal_failure_removes_its_temp_and_leaves_retry_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "record.json").write_text("{}\n", encoding="utf-8")
+            out = root / "sealed" / "backup.tar.enc"
+            key = root / "secrets" / "backup.key"
+            bindir = root / "bin"
+            bindir.mkdir()
+            log = root / "openssl.log"
+            failing = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'out=""\n'
+                'previous=""\n'
+                'for argument in "$@"; do\n'
+                '  [ "$previous" = "-out" ] && out="$argument"\n'
+                '  previous="$argument"\n'
+                "done\n"
+                "cat >/dev/null\n"
+                "printf 'PARTIAL' > \"$out\"\n"
+                "exit 9\n"
+            )
+            write_stub(bindir / "openssl", failing)
+            env = {
+                "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "OPENSSL_LOG": str(log),
+            }
+            command = [
+                sys.executable,
+                str(self.CONTROL),
+                "seal",
+                "--source",
+                str(source),
+                "--key",
+                str(key),
+                "--out",
+                str(out),
+            ]
+            failed = run(command, env)
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertIn("openssl failed", failed.stderr)
+            self.assertFalse(out.exists())
+            self.assertEqual(list(out.parent.iterdir()), [])
+
+            out.parent.mkdir(exist_ok=True)
+            out.write_bytes(b"preexisting")
+            failed_existing = run(command, env)
+            self.assertNotEqual(failed_existing.returncode, 0, failed_existing.stdout + failed_existing.stderr)
+            self.assertEqual(out.read_bytes(), b"preexisting")
+            self.assertEqual(list(out.parent.iterdir()), [out])
+
+            write_stub(
+                bindir / "openssl",
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'out=""\n'
+                'previous=""\n'
+                'for argument in "$@"; do\n'
+                '  [ "$previous" = "-out" ] && out="$argument"\n'
+                '  previous="$argument"\n'
+                "done\n"
+                "cat >/dev/null\n"
+                "printf 'sealed-on-retry\\n' > \"$out\"\n",
+            )
+            retried = run(command, env)
+            self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+            self.assertEqual(out.read_bytes(), b"sealed-on-retry\n")
+            self.assertEqual(list(out.parent.iterdir()), [out])
+
+    def test_seal_has_no_plaintext_tar_temp_and_passes_no_input_file_to_openssl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "large.bin").write_bytes(b"x" * (2 * 1024 * 1024 + 17))
+            (source / "nested").mkdir()
+            (source / "nested" / "record.json").write_text("{}", encoding="utf-8")
+            out = root / "sealed" / "newgen-backup.tar.enc"
+            key = root / "secrets" / "backup.key"
+            bindir = root / "bin"
+            bindir.mkdir()
+            log = root / "openssl.log"
+            write_stub(
+                bindir / "openssl",
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'out=""\n'
+                'previous=""\n'
+                'for argument in "$@"; do\n'
+                '  [ "$previous" = "-out" ] && out="$argument"\n'
+                '  previous="$argument"\n'
+                "done\n"
+                'printf "arg=%s\\n" "$@" >> "$OPENSSL_LOG"\n'
+                'printf "before=%s\\n" "$(find "$(dirname "$out")" -maxdepth 1 -type f -printf "%f," 2>/dev/null)"'
+                ' >> "$OPENSSL_LOG"\n'
+                "cat >/dev/null\n"
+                "printf 'double-openssl-output\\n' > \"$out\"\n",
+            )
+            result = run(
+                [
+                    sys.executable,
+                    str(self.CONTROL),
+                    "seal",
+                    "--source",
+                    str(source),
+                    "--key",
+                    str(key),
+                    "--out",
+                    str(out),
+                ],
+                {
+                    "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                    "OPENSSL_LOG": str(log),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(list(out.parent.iterdir()), [out])
+            calls = log.read_text(encoding="utf-8")
+            self.assertNotIn("arg=-in", calls)
+            self.assertIn("arg=-out\n", calls)
+            self.assertIn(".partial", calls)
+
+    def test_open_streams_openssl_stdout_and_keeps_member_and_extra_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / "payload.json"
+            payload.write_text('{"install":"resident"}\n', encoding="utf-8")
+            member = "state/install-record.json"
+            plaintext_tar = root / "plaintext.tar"
+            with tarfile.open(plaintext_tar, "w") as tar:
+                tar.add(payload, arcname=member)
+            extra_tar = root / "extra.tar"
+            with tarfile.open(extra_tar, "w") as tar:
+                tar.add(payload, arcname=member)
+                tar.add(payload, arcname="state/unexpected.json")
+            changed = root / "changed.json"
+            changed.write_text('{"install":"changed"}\n', encoding="utf-8")
+            changed_tar = root / "changed.tar"
+            with tarfile.open(changed_tar, "w") as tar:
+                tar.add(changed, arcname=member)
+
+            inputs = root / "input"
+            inputs.mkdir()
+            archive = inputs / "backup.tar.enc"
+            archive.write_bytes(b"sealed-input")
+            key = inputs / "backup.key"
+            key.write_bytes(b"test-key")
+            manifest = inputs / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": "solidworks-to-urdf.promote-backup/v1",
+                        "files": {member: hashlib.sha256(payload.read_bytes()).hexdigest()},
+                        "encrypted": {
+                            "path": str(archive),
+                            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                            "cipher": "aes-256-cbc",
+                            "key": str(key),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bindir = root / "bin"
+            bindir.mkdir()
+            log = root / "openssl.log"
+            write_stub(
+                bindir / "openssl",
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "input=\"\"\n"
+                "previous=\"\"\n"
+                "for argument in \"$@\"; do\n"
+                "  [ \"$previous\" = \"-in\" ] && input=\"$argument\"\n"
+                "  previous=\"$argument\"\n"
+                "done\n"
+                "printf \"arg=%s\\n\" \"$@\" >> \"$OPENSSL_LOG\"\n"
+                "printf \"before=%s\\n\" \"$(find \"$FIXTURE_DEST_PARENT\" -maxdepth 1 "
+                "-type f -printf \"%f,\" 2>/dev/null)\""
+                " >> \"$OPENSSL_LOG\"\n"
+                "cat \"$input\" >/dev/null\n"
+                "if [ \"${FIXTURE_OPEN_FAIL:-0}\" = \"1\" ]; then printf 'partial'; exit 9; fi\n"
+                "cat \"$FIXTURE_PLAINTEXT_TAR\"\n",
+            )
+            base_env = {
+                "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "OPENSSL_LOG": str(log),
+            }
+
+            def invoke(dest_parent: Path, tar_path: Path, *, fail: bool = False) -> subprocess.CompletedProcess:
+                dest_parent.mkdir(exist_ok=True)
+                return run(
+                    [
+                        sys.executable,
+                        str(self.CONTROL),
+                        "open",
+                        "--archive",
+                        str(archive),
+                        "--key",
+                        str(key),
+                        "--manifest",
+                        str(manifest),
+                        "--dest",
+                        str(dest_parent / "restored"),
+                    ],
+                    {
+                        **base_env,
+                        "FIXTURE_DEST_PARENT": str(dest_parent),
+                        "FIXTURE_PLAINTEXT_TAR": str(tar_path),
+                        "FIXTURE_OPEN_FAIL": "1" if fail else "0",
+                    },
+                )
+
+            failed = invoke(root / "retry", plaintext_tar, fail=True)
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertFalse((root / "retry" / "restored").exists())
+            self.assertEqual(list((root / "retry").iterdir()), [])
+            retried = invoke(root / "retry", plaintext_tar)
+            self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+            self.assertEqual((root / "retry" / "restored" / member).read_bytes(), payload.read_bytes())
+
+            opened = invoke(root / "ok", plaintext_tar)
+            self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+            self.assertEqual((root / "ok" / "restored" / member).read_bytes(), payload.read_bytes())
+            self.assertEqual(list((root / "ok").iterdir()), [root / "ok" / "restored"])
+            calls = log.read_text(encoding="utf-8")
+            self.assertNotIn("arg=-out", calls)
+            self.assertIn("before=\n", calls)
+
+            extra = invoke(root / "extra", extra_tar)
+            self.assertNotEqual(extra.returncode, 0, extra.stdout + extra.stderr)
+            self.assertIn("members outside the manifest", extra.stderr)
+            self.assertFalse((root / "extra" / "restored").exists())
+            self.assertEqual(list((root / "extra").iterdir()), [])
+            changed_result = invoke(root / "changed", changed_tar)
+            self.assertNotEqual(changed_result.returncode, 0, changed_result.stdout + changed_result.stderr)
+            self.assertIn("restored member differs from the manifest", changed_result.stderr)
+            self.assertFalse((root / "changed" / "restored").exists())
+            self.assertEqual(list((root / "changed").iterdir()), [])
 
 
 class BackupStagingCleanupUnitTests(unittest.TestCase):
