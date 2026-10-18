@@ -16,6 +16,7 @@ Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -40,6 +41,16 @@ def die(message: str) -> None:
 def require(condition: bool, message: str) -> None:
     if not condition:
         die(message)
+
+
+def sha256_file(path: Path) -> str:
+    """Hash a backup member in bounded memory; sealed and source files may be multi-gigabyte."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def ensure_key(path: Path) -> None:
@@ -103,7 +114,7 @@ def write_manifest(source: Path, sealed: Path, key: Path, out: Path) -> dict:
     require(source.is_dir(), f"backup source is missing: {source}")
     require(sealed.is_file(), f"sealed archive is missing: {sealed}")
     files = {
-        path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        path.relative_to(source).as_posix(): sha256_file(path)
         for path in sorted(source.rglob("*"))
         if path.is_file()
     }
@@ -113,7 +124,7 @@ def write_manifest(source: Path, sealed: Path, key: Path, out: Path) -> dict:
         "files": files,
         "encrypted": {
             "path": str(sealed),
-            "sha256": hashlib.sha256(sealed.read_bytes()).hexdigest(),
+            "sha256": sha256_file(sealed),
             "cipher": CIPHER,
             "key": str(key),
         },
@@ -134,18 +145,28 @@ def seal(source: Path, key: Path, out: Path) -> str:
     require(source.is_dir(), f"backup source is missing: {source}")
     ensure_key(key)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=out.parent, delete=False) as handle:
-        archive = Path(handle.name)
+    process = subprocess.Popen(
+        ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key}", "-out", str(out)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    stream_error = None
     try:
-        with tarfile.open(archive, "w") as tar:
+        with tarfile.open(fileobj=process.stdin, mode="w|") as tar:
             for path in sorted(source.rglob("*")):
                 tar.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
-        _openssl(
-            ["enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key}", "-in", str(archive), "-out", str(out)]
-        )
+    except (BrokenPipeError, OSError, tarfile.TarError) as error:
+        stream_error = error
     finally:
-        archive.unlink(missing_ok=True)
-    return hashlib.sha256(out.read_bytes()).hexdigest()
+        if process.stdin is not None:
+            with contextlib.suppress(BrokenPipeError, OSError):
+                process.stdin.close()
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    returncode = process.wait()
+    require(returncode == 0, f"openssl failed: {stderr.decode(errors='replace').strip()}")
+    require(stream_error is None, f"tar stream failed: {stream_error}")
+    return sha256_file(out)
 
 
 def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> None:
@@ -155,7 +176,7 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
     sealed = manifest["encrypted"]
     expected = sealed["sha256"]
     require(
-        isinstance(expected, str) and hashlib.sha256(archive.read_bytes()).hexdigest() == expected,
+        isinstance(expected, str) and sha256_file(archive) == expected,
         "the sealed archive digest does not match the manifest",
     )
     validated = manifest["files"]
@@ -174,7 +195,7 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
     for name, checksum in validated.items():
         restored = dest / name
         require(
-            restored.is_file() and hashlib.sha256(restored.read_bytes()).hexdigest() == checksum,
+            restored.is_file() and sha256_file(restored) == checksum,
             f"restored member differs from the manifest: {name}",
         )
     extras = sorted(

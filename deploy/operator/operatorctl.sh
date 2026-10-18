@@ -505,12 +505,149 @@ print(f"admission={view.state} revision={view.revision}")
 PY
 }
 
+# Health is a read-only relay of the endpoint that is running now.  Its binding therefore comes
+# from the identity that owns that endpoint: the candidate release manifest during promotion, or
+# the active install record after rollback has restored the previous resident.  It must never be
+# rendered from the candidate release while checking the previous generation: that would compare
+# the resident's archive with the candidate archive and turn a successful restore into a failure.
+instance_lifecycle_health() {
+  local generation="$1" identity_file="$2"
+  local dir="$OPERATOR_STATE/promotions/$generation"
+  local binding="$dir/windows-health-binding.json" output="$dir/windows-health.out"
+  mkdir -p "$dir"
+  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" <<'PY' || return 1
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+identity_path = Path(sys.argv[2])
+out = Path(sys.argv[3])
+generation = sys.argv[4]
+windows = json.loads(config_path.read_text(encoding="utf-8"))["windows"]
+instance = windows["instance"]
+identity = json.loads(identity_path.read_text(encoding="utf-8"))
+
+if identity.get("schema_version") == "solidworks-to-urdf.install-record/v1":
+    release = identity.get("release")
+    rows = release.get("artifacts") if isinstance(release, dict) else None
+    if not isinstance(rows, list):
+        raise SystemExit("operatorctl: the active install record carries no release artifacts")
+    artifacts = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"name", "sha256"}:
+            raise SystemExit("operatorctl: the active install record has a malformed release artifact")
+        artifacts[row["name"]] = row["sha256"]
+elif identity.get("schema_version") == "solidworks-to-urdf.release/v1":
+    release = identity
+    artifacts = release.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise SystemExit("operatorctl: the release manifest carries no artifacts")
+else:
+    raise SystemExit(f"operatorctl: unsupported health identity: {identity_path}")
+
+native = sorted(name for name in artifacts if name.endswith(".zip") and "-windows-" in name)
+if len(native) != 1:
+    raise SystemExit(
+        f"operatorctl: the health identity must name exactly one native Windows archive, got {native}"
+    )
+remote = instance["state_root"].rstrip("/") + "/lifecycle/" + generation
+out.write_text(
+    json.dumps(
+        {
+            "task_name": instance["task_name"],
+            "state_root": instance["state_root"],
+            "package_root": instance["package_root"],
+            "output_root": instance["output_root"],
+            "port": windows["endpoint_port"],
+            "generation": generation,
+            "dir": remote,
+            "archive": native[0],
+            "artifact_sha256": artifacts[native[0]],
+            "version": release["version"],
+            "source_commit": release["source_commit"],
+            "source_sha256": release["source_sha256"],
+        },
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+  local remote archive_name expected_hash remote_archive_state
+  remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
+  archive_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
+  expected_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
+  remote_archive_state="$(
+    ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
+      "powershell.exe -NoProfile -Command \"if (Test-Path -LiteralPath '$remote/$archive_name') { \$item=Get-Item -LiteralPath '$remote/$archive_name'; Write-Output ('{0}|{1}' -f \$item.Length, (Get-FileHash -LiteralPath '$remote/$archive_name' -Algorithm SHA256).Hash.ToLower()) } else { Write-Output 'absent' }\"" \
+      2>/dev/null | tr -d '\r' | tail -1
+  )" || { echo "instance_lifecycle: could not inspect the health archive on $SOLIDWORKS_SSH_HOST" >&2; return 2; }
+  case "$remote_archive_state" in
+    *"|$expected_hash") ;;
+    absent)
+      echo "instance_lifecycle: the health identity's staged archive is missing on $SOLIDWORKS_SSH_HOST" >&2
+      return 1
+      ;;
+    *)
+      echo "instance_lifecycle: the staged archive does not match the health identity" >&2
+      return 1
+      ;;
+  esac
+  scp -q -o BatchMode=yes "$binding" "$SOLIDWORKS_SSH_HOST:$remote/" \
+    || { echo "instance_lifecycle: could not transfer the health binding to $SOLIDWORKS_SSH_HOST" >&2; return 2; }
+  if ! { : > "$output" && : > "$output.ssh-rc"; }; then
+    echo "instance_lifecycle: could not initialise health evidence in $dir" >&2
+    return 2
+  fi
+  local remote_rc=0
+  ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
+    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote/instance-lifecycle.ps1\" -Verb health -Binding \"$remote/windows-health-binding.json\"" \
+    > "$output" || remote_rc=$?
+  if ! printf '%s\n' "$remote_rc" > "$output.ssh-rc"; then
+    echo "instance_lifecycle: could not persist the health SSH exit status in $dir" >&2
+    return 2
+  fi
+  local parse_rc=0
+  python3 - "$output" "$remote_rc" <<'PY' || parse_rc=$?
+import json
+import sys
+
+remote_rc = int(sys.argv[2])
+try:
+    document = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(3)
+if not isinstance(document, dict) or document.get("verb") != "health":
+    raise SystemExit(3)
+if remote_rc == 0 and document.get("passed") is True:
+    raise SystemExit(0)
+code = document.get("code")
+if remote_rc in (0, 1) and document.get("passed") is False and isinstance(code, str) and code.strip():
+    raise SystemExit(1)
+raise SystemExit(3)
+PY
+  if [ "$parse_rc" = "1" ]; then
+    echo "instance_lifecycle: the health result is a definite refusal; see $output" >&2
+    return 1
+  fi
+  if [ "$parse_rc" != "0" ]; then
+    echo "instance_lifecycle: the health outcome is unreadable; see $output" >&2
+    return 2
+  fi
+  echo "$output"
+}
+
 # The Windows end of the unified stage/promote/rollback protocol.  One binding file rendered
 # here from platform.json + release.json travels with the single lifecycle script over the
 # authenticated SSH channel; the script's stdout is kept as the step evidence under the
 # promotion receipt directory.
 instance_lifecycle() {
   local verb="$1" generation="$2" previous="${3:-}"
+  case "$verb" in
+    stage|promote|rollback|status) ;;
+    *) die "operatorctl: unsupported lifecycle verb: $verb" ;;
+  esac
   local dir="$OPERATOR_STATE/promotions/$generation"
   local binding="$dir/windows-binding.json" output="$dir/windows-$verb.out"
   mkdir -p "$dir"
@@ -1429,7 +1566,7 @@ PY
     # 6. the endpoint identity is what the running endpoint reports through its own health
     #    relay; the canonical IF-09 validator decides it against the release manifest - never
     #    a handwritten declaration
-    if ! WINDOWS_HEALTH="$(instance_lifecycle health "$CANDIDATE_ID")"; then
+    if ! WINDOWS_HEALTH="$(instance_lifecycle_health "$CANDIDATE_ID" "$RELEASE_FILE")"; then
       promotion_step "$CANDIDATE_ID" promote endpoint-identity failed "$RECEIPT_DIR/windows-health.out"
       die "the running endpoint health did not pass (the admission stays closed)"
     fi
@@ -1511,7 +1648,7 @@ PY
     if ! {
       "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-active \
         --config "$CONFIG_FILE" --state-root "$STATE_ROOT" \
-      && WINDOWS_HEALTH="$(instance_lifecycle health "$CANDIDATE_ID")" \
+      && WINDOWS_HEALTH="$(instance_lifecycle_health "$CANDIDATE_ID" "$RELEASE_FILE")" \
       && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/final-health.json" \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/final-health.json" --release-file "$RELEASE_FILE" \
@@ -1767,7 +1904,7 @@ PY
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-running \
         --state-root "$STATE_ROOT" \
-      && WINDOWS_HEALTH="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" instance_lifecycle health "$ACTIVE_ID")" \
+      && WINDOWS_HEALTH="$(instance_lifecycle_health "$ACTIVE_ID" "$STATE_ROOT/install-record.json")" \
       && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/rollback-health.json" \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/rollback-health.json" --release-file "$RELEASE_FILE" \
