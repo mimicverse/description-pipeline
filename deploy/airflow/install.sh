@@ -16,15 +16,20 @@
 #                        the stage half of the promote protocol.  Other arguments are ignored.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODE="${1:-}"
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
 : "${AIRFLOW_VENV:?set AIRFLOW_VENV to the private venv path}"
 : "${AIRFLOW_HOME:?set AIRFLOW_HOME to the Airflow home directory}"
 : "${PIPELINE_WHEEL:?set PIPELINE_WHEEL to the built mimicverse_description wheel}"
-: "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
-: "${AIRFLOW_RUNTIME_DB_URL:?set AIRFLOW_RUNTIME_DB_URL to the least-privilege runtime DSN}"
-: "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
+if [ "$MODE" != "--stage" ]; then
+  # Normal installation renders the managed config and migrates the live database; refuse
+  # missing connection/port inputs here, before creating the venv or running pip.
+  : "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
+  : "${AIRFLOW_RUNTIME_DB_URL:?set AIRFLOW_RUNTIME_DB_URL to the least-privilege runtime DSN}"
+  : "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
+fi
 
 for pair in "AIRFLOW_VENV:$AIRFLOW_VENV" "AIRFLOW_HOME:$AIRFLOW_HOME" "PIPELINE_WHEEL:$PIPELINE_WHEEL"; do
   name="${pair%%:*}" value="${pair#*:}"
@@ -64,7 +69,7 @@ fi
 # installing configuration or migrating the service database.
 "$AIRFLOW_VENV/bin/description" doctor
 
-if [ "${1:-}" = "--stage" ]; then
+if [ "$MODE" = "--stage" ]; then
   echo "Airflow runtime staged (no configuration switch, no migration): $("$AIRFLOW_VENV/bin/airflow" version)"
   exit 0
 fi
