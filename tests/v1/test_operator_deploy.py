@@ -752,11 +752,28 @@ class LifecycleTests(unittest.TestCase):
             'for argument in "$@"; do [ "$prev" = "-f" ] && out="$argument"; prev="$argument"; done\n'
             '[ -n "$out" ] && : > "$out"\nexit 0\n',
         )
-        write_stub(bindir / "scp", '#!/bin/bash\necho "scp $*" >> "$ORDER_LOG"\nexit 0\n')
+        write_stub(
+            bindir / "scp",
+            '#!/bin/bash\n'
+            'echo "scp $*" >> "$ORDER_LOG"\n'
+            'src=""\n'
+            'for argument in "$@"; do case "$argument" in *.zip) src="$argument" ;; esac; done\n'
+            'if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -n "$src" ]; then\n'
+            '  mkdir -p "$(dirname "$FIXTURE_REMOTE_ARCHIVE")"\n'
+            '  cp "$src" "$FIXTURE_REMOTE_ARCHIVE"\n'
+            '  chmod 0444 "$FIXTURE_REMOTE_ARCHIVE"\n'
+            'fi\n'
+            'exit 0\n',
+        )
         write_stub(
             bindir / "ssh",
             '#!/bin/bash\necho "ssh $*" >> "$ORDER_LOG"\n'
             'case "$*" in\n'
+            '  *"Get-FileHash"*)\n'
+            '    if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -f "$FIXTURE_REMOTE_ARCHIVE" ]; then\n'
+            '      printf "%s|%s\\n" "$(stat -c %s "$FIXTURE_REMOTE_ARCHIVE")" \\\n'
+            '        "$(sha256sum "$FIXTURE_REMOTE_ARCHIVE" | cut -d" " -f1)"\n'
+            '    else echo absent; fi ;;\n'
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
@@ -2161,11 +2178,28 @@ class InstallOrderingTests(unittest.TestCase):
             "[ -n \"$out\" ] && printf 'PGDUMP-DOUBLE\\n' > \"$out\"\nexit 0\n",
         )
         write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
-        write_stub(bindir / "scp", '#!/usr/bin/env bash\necho "scp $*" >> "$ORDER_LOG"\nexit 0\n')
+        write_stub(
+            bindir / "scp",
+            '#!/usr/bin/env bash\n'
+            'echo "scp $*" >> "$ORDER_LOG"\n'
+            'src=""\n'
+            'for argument in "$@"; do case "$argument" in *.zip) src="$argument" ;; esac; done\n'
+            'if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -n "$src" ]; then\n'
+            '  mkdir -p "$(dirname "$FIXTURE_REMOTE_ARCHIVE")"\n'
+            '  cp "$src" "$FIXTURE_REMOTE_ARCHIVE"\n'
+            '  chmod 0444 "$FIXTURE_REMOTE_ARCHIVE"\n'
+            'fi\n'
+            'exit 0\n',
+        )
         write_stub(
             bindir / "ssh",
             '#!/usr/bin/env bash\necho "ssh $*" >> "$ORDER_LOG"\n'
             'case "$*" in\n'
+            '  *"Get-FileHash"*)\n'
+            '    if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -f "$FIXTURE_REMOTE_ARCHIVE" ]; then\n'
+            '      printf "%s|%s\\n" "$(stat -c %s "$FIXTURE_REMOTE_ARCHIVE")" \\\n'
+            '        "$(sha256sum "$FIXTURE_REMOTE_ARCHIVE" | cut -d" " -f1)"\n'
+            '    else echo absent; fi ;;\n'
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
@@ -2752,6 +2786,69 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn("snapshot", refused.stderr)
             self.assertNotIn("duplicate", refused.stderr)
             self.assertNotIn("does not declare", refused.stderr)
+
+    def test_stage_archive_is_read_only_and_promote_reuses_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            remote_archive = Path(tmp) / "remote" / "description-1.4.0-windows-cp312-x86_64.zip"
+            control_env["FIXTURE_REMOTE_ARCHIVE"] = str(remote_archive)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self.assertTrue(remote_archive.is_file())
+            self.assertFalse(stat.S_IMODE(remote_archive.stat().st_mode) & 0o222)
+            original = remote_archive.read_bytes()
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertEqual(remote_archive.read_bytes(), original)
+            self.assertFalse(stat.S_IMODE(remote_archive.stat().st_mode) & 0o222)
+            scp_lines = order.read_text(encoding="utf-8").splitlines()
+            archive_scp = [
+                line
+                for line in scp_lines
+                if line.startswith("scp ") and "description-1.4.0-windows-cp312-x86_64.zip" in line
+            ]
+            self.assertEqual(len(archive_scp), 1, "stage should transfer the archive exactly once")
+
+    def test_promote_refuses_a_mismatched_read_only_staged_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            remote_archive = Path(tmp) / "remote" / "description-1.4.0-windows-cp312-x86_64.zip"
+            control_env["FIXTURE_REMOTE_ARCHIVE"] = str(remote_archive)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode, 0
+            )
+            remote_archive.chmod(0o600)
+            remote_archive.write_bytes(b"wrong-staged-archive")
+            remote_archive.chmod(0o444)
+            failed = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertIn("does not match the release binding", failed.stderr)
+            self.assertEqual(remote_archive.read_bytes(), b"wrong-staged-archive")
 
     def test_stage_promote_rollback_drill_with_bound_doubles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
