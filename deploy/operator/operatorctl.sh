@@ -561,16 +561,39 @@ out.write_text(
     encoding="utf-8",
 )
 PY
-  local remote archive_local
+  local remote archive_local archive_name expected_archive_size expected_archive_hash remote_archive_state
   remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
   archive_local="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive_local"])' "$binding")"
+  archive_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
+  expected_archive_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
+  expected_archive_size="$(stat -c %s "$archive_local")" \
+    || { echo "instance_lifecycle: could not size the native archive: $archive_local" >&2; return 1; }
   # The generation directory exists first (private, under the instance state root); the archive
   # travels with the binding and the script, and the script consumes exactly the transferred file.
   ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
     "powershell.exe -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '$remote' | Out-Null\"" \
     || { echo "instance_lifecycle: could not create $remote on $SOLIDWORKS_SSH_HOST" >&2; return 1; }
-  scp -q -o BatchMode=yes "$binding" "$HERE/../windows/instance-lifecycle.ps1" "$archive_local" \
-    "$SOLIDWORKS_SSH_HOST:$remote/" \
+  # Stage creates the archive once. Promote, rollback and reconcile reuse that
+  # immutable staged copy when its remote size and digest still match the
+  # binding. A present-but-different archive is a refusal, never an overwrite.
+  remote_archive_state="$(
+    ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
+      "powershell.exe -NoProfile -Command \"if (Test-Path -LiteralPath '$remote/$archive_name') { \$item=Get-Item -LiteralPath '$remote/$archive_name'; Write-Output ('{0}|{1}' -f \$item.Length, (Get-FileHash -LiteralPath '$remote/$archive_name' -Algorithm SHA256).Hash.ToLower()) } else { Write-Output 'absent' }\"" \
+      2>/dev/null | tr -d '\r' | tail -1
+  )" || { echo "instance_lifecycle: could not inspect the staged archive on $SOLIDWORKS_SSH_HOST" >&2; return 1; }
+  local -a transfer_inputs=("$binding" "$HERE/../windows/instance-lifecycle.ps1")
+  case "$remote_archive_state" in
+    absent)
+      transfer_inputs+=("$archive_local")
+      ;;
+    "$expected_archive_size|$expected_archive_hash")
+      ;;
+    *)
+      echo "instance_lifecycle: staged archive on $SOLIDWORKS_SSH_HOST does not match the release binding" >&2
+      return 1
+      ;;
+  esac
+  scp -q -o BatchMode=yes "${transfer_inputs[@]}" "$SOLIDWORKS_SSH_HOST:$remote/" \
     || { echo "instance_lifecycle: could not transfer the lifecycle inputs to $SOLIDWORKS_SSH_HOST" >&2; return 1; }
   local stage_argument=""
   case "$verb" in
