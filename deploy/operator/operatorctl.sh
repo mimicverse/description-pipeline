@@ -30,6 +30,12 @@ RELEASE_ROOT="$(cd "$HERE/../.." && pwd -P)"
 UNITS=(description-postgres description-solidworks-tunnel description-airflow-dag-processor
        description-airflow-scheduler description-airflow-api-server description-portal
        description-operator-proxy)
+GENERATION_ENV_REQUIRED=(
+  AIRFLOW_DB_URL AIRFLOW_HOME AIRFLOW_RUNTIME_DB_URL AIRFLOW_VENV
+  OPERATOR_STATE PIPELINE_STORE_ROOT PIPELINE_WHEEL PLATFORM_CONFIG_DIGEST
+  PLATFORM_OPERATOR_DSN PLATFORM_SERVICE_DSN POSTGRES_PORT POSTGRES_ROOT
+  SOLIDWORKS_HANDOFF_ROOT SOLIDWORKS_SSH_HOST
+)
 
 die() { echo "operatorctl: $*" >&2; exit 1; }
 usage() {
@@ -131,12 +137,25 @@ install_from_config() {
   ENV_FILE="$DERIVED_ENV"
 }
 
+load_env_file() {
+  local file="$1" rc=0 allexport=0
+  [ -f "$file" ] && [ ! -L "$file" ] \
+    || die "environment file is missing or a link: $file"
+  case "$-" in
+    *a*) allexport=1 ;;
+  esac
+  set -a
+  # shellcheck disable=SC1090
+  source "$file" || rc=$?
+  [ "$allexport" = "1" ] || set +a
+  return "$rc"
+}
+
 load_active_env() {
   STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
     python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
   [ -f "$STATE_ROOT/resolved.env" ] || die "not installed: $STATE_ROOT/resolved.env is missing (run install first)"
-  # shellcheck disable=SC1090
-  source "$STATE_ROOT/resolved.env"
+  load_env_file "$STATE_ROOT/resolved.env" || return $?
   # The operational entry verifies the complete install record, the snapshot digest and the
   # current-config binding before anything else; the check runs with the deployment interpreter
   # so it consumes the canonical schema implementation (single owner, no local mirror).
@@ -145,6 +164,7 @@ load_active_env() {
   [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
   ENV_FILE="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
+  load_generation_env || return $?
 }
 
 # The maintenance window (stage/promote/rollback) verifies the RUNNING record and its immutable
@@ -154,8 +174,7 @@ load_running_env() {
   STATE_ROOT="$(python3 "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
     python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
   [ -f "$STATE_ROOT/resolved.env" ] || die "not installed: $STATE_ROOT/resolved.env is missing (run install first)"
-  # shellcheck disable=SC1090
-  source "$STATE_ROOT/resolved.env"
+  load_env_file "$STATE_ROOT/resolved.env" || return $?
   ACTIVE_ID="$(AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
     verify-running --state-root "$STATE_ROOT" | sed -n 's/^install_id=//p')" || exit $?
   [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
@@ -167,12 +186,13 @@ load_running_env() {
 # record, not values inherited from the caller's previous generation. The derived file is the
 # generation-scoped authority and every key it defines replaces the ambient shell value.
 load_generation_env() {
-  [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] \
-    || die "generation environment is missing or a link: $ENV_FILE"
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
+  [ -n "$ENV_FILE" ] || die "generation environment path is not selected"
+  unset "${GENERATION_ENV_REQUIRED[@]}"
+  load_env_file "$ENV_FILE" || return $?
+  for key in "${GENERATION_ENV_REQUIRED[@]}"; do
+    [ -n "${!key:-}" ] \
+      || die "generation environment $ENV_FILE does not define $key"
+  done
 }
 
 # One env contract: platform_env and render_operator write every derived value through the
@@ -958,9 +978,13 @@ load_installed() {
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
   [ -f "$OPERATOR_STATE_DIR/resolved.env" ] \
     || die "not installed: $OPERATOR_STATE_DIR/resolved.env is missing (run install first)"
-  # shellcheck disable=SC1090
-  source "$OPERATOR_STATE_DIR/resolved.env"
-  # Every port comes from the single deploy source (render_operator.py) via resolved.env.
+  load_env_file "$OPERATOR_STATE_DIR/resolved.env" || return $?
+  # The verified generation is the final layer: values in its file override both the shared
+  # resolved environment and any same-name ambient variable, then are exported to child
+  # processes through the one loader above.
+  load_generation_env || return $?
+  # Every port comes from the single deploy source (render_operator.py) via resolved.env,
+  # unless the generation-specific file explicitly overrides it.
   for key in AIRFLOW_API_PORT TUNNEL_LOOPBACK_PORT POSTGRES_PORT SOLIDWORKS_ENDPOINT_PORT; do
     [ -n "${!key:-}" ] || die "resolved.env is missing $key; run install to re-render the deployment"
   done
@@ -1042,8 +1066,7 @@ case "$ACTION" in
       python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
     [ -f "$START_STATE_ROOT/resolved.env" ] \
       || die "not installed: $START_STATE_ROOT/resolved.env is missing (run install first)"
-    # shellcheck disable=SC1090
-    source "$START_STATE_ROOT/resolved.env"
+    load_env_file "$START_STATE_ROOT/resolved.env"
     ensure_postgres_ready
     platform_close_admission "start-window" "operatorctl start"
     load_active_env ;;
@@ -1188,9 +1211,13 @@ GUARD
         die "the staged generation's schema objects were not applied (the admission stays closed)"
       fi
       promotion_step "$CANDIDATE_ID" reconcile schema-migration completed "$RECEIPT_DIR/reconcile-schema-migration.out"
+      load_generation_env
     fi ;;
-  stage|promote|rollback)
+  stage)
     load_running_env ;;
+  promote|rollback)
+    load_running_env
+    load_generation_env ;;
   *)
     usage ;;
 esac
@@ -1207,13 +1234,12 @@ case "$ACTION" in
     PROXY_BIN="$(ensure_proxy_binary)" || die "the managed proxy binary is unavailable; nothing was installed"
     python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" > "$RENDER_LOG"
     cat "$RENDER_LOG"
-    # shellcheck disable=SC1090
-    source "$(sed -n 's/^OPERATOR_STATE=//p' "$RENDER_LOG" | head -1)/resolved.env"
+    load_env_file "$(sed -n 's/^OPERATOR_STATE=//p' "$RENDER_LOG" | head -1)/resolved.env"
+    load_generation_env
     TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     bash "$HERE/scripts/install_toolchain.sh" > "$TOOLCHAIN_LOG"
     cat "$TOOLCHAIN_LOG"
-    # shellcheck disable=SC1090
-    source "$TOOLCHAIN_LOG"
+    load_env_file "$TOOLCHAIN_LOG"
     python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
       --units-dir "$TARGET" >/dev/null
     airflow_render
@@ -1423,10 +1449,8 @@ PY
       --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,config-reference,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-config-reference,rollback-verify" \
       >/dev/null
     printf '%s\n' "$CANDIDATE_WHEEL" > "$RECEIPT_DIR/candidate-wheel"
-    set -a
-    # shellcheck disable=SC1090
-    source "$CANDIDATE_ENV"
-    set +a
+    ENV_FILE="$CANDIDATE_ENV"
+    load_generation_env
     if bash "$AIRFLOW_HERE/install.sh" --stage > "$RECEIPT_DIR/linux-generation.out" 2>&1; then
       python3 "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
         --verb promote --step linux-generation --status completed \
@@ -1757,7 +1781,8 @@ PY
     if ! {
       python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
         --units-dir "$TARGET" \
-      && source "$STATE_ROOT/resolved.env" \
+      && load_env_file "$STATE_ROOT/resolved.env" \
+      && load_generation_env \
       && airflow_render \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
@@ -2027,7 +2052,7 @@ PY
     if ! {
       python3 "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
         --units-dir "$TARGET" \
-      && source "$STATE_ROOT/resolved.env" \
+      && load_env_file "$STATE_ROOT/resolved.env" \
       && load_generation_env \
       && airflow_render \
       && airflow_units_match_generation \
