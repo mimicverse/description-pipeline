@@ -894,15 +894,34 @@ class LifecycleTests(unittest.TestCase):
             '    echo "dag_state_check expected=$expected actual=$actual" >> "$ORDER_LOG"\n'
             '    [ "$actual" = "$expected" ] || exit 1 ;;\n'
             "  *platform-close-admission*)\n"
+            '    if [ "$PLATFORM_SERVICE_DSN" != "$EXPECTED_PLATFORM_SERVICE_DSN" ]; then '
+            'echo "service=$PLATFORM_SERVICE_DSN expected=$EXPECTED_PLATFORM_SERVICE_DSN" >&2; exit 78; fi\n'
+            '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
+            '    [ "$AIRFLOW_VENV" = "$EXPECTED_AIRFLOW_VENV" ] || exit 80\n'
+            '    [ "$OPERATOR_STATE" = "$EXPECTED_OPERATOR_STATE" ] || exit 81\n'
+            '    [ "$PLATFORM_CONFIG_DIGEST" = "$EXPECTED_PLATFORM_CONFIG_DIGEST" ] || exit 82\n'
             '    echo true > "$ADMISSION"\n'
             '    echo "platform close_admission" >> "$ORDER_LOG"\n'
             '    echo "admission=closed revision=2" ;;\n'
             "  *platform-open-admission*)\n"
+            '    if [ "$PLATFORM_SERVICE_DSN" != "$EXPECTED_PLATFORM_SERVICE_DSN" ]; then '
+            'echo "service=$PLATFORM_SERVICE_DSN expected=$EXPECTED_PLATFORM_SERVICE_DSN" >&2; exit 78; fi\n'
+            '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
+            '    [ "$AIRFLOW_VENV" = "$EXPECTED_AIRFLOW_VENV" ] || exit 80\n'
+            '    [ "$OPERATOR_STATE" = "$EXPECTED_OPERATOR_STATE" ] || exit 81\n'
+            '    [ "$PLATFORM_CONFIG_DIGEST" = "$EXPECTED_PLATFORM_CONFIG_DIGEST" ] || exit 82\n'
             '    echo false > "$ADMISSION"\n'
             '    echo "platform open_admission" >> "$ORDER_LOG"\n'
             '    echo "admission=open revision=3" ;;\n'
             "  *platform-reconcile*)\n"
             '    [ -n "${RECONCILE_RUN_ID:-}" ] && [ -n "${RECONCILE_OUTCOME:-}" ] || exit 61\n'
+            '    if [ "$PLATFORM_SERVICE_DSN" != "$EXPECTED_PLATFORM_SERVICE_DSN" ]; then '
+            'echo "service=$PLATFORM_SERVICE_DSN expected=$EXPECTED_PLATFORM_SERVICE_DSN" >&2; exit 78; fi\n'
+            '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
+            '    [ "$PLATFORM_CONFIG_DIGEST" = "$EXPECTED_PLATFORM_CONFIG_DIGEST" ] || exit 82\n'
             '    echo "platform reconcile ${RECONCILE_RUN_ID}:${RECONCILE_STAGE}:${RECONCILE_OUTCOME}"'
             ' >> "$ORDER_LOG"\n'
             '    echo "reconciled=${RECONCILE_RUN_ID}:${RECONCILE_STAGE} outcome=${RECONCILE_OUTCOME}" ;;\n'
@@ -950,6 +969,11 @@ class LifecycleTests(unittest.TestCase):
             "PROJECTION_FILE": str(projection),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
             "EXPECTED_PLATFORM_DSN": derived_env["PLATFORM_OPERATOR_DSN"],
+            "EXPECTED_PLATFORM_SERVICE_DSN": derived_env["PLATFORM_SERVICE_DSN"],
+            "EXPECTED_PIPELINE_STORE_ROOT": derived_env["PIPELINE_STORE_ROOT"],
+            "EXPECTED_AIRFLOW_VENV": derived_env["AIRFLOW_VENV"],
+            "EXPECTED_OPERATOR_STATE": derived_env["OPERATOR_STATE"],
+            "EXPECTED_PLATFORM_CONFIG_DIGEST": derived_env["PLATFORM_CONFIG_DIGEST"],
             "FIXTURE_HEALTH_FILE": str(health_file),
         }
         control = self._control_tree(tmp)
@@ -1313,6 +1337,89 @@ class LifecycleTests(unittest.TestCase):
                 observed = json.loads(Path(env["LIFECYCLE_ENV_LOG"]).read_text(encoding="utf-8"))
                 self.assertEqual(observed["dsn"], observed["expected_dsn"])
                 self.assertIn("operator_ro@", observed["dsn"])
+
+    def test_clean_shell_verbs_export_the_verified_generation_environment(self) -> None:
+        """Canonical verbs replace clean-shell ambient decoys with the selected generation."""
+
+        cases = (
+            ("start", ["--keep-admission-closed"]),
+            ("drain", []),
+            ("stop", []),
+            (
+                "reconcile",
+                [
+                    "--run-id",
+                    "run-1",
+                    "--stage",
+                    "capture",
+                    "--outcome",
+                    "completed",
+                    "--evidence",
+                    "receipt.json",
+                ],
+            ),
+        )
+        for action, arguments in cases:
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
+                config_path, env, _, _, control = self._admission_fixture(Path(tmp))
+                env.update(
+                    {
+                        "PLATFORM_SERVICE_DSN": "postgresql://ambient@/wrong",
+                        "PLATFORM_OPERATOR_DSN": "postgresql://ambient_ro@/wrong",
+                        "PIPELINE_STORE_ROOT": "/ambient/store",
+                        "PLATFORM_CONFIG_DIGEST": "f" * 64,
+                        "AIRFLOW_VENV": "/ambient/venv",
+                        "OPERATOR_STATE": "/ambient/state",
+                    }
+                )
+                result = run(["bash", str(control), action, "--config", str(config_path), *arguments], env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_generation_value_is_refused_before_a_child_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, env, _, order, control = self._admission_fixture(root)
+            derived = root / "state" / "derived" / "gen-1" / "operator.env"
+            derived.write_text(
+                "\n".join(
+                    line
+                    for line in derived.read_text(encoding="utf-8").splitlines()
+                    if not line.startswith("PLATFORM_SERVICE_DSN=")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not define PLATFORM_SERVICE_DSN", result.stderr)
+            self.assertFalse(order.exists(), "the loader must refuse before invoking a child process")
+
+    def test_failing_generation_environment_statement_fails_closed_before_a_child_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, env, _, order, control = self._admission_fixture(root)
+            derived = root / "state" / "derived" / "gen-1" / "operator.env"
+            derived.write_text(
+                derived.read_text(encoding="utf-8") + "false\n",
+                encoding="utf-8",
+            )
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("unexpected EOF", result.stderr)
+            self.assertFalse(order.exists(), "a failed environment load must never reach a child process")
+
+    def test_generation_loader_preserves_optional_empty_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, env, _, _, control = self._admission_fixture(root)
+            derived = root / "state" / "derived" / "gen-1" / "operator.env"
+            derived.write_text(
+                derived.read_text(encoding="utf-8")
+                + "FEISHU_APP_SECRET_FILE=\nFEISHU_TENANT_KEYS=\n",
+                encoding="utf-8",
+            )
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_operational_entry_rejects_canonical_validator_divergence(self) -> None:
         def break_previous(record: dict) -> None:
@@ -1969,15 +2076,24 @@ class InstallOrderingTests(unittest.TestCase):
             '    echo "dag_state_check expected=$expected actual=$actual" >> "$ORDER_LOG"\n'
             '    [ "$actual" = "$expected" ] || exit 1 ;;\n'
             "  *platform-close-admission*)\n"
+            '    [ "$PLATFORM_SERVICE_DSN" = "$EXPECTED_PLATFORM_SERVICE_DSN" ] || exit 78\n'
+            '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
             '    echo true > "$ADMISSION"\n'
             '    echo "platform close_admission" >> "$ORDER_LOG"\n'
             '    echo "admission=closed revision=2" ;;\n'
             "  *platform-open-admission*)\n"
+            '    [ "$PLATFORM_SERVICE_DSN" = "$EXPECTED_PLATFORM_SERVICE_DSN" ] || exit 78\n'
+            '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
             '    echo false > "$ADMISSION"\n'
             '    echo "platform open_admission" >> "$ORDER_LOG"\n'
             '    echo "admission=open revision=3" ;;\n'
             "  *platform-reconcile*)\n"
             '    [ -n "${RECONCILE_RUN_ID:-}" ] && [ -n "${RECONCILE_OUTCOME:-}" ] || exit 61\n'
+            '    [ "$PLATFORM_SERVICE_DSN" = "$EXPECTED_PLATFORM_SERVICE_DSN" ] || exit 78\n'
+            '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
+            '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
             '    echo "platform reconcile ${RECONCILE_RUN_ID}:${RECONCILE_STAGE}:${RECONCILE_OUTCOME}"'
             ' >> "$ORDER_LOG"\n'
             '    echo "reconciled=${RECONCILE_RUN_ID}:${RECONCILE_STAGE} outcome=${RECONCILE_OUTCOME}" ;;\n'
@@ -2344,7 +2460,7 @@ class InstallOrderingTests(unittest.TestCase):
 
     def _install(self, release: Path, control_env: dict[str, str]):
         tree = release.parent
-        return run(
+        result = run(
             [
                 "bash",
                 str(release / "operator" / "operatorctl.sh"),
@@ -2358,6 +2474,20 @@ class InstallOrderingTests(unittest.TestCase):
             ],
             control_env,
         )
+        state = tree.parent / "state"
+        derived = state / "derived" / "gen-1" / "operator.env"
+        if derived.is_file():
+            values = {}
+            for line in derived.read_text(encoding="utf-8").splitlines():
+                key, _, raw = line.partition("=")
+                if key:
+                    values[key] = decode_env_value(raw.strip())
+            control_env.update(
+                EXPECTED_PLATFORM_DSN=values["PLATFORM_OPERATOR_DSN"],
+                EXPECTED_PLATFORM_SERVICE_DSN=values["PLATFORM_SERVICE_DSN"],
+                EXPECTED_PIPELINE_STORE_ROOT=values["PIPELINE_STORE_ROOT"],
+            )
+        return result
 
     def test_fresh_install_creates_then_uses_the_managed_unit_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
