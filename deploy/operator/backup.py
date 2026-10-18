@@ -3,6 +3,8 @@
 
 The key file lives under the state root (0600) and never leaves it; the sealed archive is the
 single artifact the promotion manifest binds, and ``open`` reproduces the sealed bytes exactly.
+Both operations use a sibling temporary path and publish with ``os.replace`` only after their
+stream and integrity checks succeed.
 
 ``clean-staging`` is the one owner of private-staging cleanup: it removes exactly
 ``<receipt dir>/backup`` - the tree ``seal`` and ``manifest`` bind - and never a source root,
