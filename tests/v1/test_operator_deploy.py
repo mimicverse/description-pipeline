@@ -3043,6 +3043,130 @@ class InstallOrderingTests(unittest.TestCase):
                 self.assertIn(f"http://127.0.0.1:{expected}/execution", cfg)
                 self.assertNotIn(f"http://127.0.0.1:{ambient}/execution", cfg)
 
+    def test_stage_refuses_a_release_manifest_outside_the_controller_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            foreign = root / "foreign"
+            foreign.mkdir()
+            shutil.copyfile(release.parent / "release.json", foreign / "release.json")
+            refused = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "stage",
+                    "--config",
+                    str(release.parent / "platform.json"),
+                    "--install-id",
+                    "gen-2",
+                    "--release-file",
+                    str(foreign / "release.json"),
+                ],
+                control_env,
+            )
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertIn("controller release tree", refused.stderr)
+            self.assertFalse((root / "state" / "promotions" / "gen-2").exists())
+
+    def test_the_stage_receipt_binds_the_controller_release_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
+            manifest = release.parent / "release.json"
+            self.assertEqual(
+                receipt["release_manifest"],
+                {"path": str(manifest.resolve()), "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()},
+            )
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            tampered = json.loads(receipt_path.read_text(encoding="utf-8"))
+            tampered["release_manifest"]["sha256"] = "0" * 64
+            receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertNotEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertIn("binds another release manifest", promoted.stderr)
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-1")
+            self.assertEqual((root / "admission").read_text(encoding="utf-8").strip(), "true")
+
+    def test_promote_refuses_an_old_receipt_without_release_binding_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt.pop("release_manifest")
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            before = receipt_path.read_bytes()
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertNotEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertIn("carries no release manifest binding", promoted.stderr)
+            self.assertEqual(receipt_path.read_bytes(), before, "the old receipt is not rewritten")
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-1")
+            self.assertEqual((root / "admission").read_text(encoding="utf-8").strip(), "true")
+
+    def test_maintenance_actions_refuse_a_cross_tree_manifest_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            foreign = root / "foreign"
+            foreign.mkdir()
+            shutil.copyfile(release.parent / "release.json", foreign / "release.json")
+            evidence = root / "reconcile-evidence.json"
+            evidence.write_text("{}\n", encoding="utf-8")
+            commands = {
+                "promote": [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "promote",
+                    "--config", str(release.parent / "platform.json"),
+                    "--install-id", "gen-2", "--release-file", str(foreign / "release.json"),
+                ],
+                "rollback": [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "rollback",
+                    "--config", str(release.parent / "platform.json"),
+                    "--install-id", "gen-2", "--release-file", str(foreign / "release.json"),
+                ],
+                "reconcile": [
+                    "bash", str(release / "operator" / "operatorctl.sh"), "reconcile",
+                    "--config", str(release.parent / "platform.json"),
+                    "--install-id", "gen-2", "--run-id", "portal-cross-tree",
+                    "--stage", "freeze", "--outcome", "failed", "--evidence", str(evidence),
+                    "--release-file", str(foreign / "release.json"),
+                ],
+            }
+            for label, command in commands.items():
+                with self.subTest(action=label):
+                    result = run(command, control_env)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+                    self.assertEqual(active["install_id"], "gen-1")
+                    self.assertEqual((root / "admission").read_text(encoding="utf-8").strip(), "true")
+
     def test_promote_refuses_a_generation_switch_while_a_dag_reader_is_alive(self) -> None:
         """The pointer switch has a no-reader barrier; a surviving reader keeps the old record."""
 

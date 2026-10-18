@@ -26,6 +26,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AIRFLOW_HERE="$HERE/../airflow"
+RELEASE_ROOT="$(cd "$HERE/../.." && pwd -P)"
 UNITS=(description-postgres description-solidworks-tunnel description-airflow-dag-processor
        description-airflow-scheduler description-airflow-api-server description-portal
        description-operator-proxy)
@@ -94,10 +95,7 @@ fi
 
 install_from_config() {
   [ -f "$ENDPOINT_IDENTITY" ] || die "--endpoint-identity FILE is required for install"
-  if [ -z "$RELEASE_FILE" ]; then
-    RELEASE_FILE="$HERE/../../release.json"
-  fi
-  [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+  resolve_release_file
   # Preflight the bound identities and the installed asset before any step runs: release
   # artifact digests, the endpoint generation, their common release triple, and the wheel
   # that will actually be consumed.
@@ -195,6 +193,27 @@ generation_env_value() {
   )" || die "the derived environment $file could not be read for $key"
   [ -n "$value" ] || die "the derived environment $file does not define $key"
   printf '%s' "$value"
+}
+
+# The release manifest is a member of the controller release tree, never an external override.
+# Canonicalize it before any stage/promote/rollback side effect and refuse a cross-tree path.
+resolve_release_file() {
+  local candidate="${RELEASE_FILE:-$RELEASE_ROOT/release.json}" resolved
+  resolved="$(python3 - "$RELEASE_ROOT" "$candidate" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+path = os.path.realpath(sys.argv[2])
+expected = os.path.join(root, "release.json")
+if path != expected:
+    raise SystemExit(f"release manifest must be the controller release tree manifest: {expected}")
+if not os.path.isfile(path):
+    raise SystemExit(f"release manifest not found: {path}")
+print(path)
+PY
+)" || die "the release manifest is outside the controller release tree"
+  RELEASE_FILE="$resolved"
 }
 
 # The declared-value reader: one generation environment decoded as DATA through the renderer's
@@ -1043,6 +1062,10 @@ case "$ACTION" in
       RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
       [ -f "$RECEIPT_DIR/receipt.json" ] \
         || die "no stage receipt for $CANDIDATE_ID; run stage first"
+      resolve_release_file
+      python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+        --install-id "$CANDIDATE_ID" --release-file "$RELEASE_FILE" >/dev/null \
+        || die "the staged promotion receipt binds another release manifest"
       CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
       [ -f "$CANDIDATE_ENV" ] || die "the staged generation $CANDIDATE_ID is incomplete; re-run stage"
       # The generated environment of the generation this action runs now is the candidate's.
@@ -1361,8 +1384,7 @@ case "$ACTION" in
     exit "$HEALTH_RC"
     ;;
   stage)
-    [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
-    [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+    resolve_release_file
     [ -n "$INSTALL_ID" ] || die "stage requires --install-id naming the candidate generation"
     CANDIDATE_ID="$INSTALL_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
@@ -1397,6 +1419,7 @@ PY
     [ -f "$CANDIDATE_ENV" ] || die "candidate derived environment was not written"
     python3 "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --from "$STATE_ROOT/install-records/$ACTIVE_ID.json" --to "$SNAPSHOT_PATH" \
+      --release-file "$RELEASE_FILE" \
       --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,config-reference,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-config-reference,rollback-verify" \
       >/dev/null
     printf '%s\n' "$CANDIDATE_WHEEL" > "$RECEIPT_DIR/candidate-wheel"
@@ -1434,6 +1457,10 @@ PY
     CANDIDATE_ID="$INSTALL_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no stage receipt for $CANDIDATE_ID; run stage first"
+    resolve_release_file
+    python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+      --install-id "$CANDIDATE_ID" --release-file "$RELEASE_FILE" >/dev/null \
+      || die "the promotion receipt binds another release manifest"
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
     SNAPSHOT_PATH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["to"])' "$RECEIPT_DIR/receipt.json")"
     CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
@@ -1641,8 +1668,7 @@ PY
     fi
     promotion_step "$CANDIDATE_ID" promote schema-migration completed "$EVIDENCE_DIR/schema-migration.out"
     # 6. the Windows end switches through the single lifecycle script (stop, task+config, IF-09 health)
-    [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
-    [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+    resolve_release_file
     WINDOWS_PROMOTE=""
     WINDOWS_PROMOTE_STATUS=0
     WINDOWS_PROMOTE="$(instance_lifecycle promote "$CANDIDATE_ID")" || WINDOWS_PROMOTE_STATUS=$?
@@ -1773,6 +1799,10 @@ PY
     ROLLBACK_ID="$MAINT_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$ROLLBACK_ID"
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no promotion receipt for maintenance $ROLLBACK_ID; nothing is guessed"
+    resolve_release_file
+    python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+      --install-id "$ROLLBACK_ID" --release-file "$RELEASE_FILE" >/dev/null \
+      || die "the rollback receipt binds another release manifest"
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
     mkdir -p "$EVIDENCE_DIR"
     DAG_STATE_FILE="$EVIDENCE_DIR/dag-before-promotion.json"
@@ -1804,8 +1834,7 @@ except Exception:
     pass
 ' "$RECEIPT_DIR/windows-promote.out")"
     fi
-    [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
-    [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+    resolve_release_file
     ensure_postgres_ready
     if [ -z "$PREVIOUS_GENERATION_DIR" ]; then
       # An unacknowledged switch is reconciled from the endpoint's own recorded status; the
