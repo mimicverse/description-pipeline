@@ -24,7 +24,6 @@ import stat
 import subprocess
 import sys
 import tarfile
-import tempfile
 from pathlib import Path
 
 import install_record
@@ -133,14 +132,6 @@ def write_manifest(source: Path, sealed: Path, key: Path, out: Path) -> dict:
     return manifest
 
 
-def _openssl(arguments: list[str]) -> None:
-    completed = subprocess.run(["openssl", *arguments], capture_output=True)
-    require(
-        completed.returncode == 0,
-        f"openssl failed: {completed.stderr.decode(errors='replace').strip()}",
-    )
-
-
 def seal(source: Path, key: Path, out: Path) -> str:
     require(source.is_dir(), f"backup source is missing: {source}")
     ensure_key(key)
@@ -182,16 +173,26 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
     validated = manifest["files"]
     require(not dest.exists(), f"refuse to overwrite the restore destination: {dest}")
     dest.mkdir(parents=True)
-    with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as handle:
-        plain = Path(handle.name)
+    process = subprocess.Popen(
+        ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-pass", f"file:{key}", "-in", str(archive)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stream_error = None
     try:
-        _openssl(
-            ["enc", "-d", "-aes-256-cbc", "-pbkdf2", "-pass", f"file:{key}", "-in", str(archive), "-out", str(plain)]
-        )
-        with tarfile.open(plain, "r") as tar:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
             tar.extractall(dest, filter="data")
+    except (OSError, tarfile.TarError) as error:
+        stream_error = error
     finally:
-        plain.unlink(missing_ok=True)
+        if process.stdout is not None:
+            with contextlib.suppress(BrokenPipeError, OSError):
+                process.stdout.close()
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    returncode = process.wait()
+    require(returncode == 0, f"openssl failed: {stderr.decode(errors='replace').strip()}")
+    require(stream_error is None, f"tar stream failed: {stream_error}")
     for name, checksum in validated.items():
         restored = dest / name
         require(

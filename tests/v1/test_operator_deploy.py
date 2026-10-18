@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -4240,8 +4241,8 @@ class InstallOrderingTests(unittest.TestCase):
                 self.assertFalse(order.exists(), "no installation leg may run")
 
 
-class BackupSealStreamingUnitTests(unittest.TestCase):
-    """Sealing streams the tar into openssl instead of materializing a second full archive."""
+class BackupStreamingUnitTests(unittest.TestCase):
+    """Seal and open stream tar bytes through OpenSSL without a plaintext temp archive."""
 
     CONTROL = OPERATOR / "backup.py"
 
@@ -4297,6 +4298,109 @@ class BackupSealStreamingUnitTests(unittest.TestCase):
             self.assertNotIn("arg=-in", calls)
             self.assertIn("before=\n", calls)
             self.assertNotIn("before=tmp", calls)
+
+    def test_open_streams_openssl_stdout_and_keeps_member_and_extra_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / "payload.json"
+            payload.write_text('{"install":"resident"}\n', encoding="utf-8")
+            member = "state/install-record.json"
+            plaintext_tar = root / "plaintext.tar"
+            with tarfile.open(plaintext_tar, "w") as tar:
+                tar.add(payload, arcname=member)
+            extra_tar = root / "extra.tar"
+            with tarfile.open(extra_tar, "w") as tar:
+                tar.add(payload, arcname=member)
+                tar.add(payload, arcname="state/unexpected.json")
+            changed = root / "changed.json"
+            changed.write_text('{"install":"changed"}\n', encoding="utf-8")
+            changed_tar = root / "changed.tar"
+            with tarfile.open(changed_tar, "w") as tar:
+                tar.add(changed, arcname=member)
+
+            inputs = root / "input"
+            inputs.mkdir()
+            archive = inputs / "backup.tar.enc"
+            archive.write_bytes(b"sealed-input")
+            key = inputs / "backup.key"
+            key.write_bytes(b"test-key")
+            manifest = inputs / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": "solidworks-to-urdf.promote-backup/v1",
+                        "files": {member: hashlib.sha256(payload.read_bytes()).hexdigest()},
+                        "encrypted": {
+                            "path": str(archive),
+                            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                            "cipher": "aes-256-cbc",
+                            "key": str(key),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bindir = root / "bin"
+            bindir.mkdir()
+            log = root / "openssl.log"
+            write_stub(
+                bindir / "openssl",
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "input=\"\"\n"
+                "previous=\"\"\n"
+                "for argument in \"$@\"; do\n"
+                "  [ \"$previous\" = \"-in\" ] && input=\"$argument\"\n"
+                "  previous=\"$argument\"\n"
+                "done\n"
+                "printf \"arg=%s\\n\" \"$@\" >> \"$OPENSSL_LOG\"\n"
+                "printf \"before=%s\\n\" \"$(find \"$FIXTURE_DEST_PARENT\" -maxdepth 1 -type f -printf \"%f,\" 2>/dev/null)\""
+                " >> \"$OPENSSL_LOG\"\n"
+                "cat \"$input\" >/dev/null\n"
+                "cat \"$FIXTURE_PLAINTEXT_TAR\"\n",
+            )
+            base_env = {
+                "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "OPENSSL_LOG": str(log),
+            }
+
+            def invoke(dest_parent: Path, tar_path: Path) -> subprocess.CompletedProcess:
+                dest_parent.mkdir()
+                return run(
+                    [
+                        sys.executable,
+                        str(self.CONTROL),
+                        "open",
+                        "--archive",
+                        str(archive),
+                        "--key",
+                        str(key),
+                        "--manifest",
+                        str(manifest),
+                        "--dest",
+                        str(dest_parent / "restored"),
+                    ],
+                    {
+                        **base_env,
+                        "FIXTURE_DEST_PARENT": str(dest_parent),
+                        "FIXTURE_PLAINTEXT_TAR": str(tar_path),
+                    },
+                )
+
+            opened = invoke(root / "ok", plaintext_tar)
+            self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+            self.assertEqual((root / "ok" / "restored" / member).read_bytes(), payload.read_bytes())
+            self.assertEqual(list((root / "ok").iterdir()), [root / "ok" / "restored"])
+            calls = log.read_text(encoding="utf-8")
+            self.assertNotIn("arg=-out", calls)
+            self.assertIn("before=\n", calls)
+
+            extra = invoke(root / "extra", extra_tar)
+            self.assertNotEqual(extra.returncode, 0, extra.stdout + extra.stderr)
+            self.assertIn("members outside the manifest", extra.stderr)
+            changed_result = invoke(root / "changed", changed_tar)
+            self.assertNotEqual(changed_result.returncode, 0, changed_result.stdout + changed_result.stderr)
+            self.assertIn("restored member differs from the manifest", changed_result.stderr)
 
 
 class BackupStagingCleanupUnitTests(unittest.TestCase):
