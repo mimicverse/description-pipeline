@@ -146,6 +146,7 @@ class FakeWorld:
         "operations",
         "operation_bindings",
         "task_instances",
+        "task_try_numbers",
         "dag_runs",
         "stages",
         "events",
@@ -174,6 +175,8 @@ class FakeWorld:
         self.operation_bindings: dict[str, tuple] = {}
         #: (dag_id, task_id, dag_run_id, map_index) -> task_instance state.
         self.task_instances: dict[tuple[str, str, str, int], str] = {}
+        #: (dag_id, task_id, dag_run_id, map_index) -> terminal try number.
+        self.task_try_numbers: dict[tuple[str, str, str, int], int] = {}
         #: (dag_id, dag_run_id) -> dag_run state; the view's DagRun-settled source.
         self.dag_runs: dict[tuple[str, str], str] = {}
         self.stages: dict[tuple[str, str], tuple] = {}
@@ -535,7 +538,9 @@ class FakeCursor:
                 )
                 rows.append((record[0], record[5], record[6], record[1], dag_id, dag_run_id, task_id, map_index, key))
             self._rows = rows
-        elif normalized.startswith("SELECT 'task'::text, ti.task_id, ti.map_index, ti.state FROM task_instance"):
+        elif normalized.startswith(
+            "SELECT 'task'::text, ti.task_id, ti.map_index, ti.state, ti.try_number FROM task_instance"
+        ):
             dag_id, run_id = params[0], params[1]
             rows = []
             for (task_dag, task_id, task_run, map_index), state in world.task_instances.items():
@@ -547,10 +552,18 @@ class FakeCursor:
                     "verify",
                     "publish",
                 }:
-                    rows.append(("task", task_id, map_index, state))
+                    rows.append(
+                        (
+                            "task",
+                            task_id,
+                            map_index,
+                            state,
+                            world.task_try_numbers.get((task_dag, task_id, task_run, map_index), 0),
+                        )
+                    )
             dag_run_state = world.dag_runs.get((dag_id, run_id))
             if dag_run_state is not None:
-                rows.append(("dag_run", None, None, dag_run_state))
+                rows.append(("dag_run", None, None, dag_run_state, None))
             self._rows = rows
         elif normalized.startswith("SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"):
             record = world.stages.get((params[0], params[1]))
@@ -2756,7 +2769,7 @@ class PredispatchClosureTests(unittest.TestCase):
     def _snapshot(self) -> dict:
         return self.world.snapshot_state()
 
-    def _admit(self, *, dag_run_id: str = DAG_RUN) -> str:
+    def _admit(self, *, dag_run_id: str = DAG_RUN, stage: str = "capture") -> str:
         self.store.admit_run(
             request_id=f"portal-{dag_run_id}",
             run_id=PREDISPATCH_RUN,
@@ -2764,8 +2777,8 @@ class PredispatchClosureTests(unittest.TestCase):
             target_hardware="m3.0",
             main_assembly="3.0 总装.SLDASM",
             dispatch={
-                "stage": "capture",
-                "operation_key": f"portal-{dag_run_id}/capture:0",
+                "stage": stage,
+                "operation_key": f"portal-{dag_run_id}/{stage}:0",
                 "params_digest": "a" * 64,
                 "dag_id": "solidworks_to_urdf",
                 "dag_run_id": dag_run_id,
@@ -2780,6 +2793,7 @@ class PredispatchClosureTests(unittest.TestCase):
         freeze: str = "failed",
         dag_run: str = "failed",
         freeze_map: int = -1,
+        try_number: int = 1,
         successors: dict[str, str] | None = None,
     ) -> None:
         states = {
@@ -2791,8 +2805,10 @@ class PredispatchClosureTests(unittest.TestCase):
         }
         states.update(successors or {})
         self.world.task_instances[("solidworks_to_urdf", "freeze", dag_run_id, freeze_map)] = freeze
+        self.world.task_try_numbers[("solidworks_to_urdf", "freeze", dag_run_id, freeze_map)] = try_number
         for task, state in states.items():
             self.world.task_instances[("solidworks_to_urdf", task, dag_run_id, -1)] = state
+            self.world.task_try_numbers[("solidworks_to_urdf", task, dag_run_id, -1)] = 0
         self.world.dag_runs[("solidworks_to_urdf", dag_run_id)] = dag_run
 
     def _log(
@@ -2801,13 +2817,14 @@ class PredispatchClosureTests(unittest.TestCase):
         dag_run_id: str = DAG_RUN,
         task_id: str = "freeze",
         map_index: int = -1,
+        try_number: int = 1,
         exc_value: str = EXCEPTION,
     ) -> Path:
         record = {
             "timestamp": "2026-10-16T13:51:10.237927Z",
             "level": "error",
             "event": "Task failed with exception",
-            "try_number": 1,
+            "try_number": try_number,
             "run_id": dag_run_id,
             "task_id": task_id,
             "dag_id": "solidworks_to_urdf",
@@ -2840,7 +2857,10 @@ class PredispatchClosureTests(unittest.TestCase):
         receipt = freeze[1]
         self.assertEqual(receipt["error"], f"AirflowFailException: {self.EXCEPTION}")
         self.assertTrue(receipt["admitted_before_dispatch"])
-        self.assertEqual(receipt["airflow_failure"], {"path": str(log), "sha256": file_digest(log)})
+        self.assertEqual(
+            receipt["airflow_failure"],
+            {"path": str(log), "sha256": file_digest(log), "try_number": 1},
+        )
         for later in ("discover", "capture", "generate", "verify", "publish"):
             self.assertEqual(self.world.stages[(run_id, later)][0], "blocked")
         self.assertEqual(self.world.run_states[run_id], "failed")
@@ -2864,6 +2884,27 @@ class PredispatchClosureTests(unittest.TestCase):
         self._close(log)
         self.assertEqual(self._snapshot(), before, "the identical whole action repeats as a no-op")
 
+    def test_a_legacy_receipt_without_try_number_replays_as_a_no_op(self) -> None:
+        run_id = self._admit()
+        self._airflow_facts()
+        log = self._log()
+        self._close(log)
+        receipt = dict(self.world.stages[(run_id, "freeze")][1])
+        legacy = {
+            key: value
+            for key, value in receipt.items()
+            if key not in {"closure_shape", "freeze_execution"}
+        }
+        legacy["airflow_failure"] = {
+            "path": str(log),
+            "sha256": file_digest(log),
+        }
+        legacy["admitted_before_dispatch"] = True
+        self.world.stages[(run_id, "freeze")] = ("failed", legacy, None, None, None)
+        before = self._snapshot()
+        self._close(log)
+        self.assertEqual(self._snapshot(), before, "the sealed path and bytes alone keep the replay idempotent")
+
     def test_a_replay_with_changed_evidence_bytes_is_refused(self) -> None:
         self._admit()
         self._airflow_facts()
@@ -2875,6 +2916,81 @@ class PredispatchClosureTests(unittest.TestCase):
         with self.assertRaisesRegex(PlatformStoreError, "does not match the recorded evidence"):
             self._close(log)
         self.assertEqual(self._snapshot(), before)
+
+    def test_a_failed_freeze_intent_is_bound_and_settles_failed(self) -> None:
+        run_id = self._admit(stage="freeze")
+        self._airflow_facts(try_number=3)
+        log = self._log(try_number=3)
+        self._close(log)
+        freeze = self.world.stages[(run_id, "freeze")]
+        self.assertEqual(freeze[0], "failed")
+        receipt = freeze[1]
+        self.assertEqual(receipt["closure_shape"], "freeze_dispatch_failed")
+        self.assertNotIn("admitted_before_dispatch", receipt)
+        self.assertEqual(
+            receipt["freeze_execution"],
+            {"task_id": "freeze", "map_index": -1, "try_number": 3, "state": "failed"},
+        )
+        intent = self.world.operations["portal-portal-predispatch-1/freeze:0"]
+        self.assertEqual(intent[1], "failed", "the executed freeze intent settles failed")
+        self.assertEqual(
+            self.world.operation_bindings[intent[0]],
+            ("solidworks_to_urdf", "portal-predispatch-1", "freeze", -1),
+            "the freeze binding comes from the real failed task row",
+        )
+        for later in ("discover", "capture", "generate", "verify", "publish"):
+            self.assertEqual(self.world.stages[(run_id, later)][0], "blocked")
+        self.assertEqual(self.world.run_states[run_id], "failed")
+        binding_events = [
+            json.loads(row[5])
+            for row in self.world.events
+            if row[0] == run_id and row[2] == "binding"
+        ]
+        self.assertEqual(len(binding_events), 1)
+        self.assertEqual(binding_events[0]["intent_stage"], "freeze")
+        self.assertEqual(binding_events[0]["task_id"], "freeze")
+        self.assertEqual(binding_events[0]["try_number"], 3)
+        self.assertTrue(binding_events[0]["freeze_dispatched"])
+        self.assertEqual(binding_events[0]["closure_shape"], "freeze_dispatch_failed")
+
+    def test_the_failed_freeze_intent_replays_only_with_identical_original_bytes(self) -> None:
+        self._admit(stage="freeze")
+        self._airflow_facts(try_number=3)
+        log = self._log(try_number=3)
+        self._close(log)
+        before = self._snapshot()
+        self._close(log)
+        self.assertEqual(self._snapshot(), before)
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("\n")
+        with self.assertRaisesRegex(PlatformStoreError, "does not match the recorded evidence"):
+            self._close(log)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_the_failed_freeze_intent_requires_the_terminal_attempt_and_real_facts(self) -> None:
+        cases = ("earlier_attempt", "bound_intent", "successor_executed", "dag_run_running")
+        for name in cases:
+            with self.subTest(name=name):
+                self.setUp()
+                self._admit(stage="freeze")
+                self._airflow_facts(
+                    try_number=3,
+                    dag_run="running" if name == "dag_run_running" else "failed",
+                    successors={"capture": "success"} if name == "successor_executed" else None,
+                )
+                log = self._log(try_number=1 if name == "earlier_attempt" else 3)
+                if name == "bound_intent":
+                    intent_id = self.world.operations["portal-portal-predispatch-1/freeze:0"][0]
+                    self.world.operation_bindings[intent_id] = (
+                        "solidworks_to_urdf",
+                        self.DAG_RUN,
+                        "freeze",
+                        -1,
+                    )
+                before = self._snapshot()
+                with self.assertRaises(PlatformStoreError):
+                    self._close(log)
+                self.assertEqual(self._snapshot(), before, "a refused freeze closure leaves zero change")
 
     # ------------------------------------------------------------------ refusals
     def test_every_executed_unresolved_or_ambiguous_shape_refuses_with_zero_change(self) -> None:

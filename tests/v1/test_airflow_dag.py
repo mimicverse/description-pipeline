@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib.util
 import os
@@ -306,6 +307,19 @@ class DagTests(unittest.TestCase):
         self.addCleanup(sys.modules.pop, spec.name, None)
         spec.loader.exec_module(module)
         return module
+
+    def test_task_source_identity_reports_the_loaded_dag_file(self) -> None:
+        module = self._module()
+        source = Path(module.__file__).resolve()
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        with self.assertLogs(module.log, level="INFO") as captured:
+            module._log_task_identity("freeze")
+        self.assertIn(
+            f"task source identity task=freeze dag_file={source} dag_sha256={digest}",
+            captured.output[0],
+        )
+        self.assertIn("package_file=", captured.output[0])
+        self.assertNotIn("package_sha256=<unavailable>", captured.output[0])
 
     def test_failure_stores_terminal_checks_before_raising_and_progress_logs_only_changes(self):
         from types import SimpleNamespace

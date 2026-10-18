@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--install-id", required=True)
     init.add_argument("--from", dest="source", type=Path, required=True)
     init.add_argument("--to", dest="target", type=Path, required=True)
+    init.add_argument("--release-file", type=Path, required=True)
     init.add_argument("--plan", required=True, help="comma-separated planned step names")
     step = subparsers.add_parser("step")
     step.add_argument("--state-root", type=Path, required=True)
@@ -85,6 +86,10 @@ def main(argv: list[str] | None = None) -> int:
     show = subparsers.add_parser("show")
     show.add_argument("--state-root", type=Path, required=True)
     show.add_argument("--install-id", required=True)
+    verify_release = subparsers.add_parser("verify-release")
+    verify_release.add_argument("--state-root", type=Path, required=True)
+    verify_release.add_argument("--install-id", required=True)
+    verify_release.add_argument("--release-file", type=Path, required=True)
     args = parser.parse_args(argv)
 
     path = receipt_path(args.state_root, args.install_id)
@@ -94,6 +99,9 @@ def main(argv: list[str] | None = None) -> int:
         require(plan, "the promotion plan is empty")
         require(args.source.is_file(), f"the bound source generation is missing: {args.source}")
         require(args.target.is_file(), f"the bound target generation is missing: {args.target}")
+        require(args.release_file.is_file(), f"the bound release manifest is missing: {args.release_file}")
+        release_path = Path(os.path.realpath(args.release_file))
+        release_sha256 = hashlib.sha256(release_path.read_bytes()).hexdigest()
         save_receipt(
             path,
             {
@@ -103,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
                 "from_sha256": hashlib.sha256(args.source.read_bytes()).hexdigest(),
                 "to": str(args.target),
                 "to_sha256": hashlib.sha256(args.target.read_bytes()).hexdigest(),
+                "release_manifest": {"path": str(release_path), "sha256": release_sha256},
                 "plan": plan,
                 "created_at": utc_now(),
                 "steps": [],
@@ -135,6 +144,22 @@ def main(argv: list[str] | None = None) -> int:
         document = load_receipt(path)
         print(f"receipt={path}")
         print(f"steps={len(document['steps'])} plan={','.join(document['plan'])}")
+        return 0
+    if args.action == "verify-release":
+        document = load_receipt(path)
+        binding = document.get("release_manifest")
+        require(
+            isinstance(binding, dict) and set(binding) == {"path", "sha256"},
+            f"promotion receipt {path} carries no release manifest binding",
+        )
+        release_path = Path(os.path.realpath(args.release_file))
+        require(release_path.is_file(), f"the release manifest is missing: {release_path}")
+        require(binding["path"] == str(release_path), "the promotion receipt binds another release manifest")
+        require(
+            binding["sha256"] == hashlib.sha256(release_path.read_bytes()).hexdigest(),
+            "the release manifest differs from the promotion receipt",
+        )
+        print(f"release_manifest={release_path}")
         return 0
     return 2
 

@@ -265,6 +265,9 @@ jobs:
     env:
       PLATFORM_SCHEMA: platform_ci_${{ github.run_id }}
       AIRFLOW_SCHEMA: airflow_ci_${{ github.run_id }}
+      SUPERVISED_DATABASE: supervised_ci_${{ github.run_id }}
+      SUPERVISED_PLATFORM_SCHEMA: platform_supervised_ci_${{ github.run_id }}
+      SUPERVISED_AIRFLOW_SCHEMA: airflow_supervised_ci_${{ github.run_id }}
       PLATFORM_SERVICE_DSN: postgresql://platform_service@127.0.0.1:5432/postgres
       AIRFLOW_MIGRATE_DSN: postgresql+psycopg2://airflow_migrate@127.0.0.1:5432/postgres
       AIRFLOW_RUNTIME_DSN: postgresql+psycopg2://airflow_runtime@127.0.0.1:5432/postgres
@@ -276,7 +279,9 @@ jobs:
         with:
           python-version-file: .python-version
           cache: pip
-          cache-dependency-path: deploy/airflow/requirements.lock
+          cache-dependency-path: |
+            deploy/airflow/requirements.lock
+            requirements/build-py312.lock
       - name: Install the hash-locked Airflow runtime
         env:
           AIRFLOW_HOME: ${{ runner.temp }}/airflow-home
@@ -317,6 +322,59 @@ jobs:
           bash deploy/platform/apply.sh --psql psql --database postgres \
             --host 127.0.0.1 --port 5432 --user platform_migrate \
             --platform-schema "$PLATFORM_SCHEMA" --airflow-schema "$AIRFLOW_SCHEMA"
+      - name: Bootstrap the isolated supervised identity database
+        run: |
+          set -eu
+          psql "postgresql://postgres@127.0.0.1:5432/postgres" -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE $SUPERVISED_DATABASE"
+          bash deploy/platform/apply.sh --bootstrap --psql psql --database "$SUPERVISED_DATABASE" \
+            --host 127.0.0.1 --port 5432 --user postgres \
+            --platform-schema "$SUPERVISED_PLATFORM_SCHEMA" \
+            --airflow-schema "$SUPERVISED_AIRFLOW_SCHEMA"
+      - name: Migrate the isolated supervised Airflow metadata
+        run: |
+          mkdir -p "$RUNNER_TEMP/supervised-airflow-home"
+          AIRFLOW_HOME="$RUNNER_TEMP/supervised-airflow-home" \
+            AIRFLOW__DATABASE__SQL_ALCHEMY_CONN="postgresql+psycopg2://airflow_migrate@127.0.0.1:5432/$SUPERVISED_DATABASE" \
+            "$AIRFLOW_VENV/bin/airflow" db migrate
+      - name: Apply the isolated supervised grants and platform schema
+        run: |
+          bash deploy/platform/apply.sh --airflow-grants --psql psql --database "$SUPERVISED_DATABASE" \
+            --host 127.0.0.1 --port 5432 --user postgres \
+            --platform-schema "$SUPERVISED_PLATFORM_SCHEMA" \
+            --airflow-schema "$SUPERVISED_AIRFLOW_SCHEMA"
+          bash deploy/platform/apply.sh --psql psql --database "$SUPERVISED_DATABASE" \
+            --host 127.0.0.1 --port 5432 --user platform_migrate \
+            --platform-schema "$SUPERVISED_PLATFORM_SCHEMA" \
+            --airflow-schema "$SUPERVISED_AIRFLOW_SCHEMA"
+      - name: Build the isolated supervised test wheel
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements/build-py312.lock
+          python -m build --wheel --no-isolation --outdir "$RUNNER_TEMP/supervised-wheel"
+      - name: The supervised freeze identity proof (real Airflow 3, isolated database)
+        env:
+          DESCRIPTION_SUPERVISED_AIRFLOW_DSN: postgresql+psycopg2://airflow_runtime@127.0.0.1:5432/${{ env.SUPERVISED_DATABASE }}
+          DESCRIPTION_SUPERVISED_PLATFORM_DSN: postgresql://platform_service@127.0.0.1:5432/${{ env.SUPERVISED_DATABASE }}
+          DESCRIPTION_SUPERVISED_AIRFLOW_VENV: ${{ runner.temp }}/airflow-venv
+          DESCRIPTION_SUPERVISED_EVIDENCE_DIR: ${{ runner.temp }}/supervised-evidence
+          PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}
+        run: |
+          set -o pipefail
+          shopt -s nullglob
+          wheels=( "$RUNNER_TEMP"/supervised-wheel/*.whl )
+          [ "${#wheels[@]}" -eq 1 ] || { echo "expected exactly one supervised wheel" >&2; exit 1; }
+          DESCRIPTION_SUPERVISED_WHEEL="${wheels[0]}" "$AIRFLOW_VENV/bin/python" -B -m unittest \
+            tests.v1.test_supervised_freeze_identity -v 2>&1 | tee "$RUNNER_TEMP/supervised-test.log"
+      - name: The failed freeze intent reconcile transaction (real PostgreSQL)
+        env:
+          DESCRIPTION_RECONCILE_AIRFLOW_DSN: postgresql+psycopg2://airflow_runtime@127.0.0.1:5432/${{ env.SUPERVISED_DATABASE }}
+          DESCRIPTION_RECONCILE_PLATFORM_DSN: postgresql://platform_service@127.0.0.1:5432/${{ env.SUPERVISED_DATABASE }}
+          DESCRIPTION_RECONCILE_EVIDENCE_DIR: ${{ runner.temp }}/reconcile-evidence
+          PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}
+        run: |
+          set -o pipefail
+          "$AIRFLOW_VENV/bin/python" -B -m unittest \
+            tests.v1.test_reconcile_real_postgres -v 2>&1 | tee "$RUNNER_TEMP/reconcile-test.log"
       - name: The writer to health and DAG configuration identity (real Airflow/PostgreSQL)
         env:
           DESCRIPTION_CONFIG_IDENTITY_DSN: ${{ env.AIRFLOW_RUNTIME_DSN }}
@@ -358,6 +416,10 @@ jobs:
           name: real-chain-evidence
           path: |
             ${{ runner.temp }}/real-chain-report.json
+            ${{ runner.temp }}/supervised-evidence
+            ${{ runner.temp }}/reconcile-evidence
+            ${{ runner.temp }}/supervised-test.log
+            ${{ runner.temp }}/reconcile-test.log
             ${{ runner.temp }}/config-identity-real-airflow.log
             ${{ runner.temp }}/settlement-fixtures.json
             ${{ runner.temp }}/airflow-home/logs/smoke/*.log

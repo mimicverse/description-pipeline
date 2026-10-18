@@ -26,6 +26,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AIRFLOW_HERE="$HERE/../airflow"
+RELEASE_ROOT="$(cd "$HERE/../.." && pwd -P)"
 UNITS=(description-postgres description-solidworks-tunnel description-airflow-dag-processor
        description-airflow-scheduler description-airflow-api-server description-portal
        description-operator-proxy)
@@ -94,10 +95,7 @@ fi
 
 install_from_config() {
   [ -f "$ENDPOINT_IDENTITY" ] || die "--endpoint-identity FILE is required for install"
-  if [ -z "$RELEASE_FILE" ]; then
-    RELEASE_FILE="$HERE/../../release.json"
-  fi
-  [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+  resolve_release_file
   # Preflight the bound identities and the installed asset before any step runs: release
   # artifact digests, the endpoint generation, their common release triple, and the wheel
   # that will actually be consumed.
@@ -195,6 +193,27 @@ generation_env_value() {
   )" || die "the derived environment $file could not be read for $key"
   [ -n "$value" ] || die "the derived environment $file does not define $key"
   printf '%s' "$value"
+}
+
+# The release manifest is a member of the controller release tree, never an external override.
+# Canonicalize it before any stage/promote/rollback side effect and refuse a cross-tree path.
+resolve_release_file() {
+  local candidate="${RELEASE_FILE:-$RELEASE_ROOT/release.json}" resolved
+  resolved="$(python3 - "$RELEASE_ROOT" "$candidate" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+path = os.path.realpath(sys.argv[2])
+expected = os.path.join(root, "release.json")
+if path != expected:
+    raise SystemExit(f"release manifest must be the controller release tree manifest: {expected}")
+if not os.path.isfile(path):
+    raise SystemExit(f"release manifest not found: {path}")
+print(path)
+PY
+)" || die "the release manifest is outside the controller release tree"
+  RELEASE_FILE="$resolved"
 }
 
 # The declared-value reader: one generation environment decoded as DATA through the renderer's
@@ -310,6 +329,96 @@ airflow_units_match_generation() {
       "$(sha256sum "$unit_file" | awk '{print $1}')" \
       "$(sed -n 's/^ExecStart=//p' "$unit_file" | head -1)"
   done
+}
+
+airflow_require_no_readers() {
+  local unit state
+  for unit in description-solidworks-tunnel description-airflow-dag-processor \
+      description-airflow-scheduler description-airflow-api-server; do
+    state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+    case "$state" in
+      inactive|failed) ;;
+      *) die "Airflow DAG reader $unit is ${state:-unknown}; refusing a non-barriered generation switch" ;;
+    esac
+  done
+}
+
+airflow_record_dag() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+record = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+dag = record.get("dag")
+if not isinstance(dag, dict):
+    raise SystemExit("install record has no DAG binding")
+path = Path(str(dag.get("path") or ""))
+if not path.is_absolute():
+    raise SystemExit("install record DAG path is not absolute")
+print(path)
+PY
+}
+
+airflow_here_for_record() {
+  local dag_path
+  dag_path="$(airflow_record_dag "$1")" || die "the active generation has no usable DAG path"
+  dirname "$(dirname "$dag_path")"
+}
+
+airflow_render_generation_config() {
+  local record_path="$1" venv="$2" env_file="$3" dag_path airflow_here renderer runtime_dsn api_port
+  dag_path="$(airflow_record_dag "$record_path")" \
+    || die "the active generation has no usable DAG path"
+  airflow_here="$(dirname "$(dirname "$dag_path")")"
+  [ -f "$airflow_here/render_config.py" ] && [ ! -L "$airflow_here/render_config.py" ] \
+    || die "the active generation has no config renderer: $airflow_here/render_config.py"
+  [ -f "$airflow_here/airflow.cfg.template" ] && [ ! -L "$airflow_here/airflow.cfg.template" ] \
+    || die "the active generation has no Airflow config template"
+  renderer="$airflow_here/../operator/render_operator.py"
+  [ -f "$renderer" ] && [ ! -L "$renderer" ] \
+    || die "the target generation has no operator env renderer: $renderer"
+  runtime_dsn="$(generation_env_value "$env_file" AIRFLOW_RUNTIME_DB_URL)" || return 1
+  # Resolve the port through the target controller's own env parser and default, so the
+  # generated execution URL cannot fall back to the resident generation's ambient value.
+  api_port="$(python3 - "$renderer" "$env_file" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("generation_render_operator", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+values = module.load_env(Path(sys.argv[2]))
+print(module.integer(values, "AIRFLOW_API_PORT", module.PORT_DEFAULTS["AIRFLOW_API_PORT"]))
+PY
+)" || return 1
+  [ -n "$api_port" ] || die "the target generation has no Airflow API port"
+  AIRFLOW_DB_URL="$runtime_dsn" AIRFLOW_API_PORT="$api_port" \
+    "$venv/bin/python" "$airflow_here/render_config.py" \
+      --home "$AIRFLOW_HOME" --venv "$venv" \
+      --template "$airflow_here/airflow.cfg.template" \
+      --dags-folder "$(dirname "$dag_path")" \
+    || return 1
+  AIRFLOW_HOME="$AIRFLOW_HOME" "$venv/bin/python" "$HERE/runtime_dag.py" \
+    --state-root "$STATE_ROOT" --airflow-home "$AIRFLOW_HOME" --files-only >/dev/null \
+    || return 1
+}
+
+airflow_wait_dag_identity() {
+  local attempt result=""
+  for attempt in $(seq 1 60); do
+    if result="$(
+      AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/runtime_dag.py" \
+        --state-root "$STATE_ROOT" --airflow-home "$AIRFLOW_HOME" 2>&1
+    )"; then
+      printf '%s\n' "$result"
+      return 0
+    fi
+    sleep 2
+  done
+  printf '%s\n' "${result:-Airflow did not serialize the active DAG}" >&2
+  return 1
 }
 
 airflow_lifecycle() {
@@ -953,6 +1062,10 @@ case "$ACTION" in
       RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
       [ -f "$RECEIPT_DIR/receipt.json" ] \
         || die "no stage receipt for $CANDIDATE_ID; run stage first"
+      resolve_release_file
+      python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+        --install-id "$CANDIDATE_ID" --release-file "$RELEASE_FILE" >/dev/null \
+        || die "the staged promotion receipt binds another release manifest"
       CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
       [ -f "$CANDIDATE_ENV" ] || die "the staged generation $CANDIDATE_ID is incomplete; re-run stage"
       # The generated environment of the generation this action runs now is the candidate's.
@@ -1174,12 +1287,14 @@ case "$ACTION" in
       python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
         --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
-        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --wheel "$WHEEL_FILE"
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
+        --deployment-root "$HERE/../.." --wheel "$WHEEL_FILE"
     else
       python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
         --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
-        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --tree "$HERE/../.."
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
+        --deployment-root "$HERE/../.." --tree "$HERE/../.."
     fi
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
       --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
@@ -1269,8 +1384,7 @@ case "$ACTION" in
     exit "$HEALTH_RC"
     ;;
   stage)
-    [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
-    [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+    resolve_release_file
     [ -n "$INSTALL_ID" ] || die "stage requires --install-id naming the candidate generation"
     CANDIDATE_ID="$INSTALL_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
@@ -1305,6 +1419,7 @@ PY
     [ -f "$CANDIDATE_ENV" ] || die "candidate derived environment was not written"
     python3 "$HERE/promotion.py" init --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
       --from "$STATE_ROOT/install-records/$ACTIVE_ID.json" --to "$SNAPSHOT_PATH" \
+      --release-file "$RELEASE_FILE" \
       --plan "linux-generation,windows-generation,close-admission,drain,backup,stop-services,schema-migration,windows-switch,endpoint-identity,switch-pointer,config-reference,start-services,verify,open-admission,rollback-close,rollback-drain,rollback-stop,rollback-windows,rollback-linux,rollback-config-reference,rollback-verify" \
       >/dev/null
     printf '%s\n' "$CANDIDATE_WHEEL" > "$RECEIPT_DIR/candidate-wheel"
@@ -1342,6 +1457,10 @@ PY
     CANDIDATE_ID="$INSTALL_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no stage receipt for $CANDIDATE_ID; run stage first"
+    resolve_release_file
+    python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+      --install-id "$CANDIDATE_ID" --release-file "$RELEASE_FILE" >/dev/null \
+      || die "the promotion receipt binds another release manifest"
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
     SNAPSHOT_PATH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["to"])' "$RECEIPT_DIR/receipt.json")"
     CANDIDATE_ENV="$OPERATOR_STATE/derived/$CANDIDATE_ID/operator.env"
@@ -1549,8 +1668,7 @@ PY
     fi
     promotion_step "$CANDIDATE_ID" promote schema-migration completed "$EVIDENCE_DIR/schema-migration.out"
     # 6. the Windows end switches through the single lifecycle script (stop, task+config, IF-09 health)
-    [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
-    [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+    resolve_release_file
     WINDOWS_PROMOTE=""
     WINDOWS_PROMOTE_STATUS=0
     WINDOWS_PROMOTE="$(instance_lifecycle promote "$CANDIDATE_ID")" || WINDOWS_PROMOTE_STATUS=$?
@@ -1607,21 +1725,28 @@ PY
     SERVICES_CSV="$(IFS=,; printf '%s' "${UNITS[*]}")"
     CANDIDATE_WHEEL="$(cat "$RECEIPT_DIR/candidate-wheel")"
     [ -f "$CANDIDATE_WHEEL" ] || die "the staged candidate wheel is missing: $CANDIDATE_WHEEL"
-    if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" build --state-root "$STATE_ROOT" \
+    airflow_require_no_readers
+    if ! "$CANDIDATE_RUNTIME_VENV/bin/python" "$HERE/install_record.py" build --state-root "$STATE_ROOT" \
         --install-id "$CANDIDATE_ID" --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$EVIDENCE_DIR/endpoint-identity.json" --services "$SERVICES_CSV" \
-        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --wheel "$CANDIDATE_WHEEL" \
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
+        --deployment-root "$HERE/../.." --wheel "$CANDIDATE_WHEEL" \
         --previous-record "$PREVIOUS_RECORD" --journal "$EVIDENCE_DIR/journal.json" \
         > "$EVIDENCE_DIR/switch-pointer.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote switch-pointer failed "$EVIDENCE_DIR/switch-pointer.out"
       die "the pointer switch failed (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote switch-pointer completed "$EVIDENCE_DIR/switch-pointer.out"
-    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
-        --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
-        > "$EVIDENCE_DIR/config-reference.out" 2>&1; then
+    AIRFLOW_HERE="$(airflow_here_for_record "$STATE_ROOT/install-record.json")" \
+      || die "the switched record has no generated Airflow deployment"
+    if ! {
+      airflow_render_generation_config "$STATE_ROOT/install-record.json" \
+        "$CANDIDATE_RUNTIME_VENV" "$CANDIDATE_ENV" &&
+      AIRFLOW_HOME="$AIRFLOW_HOME" "$CANDIDATE_RUNTIME_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
+        --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH"
+    } > "$EVIDENCE_DIR/config-reference.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote config-reference failed "$EVIDENCE_DIR/config-reference.out"
-      die "the Airflow connection could not bind the switched config snapshot (the admission stays closed)"
+      die "the Airflow DAG/config reference could not bind the switched generation (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote config-reference completed "$EVIDENCE_DIR/config-reference.out"
     # 8. the switched generation starts through its own derived environment
@@ -1636,6 +1761,7 @@ PY
       && airflow_render \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
+      && airflow_wait_dag_identity \
       && airflow_unpause_dag \
       && systemctl --user enable --now description-portal.service description-operator-proxy.service \
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service
@@ -1673,6 +1799,10 @@ PY
     ROLLBACK_ID="$MAINT_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$ROLLBACK_ID"
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no promotion receipt for maintenance $ROLLBACK_ID; nothing is guessed"
+    resolve_release_file
+    python3 "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
+      --install-id "$ROLLBACK_ID" --release-file "$RELEASE_FILE" >/dev/null \
+      || die "the rollback receipt binds another release manifest"
     EVIDENCE_DIR="$RECEIPT_DIR/evidence"
     mkdir -p "$EVIDENCE_DIR"
     DAG_STATE_FILE="$EVIDENCE_DIR/dag-before-promotion.json"
@@ -1704,8 +1834,7 @@ except Exception:
     pass
 ' "$RECEIPT_DIR/windows-promote.out")"
     fi
-    [ -n "$RELEASE_FILE" ] || RELEASE_FILE="$HERE/../../release.json"
-    [ -f "$RELEASE_FILE" ] || die "release manifest not found: $RELEASE_FILE"
+    resolve_release_file
     ensure_postgres_ready
     if [ -z "$PREVIOUS_GENERATION_DIR" ]; then
       # An unacknowledged switch is reconciled from the endpoint's own recorded status; the
@@ -1831,6 +1960,7 @@ PY
     fi
     # The Linux end re-activates the recorded previous generation; no generation file is rewritten.
     if [ "$LINUX_SWITCHED" = "1" ]; then
+      airflow_require_no_readers
       if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" repoint \
           --state-root "$STATE_ROOT" --record "$PREVIOUS_RECORD" > "$EVIDENCE_DIR/rollback-linux.out" 2>&1; then
         promotion_step "$ROLLBACK_ID" rollback rollback-linux failed "$EVIDENCE_DIR/rollback-linux.out"
@@ -1888,6 +2018,10 @@ PY
     load_running_env
     load_installed
     load_generation_env
+    AIRFLOW_HERE="$(airflow_here_for_record "$STATE_ROOT/install-record.json")" \
+      || die "the restored record has no generated Airflow deployment"
+    airflow_render_generation_config "$STATE_ROOT/install-record.json" "$AIRFLOW_VENV" "$ENV_FILE" \
+      || die "the restored Airflow DAG/config reference could not be rendered (the admission stays closed)"
     PROXY_BIN="$(ensure_proxy_binary)" \
       || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
@@ -1899,6 +2033,7 @@ PY
       && airflow_units_match_generation \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
+      && airflow_wait_dag_identity \
       && airflow_runtime_matches_generation "$CANDIDATE_VENV" \
       && systemctl --user enable --now description-portal.service description-operator-proxy.service \
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \

@@ -92,6 +92,33 @@ NATIVE_POOL = os.environ.get("SOLIDWORKS_NATIVE_POOL", "windows_native")
 log = logging.getLogger(__name__)
 
 
+def _execution_source(value: str | None) -> tuple[str, str]:
+    """The resolved file and digest actually imported by this task process."""
+
+    if not value:
+        return "", ""
+    path = Path(value).resolve()
+    try:
+        return str(path), hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return str(path), ""
+
+
+def _log_task_identity(task_name: str) -> None:
+    import description_pipeline
+
+    dag_file, dag_sha256 = _execution_source(globals().get("__file__"))
+    package_file, package_sha256 = _execution_source(getattr(description_pipeline, "__file__", None))
+    log.info(
+        "task source identity task=%s dag_file=%s dag_sha256=%s package_file=%s package_sha256=%s",
+        task_name,
+        dag_file or "<unavailable>",
+        dag_sha256 or "<unavailable>",
+        package_file or "<unavailable>",
+        package_sha256 or "<unavailable>",
+    )
+
+
 def _endpoint(conn_id: str, config_digest: str | None = None) -> WindowsEndpoint:
     return WindowsEndpoint(config_from_airflow_connection(conn_id, config_digest=config_digest))
 
@@ -1663,6 +1690,7 @@ def solidworks_to_urdf():
         )
     )
     def freeze(**context) -> dict:
+        _log_task_identity("freeze")
         run_id = _run_uuid(context)
         try:
             linked = _linked_conf(context)
@@ -1673,6 +1701,7 @@ def solidworks_to_urdf():
                 _conf, _target, _summary, _principal, _admitted_config, routing = _submission_basics(
                     context, config_digest=admitted_digest
                 )
+                log.info("freeze fresh admitted config_digest=%s", admitted_digest)
             else:
                 _conf = _target = _summary = _principal = _admitted_config = routing = None
         except Exception as error:
@@ -1690,6 +1719,10 @@ def solidworks_to_urdf():
                 except Exception as error:
                     _converge_early_freeze_failure(run_id, error)
                     raise
+                log.info(
+                    "freeze linked admitted config_digest=%s",
+                    request["platform_config_digest"],
+                )
                 _register_freeze_stage(
                     _work_paths(request["conn_id"], run_id, request["platform_config_digest"]),
                     run_id,

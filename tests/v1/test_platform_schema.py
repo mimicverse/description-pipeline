@@ -127,6 +127,11 @@ class SchemaQualifierTests(unittest.TestCase):
     def test_the_airflow_grants_file_is_schema_variable_aware(self) -> None:
         text = (PLATFORM_DIR / "grants-airflow.sql").read_text(encoding="utf-8")
         self.assertIn('GRANT SELECT ON :"airflow_schema".task_instance TO platform_migrate;', text)
+        self.assertIn(
+            "GRANT SELECT (dag_id, run_id, task_id, map_index, state, try_number)",
+            text,
+            "the platform-service reconcile reads the terminal attempt number",
+        )
 
     def test_operatorctl_uses_the_single_airflow_grants_owner(self) -> None:
         text = (ROOT / "deploy/operator/operatorctl.sh").read_text(encoding="utf-8")
