@@ -119,6 +119,22 @@ else
   report FAIL "connection config identity cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
+# The actual effective Airflow DAG must come from the active generation's install record,
+# not a historical release directory left in airflow.cfg.  The metadata check also requires
+# the current serialized Airflow version to carry that exact file location.
+if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
+  if DAG_IDENTITY="$(
+      AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" "$HERE/runtime_dag.py" \
+        --state-root "$OPERATOR_STATE" --airflow-home "$AIRFLOW_HOME" 2>&1
+    )"; then
+    report PASS "Airflow config, file and serialized DAG identities match the active generation"
+  else
+    report FAIL "Airflow runtime DAG identity differs from the active generation: ${DAG_IDENTITY:-probe failed}"
+  fi
+else
+  report FAIL "Airflow runtime DAG identity cannot be verified: AIRFLOW_VENV is not executable"
+fi
+
 # The packaged request-context plugin must be discoverable: without it every operator run write
 # fails closed, so a missing entry point is a deployment failure, not a warning. Only the plugin
 # and middleware names are reported; nothing secret is read or printed.

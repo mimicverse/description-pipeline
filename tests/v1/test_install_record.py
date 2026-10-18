@@ -107,6 +107,10 @@ def make_release(root: Path) -> Path:
     distribution.mkdir(parents=True, exist_ok=True)
     wheel = distribution / WHEEL_NAME
     write_contract_wheel(wheel)
+    dag = root / install_record.DAG_MEMBER
+    dag.parent.mkdir(parents=True, exist_ok=True)
+    if not dag.exists():
+        dag.write_text("# dag fixture\n", encoding="utf-8")
     document = {
         "schema_version": install_record.RELEASE_SCHEMA,
         "pipeline_id": "solidworks-to-urdf",
@@ -116,6 +120,9 @@ def make_release(root: Path) -> Path:
         "artifacts": {
             WHEEL_NAME: hashlib.sha256(wheel.read_bytes()).hexdigest(),
             "description-1.4.0-windows-cp312-x86_64.zip": "b" * 64,
+        },
+        "deployment_files": {
+            install_record.DAG_MEMBER: hashlib.sha256(dag.read_bytes()).hexdigest(),
         },
     }
     path = distribution / "release.json"
@@ -135,13 +142,15 @@ def make_endpoint_identity(root: Path) -> Path:
 
 
 def make_dag(root: Path) -> Path:
-    path = root / "solidworks_to_urdf.py"
+    path = root / install_record.DAG_MEMBER
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("# dag fixture\n", encoding="utf-8")
     return path
 
 
 def build_record(root: Path) -> dict:
-    release = install_record.release_identity(json.loads((root / "distribution" / "release.json").read_text()))
+    release_document = json.loads((root / "distribution" / "release.json").read_text())
+    release = install_record.release_identity(release_document)
     endpoint = install_record.endpoint_identity(json.loads((root / "endpoint-identity.json").read_text()))
     return install_record.build_install_record(
         install_id="gen-1",
@@ -150,7 +159,9 @@ def build_record(root: Path) -> dict:
         release=release,
         endpoint=endpoint,
         services=list(SERVICES),
-        dag_file=root / "solidworks_to_urdf.py",
+        dag_file=root / install_record.DAG_MEMBER,
+        deployment_root=root,
+        release_dag_sha256=install_record.release_dag_digest(release_document),
     )
 
 
@@ -181,6 +192,47 @@ class InstallRecordTests(unittest.TestCase):
         self.assertEqual(record["paths"]["state_root"], str(self.root / "state"))
         self.assertEqual(record["previous"], None)
         self.assertEqual(record["journal"], [])
+
+    def test_dag_must_be_the_current_release_member(self):
+        record = build_record(self.root)
+        expected = (self.root / install_record.DAG_MEMBER).resolve()
+        self.assertEqual(Path(record["dag"]["path"]), expected)
+
+        release_document = json.loads(
+            (self.root / "distribution" / "release.json").read_text(encoding="utf-8")
+        )
+        release = install_record.release_identity(release_document)
+        endpoint = install_record.endpoint_identity(
+            json.loads((self.root / "endpoint-identity.json").read_text(encoding="utf-8"))
+        )
+        historical = self.root / "historical" / install_record.DAG_MEMBER
+        historical.parent.mkdir(parents=True)
+        historical.write_bytes(expected.read_bytes())
+        dag_sha256 = hashlib.sha256(expected.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(SystemExit, "outside the current deployment root"):
+            install_record.build_install_record(
+                install_id="gen-1",
+                timestamp=TIMESTAMP,
+                snapshot_path=self.root / "state" / "snapshots" / "gen-1.json",
+                release=release,
+                endpoint=endpoint,
+                services=list(SERVICES),
+                dag_file=historical,
+                deployment_root=self.root,
+                release_dag_sha256=dag_sha256,
+            )
+        with self.assertRaisesRegex(SystemExit, "does not match the release deployment member"):
+            install_record.build_install_record(
+                install_id="gen-1",
+                timestamp=TIMESTAMP,
+                snapshot_path=self.root / "state" / "snapshots" / "gen-1.json",
+                release=release,
+                endpoint=endpoint,
+                services=list(SERVICES),
+                dag_file=expected,
+                deployment_root=self.root,
+                release_dag_sha256="0" * 64,
+            )
 
     def test_schema_constants_match_the_package(self):
         from description_pipeline import schemas
@@ -234,7 +286,9 @@ class InstallRecordTests(unittest.TestCase):
                 "--services",
                 ",".join(SERVICES),
                 "--dag",
-                str(self.root / "solidworks_to_urdf.py"),
+                str(self.root / install_record.DAG_MEMBER),
+                "--deployment-root",
+                str(self.root),
                 "--wheel",
                 str(self.root / "distribution" / WHEEL_NAME),
             ],
@@ -271,7 +325,11 @@ class InstallRecordTests(unittest.TestCase):
                 release=release,
                 endpoint=endpoint,
                 services=list(SERVICES),
-                dag_file=root / "solidworks_to_urdf.py",
+                dag_file=root / install_record.DAG_MEMBER,
+                deployment_root=root,
+                release_dag_sha256=hashlib.sha256(
+                    (root / install_record.DAG_MEMBER).read_bytes()
+                ).hexdigest(),
             )
         self.assertIn(needle, str(raised.exception))
 
@@ -328,7 +386,11 @@ class InstallRecordTests(unittest.TestCase):
                                 release=release,
                                 endpoint=endpoint,
                                 services=list(SERVICES),
-                                dag_file=root / "solidworks_to_urdf.py",
+                                dag_file=root / install_record.DAG_MEMBER,
+                                deployment_root=root,
+                                release_dag_sha256=hashlib.sha256(
+                                    (root / install_record.DAG_MEMBER).read_bytes()
+                                ).hexdigest(),
                             )
                         self.assertIn(needle, str(raised.exception))
                     continue
@@ -349,7 +411,11 @@ class InstallRecordTests(unittest.TestCase):
                 release=release,
                 endpoint=endpoint,
                 services=list(SERVICES),
-                dag_file=self.root / "solidworks_to_urdf.py",
+                dag_file=self.root / install_record.DAG_MEMBER,
+                deployment_root=self.root,
+                release_dag_sha256=hashlib.sha256(
+                    (self.root / install_record.DAG_MEMBER).read_bytes()
+                ).hexdigest(),
             )
         with self.assertRaises(SystemExit):
             install_record.build_install_record(
@@ -359,7 +425,11 @@ class InstallRecordTests(unittest.TestCase):
                 release=release,
                 endpoint=endpoint,
                 services=[],
-                dag_file=self.root / "solidworks_to_urdf.py",
+                dag_file=self.root / install_record.DAG_MEMBER,
+                deployment_root=self.root,
+                release_dag_sha256=hashlib.sha256(
+                    (self.root / install_record.DAG_MEMBER).read_bytes()
+                ).hexdigest(),
             )
         with self.assertRaises(SystemExit):
             install_record.build_install_record(
@@ -369,7 +439,11 @@ class InstallRecordTests(unittest.TestCase):
                 release=release,
                 endpoint=endpoint,
                 services=list(SERVICES),
-                dag_file=self.root / "solidworks_to_urdf.py",
+                dag_file=self.root / install_record.DAG_MEMBER,
+                deployment_root=self.root,
+                release_dag_sha256=hashlib.sha256(
+                    (self.root / install_record.DAG_MEMBER).read_bytes()
+                ).hexdigest(),
             )
 
     def test_review_bindings_reject_without_writing(self):
@@ -394,7 +468,9 @@ class InstallRecordTests(unittest.TestCase):
                     "--services",
                     ",".join(SERVICES),
                     "--dag",
-                    str(root / "solidworks_to_urdf.py"),
+                    str(root / install_record.DAG_MEMBER),
+                    "--deployment-root",
+                    str(root),
                     "--wheel",
                     str(root / "distribution" / WHEEL_NAME),
                 ],
@@ -549,7 +625,9 @@ class InstallRecordTests(unittest.TestCase):
                     "--services",
                     ",".join(SERVICES),
                     "--dag",
-                    str(root / "solidworks_to_urdf.py"),
+                    str(root / install_record.DAG_MEMBER),
+                    "--deployment-root",
+                    str(root),
                 ],
                 capture_output=True,
                 text=True,
@@ -588,7 +666,11 @@ class InstallRecordTests(unittest.TestCase):
             release=release,
             endpoint=endpoint,
             services=list(SERVICES),
-            dag_file=self.root / "solidworks_to_urdf.py",
+            dag_file=self.root / install_record.DAG_MEMBER,
+            deployment_root=self.root,
+            release_dag_sha256=hashlib.sha256(
+                (self.root / install_record.DAG_MEMBER).read_bytes()
+            ).hexdigest(),
             previous=install_record.previous_from_record(record, generation),
             journal=[
                 {
@@ -711,6 +793,8 @@ class InstallRecordTests(unittest.TestCase):
                 endpoint=endpoint,
                 services=list(SERVICES),
                 dag_file=dag,
+                deployment_root=root,
+                release_dag_sha256=hashlib.sha256(dag.read_bytes()).hexdigest(),
             )
             install_record.write_install_record(record, root / "state", owner)
             verified = install_record.verify_active_generation(config_path, root / "state")

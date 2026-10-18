@@ -312,6 +312,80 @@ airflow_units_match_generation() {
   done
 }
 
+airflow_require_no_readers() {
+  local unit state
+  for unit in description-solidworks-tunnel description-airflow-dag-processor \
+      description-airflow-scheduler description-airflow-api-server; do
+    state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+    case "$state" in
+      inactive|failed) ;;
+      *) die "Airflow DAG reader $unit is ${state:-unknown}; refusing a non-barriered generation switch" ;;
+    esac
+  done
+}
+
+airflow_record_dag() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+record = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+dag = record.get("dag")
+if not isinstance(dag, dict):
+    raise SystemExit("install record has no DAG binding")
+path = Path(str(dag.get("path") or ""))
+if not path.is_absolute():
+    raise SystemExit("install record DAG path is not absolute")
+print(path)
+PY
+}
+
+airflow_here_for_record() {
+  local dag_path
+  dag_path="$(airflow_record_dag "$1")" || die "the active generation has no usable DAG path"
+  dirname "$(dirname "$dag_path")"
+}
+
+airflow_render_generation_config() {
+  local record_path="$1" venv="$2" env_file="$3" dag_path airflow_here runtime_dsn api_port
+  dag_path="$(airflow_record_dag "$record_path")" \
+    || die "the active generation has no usable DAG path"
+  airflow_here="$(dirname "$(dirname "$dag_path")")"
+  [ -f "$airflow_here/render_config.py" ] && [ ! -L "$airflow_here/render_config.py" ] \
+    || die "the active generation has no config renderer: $airflow_here/render_config.py"
+  [ -f "$airflow_here/airflow.cfg.template" ] && [ ! -L "$airflow_here/airflow.cfg.template" ] \
+    || die "the active generation has no Airflow config template"
+  runtime_dsn="$(generation_env_value "$env_file" AIRFLOW_RUNTIME_DB_URL)" || return 1
+  api_port="${AIRFLOW_API_PORT:-}"
+  [ -n "$api_port" ] || die "the active deployment has no Airflow API port"
+  AIRFLOW_DB_URL="$runtime_dsn" AIRFLOW_API_PORT="$api_port" \
+    "$venv/bin/python" "$airflow_here/render_config.py" \
+      --home "$AIRFLOW_HOME" --venv "$venv" \
+      --template "$airflow_here/airflow.cfg.template" \
+      --dags-folder "$(dirname "$dag_path")" \
+    || return 1
+  AIRFLOW_HOME="$AIRFLOW_HOME" "$venv/bin/python" "$HERE/runtime_dag.py" \
+    --state-root "$STATE_ROOT" --airflow-home "$AIRFLOW_HOME" --files-only >/dev/null \
+    || return 1
+}
+
+airflow_wait_dag_identity() {
+  local attempt result=""
+  for attempt in $(seq 1 60); do
+    if result="$(
+      AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/runtime_dag.py" \
+        --state-root "$STATE_ROOT" --airflow-home "$AIRFLOW_HOME" 2>&1
+    )"; then
+      printf '%s\n' "$result"
+      return 0
+    fi
+    sleep 2
+  done
+  printf '%s\n' "${result:-Airflow did not serialize the active DAG}" >&2
+  return 1
+}
+
 airflow_lifecycle() {
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
   POSTGRES_ROOT="${POSTGRES_ROOT:-}" POSTGRES_MAJOR="${POSTGRES_MAJOR:-14}" \
@@ -1174,12 +1248,14 @@ case "$ACTION" in
       python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
         --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
-        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --wheel "$WHEEL_FILE"
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
+        --deployment-root "$HERE/../.." --wheel "$WHEEL_FILE"
     else
       python3 "$HERE/install_record.py" build --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
         --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$ENDPOINT_IDENTITY" --services "$SERVICES_CSV" \
-        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --tree "$HERE/../.."
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
+        --deployment-root "$HERE/../.." --tree "$HERE/../.."
     fi
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
       --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
@@ -1607,21 +1683,28 @@ PY
     SERVICES_CSV="$(IFS=,; printf '%s' "${UNITS[*]}")"
     CANDIDATE_WHEEL="$(cat "$RECEIPT_DIR/candidate-wheel")"
     [ -f "$CANDIDATE_WHEEL" ] || die "the staged candidate wheel is missing: $CANDIDATE_WHEEL"
-    if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" build --state-root "$STATE_ROOT" \
+    airflow_require_no_readers
+    if ! "$CANDIDATE_RUNTIME_VENV/bin/python" "$HERE/install_record.py" build --state-root "$STATE_ROOT" \
         --install-id "$CANDIDATE_ID" --snapshot "$SNAPSHOT_PATH" --release-file "$RELEASE_FILE" \
         --endpoint-identity "$EVIDENCE_DIR/endpoint-identity.json" --services "$SERVICES_CSV" \
-        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" --wheel "$CANDIDATE_WHEEL" \
+        --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
+        --deployment-root "$HERE/../.." --wheel "$CANDIDATE_WHEEL" \
         --previous-record "$PREVIOUS_RECORD" --journal "$EVIDENCE_DIR/journal.json" \
         > "$EVIDENCE_DIR/switch-pointer.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote switch-pointer failed "$EVIDENCE_DIR/switch-pointer.out"
       die "the pointer switch failed (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote switch-pointer completed "$EVIDENCE_DIR/switch-pointer.out"
-    if ! AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
-        --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH" \
-        > "$EVIDENCE_DIR/config-reference.out" 2>&1; then
+    AIRFLOW_HERE="$(airflow_here_for_record "$STATE_ROOT/install-record.json")" \
+      || die "the switched record has no generated Airflow deployment"
+    if ! {
+      airflow_render_generation_config "$STATE_ROOT/install-record.json" \
+        "$CANDIDATE_RUNTIME_VENV" "$CANDIDATE_ENV" &&
+      AIRFLOW_HOME="$AIRFLOW_HOME" "$CANDIDATE_RUNTIME_VENV/bin/python" "$AIRFLOW_HERE/scripts/add_connection.py" \
+        --state-root "$STATE_ROOT" --snapshot "$SNAPSHOT_PATH"
+    } > "$EVIDENCE_DIR/config-reference.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote config-reference failed "$EVIDENCE_DIR/config-reference.out"
-      die "the Airflow connection could not bind the switched config snapshot (the admission stays closed)"
+      die "the Airflow DAG/config reference could not bind the switched generation (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote config-reference completed "$EVIDENCE_DIR/config-reference.out"
     # 8. the switched generation starts through its own derived environment
@@ -1636,6 +1719,7 @@ PY
       && airflow_render \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
+      && airflow_wait_dag_identity \
       && airflow_unpause_dag \
       && systemctl --user enable --now description-portal.service description-operator-proxy.service \
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service
@@ -1831,6 +1915,7 @@ PY
     fi
     # The Linux end re-activates the recorded previous generation; no generation file is rewritten.
     if [ "$LINUX_SWITCHED" = "1" ]; then
+      airflow_require_no_readers
       if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" repoint \
           --state-root "$STATE_ROOT" --record "$PREVIOUS_RECORD" > "$EVIDENCE_DIR/rollback-linux.out" 2>&1; then
         promotion_step "$ROLLBACK_ID" rollback rollback-linux failed "$EVIDENCE_DIR/rollback-linux.out"
@@ -1888,6 +1973,10 @@ PY
     load_running_env
     load_installed
     load_generation_env
+    AIRFLOW_HERE="$(airflow_here_for_record "$STATE_ROOT/install-record.json")" \
+      || die "the restored record has no generated Airflow deployment"
+    airflow_render_generation_config "$STATE_ROOT/install-record.json" "$AIRFLOW_VENV" "$ENV_FILE" \
+      || die "the restored Airflow DAG/config reference could not be rendered (the admission stays closed)"
     PROXY_BIN="$(ensure_proxy_binary)" \
       || die "the managed proxy binary is unavailable (the admission stays closed)"
     if ! {
@@ -1899,6 +1988,7 @@ PY
       && airflow_units_match_generation \
       && systemctl --user daemon-reload \
       && airflow_lifecycle start \
+      && airflow_wait_dag_identity \
       && airflow_runtime_matches_generation "$CANDIDATE_VENV" \
       && systemctl --user enable --now description-portal.service description-operator-proxy.service \
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \

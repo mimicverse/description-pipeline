@@ -43,6 +43,7 @@ from platform_config import (  # noqa: E402  (single owners)
 INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
 RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
 DAG_ID = "solidworks_to_urdf"
+DAG_MEMBER = "deploy/airflow/dags/solidworks_to_urdf.py"
 #: Frozen stage contract size; tests guard parity with description_pipeline.stages.STAGE_IDS.
 DAG_TASK_COUNT = 6
 
@@ -98,6 +99,15 @@ def release_identity(document) -> dict:
         _text(name, "release.json artifact name")
         rows.append({"name": name, "sha256": _hex64(checksum, f"release.json artifact {name!r}")})
     return {"version": version, "source_commit": commit, "source_sha256": source_sha, "artifacts": rows}
+
+
+def release_dag_digest(document) -> str:
+    """The release's one deployment member that may become the active Airflow DAG."""
+
+    require(isinstance(document, dict), "release.json must be an object")
+    files = document.get("deployment_files")
+    require(isinstance(files, dict), "release.json deployment_files must be an object")
+    return _hex64(files.get(DAG_MEMBER), f"release.json deployment member {DAG_MEMBER!r}")
 
 
 def _is_link(path: Path) -> bool:
@@ -309,6 +319,8 @@ def build_install_record(
     endpoint: dict,
     services: list[str],
     dag_file: Path,
+    deployment_root: Path,
+    release_dag_sha256: str,
     previous: dict | None = None,
     journal: list | None = None,
 ) -> dict:
@@ -358,9 +370,26 @@ def build_install_record(
     windows_release = endpoint["release"]
     require_matching_release(release, endpoint)
 
+    deployment_root = Path(deployment_root)
+    require(
+        not _is_link(deployment_root) and deployment_root.is_dir(),
+        f"deployment root must be a real directory: {deployment_root}",
+    )
+    deployment_root = Path(os.path.realpath(deployment_root))
     dag_file = Path(dag_file)
+    require(not _is_link(dag_file), f"dag file must not be a link: {dag_file}")
     require(dag_file.is_file(), f"dag file not found: {dag_file}")
-    dag_digest = hashlib.sha256(dag_file.read_bytes()).hexdigest()
+    resolved_dag = Path(os.path.realpath(dag_file))
+    require(resolved_dag.name == Path(DAG_MEMBER).name, f"dag file name differs from {DAG_MEMBER!r}")
+    require(
+        resolved_dag == deployment_root.joinpath(*DAG_MEMBER.split("/")),
+        f"dag file is outside the current deployment root: {resolved_dag}",
+    )
+    dag_digest = hashlib.sha256(resolved_dag.read_bytes()).hexdigest()
+    require(
+        dag_digest == _hex64(release_dag_sha256, "release DAG digest"),
+        f"dag file does not match the release deployment member ({dag_digest})",
+    )
     steps = []
     for index, row in enumerate(journal or []):
         require(
@@ -394,7 +423,12 @@ def build_install_record(
         },
         "services": list(services),
         "paths": paths,
-        "dag": {"id": DAG_ID, "path": str(dag_file), "digest": dag_digest, "tasks": DAG_TASK_COUNT},
+        "dag": {
+            "id": DAG_ID,
+            "path": str(resolved_dag),
+            "digest": dag_digest,
+            "tasks": DAG_TASK_COUNT,
+        },
         "ends": {
             "linux": {
                 "install_id": install_id,
@@ -511,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--endpoint-identity", type=Path, required=True)
     build.add_argument("--services", required=True, help="comma-separated managed unit names")
     build.add_argument("--dag", type=Path, required=True)
+    build.add_argument("--deployment-root", type=Path, required=True)
     build.add_argument("--wheel", type=Path, default=None, help="the installed wheel (contract owner source)")
     build.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
     build.add_argument("--previous-record", type=Path, default=None, help="the generation this record replaces")
@@ -588,7 +623,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     timestamp = args.timestamp or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    release = release_identity(_load_json(args.release_file, "release file"))
+    release_document = _load_json(args.release_file, "release file")
+    release = release_identity(release_document)
+    release_dag_sha256 = release_dag_digest(release_document)
     verified = verify_artifacts(args.release_file.parent, release["artifacts"])
     endpoint = endpoint_identity(_load_json(args.endpoint_identity, "endpoint identity"))
     services = [unit for unit in args.services.split(",") if unit]
@@ -600,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
         endpoint=endpoint,
         services=services,
         dag_file=args.dag,
+        deployment_root=args.deployment_root,
+        release_dag_sha256=release_dag_sha256,
         previous=(
             previous_from_record(
                 _load_json(args.previous_record, "previous record"),

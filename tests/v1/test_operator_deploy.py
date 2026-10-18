@@ -160,6 +160,7 @@ def platform_fixture(
     (tmp / "description-1.4.0-windows-cp312-x86_64.zip").write_bytes(b"windows-archive")
     (tmp / "description-1.4.0-linux-cp312-x86_64.zip").write_bytes(b"linux-archive")
     (tmp / "description-1.4.0-deployment.zip").write_bytes(b"deployment-archive")
+    dag_content = b"# dag fixture\n"
     release_document = {
         "schema_version": "solidworks-to-urdf.release/v1",
         "pipeline_id": "solidworks-to-urdf",
@@ -171,6 +172,9 @@ def platform_fixture(
             "description-1.4.0-windows-cp312-x86_64.zip": hashlib.sha256(b"windows-archive").hexdigest(),
             "description-1.4.0-linux-cp312-x86_64.zip": hashlib.sha256(b"linux-archive").hexdigest(),
             "description-1.4.0-deployment.zip": hashlib.sha256(b"deployment-archive").hexdigest(),
+        },
+        "deployment_files": {
+            "deploy/airflow/dags/solidworks_to_urdf.py": hashlib.sha256(dag_content).hexdigest(),
         },
     }
     release_path = tmp / "release.json"
@@ -290,8 +294,9 @@ def platform_fixture(
         ),
         encoding="utf-8",
     )
-    dag_path = tmp / "solidworks_to_urdf.py"
-    dag_path.write_text("# dag fixture\n", encoding="utf-8")
+    dag_path = tmp / "deploy" / "airflow" / "dags" / "solidworks_to_urdf.py"
+    dag_path.parent.mkdir(parents=True, exist_ok=True)
+    dag_path.write_bytes(dag_content)
     built = run(
         [
             sys.executable,
@@ -311,6 +316,8 @@ def platform_fixture(
             "description-postgres,description-airflow-scheduler,description-operator-proxy",
             "--dag",
             str(dag_path),
+            "--deployment-root",
+            str(tmp),
             "--wheel",
             str(wheel),
         ],
@@ -1753,9 +1760,26 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "operator" / "health.sh").write_bytes(HEALTH.read_bytes())
         (release / "operator" / "health_gate.sh").write_bytes(HEALTH_GATE.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
-        for module in ("platform_config.py", "platform_env.py", "install_record.py", "promotion.py", "backup.py"):
+        for module in (
+            "platform_config.py",
+            "platform_env.py",
+            "install_record.py",
+            "promotion.py",
+            "backup.py",
+            "runtime_dag.py",
+        ):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
-        (release / "airflow" / "dags" / "solidworks_to_urdf.py").write_text("# dag fixture\n", encoding="utf-8")
+        write_stub(
+            release / "operator" / "runtime_dag.py",
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "print('runtime-dag-check')\n"
+            "raise SystemExit(int(os.environ.get('RUNTIME_DAG_RC', '0')))\n",
+        )
+        for name in ("render_config.py", "airflow.cfg.template"):
+            (release / "airflow" / name).write_bytes((OPERATOR.parent / "airflow" / name).read_bytes())
+        dag_content = b"# dag fixture\n"
+        (release / "airflow" / "dags" / "solidworks_to_urdf.py").write_bytes(dag_content)
         for template in ("nginx.conf.template", "portal.json.template"):
             (release / "operator" / template).write_bytes((OPERATOR / template).read_bytes())
         (release / "operator" / "systemd").mkdir()
@@ -1830,6 +1854,10 @@ class InstallOrderingTests(unittest.TestCase):
             "  stop|stop-executors)\n"
             '    [ "$1" = "stop" ] && printf inactive > "$SYSTEMCTL_STATE_DIR/description-postgres"\n'
             '    for unit in "${execution_units[@]}"; do\n'
+            '      if [ "$1" = "stop-executors" ] && [ "$unit" = "${FIXTURE_LEAVE_READER_ACTIVE:-}" ]; then\n'
+            '        printf active > "$SYSTEMCTL_STATE_DIR/$unit"\n'
+            '        continue\n'
+            '      fi\n'
             '      stop_runtime "$unit"\n'
             '      printf inactive > "$SYSTEMCTL_STATE_DIR/$unit"\n'
             "    done\n"
@@ -2045,6 +2073,11 @@ class InstallOrderingTests(unittest.TestCase):
                         windows_archive.name: hashlib.sha256(windows_archive.read_bytes()).hexdigest(),
                         "description-1.4.0-linux-cp312-x86_64.zip": hashlib.sha256(b"linux-archive").hexdigest(),
                         "description-1.4.0-deployment.zip": hashlib.sha256(b"deployment-archive").hexdigest(),
+                    },
+                    "deployment_files": {
+                        "deploy/airflow/dags/solidworks_to_urdf.py": hashlib.sha256(
+                            dag_content
+                        ).hexdigest(),
                     },
                 }
             ),
@@ -2856,7 +2889,12 @@ class InstallOrderingTests(unittest.TestCase):
             self._clone_generation_stubs(state)
             self._linux_health_double(release)
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
-            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            detail = promoted.stdout + promoted.stderr
+            for name in ("config-reference.out", "start-services.out", "verify.out"):
+                path = state / "promotions" / "gen-2" / "evidence" / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(promoted.returncode, 0, detail)
             self.assertEqual(remote_archive.read_bytes(), original)
             self.assertFalse(stat.S_IMODE(remote_archive.stat().st_mode) & 0o222)
             scp_lines = order.read_text(encoding="utf-8").splitlines()
@@ -2866,6 +2904,121 @@ class InstallOrderingTests(unittest.TestCase):
                 if line.startswith("scp ") and "description-1.4.0-windows-cp312-x86_64.zip" in line
             ]
             self.assertEqual(len(archive_scp), 1, "stage should transfer the archive exactly once")
+
+    def test_promote_refuses_a_failed_generation_render_after_the_pointer_switch(self) -> None:
+        """A renderer exit is fatal even when it already left a plausible airflow.cfg on disk."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            candidate_venv = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV"))
+            write_stub(candidate_venv / "bin" / "python", '#!/usr/bin/env bash\nexec python3 "$@"\n')
+            self._linux_health_double(release)
+            write_stub(
+                release / "airflow" / "render_config.py",
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "arguments = sys.argv[1:]\n"
+                'folder = Path(arguments[arguments.index("--dags-folder") + 1])\n'
+                'home = Path(arguments[arguments.index("--home") + 1])\n'
+                "home.mkdir(parents=True, exist_ok=True)\n"
+                'cfg = home / "airflow.cfg"\n'
+                'cfg.write_text("# managed-by: description-airflow\\n[core]\\ndags_folder = " + str(folder) + "\\n",'
+                " encoding='utf-8')\n"
+                "cfg.chmod(0o600)\n"
+                'print("renderer prepared a plausible config then failed", file=sys.stderr)\n'
+                "raise SystemExit(9)\n",
+            )
+            before = order.read_text(encoding="utf-8")
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertNotEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertIn(
+                "the Airflow DAG/config reference could not bind the switched generation",
+                promoted.stderr,
+            )
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            self.assertIn(
+                "renderer prepared a plausible config then failed",
+                (evidence / "config-reference.out").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (root / "admission").read_text(encoding="utf-8").strip(),
+                "true",
+                "a post-switch renderer failure must keep the admission closed",
+            )
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-2")
+            appended = order.read_text(encoding="utf-8")[len(before):]
+            self.assertIn("platform close_admission", appended)
+            self.assertNotIn("dags unpause", appended)
+            self.assertNotIn("services_start", appended)
+            self.assertNotIn("systemctl --user enable --now description-portal.service", appended)
+            for unit in (
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+                "description-portal",
+                "description-operator-proxy",
+            ):
+                path = root / "unit-state" / unit
+                self.assertEqual(path.read_text(encoding="utf-8"), "inactive", unit)
+
+    def test_promote_refuses_a_generation_switch_while_a_dag_reader_is_alive(self) -> None:
+        """The pointer switch has a no-reader barrier; a surviving reader keeps the old record."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            control_env["FIXTURE_LEAVE_READER_ACTIVE"] = "description-airflow-scheduler"
+            before = order.read_text(encoding="utf-8")
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertNotEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            self.assertIn(
+                "description-airflow-scheduler is active; refusing a non-barriered generation switch",
+                promoted.stderr,
+            )
+            active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
+            self.assertEqual(active["install_id"], "gen-1", "a live reader must block the pointer switch")
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            self.assertFalse(
+                (evidence / "switch-pointer.out").exists(),
+                "no record write may start after the no-reader barrier refuses",
+            )
+            self.assertEqual((root / "admission").read_text(encoding="utf-8").strip(), "true")
+            appended = order.read_text(encoding="utf-8")[len(before):]
+            self.assertNotIn("services_start", appended)
+            self.assertNotIn("dags unpause", appended)
+            self.assertEqual(
+                (root / "unit-state" / "description-airflow-scheduler").read_text(encoding="utf-8"),
+                "active",
+            )
 
     def test_promote_refuses_a_mismatched_read_only_staged_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2912,7 +3065,12 @@ class InstallOrderingTests(unittest.TestCase):
             self._clone_generation_stubs(state)
             self._linux_health_double(release)
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
-            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            detail = promoted.stdout + promoted.stderr
+            for name in ("config-reference.out", "start-services.out", "verify.out"):
+                path = state / "promotions" / "gen-2" / "evidence" / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(promoted.returncode, 0, detail)
             active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
             self.assertEqual(active["install_id"], "gen-2")
             restored_venv = self._derived_value(state, "gen-1", "AIRFLOW_VENV")

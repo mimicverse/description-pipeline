@@ -10,9 +10,10 @@ GRANT USAGE ON SCHEMA :"airflow_schema" TO platform_migrate;
 GRANT SELECT ON :"airflow_schema".task_instance TO platform_migrate;
 GRANT SELECT ON :"airflow_schema".dag_run TO platform_migrate;
 -- The write-side reconcile reads the original Airflow scheduling facts for the
--- admitted-before-dispatch closure: exactly the identity/state columns it binds, nothing else.
+-- admitted closure: exactly the identity/state/terminal-attempt columns it binds, nothing else.
 GRANT USAGE ON SCHEMA :"airflow_schema" TO platform_service;
-GRANT SELECT (dag_id, run_id, task_id, map_index, state) ON :"airflow_schema".task_instance TO platform_service;
+GRANT SELECT (dag_id, run_id, task_id, map_index, state, try_number)
+    ON :"airflow_schema".task_instance TO platform_service;
 GRANT SELECT (dag_id, run_id, state) ON :"airflow_schema".dag_run TO platform_service;
 GRANT USAGE ON SCHEMA :"airflow_schema" TO airflow_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA :"airflow_schema" TO airflow_runtime;
