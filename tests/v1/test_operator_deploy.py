@@ -3222,6 +3222,12 @@ class InstallOrderingTests(unittest.TestCase):
             remote_previous_archive.chmod(0o444)
             control_env["FIXTURE_REMOTE_ARCHIVE_GEN1"] = str(remote_previous_archive)
             control_env["FIXTURE_REMOTE_ARCHIVE_GEN2"] = str(remote_candidate_archive)
+            resident_binding_path = state / "promotions" / "gen-1" / "windows-binding.json"
+            resident_binding_path.parent.mkdir(parents=True, exist_ok=True)
+            resident_binding_bytes = b'{"resident":"canonical-binding-sentinel"}\n'
+            resident_binding_path.write_bytes(resident_binding_bytes)
+            resident_binding_path.chmod(0o600)
+            resident_binding_mode = stat.S_IMODE(resident_binding_path.stat().st_mode)
 
             staged = self._maintenance(candidate, control_env, "stage", "gen-2")
             self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
@@ -3265,10 +3271,12 @@ class InstallOrderingTests(unittest.TestCase):
                 previous_health_binding["artifact_sha256"],
                 hashlib.sha256(previous_archive).hexdigest(),
             )
-            self.assertFalse(
-                (state / "promotions" / "gen-1" / "windows-binding.json").exists(),
+            self.assertEqual(
+                resident_binding_path.read_bytes(),
+                resident_binding_bytes,
                 "health must not rewrite the restored resident's lifecycle binding",
             )
+            self.assertEqual(stat.S_IMODE(resident_binding_path.stat().st_mode), resident_binding_mode)
             candidate_health_binding = json.loads(
                 (state / "promotions" / "gen-2" / "windows-health-binding.json").read_text(
                     encoding="utf-8"
@@ -4246,6 +4254,77 @@ class BackupStreamingUnitTests(unittest.TestCase):
 
     CONTROL = OPERATOR / "backup.py"
 
+    def test_seal_failure_removes_its_temp_and_leaves_retry_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "record.json").write_text("{}\n", encoding="utf-8")
+            out = root / "sealed" / "backup.tar.enc"
+            key = root / "secrets" / "backup.key"
+            bindir = root / "bin"
+            bindir.mkdir()
+            log = root / "openssl.log"
+            failing = (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'out=""\n'
+                'previous=""\n'
+                'for argument in "$@"; do\n'
+                '  [ "$previous" = "-out" ] && out="$argument"\n'
+                '  previous="$argument"\n'
+                "done\n"
+                "cat >/dev/null\n"
+                "printf 'PARTIAL' > \"$out\"\n"
+                "exit 9\n"
+            )
+            write_stub(bindir / "openssl", failing)
+            env = {
+                "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "OPENSSL_LOG": str(log),
+            }
+            command = [
+                sys.executable,
+                str(self.CONTROL),
+                "seal",
+                "--source",
+                str(source),
+                "--key",
+                str(key),
+                "--out",
+                str(out),
+            ]
+            failed = run(command, env)
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertIn("openssl failed", failed.stderr)
+            self.assertFalse(out.exists())
+            self.assertEqual(list(out.parent.iterdir()), [])
+
+            out.parent.mkdir(exist_ok=True)
+            out.write_bytes(b"preexisting")
+            failed_existing = run(command, env)
+            self.assertNotEqual(failed_existing.returncode, 0, failed_existing.stdout + failed_existing.stderr)
+            self.assertEqual(out.read_bytes(), b"preexisting")
+            self.assertEqual(list(out.parent.iterdir()), [out])
+
+            write_stub(
+                bindir / "openssl",
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'out=""\n'
+                'previous=""\n'
+                'for argument in "$@"; do\n'
+                '  [ "$previous" = "-out" ] && out="$argument"\n'
+                '  previous="$argument"\n'
+                "done\n"
+                "cat >/dev/null\n"
+                "printf 'sealed-on-retry\\n' > \"$out\"\n",
+            )
+            retried = run(command, env)
+            self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+            self.assertEqual(out.read_bytes(), b"sealed-on-retry\n")
+            self.assertEqual(list(out.parent.iterdir()), [out])
+
     def test_seal_has_no_plaintext_tar_temp_and_passes_no_input_file_to_openssl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4296,8 +4375,8 @@ class BackupStreamingUnitTests(unittest.TestCase):
             self.assertEqual(list(out.parent.iterdir()), [out])
             calls = log.read_text(encoding="utf-8")
             self.assertNotIn("arg=-in", calls)
-            self.assertIn("before=\n", calls)
-            self.assertNotIn("before=tmp", calls)
+            self.assertIn("arg=-out\n", calls)
+            self.assertIn(".partial", calls)
 
     def test_open_streams_openssl_stdout_and_keeps_member_and_extra_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4358,6 +4437,7 @@ class BackupStreamingUnitTests(unittest.TestCase):
                 "-type f -printf \"%f,\" 2>/dev/null)\""
                 " >> \"$OPENSSL_LOG\"\n"
                 "cat \"$input\" >/dev/null\n"
+                "if [ \"${FIXTURE_OPEN_FAIL:-0}\" = \"1\" ]; then printf 'partial'; exit 9; fi\n"
                 "cat \"$FIXTURE_PLAINTEXT_TAR\"\n",
             )
             base_env = {
@@ -4365,8 +4445,8 @@ class BackupStreamingUnitTests(unittest.TestCase):
                 "OPENSSL_LOG": str(log),
             }
 
-            def invoke(dest_parent: Path, tar_path: Path) -> subprocess.CompletedProcess:
-                dest_parent.mkdir()
+            def invoke(dest_parent: Path, tar_path: Path, *, fail: bool = False) -> subprocess.CompletedProcess:
+                dest_parent.mkdir(exist_ok=True)
                 return run(
                     [
                         sys.executable,
@@ -4385,8 +4465,17 @@ class BackupStreamingUnitTests(unittest.TestCase):
                         **base_env,
                         "FIXTURE_DEST_PARENT": str(dest_parent),
                         "FIXTURE_PLAINTEXT_TAR": str(tar_path),
+                        "FIXTURE_OPEN_FAIL": "1" if fail else "0",
                     },
                 )
+
+            failed = invoke(root / "retry", plaintext_tar, fail=True)
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertFalse((root / "retry" / "restored").exists())
+            self.assertEqual(list((root / "retry").iterdir()), [])
+            retried = invoke(root / "retry", plaintext_tar)
+            self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+            self.assertEqual((root / "retry" / "restored" / member).read_bytes(), payload.read_bytes())
 
             opened = invoke(root / "ok", plaintext_tar)
             self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
@@ -4399,9 +4488,13 @@ class BackupStreamingUnitTests(unittest.TestCase):
             extra = invoke(root / "extra", extra_tar)
             self.assertNotEqual(extra.returncode, 0, extra.stdout + extra.stderr)
             self.assertIn("members outside the manifest", extra.stderr)
+            self.assertFalse((root / "extra" / "restored").exists())
+            self.assertEqual(list((root / "extra").iterdir()), [])
             changed_result = invoke(root / "changed", changed_tar)
             self.assertNotEqual(changed_result.returncode, 0, changed_result.stdout + changed_result.stderr)
             self.assertIn("restored member differs from the manifest", changed_result.stderr)
+            self.assertFalse((root / "changed" / "restored").exists())
+            self.assertEqual(list((root / "changed").iterdir()), [])
 
 
 class BackupStagingCleanupUnitTests(unittest.TestCase):

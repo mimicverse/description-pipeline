@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
 import install_record
@@ -136,27 +137,48 @@ def seal(source: Path, key: Path, out: Path) -> str:
     require(source.is_dir(), f"backup source is missing: {source}")
     ensure_key(key)
     out.parent.mkdir(parents=True, exist_ok=True)
-    process = subprocess.Popen(
-        ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key}", "-out", str(out)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    stream_error = None
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{out.name}.", suffix=".partial", dir=out.parent, delete=False
+    ) as handle:
+        temporary = Path(handle.name)
+    success = False
     try:
-        with tarfile.open(fileobj=process.stdin, mode="w|") as tar:
-            for path in sorted(source.rglob("*")):
-                tar.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
-    except (BrokenPipeError, OSError, tarfile.TarError) as error:
-        stream_error = error
+        process = subprocess.Popen(
+            [
+                "openssl",
+                "enc",
+                "-aes-256-cbc",
+                "-pbkdf2",
+                "-salt",
+                "-pass",
+                f"file:{key}",
+                "-out",
+                str(temporary),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        stream_error = None
+        try:
+            with tarfile.open(fileobj=process.stdin, mode="w|") as tar:
+                for path in sorted(source.rglob("*")):
+                    tar.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
+        except (BrokenPipeError, OSError, tarfile.TarError) as error:
+            stream_error = error
+        finally:
+            if process.stdin is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    process.stdin.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        returncode = process.wait()
+        require(returncode == 0, f"openssl failed: {stderr.decode(errors='replace').strip()}")
+        require(stream_error is None, f"tar stream failed: {stream_error}")
+        os.replace(temporary, out)
+        success = True
     finally:
-        if process.stdin is not None:
-            with contextlib.suppress(BrokenPipeError, OSError):
-                process.stdin.close()
-    stderr = process.stderr.read() if process.stderr is not None else b""
-    returncode = process.wait()
-    require(returncode == 0, f"openssl failed: {stderr.decode(errors='replace').strip()}")
-    require(stream_error is None, f"tar stream failed: {stream_error}")
+        if not success:
+            temporary.unlink(missing_ok=True)
     return sha256_file(out)
 
 
@@ -172,39 +194,59 @@ def open_archive(archive: Path, key: Path, manifest_path: Path, dest: Path) -> N
     )
     validated = manifest["files"]
     require(not dest.exists(), f"refuse to overwrite the restore destination: {dest}")
-    dest.mkdir(parents=True)
-    process = subprocess.Popen(
-        ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-pass", f"file:{key}", "-in", str(archive)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{dest.name}.", suffix=".partial", dir=dest.parent)
     )
-    stream_error = None
+    success = False
     try:
-        with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
-            tar.extractall(dest, filter="data")
-    except (OSError, tarfile.TarError) as error:
-        stream_error = error
-    finally:
-        if process.stdout is not None:
-            with contextlib.suppress(BrokenPipeError, OSError):
-                process.stdout.close()
-    stderr = process.stderr.read() if process.stderr is not None else b""
-    returncode = process.wait()
-    require(returncode == 0, f"openssl failed: {stderr.decode(errors='replace').strip()}")
-    require(stream_error is None, f"tar stream failed: {stream_error}")
-    for name, checksum in validated.items():
-        restored = dest / name
-        require(
-            restored.is_file() and sha256_file(restored) == checksum,
-            f"restored member differs from the manifest: {name}",
+        process = subprocess.Popen(
+            [
+                "openssl",
+                "enc",
+                "-d",
+                "-aes-256-cbc",
+                "-pbkdf2",
+                "-pass",
+                f"file:{key}",
+                "-in",
+                str(archive),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-    extras = sorted(
-        path.relative_to(dest).as_posix()
-        for path in dest.rglob("*")
-        if path.is_file() and path.relative_to(dest).as_posix() not in validated
-    )
-    require(not extras, f"the archive carries members outside the manifest: {extras[:3]}")
+        stream_error = None
+        try:
+            with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
+                tar.extractall(temporary, filter="data")
+        except (OSError, tarfile.TarError) as error:
+            stream_error = error
+        finally:
+            if process.stdout is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    process.stdout.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        returncode = process.wait()
+        require(returncode == 0, f"openssl failed: {stderr.decode(errors='replace').strip()}")
+        require(stream_error is None, f"tar stream failed: {stream_error}")
+        for name, checksum in validated.items():
+            restored = temporary / name
+            require(
+                restored.is_file() and sha256_file(restored) == checksum,
+                f"restored member differs from the manifest: {name}",
+            )
+        extras = sorted(
+            path.relative_to(temporary).as_posix()
+            for path in temporary.rglob("*")
+            if path.is_file() and path.relative_to(temporary).as_posix() not in validated
+        )
+        require(not extras, f"the archive carries members outside the manifest: {extras[:3]}")
+        os.replace(temporary, dest)
+        success = True
+    finally:
+        if not success and temporary.exists():
+            _remove_staging_tree(temporary)
 
 
 def _remove_staging_tree(root: Path) -> None:
