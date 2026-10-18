@@ -4354,7 +4354,8 @@ class BackupStreamingUnitTests(unittest.TestCase):
                 "  previous=\"$argument\"\n"
                 "done\n"
                 "printf \"arg=%s\\n\" \"$@\" >> \"$OPENSSL_LOG\"\n"
-                "printf \"before=%s\\n\" \"$(find \"$FIXTURE_DEST_PARENT\" -maxdepth 1 -type f -printf \"%f,\" 2>/dev/null)\""
+                "printf \"before=%s\\n\" \"$(find \"$FIXTURE_DEST_PARENT\" -maxdepth 1 "
+                "-type f -printf \"%f,\" 2>/dev/null)\""
                 " >> \"$OPENSSL_LOG\"\n"
                 "cat \"$input\" >/dev/null\n"
                 "cat \"$FIXTURE_PLAINTEXT_TAR\"\n",
