@@ -518,17 +518,20 @@ _RESTORE_RUN_RUNNING = "UPDATE run SET state = 'running', updated_at = now() WHE
 _SETTLE_OPERATIONS = (
     "UPDATE operation SET state = CASE WHEN kind = 'cancel' THEN 'succeeded' ELSE %s END,"
     " updated_at = now()"
-    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
+    " WHERE run_id = %s AND stage = %s"
+    " AND kind NOT IN ('reconcile', 'cache_release', 'native')"
     " AND state IN ('queued', 'running', 'unresolved')"
 )
 _SETTLE_BLOCKED_OPERATIONS = (
     "UPDATE operation SET state = 'cancelled', updated_at = now()"
-    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
+    " WHERE run_id = %s AND stage = %s"
+    " AND kind NOT IN ('reconcile', 'cache_release', 'native')"
     " AND state = 'queued'"
 )
 _SETTLE_UNKNOWN = (
     "UPDATE operation SET state = 'unresolved', updated_at = now()"
-    " WHERE run_id = %s AND stage = %s AND kind NOT IN ('reconcile', 'cache_release')"
+    " WHERE run_id = %s AND stage = %s"
+    " AND kind NOT IN ('reconcile', 'cache_release', 'native')"
     " AND state = 'running'"
 )
 _SETTLE_RECONCILE = (
@@ -1359,16 +1362,18 @@ class PlatformStore:
         receipt_path: Path | str,
         native_run_id: str,
         evidence: Sequence[str] | None = None,
+        reported_stage: str = "capture",
     ) -> None:
-        """Settle only the native owner operation after a proven capture failure.
+        """Settle only the native owner operation after a proven native failure.
 
-        The engineering stage records are already final: discover completed and
-        capture failed.  This action updates the one operation bound to the
-        native job; it never rewrites a stage, never settles another running
-        operation, and never turns an unreachable or live endpoint job into a
-        result.
+        A capture failure has completed discovery and failed capture records; a
+        direct discover failure has failed discovery and blocked successors.
+        Either way this action updates only the one operation bound to the
+        native job after re-verifying its bytes and real scheduling facts.
         """
 
+        if reported_stage not in {"discover", "capture"}:
+            raise PlatformStoreError("The native owner failure reported stage is not discover or capture")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
@@ -1391,7 +1396,7 @@ class PlatformStore:
                 "binding": {"operation_id": operation_id, "task_id": task_id, "map_index": map_index},
                 "native_receipt": {"path": str(receipt_path), "native_run_id": native_run_id},
                 "evidence": list(evidence or ()),
-                "reported_stage": "capture",
+                "reported_stage": reported_stage,
             }
             receipt, reconcile = self._byte_bound_orphan_receipt(
                 run_id=run_id, stage="discover", state="failed", receipt=None, reconcile=reconcile
@@ -2646,6 +2651,9 @@ class PlatformStore:
             operation_id=reconcile_operation,
             payload={"state": "failed", "reported_stage": reported_stage, "actual_stage": "discover"},
         )
+        cursor.execute(_SETTLE_NAMED_OPERATION, ("failed", operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The bound native discover owner lost its running state")
         self._stage_outcome(connection, run_id=run_id, stage="discover", state="failed")
         cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
         self._bind_legacy_dispatch_freeze(
@@ -2719,13 +2727,18 @@ class PlatformStore:
                 payload = json.loads(payload)
             except ValueError:
                 return False
+        expected_stage = (
+            "discover"
+            if closure_shape == "bound_native_discover_failed"
+            else "capture"
+        )
         return (
             isinstance(payload, dict)
             and payload.get("operation_key") == operation_key
             and payload.get("native_run_id") == native_run
             and payload.get("native_receipt_sha256") == native_sha
-            and payload.get("reported_stage") == "capture"
-            and payload.get("actual_stage") == "capture"
+            and payload.get("reported_stage") == expected_stage
+            and payload.get("actual_stage") == expected_stage
             and payload.get("closure_shape") == closure_shape
         )
 
@@ -2744,18 +2757,24 @@ class PlatformStore:
 
         The discover and capture engineering stage rows are already the
         authority.  This action proves the operation is the bound running owner,
-        the real discover task is failed, the native job's terminal event is
-        capture, and the discover checkpoint is still byte-identical; then it
-        updates that operation alone.  It never rewrites a stage and never
-        settles another running operation.
+        the real discover task is failed, and the native receipt is a direct
+        discover failure or an ordered capture failure; then it updates that
+        operation alone.
         """
 
+        reported_stage = receipt.get("reported_stage")
+        actual_stage = receipt.get("actual_stage")
         if (
-            receipt.get("reported_stage") != "capture"
-            or receipt.get("actual_stage") != "capture"
+            reported_stage not in {"discover", "capture"}
+            or actual_stage != reported_stage
             or receipt.get("state") != "failed"
         ):
-            raise PlatformStoreError("The native owner settlement is not a capture failure")
+            raise PlatformStoreError("The native owner settlement is not a direct discover or capture failure")
+        closure_shape = (
+            "bound_native_capture_failed"
+            if actual_stage == "capture"
+            else "bound_native_discover_failed"
+        )
         if run_state != "failed":
             raise PlatformStoreError("The native owner settlement requires the terminal failed run")
         binding = reconcile.get("binding") if isinstance(reconcile, dict) else None
@@ -2793,23 +2812,31 @@ class PlatformStore:
         stages = {item[0]: item for item in cursor.fetchall()}
         if set(stages) != {"freeze", "discover", "capture", "generate", "verify", "publish"}:
             raise PlatformStoreError(
-                "The capture settlement requires freeze, discover, capture and three blocked stages"
+                "The native settlement requires freeze, discover, capture and three blocked stages"
             )
-        if stages["discover"][1] != "completed" or stages["capture"][1] != "failed":
-            raise PlatformStoreError("The capture settlement requires completed discover and failed capture")
-        if any(stages[name][1] != "blocked" for name in ("generate", "verify", "publish")):
-            raise PlatformStoreError("The capture settlement requires blocked downstream stages")
+        if stages["freeze"][1] != "completed":
+            raise PlatformStoreError("The native settlement requires the completed freeze stage")
+        if actual_stage == "capture":
+            if stages["discover"][1] != "completed" or stages["capture"][1] != "failed":
+                raise PlatformStoreError("The capture settlement requires completed discover and failed capture")
+            if any(stages[name][1] != "blocked" for name in ("generate", "verify", "publish")):
+                raise PlatformStoreError("The capture settlement requires blocked downstream stages")
+        elif stages["discover"][1] != "failed" or any(
+            stages[name][1] != "blocked" for name in ("capture", "generate", "verify", "publish")
+        ):
+            raise PlatformStoreError("The discover settlement requires failed discover and blocked successors")
         freeze_receipt = self._verified_direct_completed_stage(
             cursor, run_id=run_id, stage="freeze", row=stages["freeze"]
         )
-        discover_receipt = self._verified_direct_completed_stage(
-            cursor, run_id=run_id, stage="discover", row=stages["discover"]
-        )
-        if (
-            discover_receipt.get("native_stages_sha256") != receipt.get("native_stages_sha256")
-            or discover_receipt.get("handoff_sha256") != receipt.get("native_handoff_sha256")
-        ):
-            raise PlatformStoreError("The completed discovery is not bound to the native stage facts")
+        if actual_stage == "capture":
+            discover_receipt = self._verified_direct_completed_stage(
+                cursor, run_id=run_id, stage="discover", row=stages["discover"]
+            )
+            if (
+                discover_receipt.get("native_stages_sha256") != receipt.get("native_stages_sha256")
+                or discover_receipt.get("handoff_sha256") != receipt.get("native_handoff_sha256")
+            ):
+                raise PlatformStoreError("The completed discovery is not bound to the native stage facts")
         self._verify_dispatch_request_identity(
             cursor,
             run_id=run_id,
@@ -2831,6 +2858,7 @@ class PlatformStore:
                 operation_key=operation_key,
                 native_run=native_run,
                 native_sha=native_sha,
+                closure_shape=closure_shape,
             ):
                 raise PlatformStoreError("The native owner operation already has another terminal identity")
             reconcile_operation = reconcile.get("operation_id") if isinstance(reconcile, dict) else None
@@ -2846,7 +2874,7 @@ class PlatformStore:
         self._insert_event(
             connection,
             run_id=run_id,
-            stage="capture",
+            stage=actual_stage,
             kind="binding",
             operation_id=operation_id,
             payload={
@@ -2854,9 +2882,9 @@ class PlatformStore:
                 "intent_stage": op_stage,
                 "reconciled_stage": "discover",
                 "reconciled_state": "failed",
-                "reported_stage": "capture",
-                "actual_stage": "capture",
-                "closure_shape": "bound_native_capture_failed",
+                "reported_stage": reported_stage,
+                "actual_stage": actual_stage,
+                "closure_shape": closure_shape,
                 "dag_id": dag_id,
                 "dag_run_id": dag_run_id,
                 "task_id": bound_task,

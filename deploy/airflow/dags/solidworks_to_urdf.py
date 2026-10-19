@@ -1536,7 +1536,12 @@ def _settle_native_owner_success_from_receipt(request: dict, receipt_path: Path)
     )
 
 
-def _settle_native_owner_failure_from_receipt(request: dict, receipt_path: Path) -> None:
+def _settle_native_owner_failure_from_receipt(
+    request: dict,
+    receipt_path: Path,
+    *,
+    reported_stage: str = "capture",
+) -> None:
     """Settle the owner native operation after the Airflow failure is terminal."""
 
     run_id = request["run_id"]
@@ -1548,6 +1553,7 @@ def _settle_native_owner_failure_from_receipt(request: dict, receipt_path: Path)
         receipt_path=receipt_path,
         native_run_id=run_id,
         evidence=[f"{receipt_path}#sha256={receipt_sha}"],
+        reported_stage=reported_stage,
     )
 
 
@@ -1615,7 +1621,11 @@ def _settle_native_owner_on_failure(context: dict) -> None:
         if not receipt_path.is_file():
             return
         if task_id == "discover":
-            _settle_native_owner_failure_from_receipt(request, receipt_path)
+            _settle_native_owner_failure_from_receipt(
+                request,
+                receipt_path,
+                reported_stage="discover",
+            )
         else:
             _settle_native_owner_success_from_receipt(request, receipt_path)
     except Exception:  # noqa: BLE001 - the original failure remains primary
@@ -1675,6 +1685,7 @@ def _converge_terminal_native_failure(
             _seal_native_discovery(request, job)
         except Exception:  # noqa: BLE001 - the original failure remains primary
             log.exception("native discovery completion convergence unavailable run=%s", run_id)
+    if stage in {"discover", "capture"}:
         try:
             _write_native_failure_receipt(request, job)
         except Exception:  # noqa: BLE001 - the original failure remains primary

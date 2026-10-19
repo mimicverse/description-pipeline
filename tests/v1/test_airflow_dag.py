@@ -728,8 +728,10 @@ class DagTests(unittest.TestCase):
             with (
                 patch.object(module, "_converge_failed_stage", return_value=converged),
                 patch.object(module, "_store_failure_report", side_effect=RuntimeError("render failed")),
+                patch.object(module, "_write_native_failure_receipt") as persist,
             ):
                 failure = module._converge_terminal_native_failure(endpoint, request)
+            persist.assert_called_once_with(request, job)
             self.assertIsNotNone(failure)
             self.assertEqual(
                 getattr(failure, "native_terminal_failure_converged", False),
@@ -3153,6 +3155,53 @@ class PlatformRegistrationTests(unittest.TestCase):
             }
             module._settle_native_owner_on_failure({"ti": ti})
         self.assertEqual(len(settled), 1, "ambiguous failure markers must never settle")
+
+    def test_direct_discover_failure_marker_routes_the_failure_receipt(self) -> None:
+        from types import SimpleNamespace
+
+        module = self.module
+        run_dir = Path(self.temporary.name) / "runs" / "native-discover-marker"
+        (run_dir / "reports").mkdir(parents=True)
+        receipt = run_dir / "reports" / "native-job-failed.json"
+        receipt.write_text("{}", encoding="utf-8")
+        request = {
+            "run_id": "cfa3e725-abc5-5b60-94ad-6ba838110408",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+
+        class TaskInstance:
+            run_id = "portal-discover-marker"
+            map_index = -1
+            task_id = "discover"
+
+            def __init__(self):
+                self.values = {}
+
+            def xcom_pull(self, *, task_ids, key=None):
+                if task_ids == "freeze" and key is None:
+                    return request
+                return self.values.get((task_ids, key))
+
+            def xcom_push(self, *, key, value):
+                self.values[(self.task_id, key)] = value
+
+        ti = TaskInstance()
+        module._record_native_failure_binding({"ti": ti})
+        settled: list[tuple[dict, Path, str]] = []
+        ti.task_id = "publish"
+        with (
+            patch.object(module, "_work_paths", return_value=SimpleNamespace(run_dir=run_dir)),
+            patch.object(
+                module,
+                "_settle_native_owner_failure_from_receipt",
+                side_effect=lambda pulled, path, *, reported_stage: settled.append(
+                    (pulled, path, reported_stage)
+                ),
+            ),
+        ):
+            module._settle_native_owner_on_failure({"ti": ti})
+        self.assertEqual(settled, [(request, receipt, "discover")])
 
     def test_a_repeated_freeze_confirmation_consumes_the_confirmed_fact(self) -> None:
         run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"

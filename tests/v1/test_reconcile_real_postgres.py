@@ -580,6 +580,18 @@ class ReconcileRealPostgresTests(unittest.TestCase):
         )
         self.store.confirm_stage(
             run_id=self.run_id,
+            stage="discover",
+            state="completed",
+            receipt=discover_receipt,
+            checkpoint_uri=discover_checkpoint,
+        )
+        self.assertEqual(
+            {row[0]: row for row in self._bound_rows()["operations"]}[self.native_operation_key][3],
+            "running",
+            "a native stage confirmation never substitutes for the owner settlement",
+        )
+        self.store.confirm_stage(
+            run_id=self.run_id,
             stage="capture",
             state="failed",
             receipt={

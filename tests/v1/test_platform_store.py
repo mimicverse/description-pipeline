@@ -720,7 +720,7 @@ class FakeCursor:
                 if (
                     record[4] == run_id
                     and record[5] == stage
-                    and record[6] not in {"reconcile", "cache_release"}
+                    and record[6] not in {"reconcile", "cache_release", "native"}
                     and record[1] in {"queued", "running", "unresolved"}
                 ):
                     settled = "succeeded" if record[6] == "cancel" else outcome
@@ -732,7 +732,7 @@ class FakeCursor:
                 if (
                     record[4] == run_id
                     and record[5] == stage
-                    and record[6] not in {"reconcile", "cache_release"}
+                    and record[6] not in {"reconcile", "cache_release", "native"}
                     and record[1] == "queued"
                 ):
                     world.operations[key] = (record[0], "cancelled", *record[2:])
@@ -743,7 +743,7 @@ class FakeCursor:
                 if (
                     record[4] == run_id
                     and record[5] == stage
-                    and record[6] not in {"reconcile", "cache_release"}
+                    and record[6] not in {"reconcile", "cache_release", "native"}
                     and record[1] == "running"
                 ):
                     world.operations[key] = (record[0], "unresolved", *record[2:])
@@ -3288,6 +3288,54 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         )
         self.assertEqual(self.world.snapshot_state(), before, "the identical owner settlement is a no-op")
 
+    def test_direct_discover_failure_settles_the_owner_from_its_receipt(self) -> None:
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            receipt={
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": self.run_id,
+                "stage": "discover",
+                "state": "failed",
+                "passed": False,
+                "error": "SelectionError: the staged main opened with CAD-reported errors",
+            },
+        )
+        for stage in ("capture", "generate", "verify", "publish"):
+            self.store.confirm_stage(run_id=self.run_id, stage=stage, state="blocked", receipt={})
+        self.document["events"] = [
+            {
+                "stage": "discover",
+                "state": "failed",
+                "error": "SelectionError: the staged main opened with CAD-reported errors",
+            }
+        ]
+        self._write_document(self.document)
+        def settle():
+            return self.store.settle_native_owner_failure(
+                run_id=self.run_id,
+                operation_key=self.native_key,
+                receipt_path=self.log,
+                native_run_id=self.native_run,
+                evidence=[str(self.log)],
+                reported_stage="discover",
+            )
+
+        settle()
+        self.assertEqual(self.world.operations[self.native_key][1], "failed")
+        binding = [
+            json.loads(payload) if isinstance(payload, str) else payload
+            for _run_id, _seq, kind, _stage, _operation_id, payload in self.world.events
+            if kind == "binding"
+        ]
+        self.assertEqual(binding[-1]["actual_stage"], "discover")
+        self.assertEqual(binding[-1]["closure_shape"], "bound_native_discover_failed")
+        before = self.world.snapshot_state()
+        settle()
+        self.assertEqual(self.world.snapshot_state(), before)
+
     def test_native_success_settles_the_owner_before_capture_import(self) -> None:
         job = dict(self.document)
         job["status"] = "native_complete"
@@ -3339,6 +3387,57 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         self.world.stages[(self.run_id, "freeze")] = freeze
         self._set_platform_main("cad/other.SLDASM")
         self._assert_refused_without_writes("does not match the admitted request", settle)
+
+    def test_stage_confirmation_never_settles_the_native_owner_without_its_binding(self) -> None:
+        from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
+        from description_pipeline.io import read_data
+
+        discover_root = self.tmp / self.run_id / "discover"
+        subject, artifacts, _upload, native_handoff = build_sealed_delivery(discover_root)
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="completed",
+            receipt={
+                "schema_version": BUNDLE_SCHEMA,
+                "pipeline_id": PIPELINE_ID,
+                "run_id": self.run_id,
+                "stage": "discover",
+                "state": "discovered",
+                "passed": False,
+                "handoff_sha256": native_handoff,
+                "subject_sha256": subject,
+                "native_tool": read_data(discover_root / "reports" / "native-tool.json"),
+                "artifacts": artifacts,
+            },
+            checkpoint_uri=f"store://sealed/{self.run_id}/discover",
+        )
+        self.assertEqual(
+            self.world.operations[self.native_key][1],
+            "running",
+            "a stage row never substitutes for the receipt-bound native owner",
+        )
+        job = dict(self.document)
+        job["status"] = "native_complete"
+        job["events"] = [
+            {"stage": "discover", "state": "completed"},
+            {"stage": "capture", "state": "completed"},
+        ]
+        job["stages"] = self._capture_stage_view(capture_state="completed")
+        job["handoff_sha256"] = self.native_handoff
+        self._write_document(job)
+        self.store.settle_native_owner_success(
+            run_id=self.run_id,
+            operation_key=self.native_key,
+            job_path=self.log,
+        )
+        self.assertEqual(self.world.operations[self.native_key][1], "succeeded")
+        binding = [
+            json.loads(payload) if isinstance(payload, str) else payload
+            for _run_id, _seq, kind, _stage, _operation_id, payload in self.world.events
+            if kind == "binding"
+        ]
+        self.assertEqual(binding[-1]["closure_shape"], "native_complete_owner_succeeded")
 
     def test_native_success_rejects_trailing_and_malformed_events(self) -> None:
         job = dict(self.document)
