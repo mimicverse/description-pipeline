@@ -248,6 +248,9 @@ class PhysicsTests(unittest.TestCase):
                 "kind": "solidworks",
                 "evidence_class": "cad",
                 "identity": copy.deepcopy(identity),
+                "capture": {
+                    "collected_document": self.captured_identity["assembly"],
+                },
                 "limits": {"native_cad": True},
                 "environment": {"solidworks": {"revision": "34.0"}},
             },
@@ -425,6 +428,14 @@ class PhysicsTests(unittest.TestCase):
         self.assertFalse(checks["physics.link.base_link"]["passed"])
         self.assertFalse(checks["physics.closure"]["passed"])
         self.link_direct["schema_version"] = "solidworks-to-urdf.link-group-mass-properties/v2"
+        self.write()
+        self.assertIn("physics.link_direct_record", self.failures())
+        self.link_direct["schema_version"] = original["schema_version"]
+        self.link_direct["configuration"] = "Other"
+        self.write()
+        self.assertIn("physics.link_direct_record", self.failures())
+        self.link_direct["configuration"] = original["configuration"]
+        self.link_direct["assembly"] = "C:\\elsewhere\\robot.SLDASM"
         self.write()
         self.assertIn("physics.link_direct_record", self.failures())
         self.link_direct = original

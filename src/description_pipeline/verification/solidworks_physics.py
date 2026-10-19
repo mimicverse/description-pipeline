@@ -352,9 +352,15 @@ def _unassigned_world(item: dict, raw_scene: dict) -> tuple[float, np.ndarray, n
     return float(item["mass"]), rotation @ com + translation, rotation @ inertia @ rotation.T
 
 
-def _link_direct_record(evidence_root: Path) -> dict:
+def _link_direct_record(evidence_root: Path, *, configuration: str) -> dict:
     """The sealed direct link group readout record (one supported schema)."""
 
+    collection = evidence.collection(evidence_root)
+    expected_assembly = (collection.get("capture") or {}).get("collected_document")
+    _require(
+        isinstance(expected_assembly, str) and bool(expected_assembly),
+        "The capture collection carries no collected document identity",
+    )
     try:
         payload = evidence.link_group_mass_properties(evidence_root)
     except (OSError, PipelineError) as error:
@@ -364,6 +370,14 @@ def _link_direct_record(evidence_root: Path) -> dict:
         "The link group mass record schema changed",
     )
     _require(payload.get("used_api") == LINK_DIRECT_USED_API, "The link group mass record API changed")
+    _require(
+        payload.get("assembly") == expected_assembly,
+        "The link group mass record assembly differs from the collected capture document",
+    )
+    _require(
+        payload.get("configuration") == configuration,
+        "The link group mass record configuration differs from the capture identity",
+    )
     _require(
         payload.get("selection_rule") == LINK_DIRECT_SELECTION_RULE,
         "The link group mass record selection rule changed",
@@ -1073,7 +1087,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     direct: dict = {"record": None}
 
     def direct_record():
-        direct["record"] = _link_direct_record(root)
+        direct["record"] = _link_direct_record(root, configuration=str(source.get("configuration") or ""))
         bodies = {str(body["name"]) for body in source["bodies"]}
         _require(
             set(direct["record"]["links"]) == bodies,

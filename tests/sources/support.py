@@ -587,6 +587,11 @@ class FixtureCadBackend(CadBackend):
         for body, names in override.items():
             if str(body) in links:
                 links[str(body)]["selection"] = [str(name) for name in names]
+        if getattr(self, "link_group_payload_nonfinite", False):
+            links["base_link"]["reads"][0]["inertia_values_about_origin_api"] = {
+                "error": "fixture",
+                "values": [float("nan")] * 9,
+            }
         return {
             "assembly": str(self.scene_document_override or path),
             "configuration": str(getattr(self, "configuration_name", "Default")),
@@ -661,7 +666,7 @@ def write_link_group_mass_record(bundle: Path, model: dict, source: dict) -> Non
     links = {str(link["name"]): link for link in model.get("links", [])}
     payload = {
         "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
-        "assembly": raw.get("source_document") or raw.get("document"),
+        "assembly": raw.get("document") or raw.get("source_document"),
         "configuration": str(source.get("configuration") or "Default"),
         "used_api": "IMassProperty2 (SelectedItems = component set)",
         "selection_rule": "top_most_providers+uncovered_leaves",
@@ -725,7 +730,7 @@ def write_link_group_mass_record_from_recombination(bundle: Path, source: dict) 
     effective = oracle.effective_math_map(masses, raw)
     payload = {
         "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
-        "assembly": raw.get("source_document") or raw.get("document"),
+        "assembly": raw.get("document") or raw.get("source_document"),
         "configuration": str(source.get("configuration") or "Default"),
         "used_api": "IMassProperty2 (SelectedItems = component set)",
         "selection_rule": "top_most_providers+uncovered_leaves",
