@@ -67,8 +67,15 @@ def _run_scenario(root: Path) -> dict:
         principal="portal",
         target_hardware="nd_fixture",
         main_assembly=MAIN,
+        configuration={"purpose": "engineering"},
         dispatch={"stage": "freeze", "operation_key": f"{RUN}/dispatch:0", "params_digest": "a" * 64},
-        baseline={"platform_config_digest": "b" * 64},
+        baseline={
+            "platform_config_digest": "b" * 64,
+            "handoff_sha256": handoff,
+            "files": len(upload),
+            "bytes": sum((native_root / name).stat().st_size for name in upload),
+            "folder": native_root.name,
+        },
     )
     freeze_request_evidence(
         paths.run_dir,
@@ -95,6 +102,7 @@ def _run_scenario(root: Path) -> dict:
                 request_id="independent-real-roundtrip",
                 intake=native_root,
                 upload_files=upload,
+                main_assembly=MAIN,
                 config_digest="b" * 64,
             )
             report["calls"].append("DAG._register_freeze_stage")

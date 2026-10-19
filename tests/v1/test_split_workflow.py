@@ -313,7 +313,14 @@ class SplitWorkflowTests(unittest.TestCase):
             patch.object(
                 module,
                 "_platform_binding",
-                return_value=(SimpleNamespace(append_event=lambda *args, **kwargs: None), Path("/nonexistent")),
+                return_value=(
+                    SimpleNamespace(
+                        append_event=lambda *args, **kwargs: None,
+                        stage_records=lambda _run_id: {},
+                        confirm_stage=lambda **_payload: None,
+                    ),
+                    Path("/nonexistent"),
+                ),
             ),
         ):
             verify = module.dag.get_task("verify").python_callable
