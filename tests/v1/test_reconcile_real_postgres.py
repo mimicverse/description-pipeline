@@ -800,6 +800,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                     state="failed",
                 )
             )
+            session.flush()
             session.execute(
                 TaskInstance.__table__.insert().values(
                     dag_id=DAG_ID,
@@ -912,6 +913,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                     state="success",
                 )
             )
+            session.flush()
             session.execute(
                 TaskInstance.__table__.insert().values(
                     dag_id=DAG_ID,
