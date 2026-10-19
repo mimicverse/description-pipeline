@@ -58,6 +58,22 @@ class RecoveryTests(unittest.TestCase):
         restart = start_plan(job(), "freeze", probe=ALL_OK, tool="changed")
         self.assertTrue(restart["accepted"], restart)
 
+    def test_windows_tool_change_names_the_linux_admission_and_no_restart_stage(self) -> None:
+        for stage in ("discover", "capture"):
+            with self.subTest(stage=stage):
+                plan = start_plan(
+                    job(),
+                    stage,
+                    probe=ALL_OK,
+                    tool="changed",
+                    host_scope=("discover", "capture"),
+                )
+                self.assertFalse(plan["accepted"])
+                self.assertEqual(plan["reason"], "tool_changed")
+                self.assertIsNone(plan["earliest_required"])
+                self.assertIn("start a new Linux admission from Freeze inputs", plan["message"])
+                self.assertIn("Windows cannot rerun Freeze", plan["message"])
+
     def test_changed_or_absent_source_requires_a_fresh_upload(self) -> None:
         for source in ("changed", "absent"):
             for stage in STAGE_IDS:

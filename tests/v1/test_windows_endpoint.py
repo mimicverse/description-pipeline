@@ -13,10 +13,11 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from description_pipeline.io import PipelineError, write_json
 from description_pipeline.orchestration.windows import Jobs, RequestError, handler, read_config
-from .endpoint_support import MAIN, TOOL, EndpointFixture
+from .endpoint_support import MAIN, PART, TOOL, EndpointFixture
 
 
 class _DelayedWorkerMutex:
@@ -65,6 +66,7 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual(calls[0]["main_assembly"], MAIN)
         self.assertEqual(set(finished["capture_archive"]), {"name", "sha256", "size", "manifest_sha256"})
+        self.assertNotIn("freeze", {event.get("stage") for event in finished["events"]})
         # The operator request binding stays exactly as submitted.
         self.assertEqual(request, finished["request"])
         self.assertEqual(MAIN, finished["main_assembly"])
@@ -80,6 +82,63 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual("native_complete", finished["status"], finished.get("error"))
         self.assertNotIn("repository_slug", finished)
         self.assertNotIn("repository_base", finished)
+
+    def test_native_selection_failure_is_recorded_in_discover(self):
+        from description_pipeline.sources.solidworks.selection import SelectionError
+
+        class RefusingReader:
+            def observe(self, stage, main, files):
+                raise SelectionError(
+                    "selection_open_errors",
+                    "the staged main opened with CAD-reported errors",
+                    open_status={"errors": 2, "warnings": 1, "already_open": False, "open_exception": None},
+                    problems=[{"code": "selection_open_errors", "document": MAIN}],
+                )
+
+        jobs = self.jobs(selection_reader=lambda: RefusingReader())
+        request = self.request()
+        jobs.create(request)
+        finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("failed", finished["status"])
+        self.assertEqual("selection_open_errors", finished["error_code"])
+        self.assertEqual("discover", finished["events"][-1]["stage"])
+        self.assertEqual("failed", finished["events"][-1]["state"])
+
+    def test_pre_selection_tool_identity_failure_is_recorded_in_discover(self):
+        jobs = self.jobs(selection_reader=lambda: self.fail("selection must not start after tool drift"))
+        request = self.request()
+        jobs.create(request)
+        with jobs.mutex:
+            jobs.jobs[request["run_id"]]["native_tool"] = {
+                **jobs.jobs[request["run_id"]]["native_tool"],
+                "source_sha256": "f" * 64,
+            }
+            jobs._save(jobs.jobs[request["run_id"]])
+        jobs.submit_files(request["run_id"], self.batch_zip())
+        finished = self.await_terminal(jobs, request["run_id"])
+        self.assertEqual("failed", finished["status"])
+        self.assertEqual("discover", finished["events"][-1]["stage"])
+        self.assertNotIn("freeze", {event.get("stage") for event in finished["events"]})
+
+    def test_source_change_after_selection_fails_in_discover_without_a_windows_freeze_stage(self):
+        from description_pipeline.orchestration.selection_transport import StagedSelection
+
+        original = StagedSelection.seal_closure
+
+        def seal_then_change(session, evidence):
+            manifest = original(session, evidence)
+            (session.stage / PART).write_bytes(b"changed-after-selection")
+            return manifest
+
+        jobs = self.jobs(runner=lambda *args, **kwargs: self.fail("native capture must not start"))
+        request = self.request()
+        jobs.create(request)
+        with patch.object(StagedSelection, "seal_closure", autospec=True, side_effect=seal_then_change):
+            finished = self.run_to_terminal(jobs, request["run_id"])
+        self.assertEqual("failed", finished["status"])
+        self.assertIn("Selected source digest changed after native closure resolution", finished["error"])
+        self.assertEqual("discover", finished["events"][-1]["stage"])
+        self.assertNotIn("freeze", {event.get("stage") for event in finished["events"]})
 
     def test_blocking_native_reader_keeps_the_run_pollable(self):
         started, release = threading.Event(), threading.Event()
@@ -99,6 +158,14 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         running = jobs.snapshot(request["run_id"])
         self.assertEqual("running", running["status"])
         self.assertEqual("sealed", running["selection"]["state"])
+        discover_running = [
+            event
+            for event in running["events"]
+            if event.get("stage") == "discover"
+            and event.get("state") == "running"
+            and "check" not in event
+        ]
+        self.assertEqual(len(discover_running), 1)
         release.set()
         self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
         self.complete_definition(jobs, request["run_id"])
@@ -270,7 +337,11 @@ class EndpointTests(EndpointFixture, unittest.TestCase):
         for request in requests:
             jobs.create(request)
         for request in requests:
-            self.stage_and_seal(jobs, request["run_id"])
+            self.stage_and_seal(
+                jobs,
+                request["run_id"],
+                statuses={"running", "awaiting_definition"},
+            )
             self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
             self.complete_definition(jobs, request["run_id"])
         for request in requests:

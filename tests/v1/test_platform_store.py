@@ -2769,6 +2769,318 @@ class OrphanReconcileTests(unittest.TestCase):
         self.assertEqual(self._snapshot(), before)
 
 
+BOUND_DISCOVER_RUN = "3324bcb0-085a-5f77-8edc-a4c1be2f1a5a"
+BOUND_DISCOVER_DAG_RUN = "portal-20261019T063230-88dee231"
+DAG_ID = "solidworks_to_urdf"
+
+
+class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
+    """The one bound-native reported-freeze/actual-discover recovery shape."""
+
+    def setUp(self) -> None:
+        import uuid
+
+        from description_pipeline.delivery import BUNDLE_SCHEMA
+        from description_pipeline.io import read_data
+        from description_pipeline.orchestration.airflow_client import native_run_id
+        from tests.v1.test_platform_store import build_sealed_delivery
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="bound-native-discover-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.world = FakeWorld()
+        self.run_id = BOUND_DISCOVER_RUN
+        self.dag_run_id = BOUND_DISCOVER_DAG_RUN
+        self.native_run = native_run_id(self.dag_run_id)
+        self.sealed_root = self.tmp / self.run_id / "freeze"
+        subject, artifacts, self.upload_sha, _native_handoff = build_sealed_delivery(self.sealed_root)
+        index = read_data(self.sealed_root / "input" / "handoff.json")
+        self.upload_files = dict(index["package_files"])
+        self.main_assembly = "cad/cad/robot.SLDASM"
+        self.store = PlatformStore(
+            self.world.connect,
+            sealed=lambda uri: self.tmp / uri.removeprefix("store://sealed/"),
+        )
+        self.store.admit_run(
+            request_id=f"portal-{self.dag_run_id}",
+            run_id=self.run_id,
+            principal="portal",
+            target_hardware="m3.0",
+            main_assembly=self.main_assembly,
+            configuration={"purpose": "inspection_preview"},
+            baseline={
+                "handoff_sha256": self.upload_sha,
+                "files": len(self.upload_files),
+                "bytes": sum((self.sealed_root / "input" / name).stat().st_size for name in self.upload_files),
+                "folder": "M3.0.3_20261016",
+            },
+            dispatch={
+                "stage": "freeze",
+                "operation_key": f"portal-{self.dag_run_id}/freeze:0",
+                "params_digest": "f" * 64,
+                "dag_id": DAG_ID,
+                "dag_run_id": self.dag_run_id,
+                "task_id": "freeze",
+                "map_index": -1,
+            },
+        )
+        self.store.start_run(self.run_id)
+        freeze_receipt = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": self.run_id,
+            "stage": "freeze",
+            "state": "frozen",
+            "passed": False,
+            "handoff_sha256": self.upload_sha,
+            "subject_sha256": subject,
+            "tool": read_data(self.sealed_root / "tool.json"),
+            "artifacts": artifacts,
+        }
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="freeze",
+            state="completed",
+            receipt=freeze_receipt,
+            checkpoint_uri=f"store://sealed/{self.run_id}/freeze",
+        )
+        self.native_id = str(uuid.uuid4())
+        self.native_key = f"{self.run_id}/native:0"
+        self.world.operations[self.native_key] = (
+            self.native_id,
+            "running",
+            self.native_key,
+            "e" * 64,
+            self.run_id,
+            "discover",
+            "native",
+        )
+        self.world.operation_bindings[self.native_id] = (DAG_ID, self.dag_run_id, "discover", -1)
+        self.world.task_instances[(DAG_ID, "freeze", self.dag_run_id, -1)] = "success"
+        self.world.task_try_numbers[(DAG_ID, "freeze", self.dag_run_id, -1)] = 1
+        self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "failed"
+        self.world.task_try_numbers[(DAG_ID, "discover", self.dag_run_id, -1)] = 1
+        for task in ("capture", "generate", "verify", "publish"):
+            self.world.task_instances[(DAG_ID, task, self.dag_run_id, -1)] = "upstream_failed"
+            self.world.task_try_numbers[(DAG_ID, task, self.dag_run_id, -1)] = 0
+        self.world.dag_runs[(DAG_ID, self.dag_run_id)] = "failed"
+        self.document = self._document()
+        self.log = self.tmp / "windows-job.json"
+        self._write_document(self.document)
+
+    def _document(self) -> dict:
+        return {
+            "schema_version": "solidworks-to-urdf.job/v1",
+            "pipeline_id": PIPELINE_ID,
+            "run_id": self.native_run,
+            "request": {
+                "run_id": self.native_run,
+                "main_assembly": self.main_assembly,
+                "upload_sha256": self.upload_sha,
+                "upload_files": dict(self.upload_files),
+            },
+            "selection": {
+                "state": "reading",
+                "staged_files": dict(self.upload_files),
+                "upload_sha256": self.upload_sha,
+            },
+            "status": "failed",
+            "error": "SelectionError: the staged main opened with CAD-reported errors",
+            "error_code": "selection_open_errors",
+            "detail": {
+                "open_status": {"errors": 2, "warnings": 1},
+                "problems": [
+                    {
+                        "code": "selection_open_errors",
+                        "document": self.main_assembly,
+                        "message": "the staged main opened with CAD-reported errors",
+                    }
+                ],
+            },
+            "events": [
+                {
+                    "stage": "freeze",
+                    "state": "failed",
+                    "error": "SelectionError: the staged main opened with CAD-reported errors",
+                }
+            ],
+        }
+
+    def _write_document(self, document: dict) -> None:
+        self.log.write_text(json.dumps(document, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _set_platform_main(self, main_assembly: str) -> None:
+        request_id = f"portal-{self.dag_run_id}"
+        for index, row in enumerate(self.world.requests):
+            if row[0] == request_id:
+                self.world.requests[index] = (*row[:3], main_assembly, *row[4:])
+                return
+        raise AssertionError("test request row is missing")
+
+    def _reconcile(self) -> dict:
+        return {
+            "operation_key": f"operatorctl-reconcile:{self.run_id}:discover:failed",
+            "params_digest": digest(
+                {
+                    "outcome": "failed",
+                    "evidence": [str(self.log)],
+                    "operation": self.native_id,
+                    "task": "discover",
+                    "map_index": -1,
+                }
+            ),
+            "evidence": [str(self.log)],
+            "binding": {"operation_id": self.native_id, "task_id": "discover", "map_index": -1},
+            "native_receipt": {"path": str(self.log), "native_run_id": self.native_run},
+            "reported_stage": "freeze",
+        }
+
+    def _apply(self) -> None:
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self._reconcile(),
+        )
+
+    def test_bound_native_discover_closes_once_and_replays_without_writes(self) -> None:
+        self._apply()
+        stages = self.store.stage_records(self.run_id)
+        self.assertEqual(stages["freeze"]["state"], "completed")
+        self.assertEqual(stages["discover"]["state"], "failed")
+        self.assertEqual(
+            [stages[task]["state"] for task in ("capture", "generate", "verify", "publish")],
+            ["blocked", "blocked", "blocked", "blocked"],
+        )
+        receipt = stages["discover"]["receipt"]
+        self.assertEqual(receipt["reported_stage"], "freeze")
+        self.assertEqual(receipt["actual_stage"], "discover")
+        self.assertEqual(receipt["native_run_id"], self.native_run)
+        self.assertEqual(receipt["native_receipt_sha256"], file_digest(self.log))
+        self.assertEqual(self.store.run_record(self.run_id)["state"], "failed")
+        self.assertEqual(self.world.operations[self.native_key][1], "failed")
+        reconcile_row = self.world.operations[f"operatorctl-reconcile:{self.run_id}:discover:failed"]
+        self.assertEqual(reconcile_row[1], "succeeded")
+        binding = [
+            json.loads(payload) if isinstance(payload, str) else payload
+            for _run_id, _seq, kind, _stage, _operation_id, payload in self.world.events
+            if kind == "binding"
+        ]
+        self.assertEqual(len(binding), 1)
+        self.assertEqual(binding[0]["reported_stage"], "freeze")
+        self.assertEqual(binding[0]["actual_stage"], "discover")
+        self.assertEqual(binding[0]["task_id"], "discover")
+        self.assertEqual(binding[0]["map_index"], -1)
+
+        before = self.world.snapshot_state()
+        self._apply()
+        self.assertEqual(self.world.snapshot_state(), before, "the identical recovery is a no-op")
+
+    def test_wrong_selection_or_airflow_fact_leaves_zero_writes(self) -> None:
+        variants = []
+        for name, mutate in (
+            ("selection_not_reading", lambda d: d["selection"].__setitem__("state", "sealed")),
+            ("wrong_error_code", lambda d: d.__setitem__("error_code", "other_error")),
+            (
+                "wrong_open_counts",
+                lambda d: d["detail"]["open_status"].__setitem__("errors", 0),
+            ),
+            (
+                "wrong_main",
+                lambda d: d["request"].__setitem__("main_assembly", "other.SLDASM"),
+            ),
+        ):
+            variants.append((name, mutate, "document"))
+        variants.append(
+            (
+                "wrong_native_task",
+                lambda: self.world.operation_bindings.__setitem__(
+                    self.native_id, (DAG_ID, self.dag_run_id, "capture", -1)
+                ),
+                "world",
+            )
+        )
+        variants.append(
+            (
+                "wrong_upload",
+                lambda d: (
+                    d["request"].__setitem__("upload_sha256", "f" * 64),
+                    d["selection"].__setitem__("upload_sha256", "f" * 64),
+                ),
+                "document",
+            )
+        )
+        variants.append(
+            (
+                "dag_run_success",
+                lambda: self.world.dag_runs.__setitem__((DAG_ID, self.dag_run_id), "success"),
+                "world",
+            )
+        )
+        variants.append(
+            (
+                "successor_executed",
+                lambda: self.world.task_instances.__setitem__(
+                    (DAG_ID, "capture", self.dag_run_id, -1), "success"
+                ),
+                "world",
+            )
+        )
+        variants.append(
+            (
+                "wrong_operation_uuid",
+                lambda: setattr(self, "native_id", "deadbeef-0000-4000-8000-000000000000"),
+                "world",
+            )
+        )
+        variants.append(
+            (
+                "main_not_in_upload_files",
+                lambda: self._set_platform_main("missing.SLDASM"),
+                "missing_main",
+            )
+        )
+        variants.append(
+            (
+                "discover_task_green",
+                lambda: self.world.task_instances.__setitem__(
+                    (DAG_ID, "discover", self.dag_run_id, -1), "success"
+                ),
+                "world",
+            )
+        )
+        variants.append(
+            (
+                "sealed_freeze_missing",
+                lambda: shutil.rmtree(self.sealed_root),
+                "side_effect",
+            )
+        )
+        variants.append(
+            (
+                "sealed_freeze_corrupt",
+                lambda: (self.sealed_root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(b"corrupt"),
+                "side_effect",
+            )
+        )
+        for name, mutate, kind in variants:
+            with self.subTest(name=name):
+                self.setUp()
+                document = json.loads(json.dumps(self.document))
+                if kind == "document":
+                    mutate(document)
+                    self._write_document(document)
+                elif kind == "missing_main":
+                    mutate()
+                    document["request"]["main_assembly"] = "missing.SLDASM"
+                    self._write_document(document)
+                else:
+                    mutate()
+                before = self.world.snapshot_state()
+                with self.assertRaises(PlatformStoreError):
+                    self._apply()
+                self.assertEqual(self.world.snapshot_state(), before, f"{name} changed state")
+
+
 PREDISPATCH_RUN = "9c1f5e42-3b7d-4a8e-b0c2-5d6f7a8b9c0d"
 
 

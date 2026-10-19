@@ -47,6 +47,12 @@ REASON_MESSAGES = {
         "cannot be mixed; restart from Freeze inputs"
     ),
 }
+HOST_SCOPE_MESSAGES = {
+    "tool_changed": (
+        "The tool release changed or cannot be verified; start a new Linux admission "
+        "from Freeze inputs; Windows cannot rerun Freeze"
+    ),
+}
 
 
 def stage_name(stage: object) -> str:
@@ -66,13 +72,22 @@ def _stage_completed(job: dict, stage_id: str) -> bool:
     return True
 
 
-def _prerequisite_failure(requested: str, job: dict, probe: dict[str, str], tool: str) -> tuple[str, str | None] | None:
+def _prerequisite_failure(
+    requested: str,
+    job: dict,
+    probe: dict[str, str],
+    tool: str,
+    *,
+    host_scope: tuple[str, ...] | None,
+) -> tuple[str, str | None] | None:
     """(reason, earliest_required) blocking ``requested``; None when it may start."""
     if probe.get("source") != "ok":
         return "source_changed", None
     if tool != "ok" and requested != "freeze":
-        return "tool_changed", "freeze"
+        return "tool_changed", "freeze" if host_scope is None else None
     for checkpoint in PREREQUISITES.get(requested, ()):
+        if host_scope is not None and checkpoint not in host_scope:
+            continue
         # Validate strictly in prerequisite order: completion, retained bytes and
         # (only when the discovery binding is reused) its dependency snapshot.
         # Any refusal therefore names a checkpoint whose own restart is accepted.
@@ -88,7 +103,14 @@ def _prerequisite_failure(requested: str, job: dict, probe: dict[str, str], tool
     return None
 
 
-def start_plan(job: dict, requested: str, *, probe: dict[str, str], tool: str) -> dict:
+def start_plan(
+    job: dict,
+    requested: str,
+    *,
+    probe: dict[str, str],
+    tool: str,
+    host_scope: tuple[str, ...] | None = None,
+) -> dict:
     """Whether one linked run may start at ``requested``; exact earliest step on refusal."""
     if requested not in STAGE_IDS:
         return {
@@ -108,10 +130,12 @@ def start_plan(job: dict, requested: str, *, probe: dict[str, str], tool: str) -
             "start_stage": None,
             "stage_name": None,
         }
-    failure = _prerequisite_failure(requested, job, probe, tool)
+    failure = _prerequisite_failure(requested, job, probe, tool, host_scope=host_scope)
     if failure is not None:
         reason, earliest = failure
-        text = REASON_MESSAGES.get(reason)
+        text = (HOST_SCOPE_MESSAGES if host_scope is not None else REASON_MESSAGES).get(reason)
+        if text is None:
+            text = REASON_MESSAGES.get(reason)
         if text is None:
             text = f"Upstream checkpoint {stage_name(earliest)} cannot be reused; restart from that step"
         return {
@@ -132,11 +156,17 @@ def start_plan(job: dict, requested: str, *, probe: dict[str, str], tool: str) -
     }
 
 
-def stage_reruns(job: dict, *, probe: dict[str, str], tool: str) -> list[dict]:
+def stage_reruns(
+    job: dict,
+    *,
+    probe: dict[str, str],
+    tool: str,
+    host_scope: tuple[str, ...] | None = None,
+) -> list[dict]:
     """Per-stage availability rows for the run detail (all six canonical stages)."""
     rows = []
     for stage_id in STAGE_IDS:
-        plan = start_plan(job, stage_id, probe=probe, tool=tool)
+        plan = start_plan(job, stage_id, probe=probe, tool=tool, host_scope=host_scope)
         index = STAGE_IDS.index(stage_id)
         rows.append(
             {

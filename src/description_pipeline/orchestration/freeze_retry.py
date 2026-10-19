@@ -198,15 +198,15 @@ def resolve_freeze_retry_identity(
         raise FreezeRetryRefusal(
             "not_ready", "The original run is not registered yet and cannot be rerun from this step"
         )
-    if record.get("state") != "failed":
+    if record.get("state") not in {"failed", "succeeded", "cancelled"}:
         raise FreezeRetryRefusal(
-            "not_ready", "The original run is not in a terminal failure state and cannot be rerun from this step"
+            "not_ready", "The original run is not terminal and cannot provide sealed originals yet"
         )
     stages = platform.stage_records(parent_run_id)
     freeze_row = stages.get("freeze") if isinstance(stages, dict) else None
-    if not (isinstance(freeze_row, dict) and freeze_row.get("state") == "failed"):
+    if not (isinstance(freeze_row, dict) and freeze_row.get("state") in {"failed", "completed"}):
         raise FreezeRetryRefusal(
-            "linux_owned", "The run has no recorded freeze failure and cannot restart from Freeze inputs"
+            "linux_owned", "The run has no registered freeze to provide sealed originals"
         )
     request_id = record.get("request_id")
     request = platform.request_record(request_id) if isinstance(request_id, str) else None
@@ -220,6 +220,10 @@ def resolve_freeze_retry_identity(
     given = _safe_intake(str(intake_path), intake_root, context_text="originals directory supplied by this trigger")
     stated_bytes: int | None = None
     if baseline is None:
+        if freeze_row.get("state") != "failed":
+            raise _identity_refusal(
+                "The completed freeze has no registered upload baseline; a new request cannot be created"
+            )
         receipt = freeze_row.get("receipt")
         failure = receipt.get("airflow_failure") if isinstance(receipt, dict) else None
         evidence_path = failure.get("path") if isinstance(failure, dict) else None

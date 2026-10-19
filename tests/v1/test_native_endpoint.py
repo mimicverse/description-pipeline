@@ -32,7 +32,7 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
         jobs = self.jobs(lambda *args, **kwargs: {"passed": False, "error": "expected"})
         request = self.request()
         jobs.create(request)
-        sealed = self.stage_and_seal(jobs, request["run_id"])
+        sealed = self.stage_and_seal(jobs, request["run_id"], statuses={"running", "awaiting_definition"})
         observed = [entry for entry in self.reader_log if entry[0] == "observe"]
         self.assertEqual(1, len(observed))
         self.assertEqual(MAIN, observed[0][3])
@@ -58,7 +58,11 @@ class NativeEndpointTests(EndpointFixture, unittest.TestCase):
                 )
                 request = self.request()
                 jobs.create(request)
-                self.stage_and_seal(jobs, request["run_id"])
+                self.stage_and_seal(
+                    jobs,
+                    request["run_id"],
+                    statuses={"running", "awaiting_definition"},
+                )
                 finished = self.wait_state_any_status(jobs, request["run_id"], {"awaiting_definition"})
                 if finished["status"] != "failed":
                     if mutation == "staged":

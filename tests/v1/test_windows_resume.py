@@ -10,10 +10,11 @@ import uuid
 from pathlib import Path
 
 from description_pipeline.io import PipelineError, write_json
-from description_pipeline.orchestration.windows import NATIVE_STAGES, Jobs, RequestError
+from description_pipeline.stages import WINDOWS_STAGES
+from description_pipeline.orchestration.windows import Jobs, RequestError
 from .endpoint_support import PART, EndpointFixture
 
-LINUX_STAGES = ("generate", "verify", "publish")
+LINUX_STAGES = ("freeze", "generate", "verify", "publish")
 
 
 class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
@@ -64,12 +65,13 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         self.assertNotIn("resume_from", calls[0])
         self.assertNotIn("seed_dir", calls[0])
         self.assertEqual(calls[0]["package"], Path(parent["prepared_dir"]))
-        self.assertEqual({event["stage"] for event in inherited}, {"freeze", "discover"})
+        self.assertEqual({event["stage"] for event in inherited}, {"discover"})
 
     def test_linux_owned_stages_are_never_rerun_on_the_native_host(self) -> None:
         jobs, parent = self.native_parent()
         rows = {row["stage"]: row for row in jobs.plan(parent["run_id"])["stage_reruns"]}
-        for stage in NATIVE_STAGES:
+        self.assertEqual(WINDOWS_STAGES, ("discover", "capture"))
+        for stage in WINDOWS_STAGES:
             self.assertTrue(rows[stage]["eligible"], stage)
         for stage in LINUX_STAGES:
             self.assertFalse(rows[stage]["eligible"], stage)
@@ -95,7 +97,7 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
             jobs.create(self.linked_request(parent, "capture"))
         self.assertTrue(caught.exception.payload["reason"])
         earliest = caught.exception.payload["earliest_required"]
-        self.assertTrue(earliest is None or earliest in NATIVE_STAGES)
+        self.assertTrue(earliest is None or earliest in WINDOWS_STAGES)
 
     def test_second_linked_job_is_refused_while_one_is_active(self) -> None:
         jobs, parent = self.native_parent()
@@ -142,7 +144,7 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual(finished["error_code"], "main_selection_ambiguous")
         self.assertIn("ambiguous", finished["error"])
 
-    def test_unrecorded_tool_identity_allows_only_a_freeze_restart(self) -> None:
+    def test_unrecorded_tool_identity_blocks_native_reuse_and_freeze_is_linux_owned(self) -> None:
         jobs, parent = self.native_parent()
         jobs.close()
         job_path = self.config["state_root"] / "jobs" / (parent["run_id"] + ".json")
@@ -153,19 +155,17 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         rows = {row["stage"]: row for row in resumed.plan(parent["run_id"])["stage_reruns"]}
         self.assertFalse(rows["capture"]["eligible"])
         self.assertEqual(rows["capture"]["reason"], "tool_changed")
-        self.assertEqual(rows["capture"]["prerequisites"]["earliest_required"], "freeze")
-        self.assertTrue(rows["freeze"]["eligible"])
+        self.assertIsNone(rows["capture"]["prerequisites"]["earliest_required"])
+        self.assertIn("start a new Linux admission from Freeze inputs", rows["capture"]["message"])
+        self.assertIn("Windows cannot rerun Freeze", rows["capture"]["message"])
+        self.assertFalse(rows["freeze"]["eligible"])
+        self.assertEqual(rows["freeze"]["reason"], "linux_owned")
         with self.assertRaises(RequestError) as caught:
             resumed.create(self.linked_request(parent, "capture"))
         self.assertEqual(caught.exception.payload["reason"], "tool_changed")
-        accepted = self.linked_request(parent, "freeze")
-        _, created = resumed.create(accepted)
-        self.assertTrue(created)
-        state = self.wait_state_any_status(resumed, accepted["run_id"], {"awaiting_definition"})
-        if state["status"] == "awaiting_definition":
-            self.complete_definition(resumed, accepted["run_id"])
-        finished = self.await_terminal(resumed, accepted["run_id"])
-        self.assertEqual(finished["status"], "native_complete", finished.get("error"))
+        with self.assertRaises(RequestError) as rejected:
+            resumed.create(self.linked_request(parent, "freeze"))
+        self.assertEqual(rejected.exception.payload["reason"], "linux_owned")
 
     def test_stale_enqueue_state_is_reprobed_before_reuse(self) -> None:
         jobs, parent = self.native_parent()
@@ -193,18 +193,13 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         self.assertEqual(finished["status"], "failed")
         self.assertIn("restart from that step", finished["error"])
 
-    def test_queued_freeze_restart_can_complete_its_definition_exchange(self) -> None:
+    def test_freeze_restart_is_refused_on_the_native_host(self) -> None:
         jobs, parent = self.native_parent()
         request = self.linked_request(parent, "freeze")
-        with patch.object(jobs.queue, "put"):
+        with self.assertRaises(RequestError) as caught:
             jobs.create(request)
-        jobs.close()
-        resumed = self.jobs()
-        waiting = self.wait_state_any_status(resumed, request["run_id"], {"awaiting_definition"})
-        self.assertEqual(waiting["status"], "awaiting_definition", waiting.get("error"))
-        self.complete_definition(resumed, request["run_id"])
-        finished = self.await_terminal(resumed, request["run_id"])
-        self.assertEqual(finished["status"], "native_complete", finished.get("error"))
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.payload["reason"], "linux_owned")
 
     def test_restarted_queue_revalidates_its_effective_selection(self) -> None:
         jobs, parent = self.native_parent()

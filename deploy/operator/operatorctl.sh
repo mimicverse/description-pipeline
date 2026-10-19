@@ -44,7 +44,7 @@ usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
 start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
-orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N
+orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N [--reported-stage STAGE]
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2
@@ -66,6 +66,7 @@ NATIVE_RUN_ID=""
 ORPHAN_OPERATION_ID=""
 ORPHAN_TASK_ID=""
 ORPHAN_MAP_INDEX=""
+REPORTED_STAGE=""
 KEEP_ADMISSION_CLOSED=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
@@ -83,6 +84,7 @@ while [ $# -gt 0 ]; do
     --orphan-operation-id) ORPHAN_OPERATION_ID="${2:-}"; shift 2 ;;
     --orphan-task-id) ORPHAN_TASK_ID="${2:-}"; shift 2 ;;
     --orphan-map-index) ORPHAN_MAP_INDEX="${2:-}"; shift 2 ;;
+    --reported-stage) REPORTED_STAGE="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
     --keep-admission-closed) KEEP_ADMISSION_CLOSED=1; shift ;;
     *) usage ;;
@@ -2086,7 +2088,7 @@ PY
       completed|failed|cancelled) ;;
       *) die "unresolved is not a result; --outcome must be completed, failed or cancelled" ;;
     esac
-    ORPHAN_INPUTS="$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX"
+    ORPHAN_INPUTS="$NATIVE_RECEIPT$NATIVE_RUN_ID$ORPHAN_OPERATION_ID$ORPHAN_TASK_ID$ORPHAN_MAP_INDEX$REPORTED_STAGE"
     if [ -n "$ORPHAN_INPUTS" ]; then
       [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] && [ -n "$ORPHAN_OPERATION_ID" ] \
         && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
@@ -2106,7 +2108,7 @@ PY
     RECONCILE_EVIDENCE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${EVIDENCE[@]}")" \
     RECONCILE_NATIVE_RECEIPT="$NATIVE_RECEIPT" RECONCILE_NATIVE_RUN_ID="$NATIVE_RUN_ID" \
     RECONCILE_ORPHAN_OPERATION_ID="$ORPHAN_OPERATION_ID" RECONCILE_ORPHAN_TASK_ID="$ORPHAN_TASK_ID" \
-    RECONCILE_ORPHAN_MAP_INDEX="$ORPHAN_MAP_INDEX" \
+    RECONCILE_ORPHAN_MAP_INDEX="$ORPHAN_MAP_INDEX" RECONCILE_REPORTED_STAGE="$REPORTED_STAGE" \
       "$AIRFLOW_VENV/bin/python" - <<'PY' || die "reconcile refused"
 # platform-reconcile
 import json
@@ -2140,10 +2142,18 @@ if native_receipt:
     # acceptance boundary (the runtime identity's reader); this entry holds no copy of the
     # predicate and passes only the raw inputs.
 
+reported_stage = os.environ.get("RECONCILE_REPORTED_STAGE") or ""
+reconcile_frame = {
+    "outcome": outcome,
+    "evidence": evidence,
+    "binding": binding,
+}
+if reported_stage:
+    reconcile_frame["reported_stage"] = reported_stage
 reconcile = {
     "operation_key": f"operatorctl-reconcile:{run_id}:{stage}:{outcome}",
     "evidence": evidence,
-    "params_digest": io.digest({"outcome": outcome, "evidence": evidence, "binding": binding}),
+    "params_digest": io.digest(reconcile_frame),
 }
 if binding is not None:
     reconcile["binding"] = binding
@@ -2151,6 +2161,8 @@ if binding is not None:
         "path": native_receipt,
         "native_run_id": os.environ["RECONCILE_NATIVE_RUN_ID"],
     }
+    if reported_stage:
+        reconcile["reported_stage"] = reported_stage
 store = PlatformStore.from_environment()
 store.confirm_stage(
     run_id=run_id,
