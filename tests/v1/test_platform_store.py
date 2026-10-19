@@ -361,7 +361,10 @@ class FakeCursor:
                 bound = (record[5], record[6], record[1], dag_id, dag_run_id, task_id, map_index, key)
                 break
             self._rows = [bound] if bound is not None else []
-        elif normalized.startswith("UPDATE operation SET task_id = %s, map_index = %s"):
+        elif normalized.startswith(
+            "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now()"
+            " WHERE operation_id = %s AND run_id = %s AND task_id IS NULL AND map_index IS NULL"
+        ):
             task_id, map_index, operation_id, run_id = params
             updated = None
             for record in world.operations.values():
@@ -456,6 +459,65 @@ class FakeCursor:
                 world.hidden_finds -= 1
                 record = None
             self._rows = [record] if record else []
+        elif normalized.startswith(
+            "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind,"
+            " dag_id, dag_run_id, task_id, map_index FROM operation WHERE operation_key"
+        ):
+            record = world.operations.get(params[0])
+            if record is None:
+                self._rows = []
+            else:
+                binding = world.operation_bindings.get(record[0], (None, None, None, None))
+                self._rows = [(*record, *binding)]
+        elif normalized.startswith(
+            "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now() WHERE operation_key"
+        ):
+            task_id, map_index, key, run_id, dag_id, dag_run_id = params
+            record = world.operations.get(key)
+            binding = world.operation_bindings.get(record[0], (None, None, None, None)) if record else None
+            if (
+                record is not None
+                and record[4] == run_id
+                and record[6] == "dispatch"
+                and record[1] == "queued"
+                and binding == (dag_id, dag_run_id, None, None)
+            ):
+                world.operation_bindings[record[0]] = (dag_id, dag_run_id, task_id, map_index)
+                self._rows = [(record[0],)]
+            else:
+                self._rows = []
+        elif normalized.startswith(
+            "SELECT operation_id, stage, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+            " FROM operation WHERE run_id = %s AND kind = 'dispatch'"
+        ):
+            rows = []
+            for key, record in world.operations.items():
+                if record[4] != params[0] or record[6] != "dispatch":
+                    continue
+                binding = world.operation_bindings.get(record[0], (None, None, None, None))
+                rows.append((record[0], record[5], record[1], *binding, key))
+            self._rows = rows
+        elif normalized.startswith(
+            "SELECT ti.map_index, ti.state, ti.try_number, dr.state FROM task_instance ti JOIN dag_run dr"
+        ):
+            dag_id, dag_run_id, task_id = params
+            dag_state = world.dag_runs.get((dag_id, dag_run_id))
+            self._rows = [
+                (map_index, task_state, world.task_try_numbers.get((dag_id, task_id, dag_run_id, map_index)), dag_state)
+                for (row_dag, row_task, row_run, map_index), task_state in world.task_instances.items()
+                if row_dag == dag_id and row_task == task_id and row_run == dag_run_id and dag_state is not None
+            ]
+        elif normalized.startswith(
+            "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now() WHERE operation_id"
+        ):
+            task_id, map_index, operation_id, run_id = params
+            record = next((r for r in world.operations.values() if r[0] == operation_id and r[4] == run_id), None)
+            binding = world.operation_bindings.get(operation_id, (None, None, None, None))
+            if record is not None and record[6] == "dispatch" and binding[2:] == (None, None):
+                world.operation_bindings[operation_id] = (binding[0], binding[1], task_id, map_index)
+                self._rows = [(operation_id,)]
+            else:
+                self._rows = []
         elif "SELECT state, from_stage FROM run WHERE run_id = %s" in normalized:
             state = world.run_states.get(params[0])
             self._rows = [(state, world.run_from_stage.get(params[0]))] if state is not None else []
