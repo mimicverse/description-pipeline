@@ -1020,6 +1020,21 @@ class DiscoveryTests(unittest.TestCase):
             def mutate(payload, connected=connected):
                 native = self.tmp / f"native{self.serial}" / "cad/sub.SLDASM"
                 native.write_bytes(b"neutral container fixture\n")
+                files = {
+                    **payload["files"],
+                    "cad/sub.SLDASM": hashlib.sha256(native.read_bytes()).hexdigest(),
+                }
+                payload["files"] = files
+                payload["source_selection"] = sealed_selection(
+                    files,
+                    "cad/robot.SLDASM",
+                    edges={
+                        "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT", "cad/sub.SLDASM"],
+                        "cad/base.SLDPRT": [],
+                        "cad/arm.SLDPRT": [],
+                        "cad/sub.SLDASM": [],
+                    },
+                )
                 container = copy.deepcopy(payload["components"][0])
                 container.update({"name2": "sub-1", "instance_id": "sub-1", "document": "cad/sub.SLDASM"})
                 payload["components"].append(container)
@@ -2221,6 +2236,43 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertEqual(report["passed"], expected)
                 if not expected:
                     self.assertIn("discovery.configuration", [item["code"] for item in report["errors"]])
+
+    def test_verifier_separates_full_upload_and_selected_closure_handoff(self) -> None:
+        raw = record()
+        main = "cad/robot.SLDASM"
+        selected = raw["source_selection"]["files"]
+        upload = {**selected, "cad/excluded.SLDPRT": "f" * 64}
+        raw["source_selection"] = sealed_selection(
+            upload,
+            main,
+            edges={
+                main: ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+                "cad/base.SLDPRT": [],
+                "cad/arm.SLDPRT": [],
+            },
+        )
+        result, output = self._derive_pure(raw)
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+        request = json.loads((delivery / "input/request.json").read_text(encoding="utf-8"))
+        payload = json.loads((delivery / "evidence/discovery.json").read_text(encoding="utf-8"))
+        upload_sha256 = payload["raw"]["source_selection"]["upload_sha256"]
+        selected_sha256 = payload["raw"]["source_selection"]["handoff_sha256"]
+        self.assertNotEqual(upload_sha256, selected_sha256)
+        self.assertNotEqual(request["handoff_digest"], upload_sha256)
+
+        self._tamper_delivered(
+            delivery,
+            "input/request.json",
+            lambda value: value.__setitem__("handoff_digest", upload_sha256),
+        )
+        report = verify_discovery(delivery)
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertEqual(
+            json.loads((delivery / "input/request.json").read_text(encoding="utf-8"))["handoff_digest"],
+            upload_sha256,
+        )
+        self.assertEqual(payload["handoff_sha256"], selected_sha256)
 
 
     def _delivery_with_frozen_request(self, *, drop: tuple[str, ...]):

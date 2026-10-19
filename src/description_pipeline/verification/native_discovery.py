@@ -2770,11 +2770,21 @@ def verify_discovery(package: Path) -> dict:
             "the sealed request names another main assembly",
             {"field": "main_assembly"},
         )
+        raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+        sealed_selection = (
+            raw.get("source_selection") if isinstance(raw.get("source_selection"), dict) else {}
+        )
         _require(
-            request["handoff_digest"] == payload.get("handoff_sha256"),
+            request["handoff_digest"] == sealed_selection.get("upload_sha256"),
             "discovery.request",
-            "the sealed request was not formed against this frozen upload",
+            "the sealed request was not formed against the full frozen upload",
             {"field": "handoff_digest"},
+        )
+        _require(
+            payload.get("handoff_sha256") == sealed_selection.get("handoff_sha256"),
+            "discovery.request",
+            "the native discovery record is not bound to the selected closure handoff",
+            {"field": "handoff_sha256"},
         )
         state["request"] = request
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
