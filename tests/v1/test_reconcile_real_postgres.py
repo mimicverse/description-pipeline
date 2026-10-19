@@ -483,6 +483,14 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             "binding": binding,
             "native_receipt": {"path": str(self.log), "native_run_id": self.run_id},
         }
+        self.store.settle_native_owner_failure(
+            run_id=self.run_id,
+            operation_key=self.native_operation_key,
+            receipt_path=self.log,
+            native_run_id=self.run_id,
+            evidence=[str(self.log)],
+            reported_stage="discover",
+        )
 
     def _bound_rows(self) -> dict:
         import psycopg2
