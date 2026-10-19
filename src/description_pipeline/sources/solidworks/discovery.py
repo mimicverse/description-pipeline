@@ -221,26 +221,46 @@ def _authored_multiline_text(value: Any) -> bool:
 
 
 def _saved_configuration_observed(record: dict, name: str) -> bool:
-    """The delivery configuration must be observed as the saved active one.
+    """Prove the delivery configuration from immutable bytes and native state.
 
-    A recorded name (the dp property or the saved-name string) is not evidence
-    by itself: the native document state must show the document saved
-    (``save_flag`` strictly false, never unknown) and the active configuration
-    matching on both the before and the after reading.
+    The sealed source-selection inventory is the pre-read authority; the native
+    record's file inventory is the post-read authority.  Both must agree, and
+    both document-state readings must come from a read-only document whose
+    active configuration is the requested name.  ``NeedsRebuild2`` is the
+    documented rebuild-status enum, not a boolean: the initial reading may be
+    non-frozen (1) or frozen-feature dirty (2), but the final reading must be
+    fully rebuilt (0).  ``GetSaveFlag`` is diagnostic only because benign
+    native reads may make an in-memory document dirty.
     """
 
     state = record.get("document_state")
     if not isinstance(state, dict):
         return False
+    selection = record.get("source_selection")
+    files = record.get("files")
+    if (
+        not isinstance(selection, dict)
+        or not isinstance(files, dict)
+        or selection.get("files") != files
+    ):
+        return False
     readings = (state.get("before"), state.get("after"))
     if not all(isinstance(reading, dict) for reading in readings):
         return False
-    return all(
-        reading.get("save_flag") is False
-        and isinstance(reading.get("configuration"), str)
-        and reading["configuration"].strip() == name
-        for reading in readings
-    )
+
+    def proven(reading: dict) -> bool:
+        rebuild = reading.get("needs_rebuild2_value")
+        return (
+            reading.get("read_only") is True
+            and reading.get("configuration_needs_rebuild") is False
+            and isinstance(reading.get("configuration"), str)
+            and reading["configuration"].strip() == name
+            and type(rebuild) is int
+            and rebuild in {0, 1, 2}
+        )
+
+    before, after = readings
+    return proven(before) and proven(after) and after["needs_rebuild2_value"] == 0
 
 
 def _snake(value: Any) -> str | None:
@@ -3918,8 +3938,8 @@ def _identity(
             _finding(
                 "discovery.configuration_unproven",
                 "assembly",
-                "the delivery configuration is not observed as the saved active configuration; "
-                "a recorded name alone is not evidence",
+                "the delivery configuration and its read-only rebuild state are not proven "
+                "by the native before/after readings",
                 {"configuration": delivery, "document_state": record.get("document_state")},
             )
         )
@@ -4205,6 +4225,13 @@ def derive_native_package(
             raise PipelineError("an explicit configuration cannot be bound: the record carries no usable configuration")
         if str(configuration) != str(recorded_configuration):
             raise PipelineError("the requested configuration does not match the recorded delivery configuration")
+    source_selection = record.get("source_selection") if isinstance(record.get("source_selection"), dict) else {}
+    upload_digest = source_selection.get("upload_sha256")
+    upload_handoff_digest = (
+        upload_digest
+        if _SHA256_HEX.fullmatch(str(upload_digest or ""))
+        else None
+    )
     findings: list[dict] = []
     components = record.get("components")
     if not isinstance(components, list):
@@ -4465,7 +4492,7 @@ def derive_native_package(
             ],
         },
     )
-    source_record = _source_record(identity, identity_sources, handoff_sha256, records)
+    source_record = _source_record(identity, identity_sources, upload_handoff_digest, records)
     if source_record is not None:
         write_json(output / SOURCE_FILE, source_record)
     return PreparedPackage(
@@ -4760,7 +4787,12 @@ def source_definition(
     return source
 
 
-def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, records: list[dict]) -> dict | None:
+def _source_record(
+    identity: dict,
+    identity_sources: dict,
+    handoff_digest: str | None,
+    records: list[dict],
+) -> dict | None:
     """The archived content identity (IF-06) that replaces the retired generated definition documents.
 
     Written only once the content identity is nameable - hardware, main assembly
@@ -4773,7 +4805,7 @@ def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, 
     hardware = identity.get("hardware_id")
     assembly = identity.get("main_assembly")
     configuration = identity.get("delivery_configuration")
-    if not (_text(hardware) and _text(assembly) and _text(configuration)):
+    if not (_text(hardware) and _text(assembly) and _text(configuration) and _text(handoff_digest)):
         return None
     references: dict[str, str] = {}
     for entry in records:
@@ -4783,7 +4815,7 @@ def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, 
             references[reference] = checksum
     content = {
         "kind": "source-revision",
-        "handoff_digest": handoff_sha256,
+        "handoff_digest": str(handoff_digest),
         "main_assembly": str(assembly),
         "configuration": str(configuration),
         "hardware_id": str(hardware),

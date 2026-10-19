@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from description_pipeline.io import digest
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
 from description_pipeline.verification.native_discovery import DISCOVERY_SCHEMA, verify_discovery
 
@@ -252,24 +253,50 @@ def relocated_carrier(owner_sha, np_sha):
 class ImportedSourceTests(unittest.TestCase):
     def _package(self, directory, contents, components, *, raw_files=None, extra_raw=None):
         package = Path(directory) / "delivery"
+        contents = dict(contents)
+        extra_raw = dict(extra_raw or {})
+        explicit_selection = extra_raw.get("source_selection")
+        if raw_files is None and isinstance(explicit_selection, dict):
+            raw_files = dict(explicit_selection.get("files") or {})
+        elif raw_files is None:
+            main = next((name for name in contents if name.lower().endswith(".sldasm")), None)
+            if main is None:
+                main = "robot.SLDASM"
+                contents[main] = b"synthetic frozen robot assembly"
         native = {}
         originals = {}
         for name, data in contents.items():
             native[name] = hashlib.sha256(data).hexdigest()
             originals[name] = data.decode("utf-8")
+        raw_inventory = dict(native if raw_files is None else raw_files)
+        source_selection = explicit_selection
+        if not isinstance(source_selection, dict) and raw_inventory:
+            main = next((name for name in raw_inventory if name.lower().endswith(".sldasm")), None)
+            if main is not None:
+                references = sorted(name for name in raw_inventory if name != main)
+                source_selection = sealed_selection(
+                    raw_inventory,
+                    main,
+                    edges={main: references, **{name: [] for name in references}},
+                )
         payload = {
             "schema_version": DISCOVERY_SCHEMA,
             "contract": "native-discovery/v1",
             "run_id": "imported-source-test",
             "namespace": "dp",
-            "handoff_sha256": "0" * 64,
+            "handoff_sha256": (
+                source_selection.get("handoff_sha256", "0" * 64)
+                if isinstance(source_selection, dict)
+                else "0" * 64
+            ),
             "raw": {
                 "components": components,
-                "files": dict(native if raw_files is None else raw_files),
+                "files": raw_inventory,
                 "identity": {},
                 "saved_configuration": "Default",
                 "document_state": support.saved_document_state(),
-                **(extra_raw or {}),
+                **({"source_selection": source_selection} if isinstance(source_selection, dict) else {}),
+                **extra_raw,
             },
             "identity": {},
         }
@@ -277,11 +304,21 @@ class ImportedSourceTests(unittest.TestCase):
             payload,
             files=native,
         )
+        source = support.default_source_record(
+            main_assembly=(
+                str(source_selection["main_assembly"])
+                if isinstance(source_selection, dict)
+                else "robot.SLDASM"
+            )
+        )
+        if isinstance(source_selection, dict):
+            source["identity"]["handoff_digest"] = source_selection["upload_sha256"]
+            source["source_revision_id"] = digest(source["identity"])
         return support.write_target_delivery(
             package,
             capture={},
             discovery=payload,
-            source=support.default_source_record(),
+            source=source,
             originals=originals,
         )
 
@@ -342,7 +379,7 @@ class ImportedSourceTests(unittest.TestCase):
                 self.assertTrue(any(str(item["code"]).startswith("discovery.suppression") for item in report["errors"]))
 
     def test_resealed_malformed_raw_fails_precisely_without_a_crash(self) -> None:
-        """A None raw record fails the suppression check instead of crashing route selection."""
+        """A None raw record fails the mandatory binding check without crashing verification."""
 
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
@@ -363,9 +400,9 @@ class ImportedSourceTests(unittest.TestCase):
             support.seal_delivery(package)
             report = verify_discovery(package)
         self.assertFalse(report["passed"])
-        failed = next(item for item in report["checks"] if item["id"] == "discovery.suppression_state")
+        failed = next(item for item in report["checks"] if item["id"] == "discovery.binding")
         self.assertFalse(failed["passed"])
-        self.assertEqual(failed["details"]["code"], "discovery.suppression_state")
+        self.assertEqual(failed["details"]["code"], "discovery.request")
 
     def test_resolved_frozen_source_class_is_preserved(self):
         content = b"frozen step bytes"
@@ -384,7 +421,7 @@ class ImportedSourceTests(unittest.TestCase):
         self.assertTrue(self._check(report)["passed"], self._check(report)["details"])
         self.assertNotIn("discovery.imported_source_unbound", {item["code"] for item in report["errors"]})
 
-    def test_frozen_inventory_is_the_sole_authority_when_raw_files_omit_the_document(self):
+    def test_raw_files_omitting_the_document_are_refused_by_mandatory_binding(self):
         content = b"frozen step bytes"
         sha = hashlib.sha256(content).hexdigest()
         component = {
@@ -398,7 +435,7 @@ class ImportedSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             package = self._package(directory, {"imported_part.step": content}, [component], raw_files={})
             report = verify_discovery(package)
-        self.assertTrue(self._check(report)["passed"], self._check(report)["details"])
+        self.assertIn("discovery.request", {item["code"] for item in report["errors"]})
 
     def test_foreign_imported_ancestor_under_selected_container_fails(self):
         contents = {"module.SLDASM": b"module bytes", "tool_part.SLDPRT": b"tool bytes"}
@@ -489,9 +526,7 @@ class ImportedSourceTests(unittest.TestCase):
                 raw_files={"imported_part.step": "e" * 64},
             )
             report = verify_discovery(package)
-        detail = self._unbound(report)["detail"]
-        self.assertEqual(detail["unbound"], 1)
-        self.assertIn("bound", detail["samples"][0]["reason"])
+        self.assertIn("discovery.request", {item["code"] for item in report["errors"]})
 
     def test_cached_materialization_is_accepted_through_the_sealed_carrier(self):
         content = b"cached HD bytes"
@@ -512,7 +547,11 @@ class ImportedSourceTests(unittest.TestCase):
         content = b"cached HD bytes"
         sha = hashlib.sha256(content).hexdigest()
         cases = {
-            "absent_carrier": (cached_component(sha), None, "carrier is absent"),
+            "absent_carrier": (
+                cached_component(sha),
+                None,
+                "no sealed cached materialization matches",
+            ),
             "owner_sha_mismatch": (
                 cached_component("f" * 64),
                 cached_carrier(sha),
@@ -635,7 +674,11 @@ class ImportedSourceTests(unittest.TestCase):
             + r"\extra\VC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
         )
         cases = {
-            "absent_carrier": (virtual_component(sha), None, "carrier is absent"),
+            "absent_carrier": (
+                virtual_component(sha),
+                None,
+                "no sealed embedded virtual component matches",
+            ),
             "false_virtual": (
                 virtual_component(sha, source_provenance=virtual_provenance(sha, is_virtual=False)),
                 virtual_carrier(sha),

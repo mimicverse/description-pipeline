@@ -19,7 +19,7 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
-from description_pipeline.io import PipelineError
+from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.native_declarations import verify_declarations
 from description_pipeline.verification.native_discovery import _Failure, rebuild_interface_frames, verify_discovery
@@ -482,6 +482,7 @@ class DeclarationConsumerTests(unittest.TestCase):
                 "schema_version": "solidworks-to-urdf.native-discovery/v1",
                 "run_id": "declaration-consumer",
                 "contract": "native-discovery/v1",
+                    "handoff_sha256": raw["source_selection"]["handoff_sha256"],
                 "raw": raw,
                 "identity": copy.deepcopy(raw["identity"]),
             },
@@ -493,6 +494,8 @@ class DeclarationConsumerTests(unittest.TestCase):
             hardware_id="fixture",
             revision="r1",
         )
+        source["identity"]["handoff_digest"] = raw["source_selection"]["upload_sha256"]
+        source["source_revision_id"] = digest(source["identity"])
         support.write_target_delivery(
             package,
             capture={"declared_masses": {"items": {}, "evidence": None}},
@@ -1228,7 +1231,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                     "schema_version": "solidworks-to-urdf.native-discovery/v1",
                     "run_id": "test",
                     "contract": "native-discovery/v1",
-                    "handoff_sha256": "0" * 64,
+                    "handoff_sha256": raw["source_selection"]["handoff_sha256"],
                     "raw": raw,
                     "identity": copy.deepcopy(raw["identity"]),
                 },
@@ -1240,6 +1243,8 @@ class NativeDeclarationsTests(unittest.TestCase):
                 hardware_id="fixture",
                 revision="r1",
             )
+            source["identity"]["handoff_digest"] = raw["source_selection"]["upload_sha256"]
+            source["source_revision_id"] = digest(source["identity"])
             # The sealed record carries the authored CAD summary; keep the
             # fixture's source record coherent with the raw reading.
             source["metadata"]["change_summary"] = raw["identity"]["change_summary"]

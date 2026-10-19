@@ -795,7 +795,10 @@ def saved_document_state(configuration: str = "Default") -> dict:
     return {
         "before": copy.deepcopy(observed),
         "after": copy.deepcopy(observed),
-        "used_api": "IModelDoc2.GetSaveFlag/IConfiguration.Name",
+        "used_api": (
+            "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
+            "IConfiguration.Name/IConfiguration.NeedsRebuild"
+        ),
     }
 
 
@@ -893,6 +896,12 @@ def write_target_delivery(
     write_json(root / "input/source.json", source)
     if request is None:
         payload_handoff = (discovery or {}).get("handoff_sha256") if isinstance(discovery, dict) else None
+        raw_selection = (
+            ((discovery or {}).get("raw") or {}).get("source_selection")
+            if isinstance(discovery, dict)
+            else None
+        )
+        upload_handoff = raw_selection.get("upload_sha256") if isinstance(raw_selection, dict) else None
         request = {
             "schema_version": "solidworks-to-urdf.request/v2",
             "purpose": "engineering",
@@ -900,7 +909,11 @@ def write_target_delivery(
             "target_hardware": str(selection["hardware_id"]),
             "change_summary": str((source.get("metadata") or {}).get("change_summary") or "fixture"),
             "main_assembly": str(selection["main_assembly"]),
-            "handoff_digest": payload_handoff if isinstance(payload_handoff, str) else "0" * 64,
+            "handoff_digest": (
+                upload_handoff
+                if isinstance(upload_handoff, str)
+                else payload_handoff if isinstance(payload_handoff, str) else "0" * 64
+            ),
             "platform_config_digest": "0" * 64,
         }
     write_json(root / "input/request.json", request)

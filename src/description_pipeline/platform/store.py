@@ -1405,7 +1405,7 @@ class PlatformStore:
                             if (
                                 stage == "discover"
                                 and isinstance(stored_receipt, dict)
-                                and stored_receipt.get("reported_stage") == "freeze"
+                                and stored_receipt.get("reported_stage") in {"freeze", "discover"}
                                 and stored_receipt.get("actual_stage") == "discover"
                             ):
                                 self._bind_legacy_dispatch_freeze(
@@ -1871,7 +1871,11 @@ class PlatformStore:
             raise PlatformStoreError("An orphan reconciliation carries no checkpoint or reuse binding")
         if not isinstance(receipt, dict):
             raise PlatformStoreError("An orphan reconciliation carries its failed receipt")
-        if stage == "discover" and receipt.get("reported_stage") == "freeze":
+        if (
+            stage == "discover"
+            and receipt.get("reported_stage") in {"discover", "freeze"}
+            and receipt.get("actual_stage") == "discover"
+        ):
             self._reconcile_bound_native_discover(
                 connection,
                 cursor,
@@ -2112,23 +2116,25 @@ class PlatformStore:
         reconcile: dict,
         run_state: object,
     ) -> None:
-        """Close the one historical reported-freeze/actual-discover failure shape.
+        """Close one bound running native discover failure from its original receipt.
 
-        This is deliberately not a general stage alias.  It is accepted only
-        when the native receipt proves a selection read in progress, the bound
-        native operation is the actual ``discover`` operation, the frozen
-        request resolves to the same upload/main identity, and the real Airflow
-        facts show the one failed ``discover`` task with the later tasks still
-        unexecuted.  The completed freeze row is read-only here.
+        The historical reported-freeze/actual-discover alias and the direct
+        discover failure with its own terminal event both enter here.  The
+        native receipt must prove the observed failure, the bound native
+        operation must be the recorded running discover operation, the frozen
+        request must resolve to the same upload/main identity, and the real
+        Airflow facts must show the one failed discover task with later tasks
+        still unexecuted.  The completed freeze row is read-only here.
         """
 
+        reported_stage = receipt.get("reported_stage")
         if (
             stage != "discover"
             or state != "failed"
-            or receipt.get("reported_stage") != "freeze"
+            or reported_stage not in {"discover", "freeze"}
             or receipt.get("actual_stage") != "discover"
         ):
-            raise PlatformStoreError("The bound native recovery is only the reported-freeze/actual-discover shape")
+            raise PlatformStoreError("The bound native recovery is not a supported discover failure shape")
         if run_state != "running":
             raise PlatformStoreError("The bound native recovery requires a running admitted run")
 
@@ -2226,11 +2232,16 @@ class PlatformStore:
 
         self._verify_bound_discover_airflow(cursor, dag_id=dag_id, dag_run_id=dag_run_id, binding=binding)
 
+        closure_shape = (
+            "reported_freeze_actual_discover"
+            if reported_stage == "freeze"
+            else "bound_native_discover_failed"
+        )
         payload_receipt = {
             **receipt,
             "reconciliation": reconcile,
-            "closure_shape": "reported_freeze_actual_discover",
-            "reported_stage": "freeze",
+            "closure_shape": closure_shape,
+            "reported_stage": reported_stage,
             "actual_stage": "discover",
         }
         cursor.execute(_INSERT_STAGE, (run_id, "discover", "failed", _json(payload_receipt), None, None, None))
@@ -2259,7 +2270,7 @@ class PlatformStore:
                 "intent_stage": op_stage,
                 "reconciled_stage": "discover",
                 "reconciled_state": "failed",
-                "reported_stage": "freeze",
+                "reported_stage": reported_stage,
                 "actual_stage": "discover",
                 "dag_id": dag_id,
                 "dag_run_id": dag_run_id,
@@ -2267,7 +2278,7 @@ class PlatformStore:
                 "map_index": map_index,
                 "native_run_id": native_run,
                 "native_receipt_sha256": native_sha,
-                "closure_shape": "reported_freeze_actual_discover",
+                "closure_shape": closure_shape,
             },
         )
         self._insert_event(
@@ -2276,7 +2287,7 @@ class PlatformStore:
             stage="discover",
             kind="stage",
             operation_id=reconcile_operation,
-            payload={"state": "failed", "reported_stage": "freeze", "actual_stage": "discover"},
+            payload={"state": "failed", "reported_stage": reported_stage, "actual_stage": "discover"},
         )
         self._stage_outcome(connection, run_id=run_id, stage="discover", state="failed")
         cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
@@ -2430,6 +2441,16 @@ class PlatformStore:
             or dag_run_state != "failed"
         ):
             raise PlatformStoreError("The legacy dispatch has no successful freeze under a failed DagRun")
+        if receipt.get("stage") == "discover":
+            binding = reconcile.get("binding")
+            if not isinstance(binding, dict):
+                raise PlatformStoreError("The repeated discover closure carries no scheduling binding")
+            self._verify_bound_discover_airflow(
+                cursor,
+                dag_id=dag_id,
+                dag_run_id=dag_run_id,
+                binding=binding,
+            )
         if already_bound:
             return
         cursor.execute(_BIND_LEGACY_DISPATCH, ("freeze", -1, operation_id, run_id))
