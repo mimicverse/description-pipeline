@@ -165,10 +165,10 @@ class PortalSplitTests(unittest.TestCase):
             "stage_reruns": [
                 {
                     "stage": stage["id"],
-                    "name_zh": stage["name_zh"],
+                    "name": stage["name"],
                     "eligible": False,
                     "reason": "native",
-                    "reason_zh": "原生端",
+                    "message": "Native endpoint",
                     "recomputes": [stage["id"]],
                     "retains": [],
                     "prerequisites": dict(native_prerequisites),
@@ -221,7 +221,7 @@ class PortalSplitTests(unittest.TestCase):
             )
         )
         self.assertEqual(captured["status"], "401 Unauthorized")
-        self.assertEqual(json.loads(response)["error"], "请使用飞书登录")
+        self.assertEqual(json.loads(response)["error"], "Sign in with Feishu")
         # Nothing downstream was consulted and nothing was reserved on disk.
         self.assertEqual(self.airflow.calls, 0)
         self.assertEqual(self.windows.calls, 0)

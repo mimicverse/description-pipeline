@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate the private ``platform.json`` and render the immutable config snapshot (IF-16).
 
-Contract: ``docs/deployment.md`` §配置权威 - one private ``platform.json`` (schema
+Contract: ``docs/deployment.md`` configuration authority - one private ``platform.json`` (schema
 ``solidworks-to-urdf.platform/v1``) is the single configuration authority; the schema refuses
 unknown keys, unsafe paths, incomplete targets and conflicting ports, and secrets travel only as
 file references.  ``install`` renders the immutable generation snapshot
@@ -300,7 +300,6 @@ def validate_platform(document) -> dict:
     }
 
 
-
 #: The minimal same-source contract closure inside the release wheel.  ``io.py`` is the single
 #: owner of the canonical bytes; the deployment keeps NO mirror - the snapshot bytes and
 #: every digest consume exactly these files from the digest-bound artifact.
@@ -368,15 +367,11 @@ def load_contract_owner(closure_dir: Path):
                 source.is_relative_to(package_dir),
                 f"the contract closure did not decide the {module.__name__} import: {source}",
             )
-        owner = SimpleNamespace(
-            canonical=io.canonical, config_snapshot_digest=interface_records.config_snapshot_digest
-        )
+        owner = SimpleNamespace(canonical=io.canonical, config_snapshot_digest=interface_records.config_snapshot_digest)
     finally:
         sys.path.remove(str(closure_dir))
         for name in [
-            name
-            for name in sys.modules
-            if name == "description_pipeline" or name.startswith("description_pipeline.")
+            name for name in sys.modules if name == "description_pipeline" or name.startswith("description_pipeline.")
         ]:
             del sys.modules[name]
         sys.modules.update(saved)

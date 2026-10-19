@@ -182,9 +182,7 @@ class PublishTests(unittest.TestCase):
                 return entry["url"] + "\n"
             if args[0] == "api":
                 entry = self.prs[self.branch]
-                self.assertEqual(
-                    args[:4], ("api", "--method", "PATCH", f"repos/example/m3.0/pulls/{entry['number']}")
-                )
+                self.assertEqual(args[:4], ("api", "--method", "PATCH", f"repos/example/m3.0/pulls/{entry['number']}"))
                 self.rest_payloads.append(json.loads(Path(args[args.index("--input") + 1]).read_text(encoding="utf-8")))
                 if self.gh_mode == "fail_update":
                     raise subprocess.CalledProcessError(1, ["gh", *args], stderr="REST update unavailable")
@@ -226,7 +224,7 @@ class PublishTests(unittest.TestCase):
                             "type": "revolute",
                             "limit_source": "native",
                             "limits": {"lower": -1.0, "upper": 1.0},
-                        }
+                        },
                     ],
                     "frames": [],
                 },
@@ -576,8 +574,8 @@ class PublishTests(unittest.TestCase):
         self.assertIn("- purpose: `engineering`", body)
         self.assertIn("- engineering_position_range[arm-a]: established", body)
         self.assertIn("- drive_sizing[arm-a]: established", body)
-        self.assertIn("- drive_sizing[arm-b]: unqualified（未建立）", body)
-        self.assertIn("- machine_qualification: unqualified（未建立）", body)
+        self.assertIn("- drive_sizing[arm-b]: unqualified (unqualified)", body)
+        self.assertIn("- machine_qualification: unqualified (unqualified)", body)
         self.assertEqual(result["purpose"], "engineering")
         self.assertFalse(any(call[:2] == ("pr", "edit") for call in self.gh_calls))
 
@@ -888,8 +886,8 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(INSPECTION_BRANCH), third["commit"])
         body = self.rest_payloads[-1]["body"]
         self.assertIn("- purpose: `inspection_preview`", body)
-        self.assertIn("- drive_sizing[arm-a]: unqualified（未建立）", body)
-        self.assertIn("- machine_qualification: unqualified（未建立）", body)
+        self.assertIn("- drive_sizing[arm-a]: unqualified (unqualified)", body)
+        self.assertIn("- machine_qualification: unqualified (unqualified)", body)
 
     def test_pr_body_lists_each_qualification_identity_independent_of_order(self) -> None:
         def qualification_lines(body: str) -> list[str]:
@@ -904,7 +902,7 @@ class PublishTests(unittest.TestCase):
         self.submit()
         forward = self.rest_payloads[-1]["body"]
         self.assertIn("- drive_sizing[arm-a]: established", forward)
-        self.assertIn("- drive_sizing[arm-b]: unqualified（未建立）", forward)
+        self.assertIn("- drive_sizing[arm-b]: unqualified (unqualified)", forward)
         self.assertLess(forward.index("[arm-a]"), forward.index("[arm-b]"))
         self.qualification_reversed = True
         result = self.submit()

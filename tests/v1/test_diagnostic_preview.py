@@ -294,7 +294,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         with self.assertRaises(portal_module.PortalError) as caught:
             app._preview_payload(session, DAG_RUN_ID)
         self.assertEqual(caught.exception.status, 502)
-        self.assertIn("不一致", caught.exception.message)
+        self.assertIn("conflicts", caught.exception.message)
         # The failed member stays byte-verifiable and downloadable.
         environ = {"HTTP_COOKIE": f"{portal_module.DEFAULT_SESSION_COOKIE}={session.session_id}"}
         captured: dict = {}
@@ -335,7 +335,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertIn('id="preview-diagnostic"', html)
         self.assertIn("renderPreviewDiagnostic(preview)", app)
         self.assertIn("preview.verified !== false", app)
-        self.assertIn("禁止发布", app)
+        self.assertIn("must not be published", app)
 
 
 if __name__ == "__main__":

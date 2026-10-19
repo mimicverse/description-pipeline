@@ -6,16 +6,16 @@
 export const MACHINE_FIELD_KEYS = ["run_id", "subject_sha256", "tool_identity", "purpose"];
 
 export function purposeLabel(value) {
-  return value === "engineering" || value === "inspection_preview" ? value : "未记录";
+  return value === "engineering" || value === "inspection_preview" ? value : "not recorded";
 }
 
 export function statusLabel(status) {
   return status === "unqualified"
-    ? "未建立"
+    ? "unqualified"
     : status === "established"
-      ? "已建立"
+      ? "established"
       : status === "out_of_scope"
-        ? "不适用"
+        ? "not applicable"
         : "?";
 }
 
@@ -210,12 +210,12 @@ export function closureRows(checks) {
 
 //: One-line necessity for each lightweight stage summary (design-side review record).
 export const STAGE_SUMMARY_NECESSITY = {
-  freeze: "冻结摘要让复核者先见输入清单规模，不必展开原始清单。",
-  discover: "发现摘要给出原生解析规模，用于对照捕获证据的覆盖。",
-  capture: "采集摘要给出证据与网格件数，确认证据面完整。",
-  generate: "生成摘要绑定交互预览的交付主体（subject）。",
-  verify: "验证摘要给出通过计数，是发布资格的直接读数。",
-  publish: "发布摘要给出 PR 回执，闭合交付链。",
+  freeze: "Shows input scale before the full inventory is expanded.",
+  discover: "Shows native discovery scale for comparison with capture coverage.",
+  capture: "Shows evidence and mesh counts to confirm capture coverage.",
+  generate: "Binds the interactive preview to the delivery subject.",
+  verify: "Shows the passed-check count used for publication eligibility.",
+  publish: "Shows the PR receipt and closes the delivery chain.",
 };
 
 function segmentCounts(files) {
@@ -234,24 +234,24 @@ export function stageSummaryRows(stageId, { files, stage, quality, pr, subjectSh
   const rows = [];
   const counts = segmentCounts(files);
   if (stageId === "freeze") {
-    rows.push({ label: "输入清单", value: `${counts.input} 件（已验证交付内 input/）` });
+    rows.push({ label: "Input inventory", value: `${counts.input} files in the verified input/ tree` });
   } else if (stageId === "capture") {
-    rows.push({ label: "证据文件", value: `${counts.evidence} 件（evidence/）` });
-    rows.push({ label: "网格文件", value: `${counts.meshes} 件（meshes/）` });
+    rows.push({ label: "Evidence files", value: `${counts.evidence} files in evidence/` });
+    rows.push({ label: "Mesh files", value: `${counts.meshes} files in meshes/` });
   } else if (stageId === "generate") {
-    rows.push({ label: "交付主体", value: typeof subjectSha256 === "string" ? subjectSha256 : "未记录" });
+    rows.push({ label: "Delivery subject", value: typeof subjectSha256 === "string" ? subjectSha256 : "not recorded" });
   } else if (stageId === "verify") {
     const passed = Number.isFinite(stage?.passed) ? stage.passed : null;
     const total = Number.isFinite(stage?.total) ? stage.total : null;
-    rows.push({ label: "通过计数", value: passed !== null && total !== null ? `${passed}/${total}` : "未记录" });
+    rows.push({ label: "Passed checks", value: passed !== null && total !== null ? `${passed}/${total}` : "not recorded" });
     if (quality && typeof quality.schema_version === "string") {
-      rows.push({ label: "质量报告", value: quality.schema_version });
+      rows.push({ label: "Quality report", value: quality.schema_version });
     }
   } else if (stageId === "publish") {
-    rows.push({ label: "PR 状态", value: pr && typeof pr.state === "string" ? pr.state : "未创建" });
+    rows.push({ label: "PR state", value: pr && typeof pr.state === "string" ? pr.state : "not created" });
     if (pr && typeof pr.url === "string") rows.push({ label: "PR", value: pr.url });
   } else if (stageId === "discover") {
-    rows.push({ label: "交付清单", value: `${counts.total} 件` });
+    rows.push({ label: "Delivery inventory", value: `${counts.total} files` });
   }
   return { rows, necessity: STAGE_SUMMARY_NECESSITY[stageId] || "" };
 }

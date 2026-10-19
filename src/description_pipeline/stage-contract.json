@@ -7,10 +7,9 @@
       "hosts": ["linux"],
       "host_text": "Linux",
       "name": "Freeze inputs",
-      "name_zh": "冻结输入",
       "doc": {
-        "input": "已完成上传、认证主体、主装配、配置目标、用途及必填提交说明；路径、文件类型、大小和选择有效",
-        "output": "不可变请求、上传清单与原件；清单闭合、字节及摘要一致；不启动 CAD"
+        "input": "Completed upload, authenticated principal, main assembly, configuration target, purpose, and required change summary; paths, file types, sizes, and selection are valid",
+        "output": "Immutable request, upload inventory, and originals; the inventory is closed and byte/digest bound; CAD is not started"
       },
       "inputs": [
         {
@@ -47,12 +46,11 @@
     {
       "id": "discover",
       "hosts": ["windows", "linux"],
-      "host_text": "Windows 原生观察 + Linux 推导",
+      "host_text": "Windows native observation + Linux derivation",
       "name": "Discover structure",
-      "name_zh": "解析结构",
       "doc": {
-        "input": "冻结工程及同版工具；原生解析状态和来源绑定有效",
-        "output": "原始发现、规格快照、工程内容身份和采集计划；模式明确、结构可解、对象引用唯一且计划绑定原始观察"
+        "input": "Frozen engineering folder and same-release tools; native discovery state and source binding are valid",
+        "output": "Raw discovery, controlled record snapshot, engineering content identity, and capture plan; the mode is explicit, the structure is resolvable, object references are unique, and the plan is bound to the raw observations"
       },
       "inputs": [
         {
@@ -109,12 +107,11 @@
     {
       "id": "capture",
       "hosts": ["windows", "linux"],
-      "host_text": "Windows 原生读取 + Linux 传输核验",
+      "host_text": "Windows native read + Linux transfer verification",
       "name": "Capture evidence",
-      "name_zh": "采集证据",
       "doc": {
-        "input": "封存计划及同一工程副本；工具、计划摘要、已保存配置和实例身份一致；身份按逐字段规则核对，不设置全部 `dp.*` 齐备的前置门",
-        "output": "完整原生证据；重建、原生状态读取、临时选择/配置恢复、几何覆盖和源文件稳定检查通过，传输闭合"
+        "input": "Sealed plan and the same engineering-folder copy; tool, plan digest, saved configuration, and instance identities agree; identity is checked field by field without requiring every `dp.*` value",
+        "output": "Complete native evidence; reconstruction, native state reads, temporary selection/configuration restoration, geometry coverage, and source stability pass, and transfer is closed"
       },
       "inputs": [
         {
@@ -171,10 +168,9 @@
       "hosts": ["linux"],
       "host_text": "Linux",
       "name": "Generate URDF",
-      "name_zh": "生成 URDF",
       "doc": {
-        "input": "完整封存证据；清单、schema、来源与工具身份有效",
-        "output": "规范化模型、URDF、网格及交付主体；模型合法、文件完整并绑定来源"
+        "input": "Complete sealed evidence; inventory, schema, provenance, and tool identity are valid",
+        "output": "Canonical model, URDF, meshes, and delivery subject; the model is valid, files are complete, and every artifact is bound to its source"
       },
       "inputs": [
         {
@@ -225,10 +221,9 @@
       "hosts": ["linux"],
       "host_text": "Linux",
       "name": "Independent verification",
-      "name_zh": "独立验证",
       "doc": {
-        "input": "原始证据和实际产物；交付主体未变",
-        "output": "确定性质量报告；所有必需且适用的检查通过，报告绑定主体与策略"
+        "input": "Raw evidence and actual artifacts; the delivery subject has not changed",
+        "output": "Deterministic quality report; every required applicable check passes and the report is bound to the subject and policy"
       },
       "inputs": [
         {
@@ -270,10 +265,9 @@
       "hosts": ["linux"],
       "host_text": "Linux",
       "name": "Publish review PR",
-      "name_zh": "提交评审 PR",
       "doc": {
-        "input": "完整重验、配置目标、发布前置基线和干净工作区有效",
-        "output": "候选 commit 与 PR 收据；复制、Git blobs、远端 head/base 与验证主体一致"
+        "input": "Complete reverification, configuration target, publication predecessor baseline, and clean workspace are valid",
+        "output": "Candidate commit and PR receipt; copied bytes, Git blobs, remote head/base, and verified subject agree"
       },
       "inputs": [
         {
@@ -291,7 +285,7 @@
       "outputs": [
         {
           "label": "Candidate commit and PR receipt",
-          "path": "平台运行存储/PR 收据",
+          "path": "submission",
           "class": "receipt"
         }
       ],
@@ -306,7 +300,7 @@
         }
       ],
       "evidence": [
-        "平台运行存储/PR 收据",
+        "submission",
         "commit",
         "url"
       ]
@@ -315,54 +309,54 @@
   "confirmations": [
     {
       "id": "design_fidelity",
-      "label": "结构负责人",
+      "label": "Structural owner",
       "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "discover",
-      "scope": "CAD 与预期实物、配置、刚性/自由度、接口身份、零位、正向及工程变更对应",
-      "automatic_exclusion": "不重复检查主装配唯一性、实例覆盖、刚体唯一归属、树拓扑、坐标变换或导出一致性。"
+      "scope": "CAD correspondence to the intended physical system, configuration, rigidity and degrees of freedom, interface identity, zero pose, positive direction, and engineering changes",
+      "automatic_exclusion": "Do not repeat main-assembly uniqueness, instance coverage, rigid-body ownership, tree topology, coordinate transforms, or export consistency checks."
     },
     {
       "id": "motion_safety",
-      "label": "机械安全责任人",
+      "label": "Mechanical safety owner",
       "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "verify",
-      "scope": "全行程、关键组合、干涉、间隙、公差、安全余量与线缆约束",
-      "automatic_exclusion": "不重复检查限位数值合法性、原生限位与输出限位的一致性。"
+      "scope": "Full travel, critical combinations, interference, clearance, tolerances, safety margins, and cable constraints",
+      "automatic_exclusion": "Do not repeat numeric limit validity or native-to-output limit consistency checks."
     },
     {
       "id": "drive_applicability",
-      "label": "参数责任人",
+      "label": "Parameter owner",
       "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "discover",
-      "scope": "输出侧规格、传动、持续/峰值工况及适用条件",
-      "automatic_exclusion": "不重复抄录或核算流水线已验证的规格引用、版本、数值和派生一致性。"
+      "scope": "Output-side specification, transmission, continuous and peak duty, and applicability",
+      "automatic_exclusion": "Do not repeat already verified specification references, versions, values, or derivation consistency."
     },
     {
       "id": "physical_fidelity",
-      "label": "物理参数责任人",
+      "label": "Physical-parameter owner",
       "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "capture",
-      "scope": "真实材料、密度、物理范围、覆盖与简化来源",
-      "automatic_exclusion": "不重复验算 CAD 与 URDF 总质量、质心、惯量组合、单位和变换。"
+      "scope": "Physical material, density, physical scope, overrides, and simplification provenance",
+      "automatic_exclusion": "Do not repeat CAD-to-URDF total mass, center of mass, inertia combination, units, or transform checks."
     },
     {
       "id": "acceptance_basis",
-      "label": "预算责任人",
+      "label": "Budget owner",
       "reference": "docs/mechanical-handoff-spec.md#review",
       "review_stage": "verify",
-      "scope": "已提供预算的独立性、范围和不确定度",
-      "automatic_exclusion": "不重复比较产物是否落在已声明区间内。"
+      "scope": "Independence, scope, and uncertainty of a supplied budget",
+      "automatic_exclusion": "Do not repeat whether the artifact falls inside the declared interval."
     }
   ],
   "unsupported": [
     {
       "id": "interference",
-      "label": "干涉与间隙：全行程干涉、碰撞及制造公差验算",
+      "label": "Interference and clearance: full-travel interference, collision, and manufacturing-tolerance analysis",
       "stage": "verify"
     },
     {
       "id": "naming_identity",
-      "label": "命名与身份：术语与物料号身份绑定、跨版本改名对应关系",
+      "label": "Naming and identity: terminology and part-number binding across revisions",
       "stage": "discover"
     }
   ]

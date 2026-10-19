@@ -63,9 +63,7 @@ class OpenAttemptConflictError(PlatformStoreError):
     code = "open_attempt_conflict"
 
     def __init__(self, parent_run_id: str, run_id: str, request_id: str):
-        super().__init__(
-            f"The parent run {parent_run_id!r} already holds the open attempt {run_id!r} ({request_id!r})"
-        )
+        super().__init__(f"The parent run {parent_run_id!r} already holds the open attempt {run_id!r} ({request_id!r})")
         self.parent_run_id = parent_run_id
         self.run_id = run_id
         self.request_id = request_id
@@ -137,9 +135,7 @@ class NativeReceiptEvidence:
 NATIVE_TERMINAL_STATES = frozenset({"passed", "failed"})
 
 
-def load_native_failed_receipt(
-    path: object, *, stage: str, native_run_id: str
-) -> NativeReceiptEvidence:
+def load_native_failed_receipt(path: object, *, stage: str, native_run_id: str) -> NativeReceiptEvidence:
     """Load and validate one original native failed receipt - the single acceptance source.
 
     The bytes on disk are the authority: they are read once, the receipt digest is
@@ -312,9 +308,7 @@ class RunDisplay:
     updated_at: datetime
 
 
-_LOCK_ADMISSION = (
-    "SELECT state, reason, actor, changed_at, revision FROM admission WHERE id = 1 FOR UPDATE"
-)
+_LOCK_ADMISSION = "SELECT state, reason, actor, changed_at, revision FROM admission WHERE id = 1 FOR UPDATE"
 _READ_ADMISSION = "SELECT state, reason, actor, changed_at, revision FROM admission_projection"
 _UPDATE_ADMISSION = (
     "UPDATE admission SET state = %s, reason = %s, actor = %s, changed_at = now(),"
@@ -341,9 +335,7 @@ _FIND_OPERATION = (
 )
 _LOCK_RUN = "SELECT state, from_stage FROM run WHERE run_id = %s FOR UPDATE"
 _READ_RUN = "SELECT state, from_stage FROM run WHERE run_id = %s"
-_READ_RUN_DISPLAY = (
-    "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run WHERE run_id = %s"
-)
+_READ_RUN_DISPLAY = "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run WHERE run_id = %s"
 _READ_RUN_DISPLAYS = (
     "SELECT run_id, display_name, hidden_at, hidden_reason, updated_at FROM run"
     " WHERE display_name IS NOT NULL OR hidden_at IS NOT NULL"
@@ -362,8 +354,7 @@ _RESTORE_RUN = (
     " WHERE run_id = %s RETURNING run_id, display_name, hidden_at, hidden_reason, updated_at"
 )
 _START_RUN = (
-    "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'queued'"
-    " RETURNING state"
+    "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'queued' RETURNING state"
 )
 _CLAIM_OPERATION = (
     "UPDATE operation SET state = 'running', updated_at = now()"
@@ -374,12 +365,8 @@ _SET_RUN_OUTCOME = (
     "UPDATE run SET state = %s, updated_at = now()"
     " WHERE run_id = %s AND state NOT IN ('succeeded', 'failed', 'cancelled')"
 )
-_SET_RUN_UNRESOLVED = (
-    "UPDATE run SET state = 'unresolved', updated_at = now() WHERE run_id = %s AND state = 'running'"
-)
-_RESTORE_RUN_RUNNING = (
-    "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'unresolved'"
-)
+_SET_RUN_UNRESOLVED = "UPDATE run SET state = 'unresolved', updated_at = now() WHERE run_id = %s AND state = 'running'"
+_RESTORE_RUN_RUNNING = "UPDATE run SET state = 'running', updated_at = now() WHERE run_id = %s AND state = 'unresolved'"
 _SETTLE_OPERATIONS = (
     "UPDATE operation SET state = CASE WHEN kind = 'cancel' THEN 'succeeded' ELSE %s END,"
     " updated_at = now()"
@@ -424,9 +411,7 @@ _SETTLE_CACHE_RELEASE = (
     " AND state = 'running'"
     " RETURNING operation_id, state, operation_key, params_digest, run_id, stage, kind"
 )
-_READ_RUN_RECORD = (
-    "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
-)
+_READ_RUN_RECORD = "SELECT state, request_id, parent_run_id, from_stage, tool_identity FROM run WHERE run_id = %s"
 _READ_RUN_PARENT = "SELECT parent_run_id FROM run WHERE run_id = %s"
 _OPEN_CHILD_RUN = (
     "SELECT run_id, request_id FROM run WHERE parent_run_id = %s"
@@ -444,25 +429,18 @@ _READ_REQUEST_RECORD = (
     " FROM request WHERE request_id = %s"
 )
 _READ_STAGE_RECORDS = (
-    "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
-    " FROM stage WHERE run_id = %s"
+    "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at FROM stage WHERE run_id = %s"
 )
-_CONFIRMED_PUBLISH = (
-    "SELECT 1 FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
-)
-_READ_STAGE_ROW = (
-    "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
-)
+_CONFIRMED_PUBLISH = "SELECT 1 FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
+_READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
 _READ_STAGE = "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
 _READ_STAGE_TIME = "SELECT original_executed_at FROM stage WHERE run_id = %s AND stage = %s"
 _LOCK_STAGE = "SELECT state FROM stage WHERE run_id = %s AND stage = %s FOR UPDATE"
 _FIND_RECONCILE = (
-    "SELECT 1 FROM operation"
-    " WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s LIMIT 1"
+    "SELECT 1 FROM operation WHERE operation_id = %s AND run_id = %s AND kind = 'reconcile' AND stage = %s LIMIT 1"
 )
 _FIND_UNKNOWN_ORIGIN = (
-    "SELECT 1 FROM operation"
-    " WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'unresolved' LIMIT 1"
+    "SELECT 1 FROM operation WHERE run_id = %s AND stage = %s AND kind <> 'reconcile' AND state = 'unresolved' LIMIT 1"
 )
 _READ_ORPHAN_OPERATION = (
     "SELECT stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
@@ -506,13 +484,10 @@ _RECONCILE_STAGE = (
     " WHERE stage.state = 'unresolved'"
     " RETURNING run_id, stage, state"
 )
-_READ_LIFECYCLE = (
-    "SELECT object_kind, object_id, run_id, state, bucket, updated_at FROM lifecycle_projection"
-)
+_READ_LIFECYCLE = "SELECT object_kind, object_id, run_id, state, bucket, updated_at FROM lifecycle_projection"
 _NEXT_EVENT_SEQ = "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_event WHERE run_id = %s"
 _INSERT_EVENT = (
-    "INSERT INTO run_event (run_id, seq, kind, stage, operation_id, payload)"
-    " VALUES (%s, %s, %s, %s, %s, %s::jsonb)"
+    "INSERT INTO run_event (run_id, seq, kind, stage, operation_id, payload) VALUES (%s, %s, %s, %s, %s, %s::jsonb)"
 )
 _READ_EVENTS = (
     "SELECT seq, at, kind, stage, operation_id, payload FROM run_event"
@@ -528,6 +503,7 @@ _TERMINAL_KINDS = frozenset({"cancel", "reconcile"})
 
 #: The bound on the registered reuse lineage of one attempt; a longer chain is malformed.
 REUSE_LINEAGE_DEPTH = 256
+
 
 def _stored_receipt(row) -> dict | None:
     """The parsed receipt of one locked stage row (jsonb arrives as text or a mapping)."""
@@ -740,9 +716,7 @@ class PlatformStore:
                 _INSERT_REQUEST,
                 (request_id, principal, target_hardware, main_assembly, _json(configuration), _json(baseline)),
             )
-            cursor.execute(
-                _INSERT_RUN, (run_id, request_id, parent_run_id, from_stage, _json(tool_identity))
-            )
+            cursor.execute(_INSERT_RUN, (run_id, request_id, parent_run_id, from_stage, _json(tool_identity)))
             self._insert_operation(
                 connection,
                 run_id=run_id,
@@ -977,9 +951,7 @@ class PlatformStore:
             stage_row = cursor.fetchone()
             current = stage_row[0] if stage_row else None
             if current != "completed":
-                raise PlatformStoreError(
-                    f"A cache release requires the confirmed {stage!r} stage of run {run_id!r}"
-                )
+                raise PlatformStoreError(f"A cache release requires the confirmed {stage!r} stage of run {run_id!r}")
             return
         cursor = connection.cursor()
         cursor.execute(_LOCK_RUN, (run_id,))
@@ -1174,9 +1146,7 @@ class PlatformStore:
                 )
             if original_executed_at != reuse_binding["original_executed_at"]:
                 raise PlatformStoreError("The reused execution instant is not the confirmed source instant")
-        self._verify_checkpoint_scope(
-            checkpoint_uri, run_id=run_id, stage=stage, reused_from_run=reused_from_run
-        )
+        self._verify_checkpoint_scope(checkpoint_uri, run_id=run_id, stage=stage, reused_from_run=reused_from_run)
         if state == "completed" and stage in CONFIRMED_STAGE_STATES:
             definition, sealed_root = self._verify_sealed(checkpoint_uri, receipt)
         elif state == "failed" and (receipt or {}).get("artifacts"):
@@ -1202,9 +1172,7 @@ class PlatformStore:
                 raise PlatformStoreError(f"The run {run_id!r} is not admitted")
             run_state = run_row[0]
             if reconcile is not None:
-                reconcile = self._reconcile_operation(
-                    connection, run_id=run_id, stage=stage, reconcile=reconcile
-                )
+                reconcile = self._reconcile_operation(connection, run_id=run_id, stage=stage, reconcile=reconcile)
             cursor.execute(_LOCK_STAGE, (run_id, stage))
             row = cursor.fetchone()
             current = row[0] if row else None
@@ -1247,9 +1215,7 @@ class PlatformStore:
                         f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
                     )
                 if current == "unresolved" and reconcile is None:
-                    raise PlatformStoreError(
-                        "The stage is unresolved; confirm it through an evidenced reconciliation"
-                    )
+                    raise PlatformStoreError("The stage is unresolved; confirm it through an evidenced reconciliation")
                 if current != "unresolved" and reconcile is not None:
                     raise PlatformStoreError("Reconciliation only confirms an unresolved stage")
             elif reconcile is not None:
@@ -1319,9 +1285,7 @@ class PlatformStore:
                     )
                 cursor.execute(_FIND_UNKNOWN_ORIGIN, (run_id, stage))
                 if cursor.fetchone() is None:
-                    raise PlatformStoreError(
-                        "The reconciliation binds no unresolved original operation of this stage"
-                    )
+                    raise PlatformStoreError("The reconciliation binds no unresolved original operation of this stage")
             payload_receipt = {**receipt, "reconciliation": reconcile} if reconcile is not None else receipt
             if current == "unresolved":
                 cursor.execute(
@@ -1389,9 +1353,7 @@ class PlatformStore:
         if state != "failed":
             raise PlatformStoreError("An orphan reconciliation records the observed failure")
         if receipt is not None:
-            raise PlatformStoreError(
-                "An orphan recovery carries its original receipt inputs, never a formed receipt"
-            )
+            raise PlatformStoreError("An orphan recovery carries its original receipt inputs, never a formed receipt")
         inputs = reconcile.get("native_receipt")
         if not isinstance(inputs, dict):
             raise PlatformStoreError(
@@ -1454,12 +1416,7 @@ class PlatformStore:
             raise PlatformStoreError("A reconciliation names its operation or its registration, not both")
         if operation_id is not None:
             return reconcile
-        if not (
-            isinstance(operation_key, str)
-            and operation_key
-            and isinstance(params_digest, str)
-            and params_digest
-        ):
+        if not (isinstance(operation_key, str) and operation_key and isinstance(params_digest, str) and params_digest):
             raise PlatformStoreError(
                 "A reconciliation must name its registered reconcile operation or carry its registration key"
             )
@@ -1727,9 +1684,7 @@ class PlatformStore:
         reconcile_operation = reconcile.get("operation_id")
         cursor.execute(_FIND_RECONCILE, (reconcile_operation, run_id, stage))
         if cursor.fetchone() is None:
-            raise PlatformStoreError(
-                "The reconciliation names no registered reconcile operation of this run and stage"
-            )
+            raise PlatformStoreError("The reconciliation names no registered reconcile operation of this run and stage")
         cursor.execute(_READ_ORPHAN_OPERATION, (operation_id, run_id))
         row = cursor.fetchone()
         if row is None:
@@ -1855,9 +1810,7 @@ class PlatformStore:
         sequence = row[0] if row else 1
         cursor.execute(_INSERT_EVENT, (run_id, sequence, kind, stage, operation_id, _json(payload)))
 
-    def _verify_checkpoint_scope(
-        self, checkpoint_uri, *, run_id: str, stage: str, reused_from_run: str | None
-    ) -> None:
+    def _verify_checkpoint_scope(self, checkpoint_uri, *, run_id: str, stage: str, reused_from_run: str | None) -> None:
         """A parseable sealed locator must name this run or the proven origin of its reuse chain.
 
         Being able to parse a locator is not a consumption right: a reference
@@ -1926,9 +1879,7 @@ class PlatformStore:
                 return origin_run
         return None
 
-    def _verify_reuse_source(
-        self, *, run_id: str, stage: str, checkpoint_uri, reused_from_run: str
-    ) -> dict:
+    def _verify_reuse_source(self, *, run_id: str, stage: str, checkpoint_uri, reused_from_run: str) -> dict:
         """A linked attempt may reuse only the registered source stage of its own parent run.
 
         The caller's string never grants consumption: the source must be the
@@ -2050,7 +2001,7 @@ class PlatformStore:
                 raise PlatformStoreError("The receipt's handoff binding does not match the sealed original bytes")
         # The prepared index must be complete: every staged input member except the
         # carried request and the index itself has to appear in its inventory.
-        indexed = {path[len("input/"):] for path in stamped if path.startswith("input/")}
+        indexed = {path[len("input/") :] for path in stamped if path.startswith("input/")}
         missing = sorted(indexed - set(files) - {"request.json", "handoff.json"})
         if missing:
             raise PlatformStoreError(f"The sealed input/handoff.json index is incomplete: {missing}")
@@ -2077,7 +2028,7 @@ class PlatformStore:
             inventory = receipt_index.get("inventory") if isinstance(receipt_index, dict) else None
             if not isinstance(inventory, dict) or not inventory:
                 raise PlatformStoreError("The sealed handoff index carries no native input inventory")
-            natives = {path[len("input/cad/"):] for path in stamped if path.startswith("input/cad/")}
+            natives = {path[len("input/cad/") :] for path in stamped if path.startswith("input/cad/")}
             if set(inventory) != natives:
                 raise PlatformStoreError(
                     "The native input inventory does not match the sealed native originals: "
@@ -2086,9 +2037,7 @@ class PlatformStore:
             for name, checksum in inventory.items():
                 record = stamped.get("input/cad/" + str(name))
                 if record is None or record[1] != checksum:
-                    raise PlatformStoreError(
-                        "The native input inventory is not byte-bound to the sealed originals"
-                    )
+                    raise PlatformStoreError("The native input inventory is not byte-bound to the sealed originals")
             native_files = discovery.get("native_files")
             if not isinstance(native_files, dict) or native_files != inventory:
                 raise PlatformStoreError("The native input inventory differs from the sealed discovery record")
@@ -2398,7 +2347,7 @@ def _machine_tool_identity(record, *, role: str) -> None:
 def _evidence_path(entry) -> bool:
     """A contract evidence entry that names a sealed path, not a receipt field."""
 
-    return isinstance(entry, str) and "/" in entry and entry.isascii() and not entry.startswith("/")
+    return isinstance(entry, str) and "/" in entry and not entry.startswith("/")
 
 
 def _covered(root: Path, records: dict, entry: str) -> bool:
@@ -2512,8 +2461,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
                 raise PlatformStoreError("The registered objects lack the byte-bound reports/quality.json member")
             report_path = root / "reports" / "quality.json"
             if not any(
-                record.get("bytes") == report_path.stat().st_size
-                and record.get("sha256") == file_digest(report_path)
+                record.get("bytes") == report_path.stat().st_size and record.get("sha256") == file_digest(report_path)
                 for record in members
             ):
                 raise PlatformStoreError("The registered reports/quality.json member does not bind the sealed bytes")
@@ -2529,9 +2477,7 @@ def _sealed_receipt(receipt, *, run_id: str, stage: str, state: str, checkpoint_
             raise PlatformStoreError("The sealed publication receipt has no confirmed submission")
 
 
-def _require_successor(
-    self, connection, *, run_id: str, kind: str, stage: str, binding: dict | None = None
-) -> None:
+def _require_successor(self, connection, *, run_id: str, kind: str, stage: str, binding: dict | None = None) -> None:
     """The successor must be a legal transition of the admitted run.
 
     The run row is locked; non-terminal kinds need a running run (queued or

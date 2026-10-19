@@ -187,7 +187,7 @@ def _http_refusal(error: urlerror.HTTPError, *, context: str | None = None) -> E
     failure.status = error.code
     failure.payload = payload
     failure.code = payload.get("error_code") if isinstance(payload.get("error_code"), str) else None
-    for field in ("error_code", "reason", "reason_zh", "earliest_required", "active_run_id", "detail"):
+    for field in ("error_code", "reason", "message", "earliest_required", "active_run_id", "detail"):
         setattr(failure, field, payload.get(field))
     return failure
 
@@ -686,9 +686,7 @@ def _frozen_snapshot_reference(state_root: Path, config_digest: str) -> dict:
         if actual == config_digest:
             matches.append(candidate)
     if len(matches) != 1:
-        raise EndpointProtocolError(
-            f"frozen config digest {config_digest} does not identify exactly one snapshot"
-        )
+        raise EndpointProtocolError(f"frozen config digest {config_digest} does not identify exactly one snapshot")
     return {
         "schema_version": CONFIG_SNAPSHOT_SCHEMA,
         "path": str(matches[0]),
@@ -785,6 +783,8 @@ def config_reference_cli(argv=None) -> int:
     config = config_from_airflow_connection(args.conn_id, state_root=args.state_root)
     print(f"config_digest={config.config_digest}")
     return 0
+
+
 @dataclass(frozen=True, slots=True)
 class SelectionSnapshot:
     """Validated selection block of one endpoint job snapshot."""
@@ -1213,9 +1213,7 @@ class WindowsEndpoint:
         canonical = validate_run_id(run_id)
         destination = Path(destination)
         destination.mkdir(parents=True, exist_ok=True)
-        manifest_bytes = self._read_artifact(
-            canonical, receipt["path"], receipt["sha256"], limit=min(limit, 1 << 22)
-        )
+        manifest_bytes = self._read_artifact(canonical, receipt["path"], receipt["sha256"], limit=min(limit, 1 << 22))
         try:
             manifest = json.loads(manifest_bytes)
         except ValueError as error:
@@ -1357,10 +1355,10 @@ class WindowsEndpoint:
                 key not in row
                 for key in (
                     "stage",
-                    "name_zh",
+                    "name",
                     "eligible",
                     "reason",
-                    "reason_zh",
+                    "message",
                     "recomputes",
                     "retains",
                     "prerequisites",

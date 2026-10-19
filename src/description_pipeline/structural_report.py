@@ -106,6 +106,8 @@ def is_sealed_diagnostic_member(relative: str) -> bool:
         and parts[-1].endswith(".urdf")
         and all(part not in {"", ".", ".."} for part in parts)
     )
+
+
 _FINDING_LISTS = {"findings", "warnings", "errors", "problems", "diagnostics", "checks"}
 
 #: The single canonical material-provenance record (producer: 71f489a): written for every
@@ -433,7 +435,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "severity": "warning",
                 "code": "native.open_warnings",
                 "object": receipt.get("main_assembly"),
-                "message": "SolidWorks 打开装配时返回警告，原始位掩码保留在证据中。",
+                "message": (
+                    "SolidWorks returned warnings while opening the assembly; the raw bitmask remains in evidence."
+                ),
                 "source": "run/selection/manifest/closure/open_status",
                 "evidence": opened,
             }
@@ -453,8 +457,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "native.stale_stored_reference",
                     "object": item.get("document") or item.get("resolved_path"),
                     "message": (
-                        "SolidWorks 的保存引用未被所选闭包使用（未解析为活动边，位置可能已失效且在交付包外）；"
-                        "流水线未读取、未复制该外部文件，仅按原文保留记录，不阻断生成与独立校验。"
+                        "The stored SolidWorks reference is unused by the selected closure "
+                        "(it resolved to no active edge, its location may be stale, and it is outside the delivery). "
+                        "The pipeline neither read nor copied the external file; "
+                        "it only retained the recorded text and did not block generation or independent verification."
                     ),
                     "source": "evidence/raw/dependency_closure.json/stale_stored_references",
                     "evidence": {
@@ -488,8 +494,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "code": "report.effective_instances_invalid",
                 "object": receipt.get("main_assembly"),
                 "message": (
-                    "有效实例证据不可读：证据无效，必须由独立检查判为失败。"
-                    "本报告不采用默认值、不做替代解释、不据此输出有效实例警告。"
+                    "Effective-instance evidence is unreadable. The evidence is invalid and "
+                    "independent verification must fail. This report uses no defaults, offers no "
+                    "substitute interpretation, and emits no effective-instance warning."
                 ),
                 "source": effective_source,
                 "evidence": {"unreadable": True},
@@ -505,8 +512,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.effective_instances_missing",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "快照清单要求有效实例记录（evidence/raw/effective_instances.json），但该证据缺失："
-                        "证据无效，必须由独立检查判为失败。本报告不采用默认值或替代解释。"
+                        "The snapshot inventory requires effective-instance evidence "
+                        "(evidence/raw/effective_instances.json), but it is missing. "
+                        "The evidence is invalid and independent verification must fail; "
+                        "this report uses no defaults or substitute interpretation."
                     ),
                     "source": effective_source,
                     "evidence": {"required_by_manifest": True},
@@ -523,17 +532,17 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.effective_instances_invalid",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "有效实例证据不符合当前 schema：证据无效，必须由独立检查判为失败。"
-                        "本报告不采用默认值、不做替代解释、不据此输出有效实例警告；"
-                        "请用当前生产者的规范记录替换该证据。"
+                        "Effective-instance evidence does not match the current schema. "
+                        "The evidence is invalid and independent verification must fail. "
+                        "This report uses no defaults or substitute interpretation and emits no "
+                        "effective-instance warning; replace the evidence with a canonical record "
+                        "from the current producer."
                     ),
                     "source": effective_source,
                     "evidence": {
                         "type": type(effective_instances).__name__,
                         "schema_version": (
-                            effective_instances.get("schema_version")
-                            if isinstance(effective_instances, dict)
-                            else None
+                            effective_instances.get("schema_version") if isinstance(effective_instances, dict) else None
                         ),
                         "keys": sorted(effective_instances) if isinstance(effective_instances, dict) else None,
                     },
@@ -544,20 +553,28 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             # flags and readings verbatim, states the instance scope plainly, and never
             # claims geometric derivation or independent physical qualification.
             override_message = (
-                "CAD 在装配实例上按有效覆盖值记录该组件（assembly_component_group 范围，使用装配文档坐标轴）："
-                "父级实例的覆盖值在单个刚体范围内整体替换其子树，未向运动链分摊；"
-                "该值为 CAD 编写的有效值，未经几何推导与独立物理校核，本报告不据此声称物理准确性。"
+                "CAD records this component's effective override in assembly-instance scope "
+                "(assembly_component_group, using assembly-document axes). "
+                "The parent override replaces its subtree within one rigid body and is not "
+                "distributed along the kinematic chain. "
+                "The value is CAD-authored and is not geometrically derived or independently "
+                "physically qualified; this report does not claim physical accuracy from it."
             )
             surface_message = (
-                "该组件仅有曲面（无实体），零件文档无法回答质量属性，CAD 改按装配实例记录有效值"
-                "（assembly_component_group 范围，使用装配文档坐标轴）：质量、质心与惯量来自 CAD 编写的有效值，"
-                "未经几何推导与独立物理校核，本报告不据此声称物理准确性，也不做分摊或替代。"
+                "This component has surfaces but no solid, so the part document cannot provide "
+                "mass properties; CAD records an effective assembly-instance value "
+                "(assembly_component_group, using assembly-document axes). "
+                "Mass, COM, and inertia come from the CAD-authored value and are not geometrically "
+                "derived or independently physically qualified; this report neither claims physical "
+                "accuracy nor substitutes or distributes the value."
             )
             difference_message = (
-                "该叶实例在装配组件组范围内的测量与其零件文档测量不同"
-                "（basis：cad_assembly_instance_measurement）：差异原因尚未证实；"
-                "本报告保留实例测量与零件测量双方的原始数值供工程确认，不做缩放或替代；"
-                "该值为 CAD 实例上下文记录，未经几何推导与独立物理校核，不据此声称物理准确性。"
+                "This leaf instance's assembly-component-group measurement differs from its part-document measurement "
+                "(basis: cad_assembly_instance_measurement), and the cause is unproven. "
+                "This report retains both readings for engineering review without scaling or "
+                "substitution. The value is a CAD instance-context record, not a geometric "
+                "derivation or independent physical qualification, and does not establish "
+                "physical accuracy."
             )
             for item in effective_warnings:
                 if item["code"] == "cad_surface_only_effective_instance":
@@ -586,8 +603,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "code": "report.geometry_metadata_invalid",
                 "object": receipt.get("main_assembly"),
                 "message": (
-                    "几何元数据不可读：证据无效，必须由独立检查判为失败。"
-                    "本报告不做面积容差或替代解释。"
+                    "Geometry metadata is unreadable. The evidence is invalid and independent "
+                    "verification must fail; this report applies no area tolerance or substitute "
+                    "interpretation."
                 ),
                 "source": geometry_source,
                 "evidence": {"unreadable": True},
@@ -601,8 +619,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.geometry_metadata_missing",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "快照清单要求几何记录（evidence/raw/geometry.json），但该证据缺失："
-                        "证据无效，必须由独立检查判为失败。本报告不采用默认值或替代解释。"
+                        "The snapshot inventory requires geometry evidence "
+                        "(evidence/raw/geometry.json), but it is missing. The evidence is invalid "
+                        "and independent verification must fail; this report uses no defaults or "
+                        "substitute interpretation."
                     ),
                     "source": geometry_source,
                     "evidence": {"required_by_manifest": True},
@@ -617,8 +637,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.geometry_metadata_invalid",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "几何元数据不符合已批准 schema：证据无效，必须由独立检查判为失败。"
-                        "本报告不做面积容差、不做替代解释。"
+                        "Geometry metadata does not match the approved schema. The evidence is "
+                        "invalid and independent verification must fail; this report applies no area "
+                        "tolerance or substitute interpretation."
                     ),
                     "source": geometry_source,
                     "evidence": {
@@ -631,21 +652,24 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             for row in untessellated:
                 if "tessellate_probe_error" in row:
                     facets = (
-                        "在原生三角剖分中返回 0 个三角形，面元探针在几何退化面上重试后仍失败"
-                        f"（{row['tessellate_probe_error']}）"
+                        "Native tessellation returned zero triangles, and the facet probe still "
+                        "failed when retried on the degenerate geometry"
+                        f" ({row['tessellate_probe_error']})"
                     )
                 else:
-                    facets = "在原生三角剖分中返回 0 个三角形与 0 个面元"
+                    facets = "native tessellation returned zero triangles and zero facets"
                 entries.append(
                     {
                         "severity": "warning",
                         "code": "cad_sheet_face_untessellated",
                         "object": f"{row['component']} sheet body {row['body_index']} face {row['face_index']}",
                         "message": (
-                            f"该曲面（component {row['component']}；body_type 1；body_index {row['body_index']}，"
-                            f"face_index {row['face_index']}）{facets}，"
-                            f"原生面积量测为 {row['area_m2']!r} m²：CAD 未提供该曲面的可导出三角剖分；"
-                            "本报告保留原始事实、不断言零面积；曲面几何的完整性与可用性未经独立确认。"
+                            f"This surface (component {row['component']}; body_type 1; body_index {row['body_index']}, "
+                            f"face_index {row['face_index']}); {facets}; "
+                            f"native area is {row['area_m2']!r} m^2: CAD provided no exportable "
+                            "tessellation for the surface. This report retains the raw fact without "
+                            "claiming zero area; surface completeness and usability are not "
+                            "independently confirmed."
                         ),
                         "source": "evidence/raw/geometry.json/tessellation/no_facets_faces",
                         "evidence": row,
@@ -695,8 +719,12 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     valid = False
                     break
                 mass = row.get("mass_kg")
-                if (isinstance(mass, bool) or not isinstance(mass, (int, float))
-                        or not _math.isfinite(mass) or mass <= 0):
+                if (
+                    isinstance(mass, bool)
+                    or not isinstance(mass, (int, float))
+                    or not _math.isfinite(mass)
+                    or mass <= 0
+                ):
                     valid = False
                     break
         if not valid:
@@ -706,8 +734,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.selection_accounting_invalid",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "选择核算记录不符合已批准 schema：证据无效，必须由独立检查判为失败。"
-                        "本报告不采用默认值、不做替代解释。"
+                        "Selection-accounting evidence does not match the approved schema. The "
+                        "evidence is invalid and independent verification must fail; this report uses "
+                        "no defaults or substitute interpretation."
                     ),
                     "source": f"{selection_source}/derived/selection",
                     "evidence": selection,
@@ -721,8 +750,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "code": "report.selection_accounting_invalid",
                         "object": receipt.get("main_assembly"),
                         "message": (
-                            f"选择核算残留为 {selection['accounting_delta_kg']!r} kg（容差 1e-12 kg）："
-                            "证据无效，必须由独立检查判为失败。"
+                            f"Selection-accounting residual is {selection['accounting_delta_kg']!r} "
+                            "kg (tolerance 1e-12 kg). The evidence is invalid and independent "
+                            "verification must fail."
                         ),
                         "source": f"{selection_source}/derived/selection",
                         "evidence": selection,
@@ -735,10 +765,12 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "code": "cad_unassigned_occurrence_mass",
                         "object": row["component"],
                         "message": (
-                            f"该 CAD 实例未进入所选交付（component {row['component']}；parent {row['parent']}；"
-                            f"document {row['document']}；configuration {row['configuration']}）："
-                            f"质量为原生记录读数 {row['mass_kg']!r} kg；质量归属的工程资格暂未确认"
-                            "（qualification withheld）；本报告不据此声称输入缺失或流水线失败。"
+                            f"This CAD instance is not in the selected delivery "
+                            f"(component {row['component']}; parent {row['parent']}; "
+                            f"document {row['document']}; configuration {row['configuration']}): "
+                            f"native mass is {row['mass_kg']!r} kg; engineering qualification of "
+                            "its mass ownership is withheld. "
+                            "This report does not claim missing input or pipeline failure from that fact."
                         ),
                         "source": f"{selection_source}/derived/selection/unassigned",
                         "evidence": row,
@@ -751,11 +783,11 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "code": "cad_native_mass_gap_unqualified",
                         "object": receipt.get("main_assembly"),
                         "message": (
-                            "原生整体质量与所选交付质量之差为 "
+                            "The difference between native whole-assembly mass and selected-delivery mass is "
                             f"{selection['native_mass_kg'] - selection['selected_mass_kg']!r} kg"
-                            f"（native {selection['native_mass_kg']!r} − selected {selection['selected_mass_kg']!r}；"
-                            f"未分配合计 {selection['unassigned_mass_kg']!r} kg，未作归一化）；"
-                            "只要存在未分配实例，整体质量资格即不予确认（qualification withheld）。"
+                            f" (native {selection['native_mass_kg']!r} - selected {selection['selected_mass_kg']!r}; "
+                            f"unassigned total {selection['unassigned_mass_kg']!r} kg; no normalization was applied). "
+                            "Whole-mass qualification remains withheld while unassigned instances exist."
                         ),
                         "source": f"{selection_source}/derived/selection",
                         "evidence": selection,
@@ -770,8 +802,9 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 "code": "report.material_provenance_invalid",
                 "object": receipt.get("main_assembly"),
                 "message": (
-                    "材料来源证据不可读：证据无效，必须由独立检查判为失败。"
-                    "本报告不采用默认值、不做替代解释、不据此输出材料警告。"
+                    "Material-provenance evidence is unreadable. The evidence is invalid and "
+                    "independent verification must fail; this report uses no defaults or substitute "
+                    "interpretation and emits no material warning from it."
                 ),
                 "source": material_source,
                 "evidence": {"unreadable": True},
@@ -787,8 +820,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.material_provenance_missing",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "快照清单要求材料来源记录（evidence/raw/material_provenance.json），但该证据缺失："
-                        "证据无效，必须由独立检查判为失败。本报告不采用默认值或替代解释。"
+                        "The snapshot inventory requires material-provenance evidence "
+                        "(evidence/raw/material_provenance.json), but it is missing. The evidence is "
+                        "invalid and independent verification must fail; this report uses no defaults "
+                        "or substitute interpretation."
                     ),
                     "source": material_source,
                     "evidence": {"required_by_manifest": True},
@@ -805,9 +840,10 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                     "code": "report.material_provenance_invalid",
                     "object": receipt.get("main_assembly"),
                     "message": (
-                        "材料来源证据不符合当前 schema：证据无效，必须由独立检查判为失败。"
-                        "本报告不采用默认值、不做替代解释、不据此输出材料警告；"
-                        "请用当前生产者的规范记录替换该证据。"
+                        "Material-provenance evidence does not match the current schema. The "
+                        "evidence is invalid and independent verification must fail. This report uses "
+                        "no defaults or substitute interpretation and emits no material warning from "
+                        "it; replace the evidence with a canonical record from the current producer."
                     ),
                     "source": material_source,
                     "evidence": {
@@ -830,12 +866,18 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "severity": "blocker" if blocking else "warning",
                         "code": "native.material_provenance_missing",
                         "object": item.get("component") or item.get("document"),
-                        "message": "SolidWorks 实体缺少显式物理材料赋值（默认密度不作为材料证据）："
+                        "message": (
+                            "The SolidWorks body has no explicit physical material assignment "
+                            "(default density is not material evidence): "
+                        )
                         + (
-                            "该记录标记为阻断，必须由独立检查判为失败。"
+                            "The record is blocking and independent verification must fail."
                             if blocking
-                            else "按可警告缺陷记录——流水线保留 CAD 实测质量、质心与惯量并继续生成与独立校验；"
-                            "本报告不据此声称材料已核验，材料真实性与物理/动力学合格仍属外部工程确认。"
+                            else "recorded as a warning-level defect: the pipeline preserves "
+                            "measured CAD mass, COM, and inertia and continues generation and "
+                            "independent verification. This report does not claim verified material; "
+                            "material truth and physical/dynamic qualification remain external "
+                            "engineering confirmation."
                         ),
                         "source": "evidence/raw/material_provenance.json/warnings",
                         "evidence": {
@@ -886,27 +928,34 @@ def _fenced(value) -> str:
 def render_structural_markdown(report: dict) -> str:
     summary = report["summary"]
     lines = [
-        "# 结构组 CAD → URDF 问题报告",
+        "# Structural CAD-to-URDF issue report",
         "",
-        f"运行：{report.get('run_id') or '未指定'}",
+        f"Run: {report.get('run_id') or 'not specified'}",
         "",
-        f"运行状态：{report.get('state') or '未记录'}；"
-        f"警告 {summary['warnings']} 项，阻断问题 {summary['blockers']} 项。",
+        f"Run state: {report.get('state') or 'not recorded'}; "
+        f"{summary['warnings']} warnings and {summary['blockers']} blocking issues.",
         "",
-        "本报告由 pipeline 自动生成，汇总本次运行已记录的事实。警告保留在报告中；"
-        "是否通过独立校验，以该次运行的质量报告为准。报告不补写 CAD 中缺失的工程参数。",
+        "This report is generated by the pipeline from recorded run facts. Warnings remain "
+        "visible; the run quality report decides whether independent verification passed. "
+        "This report does not invent missing CAD engineering parameters.",
         "",
-        "## 输入与输出",
+        "## Inputs and outputs",
         "",
         _fenced({key: report.get(key) for key in ("main_assembly", "upload_sha256", "handoff_sha256", "urdf_files")}),
         "",
     ]
     if not report["urdf_files"]:
-        lines.extend(["本阶段尚未产生 URDF；原生采集成功时，由 Linux 后续阶段生成。", ""])
+        lines.extend(
+            [
+                "This stage has not produced a URDF; after a successful native capture, "
+                "Linux generation stages produce it.",
+                "",
+            ]
+        )
     if not report["findings"]:
-        lines.extend(["本次阶段记录中未发现需结构组处理的问题。", ""])
+        lines.extend(["The stage records contain no issues requiring structural-team action.", ""])
     for index, item in enumerate(report["findings"], 1):
-        label = "警告" if item["severity"] == "warning" else "阻断"
+        label = "Warning" if item["severity"] == "warning" else "Blocking"
         # Evidence strings remain inside JSON fences, so CAD names cannot alter
         # report structure or turn recorded text into active markup.
         lines.extend(
@@ -915,8 +964,9 @@ def render_structural_markdown(report: dict) -> str:
                 "",
                 _fenced({key: item.get(key) for key in ("code", "object", "message", "source", "evidence")}),
                 "",
-                "处理依据：请根据上述 CAD 对象和原始证据检查装配引用、导出声明或相关参数；"
-                "如属读取器问题，应修复 pipeline 后对相同 CAD 字节重跑。",
+                "Action: inspect the assembly references, exporter declarations, and related "
+                "parameters using the CAD object and raw evidence above. "
+                "If the reader is defective, fix the pipeline and rerun against the same CAD bytes.",
                 "",
             ]
         )

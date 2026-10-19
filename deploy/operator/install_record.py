@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assemble and persist the Linux-side install record for one generation (IF-16).
 
-Contract: ``docs/deployment.md`` §安装 Linux 平台 / §维护、升级与恢复 (the install record names
+Contract: ``docs/deployment.md`` Linux installation / maintenance, upgrade, and recovery (the install record names
 every managed service and path; the lifecycle reads the same record), frozen-interfaces-v1.1
 IF-16, and the D04 per-end binding: ``ends.linux`` carries this host's snapshot digest while
 ``ends.windows`` carries the isolated endpoint's own generation - the two are never compared for
@@ -505,9 +505,7 @@ def validate_endpoint_health(health_document, release: dict) -> tuple[dict, dict
     identity = {
         "install_id": health["install"]["install_id"],
         "config_digest": health["install"]["config_digest"],
-        "release": {
-            key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")
-        },
+        "release": {key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")},
     }
     return identity, health
 

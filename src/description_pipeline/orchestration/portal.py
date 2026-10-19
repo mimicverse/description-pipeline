@@ -110,7 +110,7 @@ _AIRFLOW_TIMEOUT = 20.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,250}\Z")
 _STAGE_IDS = tuple(stage["id"] for stage in CONTRACT["stages"])
-_STAGE_NAMES_ZH = {stage["id"]: stage.get("name_zh") or stage["id"] for stage in CONTRACT["stages"]}
+_STAGE_NAMES = {stage["id"]: stage.get("name") or stage["id"] for stage in CONTRACT["stages"]}
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 #: Row overlay when a run has no platform display row (treated read-only).
 _EMPTY_OVERLAY = {"title": None, "deleted": False, "deleted_at": None, "deleted_by": None}
@@ -127,14 +127,14 @@ def normalise_title(value: object) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise TitleError("运行名称必须是文本")
+        raise TitleError("Run title must be text")
     text = value.strip()
     if not text:
-        raise TitleError("运行名称不能为空；如需恢复默认名称请传入 null")
+        raise TitleError("Run title cannot be empty; pass null to restore the default")
     if len(text) > MAX_TITLE:
-        raise TitleError(f"运行名称最多 {MAX_TITLE} 个字符")
+        raise TitleError(f"Run title cannot exceed {MAX_TITLE} characters")
     if any(unicodedata.category(character).startswith("C") for character in text):
-        raise TitleError("运行名称包含不可见的控制字符")
+        raise TitleError("Run title contains invisible control characters")
     return text
 
 
@@ -150,6 +150,8 @@ def _display_overlay(display: object) -> dict:
         "deleted_at": display.hidden_at.isoformat() if display.hidden_at is not None else None,
         "deleted_by": display.hidden_reason,
     }
+
+
 #: Task states that still own execution; an unknown (None) state stays a refusal too.
 _ACTIVE_TASK_STATES = {"running", "queued", "scheduled", "up_for_retry", "up_for_reschedule", "deferred"}
 #: Task states that are terminal; anything else (including new Airflow states) fails closed.
@@ -199,7 +201,7 @@ def _failing_checks(report: dict) -> list[dict]:
             {
                 "id": str(row.get("id") or ""),
                 "state": str(row.get("state") or "failed"),
-                "message": str(details.get("error") or details.get("reason") or "自动检查未通过"),
+                "message": str(details.get("error") or details.get("reason") or "Automatic check failed"),
             }
         )
     return checks
@@ -215,13 +217,13 @@ def _parse_registered_json(data: bytes) -> dict:
     """
 
     if not isinstance(data, (bytes, bytearray)):
-        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容无法解析，已拒绝提供")
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered diagnostic content cannot be parsed")
     try:
         parsed = json.loads(bytes(data).decode("utf-8-sig"))
     except (ValueError, UnicodeDecodeError) as error:
-        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容无法解析，已拒绝提供") from error
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered diagnostic content cannot be parsed") from error
     if not isinstance(parsed, dict):
-        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容无法解析，已拒绝提供")
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered diagnostic content cannot be parsed")
     return parsed
 
 
@@ -239,7 +241,7 @@ def _registered_source_rows(report: dict, field: str, *, code_required: bool = F
     if not isinstance(rows, list) or any(
         not isinstance(row, dict) or (code_required and not row.get("code")) for row in rows
     ):
-        raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断内容结构无效，已拒绝提供")
+        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered diagnostic content has an invalid structure")
     return rows
 
 
@@ -279,8 +281,8 @@ def _delivery_warnings(members: dict) -> list[dict]:
 
 #: Readable labels for the automatically retained structural-team reports.
 _STRUCTURAL_REPORT_LABELS = {
-    "reports/structural-team.md": "结构团队报告（可读 Markdown）",
-    "reports/structural-team.json": "结构团队报告（结构化发现与参数）",
+    "reports/structural-team.md": "Structural-team report (readable Markdown)",
+    "reports/structural-team.json": "Structural-team report (structured findings and parameters)",
 }
 _STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -311,11 +313,17 @@ def _verified_admission_config_digest(provider: Callable[[], str] | None = None)
         try:
             value = config_from_airflow_connection("solidworks_windows").config_digest
         except Exception as error:
-            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "平台配置身份不可用，本次提交未接纳") from error
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Platform configuration identity is unavailable; submission was not admitted",
+            ) from error
     else:
         value = str(provider()).strip()
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "平台配置身份不可用，本次提交未接纳")
+        raise PortalError(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            "Platform configuration identity is unavailable; submission was not admitted",
+        )
     return value
 
 
@@ -792,9 +800,9 @@ def _admission_matches(
     )
 
 
-def _stage_name_zh(value: object) -> str | None:
+def _stage_name(value: object) -> str | None:
     stage = _optional_str(value)
-    return _STAGE_NAMES_ZH.get(stage) if stage is not None else None
+    return _STAGE_NAMES.get(stage) if stage is not None else None
 
 
 def suggest_target(candidates: list[str], targets: dict[str, dict]) -> str | None:
@@ -816,9 +824,9 @@ def _page_integer(query: dict, name: str, *, default: int, minimum: int, maximum
     try:
         value = int(raw)
     except (TypeError, ValueError) as error:
-        raise PortalError(HTTPStatus.BAD_REQUEST, f"分页参数 {name} 不合法") from error
+        raise PortalError(HTTPStatus.BAD_REQUEST, f"Pagination parameter {name} is invalid") from error
     if value < minimum or value > maximum:
-        raise PortalError(HTTPStatus.BAD_REQUEST, f"分页参数 {name} 超出范围")
+        raise PortalError(HTTPStatus.BAD_REQUEST, f"Pagination parameter {name} is out of range")
     return value
 
 
@@ -896,7 +904,7 @@ def _findings(job: dict | None) -> list[dict]:
                         "message": str(
                             (check.get("details") or {}).get("error")
                             or (check.get("details") or {}).get("reason")
-                            or "自动检查未通过"
+                            or "Automatic check failed"
                         ),
                         "evidence": check.get("details") or {},
                     }
@@ -938,7 +946,7 @@ def _automatic_summary(job: dict | None) -> dict:
             "state": "failed",
             "job_state": status,
             "checks": discovery_checks,
-            "message": "原生 CAD 解析未通过；请按逐项发现修正工程源",
+            "message": "Native CAD discovery failed; correct the engineering source for each finding",
         }
     if status == "failed":
         return {"state": "failed", "job_state": status, "checks": checks, "message": message}
@@ -959,9 +967,14 @@ _NATIVE_JOB_STATUSES = frozenset(
 )
 _RETRY_REFUSED_MESSAGES = {
     RECOVERY_UNKNOWN_PUBLICATION: (
-        "发布响应未知：为避免重复发布，此运行不可原地重试；请先完成结果对账，必要时从已确认检查点新建关联运行"
+        "Publication response is unknown. To prevent duplicate publication, this run cannot be "
+        "retried in place; reconcile the result first and, if needed, start a linked run from a "
+        "confirmed checkpoint"
     ),
-    RECOVERY_ENGINEERING_TERMINAL: ("工程阶段已终态失败：请按检查结果修复后新建关联运行；此运行不再原地重试"),
+    RECOVERY_ENGINEERING_TERMINAL: (
+        "The engineering stage failed terminally; fix the findings and start a linked run. "
+        "This run cannot be retried in place."
+    ),
 }
 
 
@@ -994,9 +1007,7 @@ def _registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
     return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
 
 
-def _retry_assessment(
-    run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None
-) -> RecoveryAssessment:
+def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None) -> RecoveryAssessment:
     states: dict[str, object] = {}
     for task in tasks:
         name = task.get("task_id")
@@ -1047,7 +1058,9 @@ def _coverage_report(job: dict | None, report: dict) -> dict:
         "automatic": {
             "state": report["overall"]["state"],
             "unsupported": [item["label"] for item in CONTRACT["unsupported"]],
-            "message": "自动校验状态见逐阶段报告；未覆盖类别属于外部评审范围。",
+            "message": (
+                "See the per-stage reports for automatic verification; uncovered categories belong to external review."
+            ),
         },
         "engineering": {
             "state": "external_review" if verified else "not_ready",
@@ -1064,7 +1077,10 @@ def _coverage_report(job: dict | None, report: dict) -> dict:
                 }
                 for item in CONTRACT["confirmations"]
             ],
-            "message": "外部评审跟踪：平台不读取或代管评审批准；重跑时未变化事实可沿用既有批准，仅变化项需重新确认。",
+            "message": (
+                "External review tracking: the platform neither reads nor manages approvals. "
+                "Unchanged facts may retain approval on rerun; changed items require confirmation."
+            ),
         },
     }
 
@@ -1120,7 +1136,7 @@ class PortalApp:
             if method == "GET":
                 return self._session_info(environ, start_response)
             if method == "POST":
-                raise PortalError(HTTPStatus.METHOD_NOT_ALLOWED, "请求方法不被允许")
+                raise PortalError(HTTPStatus.METHOD_NOT_ALLOWED, "Request method is not allowed")
             if method == "DELETE":
                 return self._logout(environ, start_response)
         if path == "/api/runs":
@@ -1158,11 +1174,11 @@ class PortalApp:
         cookies = _parse_cookies(environ.get("HTTP_COOKIE"))
         session = self.sessions.get(cookies.get(DEFAULT_SESSION_COOKIE))
         if session is None:
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "请使用飞书登录")
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Sign in with Feishu")
         if csrf:
             supplied = str(environ.get("HTTP_X_CSRF_TOKEN") or "")
             if not supplied or not hmac.compare_digest(supplied, session.csrf_token):
-                raise PortalError(HTTPStatus.FORBIDDEN, "请求校验失败，请刷新页面重试")
+                raise PortalError(HTTPStatus.FORBIDDEN, "Request validation failed; refresh the page and retry")
         return session
 
     def _adopt_airflow_session(self, token: str | None) -> PortalSession | None:
@@ -1176,7 +1192,7 @@ class PortalApp:
         try:
             profile = self.config.airflow.profile(token)
         except AirflowAuthError as error:
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已过期，请重新登录") from error
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
         except AirflowApiError as error:
             raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         open_id = profile.get("open_id")
@@ -1186,14 +1202,14 @@ class PortalApp:
         # actor value must fit the metadata column); anything else is refused rather than shown
         # as an identifier or the viewing operator.
         if not isinstance(open_id, str) or not open_id.strip():
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回有效的飞书身份")
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow returned no valid Feishu identity")
         if not isinstance(principal, str) or not principal.strip():
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回稳定的飞书身份")
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow returned no stable Feishu identity")
         try:
             recorded = recorded_display_name(name)
             build_actor_name(principal.strip(), recorded)
         except ValueError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回可记录的飞书身份") from error
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow returned no recordable Feishu identity") from error
         avatar = profile.get("avatar_url")
         return self.sessions.create(
             recorded,
@@ -1208,14 +1224,14 @@ class PortalApp:
             profile = self.config.airflow.profile(session.token)
         except AirflowAuthError as error:
             self.sessions.drop(session.session_id)
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已过期，请重新登录") from error
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
         except AirflowApiError as error:
             raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         principal = profile.get("principal")
         try:
             build_actor_name(principal, recorded_display_name(profile.get("name")))
         except ValueError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 未返回可记录的飞书身份") from error
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow returned no recordable Feishu identity") from error
         components = [profile.get(key) for key in ("app_id", "tenant_key", "open_id")]
         if (
             not all(isinstance(value, str) and value for value in components)
@@ -1223,7 +1239,7 @@ class PortalApp:
             or principal != session.principal
         ):
             self.sessions.drop(session.session_id)
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书身份已变更，请重新登录")
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu identity changed; sign in again")
         return principal, profile.get("role") == "ADMIN"
 
     def _can_manage(self, session: PortalSession, run: dict) -> bool:
@@ -1240,7 +1256,7 @@ class PortalApp:
             # session in the browser with the portal's own opaque cookie.
             session = self._adopt_airflow_session(cookies.get(AIRFLOW_TOKEN_COOKIE))
             if session is None:
-                raise PortalError(HTTPStatus.UNAUTHORIZED, "请使用飞书登录")
+                raise PortalError(HTTPStatus.UNAUTHORIZED, "Sign in with Feishu")
             headers.append(("Set-Cookie", _session_cookie(session.session_id, environ, self.config)))
         return _json_response(
             start_response,
@@ -1312,7 +1328,9 @@ class PortalApp:
         pages = 0
         while True:
             if pages >= scan_budget:
-                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行历史过长，暂时无法定位更多记录，请稍后重试")
+                raise PortalError(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "Run history is too long to locate more records; retry later"
+                )
             try:
                 items = self.config.airflow.list_dag_runs(
                     session.token, self.config.dag_id, limit=page_size, offset=pages * page_size
@@ -1321,7 +1339,9 @@ class PortalApp:
                 raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
             except AirflowApiError as error:
                 # Never present a partial history as the complete one.
-                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "暂时无法读取运行列表，请稍后重试") from error
+                raise PortalError(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "Run list is temporarily unavailable; retry later"
+                ) from error
             pages += 1
             for item in items:
                 dag_run_id = str(item.get("dag_run_id") or "")
@@ -1346,7 +1366,7 @@ class PortalApp:
                         # Linked rerun lineage: derived from the child run's own conf only.
                         "parent_dag_run_id": _optional_str(conf.get("parent_dag_run_id")),
                         "resume_from": _optional_str(conf.get("resume_from")),
-                        "resume_from_name_zh": _stage_name_zh(conf.get("resume_from")),
+                        "resume_from_name": _stage_name(conf.get("resume_from")),
                         # Row-level action gate for the operator page (one profile check per list).
                         "can_manage": is_admin or owner == principal,
                         **overlay,
@@ -1372,12 +1392,17 @@ class PortalApp:
         if not principal:
             # The submitter identity is the strict profile principal only - never a
             # username fallback and never client text.
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again")
         content_type = str(environ.get("CONTENT_TYPE") or "")
         if not content_type.lower().startswith("multipart/form-data"):
-            raise PortalError(HTTPStatus.BAD_REQUEST, "请通过页面上的文件夹按钮上传工程文件夹后启动运行")
+            raise PortalError(
+                HTTPStatus.BAD_REQUEST, "Upload an engineering folder with the page control before starting a run"
+            )
         if self.config.upload_root is None:
-            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "服务端尚未配置上传目录，请联系管理员")
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "The server has no configured upload directory; contact an administrator",
+            )
         # A cached portal session can outlive the Airflow token behind it; prove the live
         # profile before reading a single byte of a possibly multi-gigabyte body.
         try:
@@ -1386,14 +1411,14 @@ class PortalApp:
             return _json_response(
                 start_response,
                 HTTPStatus.UNAUTHORIZED,
-                {"error": "飞书登录已失效，请重新登录后重试"},
+                {"error": "Feishu session expired; sign in again and retry"},
                 self.config,
             )
         except AirflowApiError:
             return _json_response(
                 start_response,
                 HTTPStatus.BAD_GATEWAY,
-                {"error": "Airflow 暂时不可用，请稍后重试"},
+                {"error": "Airflow is temporarily unavailable; retry later"},
                 self.config,
             )
         try:
@@ -1402,14 +1427,14 @@ class PortalApp:
             return _json_response(
                 start_response,
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "平台服务暂不可用，请稍后重试"},
+                {"error": "Platform service is temporarily unavailable; retry later"},
                 self.config,
             )
         if admission.state != "open":
             return _json_response(
                 start_response,
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "平台准入窗口已关闭，暂不接待新的运行提交"},
+                {"error": "Platform admission is closed; new run submissions are not accepted"},
                 self.config,
             )
         dag_run_id = f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
@@ -1433,21 +1458,19 @@ class PortalApp:
             raise PortalError(error.status, error.message) from error
         target_hardware = receipt.target_hardware.strip() if isinstance(receipt.target_hardware, str) else ""
         if not target_hardware:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请选择发布目标后重试")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Publication target is required; select one and retry")
         if target_hardware not in (self.config.pipeline_targets or {}):
-            raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再提交")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Publication target is not configured; select another target")
         change_summary = (
-            normalize_change_summary(receipt.change_summary).strip()
-            if isinstance(receipt.change_summary, str)
-            else ""
+            normalize_change_summary(receipt.change_summary).strip() if isinstance(receipt.change_summary, str) else ""
         )
         if not change_summary:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请填写后重试")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Change summary is required")
         purpose = receipt.purpose.strip() if isinstance(receipt.purpose, str) else ""
         if not purpose:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "用途为必填：请在页面上选择用途后重试")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Purpose is required; select one on the page")
         if purpose not in REQUEST_PURPOSES:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "用途不在平台配置中，请重新选择后再提交")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Purpose is not configured; select another purpose")
         handoff_path = str(self.config.upload_root / dag_run_id / receipt.folder)
         try:
             self._platform().admit_run(
@@ -1485,7 +1508,7 @@ class PortalApp:
             return _json_response(
                 start_response,
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "平台准入窗口已关闭，本次提交未接纳", "dag_run_id": dag_run_id},
+                {"error": "Platform admission is closed; submission was not admitted", "dag_run_id": dag_run_id},
                 self.config,
             )
         except PlatformStoreError:
@@ -1493,7 +1516,10 @@ class PortalApp:
             return _json_response(
                 start_response,
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "平台服务暂不可用，本次提交未接纳", "dag_run_id": dag_run_id},
+                {
+                    "error": "Platform service is temporarily unavailable; submission was not admitted",
+                    "dag_run_id": dag_run_id,
+                },
                 self.config,
             )
         outcome = self._trigger_uploaded_run(
@@ -1509,7 +1535,7 @@ class PortalApp:
             return _json_response(
                 start_response,
                 HTTPStatus.UNAUTHORIZED,
-                {"error": "飞书登录已失效，请重新登录后重试", "dag_run_id": dag_run_id},
+                {"error": "Feishu session expired; sign in again and retry", "dag_run_id": dag_run_id},
                 self.config,
             )
         if outcome != "created":
@@ -1518,7 +1544,10 @@ class PortalApp:
                 start_response,
                 HTTPStatus.BAD_GATEWAY,
                 {
-                    "error": "运行启动状态尚未确认；上传已保留，请检查运行列表或联系管理员，不要重复提交",
+                    "error": (
+                        "Run start state is unconfirmed; the upload was retained. Check the run list "
+                        "or contact an administrator; do not submit again."
+                    ),
                     "dag_run_id": dag_run_id,
                     "trigger": outcome,
                 },
@@ -1602,7 +1631,7 @@ class PortalApp:
         except PlatformStoreError as error:
             log.error("run display state unavailable: %s", error)
             raise PortalError(
-                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+                HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
             ) from error
 
     def _metadata_snapshot(self) -> dict[str, dict]:
@@ -1612,7 +1641,7 @@ class PortalApp:
         except PlatformStoreError as error:
             log.error("run display state unavailable: %s", error)
             raise PortalError(
-                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+                HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
             ) from error
         return {run_id: _display_overlay(display) for run_id, display in displays.items()}
 
@@ -1622,7 +1651,7 @@ class PortalApp:
         except PlatformStoreError as error:
             log.error("run display state unavailable: %s", error)
             raise PortalError(
-                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+                HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
             ) from error
         return _display_overlay(display) if display is not None else dict(_EMPTY_OVERLAY)
 
@@ -1644,13 +1673,17 @@ class PortalApp:
         """Display-only rename; works for deleted runs and never touches native state."""
         session = self._session(environ, csrf=True)
         if _RUN_ID.fullmatch(dag_run_id) is None:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         body = self._body(environ)
         if set(body) != {"title"}:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "重命名只接受 title 参数；传入 null 恢复默认名称")
+            raise PortalError(
+                HTTPStatus.BAD_REQUEST, "Rename accepts only the title field; pass null to restore the default"
+            )
         run = self._require_run(session, dag_run_id)
         if not self._can_manage(session, run):
-            raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重命名此运行")
+            raise PortalError(
+                HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can rename this run"
+            )
         try:
             title = normalise_title(body["title"])
         except TitleError as error:
@@ -1658,10 +1691,14 @@ class PortalApp:
         try:
             display = self._platform().set_run_display(native_run_id(dag_run_id), title)
         except RunNotAdmittedError as error:
-            raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法重命名") from error
+            raise PortalError(
+                HTTPStatus.NOT_FOUND, "This run has no platform registration and cannot be renamed"
+            ) from error
         except PlatformStoreError as error:
             log.error("run display rename failed: %s", error)
-            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
+            ) from error
         return _json_response(
             start_response,
             200,
@@ -1673,10 +1710,12 @@ class PortalApp:
         """Reversible tombstone: the record moves to the shared Deleted view, nothing else changes."""
         session = self._session(environ, csrf=True)
         if _RUN_ID.fullmatch(dag_run_id) is None:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         run = self._require_run(session, dag_run_id)
         if not self._can_manage(session, run):
-            raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可删除此运行")
+            raise PortalError(
+                HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can delete this run"
+            )
         # Deleting must serialize with retry/rerun so a tombstone can never hide active work:
         # whoever holds this lock completes its state change before the other checks it.
         with self._rerun_lock:
@@ -1694,10 +1733,14 @@ class PortalApp:
                     native_run_id(dag_run_id), actor=self._actor_label(session, dag_run_id, run)
                 )
             except RunNotAdmittedError as error:
-                raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法删除") from error
+                raise PortalError(
+                    HTTPStatus.NOT_FOUND, "This run has no platform registration and cannot be deleted"
+                ) from error
             except PlatformStoreError as error:
                 log.error("run display hide failed: %s", error)
-                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+                raise PortalError(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
+                ) from error
             overlay = _display_overlay(display)
         log.info("portal deleted dag_run_id=%s principal=%s", dag_run_id, session.principal)
         return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
@@ -1706,58 +1749,64 @@ class PortalApp:
         """Any active or unknown execution state refuses deletion (fail closed)."""
         state = str(run.get("state") or "")
         if state in {"queued", "running"}:
-            return "run_active", "运行仍在执行，结束后才能删除"
+            return "run_active", "The run is still executing and can be deleted only after it ends"
         if state not in {"success", "failed"}:
-            return "unconfirmed", "无法确认运行已经结束，请稍后重试"
+            return "unconfirmed", "Cannot confirm that the run ended; retry later"
         try:
             tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
         except AirflowAuthError as error:
             raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
         except AirflowApiError:
-            return "unconfirmed", "无法确认运行中的任务状态，请稍后重试"
+            return "unconfirmed", "Cannot confirm active task states; retry later"
         for task in tasks:
             task_state = task.get("state")
             if task_state in _ACTIVE_TASK_STATES:
-                return "run_active", "运行仍有未结束的任务，结束后才能删除"
+                return "run_active", "The run still has unfinished tasks and can be deleted only after they end"
             if task_state not in _TERMINAL_TASK_STATES:
-                return "unconfirmed", "无法确认任务状态，请稍后重试"
+                return "unconfirmed", "Cannot confirm task states; retry later"
         try:
             job = self._endpoint().get_job(native_run_id(dag_run_id))
         except EndpointNotFound:
             job = None
         except EndpointError:
-            return "unconfirmed", "暂时无法确认原生作业状态，请稍后重试"
+            return "unconfirmed", "Cannot confirm native job state; retry later"
         if isinstance(job, dict):
             job_state = str(job.get("status") or "")
             if job_state in {"queued", "selecting", "running", "awaiting_definition"}:
-                return "run_active", "原生作业仍在执行，结束后才能删除"
+                return "run_active", "The native job is still executing and can be deleted only after it ends"
             # native_complete is a definitive native state: the Windows half is done and only
             # the Linux portable half may still be running (checked above).
             if job_state not in {"passed", "failed", "native_complete"}:
-                return "unconfirmed", "无法确认原生作业状态，请稍后重试"
+                return "unconfirmed", "Cannot confirm native job state; retry later"
         return None
 
     def _restore_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ, csrf=True)
         if _RUN_ID.fullmatch(dag_run_id) is None:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         run = self._require_run(session, dag_run_id)
         if not self._can_manage(session, run):
-            raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可恢复此运行")
+            raise PortalError(
+                HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can restore this run"
+            )
         try:
             overlay = _display_overlay(self._platform().restore_run(native_run_id(dag_run_id)))
         except RunNotAdmittedError as error:
-            raise PortalError(HTTPStatus.NOT_FOUND, "该运行没有平台登记，无法恢复") from error
+            raise PortalError(
+                HTTPStatus.NOT_FOUND, "This run has no platform registration and cannot be restored"
+            ) from error
         except PlatformStoreError as error:
             log.error("run display restore failed: %s", error)
-            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用，请稍后重试") from error
+            raise PortalError(
+                HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
+            ) from error
         log.info("portal restored dag_run_id=%s principal=%s", dag_run_id, session.principal)
         return _json_response(start_response, 200, {"dag_run_id": dag_run_id, **overlay}, self.config)
 
     def _run_status(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ)
         if _RUN_ID.fullmatch(dag_run_id) is None:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         try:
             airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
@@ -1806,7 +1855,7 @@ class PortalApp:
         report = build_report(job, view=stage_view_payload)
         # The purpose authority of both pages is the registered freeze request: a
         # mutable conf echo never decides the display, and an unfinished
-        # registration reads as "未记录".
+        # registration reads as "not recorded".
         projection = self._read_projection(run_id)
         purpose = self._registered_purpose(projection) if projection is not None else None
         payload = {
@@ -1821,7 +1870,7 @@ class PortalApp:
             # Linked rerun lineage from the child run's own conf, same fields as the list rows.
             "parent_dag_run_id": _optional_str(conf.get("parent_dag_run_id")),
             "resume_from": _optional_str(conf.get("resume_from")),
-            "resume_from_name_zh": _stage_name_zh(conf.get("resume_from")),
+            "resume_from_name": _stage_name(conf.get("resume_from")),
             "retry": {
                 "eligible": retry.eligible,
                 "reason": retry.reason,
@@ -1877,20 +1926,22 @@ class PortalApp:
     def _retry_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         session = self._session(environ, csrf=True)
         if _RUN_ID.fullmatch(dag_run_id) is None:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         if self._body(environ):
-            raise PortalError(HTTPStatus.BAD_REQUEST, "重试不接受运行参数")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Retry does not accept run parameters")
         try:
             run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, run):
-                raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重试此运行")
+                raise PortalError(
+                    HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can retry this run"
+                )
             # Deleted-record refusal and the retry state change are atomic against deletion.
             with self._rerun_lock:
                 if self._metadata_overlay(dag_run_id)["deleted"]:
                     return _json_response(
                         start_response,
                         HTTPStatus.CONFLICT,
-                        {"error": "已删除的运行不能重试，请先恢复", "reason": "deleted"},
+                        {"error": "Deleted runs cannot be retried; restore first", "reason": "deleted"},
                         self.config,
                     )
                 # Only a known live admitted registration opens the scheduling
@@ -1908,8 +1959,10 @@ class PortalApp:
                         HTTPStatus.CONFLICT,
                         {
                             "error": (
-                                "该运行没有可原地恢复的平台登记（缺失、未知、已终态或结果未决）：不可清除重试；"
-                                "未决结果请先完成对账，其余请按登记结果修复后新建关联运行"
+                                "This run has no platform registration that can be recovered in place "
+                                "(missing, unknown, terminal, or unresolved). Clear-and-retry is not allowed. "
+                                "Reconcile unresolved results; otherwise fix the registered result "
+                                "and start a linked run."
                             ),
                             "reason": reason,
                         },
@@ -1922,13 +1975,16 @@ class PortalApp:
                 except EndpointNotFound:
                     pass
                 except EndpointError as error:
-                    raise PortalError(HTTPStatus.CONFLICT, "无法确认原作业状态，请稍后重试") from error
+                    raise PortalError(
+                        HTTPStatus.CONFLICT, "Cannot confirm the original job state; retry later"
+                    ) from error
                 assessment = _retry_assessment(run, tasks, job, None)
                 if not assessment.eligible:
                     raise PortalError(
                         HTTPStatus.CONFLICT,
                         _RETRY_REFUSED_MESSAGES.get(
-                            assessment.classification, "此运行无法重试，请查看检查结果并按需新建运行"
+                            assessment.classification,
+                            "This run cannot be retried; review the check results and start a new run if needed",
                         ),
                     )
                 preview = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=True)
@@ -1939,7 +1995,7 @@ class PortalApp:
                     or preview.get("total_entries") != len(selected)
                     or any(not isinstance(task, dict) for task in selected)
                 ):
-                    raise PortalError(HTTPStatus.CONFLICT, "Airflow 未提供有效的重试任务检查结果")
+                    raise PortalError(HTTPStatus.CONFLICT, "Airflow returned no valid retry-task check")
                 selected_states = {}
                 for task in selected:
                     name = task.get("task_id")
@@ -1951,19 +2007,19 @@ class PortalApp:
                         or task.get("dag_id", self.config.dag_id) != self.config.dag_id
                         or task.get("dag_run_id", dag_run_id) != dag_run_id
                     ):
-                        raise PortalError(HTTPStatus.CONFLICT, "重试任务与原运行不一致")
+                        raise PortalError(HTTPStatus.CONFLICT, "Retry tasks do not match the original run")
                     selected_states[name] = task.get("state")
                 if tuple(sorted(selected_states)) != assessment.cleared_tasks:
-                    raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
+                    raise PortalError(HTTPStatus.CONFLICT, "Run state changed; refresh and retry")
                 if any(
                     selected_states[task["task_id"]] != task.get("state")
                     for task in tasks
                     if task.get("task_id") in selected_states
                 ):
-                    raise PortalError(HTTPStatus.CONFLICT, "运行状态已变化，请刷新后重试")
+                    raise PortalError(HTTPStatus.CONFLICT, "Run state changed; refresh and retry")
                 result = self.config.airflow.clear_dag_run(session.token, self.config.dag_id, dag_run_id, dry_run=False)
                 if result.get("dag_run_id") != dag_run_id or result.get("dag_id") != self.config.dag_id:
-                    raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow 返回的重试运行身份不一致")
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, "Airflow returned an inconsistent retry-run identity")
         except AirflowAuthError as error:
             forbidden = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 403
             raise PortalError(HTTPStatus.FORBIDDEN if forbidden else HTTPStatus.UNAUTHORIZED, str(error)) from error
@@ -2010,10 +2066,18 @@ class PortalApp:
             return None
         parent_dag_run_id = self._admitted_dag_run_id(record.get("request_id"))
         if parent_dag_run_id is None:
-            return (False, "originals_identity_missing", "原运行缺少可恢复的调度身份，拒绝从“冻结输入”重跑")
+            return (
+                False,
+                "originals_identity_missing",
+                "The original run has no recoverable scheduling identity; Freeze inputs cannot be rerun",
+            )
         handoff_path = _optional_str(conf.get("handoff_path")) if isinstance(conf, dict) else None
         if handoff_path is None:
-            return (False, "incomplete", "原运行缺少可复用的上传目录，无法从此步骤重新运行")
+            return (
+                False,
+                "incomplete",
+                "The original run has no reusable upload directory and cannot be rerun from this step",
+            )
         try:
             resolve_freeze_retry_identity(
                 self._platform(),
@@ -2024,12 +2088,12 @@ class PortalApp:
                 intake_root=self.config.upload_root,
             )
         except FreezeRetryRefusal as refusal:
-            return (False, refusal.reason, refusal.reason_zh)
+            return (False, refusal.reason, refusal.message)
         except PlatformStoreError as error:
             raise PortalError(
-                HTTPStatus.SERVICE_UNAVAILABLE, "运行记录元数据暂时不可用；为避免显示错误请稍后重试"
+                HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
             ) from error
-        return (True, "linux_ready", "可在 Linux 重跑“冻结输入”并复用已封存原件")
+        return (True, "linux_ready", "Freeze inputs can be rerun on Linux with the sealed originals")
 
     def _rerun_rows(self, native_id: str, conf: dict | None = None) -> list[dict] | None:
         """Finished stage-rerun availability rows; unavailable data is omitted, never faked."""
@@ -2060,10 +2124,10 @@ class PortalApp:
             rows = [
                 {
                     "stage": stage["id"],
-                    "name_zh": stage["name_zh"],
+                    "name": stage["name"],
                     "eligible": False,
                     "reason": "linux_owned",
-                    "reason_zh": "该阶段由 Windows 原生端提供或已复用",
+                    "message": "This stage is provided by the Windows native endpoint or was reused",
                     "recomputes": [stage["id"]],
                     "retains": [],
                     "prerequisites": [],
@@ -2080,7 +2144,7 @@ class PortalApp:
             row.update(
                 eligible=bool(ready),
                 reason="linux_ready" if ready else "linux_checkpoint_missing",
-                reason_zh="可在 Linux 便携端重跑" if ready else "缺少可在 Linux 重跑的检查点",
+                message="Restartable on Linux" if ready else "No Linux-restartable checkpoint is available",
                 # The native plan's prerequisite summary describes the Windows half only
                 # (its receipt accounting cannot see post-capture evidence); for the
                 # portable surface the verdict above is proven by the local checkpoints.
@@ -2089,14 +2153,14 @@ class PortalApp:
             )
         verdict = self._freeze_retry_stand(native_id, conf) if conf is not None else None
         if verdict is not None:
-            eligible, reason, reason_zh = verdict
+            eligible, reason, message = verdict
             for row in rows:
                 if row.get("stage") != "freeze":
                     continue
                 row.update(
                     eligible=eligible,
                     reason=reason,
-                    reason_zh=reason_zh,
+                    message=message,
                     recomputes=list(_STAGE_IDS) if eligible else [],
                     retains=[],
                     prerequisites={},
@@ -2126,7 +2190,7 @@ class PortalApp:
         """
         if not isinstance(request_id, str) or not request_id.startswith("portal-"):
             return None
-        candidate = request_id[len("portal-"):]
+        candidate = request_id[len("portal-") :]
         return candidate if _RUN_ID.fullmatch(candidate) is not None else None
 
     def _open_linked_child(self, parent_dag_run_id: str) -> tuple[str, str | None] | None:
@@ -2189,7 +2253,7 @@ class PortalApp:
             "dag_run_id": new_run_id,
             "parent_dag_run_id": parent_dag_run_id,
             "resume_from": stage,
-            "resume_from_name_zh": _STAGE_NAMES_ZH.get(stage, stage),
+            "resume_from_name": _STAGE_NAMES.get(stage, stage),
             "state": state,
         }
 
@@ -2207,15 +2271,15 @@ class PortalApp:
         self,
         start_response: Callable,
         reason: str,
-        reason_zh: str,
+        message: str,
         earliest_required: str | None,
         *,
         active_dag_run_id: str | None = None,
     ) -> Iterable[bytes]:
         payload = {
-            "error": reason_zh,
+            "error": message,
             "reason": reason,
-            "reason_zh": reason_zh,
+            "message": message,
             "earliest_required": earliest_required,
         }
         if active_dag_run_id is not None:
@@ -2227,37 +2291,45 @@ class PortalApp:
         session = self._session(environ, csrf=True)
         principal = session.principal or ""
         if not principal:
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again")
         if _RUN_ID.fullmatch(dag_run_id) is None:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         body = self._body(environ)
         stage = body.get("stage")
         keys = {"stage", "target_hardware", "change_summary"}
         if set(body) - keys or not isinstance(stage, str) or stage not in _STAGE_IDS:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 与发布目标参数")
+            raise PortalError(
+                HTTPStatus.BAD_REQUEST, "Rerun accepts only a valid stage and publication-target parameters"
+            )
         overrides: dict[str, str] = {}
         for key in ("target_hardware", "change_summary"):
             if key in body:
                 if not isinstance(body[key], str):
-                    raise PortalError(HTTPStatus.BAD_REQUEST, "重新运行只接受有效的 stage 与发布目标参数")
+                    raise PortalError(
+                        HTTPStatus.BAD_REQUEST, "Rerun accepts only a valid stage and publication-target parameters"
+                    )
                 overrides[key] = body[key].strip()
         try:
             airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, airflow_run):
-                raise PortalError(HTTPStatus.FORBIDDEN, "只有发起人或平台管理员可重新运行此运行")
+                raise PortalError(
+                    HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can rerun this run"
+                )
             parent_conf = airflow_run.get("conf") if isinstance(airflow_run.get("conf"), dict) else {}
             handoff_path = _optional_str(parent_conf.get("handoff_path"))
             if handoff_path is None:
                 return self._rerun_refusal(
                     start_response,
                     "incomplete",
-                    "原运行缺少可复用的上传目录，无法从此步骤重新运行",
+                    "The original run has no reusable upload directory and cannot be rerun from this step",
                     None,
                 )
             with self._rerun_lock:
                 if self._metadata_overlay(dag_run_id)["deleted"]:
                     # Readable evidence, but not a valid starting point until restored.
-                    return self._rerun_refusal(start_response, "deleted", "已删除的运行不能重新运行，请先恢复", None)
+                    return self._rerun_refusal(
+                        start_response, "deleted", "Deleted runs cannot be rerun; restore first", None
+                    )
                 # This request's effective frame, validated once here and reused by the
                 # existing-attempt comparison and by the trigger itself.
                 target_hardware = (
@@ -2266,21 +2338,21 @@ class PortalApp:
                     else _optional_str(parent_conf.get("target_hardware"))
                 )
                 if not target_hardware:
-                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标为必填：请在重新运行时选择发布目标")
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "Publication target is required when rerunning")
                 if target_hardware not in (self.config.pipeline_targets or {}):
-                    raise PortalError(HTTPStatus.BAD_REQUEST, "发布目标不在平台配置中，请重新选择后再重新运行")
+                    raise PortalError(
+                        HTTPStatus.BAD_REQUEST, "Publication target is not configured; select another target"
+                    )
                 change_summary = (
                     overrides["change_summary"]
                     if "change_summary" in overrides
                     else _optional_str(parent_conf.get("change_summary"))
                 )
                 change_summary = (
-                    normalize_change_summary(change_summary).strip()
-                    if isinstance(change_summary, str)
-                    else ""
+                    normalize_change_summary(change_summary).strip() if isinstance(change_summary, str) else ""
                 )
                 if not change_summary:
-                    raise PortalError(HTTPStatus.BAD_REQUEST, "变更说明为必填：请在重新运行时填写")
+                    raise PortalError(HTTPStatus.BAD_REQUEST, "Change summary is required when rerunning")
                 parent_assembly = _optional_str(parent_conf.get("main_assembly"))
                 # The linked attempt inherits the parent's declared purpose and never
                 # accepts a new one; a parent without it cannot be re-run.
@@ -2289,7 +2361,7 @@ class PortalApp:
                     return self._rerun_refusal(
                         start_response,
                         "incomplete",
-                        "原运行缺少用途标识（purpose），无法从此步骤重新运行",
+                        "The original run has no purpose identifier and cannot be rerun from this step",
                         None,
                     )
                 # The platform admission of the child IS the reservation: an open admitted
@@ -2306,7 +2378,7 @@ class PortalApp:
                             return self._rerun_refusal(
                                 start_response,
                                 "already_active",
-                                "已有正在执行的关联尝试，请等待其结束",
+                                "A linked attempt is already running; wait for it to finish",
                                 None,
                                 active_dag_run_id=child_id,
                             )
@@ -2322,7 +2394,8 @@ class PortalApp:
                             return self._rerun_refusal(
                                 start_response,
                                 "attempt_mismatch",
-                                "已存在的关联尝试与本次参数不一致，请等待其结束或恢复原参数",
+                                "An existing linked attempt uses different parameters; wait for it "
+                                "to finish or restore the original parameters",
                                 None,
                                 active_dag_run_id=child_id,
                             )
@@ -2335,7 +2408,7 @@ class PortalApp:
                         return self._rerun_refusal(
                             start_response,
                             "already_active",
-                            "已有未完成的关联尝试，请稍后重试",
+                            "A linked attempt is already incomplete; retry later",
                             None,
                             active_dag_run_id=child_id,
                         )
@@ -2369,7 +2442,8 @@ class PortalApp:
                         return self._rerun_refusal(
                             start_response,
                             "attempt_mismatch",
-                            "已存在的关联尝试与本次准入请求不一致，请等待其结束或恢复原请求",
+                            "An existing linked attempt differs from this admission request; wait "
+                            "for it to finish or restore the original request",
                             None,
                             active_dag_run_id=child_id,
                         )
@@ -2379,7 +2453,7 @@ class PortalApp:
                     return self._rerun_refusal(
                         start_response,
                         "endpoint_evidence_unavailable",
-                        "暂时无法确认可复用的检查点，请稍后重试",
+                        "Cannot currently confirm a reusable checkpoint; retry later",
                         None,
                     )
                 row = next((item for item in rows if isinstance(item, dict) and item.get("stage") == stage), None)
@@ -2392,7 +2466,7 @@ class PortalApp:
                     return self._rerun_refusal(
                         start_response,
                         str((row or {}).get("reason") or "not_ready") if isinstance(row, dict) else "not_ready",
-                        str((row or {}).get("reason_zh") or "当前无法从此步骤重新运行"),
+                        str((row or {}).get("message") or "This step cannot currently be rerun"),
                         _optional_str(prerequisites.get("earliest_required")),
                     )
                 new_run_id = reserved_id or f"portal-{datetime.now(UTC):%Y%m%dT%H%M%S}-{secrets.token_hex(4)}"
@@ -2423,12 +2497,12 @@ class PortalApp:
                             intake_root=self.config.upload_root,
                         )
                     except FreezeRetryRefusal as refusal:
-                        return self._rerun_refusal(start_response, refusal.reason, refusal.reason_zh, None)
+                        return self._rerun_refusal(start_response, refusal.reason, refusal.message, None)
                     except PlatformStoreError:
                         return _json_response(
                             start_response,
                             HTTPStatus.SERVICE_UNAVAILABLE,
-                            {"error": "平台服务暂不可用，本次重新运行未接纳"},
+                            {"error": "Platform service is temporarily unavailable; rerun was not admitted"},
                             self.config,
                         )
                     admit_baseline = {
@@ -2475,7 +2549,7 @@ class PortalApp:
                         return self._rerun_refusal(
                             start_response,
                             "already_active",
-                            "已有并发开始的关联尝试，请刷新后重试",
+                            "A concurrent linked attempt has started; refresh and retry",
                             None,
                             active_dag_run_id=self._admitted_dag_run_id(error.request_id),
                         )
@@ -2483,19 +2557,19 @@ class PortalApp:
                         return _json_response(
                             start_response,
                             HTTPStatus.SERVICE_UNAVAILABLE,
-                            {"error": "平台准入窗口已关闭，本次重新运行未接纳"},
+                            {"error": "Platform admission is closed; rerun was not admitted"},
                             self.config,
                         )
                     except PlatformStoreError:
                         return _json_response(
                             start_response,
                             HTTPStatus.SERVICE_UNAVAILABLE,
-                            {"error": "平台服务暂不可用，本次重新运行未接纳"},
+                            {"error": "Platform service is temporarily unavailable; rerun was not admitted"},
                             self.config,
                         )
                 outcome = self._trigger_linked_attempt(session, new_run_id, conf)
                 if outcome == "auth":
-                    raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录")
+                    raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again")
                 if outcome == "absent":
                     # The durable reservation is the platform admission itself; a retry
                     # reuses the exact admitted child id.
@@ -2503,7 +2577,10 @@ class PortalApp:
                         start_response,
                         HTTPStatus.BAD_GATEWAY,
                         {
-                            "error": "启动状态尚未确认，请在运行列表中核对新尝试；不要重复提交",
+                            "error": (
+                                "Start state is unconfirmed; check the run list for the new "
+                                "attempt and do not submit again"
+                            ),
                             "dag_run_id": new_run_id,
                         },
                         self.config,
@@ -2512,7 +2589,7 @@ class PortalApp:
             return self._rerun_refusal(
                 start_response,
                 "unresolved_outcome",
-                "暂时无法确认运行状态，请稍后重试",
+                "Cannot currently confirm run state; retry later",
                 None,
             )
         except AirflowAuthError as error:
@@ -2545,13 +2622,13 @@ class PortalApp:
         """
 
         if _RUN_ID.fullmatch(dag_run_id) is None:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "运行标识不合法")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         try:
             self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
         except AirflowAuthError as error:
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "飞书登录已失效，请重新登录") from error
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
         except AirflowApiError as error:
-            raise PortalError(HTTPStatus.NOT_FOUND, "该运行不存在或无权访问") from error
+            raise PortalError(HTTPStatus.NOT_FOUND, "Run does not exist or access is denied") from error
         return native_run_id(dag_run_id)
 
     def _read_projection(self, run_id: str) -> dict | None:
@@ -2612,7 +2689,7 @@ class PortalApp:
             and isinstance(checkpoint, str)
             and checkpoint
         ):
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供")
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Sealed-file registration is incomplete")
         return expected, length, checkpoint
 
     def _registered_member_bytes(self, path: str, member: dict) -> bytes:
@@ -2631,16 +2708,16 @@ class PortalApp:
         try:
             root = Path(platform.sealed_path(checkpoint)).resolve()
         except (PlatformStoreError, PipelineError, OSError, ValueError) as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "封存文件登记不完整，已拒绝提供") from error
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Sealed-file registration is incomplete") from error
         try:
             target = (root / path).resolve()
             if root not in target.parents:
                 raise OSError("member path escapes the registered checkpoint")
             data = target.read_bytes()
         except OSError as error:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供") from error
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Delivery artifact digest verification failed") from error
         if len(data) != length or hashlib.sha256(data).hexdigest() != expected:
-            raise PortalError(HTTPStatus.BAD_GATEWAY, "交付文件摘要校验失败，已拒绝提供")
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Delivery artifact digest verification failed")
         return data
 
     def _preview_from_projection(self, run_id: str, projection: dict) -> dict | None:
@@ -2669,11 +2746,7 @@ class PortalApp:
             for path, member in members.items()
             if _member_class(path) == "subject" and path != "manifest.json"
         }
-        report_files = {
-            path: member["sha256"]
-            for path, member in members.items()
-            if _member_class(path) == "report"
-        }
+        report_files = {path: member["sha256"] for path, member in members.items() if _member_class(path) == "report"}
         if "urdf/robot.urdf" not in files:
             raise PipelineError("The registered delivery carries no urdf/robot.urdf member")
         payload = {
@@ -2699,7 +2772,9 @@ class PortalApp:
                 # A failed-verify registration whose report claims success contradicts
                 # the registered stage outcome: the diagnostic is refused, while the
                 # failed products stay registered and downloadable.
-                raise PortalError(HTTPStatus.BAD_GATEWAY, "已登记的诊断报告与失败阶段登记不一致，已拒绝提供")
+                raise PortalError(
+                    HTTPStatus.BAD_GATEWAY, "Registered diagnostic report conflicts with the failed-stage registration"
+                )
             failing = _failing_checks(report)
             warnings = _delivery_warnings(
                 {
@@ -2726,7 +2801,7 @@ class PortalApp:
         The value is read from the registered ``input/request.json`` member (the
         same store-side request record the freeze stage sealed); a missing,
         unreadable or undeclared purpose yields ``None`` so the display layer
-        states "未记录" instead of guessing.  D's sourcing and validation stay
+        states "not recorded" instead of guessing.  D's sourcing and validation stay
         untouched - this is a read for the run/preview payloads.
         """
 
@@ -2759,9 +2834,9 @@ class PortalApp:
             if missing_ok:
                 return None
             if projection is not None and projection["members"]:
-                detail = f"：{failure}" if failure is not None else ""
-                raise PortalError(HTTPStatus.CONFLICT, f"模型尚未通过独立校验{detail}")
-            raise PortalError(HTTPStatus.NOT_FOUND, "该运行还没有可展示的已验证交付")
+                detail = f": {failure}" if failure is not None else ""
+                raise PortalError(HTTPStatus.CONFLICT, f"The model has not passed independent verification{detail}")
+            raise PortalError(HTTPStatus.NOT_FOUND, "This run has no verified delivery to display")
         with self._lock:
             self._previews[run_id] = (now, preview)
         return preview
@@ -2780,7 +2855,7 @@ class PortalApp:
         projection = self._read_projection(run_id)
         member = projection["members"].get(artifact) if projection is not None else None
         if member is None:
-            raise PortalError(HTTPStatus.NOT_FOUND, "该文件尚未登记为本次运行的封存产物")
+            raise PortalError(HTTPStatus.NOT_FOUND, "This file is not registered as a sealed artifact of the run")
         data = self._registered_member_bytes(artifact, member)
         content_type = _ARTIFACT_TYPES.get(Path(artifact).suffix.lower(), "application/octet-stream")
         headers = [
@@ -2805,7 +2880,7 @@ class PortalApp:
         return [
             {
                 "path": artifact,
-                "label_zh": _STRUCTURAL_REPORT_LABELS.get(artifact, artifact),
+                "label": _STRUCTURAL_REPORT_LABELS.get(artifact, artifact),
                 "url": f"/api/runs/{dag_run_id}/artifacts/{artifact}",
             }
             for artifact in TEAM_REPORTS
@@ -2859,13 +2934,9 @@ class PortalApp:
         record = self._platform_read(lambda: self._platform().run_record(run_id))
         if not isinstance(record, dict):
             return native
-        registered = self._platform_read(
-            lambda: flow.registered_delivery_snapshot(self._platform(), run_id)
-        )
+        registered = self._platform_read(lambda: flow.registered_delivery_snapshot(self._platform(), run_id))
         observation = {
-            key: native[key]
-            for key in _OBSERVATION_ONLY_JOB_FIELDS
-            if isinstance(native, dict) and key in native
+            key: native[key] for key in _OBSERVATION_ONLY_JOB_FIELDS if isinstance(native, dict) and key in native
         }
         observation["native_status"] = native.get("status") if isinstance(native, dict) else None
         snapshot = {**observation, **registered}
@@ -2885,16 +2956,16 @@ class PortalApp:
         try:
             length = int(environ.get("CONTENT_LENGTH") or 0)
         except (TypeError, ValueError) as error:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "请求长度不合法") from error
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Request length is invalid") from error
         if length < 0 or length > self.config.max_body_bytes:
-            raise PortalError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "请求内容过大")
+            raise PortalError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large")
         raw = environ["wsgi.input"].read(length)
         try:
             payload = json.loads(raw.decode("utf-8") or "{}")
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "请求内容不是合法 JSON") from error
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Request body is not valid JSON") from error
         if not isinstance(payload, dict):
-            raise PortalError(HTTPStatus.BAD_REQUEST, "请求内容不是 JSON 对象")
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Request body is not a JSON object")
         return payload
 
 

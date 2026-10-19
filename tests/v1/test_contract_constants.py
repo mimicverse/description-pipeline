@@ -46,9 +46,31 @@ SCHEMA_LITERAL_FIXTURES = {
 
 
 class ContractConvergenceTests(unittest.TestCase):
+    def test_runtime_sources_use_one_english_display_vocabulary(self) -> None:
+        """Runtime text and code stay English; Chinese belongs to project documents only."""
+        offenders = []
+        old_keys = re.compile(
+            r"\b(?:name|label|state|title|meaning|note|scope|reason|"
+            r"resume_from_name|stage_name|headline|manual_scope_note)_zh\b|_ZH\b"
+        )
+        for base in ("src", "deploy", "tools"):
+            for path in (REPO / base).rglob("*"):
+                if not path.is_file() or "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    continue
+                relative = path.relative_to(REPO).as_posix()
+                if any("\u4e00" <= character <= "\u9fff" for character in text):
+                    offenders.append((relative, "Han character"))
+                if old_keys.search(text):
+                    offenders.append((relative, "legacy language suffix"))
+        self.assertEqual(offenders, [])
+
     def test_portal_labels_cover_the_fixed_required_checks(self) -> None:
         self.assertEqual(report_view._UNLABELLED_REQUIRED_CHECKS, ())
-        self.assertLessEqual(FIXED_REQUIRED_CHECKS, set(report_view._INDEPENDENT_LABELS_ZH))
+        self.assertLessEqual(FIXED_REQUIRED_CHECKS, set(report_view._INDEPENDENT_LABELS))
 
     def test_required_check_inventory_is_single_sourced(self) -> None:
         from description_pipeline.interface_records import CHECK_POLICY_V1

@@ -1,4 +1,4 @@
-"""Readable Chinese report projection over recorded run evidence (display only).
+"""Readable report projection over recorded run evidence (display only).
 
 Everything here is derived from data the pipeline already records — the stage contract view
 (``stages.stage_view``), the delivered quality document and the job error/detail fields. This
@@ -17,155 +17,155 @@ from ..stages import FIXED_REQUIRED_CHECKS, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
 
-_STAGE_STATE_ZH = {
-    "completed": "已完成",
-    "running": "进行中",
-    "failed": "失败",
-    "blocked": "上游阶段失败（未执行）",
-    "not_run": "未执行",
+_STAGE_STATE_LABELS = {
+    "completed": "Completed",
+    "running": "In progress",
+    "failed": "Failed",
+    "blocked": "Blocked by upstream failure",
+    "not_run": "Not run",
 }
-_CHECK_STATE_ZH = {
-    "passed": "通过",
-    "failed": "失败",
-    "not_run": "未执行（未获得结果）",
+_CHECK_STATE_LABELS = {
+    "passed": "Passed",
+    "failed": "Failed",
+    "not_run": "Not run (no result)",
 }
-_OVERALL_STATE_ZH = {
-    "passed": "已通过",
-    "running": "进行中",
-    "failed": "失败",
-    "not_run": "未开始",
+_OVERALL_STATE_LABELS = {
+    "passed": "Passed",
+    "running": "In progress",
+    "failed": "Failed",
+    "not_run": "Not started",
 }
 
-_BOUNDARY_LABELS_ZH = {
-    "handoff.admission": "交接包准入（路径、常规文件与原生包）",
-    "handoff.integrity": "交接包完整性（摘要与文件清单）",
-    "discovery.inputs": "解析输入（原生文件夹可用）",
-    "discovery.definition": "结构定义生成",
-    "discovery.binding": "结构与身份绑定",
-    "input.valid": "输入有效性（只读快照语义）",
-    "runtime.ready": "原生运行环境就绪",
-    "capture.integrity": "证据采集完整性（字节与清单）",
-    "capture.input_stability": "输入稳定性复核",
-    "generation.inputs": "生成输入有效性",
-    "generation.artifacts": "生成产物校验（URDF、网格与报告）",
-    "verification.subject": "交付主体摘要绑定",
-    "verification.gates": "独立校验门（聚合）",
-    "verification.report_binding": "校验报告与主体绑定",
-    "publication.inputs": "发布输入（分支与基线）",
-    "publication.git": "发布提交字节一致性（复制/暂存/提交）",
-    "publication.receipt": "评审分支回执确认",
+_BOUNDARY_LABELS = {
+    "handoff.admission": "Handoff admission (path, regular files, native package)",
+    "handoff.integrity": "Handoff integrity (digest and file inventory)",
+    "discovery.inputs": "Discovery inputs (native folder available)",
+    "discovery.definition": "Structure definition generation",
+    "discovery.binding": "Structure and identity binding",
+    "input.valid": "Input validity (read-only snapshot semantics)",
+    "runtime.ready": "Native runtime readiness",
+    "capture.integrity": "Capture integrity (bytes and inventory)",
+    "capture.input_stability": "Input-stability recheck",
+    "generation.inputs": "Generation input validity",
+    "generation.artifacts": "Generated artifact validation (URDF, meshes, report)",
+    "verification.subject": "Delivery subject digest binding",
+    "verification.gates": "Independent verification gates (aggregate)",
+    "verification.report_binding": "Report and subject binding",
+    "publication.inputs": "Publication inputs (branch and baseline)",
+    "publication.git": "Published commit byte consistency (copy/stage/commit)",
+    "publication.receipt": "Review-branch receipt confirmation",
 }
 
 #: Readable names for the native discovery finding codes (fallback: the raw code).
-_DISCOVERY_CODE_LABELS_ZH = {
-    "discovery.identity_missing": "缺少硬件身份定义",
-    "discovery.revision_missing": "缺少结构修订记录",
-    "discovery.owner_missing": "缺少修订责任人",
-    "discovery.summary_missing": "缺少变更说明",
-    "discovery.control_missing": "缺少交付版本控制引用（system/reference）",
-    "discovery.configuration_missing": "缺少交付配置声明",
-    "discovery.robot_name_invalid": "机器人名称不是 snake_case",
-    "discovery.design_budget_missing": "缺少设计预算记录",
-    "discovery.link_name_missing": "未识别刚体坐标系",
-    "discovery.joint_unsupported_pattern": "记录的约束未能确定单自由度关节",
-    "discovery.joint_axis_sign_missing": "缺少 dp.joint.axis_sign（±1）",
-    "discovery.joint_axis_selector_missing": "缺少可读取的关节轴选择器",
-    "discovery.mate_entities_unsupported": "配合实体组合暂不能解析",
-    "discovery.mate_geometry_mismatch": "记录的配合几何与约束不一致",
-    "discovery.frame_attachment": "装配基准归属暂不能确定",
-    "discovery.root_missing": "未确定根刚体坐标系归属",
-    "discovery.inputs": "解析输入（原生文件夹可用）",
-    "discovery.main_assembly_ambiguous": "无法唯一确定主装配",
+_DISCOVERY_CODE_LABELS = {
+    "discovery.identity_missing": "Hardware identity is missing",
+    "discovery.revision_missing": "Structural revision record is missing",
+    "discovery.owner_missing": "Revision owner is missing",
+    "discovery.summary_missing": "Change summary is missing",
+    "discovery.control_missing": "Delivery version-control reference is missing (system/reference)",
+    "discovery.configuration_missing": "Delivery configuration declaration is missing",
+    "discovery.robot_name_invalid": "Robot name is not snake_case",
+    "discovery.design_budget_missing": "Design-budget record is missing",
+    "discovery.link_name_missing": "Rigid-body coordinate system is unidentified",
+    "discovery.joint_unsupported_pattern": "Recorded constraints do not identify a one-DOF joint",
+    "discovery.joint_axis_sign_missing": "dp.joint.axis_sign (+/-1) is missing",
+    "discovery.joint_axis_selector_missing": "No readable joint-axis selector",
+    "discovery.mate_entities_unsupported": "Mate entity combination is not supported",
+    "discovery.mate_geometry_mismatch": "Recorded mate geometry conflicts with the constraint",
+    "discovery.frame_attachment": "Assembly-datum ownership is unresolved",
+    "discovery.root_missing": "Root rigid-body coordinate system is unresolved",
+    "discovery.inputs": "Discovery inputs (native folder available)",
+    "discovery.main_assembly_ambiguous": "Main assembly is not unique",
     # Declared-native-evidence observations: recorded warnings, never passes.
-    "discovery.exporter_unread": "导出器声明未能读取",
-    "discovery.exporter_rigid_attachment": "实例由原生刚性证明归属",
-    "discovery.exporter_membership_uncovered": "存在未归属实例（保留几何与质量）",
-    "discovery.exporter_mate_conflict": "原生配合约束与声明关节运动冲突（已保存姿态）",
-    "discovery.joint_limits_degenerate": "关节行程为等值零范围",
-    "discovery.joint_drive_unspecified": "关节驱动力矩/速度为零",
-    "discovery.jcs_alias": "JCS_ 与刚体基准重合（别名）",
-    "discovery.design_budget_unspecified": "未指定设计预算（可选范围不适用）",
-    "discovery.identity_derived": "发布身份由提交信息派生（CAD 缺省字段）",
-    "discovery.identity_conflict": "提交的硬件身份与 CAD 记录冲突（阻止发布）",
+    "discovery.exporter_unread": "Exporter declaration is unreadable",
+    "discovery.exporter_rigid_attachment": "Instance ownership is established by native rigidity",
+    "discovery.exporter_membership_uncovered": "Unassigned instances remain (geometry and mass retained)",
+    "discovery.exporter_mate_conflict": "Native mate constraints conflict with declared joint motion in the saved pose",
+    "discovery.joint_limits_degenerate": "Joint travel has an equal zero range",
+    "discovery.joint_drive_unspecified": "Joint effort and velocity are zero",
+    "discovery.jcs_alias": "JCS_ coincides with the body datum (alias)",
+    "discovery.design_budget_unspecified": "Design budget is not specified (optional range not applicable)",
+    "discovery.identity_derived": "Publication identity is derived from submission data (optional CAD fields absent)",
+    "discovery.identity_conflict": "Submitted hardware identity conflicts with CAD records (publication blocked)",
 }
 
 #: Readable names for verifier diagnostics carried on check details (recorded warnings).
-_DIAGNOSTIC_CODE_LABELS_ZH = {
-    "v14.saved_pose_restriction": "已保存姿态限制（诊断）",
-    "v14.mate_inference_unavailable": "配合推导不可用（诊断）",
-    "v14.pose_diagnostics_unread": "已保存姿态诊断尚未读取（诊断）",
-    "v14.membership_unread": "连杆成员关系尚未读取（诊断）",
+_DIAGNOSTIC_CODE_LABELS = {
+    "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
+    "v14.mate_inference_unavailable": "Mate inference unavailable (diagnostic)",
+    "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",
+    "v14.membership_unread": "Link membership not read (diagnostic)",
 }
 
-#: Chinese descriptions for the contract's declared input/output records (by path string).
-_FILE_PATH_LABELS_ZH = {
-    "handoff/": "已保存的 SolidWorks 工程文件夹",
-    "input/": "准备后的输入定义与保存的 CAD",
-    "evidence/": "采集的 CAD 证据、原始测量与清单",
-    "model/robot.json": "规范化模型",
-    "urdf/ + meshes/": "URDF 与本地网格",
-    "reports/tool.json": "工具身份与文件主体",
-    "input/ + evidence/ + model/ + urdf/ + meshes/": "原始证据与生成产物",
-    "reports/quality.json": "确定性逐对象质量报告",
-    "urdf/ + meshes/ + reports/quality.json": "已验证交付与配置的模型仓库",
-    "reports/pr.json": "候选提交与评审回执",
-    "reports/structural-team.md": "结构团队报告（可读 Markdown）",
-    "reports/structural-team.json": "结构团队报告（结构化发现与参数）",
+#: Readable descriptions for the contract's declared input/output records.
+_FILE_PATH_LABELS = {
+    "handoff/": "Saved SolidWorks engineering folder",
+    "input/": "Prepared input definition and saved CAD",
+    "evidence/": "Captured CAD evidence, raw measurements, and inventory",
+    "model/robot.json": "Canonical model",
+    "urdf/ + meshes/": "URDF and local meshes",
+    "reports/tool.json": "Tool identity and file subject",
+    "input/ + evidence/ + model/ + urdf/ + meshes/": "Raw evidence and generated artifacts",
+    "reports/quality.json": "Deterministic per-object quality report",
+    "urdf/ + meshes/ + reports/quality.json": "Verified delivery and configured model repository",
+    "reports/pr.json": "Candidate commit and review receipt",
+    "reports/structural-team.md": "Structural-team report (readable Markdown)",
+    "reports/structural-team.json": "Structural-team report (structured findings and parameters)",
 }
 
-_INDEPENDENT_LABELS_ZH = {
+_INDEPENDENT_LABELS = {
     # The fixed required checks (solidworks_urdf.required_checks).
-    "bundle.subject": "交付包主体摘要绑定",
-    "input.valid": "输入有效性（独立复核）",
-    "source.native_discovery": "原生结构发现证据",
-    "tool.identity": "工具版本身份",
-    "source.integrity": "原生源完整性",
-    "source.native": "原生源存在性",
-    "model.schema": "模型模式符合性",
-    "source.raw": "原生原始证据存在性",
-    "physics.mass_closure_equality": "质量闭合（URDF 质量 = 整机 CAD 质量）",
-    "source.dependencies": "原生依赖闭包",
-    "source.coverage": "原生源覆盖率",
-    "verification.complete": "独立校验完成标记",
-    "model.policy": "模型策略符合性",
-    "physics.independent": "物理量独立计算复核",
-    "frames.native": "原生坐标系",
-    "frames.components": "组件坐标系",
-    "frames.references": "参考坐标系",
-    "urdf.syntax_names": "URDF 语法与命名",
-    "urdf.topology": "URDF 拓扑",
-    "geometry.coverage": "几何网格覆盖",
-    "geometry.assets": "几何网格资产",
-    "geometry.native_tessellation": "几何原生三角剖分",
-    "geometry.expected_extent": "外形尺寸期望范围",
-    "physics.expected_mass": "质量期望范围",
-    "consumer.urdf": "消费端 URDF 可加载性",
+    "bundle.subject": "Delivery subject digest binding",
+    "input.valid": "Input validity (independent recheck)",
+    "source.native_discovery": "Native structure-discovery evidence",
+    "tool.identity": "Tool release identity",
+    "source.integrity": "Native source integrity",
+    "source.native": "Native source presence",
+    "model.schema": "Model schema conformance",
+    "source.raw": "Native raw-evidence presence",
+    "physics.mass_closure_equality": "Mass closure (URDF mass = whole CAD mass)",
+    "source.dependencies": "Native dependency closure",
+    "source.coverage": "Native source coverage",
+    "verification.complete": "Independent verification completion marker",
+    "model.policy": "Model policy conformance",
+    "physics.independent": "Independent physical recomputation",
+    "frames.native": "Native coordinate systems",
+    "frames.components": "Component coordinate systems",
+    "frames.references": "Reference coordinate systems",
+    "urdf.syntax_names": "URDF syntax and names",
+    "urdf.topology": "URDF topology",
+    "geometry.coverage": "Geometry mesh coverage",
+    "geometry.assets": "Geometry mesh assets",
+    "geometry.native_tessellation": "Native geometry tessellation",
+    "geometry.expected_extent": "Expected overall extent",
+    "physics.expected_mass": "Expected mass range",
+    "consumer.urdf": "Consumer URDF loadability",
     # Physics-module variants that can accompany the fixed set.
-    "physics.authority": "物理证据权威性",
-    "physics.closure": "物理质量闭合",
-    "physics.link": "物理链接一致性",
-    "physics.raw_inputs": "物理原始输入",
-    "physics.reading": "物理读数",
+    "physics.authority": "Physical-evidence authority",
+    "physics.closure": "Physical mass closure",
+    "physics.link": "Physical link consistency",
+    "physics.raw_inputs": "Physical raw inputs",
+    "physics.reading": "Physical reading",
 }
 
 #: VER-02 guard: the label table must cover the verifier's fixed inventory; the
 #: regression suite asserts this stays empty.
-_UNLABELLED_REQUIRED_CHECKS = tuple(sorted(FIXED_REQUIRED_CHECKS - set(_INDEPENDENT_LABELS_ZH)))
+_UNLABELLED_REQUIRED_CHECKS = tuple(sorted(FIXED_REQUIRED_CHECKS - set(_INDEPENDENT_LABELS)))
 
 _INDEPENDENT_FAMILIES = (
-    ("inertia.", "惯量：{name}"),
-    ("geometry.", "几何：{name}"),
-    ("joints.", "关节：{name}"),
-    ("shafts.", "轴：{name}"),
-    ("frames.", "坐标系：{name}"),
+    ("inertia.", "Inertia: {name}"),
+    ("geometry.", "Geometry: {name}"),
+    ("joints.", "Joint: {name}"),
+    ("shafts.", "Axis: {name}"),
+    ("frames.", "Coordinate system: {name}"),
 )
 
 
 def independent_label(identifier: object) -> str:
-    """Chinese label for one independent check id; family patterns, then the raw id."""
+    """Readable label for one independent check id; family patterns, then the raw id."""
     name = str(identifier or "")
-    if name in _INDEPENDENT_LABELS_ZH:
-        return _INDEPENDENT_LABELS_ZH[name]
+    if name in _INDEPENDENT_LABELS:
+        return _INDEPENDENT_LABELS[name]
     for prefix, template in _INDEPENDENT_FAMILIES:
         if name.startswith(prefix) and len(name) > len(prefix):
             return template.format(name=name[len(prefix) :])
@@ -173,8 +173,8 @@ def independent_label(identifier: object) -> str:
 
 
 def _short(value: object, length: int = 12) -> str:
-    text = str(value or "未记录")
-    return text[:length] + "…" if len(text) > length else text
+    text = str(value or "not recorded")
+    return text[:length] + "..." if len(text) > length else text
 
 
 def _failure_object(raw_type: str, message: str, raw_detail: dict | None) -> str | None:
@@ -220,38 +220,42 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
                 and row.get("passed") is True
             )
             return {
-                "scope_zh": "全部必需独立校验",
-                "expected": f"{len(required)} 项必需校验全部通过",
-                "actual": f"{passed}/{len(required)} 通过（已记录 {len(rows)} 项）",
+                "scope": "All required independent checks",
+                "expected": f"All {len(required)} required checks pass",
+                "actual": f"{passed}/{len(required)} passed ({len(rows)} recorded)",
             }
         subject = details.get("subject_sha256")
         status = details.get("subject_status")
         if isinstance(subject, str) or status:
             return {
-                "scope_zh": "独立校验报告",
-                "expected": "必需校验全部通过且主体绑定",
-                "actual": f"主体 {_short(subject)}（{status or '未标注'}）",
+                "scope": "Independent verification report",
+                "expected": "All required checks pass and the subject is bound",
+                "actual": f"Subject {_short(subject)} ({status or 'not marked'})",
             }
         return None
     if name == "handoff.admission":
         return {
-            "scope_zh": "交接包导入",
-            "expected": "记录导入包与摘要",
-            "actual": f"摘要 {_short(details.get('handoff_sha256'))}，已冻结导入包",
+            "scope": "Handoff import",
+            "expected": "Imported package and digest are recorded",
+            "actual": f"Digest {_short(details.get('handoff_sha256'))}; imported package is frozen",
         }
     if name == "handoff.integrity":
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         return {
-            "scope_zh": "交接包文件清单",
-            "expected": "清单与交接摘要一致",
-            "actual": f"{count} 个文件，清单校验通过" if count is not None else _short(details.get("handoff_sha256")),
+            "scope": "Handoff file inventory",
+            "expected": "Inventory agrees with the handoff digest",
+            "actual": f"{count} files; inventory verified"
+            if count is not None
+            else _short(details.get("handoff_sha256")),
         }
     if name == "discovery.inputs":
         return {
-            "scope_zh": "冻结文件与命名注册",
-            "expected": "冻结清单与命名注册表一致",
-            "actual": f"清单 {_short(details.get('files_sha256'))}、命名 {_short(details.get('frozen_names_sha256'))}",
+            "scope": "Frozen files and name registry",
+            "expected": "Frozen inventory agrees with the name registry",
+            "actual": (
+                f"Inventory {_short(details.get('files_sha256'))}; names {_short(details.get('frozen_names_sha256'))}"
+            ),
         }
     if name == "discovery.definition":
         findings = details.get("findings")
@@ -261,21 +265,28 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
             else None
         )
         return {
-            "scope_zh": "原生结构定义",
-            "expected": "生成通过的原生结构定义",
-            "actual": f"型号 {details.get('hardware_id') or '未记录'}，修订 {details.get('revision') or '未记录'}，"
-            f"阻塞发现 {blocked if blocked is not None else '未记录'} 项",
+            "scope": "Native structure definition",
+            "expected": "A generated native structure definition that passes",
+            "actual": (
+                f"Hardware {details.get('hardware_id') or 'not recorded'}; "
+                f"revision {details.get('revision') or 'not recorded'}; "
+                f"blocking findings {blocked if blocked is not None else 'not recorded'}"
+            ),
         }
     if name == "discovery.binding":
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         actual = (
-            f"型号 {details.get('hardware_id') or '未记录'} → "
-            f"{details.get('repository_slug') or '未记录'}@{details.get('base') or '未记录'}"
+            f"Hardware {details.get('hardware_id') or 'not recorded'} -> "
+            f"{details.get('repository_slug') or 'not recorded'}@{details.get('base') or 'not recorded'}"
         )
         if count is not None:
-            actual += f"，{count} 个准备文件"
-        return {"scope_zh": "结构定义与目标仓库绑定", "expected": "绑定摘要与目标一致", "actual": actual}
+            actual += f"; {count} prepared files"
+        return {
+            "scope": "Structure definition and target-repository binding",
+            "expected": "Bound digest agrees with the target",
+            "actual": actual,
+        }
     if name == "input.valid":
         revision = details.get("cad_revision")
         if isinstance(revision, dict):
@@ -283,81 +294,87 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         return {
-            "scope_zh": "CAD 包输入规范",
-            "expected": "CAD 包通过输入规范并归档一致",
-            "actual": f"CAD 修订 {revision or '未记录'}" + (f"，{count} 个文件" if count is not None else ""),
+            "scope": "CAD package input specification",
+            "expected": "The CAD package passes the input specification and its archive agrees",
+            "actual": f"CAD revision {revision or 'not recorded'}" + (f"; {count} files" if count is not None else ""),
         }
     if name == "runtime.ready":
         return {
-            "scope_zh": "原生运行环境",
-            "expected": "原生平台与 SolidWorks 就绪",
-            "actual": "已检查 Windows、COM 与 SolidWorks 前置条件；实际 CAD 访问与文档就绪由采集会话验证",
+            "scope": "Native runtime environment",
+            "expected": "Native platform and SolidWorks are ready",
+            "actual": (
+                "Windows, COM, and SolidWorks prerequisites were checked; "
+                "the capture session verifies actual CAD access and document readiness"
+            ),
         }
     if name == "capture.integrity":
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         return {
-            "scope_zh": "证据快照",
-            "expected": "快照与清单逐字节一致",
-            "actual": f"{count if count is not None else '未记录'} 个证据文件，"
-            f"清单 {_short(details.get('manifest_sha256'))}",
+            "scope": "Evidence snapshot",
+            "expected": "Snapshot and inventory agree byte for byte",
+            "actual": f"{count if count is not None else 'not recorded'} evidence files; "
+            f"inventory {_short(details.get('manifest_sha256'))}",
         }
     if name == "capture.input_stability":
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         return {
-            "scope_zh": "输入稳定性",
-            "expected": "采集期间输入文件未变化",
-            "actual": f"{count if count is not None else '未记录'} 个输入文件保持不变",
+            "scope": "Input stability",
+            "expected": "Input files do not change during capture",
+            "actual": f"{count if count is not None else 'not recorded'} input files remained unchanged",
         }
     if name == "generation.inputs":
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         return {
-            "scope_zh": "生成前证据快照",
-            "expected": "快照有效且未变化",
-            "actual": f"证据快照 {count if count is not None else '未记录'} 个文件",
+            "scope": "Pre-generation evidence snapshot",
+            "expected": "Snapshot is valid and unchanged",
+            "actual": f"Evidence snapshot: {count if count is not None else 'not recorded'} files",
         }
     if name == "generation.artifacts":
         files = details.get("files")
         count = len(files) if isinstance(files, dict) else None
         return {
-            "scope_zh": "生成产物",
-            "expected": "产物完整并绑定交付主体",
-            "actual": f"{count if count is not None else '未记录'} 个产物文件，"
-            f"主体 {_short(details.get('subject_sha256'))}",
+            "scope": "Generated artifacts",
+            "expected": "Artifacts are complete and bound to the delivery subject",
+            "actual": f"{count if count is not None else 'not recorded'} artifact files; "
+            f"subject {_short(details.get('subject_sha256'))}",
         }
     if name == "verification.subject":
         return {
-            "scope_zh": "交付主体",
-            "expected": "主体与生成结果一致",
+            "scope": "Delivery subject",
+            "expected": "The subject agrees with the generated result",
             "actual": _short(details.get("subject_sha256")),
         }
     if name == "verification.report_binding":
         return {
-            "scope_zh": "质量报告绑定",
-            "expected": "报告摘要与交付主体绑定",
-            "actual": f"报告 {_short(details.get('report_sha256'))} 绑定主体 {_short(details.get('subject_sha256'))}",
+            "scope": "Quality-report binding",
+            "expected": "The report digest is bound to the delivery subject",
+            "actual": (
+                f"Report {_short(details.get('report_sha256'))} is bound to subject "
+                f"{_short(details.get('subject_sha256'))}"
+            ),
         }
     if name == "publication.inputs":
         return {
-            "scope_zh": "评审基线与确定性分支",
-            "expected": "基线与确定分支校验通过",
-            "actual": f"{details.get('repository_slug') or '未记录'}: "
-            f"{details.get('base') or '未记录'} ← {details.get('branch') or '未记录'}",
+            "scope": "Review baseline and deterministic branch",
+            "expected": "Baseline and deterministic branch verify",
+            "actual": f"{details.get('repository_slug') or 'not recorded'}: "
+            f"{details.get('base') or 'not recorded'} <- {details.get('branch') or 'not recorded'}",
         }
     if name == "publication.git":
         return {
-            "scope_zh": "复制、暂存与提交的字节一致性",
-            "expected": "提交与交付字节一致",
-            "actual": f"提交 {_short(details.get('commit'))}，"
-            f"字节复核 {details.get('copied_staged_committed') or '未记录'}",
+            "scope": "Copy, stage, and commit byte consistency",
+            "expected": "Committed bytes agree with the delivery",
+            "actual": f"Commit {_short(details.get('commit'))}; "
+            f"byte recheck {details.get('copied_staged_committed') or 'not recorded'}",
         }
     if name == "publication.receipt":
         return {
-            "scope_zh": "评审分支回执",
-            "expected": "回执状态与提交一致",
-            "actual": f"状态 {details.get('state') or '未记录'}，提交 {_short(details.get('commit'))}",
+            "scope": "Review-branch receipt",
+            "expected": "Receipt state agrees with the commit",
+            "actual": f"State {details.get('state') or 'not recorded'}; commit {_short(details.get('commit'))}",
         }
     return None
 
@@ -369,19 +386,23 @@ def _independent_summary(identifier: object, details: dict) -> dict | None:
         mass = details.get("mass_kg")
         window = _range_text(details.get("expected_kg"))
         if isinstance(mass, (int, float)) and not isinstance(mass, bool):
-            return {"scope_zh": "质量在期望窗口内", "expected": window or "期望窗口", "actual": f"{mass} kg"}
+            return {
+                "scope": "Mass within the expected range",
+                "expected": window or "expected range",
+                "actual": f"{mass} kg",
+            }
         return None
     if name in {"physics.mass_closure_equality", "physics.closure"}:
         urdf, whole = details.get("urdf_mass_kg"), details.get("whole_cad_mass_kg")
         if isinstance(urdf, (int, float)) and isinstance(whole, (int, float)):
             delta = details.get("delta_kg")
             return {
-                "scope_zh": "URDF 质量与整机 CAD 质量一致",
-                "expected": f"绝对误差 ≤ {details['atol_kg']} kg"
+                "scope": "URDF mass agrees with whole-CAD mass",
+                "expected": f"absolute error <= {details['atol_kg']} kg"
                 if isinstance(details.get("atol_kg"), (int, float)) and details.get("rtol") == 0
-                else "与整机 CAD 质量一致（按记录的数值容差）",
+                else "agrees with whole-CAD mass within the recorded numeric tolerance",
                 "actual": f"URDF {urdf} kg / CAD {whole} kg"
-                + (f"（差值 {delta} kg）" if isinstance(delta, (int, float)) else "（差值未记录）"),
+                + (f" (difference {delta} kg)" if isinstance(delta, (int, float)) else " (difference not recorded)"),
             }
         return None
     if name == "consumer.urdf":
@@ -389,88 +410,116 @@ def _independent_summary(identifier: object, details: dict) -> dict | None:
         version = details.get("version")
         if isinstance(bodies, int):
             return {
-                "scope_zh": "消费端（MuJoCo）可加载",
-                "expected": "可加载且刚体完整",
-                "actual": f"{bodies} 个消费端刚体（含世界坐标体），版本 {version or '未记录'}",
+                "scope": "Consumer loadability (MuJoCo)",
+                "expected": "Loads with the complete body set",
+                "actual": f"{bodies} consumer bodies (including the world body); version {version or 'not recorded'}",
             }
         return None
     if name == "geometry.expected_extent":
         extent = details.get("extent_m")
         expected = details.get("expected_largest_m")
         if isinstance(extent, list) and isinstance(expected, list):
-            return {"scope_zh": "外形尺寸", "expected": f"最大边 {expected} m", "actual": f"三轴尺寸 {extent} m"}
+            return {
+                "scope": "Overall extent",
+                "expected": f"largest edge {expected} m",
+                "actual": f"three-axis extent {extent} m",
+            }
         return None
     if name == "bundle.subject":
         return {
-            "scope_zh": "交付包主体摘要",
-            "expected": "主体摘要与交付一致",
+            "scope": "Delivery subject digest",
+            "expected": "The subject digest agrees with the delivery",
             "actual": _short(details.get("sha256")),
         }
     if name == "tool.identity":
         return {
-            "scope_zh": "工具身份",
-            "expected": "版本与来源摘要记录",
-            "actual": f"版本 {details.get('version') or '未记录'}，来源 {_short(details.get('source_sha256'))}",
+            "scope": "Tool identity",
+            "expected": "Version and source digest are recorded",
+            "actual": (
+                f"Version {details.get('version') or 'not recorded'}; source {_short(details.get('source_sha256'))}"
+            ),
         }
     if name == "source.native":
         return {
-            "scope_zh": "原生源信息",
-            "expected": "记录 SolidWorks 修订与配置",
-            "actual": f"SolidWorks {details.get('solidworks_revision') or '未记录'}，"
-            f"配置 {details.get('configuration') or '未记录'}",
+            "scope": "Native source information",
+            "expected": "SolidWorks revision and configuration are recorded",
+            "actual": f"SolidWorks {details.get('solidworks_revision') or 'not recorded'}; "
+            f"configuration {details.get('configuration') or 'not recorded'}",
         }
     if name == "source.dependencies" and isinstance(details.get("native_documents"), int):
         return {
-            "scope_zh": "原生依赖与采集副本覆盖",
-            "expected": "每个原生文档均有完整、可追溯的采集副本",
-            "actual": f"原生 {details['native_documents']} 个文档，"
-            f"副本 {details.get('collected_documents', '未记录')} 个，"
-            f"抑制实例 {details.get('suppressed_instances', '未记录')} 个",
+            "scope": "Native dependency and captured-copy coverage",
+            "expected": "Every native document has a complete, traceable captured copy",
+            "actual": f"{details['native_documents']} native documents; "
+            f"{details.get('collected_documents', 'not recorded')} collected copies; "
+            f"{details.get('suppressed_instances', 'not recorded')} suppressed instances",
         }
     if name in {"source.coverage", "source.native_discovery"} and isinstance(details.get("bodies"), int):
-        field, label = ("occurrences", "实例") if name == "source.coverage" else ("joints", "关节")
+        field, label = ("occurrences", "occurrences") if name == "source.coverage" else ("joints", "joints")
         return {
-            "scope_zh": "实例与刚体覆盖" if name == "source.coverage" else "原生结构定义",
-            "expected": "独立重建结果与定义一致",
-            "actual": f"{details['bodies']} 个刚体，{details.get(field, '未记录')} 个{label}",
+            "scope": "Instance and rigid-body coverage" if name == "source.coverage" else "Native structure definition",
+            "expected": "Independent reconstruction agrees with the definition",
+            "actual": f"{details['bodies']} bodies; {details.get(field, 'not recorded')} {label}",
         }
     if name.startswith("shafts.") and isinstance(details.get("angle_deg"), (int, float)):
         return {
-            "scope_zh": "关节轴与原生圆柱轴对齐",
-            "expected": "轴线共线、原点在轴线上；按质量规范的数值容差验收",
-            "actual": f"夹角 {details['angle_deg']}°，轴线偏距 {details.get('offset_m', '未记录')} m",
+            "scope": "Joint axis alignment with the native cylinder axis",
+            "expected": "Collinear axes with the origin on the axis, within the quality-spec tolerances",
+            "actual": f"angle {details['angle_deg']} deg; axis offset {details.get('offset_m', 'not recorded')} m",
         }
     if name.startswith("inertia.") and isinstance(details.get("mass_kg"), (int, float)):
         return {
-            "scope_zh": "刚体质量与惯量",
-            "expected": "质量及主惯量为正，惯量满足三角关系并与独立计算一致",
-            "actual": f"质量 {details['mass_kg']} kg；主惯量 {details.get('principal_inertia_kg_m2', '未记录')} kg·m²",
+            "scope": "Body mass and inertia",
+            "expected": (
+                "Positive mass and principal inertias; the tensor satisfies the triangle "
+                "inequality and agrees with the independent result"
+            ),
+            "actual": (
+                f"mass {details['mass_kg']} kg; principal inertia "
+                f"{details.get('principal_inertia_kg_m2', 'not recorded')} kg*m^2"
+            ),
         }
     if name.startswith("joints.") and isinstance(details.get("type"), str):
         kind = details["type"]
         limits = details.get("limits") or {}
         unit = "m" if kind == "prismatic" else "rad"
-        actual = f"类型 {kind}，有符号轴 {details.get('axis', '未记录')}"
+        actual = f"type {kind}; signed axis {details.get('axis', 'not recorded')}"
         if isinstance(limits, dict) and "lower" in limits and "upper" in limits:
-            actual += f"，范围 [{limits['lower']}, {limits['upper']}] {unit}"
-        return {"scope_zh": "关节类型、轴向与限位", "expected": "输出与原生结构定义一致", "actual": actual}
+            actual += f"; range [{limits['lower']}, {limits['upper']}] {unit}"
+        return {
+            "scope": "Joint type, axis, and limits",
+            "expected": "Output agrees with the native structure definition",
+            "actual": actual,
+        }
     if name == "urdf.syntax_names":
         if details.get("validated") is True:
-            return {"scope_zh": "URDF 语法与命名", "expected": "语法与命名校验通过", "actual": "校验通过"}
+            return {"scope": "URDF syntax and names", "expected": "Syntax and naming pass", "actual": "Passed"}
         return None
     if name == "urdf.topology":
         links, root = details.get("links"), details.get("root")
         if isinstance(links, int):
-            return {"scope_zh": "URDF 拓扑", "expected": "单一根链接且连通", "actual": f"{links} 个链接，根 {root}"}
+            return {
+                "scope": "URDF topology",
+                "expected": "One connected tree with a single root",
+                "actual": f"{links} links; root {root}",
+            }
         return None
     if name in {"geometry.coverage", "geometry.assets"}:
         meshes = details.get("meshes")
         if isinstance(meshes, int):
-            return {"scope_zh": "几何网格", "expected": "全部刚体网格存在", "actual": f"{meshes} 个网格"}
+            return {
+                "scope": "Geometry meshes",
+                "expected": "Every rigid-body mesh is present",
+                "actual": f"{meshes} meshes",
+            }
         return None
     if name == "input.valid":
         if details.get("passed") is True or details.get("validated") is True:
-            return {"scope_zh": "输入规范", "expected": "输入包符合规范", "actual": "规范校验通过"}
+            return {
+                "scope": "Input specification",
+                "expected": "The input package conforms",
+                "actual": "Specification passed",
+            }
         return None
     return None
 
@@ -492,10 +541,11 @@ def _failure(job: dict, stage: dict) -> dict:
         if isinstance(item, dict) and item.get("blocking", True) and item.get("code")
     ]
     if stage.get("error_code") == "native_discovery_main_assembly_ambiguous":
-        title = "无法唯一确定主装配"
+        title = "Main assembly is not unique"
         meaning = (
-            "请在交付主装配中保存 dp.hardware_id 和 dp.delivery_configuration；"
-            "多个装配声明交付身份时须明确唯一入口，流水线不会按文件名或大小猜测。"
+            "Save dp.hardware_id and dp.delivery_configuration in the delivered main assembly. "
+            "When multiple assemblies declare delivery identity, one entry must be explicit; "
+            "the pipeline does not guess by filename or size."
         )
         kind = "definition"
     elif stage.get("id") == "discover" and "discovery.definition" in raw_error and blocking_findings:
@@ -508,51 +558,65 @@ def _failure(job: dict, stage: dict) -> dict:
             if len(rows) < 3:
                 rows.append({"object": str(item.get("object") or ""), "message": str(item.get("message") or "")})
         structured_groups = [
-            {"code": code, "label_zh": _DISCOVERY_CODE_LABELS_ZH.get(code, code), "count": count}
+            {"code": code, "label": _DISCOVERY_CODE_LABELS.get(code, code), "count": count}
             for code, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
         ]
         structured_samples = samples
-        title = "结构解析检查未通过"
+        title = "Structure discovery checks failed"
         meaning = (
-            f"共 {len(blocking_findings)} 项检查未通过：可能缺少必需定义，也可能超出当前解析能力。"
-            "展开问题清单查看对象、原因与证据；解析不支持不等于结构设计有误。"
+            f"{len(blocking_findings)} checks failed. Required definitions may be missing, or "
+            "the record may exceed current discovery capability. Expand the issue list for the "
+            "object, cause, and evidence; an unsupported pattern does not mean the design is wrong."
         )
         kind = "definition"
     elif raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
         kind = "runtime"
         codes = {"errors": raw_detail.get("errors"), "warnings": raw_detail.get("warnings")}
         if raw_detail.get("errors") == 2:
-            title = "原生 CAD 打开失败"
+            title = "Native CAD open failed"
             meaning = (
-                "文件或其引用的文档无法定位；影响范围尚未证明，"
-                "请由平台维护人员核实该文档及其引用对本次交付的必要性后再处理。"
+                "A file or one of its referenced documents cannot be located. The impact is not "
+                "yet proven; platform maintenance must verify whether it is required for this delivery."
             )
         else:
-            title = "原生 CAD 打开错误"
+            title = "Native CAD open error"
             meaning = (
-                f"原生会话返回错误码 {raw_detail.get('errors')}（警告 {raw_detail.get('warnings')}）；"
-                "无法据此判定文件缺失，请由平台维护人员核实后处理。"
+                f"The native session returned error code {raw_detail.get('errors')} with "
+                f"{raw_detail.get('warnings')} warnings. This does not prove a missing file; "
+                "platform maintenance must verify the condition before retrying."
             )
     elif raw_type == "CadError":
         kind = "runtime"
-        title = "原生 CAD 阶段失败"
-        meaning = "当前文档或其依赖无法被读取，阶段未完成；请按诊断信息核查后重试。"
+        title = "Native CAD stage failed"
+        meaning = (
+            "The document or one of its dependencies could not be read; the stage did not "
+            "complete. Check the diagnostic before retrying."
+        )
     elif raw_type in {"EnvironmentError_", "EnvironmentError"}:
         kind = "runtime"
-        title = "原生运行环境不可用"
-        meaning = "Windows 原生环境未就绪（服务或许可等），阶段未完成；请联系平台维护人员。"
+        title = "Native runtime environment unavailable"
+        meaning = (
+            "The Windows native environment is not ready (service, license, or similar); "
+            "the stage did not complete. Contact platform maintenance."
+        )
     elif raw_type == "TimeoutError" or "modal" in message.lower():
         kind = "runtime"
-        title = "原生会话被阻塞"
-        meaning = "原生会话被对话框或超时阻塞，阶段未完成；请在 Windows 会话上处理后重试。"
+        title = "Native session blocked"
+        meaning = (
+            "A dialog or timeout blocked the native session; the stage did not complete. "
+            "Resolve it on the Windows session before retrying."
+        )
     else:
-        title = "阶段失败（原因未判定）"
-        meaning = "阶段未完成，且未获得可判定的原因；请提供运行编号联系平台维护人员。"
+        title = "Stage failed (cause undetermined)"
+        meaning = (
+            "The stage did not complete and no determinable cause was recorded. "
+            "Provide the run ID when contacting platform maintenance."
+        )
     failure = {
         "stage": stage.get("id"),
-        "stage_name_zh": stage.get("name_zh"),
-        "title_zh": title,
-        "meaning_zh": meaning,
+        "stage_name": stage.get("name"),
+        "title": title,
+        "meaning": meaning,
         "raw_type": raw_type or None,
         "error_code": stage.get("error_code"),
         "raw_error": raw_error or None,
@@ -572,10 +636,11 @@ def _failure(job: dict, stage: dict) -> dict:
     unresolved = _unresolved_dependencies(raw_detail)
     if unresolved:
         failure["unresolved_dependencies"] = unresolved
-        names = "、".join(item.get("name") or item.get("path") or "" for item in unresolved)
-        failure["meaning_zh"] = (
-            f"文件或其引用的文档无法定位（原生会话报告以下引用未解析：{names}）；"
-            "这些引用是否被当前配置实际使用尚未证明，请由维护人员核实影响后再处理。"
+        names = ", ".join(item.get("name") or item.get("path") or "" for item in unresolved)
+        failure["meaning"] = (
+            f"A file or referenced document cannot be located; the native session reported "
+            f"these unresolved references: {names}. Whether the active configuration uses "
+            "them is not yet proven; maintenance must verify the impact before acting."
         )
     if codes is not None:
         applicability = raw_detail.get("applicability") if isinstance(raw_detail, dict) else None
@@ -622,14 +687,14 @@ def _failed_summary(label: str, summary: dict | None, details: dict) -> dict:
         first = errors[0]
         if isinstance(first, dict):
             reason = first.get("message") or first.get("code")
-    row = dict(summary) if summary else {"scope_zh": f"{label}未通过"}
-    row.setdefault("expected", "检查通过")
+    row = dict(summary) if summary else {"scope": f"{label} failed"}
+    row.setdefault("expected", "check passes")
     if isinstance(reason, str) and reason.strip():
         text = reason.strip()
-        pointer = "…（完整诊断见问题清单与原始证据）" if len(text) > 160 else ""
-        row["actual"] = f"未通过：{text[:160]}{pointer}"
+        pointer = "... (see the issue list and raw evidence for the full diagnostic)" if len(text) > 160 else ""
+        row["actual"] = f"Failed: {text[:160]}{pointer}"
     else:
-        row["actual"] = "未通过（原因未记录，详见问题清单与原始证据）"
+        row["actual"] = "Failed (reason not recorded; see the issue list and raw evidence)"
     return row
 
 
@@ -659,10 +724,10 @@ def _warning_row(stage: dict, item: dict) -> dict:
     detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
     row: dict = {
         "stage": stage.get("id"),
-        "stage_name_zh": stage.get("name_zh"),
+        "stage_name": stage.get("name"),
         "code": code,
-        "label_zh": _DIAGNOSTIC_CODE_LABELS_ZH.get(code, _DISCOVERY_CODE_LABELS_ZH.get(code, code)),
-        "state_zh": "警告",
+        "label": _DIAGNOSTIC_CODE_LABELS.get(code, _DISCOVERY_CODE_LABELS.get(code, code)),
+        "state_label": "Warning",
         "blocking": False,
     }
     object_id = item.get("object") or (f"joint:{detail['joint']}" if detail.get("joint") else None)
@@ -732,18 +797,18 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                 row = {
                     "id": item.get("id"),
                     "boundary": boundary,
-                    "label_zh": _BOUNDARY_LABELS_ZH.get(item.get("id"), str(item.get("label") or item.get("id") or "")),
+                    "label": _BOUNDARY_LABELS.get(item.get("id"), str(item.get("label") or item.get("id") or "")),
                     "state": state,
-                    "state_zh": _CHECK_STATE_ZH[state],
+                    "state_label": _CHECK_STATE_LABELS[state],
                     "executed": state != "not_run",
                     "raw_details": details,
                     **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
                 }
                 summary = _boundary_summary(item.get("id"), details)
                 if state == "failed":
-                    summary = _failed_summary(row["label_zh"], summary, details)
+                    summary = _failed_summary(row["label"], summary, details)
                 elif state == "not_run":
-                    summary = {**(summary or {}), "actual": "未执行，尚无检查结果"}
+                    summary = {**(summary or {}), "actual": "Not run; no check result is available"}
                 if summary is not None:
                     row["summary"] = summary
                 boundary_rows.append(row)
@@ -764,18 +829,18 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                     state = "not_run"
                 row = {
                     "id": item.get("id"),
-                    "label_zh": independent_label(item.get("id")),
+                    "label": independent_label(item.get("id")),
                     "state": state,
-                    "state_zh": _CHECK_STATE_ZH[state],
+                    "state_label": _CHECK_STATE_LABELS[state],
                     "executed": state != "not_run",
                     "raw_details": details,
                     **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
                 }
                 summary = _independent_summary(item.get("id"), details)
                 if state == "failed":
-                    summary = _failed_summary(row["label_zh"], summary, details)
+                    summary = _failed_summary(row["label"], summary, details)
                 elif state == "not_run":
-                    summary = {**(summary or {}), "actual": "未执行，尚无检查结果"}
+                    summary = {**(summary or {}), "actual": "Not run; no check result is available"}
                 if summary is not None:
                     row["summary"] = summary
                 independent_rows.append(row)
@@ -792,9 +857,9 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         warning_rows = _recorded_warnings(stage, discovery_findings, [*boundary_rows, *independent_rows])
         stage_out = {
             "id": stage.get("id"),
-            "name_zh": stage.get("name_zh"),
+            "name": stage.get("name"),
             "state": stage.get("state", "not_run"),
-            "state_zh": _STAGE_STATE_ZH.get(stage.get("state"), str(stage.get("state") or "未执行")),
+            "state_label": _STAGE_STATE_LABELS.get(stage.get("state"), str(stage.get("state") or "Not run")),
             "at": stage.get("at"),
             **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
             "in_scope": stage.get("in_scope"),
@@ -807,9 +872,9 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "files": [
                 {
                     "boundary": boundary,
-                    "label_zh": "冻结交接包与清单"
+                    "label": "Frozen handoff and inventory"
                     if stage.get("id") == "freeze" and boundary == "output"
-                    else _FILE_PATH_LABELS_ZH.get(
+                    else _FILE_PATH_LABELS.get(
                         str(record.get("path") or ""), str(record.get("label") or record.get("path") or "")
                     ),
                     "path": record.get("path"),
@@ -820,14 +885,10 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                 for record in records
             ],
             "automatic": {
-                "passed_labels": [
-                    row["label_zh"] for row in boundary_rows if row["executed"] and row["state"] == "passed"
-                ]
-                + [row["label_zh"] for row in independent_rows if row["executed"] and row["state"] == "passed"],
-                "failed_labels": [
-                    row["label_zh"] for row in boundary_rows if row["executed"] and row["state"] == "failed"
-                ]
-                + [row["label_zh"] for row in independent_rows if row["executed"] and row["state"] == "failed"],
+                "passed_labels": [row["label"] for row in boundary_rows if row["executed"] and row["state"] == "passed"]
+                + [row["label"] for row in independent_rows if row["executed"] and row["state"] == "passed"],
+                "failed_labels": [row["label"] for row in boundary_rows if row["executed"] and row["state"] == "failed"]
+                + [row["label"] for row in independent_rows if row["executed"] and row["state"] == "failed"],
             },
             "unsupported": [
                 {"id": item.get("id"), "label": item.get("label")} for item in stage.get("unsupported", [])
@@ -851,11 +912,15 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             ],
         }
         if stage.get("state") in {"completed", "running"}:
-            stage_out["manual_scope_note_zh"] = (
-                "以下为需外部评审确认的事实范围；平台不读取评审批准记录，重跑时仅相关事实发生变化才需要重新确认。"
+            stage_out["manual_scope_note"] = (
+                "The following fact scopes require external review. The platform does not read "
+                "review approvals; a rerun only requires re-confirmation where relevant facts changed."
             )
         else:
-            stage_out["manual_scope_note_zh"] = "自动校验未通过或未执行：先修复问题并完成自动校验，人工确认项不适用。"
+            stage_out["manual_scope_note"] = (
+                "Automatic checks failed or did not run. Fix the issues and complete automatic "
+                "verification first; manual confirmations are not applicable yet."
+            )
         if independent_rows:
             stage_out["independent"] = independent_rows
         if stage.get("state") == "failed" and first_failed is None:
@@ -863,22 +928,22 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         stages_out.append(stage_out)
     states = {stage["state"] for stage in stages_out}
     if "failed" in states:
-        overall_state, headline = "failed", f"{first_failed['name_zh']}阶段失败，后续阶段未执行"
+        overall_state, headline = "failed", f"{first_failed['name']} stage failed; downstream stages did not run"
     elif job.get("status") == "failed":
-        overall_state, headline = "failed", "作业失败，请查看原始诊断"
+        overall_state, headline = "failed", "Job failed; see the raw diagnostic"
     elif "running" in states:
-        overall_state, headline = "running", "运行进行中，尚未完成全部阶段"
+        overall_state, headline = "running", "Run is in progress; not all stages have completed"
     elif stages_out and states == {"completed"}:
-        overall_state, headline = "passed", "六个阶段全部完成，独立校验已通过"
+        overall_state, headline = "passed", "All six stages completed and independent verification passed"
     else:
-        overall_state, headline = "not_run", "尚无阶段记录"
+        overall_state, headline = "not_run", "No stage records yet"
     warning_items = [item for stage in stages_out for item in stage.get("warnings") or []]
     report = {
         "schema_version": REPORT_SCHEMA,
         "overall": {
             "state": overall_state,
-            "state_zh": _OVERALL_STATE_ZH[overall_state],
-            "headline_zh": headline,
+            "state_label": _OVERALL_STATE_LABELS[overall_state],
+            "headline": headline,
             "stages_completed": sum(1 for stage in stages_out if stage["state"] == "completed"),
             "stages_total": len(stages_out),
             "engineering_state": "not_ready",
@@ -893,8 +958,9 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         "warnings": {
             "total": len(warning_items),
             "items": warning_items,
-            "note_zh": (
-                "警告为记录、不阻断的观察项：不计为通过，也不作为验收结论；无需逐项人工确认，按对应阶段的检查清单复核。"
+            "note": (
+                "Warnings are recorded, non-blocking observations. They are neither passes nor "
+                "acceptance conclusions; review them through the corresponding stage checklist."
             ),
         },
         "stages": stages_out,
@@ -909,6 +975,9 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         "scopes": [
             {**confirmation, "stage": stage["id"]} for stage in stages_out for confirmation in stage["confirmations"]
         ],
-        "note_zh": "平台不读取或代管评审批准记录；重跑时可直接沿用未变化事实的既有批准，仅变化项需要重新确认。",
+        "note": (
+            "The platform does not read or manage review approvals; unchanged facts may retain "
+            "existing approval on rerun, while changed items require confirmation."
+        ),
     }
     return report

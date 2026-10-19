@@ -71,17 +71,17 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn("session.upload_limits", app)
         self.assertIn('id="upload-limits"', (STATIC / "index.html").read_text(encoding="utf-8"))
         self.assertIn('startsWith("~$")', app)
-        self.assertIn("将拒绝上传", app)
+        self.assertIn("temporary lock files", app)
         self.assertIn("state.viewer.resize", app)
         self.assertIn("limits.max_files", app)
-        self.assertIn("启动状态尚未确认", app)
-        self.assertIn("不要重复提交", app)
+        self.assertIn("Start state is unconfirmed", app)
+        self.assertIn("do not submit again", app)
         self.assertIn("error.dagRunId", app)
         self.assertIn('$("folder-input").disabled = true', app)
-        self.assertIn("上传完成，正在创建运行", app)
+        self.assertIn("Upload complete; creating run", app)
         self.assertIn("state.blockedPick", app)
         self.assertIn("ratio >= 1", app)
-        self.assertIn("不会自动重试", app)
+        self.assertIn("will not retry automatically", app)
         self.assertNotIn("UPLOAD_LIMITS.", app)
 
     def test_every_static_id_used_by_app_exists_in_page(self) -> None:
@@ -94,7 +94,7 @@ class UploadUiContractTests(unittest.TestCase):
     def test_change_summary_is_a_required_multiline_textarea(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
         self.assertIn('<textarea id="change-summary" rows="3"', html)
-        self.assertIn('placeholder="变更说明（必填）"', html)
+        self.assertIn('placeholder="Change summary (required)"', html)
         self.assertNotIn('maxlength="120"', html)
         self.assertNotIn('id="change-summary" class="muted small"', html)
         app = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -103,22 +103,22 @@ class UploadUiContractTests(unittest.TestCase):
 
     def test_purpose_is_a_required_select_without_a_default(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
-        self.assertIn('<label for="purpose-select" class="muted small">用途（必填）</label>', html)
+        self.assertIn('<label for="purpose-select" class="muted small">Purpose (required)</label>', html)
         self.assertIn('<select id="purpose-select">', html)
-        self.assertIn('<option value="">请选择用途</option>', html)
-        self.assertIn('<option value="engineering">工程交付</option>', html)
-        self.assertIn('<option value="inspection_preview">检查预览</option>', html)
+        self.assertIn('<option value="">Select a purpose</option>', html)
+        self.assertIn('<option value="engineering">Engineering delivery</option>', html)
+        self.assertIn('<option value="inspection_preview">Inspection preview</option>', html)
         app = (STATIC / "app.js").read_text(encoding="utf-8")
         self.assertIn('form.append("purpose", purposeSelect.value)', app)
-        self.assertIn("用途为必填：请选择用途后重试", app)
+        self.assertIn("Purpose is required", app)
         # The select feeds the start gate and the submit body from the same id.
         self.assertEqual(app.count('$("purpose-select")'), 3)
 
     def test_targets_fetch_failure_is_distinct_from_an_unconfigured_platform(self) -> None:
         app = (STATIC / "app.js").read_text(encoding="utf-8")
-        self.assertIn("平台未配置发布目标", app)
-        self.assertIn("发布目标加载失败", app)
-        self.assertIn("会话已失效", app)
+        self.assertIn("No publication target is configured", app)
+        self.assertIn("Failed to load publication targets", app)
+        self.assertIn("session expired", app)
         self.assertIn("state.targetsRetryPick", app)
         self.assertIn("if (state.targetsRetryPick) void loadTargets(state.targetsRetryPick);", app)
 
@@ -198,27 +198,28 @@ class RerunUiContractTests(unittest.TestCase):
             "stage_reruns",
             "/attempts",
             "body: { stage: stageId }",
-            "resume_from_name_zh",
+            "resume_from_name",
             "parent_dag_run_id",
-            "reason_zh",
+            "message",
             "earliest_required",
             "renderRerunPanel",
             "rerunFromStage",
             "shortRunId",
-            "从此步骤重新运行",
-            "继续原作业",
-            "仅发起人或平台管理员可重新运行。",
-            "将重算该步骤及其后续阶段；原始运行与证据保留，重跑为新关联运行。",
-            "重新运行 · 来源",
+            "Rerun from this stage",
+            "Continue original job",
+            "Only the initiator or a platform administrator can rerun.",
+            "This stage and downstream stages will be recomputed. The original run and "
+            "evidence remain, and the rerun is a new linked run.",
+            "Rerun from",
             "prerequisites",
             "recomputes",
             "retains",
-            "PREREQ_STATE_ZH",
+            "PREREQ_STATE",
             "rerunStageName",
-            "前置条件：",
-            "将重算：",
-            "最早可重新运行：",
-            "复用既有输入/结果",
+            "Prerequisites: ",
+            "Recomputes: ",
+            "Earliest restart: ",
+            "Reuse source",
             "nextRunId",
             "stageToShow",
             "stageSelectionKey(nextRunId)",
@@ -227,7 +228,7 @@ class RerunUiContractTests(unittest.TestCase):
             self.assertIn(token, app)
         # The superseded picker design and its parameter name are gone.
         self.assertNotIn("from_stage", app)
-        self.assertNotIn("重试失败步骤", app)
+        self.assertNotIn("Retry failed step", app)
 
 
 class ReportUiContractTests(unittest.TestCase):
@@ -241,11 +242,11 @@ class ReportUiContractTests(unittest.TestCase):
         for token in (
             "run.report",
             "report.overall",
-            "headline_zh",
+            "headline",
             "engineering_state",
             "report.failure",
-            "title_zh",
-            "meaning_zh",
+            "title",
+            "meaning",
             "raw_error",
             "raw_detail",
             "report.measured",
@@ -253,16 +254,16 @@ class ReportUiContractTests(unittest.TestCase):
             "mass_closure",
             "urdf_mass_kg",
             "whole_cad_mass_kg",
-            "label_zh",
-            "state_zh",
+            "label",
+            "state_label",
             "raw_details",
             "counts",
             "countsText",
             "external_review",
             "scopes",
             "automatic_exclusion",
-            "note_zh",
-            "manual_scope_note_zh",
+            "note",
+            "manual_scope_note",
             "executed",
             "independent",
             "boundary",
@@ -278,9 +279,9 @@ class ReportUiContractTests(unittest.TestCase):
             "warnings: Array.isArray(stage.warnings)",
             "renderStageWarnings(root, stage",
             "stage.counts.warnings",
-            "限定资格阻断：",
-            "发布阻断：",
-            "记录值",
+            "Qualification blocker: ",
+            "Publication blocker: ",
+            "Recorded values",
             "warningValueText",
             "rows.slice(0, WARNING_ROW_LIMIT)",
             "WARNING_VALUE_LIMIT",
@@ -294,16 +295,16 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertNotIn("checkbox", app)
 
     def test_failure_card_lists_failed_checks_and_keeps_warnings_separate(self) -> None:
-        """A failed stage names its exact failed checks instead of "原因未判定"."""
+        """A failed stage names its exact failed checks instead of an undetermined cause."""
 
         app = self.app()
         for token in (
             "buildFailureCard(report.failure, report)",
-            "未通过的自动检查（",
+            "Failed automatic checks (",
             "failedChecks.slice(0, 5)",
-            "来源证据检查未通过",
-            "该阶段另有",
-            "警告不计为通过",
+            "A source-evidence check failed.",
+            "This stage has",
+            "Warnings are neither passes nor acceptance/publication evidence.",
         ):
             self.assertIn(token, app)
         self.assertNotIn("buildFailureCard(report.failure);", app)
@@ -320,7 +321,7 @@ class ReportUiContractTests(unittest.TestCase):
             "checks_executed",
         ):
             self.assertNotIn(legacy, app)
-        self.assertIn("报告数据暂不可用", app)
+        self.assertIn("Report data is unavailable", app)
 
     def test_failed_stage_is_auto_selected_and_selection_persists(self) -> None:
         app = self.app()
@@ -350,20 +351,20 @@ class ReportUiContractTests(unittest.TestCase):
 
     def test_manual_scope_is_gated_and_honest(self) -> None:
         app = self.app()
-        self.assertIn("工程评审范围", app)
-        self.assertIn("未就绪", app)
-        self.assertIn("自动检查无法核验", app)
+        self.assertIn("Engineering review scope", app)
+        self.assertIn("not ready", app)
+        self.assertIn("facts that automatic checks cannot verify", app)
         self.assertIn("text.textContent = scope.automatic_exclusion", app)
-        self.assertNotIn("项待确认", app)
+        self.assertNotIn("pending confirmations", app)
 
     def test_stepper_keeps_names_and_shows_affected_object(self) -> None:
         app = self.app()
         css = (STATIC / "style.css").read_text(encoding="utf-8")
         self.assertIn("STEP_STATE_SHORT", app)
-        self.assertIn("已阻断", app)
+        self.assertIn("Blocked", app)
         self.assertIn("minmax(3.5em, 1fr)", css)
         self.assertIn("max-width: 5.5em", css)
-        self.assertIn("涉及对象", app)
+        self.assertIn("Objects: ", app)
         self.assertIn("visibleFindings", app)
 
 
@@ -382,8 +383,8 @@ class AssemblySelectorUiContractTests(unittest.TestCase):
             "updateStartEnabled",
             "state.assemblyChoice",
             'form.append("main_assembly", state.assemblyChoice)',
-            "主装配",
-            "请选择主装配…",
+            "Main assembly",
+            "Select the main assembly...",
         ):
             self.assertIn(token, app)
         self.assertIn(".assembly-row", css)
@@ -394,7 +395,7 @@ class RunHistoryUiContractTests(unittest.TestCase):
 
     The list shows the engineering folder (or the custom display title), a human timestamp,
     the state and the recorded initiator; rerun lineage stays a secondary chip. Delete moves a
-    run into the explicit 已删除 view (never a one-way hide), rename only changes the displayed
+    run into the explicit Deleted view (never a one-way hide), rename only changes the displayed
     name, and deleted runs stay readable while retry/rerun wait for a restore.
     """
 
@@ -406,8 +407,8 @@ class RunHistoryUiContractTests(unittest.TestCase):
 
     def test_page_title_is_exact(self) -> None:
         page = self.page()
-        self.assertIn("<title>SolidWorks2URDF 交付操作台</title>", page)
-        self.assertIn("<h1>SolidWorks2URDF 交付操作台</h1>", page)
+        self.assertIn("<title>SolidWorks2URDF Delivery Portal</title>", page)
+        self.assertIn("<h1>SolidWorks2URDF Delivery Portal</h1>", page)
 
     def test_rows_render_name_time_state_actor_and_secondary_rerun_chip(self) -> None:
         app = self.app()
@@ -415,16 +416,16 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "runDisplayTitle",
             "formatRunTime",
             "RUN_STATES[run.state]",
-            "状态待确认",
-            '发起人：${run.user || "未记录"}',
-            "从${run.resume_from_name_zh}重跑",
-            "重跑来源：",
+            "State unconfirmed",
+            'Initiator: ${run.user || "not recorded"}',
+            "Rerun from ${run.resume_from_name}",
+            "Rerun source: ",
             "open.title",
             "formatTime(run.started_at)",
         ):
             self.assertIn(token, app)
         # The rerun-dominated list title is gone; the parent id only lives in secondary detail.
-        self.assertNotIn("自${run.resume_from_name_zh}重新运行", app)
+        self.assertNotIn("Rerun source: ${run.resume_from_name} rerun", app)
 
     def test_explicit_views_with_real_paging(self) -> None:
         page = self.page()
@@ -435,9 +436,9 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "include_deleted=1",
             "next_offset",
             "loadMoreRuns",
-            "加载更多",
-            "当前已加载记录中没有可显示的运行，可继续加载更多。",
-            "已显示全部",
+            "Load more",
+            "No runs are visible in the loaded records; load more.",
+            "All runs shown",
             "state.runView",
             "state.runsNextOffset",
         ):
@@ -459,14 +460,14 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "run-menu-pop",
             "aria-haspopup",
             "aria-expanded",
-            "操作：",
-            "重命名「",
+            "Actions: ",
+            "Rename",
             "run-menu-buttons",
-            "运行结束前不能删除。",
-            "运行状态未知，暂不能删除。",
-            "从运行列表移除，可在「已删除」中恢复；模型、证据和 PR 保留。",
-            "已删除 · ",
-            "删除人：",
+            "This run cannot be deleted before it ends.",
+            "Run state is unknown, so deletion is unavailable.",
+            "Remove this run from the list. It can be restored from Deleted; models, evidence, and PRs remain.",
+            "Deleted · ",
+            "Deleted by: ",
             "overlayRun",
         ):
             self.assertIn(token, app)
@@ -497,8 +498,8 @@ class RunHistoryUiContractTests(unittest.TestCase):
         app = self.app()
         page = self.page()
         self.assertIn('id="run-deleted"', page)
-        self.assertIn("此运行已删除：请先恢复后再重试或重跑。", app)
-        self.assertIn("此运行已删除：请先恢复后再重跑。", app)
+        self.assertIn("This run is deleted; restore it before retrying or rerunning.", app)
+        self.assertIn("This run is deleted; restore it before rerunning.", app)
         self.assertIn("RETRY_REASONS.deleted", app)
 
     def test_keyboard_and_focus_contract(self) -> None:
@@ -549,36 +550,36 @@ class ActivityUiContractTests(unittest.TestCase):
             "activityPlacement(",
             "startActivityTimer()",
             "stopActivityTimer()",
-            "相关对象：",
+            "Related object: ",
         ):
             self.assertIn(token, app)
 
     def test_wording_states_and_hard_rules_are_pinned(self) -> None:
         source = self.activity()
         for token in (
-            "暂无详细进度",
-            "暂无新更新",
-            "刚刚更新",
-            "已处理",
+            "No detailed progress",
+            "No new update",
+            "Updated just now",
+            "Processed",
             "updated_at",
             "queued",
             "waiting",
             "busy",
             "finished",
-            "最后活动",
-            "打开文档",
-            "读取已保存的模型状态",
+            "Last activity",
+            "Opening document",
+            "Reading saved model state",
             "discover.open_document",
             "discover.session_start",
-            "正在启动 SolidWorks",
+            "Starting SolidWorks",
         ):
             self.assertIn(token, source)
         # No percentage figures in any rendered text (modulo arithmetic outside strings is
         # fine), no forecasts, no HTML injection surface.
         self.assertIsNone(re.search(r'"[^"\n]*%[^"\n]*"', source), "percent in double-quoted text")
         self.assertIsNone(re.search(r"`[^`\n]*%[^`\n]*`", source), "percent in template text")
-        self.assertNotIn("预计", source)
-        self.assertNotIn("剩余", source)
+        self.assertNotIn("\u9884\u8ba1", source)
+        self.assertNotIn("\u5269\u4f59", source)
         self.assertNotIn("innerHTML", source)
         app = (STATIC / "app.js").read_text(encoding="utf-8")
         self.assertIn("buildActivityCard", app)
@@ -625,13 +626,13 @@ class FailureDisplayUiContractTests(unittest.TestCase):
     def test_failure_summary_counts_are_findings_not_defects(self) -> None:
         app = (STATIC / "app.js").read_text(encoding="utf-8")
         for token in (
-            "不代表 CAD 缺陷",
+            "not CAD defects",
             "discovery.link_name_missing",
-            "并不代表 CAD 中不存在坐标系",
-            "不需要为每个供应商内部叶件单独添加坐标系",
-            "示例对象：",
-            "未读取到机器人名称",
-            "缺少机器人名称",
+            "does not prove that CAD has no coordinate system",
+            "Do not add a separate coordinate system for every supplier-internal leaf.",
+            "Example objects: ",
+            "No robot name was read",
+            "Missing robot name",
         ):
             self.assertIn(token, app)
 

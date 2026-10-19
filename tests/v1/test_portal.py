@@ -367,9 +367,7 @@ class PortalClient:
         self.jar = CookieJar()
         # The portal tests talk to loopback fixtures; ambient HTTP(S)_PROXY must not route
         # them through an external proxy (the production internal opener is direct too).
-        self.opener = urlrequest.build_opener(
-            urlrequest.ProxyHandler({}), urlrequest.HTTPCookieProcessor(self.jar)
-        )
+        self.opener = urlrequest.build_opener(urlrequest.ProxyHandler({}), urlrequest.HTTPCookieProcessor(self.jar))
         self.csrf: str | None = None
         self.login_response = b""
         self.last_set_cookies: list[str] = []
@@ -1152,9 +1150,7 @@ class PortalTests(unittest.TestCase):
             if not path.startswith("reports/") and path != "manifest.json"
         }
         report_files = {
-            path: hashlib.sha256(data).hexdigest()
-            for path, data in members.items()
-            if path.startswith("reports/")
+            path: hashlib.sha256(data).hexdigest() for path, data in members.items() if path.startswith("reports/")
         }
         self.store.add(
             run_id,
@@ -1529,7 +1525,7 @@ class PortalTests(unittest.TestCase):
             "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
         )
         self.assertEqual(status, 503, body)
-        self.assertIn("准入窗口已关闭", json.loads(body)["error"])
+        self.assertIn("Platform admission is closed", json.loads(body)["error"])
         self.assertEqual(self.platform.admits, [])
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual([entry.name for entry in self.upload_root.iterdir() if entry.name != ".staging"], [])
@@ -1594,7 +1590,7 @@ class PortalTests(unittest.TestCase):
             "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 503, body)
-        self.assertIn("未接纳", json.loads(body)["error"])
+        self.assertIn("was not admitted", json.loads(body)["error"])
         self.assertEqual(self.platform.admits, [])
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual([entry.name for entry in self.upload_root.iterdir() if entry.name != ".staging"], [])
@@ -1607,9 +1603,10 @@ class PortalTests(unittest.TestCase):
             "POST", "/api/runs", _upload_body(files=files), "multipart/form-data; boundary=portal-boundary"
         )
         self.assertEqual(status, 503, body)
-        self.assertIn("暂不可用", json.loads(body)["error"])
+        self.assertIn("temporarily unavailable", json.loads(body)["error"])
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual([entry.name for entry in self.upload_root.iterdir() if entry.name != ".staging"], [])
+
     def test_submission_requires_a_configured_target_and_a_change_summary(self) -> None:
         self.client.login()
         cases = {
@@ -1707,7 +1704,7 @@ class PortalTests(unittest.TestCase):
             "multipart/form-data; boundary=portal-boundary",
         )
         self.assertEqual(status, 400, body)
-        self.assertIn("发布目标不在平台配置中", json.loads(body)["error"])
+        self.assertIn("Publication target is not configured", json.loads(body)["error"])
 
     def test_main_assembly_selection_is_validated_and_persisted(self) -> None:
         self.client.login()
@@ -1878,7 +1875,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 502, body)
         payload = json.loads(body)
         self.assertEqual(payload["trigger"], "absent")
-        self.assertIn("不要重复提交", payload["error"])
+        self.assertIn("do not submit again", payload["error"])
         unresolved = payload["dag_run_id"]
         self.assertNotIn(unresolved, self.airflow.dag_runs)
         self.assertTrue((self.upload_root / unresolved / "机器人工程" / "model.SLDASM").is_file())
@@ -2152,7 +2149,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(coverage["automatic"]["state"], "passed")
         self.assertEqual(coverage["structure"]["hardware_id"], "m3.0")
         self.assertEqual(coverage["structure"]["revision"], "r1")
-        self.assertTrue(any("干涉与间隙" in text for text in coverage["automatic"]["unsupported"]))
+        self.assertTrue(any("Interference and clearance" in text for text in coverage["automatic"]["unsupported"]))
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(
             [task["task_id"] for task in payload["tasks"]],
@@ -2175,7 +2172,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(payload["report"]["overall"]["state"], "failed")
         self.assertEqual(payload["report"]["failure"]["stage"], "discover")
         blocked = next(stage for stage in payload["report"]["stages"] if stage["id"] == "capture")
-        self.assertEqual(blocked["state_zh"], "上游阶段失败（未执行）")
+        self.assertEqual(blocked["state_label"], "Blocked by upstream failure")
         self.assertTrue(any(check["id"] == "discovery.axis_unresolved" for check in payload["automatic"]["checks"]))
         self.assertEqual(payload["coverage"]["structure"]["hardware_id"], "m3.0")
         self.assertFalse(payload["discovery"]["passed"])
@@ -2246,7 +2243,7 @@ class PortalTests(unittest.TestCase):
         links = json.loads(body)["structural_report"]
         self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
         self.assertEqual(links[0]["url"], f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
-        self.assertTrue(links[0]["label_zh"])
+        self.assertTrue(links[0]["label"])
 
     def test_failed_native_run_serves_the_fetched_report_and_refuses_absent(self) -> None:
         self.client.login()
@@ -2325,17 +2322,13 @@ class PortalTests(unittest.TestCase):
             },
             artifacts={"urdf/robot.urdf": urdf, "reports/quality.json": document},
         )
-        status, headers, body = self.client.request(
-            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
-        )
+        status, headers, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
         self.assertEqual(status, 200, body)
         self.assertEqual(body, document)
         self.assertEqual(headers.get("Content-Type"), "application/json")
         # The digest rule is unchanged: tampered bytes surface as a stream failure.
         self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b"tampered"
-        status, _, body = self.client.request(
-            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
-        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
         self.assertEqual(status, 502)
         self.assertNotIn(b"tampered", body)
         # A member outside the bound member maps stays a clear 404.
@@ -2878,12 +2871,12 @@ class PortalTests(unittest.TestCase):
     @staticmethod
     def _rerun_rows(overrides: dict[str, tuple[bool, str, str | None]] | None = None) -> list[dict]:
         names = {
-            "freeze": "冻结输入",
-            "discover": "解析结构",
-            "capture": "采集证据",
-            "generate": "生成 URDF",
-            "verify": "独立验证",
-            "publish": "提交评审 PR",
+            "freeze": "Freeze inputs",
+            "discover": "Discover structure",
+            "capture": "Capture evidence",
+            "generate": "Generate URDF",
+            "verify": "Independent verification",
+            "publish": "Publish review PR",
         }
         chosen = overrides or {}
         rows = []
@@ -2892,10 +2885,10 @@ class PortalTests(unittest.TestCase):
             rows.append(
                 {
                     "stage": stage,
-                    "name_zh": name,
+                    "name": name,
                     "eligible": eligible,
                     "reason": reason,
-                    "reason_zh": "" if eligible else "上游检查点不可复用，请从更早步骤重新执行",
+                    "message": "" if eligible else "Upstream checkpoint cannot be reused; restart from an earlier step",
                     "recomputes": [stage],
                     "retains": [],
                     "prerequisites": {
@@ -2946,7 +2939,7 @@ class PortalTests(unittest.TestCase):
         self.assertNotEqual(child, DAG_RUN_ID)
         self.assertEqual(payload["parent_dag_run_id"], DAG_RUN_ID)
         self.assertEqual(payload["resume_from"], "generate")
-        self.assertEqual(payload["resume_from_name_zh"], "生成 URDF")
+        self.assertEqual(payload["resume_from_name"], "Generate URDF")
         self.assertEqual(payload["state"], "queued")
         self.assertEqual(self.airflow.trigger_payloads[-1]["dag_run_id"], child)
         # The admission is the durable reservation: canonical native id, the parent
@@ -3086,7 +3079,7 @@ class PortalTests(unittest.TestCase):
             payload = json.loads(body)
             self.assertEqual(payload["reason"], "already_active")
             self.assertEqual(payload["active_dag_run_id"], child)
-            self.assertTrue(payload["reason_zh"])
+            self.assertTrue(payload["message"])
             # A changed frame (another target) may never ride the existing attempt.
             status, _, body = self.client.request(
                 "POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate", "target_hardware": "m3.1"}
@@ -3108,7 +3101,7 @@ class PortalTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload["reason"], "dependency_changed")
         self.assertEqual(payload["earliest_required"], "discover")
-        self.assertTrue(payload["reason_zh"])
+        self.assertTrue(payload["message"])
         # A portable stage whose Linux checkpoint is missing refuses with the store's own reason.
         self.store.runs[RUN_ID]["checkpoints"] = ("capture",)
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": self._rerun_rows()}):
@@ -3217,13 +3210,13 @@ class PortalTests(unittest.TestCase):
         rows = {row["stage"]: row for row in json.loads(body)["stage_reruns"]}
         self.assertIs(rows["freeze"]["eligible"], True)
         self.assertEqual(rows["freeze"]["reason"], "linux_ready")
-        self.assertTrue(rows["freeze"]["reason_zh"])
+        self.assertTrue(rows["freeze"]["message"])
         status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "freeze"})
         self.assertEqual(status, 202, body)
         payload = json.loads(body)
         child = payload["dag_run_id"]
         self.assertEqual(payload["resume_from"], "freeze")
-        self.assertEqual(payload["resume_from_name_zh"], "冻结输入")
+        self.assertEqual(payload["resume_from_name"], "Freeze inputs")
         self.assertEqual(len(self.platform.admits), 1)
         admit = self.platform.admits[0]
         self.assertEqual(admit["request_id"], f"portal-{child}")
@@ -3453,9 +3446,7 @@ class PortalTests(unittest.TestCase):
             if receipt
             else {"error": "shape-only legacy failure"}
         )
-        self.platform.stages[native] = {
-            "freeze": {"stage": "freeze", "state": "failed", "receipt": stage_receipt}
-        }
+        self.platform.stages[native] = {"freeze": {"stage": "freeze", "state": "failed", "receipt": stage_receipt}}
         return intake
 
     def test_freeze_retry_old_shape_resolves_the_bound_failure_evidence(self) -> None:
@@ -3629,7 +3620,7 @@ class PortalTests(unittest.TestCase):
         runs = {item["dag_run_id"]: item for item in json.loads(body)["runs"]}
         self.assertEqual(runs[child]["parent_dag_run_id"], DAG_RUN_ID)
         self.assertEqual(runs[child]["resume_from"], "verify")
-        self.assertEqual(runs[child]["resume_from_name_zh"], "独立验证")
+        self.assertEqual(runs[child]["resume_from_name"], "Independent verification")
         self.assertIsNone(runs[DAG_RUN_ID]["parent_dag_run_id"])
         self.assertIsNone(runs[DAG_RUN_ID]["resume_from"])
 
@@ -3884,7 +3875,7 @@ class PortalTests(unittest.TestCase):
         with patch.object(self.endpoint, "rerun_plan", create=True, return_value={"stage_reruns": rows}):
             status, _, body = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"stage": "generate"})
         self.assertEqual(status, 503, body)
-        self.assertIn("准入窗口已关闭", json.loads(body)["error"])
+        self.assertIn("Platform admission is closed", json.loads(body)["error"])
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual(self.platform.admits, [])
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from ..stages import CONTRACT, STAGE_IDS, stage_view
 
-STAGE_NAMES_ZH = {stage["id"]: stage.get("name_zh") or stage["id"] for stage in CONTRACT["stages"]}
+STAGE_NAMES = {stage["id"]: stage.get("name") or stage["id"] for stage in CONTRACT["stages"]}
 STAGE_INPUTS = {stage["id"]: list(stage.get("inputs") or []) for stage in CONTRACT["stages"]}
 PREREQUISITES: dict[str, tuple[str, ...]] = {
     "freeze": (),
@@ -35,17 +35,22 @@ AVAILABILITY = {
     "generate": "generate",
     "verify": "receipt",
 }
-REASON_ZH = {
-    "not_ready": "原运行尚未结束，暂不能从此步骤重新运行",
-    "incomplete": "原运行未产生可复用的检查点，最早可从“冻结输入”重新开始",
-    "source_changed": "原始上传不可复用，请重新上传后开始新运行",
-    "dependency_changed": "解析依赖快照（命名注册表或记录来源）与原始运行不一致或无法验证，最早可从“解析结构”重新开始",
-    "tool_changed": "工具版本已变化或无法验证；不能混用不同版本的证据，最早可从“冻结输入”重新开始",
+REASON_MESSAGES = {
+    "not_ready": "The original run has not finished, so it cannot be rerun from this step yet",
+    "incomplete": "The original run produced no reusable checkpoint; restart from Freeze inputs",
+    "source_changed": "The original upload cannot be reused; upload the folder again for a new run",
+    "dependency_changed": (
+        "The discovery dependency snapshot is inconsistent or unverifiable; restart from Discover structure"
+    ),
+    "tool_changed": (
+        "The tool release changed or cannot be verified; evidence from different releases "
+        "cannot be mixed; restart from Freeze inputs"
+    ),
 }
 
 
-def stage_name_zh(stage: object) -> str:
-    return STAGE_NAMES_ZH.get(str(stage), str(stage))
+def stage_name(stage: object) -> str:
+    return STAGE_NAMES.get(str(stage), str(stage))
 
 
 def _stage_completed(job: dict, stage_id: str) -> bool:
@@ -90,40 +95,40 @@ def start_plan(job: dict, requested: str, *, probe: dict[str, str], tool: str) -
             "accepted": False,
             "reason": "unknown_stage",
             "earliest_required": None,
-            "reason_zh": "未知的工程阶段",
+            "message": "Unknown engineering stage",
             "start_stage": None,
-            "stage_name_zh": None,
+            "stage_name": None,
         }
     if job.get("status") not in {"failed", "passed", "native_complete"}:
         return {
             "accepted": False,
             "reason": "not_ready",
             "earliest_required": None,
-            "reason_zh": REASON_ZH["not_ready"],
+            "message": REASON_MESSAGES["not_ready"],
             "start_stage": None,
-            "stage_name_zh": None,
+            "stage_name": None,
         }
     failure = _prerequisite_failure(requested, job, probe, tool)
     if failure is not None:
         reason, earliest = failure
-        text = REASON_ZH.get(reason)
+        text = REASON_MESSAGES.get(reason)
         if text is None:
-            text = f"上游检查点“{stage_name_zh(earliest)}”不可复用，请从该步骤重新开始"
+            text = f"Upstream checkpoint {stage_name(earliest)} cannot be reused; restart from that step"
         return {
             "accepted": False,
             "reason": reason,
             "earliest_required": earliest,
-            "reason_zh": text,
+            "message": text,
             "start_stage": None,
-            "stage_name_zh": None,
+            "stage_name": None,
         }
     return {
         "accepted": True,
         "reason": "ok",
         "earliest_required": None,
-        "reason_zh": "",
+        "message": "",
         "start_stage": requested,
-        "stage_name_zh": stage_name_zh(requested),
+        "stage_name": stage_name(requested),
     }
 
 
@@ -136,14 +141,14 @@ def stage_reruns(job: dict, *, probe: dict[str, str], tool: str) -> list[dict]:
         rows.append(
             {
                 "stage": stage_id,
-                "name_zh": stage_name_zh(stage_id),
+                "name": stage_name(stage_id),
                 "eligible": plan["accepted"],
                 "reason": plan["reason"],
-                "reason_zh": plan["reason_zh"],
+                "message": plan["message"],
                 "recomputes": list(STAGE_IDS[index:]),
                 "retains": [
                     {
-                        "label_zh": stage_name_zh(up),
+                        "label": stage_name(up),
                         "path": record.get("path"),
                         "availability": probe.get("source" if up == "freeze" else AVAILABILITY.get(up, up), "absent"),
                     }

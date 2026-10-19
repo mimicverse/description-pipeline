@@ -306,9 +306,8 @@ class MassEvidenceContractTests(unittest.TestCase):
         self.assertEqual(base["provenance"]["mass"], "source.documented_masses")
         self.assertEqual(base["provenance"]["mass_sources"], ["documented"])
         self.assertEqual(base["provenance"]["inertia_model"], "scaled_cad_uniform_density")
-        self.assertIn("不等于实测惯量", base["provenance"]["inertia_model_scope"])
+        self.assertIn("is not measured inertia", base["provenance"]["inertia_model_scope"])
         record = base["provenance"]["declared_masses"][0]
         self.assertEqual(record["scale"], 2.5)
         arm = next(link for link in scene["links"] if link["name"] == "arm_link")
         self.assertEqual(arm["provenance"]["mass_sources"], ["documented"])
-

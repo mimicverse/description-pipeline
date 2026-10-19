@@ -177,10 +177,71 @@ class StageTests(unittest.TestCase):
         contracts = (docs / "contracts.md").read_text()
         section = contracts.split("## 六阶段契约", 1)[1].split("\n## ", 1)[0]
         table = "\n".join(line for line in section.splitlines() if line.startswith("|")).rstrip()
-        # The documentation table and the rendering from the machine contract the
-        # runtime consumes must be equal cell-for-cell - no re-typed shadow table.
-        self.assertEqual(table, contract_markdown())
+        documented_rows = [
+            [cell.strip() for cell in line.strip("|").split("|")]
+            for line in table.splitlines()
+            if line.startswith("| `")
+        ]
+        documented_stages = [row[0].strip("`").split("`", 1)[0] for row in documented_rows]
+        self.assertEqual(tuple(documented_stages), STAGE_IDS)
+        documented_hosts = {
+            "freeze": "Linux",
+            "discover": "Windows 原生观察 + Linux 推导",
+            "capture": "Windows 原生读取 + Linux 传输核验",
+            "generate": "Linux",
+            "verify": "Linux",
+            "publish": "Linux",
+        }
+        expected_qc = {
+            "freeze": (("handoff.admission",), ("handoff.integrity",)),
+            "discover": (
+                ("discovery.inputs",),
+                ("discovery.definition", "discovery.binding"),
+            ),
+            "capture": (
+                ("input.valid", "runtime.ready"),
+                ("capture.integrity", "capture.input_stability"),
+            ),
+            "generate": (("generation.inputs",), ("generation.artifacts",)),
+            "verify": (
+                ("verification.subject",),
+                ("verification.gates", "verification.report_binding"),
+            ),
+            "publish": (
+                ("publication.inputs",),
+                ("publication.git", "publication.receipt"),
+            ),
+        }
+        for row, stage in zip(documented_rows, CONTRACT["stages"], strict=True):
+            self.assertEqual(row[1], documented_hosts[stage["id"]])
+            self.assertEqual(
+                tuple(check["id"] for check in stage["input_qc"]),
+                expected_qc[stage["id"]][0],
+            )
+            self.assertEqual(
+                tuple(check["id"] for check in stage["output_qc"]),
+                expected_qc[stage["id"]][1],
+            )
+        rendered = contract_markdown()
+        rendered_rows = [
+            [cell.strip() for cell in line.strip("|").split("|")]
+            for line in rendered.splitlines()
+            if line.startswith("| `")
+        ]
+        self.assertEqual(tuple(documented_stages), tuple(row[0].strip("`").split("`", 1)[0] for row in rendered_rows))
+        for row, stage in zip(rendered_rows, CONTRACT["stages"], strict=True):
+            self.assertEqual(row[0], f"`{stage['id']}` {stage['name']}")
+            self.assertEqual(row[1], stage["host_text"])
+            self.assertEqual(row[2], stage["doc"]["input"])
+            self.assertEqual(row[3], stage["doc"]["output"])
+        for stage in CONTRACT["stages"]:
+            self.assertTrue(stage["name"])
+            self.assertTrue(stage["host_text"].isascii())
+            self.assertTrue(stage["doc"]["input"].isascii())
+            self.assertTrue(stage["doc"]["output"].isascii())
         spec = (docs / "mechanical-handoff-spec.md").read_text()
+        self.assertEqual(len(CONTRACT["confirmations"]), 5)
+        self.assertEqual(len({item["id"] for item in CONTRACT["confirmations"]}), 5)
         responsibilities = {}
         for line in spec.splitlines():
             if not line.startswith("|"):
@@ -195,12 +256,23 @@ class StageTests(unittest.TestCase):
             }:
                 responsibilities[cells[0]] = cells[1]
         self.assertEqual(len(responsibilities), 5)
-        self.assertEqual(len(CONTRACT["confirmations"]), 5)
+        expected_responsibility = {
+            "design_fidelity": "结构负责人",
+            "motion_safety": "机械安全责任人",
+            "drive_applicability": "参数责任人",
+            "physical_fidelity": "物理参数责任人",
+            "acceptance_basis": "预算责任人",
+        }
         for item in CONTRACT["confirmations"]:
             self.assertEqual(item["reference"], "docs/mechanical-handoff-spec.md#review")
-            self.assertIn(item["label"], responsibilities)
-            self.assertEqual(item["scope"], responsibilities[item["label"]])
+            self.assertIn(expected_responsibility[item["id"]], responsibilities)
+            self.assertTrue(responsibilities[expected_responsibility[item["id"]]])
+            self.assertTrue(item["label"].isascii())
+            self.assertTrue(item["scope"].isascii())
+            self.assertTrue(item["automatic_exclusion"].isascii())
             self.assertIn(item["review_stage"], STAGE_IDS)
+        self.assertIn('<a id="stages"></a>', contracts)
+        self.assertIn('<a id="review"></a>', spec)
         view = stage_view()
         self.assertEqual({row["stage"] for row in view["unsupported"]}, {"discover", "verify"})
 
@@ -254,9 +326,9 @@ class StageTests(unittest.TestCase):
         self.assertLess(len(json.dumps(compact_view(view))), 7000)
         table = contract_markdown()
         self.assertEqual(len(table.splitlines()), 8)
-        self.assertIn("| 阶段 | 执行 | 输入与输入检查 | 封存输出与输出检查 |", table)
+        self.assertIn("| Stage | Execution | Input and input checks | Sealed output and output checks |", table)
         for definition in CONTRACT["stages"]:
-            self.assertIn(f"`{definition['id']}` {definition['name_zh']}", table)
+            self.assertIn(f"`{definition['id']}` {definition['name']}", table)
 
 
 if __name__ == "__main__":

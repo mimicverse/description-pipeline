@@ -288,7 +288,7 @@ def _member(obj, name, *args):
         _hint_method(obj, name)
     try:
         value = getattr(obj, name)
-    except AttributeError as error:  # 稳定的错误码，避免上层看到裸 AttributeError
+    except AttributeError as error:  # stable error code instead of leaking a raw AttributeError
         raise CadError("cad_member_missing", name) from error
     if hasattr(value, "_oleobj_"):
         if args:
@@ -347,7 +347,7 @@ def _method(obj, name, *args):
     _hint_method(obj, name)
     try:
         value = getattr(obj, name)
-    except AttributeError as error:  # 稳定的错误码，避免上层看到裸 AttributeError
+    except AttributeError as error:  # stable error code instead of leaking a raw AttributeError
         raise CadError("cad_member_missing", name) from error
     if hasattr(value, "_oleobj_"):
         raise CadError("cad_member_not_callable", name)
@@ -2109,7 +2109,7 @@ class _ActivityEmitter:
         self._keepalive_thread = None
 
 
-#: SolidWorks COM mid-export transient: DISP_E_EXCEPTION ("服务器出现意外情况").
+#: SolidWorks COM mid-export transient: DISP_E_EXCEPTION ("unexpected server condition").
 TRANSIENT_COM_RETRY_ATTEMPTS = 3
 TRANSIENT_COM_RETRY_DELAYS = (0.2, 0.5)
 #: Geometry-export face reads (display triangles and the facetless probe) run
@@ -2136,11 +2136,9 @@ FACETLESS_DEGENERATE_AREA_M2 = 1e-12
 FACETLESS_EVIDENCE_API = "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets"
 
 
-#: SolidWorks COM mid-session transients that are retried, matched textually
-#: because pywin32 surfaces both through ``com_error``: DISP_E_EXCEPTION
-#: 0x80010105 ("服务器出现意外情况") and RPC_S_SERVER_UNAVAILABLE 0x800706BA
-#: ("RPC 服务器不可用", the r8 face-51 read that failed the capture while the
-#: predicate matched only the first code).
+#: SolidWorks COM mid-session transients that are retried because pywin32 surfaces
+#: both through ``com_error``: DISP_E_EXCEPTION 0x80010105 (unexpected server
+#: condition) and RPC_S_SERVER_UNAVAILABLE 0x800706BA (RPC server unavailable).
 TRANSIENT_COM_ERROR_CODES = ("-2147417851", "-2147023174")
 
 
@@ -2316,9 +2314,7 @@ class SolidWorksBackend(CadBackend):
                     "document_seal_invalid", "Sealed documents must be non-empty paths", {"document": repr(document)}
                 )
             if not os.path.isabs(text):
-                raise CadError(
-                    "document_seal_invalid", "Sealed documents must be absolute paths", {"document": text}
-                )
+                raise CadError("document_seal_invalid", "Sealed documents must be absolute paths", {"document": text})
             sealed.add(normalize_document_path(os.path.abspath(text)))
         self._sealed_documents = sealed
         return sorted(sealed)
@@ -2861,9 +2857,7 @@ class SolidWorksBackend(CadBackend):
         def read_once(body_name: str, components: list[object]) -> dict:
             mp = _member(_member(doc, "Extension"), "CreateMassProperty2")
             if mp is None:
-                raise CadError(
-                    "cad_empty_mass_property", "CreateMassProperty2 returned null", {"link": body_name}
-                )
+                raise CadError("cad_empty_mass_property", "CreateMassProperty2 returned null", {"link": body_name})
             mp.UseSystemUnits = True
             mp.IncludeHiddenBodiesOrComponents = True
             selection = _win32().VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, tuple(components))
@@ -2887,9 +2881,7 @@ class SolidWorksBackend(CadBackend):
                 raise CadError("cad_mass_property_inertia_unsupported", "GetMomentOfInertia(0) must return 9 values")
             inertia, _axis = _inertia_from_raw(tuple(values), document_title)
             if mass <= 0 or not math.isfinite(mass) or len(com) != 3 or not all(map(math.isfinite, com)):
-                raise CadError(
-                    "cad_mass_property_invalid", "mass/COM are not finite and positive", {"link": body_name}
-                )
+                raise CadError("cad_mass_property_invalid", "mass/COM are not finite and positive", {"link": body_name})
             read = {
                 "mass_kg": mass,
                 "com_m": com,
@@ -3064,7 +3056,8 @@ class SolidWorksBackend(CadBackend):
                         document_type,
                         measurement_basis=(
                             "cad_assembly_instance_measurement"
-                            if differs_from_part else "cad_authored_effective_instance"
+                            if differs_from_part
+                            else "cad_authored_effective_instance"
                         ),
                         part_reading=part_reading if differs_from_part else None,
                     )
@@ -3362,9 +3355,7 @@ class SolidWorksBackend(CadBackend):
                     "selection_api": "IMassProperty2 (SelectedItems = component instance)",
                     "override_api": "IMassProperty2.GetOverrideOptions (same selection)",
                     "effective_instance": effective,
-                    "measurement_basis": (
-                        "cad_authored_effective_instance" if effective else "cad_measured"
-                    ),
+                    "measurement_basis": ("cad_authored_effective_instance" if effective else "cad_measured"),
                 }
             )
             # Optional native scalars are preserved verbatim when readable and
@@ -3922,11 +3913,10 @@ class SolidWorksBackend(CadBackend):
                             area = _member(face, "GetArea")
                         except Exception:  # noqa: BLE001 - missing evidence must not warn-pass
                             area = None
+
                         def _probe_facetless(body=body, face_index=face_index, face=face) -> dict:
                             fresh_faces = _as_list(_member(body, "GetFaces"))
-                            face_ref = (
-                                _dynamic(fresh_faces[face_index]) if len(fresh_faces) > face_index else face
-                            )
+                            face_ref = _dynamic(fresh_faces[face_index]) if len(fresh_faces) > face_index else face
                             return self._face_facetless_evidence(body, face_ref)
 
                         try:
@@ -3944,7 +3934,8 @@ class SolidWorksBackend(CadBackend):
                         and body_type == 1
                         and facetless.get("facets") == 0
                         and isinstance(facetless.get("tessellate_result"), bool)
-                        and type(native_count) is int and native_count == 0
+                        and type(native_count) is int
+                        and native_count == 0
                         and type(area) in (int, float)
                         and math.isfinite(area)
                         and area >= 0.0
@@ -4472,9 +4463,7 @@ class SolidWorksBackend(CadBackend):
                         str(item) for item in evidence.get("stored_locations") or [] if isinstance(item, str)
                     ],
                     "resolved_targets": {
-                        str(item).casefold()
-                        for item in evidence.get("resolved_targets") or []
-                        if isinstance(item, str)
+                        str(item).casefold() for item in evidence.get("resolved_targets") or [] if isinstance(item, str)
                     },
                     "resolved_paths": {
                         os.path.normcase(os.path.abspath(str(item)))
@@ -4518,9 +4507,7 @@ class SolidWorksBackend(CadBackend):
                         None,
                     )
                     artifact_canonical = (
-                        os.path.relpath(normalized_ref, contained).replace("\\", "/")
-                        if contained is not None
-                        else None
+                        os.path.relpath(normalized_ref, contained).replace("\\", "/") if contained is not None else None
                     )
                     selected = artifact_canonical is not None and artifact_canonical.casefold() in required_folded
                     document_normalized = os.path.normcase(os.path.abspath(document))
@@ -4541,12 +4528,9 @@ class SolidWorksBackend(CadBackend):
                     if not selected and evidence is not None:
                         recorded = value in evidence["stored_locations"]
                         resolved_hit = (
-                            (
-                                artifact_canonical is not None
-                                and artifact_canonical.casefold() in evidence["resolved_targets"]
-                            )
-                            or os.path.normcase(os.path.abspath(reference)) in evidence["resolved_paths"]
-                        )
+                            artifact_canonical is not None
+                            and artifact_canonical.casefold() in evidence["resolved_targets"]
+                        ) or os.path.normcase(os.path.abspath(reference)) in evidence["resolved_paths"]
                         if recorded and not resolved_hit:
                             # Evidence-covered UNUSED stored reference: the
                             # closure recorded exactly this verbatim location
@@ -4821,9 +4805,7 @@ class SolidWorksBackend(CadBackend):
                         continue
                     child_defining = relative or resolved or defining
                     for child in reversed(_as_list(_method(component, "GetChildren"))):
-                        stack.append(
-                            (child, instance, depth + 1, child_defining, anchor_for_children, child_owner)
-                        )
+                        stack.append((child, instance, depth + 1, child_defining, anchor_for_children, child_owner))
                 readings["occurrences"] = occurrences
                 readings["documents_after"] = int(_member(app, "GetDocumentCount"))
                 readings["document_state"] = {
@@ -4833,9 +4815,7 @@ class SolidWorksBackend(CadBackend):
                 }
             finally:
                 try:
-                    _member(
-                        app, "SetSearchFolders", SEARCH_FOLDER_DOCUMENT_TYPE, ";".join(pinned.get("before") or [])
-                    )
+                    _member(app, "SetSearchFolders", SEARCH_FOLDER_DOCUMENT_TYPE, ";".join(pinned.get("before") or []))
                     restored = read_search_folders(app, SEARCH_FOLDER_DOCUMENT_TYPE)
                     restored_folders = restored["folders"]
                     restored_raw = restored["raw"]
@@ -4890,10 +4870,7 @@ class SolidWorksBackend(CadBackend):
         instances = []
         read_only_paths = set()
 
-        stack = [
-            (child, "", 0, document_path, None)
-            for child in reversed(_as_list(_method(root, "GetChildren")))
-        ]
+        stack = [(child, "", 0, document_path, None) for child in reversed(_as_list(_method(root, "GetChildren")))]
         while stack:
             item, context, depth, defining, anchor = stack.pop()
             if depth > 40:
@@ -5269,9 +5246,7 @@ class SolidWorksBackend(CadBackend):
                     # make cached descendants lose their defining anchor.
                     source_provenance = source_document.get("source_provenance") or {}
                     materialization_path = source_provenance.get("materialization_path")
-                    materialized = bool(materialization_path) and session_materialization_path(
-                        materialization_path
-                    )
+                    materialized = bool(materialization_path) and session_materialization_path(materialization_path)
                     anchor_for_children = path_name if materialized else anchor
                     # Ultimate native owner: the nearest ancestor delivered
                     # document that owns this occurrence's subtree; nested
@@ -5356,9 +5331,7 @@ class SolidWorksBackend(CadBackend):
                             # Informational per-component mass: a lightweight
                             # occurrence is not measured and is never silently
                             # reported as if it had no mass.
-                            notes.append(
-                                f"mass:{path_name}:lightweight_state_{entry['suppression_state']}_unmeasured"
-                            )
+                            notes.append(f"mass:{path_name}:lightweight_state_{entry['suppression_state']}_unmeasured")
                         if (
                             mass_property is not None
                             and not entry["suppressed"]
@@ -5567,15 +5540,11 @@ class SolidWorksBackend(CadBackend):
                                         f"mate_lock_rotation:{name}:read:IConcentricMateFeatureData.LockRotation"
                                     )
                                 else:
-                                    notes.append(
-                                        f"mate_lock_rotation:{name}:unreadable:{repr(raw_lock)[:60]}"
-                                    )
+                                    notes.append(f"mate_lock_rotation:{name}:unreadable:{repr(raw_lock)[:60]}")
                             else:
                                 notes.append(f"mate_lock_rotation:{name}:no_definition")
                         except Exception as error:  # noqa: BLE001 - recorded, never guessed
-                            notes.append(
-                                f"mate_lock_rotation:{name}:{type(error).__name__}: {str(error)[:160]}"
-                            )
+                            notes.append(f"mate_lock_rotation:{name}:{type(error).__name__}: {str(error)[:160]}")
                         mate_record["lock_rotation"] = lock_rotation
                         if lock_rotation_api is not None:
                             mate_record["lock_rotation_api"] = lock_rotation_api
@@ -5732,9 +5701,8 @@ class SolidWorksBackend(CadBackend):
                 if relative and relative not in planned:
                     planned.add(relative)
                     hash_plan.append((source_root / relative, relative))
-                elif (
-                    provenance.get("state") == "cached_materialization"
-                    and provenance.get("author_imported_in_source_root")
+                elif provenance.get("state") == "cached_materialization" and provenance.get(
+                    "author_imported_in_source_root"
                 ):
                     # A validated in-stage author source of a cached
                     # materialization is an acquired CAD document: hash the

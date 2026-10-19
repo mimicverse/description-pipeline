@@ -39,7 +39,7 @@ class StructuralReportTests(unittest.TestCase):
             self.assertEqual(report["findings"][0]["evidence"]["detail"], {"effort": 0, "velocity": 0})
             for pin in pins.values():
                 self.assertEqual(pin["sha256"], file_digest(root / pin["path"]))
-            self.assertIn("结构组", (root / pins["markdown"]["path"]).read_text())
+            self.assertIn("# Structural CAD-to-URDF issue report", (root / pins["markdown"]["path"]).read_text())
 
     def test_pre_capture_failure_preserves_native_reference_diagnostics(self):
         with TemporaryDirectory() as directory:
@@ -69,7 +69,10 @@ class StructuralReportTests(unittest.TestCase):
             self.assertEqual(diagnostic["evidence"]["stored_location"], stored)
             self.assertIsNone(diagnostic["evidence"]["resolved"])
             self.assertEqual(report["urdf_files"], [])
-            self.assertIn("尚未产生 URDF", (root / pins["markdown"]["path"]).read_text())
+            self.assertIn(
+                "This stage has not produced a URDF",
+                (root / pins["markdown"]["path"]).read_text(),
+            )
 
     def test_unreadable_evidence_is_reported_without_masking_the_original_failure(self):
         with TemporaryDirectory() as directory:
@@ -116,7 +119,7 @@ class StructuralReportTests(unittest.TestCase):
             self.assertEqual(first["evidence"]["resolved_path"], r"C:\author\stale\stale_part.SLDASM")
             self.assertIs(first["evidence"]["exists"], False)
             self.assertEqual(first["object"], "cad/shank.SLDPRT")
-            self.assertIn("未读取", first["message"])
+            self.assertIn("neither read nor copied", first["message"])
             self.assertEqual(report["summary"], {"warnings": 2, "blockers": 0})
             markdown = (root / pins["markdown"]["path"]).read_text()
             self.assertIn("stale_part.SLDASM", markdown)
@@ -228,7 +231,7 @@ class StructuralReportTests(unittest.TestCase):
             self.assertEqual(measured["center_of_mass_m"], [0.015, 0.001, 0.02])
             self.assertEqual(measured["inertia_kg_m2"][0][1], 2.0e-6)
             self.assertEqual(measured["density_kg_m3"], 7850.0)
-            self.assertIn("不据此声称材料已核验", finding["message"])
+            self.assertIn("does not claim verified material", finding["message"])
             self.assertEqual(report["summary"], {"warnings": 1, "blockers": 0})
             markdown = (root / pins["markdown"]["path"]).read_text()
             self.assertIn("native.material_provenance_missing", markdown)
@@ -286,8 +289,8 @@ class StructuralReportTests(unittest.TestCase):
                 invalid = next(
                     item for item in report["findings"] if item["code"] == "report.material_provenance_invalid"
                 )
-                self.assertIn("必须由独立检查判为失败", invalid["message"])
-                self.assertIn("不采用默认值", invalid["message"])
+                self.assertIn("independent verification must fail", invalid["message"])
+                self.assertIn("no defaults or substitute interpretation", invalid["message"])
 
     def test_manifest_required_missing_material_record_is_a_blocker(self):
         with TemporaryDirectory() as directory:
@@ -310,7 +313,7 @@ class StructuralReportTests(unittest.TestCase):
             self.assertNotIn("native.material_provenance_missing", codes)
             missing = next(item for item in report["findings"] if item["code"] == "report.material_provenance_missing")
             self.assertEqual(missing["severity"], "blocker")
-            self.assertIn("证据缺失", missing["message"])
+            self.assertIn("requires material-provenance evidence", missing["message"])
             self.assertEqual(report["summary"]["blockers"], 1)
 
     def test_legacy_snapshot_without_the_required_record_is_unaffected(self):
@@ -374,7 +377,7 @@ class StructuralReportTests(unittest.TestCase):
             report = json.loads((root / pins["json"]["path"]).read_text())
             findings = [item for item in report["findings"] if item["code"] == "native.material_provenance_missing"]
             self.assertEqual([item["severity"] for item in findings], ["blocker"])
-            self.assertIn("标记为阻断", findings[0]["message"])
+            self.assertIn("blocking and independent verification must fail", findings[0]["message"])
             self.assertEqual(report["summary"], {"warnings": 0, "blockers": 1})
 
     def test_primary_blocker_uses_the_exact_component_from_the_native_detail(self):
@@ -517,8 +520,13 @@ class StructuralReportTests(unittest.TestCase):
             )
             self.assertTrue(all(item["severity"] == "warning" for item in findings))
             self.assertEqual([item["object"] for item in findings], ["board-1", "pcb-1"])
-            self.assertTrue(all("未经几何推导与独立物理校核" in item["message"] for item in findings))
-            self.assertIn("未向运动链分摊", findings[0]["message"])
+            self.assertTrue(
+                all(
+                    "not geometrically derived or independently physically qualified" in item["message"]
+                    for item in findings
+                )
+            )
+            self.assertIn("not distributed along the kinematic chain", findings[0]["message"])
             self.assertEqual(
                 findings[0]["evidence"]["qualification"],
                 "cad_authored_effective_instance; not geometry-derived, not independently physically qualified",
@@ -558,9 +566,6 @@ class StructuralReportTests(unittest.TestCase):
             codes = [item["code"] for item in report["findings"]]
             self.assertNotIn("report.effective_instances_missing", codes)
             self.assertNotIn("report.effective_instances_invalid", codes)
-
-
-
 
     def test_mass_closure_records_are_projected_and_allowlisted(self):
         from description_pipeline.structural_report import is_sealed_diagnostic_member
@@ -672,14 +677,12 @@ class StructuralReportTests(unittest.TestCase):
             pins = write_structural_report(root, {"run_id": "m3", "state": "verified"}, evidence_root=root)
             report = json.loads((root / pins["json"]["path"]).read_text())
             finding = next(
-                item
-                for item in report["findings"]
-                if item["code"] == "cad_instance_measurement_differs_from_part"
+                item for item in report["findings"] if item["code"] == "cad_instance_measurement_differs_from_part"
             )
             self.assertEqual(finding["severity"], "warning")
             self.assertEqual(finding["object"], "shim-1")
-            self.assertIn("差异原因尚未证实", finding["message"])
-            self.assertIn("未经几何推导与独立物理校核", finding["message"])
+            self.assertIn("the cause is unproven", finding["message"])
+            self.assertIn("not a geometric derivation or independent physical qualification", finding["message"])
             self.assertEqual(
                 finding["evidence"]["qualification"],
                 "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
@@ -788,9 +791,9 @@ class StructuralReportTests(unittest.TestCase):
             findings = [item for item in report["findings"] if item["code"] == "cad_sheet_face_untessellated"]
             self.assertEqual(len(findings), 3)
             self.assertEqual(findings[0]["object"], "board-1 sheet body 5 face 0")
-            self.assertIn("原生面积量测为 0.0004 m²", findings[0]["message"])
-            self.assertIn("不断言零面积", findings[0]["message"])
-            self.assertNotIn("面积为正值", findings[0]["message"])
+            self.assertIn("native area is 0.0004 m^2", findings[0]["message"])
+            self.assertIn("without claiming zero area", findings[0]["message"])
+            self.assertNotIn("positive area", findings[0]["message"])
             self.assertEqual(findings[0]["evidence"]["component"], "board-1")
             self.assertEqual(findings[1]["evidence"]["area_m2"], 0.0)
             self.assertIs(findings[2]["evidence"]["tessellate_result"], True)
@@ -815,9 +818,9 @@ class StructuralReportTests(unittest.TestCase):
             )
             self.assertNotIn("tessellate_result", findings[0]["evidence"])
             self.assertNotIn("facet_count", findings[0]["evidence"])
-            self.assertNotIn("0 个面元", findings[0]["message"])
-            self.assertIn("原生面积量测为 1.8716e-13", findings[0]["message"])
-            self.assertIn("不断言零面积", findings[0]["message"])
+            self.assertNotIn("zero facets", findings[0]["message"])
+            self.assertIn("native area is 1.8716e-13", findings[0]["message"])
+            self.assertIn("without claiming zero area", findings[0]["message"])
             self.assertEqual(report["summary"]["blockers"], 0)
 
     def test_untessellated_sheet_metadata_fails_closed_outside_schema(self):
@@ -890,10 +893,10 @@ class StructuralReportTests(unittest.TestCase):
             row = next(item for item in report["findings"] if item["code"] == "cad_unassigned_occurrence_mass")
             self.assertEqual(row["object"], "headM3.0-1/垫片2-2")
             self.assertIn("7.25e-05", row["message"])
-            self.assertIn("qualification withheld", row["message"])
-            self.assertIn("不据此声称输入缺失或流水线失败", row["message"])
+            self.assertIn("engineering qualification of its mass ownership is withheld", row["message"])
+            self.assertIn("does not claim missing input or pipeline failure", row["message"])
             gap = next(item for item in report["findings"] if item["code"] == "cad_native_mass_gap_unqualified")
-            self.assertIn("未作归一化", gap["message"])
+            self.assertIn("no normalization was applied", gap["message"])
             self.assertEqual(report["summary"]["blockers"], 0)
 
     def test_selection_accounting_schema_and_residual_fail_closed(self):
@@ -925,8 +928,5 @@ class StructuralReportTests(unittest.TestCase):
             self.assertNotIn("report.selection_accounting_invalid", [row["code"] for row in report["findings"]])
 
 
-
 if __name__ == "__main__":
     unittest.main()
-
-

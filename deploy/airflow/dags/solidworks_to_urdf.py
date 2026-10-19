@@ -87,7 +87,7 @@ SENSOR_MODE = os.environ.get("SOLIDWORKS_SENSOR_MODE", "reschedule")
 POLL_INTERVAL = float(os.environ.get("SOLIDWORKS_POLL_INTERVAL", "10"))
 POLL_TIMEOUT = float(os.environ.get("SOLIDWORKS_TIMEOUT", "3600"))
 #: One native job at a time: the shared Windows CAD resource domain is serial
-#: (contracts §资源所有权; the deploy installs this pool with capacity 1).
+#: (contracts, resource ownership; the deploy installs this pool with capacity 1).
 NATIVE_POOL = os.environ.get("SOLIDWORKS_NATIVE_POOL", "windows_native")
 log = logging.getLogger(__name__)
 
@@ -155,9 +155,7 @@ def _linked_parent_binding(parent_run: str) -> tuple[dict, str, EndpointConfig]:
     state_root = str(os.environ.get("OPERATOR_STATE") or "").strip()
     store_root = str(os.environ.get("PIPELINE_STORE_ROOT") or "").strip()
     if not state_root or not store_root:
-        raise AirflowFailException(
-            "OPERATOR_STATE and PIPELINE_STORE_ROOT are required to resolve a linked parent"
-        )
+        raise AirflowFailException("OPERATOR_STATE and PIPELINE_STORE_ROOT are required to resolve a linked parent")
     sealed = sealed_resolver(store_root)
     tree = sealed(f"store://sealed/{parent_run}/freeze")
     record, _sha = read_request_evidence(tree / "input" / "request.json")
@@ -273,9 +271,7 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
             transfer = read_data(transfer_path)
             transfer_handoff = transfer.get("handoff_sha256") if isinstance(transfer, dict) else None
             if not isinstance(transfer_handoff, str) or not transfer_handoff:
-                raise AirflowFailException(
-                    f"The {stage!r} stage tree carries an unreadable native transfer identity"
-                )
+                raise AirflowFailException(f"The {stage!r} stage tree carries an unreadable native transfer identity")
             payload["handoff_sha256"] = transfer_handoff
     for key in ("error", "error_code", "detail", "tool", "native_tool", "quality", "submission"):
         if receipt.get(key) is not None:
@@ -636,9 +632,7 @@ def _claim_operation_intent(
     if not isinstance(task_id, str) or not task_id.strip():
         raise AirflowFailException(f"the {what} intent requires the executing task identity")
     if type(map_index) is not int or map_index < -1:
-        raise AirflowFailException(
-            f"the {what} intent requires the real task-instance key of the executing task"
-        )
+        raise AirflowFailException(f"the {what} intent requires the real task-instance key of the executing task")
     platform.register_operation(
         run_id=run_id,
         stage=stage,
@@ -847,9 +841,7 @@ def _boundary_failure(message: str, source: dict) -> AirflowFailException:
 def _portable_summary(receipt: dict, *, stage: str) -> dict:
     expected = {"generate": {"generated"}, "verify": {"verified"}, "publish": {"published", "updated", "noop"}}
     if receipt.get("state") not in expected[stage] or (stage != "generate" and receipt.get("passed") is not True):
-        raise _boundary_failure(
-            receipt.get("error") or f"{stage} did not complete its required checks", receipt
-        )
+        raise _boundary_failure(receipt.get("error") or f"{stage} did not complete its required checks", receipt)
     return {
         "state": receipt.get("state"),
         "passed": receipt.get("passed"),
@@ -955,9 +947,7 @@ def _linked_purpose(context, parent_record: dict) -> str:
     conf = conf if isinstance(conf, dict) else {}
     purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
     if purpose not in REQUEST_PURPOSES:
-        raise AirflowFailException(
-            "A linked attempt must declare its purpose: engineering or inspection_preview"
-        )
+        raise AirflowFailException("A linked attempt must declare its purpose: engineering or inspection_preview")
     parent_purpose = parent_record.get("purpose") if isinstance(parent_record, dict) else None
     if purpose != parent_purpose:
         raise AirflowFailException(
@@ -979,9 +969,7 @@ def _submission_frame(
     rebinds ``repository_slug``/``repository_base`` from.
     """
 
-    conf, target, summary, principal, config, routing = _submission_basics(
-        context, config_digest=config_digest
-    )
+    conf, target, summary, principal, config, routing = _submission_basics(context, config_digest=config_digest)
     declared_purpose = str(purpose or conf.get("purpose") or context["params"].get("purpose") or "").strip()
     if declared_purpose not in REQUEST_PURPOSES:
         raise AirflowFailException(
@@ -1193,9 +1181,7 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         and provenance.get("parent_run_id") == resolved.provenance["parent_run_id"]
     ):
         raise AirflowFailException("The admitted child provenance does not match the resolved evidence")
-    identity, _routing, _config = _submission_frame(
-        context, purpose=purpose, config_digest=config_digest
-    )
+    identity, _routing, _config = _submission_frame(context, purpose=purpose, config_digest=config_digest)
     paths = _work_paths(CONN_ID, run_id, config_digest)
     evidence = freeze_request_evidence(
         paths.run_dir,
@@ -1238,9 +1224,7 @@ def _store_failure_report(endpoint: WindowsEndpoint, request: dict, job: dict) -
         return
     run_id = request["run_id"]
     try:
-        run_dir = _work_paths(
-            request["conn_id"], run_id, request["platform_config_digest"]
-        ).run_dir
+        run_dir = _work_paths(request["conn_id"], run_id, request["platform_config_digest"]).run_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".failure-diagnostics-", dir=run_dir))
         try:
@@ -1335,9 +1319,7 @@ def _provide_definition(endpoint: WindowsEndpoint, request: dict) -> None:
 
     run_id = request["run_id"]
     snapshot = endpoint.definition_snapshot(run_id, upload_files=request["upload_files"])
-    work = _work_paths(
-        request["conn_id"], run_id, request["platform_config_digest"]
-    ).run_dir / "definition"
+    work = _work_paths(request["conn_id"], run_id, request["platform_config_digest"]).run_dir / "definition"
     bundle = work / "raw-record.zip"
     derived = work / "derived"
     capture_request = work / "capture-request.zip"
@@ -1504,9 +1486,7 @@ def _poke(request: dict, **context) -> bool:
         result = job.get("result") or {}
         log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
         _store_failure_report(endpoint, request, job)
-        failure = _boundary_failure(
-            f"SolidWorks job {request['run_id']} failed: {job.get('error')}", job
-        )
+        failure = _boundary_failure(f"SolidWorks job {request['run_id']} failed: {job.get('error')}", job)
         _converge_failed_stage(
             request["run_id"],
             _failed_native_stage(job),
@@ -1854,9 +1834,7 @@ def solidworks_to_urdf():
             conf = conf if isinstance(conf, dict) else {}
             request_id = str(conf.get("request_id") or context["params"].get("request_id") or "").strip()
             if not request_id:
-                raise AirflowFailException(
-                    "request_id is required: the run carries no authenticated request identity"
-                )
+                raise AirflowFailException("request_id is required: the run carries no authenticated request identity")
             conf_digest = str(conf.get("platform_config_digest") or "").strip()
             if conf_digest and conf_digest != config_digest:
                 raise AirflowFailException(
@@ -1867,9 +1845,7 @@ def solidworks_to_urdf():
                 raise AirflowFailException(
                     "purpose is required: the admitted request must declare engineering or inspection_preview"
                 )
-            identity, routing, _config = _submission_frame(
-                context, purpose=purpose, config_digest=config_digest
-            )
+            identity, routing, _config = _submission_frame(context, purpose=purpose, config_digest=config_digest)
             request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
             paths = _work_paths(CONN_ID, run_id, config_digest)
             evidence = freeze_request_evidence(
@@ -1967,9 +1943,7 @@ def solidworks_to_urdf():
             parent_record, _ = read_request_evidence(
                 _sealed_stage_tree(platform, parent_run, "freeze") / "input" / "request.json"
             )
-            hardware, revision = native_capture.source_identity(
-                _sealed_stage_tree(platform, parent_run, "capture")
-            )
+            hardware, revision = native_capture.source_identity(_sealed_stage_tree(platform, parent_run, "capture"))
             binding = {
                 "run_id": run_id,
                 "source_run_id": parent_run,
@@ -1990,9 +1964,7 @@ def solidworks_to_urdf():
                 job = endpoint.get_job(run_id)
                 _same_request(job, request)
                 if job.get("status") != "native_complete":
-                    raise AirflowFailException(
-                        f"native job {run_id} is {job.get('status')}, not native_complete"
-                    )
+                    raise AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
                 platform, store_root = _platform_binding(request["platform_config_digest"])
                 paths = flow.RunPaths(store_root, run_id)
                 binding = native_capture.import_native_capture(platform, paths, run_id, job, endpoint)

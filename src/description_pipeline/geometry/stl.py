@@ -1,7 +1,8 @@
-"""STL 读取（二进制/ASCII）与几何统计：包围盒、体积、面积、退化面。
+"""STL reading (binary/ASCII) and geometry statistics: bounds, volume, area, and degeneracy.
 
-只做质检需要的一次流式扫描，不缓存全部三角形；文件损坏或超限时抛
-``StlError``，由调用方转成质检结论而不是崩溃。
+Uses one streaming pass for quality checks without caching every triangle. A
+damaged or oversized file raises ``StlError`` so the caller can turn it into a
+quality result instead of crashing.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import cast
 
 MAX_TRIANGLES = 5_000_000
-DEGENERATE_AREA = 1.0e-14  # m²，约 (0.1 µm)²
+DEGENERATE_AREA = 1.0e-14  # m^2, approximately (0.1 um)^2
 #: Largest triangle count per delivered mesh part; larger native meshes are split
 #: losslessly.  Owned here so the generator and the verifier cannot drift (VER-03).
 MESH_PART_TRIANGLES_MAX = 199_999
@@ -28,15 +29,15 @@ class MeshStats:
     triangles: int
     low: tuple[float, float, float]
     high: tuple[float, float, float]
-    volume: float  # m³，封闭网格的有向体积绝对值
-    signed_volume: float  # m³，带符号（负值说明法线整体朝内）
-    area: float  # m²
+    volume: float  # m^3, absolute signed volume of a closed mesh
+    signed_volume: float  # m^3; a negative value means normals point inward
+    area: float  # m^2
     degenerate: int
-    degenerate_area: float  # m²，退化三角面的面积合计
+    degenerate_area: float  # m^2, total area of degenerate triangles
     binary: bool
-    com: tuple[float, float, float]  # 均匀密度质心（网格坐标系）
-    second_moment: tuple[float, ...]  # ∫ x xᵀ dV，单位密度，9 个分量
-    boundary_edges: int  # 未被恰好两个三角面共享的边（CAD 导出的 T 型接缝）
+    com: tuple[float, float, float]  # uniform-density center of mass in mesh coordinates
+    second_moment: tuple[float, ...]  # integral of x*x^T dV at unit density, nine components
+    boundary_edges: int  # edges not shared by exactly two triangles (CAD T-junctions)
 
     @property
     def extent(self) -> tuple[float, float, float]:
@@ -58,20 +59,20 @@ class MeshStats:
 
 
 def read(path: Path) -> MeshStats:
-    """读取 STL 并统计。文件不存在/不可解析/超限时抛 :class:`StlError`。"""
+    """Read and measure an STL file; raise :class:`StlError` when unavailable or invalid."""
 
     path = Path(path)
     try:
         data = path.read_bytes()
     except OSError as error:
-        raise StlError(f"无法读取：{error}") from error
+        raise StlError(f"cannot read STL: {error}") from error
     return read_bytes(data)
 
 
 def read_bytes(data: bytes) -> MeshStats:
     """Use the identical strict acceptance contract for file and source-adapter bytes."""
     if len(data) < 15:
-        raise StlError("文件过短，不是有效 STL")
+        raise StlError("STL file is too short")
     if len(data) >= 84 and len(data) == 84 + 50 * struct.unpack("<I", data[80:84])[0]:
         return _read_binary(data)
     return _read_ascii(data)
@@ -103,9 +104,9 @@ def vertices(path: Path):
 def _read_binary(data: bytes) -> MeshStats:
     count = struct.unpack("<I", data[80:84])[0]
     if count == 0:
-        raise StlError("二进制 STL 没有三角面")
+        raise StlError("binary STL contains no triangles")
     if count > MAX_TRIANGLES:
-        raise StlError(f"三角面数 {count} 超过上限 {MAX_TRIANGLES}")
+        raise StlError(f"triangle count {count} exceeds the limit {MAX_TRIANGLES}")
     low = [float("inf")] * 3
     high = [float("-inf")] * 3
     volume = 0.0
@@ -122,7 +123,7 @@ def _read_binary(data: bytes) -> MeshStats:
             for axis in range(3):
                 value = corner[axis]
                 if not math.isfinite(value):
-                    raise StlError(f"第 {index + 1} 个三角面含非有限坐标")
+                    raise StlError(f"triangle {index + 1} contains a non-finite coordinate")
                 low[axis] = min(low[axis], value)
                 high[axis] = max(high[axis], value)
         triangle_area, signed = _triangle(corners)
@@ -138,7 +139,7 @@ def _read_binary(data: bytes) -> MeshStats:
 def _read_ascii(data: bytes) -> MeshStats:
     text = data.decode("ascii", errors="ignore")
     if "vertex" not in text or not text.lstrip().lower().startswith("solid"):
-        raise StlError("既不是二进制 STL，也不是带 solid 头的 ASCII STL")
+        raise StlError("data is neither binary STL nor ASCII STL with a solid header")
     low = [float("inf")] * 3
     high = [float("-inf")] * 3
     volume = 0.0
@@ -156,9 +157,9 @@ def _read_ascii(data: bytes) -> MeshStats:
             try:
                 corner = tuple(float(value) for value in fields[1:])
             except ValueError as error:
-                raise StlError(f"顶点坐标无法解析：{line.strip()}") from error
+                raise StlError(f"cannot parse vertex coordinates: {line.strip()}") from error
             if not all(math.isfinite(value) for value in corner):
-                raise StlError(f"顶点坐标非有限：{line.strip()}")
+                raise StlError(f"vertex coordinates are non-finite: {line.strip()}")
             corners.append(corner)  # type: ignore[arg-type]
             for axis in range(3):
                 low[axis] = min(low[axis], corner[axis])
@@ -166,7 +167,7 @@ def _read_ascii(data: bytes) -> MeshStats:
             if len(corners) == 3:
                 count += 1
                 if count > MAX_TRIANGLES:
-                    raise StlError(f"三角面数超过上限 {MAX_TRIANGLES}")
+                    raise StlError(f"triangle count exceeds the limit {MAX_TRIANGLES}")
                 triangle_area, signed = _triangle(corners)
                 area += triangle_area
                 volume += signed
@@ -176,15 +177,15 @@ def _read_ascii(data: bytes) -> MeshStats:
                     degenerate_area += triangle_area
                 corners = []
     if count == 0 or corners:
-        raise StlError("ASCII STL 的顶点数不是 3 的倍数或没有三角面")
+        raise StlError("ASCII STL vertex count is not divisible by three or contains no triangles")
     return _finish(count, low, high, volume, area, degenerate, degenerate_area, False, moment, centroid, edges)
 
 
 def _accumulate(corners, signed: float, moment: list, centroid: list, edges: dict) -> None:
-    """累加单位密度下的体积矩、质心与边表（有向体积的符号处理朝向）。"""
+    """Accumulate unit-density volume moments, centroid, and edge counts."""
 
     if abs(signed) > 1.0e-18:
-        # 四面体 (0, a, b, c)：∫ x xᵀ dV = V/20 · A (I + J) Aᵀ，A = [a b c]
+        # Tetrahedron (0, a, b, c): integral(x*x^T dV) = V/20 * A (I + J) A^T.
         for row in range(3):
             for column in range(3):
                 value = 0.0

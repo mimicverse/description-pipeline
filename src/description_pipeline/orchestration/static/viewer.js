@@ -149,7 +149,7 @@ function parseVector(text, fallback) {
   if (text === undefined || text === null || text === "") return fallback.slice();
   const parts = String(text).trim().split(/\s+/).map(Number);
   if (parts.length !== 3 || parts.some((value) => !Number.isFinite(value))) {
-    throw new Error(`无法解析 URDF 向量：${text}`);
+    throw new Error(`Cannot parse URDF vector: ${text}`);
   }
   return parts;
 }
@@ -187,7 +187,7 @@ export function parseStl(buffer) {
   if (/^\s*solid/i.test(text) && /facet/i.test(text)) {
     return asciiStl(text);
   }
-  throw new Error("无法识别的 STL 文件");
+  throw new Error("Unrecognized STL file");
 }
 
 function binaryStl(view, triangles) {
@@ -216,7 +216,7 @@ function asciiStl(text) {
   while ((match = pattern.exec(text)) !== null) {
     vertices.push(Number(match[1]), Number(match[2]), Number(match[3]));
   }
-  if (vertices.length < 9) throw new Error("ASCII STL 不含三角面");
+  if (vertices.length < 9) throw new Error("ASCII STL contains no triangles");
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(vertices), 3));
   geometry.computeVertexNormals();
@@ -260,7 +260,7 @@ async function loadMesh(viewer, url, cache, signal) {
   if (cache.has(url)) return cache.get(url);
   const pending = fetch(url, { credentials: "same-origin", signal })
     .then((response) => {
-      if (!response.ok) throw new Error(`网格加载失败（HTTP ${response.status}）`);
+      if (!response.ok) throw new Error(`Mesh load failed (HTTP ${response.status})`);
       return response.arrayBuffer();
     })
     .then((buffer) => parseStl(buffer));
@@ -270,16 +270,16 @@ async function loadMesh(viewer, url, cache, signal) {
 
 export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning, signal }) {
   const response = await fetch(urdfUrl, { credentials: "same-origin", signal });
-  if (!response.ok) throw new Error(`URDF 加载失败（HTTP ${response.status}）`);
+  if (!response.ok) throw new Error(`URDF load failed (HTTP ${response.status})`);
   const xml = await response.text();
   signal?.throwIfAborted();
   if (/<!doctype/i.test(xml)) {
-    throw new Error("URDF 不允许包含文档类型声明");
+    throw new Error("URDF must not contain a document type declaration");
   }
   const document = new DOMParser().parseFromString(xml, "application/xml");
-  if (document.querySelector("parsererror")) throw new Error("URDF XML 解析失败");
+  if (document.querySelector("parsererror")) throw new Error("URDF XML parsing failed");
   const robot = document.querySelector("robot");
-  if (!robot) throw new Error("URDF 缺少 robot 元素");
+  if (!robot) throw new Error("URDF has no robot element");
 
   disposeRobot(viewer);
   const meshCache = new Map();
@@ -289,19 +289,19 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
 
   for (const node of robot.querySelectorAll(":scope > link")) {
     const name = node.getAttribute("name");
-    if (!name || links.has(name)) throw new Error(`URDF link 名称缺失或重复：${name}`);
+    if (!name || links.has(name)) throw new Error(`URDF link name is missing or duplicated: ${name}`);
     const group = new THREE.Group();
     group.name = name;
     links.set(name, { node, group });
   }
 
   for (const node of robot.querySelectorAll(":scope > joint")) {
-    const name = node.getAttribute("name") || "(未命名关节)";
+    const name = node.getAttribute("name") || "(unnamed joint)";
     const type = (node.getAttribute("type") || "fixed").toLowerCase();
     const parent = node.querySelector("parent")?.getAttribute("link");
     const child = node.querySelector("child")?.getAttribute("link");
     if (!links.has(parent) || !links.has(child)) {
-      warnings.push(`关节 ${name} 引用了不存在的 link`);
+      warnings.push(`Joint ${name} references a missing link`);
       continue;
     }
     const { position, quaternion } = originOf(node);
@@ -321,7 +321,7 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
 
     const limit = node.querySelector("limit");
     if ((type === "revolute" || type === "prismatic") && !limit) {
-      warnings.push(`关节 ${name} 缺少 limit，未生成控制`);
+      warnings.push(`Joint ${name} has no limit; no control was created`);
     }
     const lower = limit ? parseNumber(limit.getAttribute("lower"), 0) : 0;
     const upper = limit ? parseNumber(limit.getAttribute("upper"), 0) : 0;
@@ -355,7 +355,7 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
   const rootName = [...links.keys()].find(
     (name) => ![...robot.querySelectorAll(":scope > joint > child")].some((child) => child.getAttribute("link") === name),
   );
-  if (!rootName) throw new Error("URDF 没有根 link");
+  if (!rootName) throw new Error("URDF has no root link");
   viewer.robotRoot.add(links.get(rootName).group);
 
   for (const [name, entry] of links) {
@@ -374,7 +374,7 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
         const filename = meshNode.getAttribute("filename");
         const resolved = resolveMesh(files, filename);
         if (!resolved) {
-          warnings.push(`link ${name} 的网格不在已验证交付清单中：${filename}`);
+          warnings.push(`Mesh for link ${name} is not in the verified delivery inventory: ${filename}`);
           continue;
         }
         try {
@@ -382,7 +382,7 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
           signal?.throwIfAborted();
         } catch (error) {
           if (signal?.aborted) throw error;
-          warnings.push(`link ${name} 的网格加载失败：${error.message}`);
+          warnings.push(`Mesh load failed for link ${name}: ${error.message}`);
           continue;
         }
         const scale = parseVector(meshNode.getAttribute("scale"), [1, 1, 1]);
@@ -401,7 +401,7 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
   viewer.robotRoot.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(viewer.robotRoot);
   if (box.isEmpty()) {
-    warnings.push("URDF 没有可显示的几何");
+    warnings.push("URDF contains no displayable geometry");
   } else {
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());

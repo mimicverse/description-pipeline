@@ -143,15 +143,15 @@ def _main_assembly_spec(value):
     if value is None:
         return None
     if not isinstance(value, str) or not value or len(value) > MAX_MAIN_ASSEMBLY:
-        raise RequestError("主装配必须是工程文件夹内的一个 .SLDASM 相对路径")
+        raise RequestError("Main assembly must be a relative .SLDASM path inside the engineering folder")
     if value != value.strip():
-        raise RequestError("主装配路径不能包含首尾空白")
+        raise RequestError("Main-assembly path cannot have leading or trailing whitespace")
     if unicodedata.normalize("NFC", value) != value:
-        raise RequestError("主装配路径必须使用 NFC 规范形式")
+        raise RequestError("Main-assembly path must use NFC normalization")
     try:
         parts = artifact_path_parts(value)
     except PipelineError as error:
-        raise RequestError("主装配路径必须是可移植的相对路径") from error
+        raise RequestError("Main-assembly path must be a portable relative path") from error
     if (
         not parts
         or "/".join(parts) != value
@@ -159,14 +159,14 @@ def _main_assembly_spec(value):
         or value.startswith("/")
         or any(segment in {"", ".", ".."} for segment in value.split("/"))
     ):
-        raise RequestError("主装配必须是工程文件夹内的一个 .SLDASM 相对路径")
+        raise RequestError("Main assembly must be a relative .SLDASM path inside the engineering folder")
     if not value.casefold().endswith(".sldasm"):
-        raise RequestError("主装配必须指向一个已保存的 SolidWorks 装配（.SLDASM）")
+        raise RequestError("Main assembly must identify a saved SolidWorks assembly (.SLDASM)")
     return value
 
 
 def _refusal(reason, message, *, earliest=None, **extra):
-    payload = {"reason": reason, "reason_zh": message, "earliest_required": earliest}
+    payload = {"reason": reason, "message": message, "earliest_required": earliest}
     payload.update(extra)
     return RequestError(message, 409, payload=payload)
 
@@ -292,9 +292,7 @@ def _cad_health(jobs) -> tuple[dict, list[str]]:
     try:
         from ..sources.solidworks import isolation
 
-        facts = isolation.cad_session_facts(
-            isolation.registered_executable(), ownership_file=jobs.cad_ownership_file
-        )
+        facts = isolation.cad_session_facts(isolation.registered_executable(), ownership_file=jobs.cad_ownership_file)
     except Exception:  # noqa: BLE001 - an unprovable CAD state is a readiness problem, never a pass
         return {"external_session_detected": False, "owned_sessions": 0, "lease_held": False}, ["cad_state_unavailable"]
     return (
@@ -662,12 +660,14 @@ class Jobs:
             if row.get("stage") not in NATIVE_STAGES:
                 row["eligible"] = False
                 row["reason"] = "linux_owned"
-                row["reason_zh"] = "该阶段已移至 Linux 执行；请通过交付流程重新运行"
+                row["message"] = "This stage runs on Linux; restart it through the delivery workflow"
                 row["recomputes"] = []
             elif not reader_matches:
                 row["eligible"] = False
                 row["reason"] = "tool_changed"
-                row["reason_zh"] = "原生依赖读取器已变化；请重新提交工程并完成文件选择"
+                row["message"] = (
+                    "The native dependency reader changed; resubmit the engineering folder and complete file selection"
+                )
                 row["recomputes"] = []
         return rows
 
@@ -1003,7 +1003,7 @@ class Jobs:
                     )
                 plan = start_plan(parent, spec["from_stage"], probe=self._probe(parent), tool=self._tool_state(parent))
                 if not plan["accepted"]:
-                    raise _refusal(plan["reason"], plan["reason_zh"], earliest=plan["earliest_required"])
+                    raise _refusal(plan["reason"], plan["message"], earliest=plan["earliest_required"])
                 _require(
                     all(
                         parent["request"].get(key) == request[key]
@@ -1102,6 +1102,7 @@ class Jobs:
         session = self.selections[identifier]
         factory = self.selection_reader_factory
         if factory is None:
+
             def factory():
                 return self._default_selection_reader(identifier)
 
@@ -1615,7 +1616,7 @@ class Jobs:
                         409,
                         payload={
                             "reason": "linux_owned",
-                            "reason_zh": "该阶段已移至 Linux 执行；请通过交付流程重新运行",
+                            "message": "This stage runs on Linux; restart it through the delivery workflow",
                         },
                     )
                 # A replayed linked run must name a retained parent before any deeper
@@ -1665,11 +1666,11 @@ class Jobs:
                     plan = start_plan(parent, from_stage, probe=self._probe(parent), tool=self._tool_state(parent))
                     if not plan["accepted"]:
                         failure = RequestError(
-                            plan["reason_zh"],
+                            plan["message"],
                             409,
                             payload={
                                 "reason": plan["reason"],
-                                "reason_zh": plan["reason_zh"],
+                                "message": plan["message"],
                                 "earliest_required": plan["earliest_required"],
                             },
                         )
