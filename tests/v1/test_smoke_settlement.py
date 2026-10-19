@@ -58,10 +58,20 @@ class SettlementCheckerTests(unittest.TestCase):
             "run_state": ["failed"],
             "request": [[f"portal-{RUN_ID}", "fixture", "app:tenant:ordinary-operator"]],
             "operations": [
-                ["dispatch-key", None, "dispatch", "succeeded"],
-                ["native-key", "capture", "native", "succeeded"],
+                [f"portal-{RUN_ID}/freeze:0", "freeze", "dispatch", "succeeded", "freeze", -1],
+                ["native-key", "capture", "native", "succeeded", "capture", -1],
             ],
             "stages": [[stage, state] for stage, state in STAGES.items()],
+            "lifecycle": [
+                {"object_kind": "run", "object_id": RUN_ID, "state": "failed", "bucket": "terminal"},
+                {"object_kind": "stage", "object_id": "verify", "state": "failed", "bucket": "terminal"},
+                {
+                    "object_kind": "scheduling",
+                    "object_id": "dispatch-key",
+                    "state": "success",
+                    "bucket": "terminal",
+                },
+            ],
             "events": events,
         }
 
@@ -139,6 +149,17 @@ class SettlementCheckerTests(unittest.TestCase):
         rows = self.rows()
         rows["operations"][1][3] = "running"
         self.assertFalse(self.compare(rows)["native_operation_terminal"]["passed"])
+
+    def test_an_unbound_dispatch_is_rejected(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][4] = None
+        rows["operations"][0][5] = None
+        self.assertFalse(self.compare(rows)["dispatch_task_binding"]["passed"])
+
+    def test_an_unknown_lifecycle_bucket_is_rejected(self) -> None:
+        rows = self.rows()
+        rows["lifecycle"][-1]["bucket"] = "unknown"
+        self.assertFalse(self.compare(rows)["lifecycle_projection_terminal"]["passed"])
 
     def test_capture_completed_without_a_native_operation_is_rejected(self) -> None:
         rows = self.rows()

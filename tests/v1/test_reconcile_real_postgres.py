@@ -387,6 +387,20 @@ class ReconcileRealPostgresTests(unittest.TestCase):
         self._prepare_bound_native_discover()
         error = "SelectionError: a reference resolves outside the staged root"
         error_code = "selection_resolved_outside_stage"
+        diagnostic = {
+            "count": 1,
+            "problems": [
+                {
+                    "code": error_code,
+                    "document": "waist.SLDASM",
+                    "instance": "waist-1/virtual",
+                    "message": "a reference resolves outside the staged root",
+                    "resolved": "C:\\Temp\\swx111\\VC~~\\waist\\virtual.SLDPRT",
+                    "stored_location": None,
+                }
+            ],
+            "stage_root": "C:\\description\\selected\\run",
+        }
         self.log = self.evidence / f"terminal-native-{uuid.uuid4().hex[:8]}.json"
         self.log.write_text(
             json.dumps(
@@ -408,6 +422,15 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                     "status": "failed",
                     "error": error,
                     "error_code": error_code,
+                    "stages": {
+                        "stages": [
+                            {
+                                "id": "discover",
+                                "state": "failed",
+                                "diagnostic": diagnostic,
+                            }
+                        ]
+                    },
                     "events": [
                         {"stage": "discover", "state": "running"},
                         {"stage": "discover", "state": "failed", "error": error},
@@ -439,6 +462,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                 "passed": False,
                 "error": f"AirflowFailException: SolidWorks job {self.run_id} failed: {error}",
                 "error_code": error_code,
+                "detail": diagnostic,
             },
         )
         self.store.close_admission(reason="terminal native dispatch proof", actor="reconcile-test")
@@ -717,15 +741,24 @@ class ReconcileRealPostgresTests(unittest.TestCase):
 
     def test_new_initial_dispatch_has_no_unknown_on_completion_or_failure(self) -> None:
         import psycopg2
+        from types import SimpleNamespace
 
+        from airflow.models import DagBag
         from airflow.models.dagrun import DagRun
         from airflow.models.taskinstance import TaskInstance
         from airflow.settings import Session
         from description_pipeline.delivery import BUNDLE_SCHEMA
+        from description_pipeline.io import digest as pipeline_digest
         from description_pipeline.io import read_data
         from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.orchestration.portal import _initial_dispatch
         from tests.v1.test_platform_store import build_sealed_delivery
 
+        bag = DagBag(str(ROOT / "deploy/airflow/dags"))
+        module = __import__(
+            bag.dags[DAG_ID].task_dict["freeze"].python_callable.__module__,
+            fromlist=["_bind_initial_dispatch"],
+        )
         for outcome in ("completed", "failed"):
             with self.subTest(outcome=outcome):
                 self.setUp()
@@ -748,13 +781,18 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                         "bytes": sum((sealed_root / "input" / name).stat().st_size for name in upload_files),
                         "folder": "M3.0.3_20261016",
                     },
-                    dispatch={
-                        "stage": "freeze",
-                        "operation_key": f"portal-{dag_run_id}/freeze:0",
-                        "params_digest": "a" * 64,
-                        "dag_id": DAG_ID,
-                        "dag_run_id": dag_run_id,
-                    },
+                    dispatch=_initial_dispatch(
+                        dag_id=DAG_ID,
+                        dag_run_id=dag_run_id,
+                        stage="freeze",
+                        params_digest=pipeline_digest(
+                            {
+                                "handoff_path": str(sealed_root),
+                                "main_assembly": main_assembly,
+                                "target_hardware": "m3.0",
+                            }
+                        ),
+                    ),
                 )
                 with Session() as session:
                     session.add(
@@ -778,13 +816,18 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                         )
                     )
                     session.commit()
-                self.store.bind_initial_dispatch(
+                module._bind_initial_dispatch(
+                    self.store,
                     run_id=run_id,
-                    stage="freeze",
-                    operation_key=f"portal-{dag_run_id}/freeze:0",
-                    dag_id=DAG_ID,
-                    dag_run_id=dag_run_id,
+                    context={"dag_run": SimpleNamespace(run_id=dag_run_id)},
                 )
+                with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT task_id, map_index FROM operation"
+                        " WHERE run_id=%s AND kind='dispatch'",
+                        (run_id,),
+                    )
+                    self.assertEqual(cursor.fetchone(), ("freeze", -1))
                 self.store.start_run(run_id)
                 if outcome == "completed":
                     receipt = {
@@ -848,6 +891,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             "extra_freeze_task",
             "extra_dispatch",
             "foreign_native",
+            "foreign_detail",
         ):
             with self.subTest(name=name):
                 self.setUp()
@@ -899,9 +943,26 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                 reconcile = self.bound_reconcile
                 if name == "foreign_native":
                     foreign = dict(json.loads(self.log.read_text(encoding="utf-8")))
-                    foreign["request"] = {
-                        **foreign["request"],
-                        "main_assembly": "other.SLDASM",
+                    foreign["error"] = "SelectionError: a different failure"
+                    foreign["events"][-1]["error"] = foreign["error"]
+                    path = self.evidence / f"foreign-{uuid.uuid4().hex[:8]}.json"
+                    path.write_text(json.dumps(foreign) + "\n", encoding="utf-8")
+                    reconcile = {
+                        **self.bound_reconcile,
+                        "evidence": [str(path)],
+                        "native_receipt": {"path": str(path), "native_run_id": self.run_id},
+                    }
+                elif name == "foreign_detail":
+                    foreign = dict(json.loads(self.log.read_text(encoding="utf-8")))
+                    stage_rows = foreign["stages"]["stages"]
+                    stage_rows[0]["diagnostic"] = {
+                        **stage_rows[0]["diagnostic"],
+                        "problems": [
+                            {
+                                **stage_rows[0]["diagnostic"]["problems"][0],
+                                "instance": "other-instance",
+                            }
+                        ],
                     }
                     path = self.evidence / f"foreign-{uuid.uuid4().hex[:8]}.json"
                     path.write_text(json.dumps(foreign) + "\n", encoding="utf-8")

@@ -774,6 +774,24 @@ def _attempt_frame_digest(
     )
 
 
+def _initial_dispatch(
+    *,
+    dag_id: str,
+    dag_run_id: str,
+    stage: str,
+    params_digest: str,
+) -> dict:
+    """The one Portal-owned initial dispatch payload for a new admitted run."""
+
+    return {
+        "stage": stage,
+        "operation_key": f"portal-{dag_run_id}/{stage}:0",
+        "params_digest": params_digest,
+        "dag_id": dag_id,
+        "dag_run_id": dag_run_id,
+    }
+
+
 def _admission_matches(
     admission: object,
     *,
@@ -1490,19 +1508,18 @@ class PortalApp:
                     "folder": receipt.folder,
                     "platform_config_digest": self._admission_config_digest(),
                 },
-                dispatch={
-                    "stage": "freeze",
-                    "operation_key": f"portal-{dag_run_id}/freeze:0",
-                    "params_digest": digest(
+                dispatch=_initial_dispatch(
+                    dag_id=self.config.dag_id,
+                    dag_run_id=dag_run_id,
+                    stage="freeze",
+                    params_digest=digest(
                         {
                             "handoff_path": handoff_path,
                             "main_assembly": receipt.main_assembly,
                             "target_hardware": receipt.target_hardware,
                         }
                     ),
-                    "dag_id": self.config.dag_id,
-                    "dag_run_id": dag_run_id,
-                },
+                ),
             )
         except AdmissionClosedError:
             drop_received_folder(self.config.upload_root / dag_run_id)
@@ -2578,10 +2595,11 @@ class PortalApp:
                             main_assembly=selected_assembly or "",
                             configuration={"purpose": purpose},
                             baseline=admit_baseline,
-                            dispatch={
-                                "stage": stage,
-                                "operation_key": f"portal-{new_run_id}/{stage}:0",
-                                "params_digest": _attempt_frame_digest(
+                            dispatch=_initial_dispatch(
+                                dag_id=self.config.dag_id,
+                                dag_run_id=new_run_id,
+                                stage=stage,
+                                params_digest=_attempt_frame_digest(
                                     handoff_path=handoff_path,
                                     stage=stage,
                                     target_hardware=target_hardware,
@@ -2589,9 +2607,7 @@ class PortalApp:
                                     parent_assembly=selected_assembly,
                                     purpose=purpose,
                                 ),
-                                "dag_id": self.config.dag_id,
-                                "dag_run_id": new_run_id,
-                            },
+                            ),
                             from_stage=stage,
                             parent_run_id=native_run_id(dag_run_id),
                         )

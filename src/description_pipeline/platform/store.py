@@ -205,6 +205,16 @@ def load_native_failed_receipt(
         raise PlatformStoreError("The native receipt's terminal event names another stage")
 
     detail = document.get("detail")
+    if detail is None:
+        stage_document = document.get("stages")
+        stage_rows = stage_document.get("stages") if isinstance(stage_document, dict) else None
+        matches = [
+            row
+            for row in (stage_rows if isinstance(stage_rows, list) else [])
+            if isinstance(row, dict) and row.get("id") == stage and row.get("state") == "failed"
+        ]
+        if len(matches) == 1:
+            detail = matches[0].get("diagnostic")
     error = terminal[0].get("error")
     if not isinstance(error, str) or not error:
         error = document.get("error")
@@ -2036,6 +2046,7 @@ class PlatformStore:
         stored_code = stored_receipt.get("error_code")
         native_error = receipt.get("error")
         stored_error = stored_receipt.get("error")
+        expected_error = f"AirflowFailException: SolidWorks job {run_id} failed: {native_error}"
         if (
             not isinstance(native_code, str)
             or not native_code
@@ -2043,7 +2054,8 @@ class PlatformStore:
             or not isinstance(native_error, str)
             or not native_error
             or not isinstance(stored_error, str)
-            or native_error not in stored_error
+            or stored_error != expected_error
+            or receipt.get("detail") != stored_receipt.get("detail")
         ):
             raise PlatformStoreError("The original native failure does not match the terminal discover record")
 

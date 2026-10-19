@@ -868,7 +868,15 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
         {"name": "admission_request_row", "passed": len(rows["request"]) == 1, "observed": rows["request"]},
     ]
     operations = [
-        {"operation_key": row[0], "stage": row[1], "kind": row[2], "state": row[3]} for row in rows["operations"]
+        {
+            "operation_key": row[0],
+            "stage": row[1],
+            "kind": row[2],
+            "state": row[3],
+            "task_id": row[4],
+            "map_index": row[5],
+        }
+        for row in rows["operations"]
     ]
     dispatch = [item for item in operations if item["kind"] == "dispatch"]
     comparisons.append(
@@ -876,6 +884,28 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
             "name": "dispatch_operation_terminal",
             "passed": bool(dispatch) and all(item["state"] in terminal_operation_states for item in dispatch),
             "observed": operations,
+        }
+    )
+    comparisons.append(
+        {
+            "name": "dispatch_task_binding",
+            "passed": bool(dispatch)
+            and all(
+                isinstance(item["task_id"], str)
+                and item["task_id"] == str(item["stage"])
+                and type(item["map_index"]) is int
+                and item["map_index"] >= -1
+                for item in dispatch
+            ),
+            "observed": dispatch,
+        }
+    )
+    lifecycle = [dict(item) for item in rows.get("lifecycle", [])]
+    comparisons.append(
+        {
+            "name": "lifecycle_projection_terminal",
+            "passed": bool(lifecycle) and all(item.get("bucket") == "terminal" for item in lifecycle),
+            "observed": lifecycle,
         }
     )
     native = [item for item in operations if item["kind"] == "native"]
@@ -975,11 +1005,22 @@ def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict, 
         )
         rows["request"] = cursor.fetchall()
         cursor.execute(
-            f"SELECT operation_key, stage, kind, state FROM {platform_schema}.operation WHERE run_id=%s "
+            f"SELECT operation_key, stage, kind, state, task_id, map_index"
+            f" FROM {platform_schema}.operation WHERE run_id=%s "
             "ORDER BY operation_id",
             (run_id,),
         )
         rows["operations"] = cursor.fetchall()
+        cursor.execute(
+            f"SELECT object_kind, object_id, state, bucket"
+            f" FROM {platform_schema}.lifecycle_projection WHERE run_id=%s"
+            " ORDER BY object_kind, object_id",
+            (run_id,),
+        )
+        rows["lifecycle"] = [
+            {"object_kind": row[0], "object_id": row[1], "state": row[2], "bucket": row[3]}
+            for row in cursor.fetchall()
+        ]
         cursor.execute(f"SELECT stage, state FROM {platform_schema}.stage WHERE run_id=%s ORDER BY stage", (run_id,))
         rows["stages"] = cursor.fetchall()
         cursor.execute(
