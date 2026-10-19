@@ -56,6 +56,7 @@ from .session_artifacts import (
     has_session_document_marker,
     session_artifact_path,
     session_materialization_path,
+    session_root_pid,
     session_temp_root,
 )
 from .selection import MAX_SELECTION_FILES, SelectionError, validate_file_index
@@ -310,6 +311,10 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     declarations = readings.get("identity_properties")
     declarations = dict(declarations) if isinstance(declarations, Mapping) else {}
     declarations_error = readings.get("identity_properties_error")
+    session_evidence = readings.get("session")
+    native_api_pid = session_evidence.get("native_api_pid") if isinstance(session_evidence, Mapping) else None
+    if type(native_api_pid) is not int or native_api_pid <= 0:
+        native_api_pid = None
     missing_declarations = [
         key
         for key in IDENTITY_DECLARATIONS
@@ -500,6 +505,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 if (
                     not virtual_document
                     or session_root is None
+                    or native_api_pid is None
+                    or session_root_pid(session_root) != native_api_pid
                     or not isinstance(instance, str)
                     or not instance.strip()
                     or not isinstance(configuration, str)
@@ -516,6 +523,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                             instance=instance,
                             resolved=resolved or None,
                             session_temp_root=session_root,
+                            native_api_pid=native_api_pid,
                             configuration=configuration,
                             imported_path_error=record.get("import_error"),
                             imported_path_reading=imported_reading,
@@ -545,6 +553,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "name": record.get("name"),
                         "session_document_path": resolved,
                         "session_temp_root": session_root,
+                        "native_api_pid": native_api_pid,
                         "configuration": configuration,
                         "suppression_state": state,
                         "is_virtual": True,
@@ -605,6 +614,20 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 # session materialization; GetImportedPath is author-path
                 # metadata, never an in-package binding.  Recorded as a warning
                 # (no graph edge); the absence test decides cache provenance.
+                cached_root = session_temp_root(resolved)
+                if native_api_pid is None or session_root_pid(cached_root) != native_api_pid:
+                    problems.append(
+                        _problem(
+                            "selection_cached_materialization_unproven",
+                            "an IC~~ materialization is not owned by the current native session",
+                            document=label,
+                            instance=instance,
+                            resolved=resolved,
+                            session_temp_root=cached_root,
+                            native_api_pid=native_api_pid,
+                        )
+                    )
+                    continue
                 cached_materializations.add(cached_key(resolved))
                 author_in_stage = _indexed(stage_root, imported, files) is not None if imported else None
                 owner = record.get("native_owner")
@@ -675,7 +698,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "author_metadata_in_stage": author_in_stage,
                         "is_virtual": virtual if type(virtual) is bool else None,
                         "materialization": resolved,
-                        "session_temp_root": session_temp_root(resolved),
+                        "session_temp_root": cached_root,
+                        "native_api_pid": native_api_pid,
                         "configuration": record.get("configuration"),
                         "suppression_state": state,
                         "state": "cached_materialization",

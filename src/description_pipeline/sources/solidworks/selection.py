@@ -19,6 +19,8 @@ from .session_artifacts import (
     embedded_virtual_component_under_root,
     has_session_document_marker,
     session_document_marker,
+    session_materialization_under_root,
+    session_root_pid,
 )
 
 SELECTION_SCHEMA = "solidworks-to-urdf.selection/v1"
@@ -346,6 +348,19 @@ def seal_closure_selection(
                 raise SelectionError(
                     "selection_closure_invalid", "A cached materialization owner differs from the staged bytes"
                 )
+            native_api_pid = item.get("native_api_pid")
+            if (
+                type(native_api_pid) is not int
+                or native_api_pid <= 0
+                or session_root_pid(item.get("session_temp_root")) != native_api_pid
+                or not session_materialization_under_root(
+                    item.get("materialization"), item.get("session_temp_root")
+                )
+            ):
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A cached materialization is not owned by its recorded native session",
+                )
             anchor = item.get("owner_anchor")
             if anchor is not None and (
                 not isinstance(anchor, str)
@@ -464,10 +479,16 @@ def seal_closure_selection(
             )
         session_document = item.get("session_document_path")
         session_root = item.get("session_temp_root")
-        if not embedded_virtual_component_under_root(session_document, session_root):
+        native_api_pid = item.get("native_api_pid")
+        if (
+            type(native_api_pid) is not int
+            or native_api_pid <= 0
+            or session_root_pid(session_root) != native_api_pid
+            or not embedded_virtual_component_under_root(session_document, session_root)
+        ):
             raise SelectionError(
                 "selection_closure_invalid",
-                "An embedded virtual component is not an exact VC~~ document under its owned session root",
+                "An embedded virtual component is not owned by its recorded native session",
                 path=str(session_document),
             )
         key = (owner.casefold(), instance)

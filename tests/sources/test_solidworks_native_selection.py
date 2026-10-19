@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -88,6 +89,12 @@ def occurrence(
 
 
 def readings(stage: Path, occurrences: list[dict], *, stored=None, **extra) -> dict:
+    native_api_pid = None
+    for item in occurrences:
+        match = re.search(r"(?i)(?:^|[\\/])swx([0-9]+)(?:[\\/]|$)", str(item.get("resolved_path") or ""))
+        if match is not None:
+            native_api_pid = int(match.group(1))
+            break
     value = {
         "stage_root": str(stage),
         "occurrences": occurrences,
@@ -104,7 +111,7 @@ def readings(stage: Path, occurrences: list[dict], *, stored=None, **extra) -> d
         },
         "open": {"errors": 0, "warnings": 0},
         "session": {
-            "native_api_pid": 111,
+            "native_api_pid": native_api_pid or 111,
             "solidworks_revision": "34.0.0",
             "sealed": True,
             "closed": True,
@@ -305,6 +312,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(entry["configuration"], "默认")
         self.assertEqual(entry["session_document_path"], document)
         self.assertEqual(entry["session_temp_root"], session_temp("swx21040"))
+        self.assertEqual(entry["native_api_pid"], 21040)
         self.assertIs(entry["is_virtual"], True)
         self.assertEqual(
             entry["used_api"],
@@ -406,6 +414,28 @@ class ClosureAdmissionTests(unittest.TestCase):
                 with self.assertRaises(SelectionError) as caught:
                     self.observe([record])
                 self.assertEqual(caught.exception.code, code)
+
+    def test_virtual_component_root_must_match_the_native_session_pid(self) -> None:
+        document = session_temp("swx99999", "VC~~", "waist", "virtual_part.SLDPRT")
+        record = occurrence(
+            "waist-1/virtual_part-1",
+            document,
+            defining="robot.SLDASM",
+            virtual=True,
+            native_owner="robot.SLDASM",
+            configuration="默认",
+        )
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [record],
+                session={
+                    "native_api_pid": 111,
+                    "solidworks_revision": "34.0.0",
+                    "sealed": True,
+                    "closed": True,
+                },
+            )
+        self.assertEqual(caught.exception.code, "selection_virtual_component_unproven")
 
     def test_normal_child_of_a_virtual_assembly_binds_through_its_anchor(self) -> None:
         virtual_assembly = session_temp(
@@ -529,6 +559,7 @@ class ClosureAdmissionTests(unittest.TestCase):
                 owner_anchor="ghost-1", instance="ghost-1/virtual_part-1"
             ),
             "wrong_api": lambda row: row.update(used_api="basename_guess"),
+            "wrong_native_pid": lambda row: row.update(native_api_pid=99999),
         }
         for label, mutate in cases.items():
             with self.subTest(case=label):
@@ -1116,14 +1147,14 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         stage = Path(tmp.name).resolve()
         files = write_stage(stage, {"robot.SLDASM": b"robot", "arm.SLDPRT": b"arm"})
-        parent_doc = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
-        child_doc = session_temp("swx25524", "IC~~", "3915_ASM_2_ASM.stp.SLDASM")
+        parent_doc = session_temp("swx111", "IC~~", "bracket_a.stp.SLDASM")
+        child_doc = session_temp("swx111", "IC~~", "3915_ASM_2_ASM.stp.SLDASM")
         child = _Component("3915_ASM_2_ASM.stp-1", child_doc, doc=_Doc(child_doc))
         parent = _Component(
             "bracket_a.stp-2", parent_doc, doc=_Doc(parent_doc), children=(child,)
         )
         virtual_doc = session_temp(
-            "swx21040",
+            "swx111",
             "VC~~",
             "waist",
             "Copy of 复件 (2) 零件10^waist.SLDPRT",

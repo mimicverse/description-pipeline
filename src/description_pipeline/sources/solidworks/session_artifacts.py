@@ -19,6 +19,7 @@ import tempfile
 _IC_MARKER = "ic~~"
 _VC_MARKER = "vc~~"
 _SESSION_ROOT = re.compile(r"swx[0-9]+\Z", re.IGNORECASE)
+_SESSION_ROOT_PID = re.compile(r"swx([0-9]+)\Z", re.IGNORECASE)
 SESSION_DOCUMENT_API = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
 
 
@@ -84,6 +85,24 @@ def _owned_session_root(value: object, marker: str) -> str | None:
     if not parts or _SESSION_ROOT.fullmatch(parts[-1]) is None:
         return None
     return root
+
+
+def session_root_pid(value: object) -> int | None:
+    """The positive process id encoded by an owned ``swxNNNN`` root."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parsed = _path_parts(value)
+    if parsed is None:
+        return None
+    _normalized, _module, _separator, parts = parsed
+    if not parts:
+        return None
+    match = _SESSION_ROOT_PID.fullmatch(parts[-1])
+    if match is None:
+        return None
+    pid = int(match.group(1))
+    return pid if pid > 0 else None
 
 
 def import_materialization_path(value: object) -> bool:

@@ -28,6 +28,7 @@ from .session_artifacts import (
     embedded_virtual_component_under_root,
     session_artifact_path,
     session_materialization_path,
+    session_root_pid,
 )
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, read_json, sha256_file, write_json
@@ -626,6 +627,17 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     for entry in closure.get("imports") or []:
         if not isinstance(entry, dict) or entry.get("state") != "cached_materialization":
             continue
+        native_api_pid = entry.get("native_api_pid")
+        if (
+            type(native_api_pid) is not int
+            or native_api_pid <= 0
+            or session_root_pid(entry.get("session_temp_root")) != native_api_pid
+        ):
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the admitted cached materialization has no current-session identity",
+                exit_code=3,
+            )
         instance = entry.get("instance")
         token = _closure_owner_token(entry)
         if isinstance(instance, str) and instance and token is not None:
@@ -663,6 +675,9 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             or not embedded_virtual_component_under_root(
                 entry.get("session_document_path"), entry.get("session_temp_root")
             )
+            or type(entry.get("native_api_pid")) is not int
+            or entry["native_api_pid"] <= 0
+            or session_root_pid(entry.get("session_temp_root")) != entry["native_api_pid"]
             or (
                 entry.get("owner_anchor") is not None
                 and (

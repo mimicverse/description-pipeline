@@ -55,6 +55,7 @@ from ..sources.solidworks.session_artifacts import (
     embedded_virtual_component_under_root,
     has_session_document_marker,
     session_materialization_under_root,
+    session_root_pid,
 )
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
@@ -630,6 +631,7 @@ def _embedded_virtual_component_reason(
     native_document = provenance.get("native_document_path")
     materialization = provenance.get("materialization_path")
     session_root = provenance.get("session_temp_root")
+    native_api_pid = provenance.get("native_api_pid")
     if not (isinstance(owner, str) and owner.strip()):
         return "the embedded virtual component names no ultimate owner"
     if not (isinstance(occurrence, str) and occurrence.strip()):
@@ -649,6 +651,12 @@ def _embedded_virtual_component_reason(
         return "the embedded virtual component API path fields disagree"
     if not embedded_virtual_component_under_root(session_document, session_root):
         return "the embedded virtual component is not an exact VC~~ document under its owned session root"
+    if (
+        type(native_api_pid) is not int
+        or native_api_pid <= 0
+        or session_root_pid(session_root) != native_api_pid
+    ):
+        return "the embedded virtual component root does not match its native API session"
     document = component.get("document")
     if (
         not isinstance(document, str)
@@ -676,6 +684,9 @@ def _embedded_virtual_component_reason(
             or slot.get("kind") != "native_embedded_virtual_component"
             or slot.get("used_api") != SESSION_DOCUMENT_API
             or slot.get("is_virtual") is not True
+            or type(slot.get("native_api_pid")) is not int
+            or slot["native_api_pid"] <= 0
+            or session_root_pid(slot.get("session_temp_root")) != slot["native_api_pid"]
             or "author_imported_path" not in slot
             or slot["author_imported_path"] is not None
             or "author_imported_error" not in slot

@@ -30,6 +30,7 @@ from .session_artifacts import (
     session_artifact_path,
     session_document_marker,
     session_materialization_path,
+    session_root_pid,
     session_temp_root,
 )
 
@@ -1573,10 +1574,19 @@ def _urdf_exporter_attribute(app, doc, source_root, configuration):
         version = float(_method(version_parameter, "GetDoubleValue"))
         if not math.isfinite(version):
             raise ValueError("stored exporter version is not finite")
+        try:
+            native_api_pid = int(_method(app, "GetProcessID"))
+        except Exception:  # noqa: BLE001 - PID provenance is optional on legacy test surfaces
+            native_api_pid = None
         result.update(
             {
                 "exporter_version": version,
-                "pid_bindings": _urdf_exporter_pid_bindings(xml, _member(doc, "Extension"), source_root),
+                "pid_bindings": _urdf_exporter_pid_bindings(
+                    xml,
+                    _member(doc, "Extension"),
+                    source_root,
+                    native_api_pid=native_api_pid,
+                ),
                 "state": "extracted",
             }
         )
@@ -1585,7 +1595,7 @@ def _urdf_exporter_attribute(app, doc, source_root, configuration):
     return result
 
 
-def _urdf_exporter_pid_bindings(xml_text, extension, source_root):
+def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_pid=None):
     """Resolve each unique declared PID as exact bytes, preserving XML separately."""
 
     import base64
@@ -1628,6 +1638,8 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root):
                 component = _component(_dynamic(resolved))
                 row["name2"] = str(_member(component, "Name2") or "") or None
                 row.update(_component_source_document(component, source_root))
+                if isinstance(row.get("source_provenance"), dict) and type(native_api_pid) is int:
+                    row["source_provenance"]["native_api_pid"] = native_api_pid
                 row["configuration"] = str(_member(component, "ReferencedConfiguration") or "") or None
                 provenance = row.get("source_provenance")
                 session_document = (
@@ -2371,6 +2383,13 @@ class SolidWorksBackend(CadBackend):
                 "cad_materialization_session_mismatch",
                 "a session artifact has no canonical controlled temporary root",
                 {"path": str(path), "role": role},
+            )
+        session_pid = session.identity().get("pid")
+        if type(session_pid) is int and session_pid > 0 and session_root_pid(artifact_root) != session_pid:
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "a session artifact root does not match the owning process id",
+                {"path": str(path), "role": role, "session_pid": session_pid, "root": artifact_root},
             )
         recorded_root = self._session_artifact_roots.setdefault(session, artifact_root)
         if recorded_root != artifact_root:
@@ -5204,6 +5223,7 @@ class SolidWorksBackend(CadBackend):
             selection_mode = "sole_candidate"
         activity.emit("session_start", force=True)
         with self.session():
+            native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
             # Exactly the selected frozen entry is opened; zero or several
             # assemblies already failed before this session started.
             activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
@@ -5349,6 +5369,7 @@ class SolidWorksBackend(CadBackend):
                             child_owner_path = str(Path(source_root) / child_relative)
                     provenance = source_document.get("source_provenance")
                     if provenance is not None:
+                        provenance["native_api_pid"] = native_api_pid
                         owner_relative = _relative_document(owner_path, source_root)
                         if not owner_relative:
                             owner_relative = normalize_document_path(str(owner_path))

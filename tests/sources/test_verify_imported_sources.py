@@ -94,6 +94,7 @@ def cached_provenance(owner_sha, **overrides):
         "defining_anchor": None,
         "materialization_path": CACHED_MATERIALIZATION,
         "session_temp_root": CACHED_TEMP_ROOT,
+        "native_api_pid": 2,
         "author_imported_path": CACHED_AUTHOR,
         "is_virtual": False,
         "used_api": CACHED_API,
@@ -126,6 +127,7 @@ def cached_slot(owner_sha, occurrence=CACHED_OCCURRENCE, configuration="Default"
         "binding": "author_metadata_only",
         "materialization": SELECTION_MATERIALIZATION,
         "session_temp_root": SELECTION_TEMP_ROOT,
+        "native_api_pid": 3,
         "author_imported_path": CACHED_AUTHOR,
         "owner_sha256": owner_sha,
         "configuration": configuration,
@@ -156,6 +158,7 @@ def virtual_provenance(owner_sha, **overrides):
         "session_document_path": VIRTUAL_CAPTURE_DOCUMENT,
         "materialization_path": VIRTUAL_CAPTURE_DOCUMENT,
         "session_temp_root": VIRTUAL_CAPTURE_ROOT,
+        "native_api_pid": 21040,
         "author_imported_path": None,
         "author_imported_error": None,
         "is_virtual": True,
@@ -191,6 +194,7 @@ def virtual_slot(owner_sha, occurrence=VIRTUAL_OCCURRENCE, configuration="默认
         "kind": "native_embedded_virtual_component",
         "session_document_path": VIRTUAL_SELECTION_DOCUMENT,
         "session_temp_root": VIRTUAL_SELECTION_ROOT,
+        "native_api_pid": 21041,
         "owner_sha256": owner_sha,
         "configuration": configuration,
         "suppression_state": 2,
@@ -646,6 +650,14 @@ class ImportedSourceTests(unittest.TestCase):
                 virtual_component(sha, source_provenance=virtual_provenance(sha, used_api="basename_guess")),
                 virtual_carrier(sha),
                 "not an API-proven embedded virtual component",
+            ),
+            "session_pid_mismatch": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(sha, native_api_pid=21041),
+                ),
+                virtual_carrier(sha),
+                "root does not match its native API session",
             ),
             "ic_document": (
                 virtual_component(

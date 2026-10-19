@@ -463,6 +463,9 @@ class _App:
     def GetBuildNumbers(self):
         return "portable-mock"
 
+    def GetProcessID(self):
+        return 21040
+
     def GetCurrentLicenseType(self):
         return 1
 
@@ -3963,7 +3966,7 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
 
         def identity(self):
             return {
-                "pid": 1,
+                "pid": 4242,
                 "executable": "fake",
                 "ownership": "windows_job",
                 "state": "closed" if self.closed else "active",

@@ -974,6 +974,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "native_document_path": materialization,
             "materialization_path": materialization,
             "session_temp_root": session_root,
+            "native_api_pid": 16840,
             "author_imported_path": r"D:\author\imported_part.step",
             "author_imported_in_source_root": False,
             "author_imported_relative": None,
@@ -992,6 +993,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "binding": "author_metadata_only",
             "materialization": materialization,
             "session_temp_root": session_root,
+            "native_api_pid": 16840,
             "author_imported_path": r"D:\author\imported_part.step",
             "owner_sha256": owner_sha,
             "configuration": "Default",
@@ -1047,6 +1049,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "materialization_path": materialization,
             "session_document_path": materialization,
             "session_temp_root": session_root,
+            "native_api_pid": 21040,
             "author_imported_path": None,
             "author_imported_error": None,
             "is_virtual": True,
@@ -1066,6 +1069,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "kind": "native_embedded_virtual_component",
             "session_document_path": selection_document,
             "session_temp_root": selection_root,
+            "native_api_pid": 21041,
             "owner_sha256": owner_sha,
             "configuration": "Default",
             "suppression_state": 2,
@@ -1105,6 +1109,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "api_path_fields_disagree": {
                 "materialization_path": r"C:\other\swx21040\VC~~\waist\other.SLDPRT"
             },
+            "native_pid_mismatch": {"native_api_pid": 21041},
         }
         for label, patch in cases.items():
             with self.subTest(case=label):
