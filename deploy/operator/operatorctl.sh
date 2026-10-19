@@ -45,6 +45,7 @@ install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release
 start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
 orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N [--reported-stage STAGE]
+native capture recovery adds: --install-id ID --derived DIR --archive FILE (--reported-stage capture, --stage discover, --outcome failed)
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2
@@ -58,6 +59,8 @@ INSTALL_ID=""
 WHEEL_FILE=""
 ENDPOINT_IDENTITY=""
 RELEASE_FILE=""
+NATIVE_DERIVED=""
+NATIVE_ARCHIVE=""
 RUN_ID=""
 STAGE=""
 OUTCOME=""
@@ -85,6 +88,8 @@ while [ $# -gt 0 ]; do
     --orphan-task-id) ORPHAN_TASK_ID="${2:-}"; shift 2 ;;
     --orphan-map-index) ORPHAN_MAP_INDEX="${2:-}"; shift 2 ;;
     --reported-stage) REPORTED_STAGE="${2:-}"; shift 2 ;;
+    --derived) NATIVE_DERIVED="${2:-}"; shift 2 ;;
+    --archive) NATIVE_ARCHIVE="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
     --keep-admission-closed) KEEP_ADMISSION_CLOSED=1; shift ;;
     *) usage ;;
@@ -2096,6 +2101,29 @@ PY
       [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
       [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
       [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
+    fi
+    if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]; then
+      [ -n "$NATIVE_DERIVED" ] && [ -n "$NATIVE_ARCHIVE" ] \
+        && [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] \
+        && [ "$REPORTED_STAGE" = "capture" ] \
+        && [ -n "$INSTALL_ID" ] \
+        && [ -n "$RUN_ID" ] && [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] \
+        && [ -n "$ORPHAN_OPERATION_ID" ] && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
+        || die "native capture recovery requires the complete discover/capture receipt and operation binding"
+      [ "$NATIVE_RUN_ID" = "$RUN_ID" ] || die "the native receipt names another run"
+      [ -d "$NATIVE_DERIVED" ] || die "the derived prepared directory is missing: $NATIVE_DERIVED"
+      [ -f "$NATIVE_ARCHIVE" ] || die "the capture-request archive is missing: $NATIVE_ARCHIVE"
+      (
+        set -a
+        . "$ENV_FILE"
+        set +a
+        args=(--run-id "$RUN_ID" --job "$NATIVE_RECEIPT" --derived "$NATIVE_DERIVED" \
+          --archive "$NATIVE_ARCHIVE" --operation-id "$ORPHAN_OPERATION_ID" \
+          --task-id "$ORPHAN_TASK_ID" --map-index "$ORPHAN_MAP_INDEX")
+        for item in "${EVIDENCE[@]}"; do args+=(--evidence "$item"); done
+        "$AIRFLOW_VENV/bin/python" "$HERE/reconcile-native-capture.py" "${args[@]}"
+      )
+      exit $?
     fi
     # Every reconcile shape consumes the generation DSNs: read them back from the derived
     # environment file so the canonical action always runs against the controlled values.

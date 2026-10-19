@@ -456,6 +456,21 @@ def _require_plan_against_capture(staging: Path, plan: dict) -> None:
             raise PipelineError(f"The capture did not produce a planned evidence item: {requested}")
 
 
+def _require_selector_state(item: dict, component: object) -> None:
+    """Require the plan state to be the raw component's exact suppression integer."""
+
+    component_state = component.get("suppression_state") if isinstance(component, dict) else None
+    plan_state = item.get("state")
+    if (
+        component is None
+        or type(component_state) is not int
+        or component_state not in {0, 1, 2, 3, 4}
+        or type(plan_state) is not int
+        or plan_state != component_state
+    ):
+        raise PipelineError("The sealed capture plan does not bind the native suppression state")
+
+
 def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     """Consume the sealed Linux-origin definition of one prepared package.
 
@@ -468,7 +483,15 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     """
 
     from .io import artifact_path_parts
-    from .sources.solidworks.discovery import DISCOVERY_FILE, PLAN_FILE, PLAN_SCHEMA, SOURCE_FILE
+    from .sources.solidworks.discovery import (
+        DISCOVERY_FILE,
+        PLAN_FILE,
+        PLAN_SCHEMA,
+        SOURCE_FILE,
+        sealed_cached_import_materialization,
+        sealed_embedded_virtual_document,
+    )
+    from .sources.solidworks.selection import selection_bindings
 
     discovery_path = package / DISCOVERY_FILE
     source_path = package / SOURCE_FILE
@@ -504,6 +527,15 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     if plan.get("main_assembly") != derivation.get("main_assembly"):
         raise PipelineError("The sealed capture plan names another project entry than the sealed discovery")
     record = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    raw_selection = record.get("source_selection")
+    bindings = selection_bindings(raw_selection)
+    if (
+        bindings["files"] != expected_files
+        or record.get("files") != bindings["files"]
+        or plan.get("selection", {}).get("files") != bindings["files"]
+        or bindings["main_assembly"] != plan.get("main_assembly")
+    ):
+        raise PipelineError("The sealed source selection does not bind the complete frozen inventory")
     saved = record.get("saved_configuration")
     if isinstance(saved, str) and saved and plan.get("configuration") != saved:
         raise PipelineError("The sealed capture plan configuration disagrees with the recorded saved configuration")
@@ -516,6 +548,11 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         and not item.get("suppressed")
         and isinstance(item.get("instance_id") or item.get("name2"), str)
     }
+    raw_components = {
+        str(item.get("instance_id") or item.get("name2")): item
+        for item in (record.get("components") or [])
+        if isinstance(item, dict) and isinstance(item.get("instance_id") or item.get("name2"), str)
+    }
     registered = set(raw_documents)
     objects = plan.get("objects")
     if not isinstance(objects, list) or not objects:
@@ -527,8 +564,81 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         name = item.get("name")
         if not isinstance(name, str) or not name:
             raise PipelineError("The sealed capture plan carries no usable native object selectors")
+        if name not in registered:
+            raise PipelineError("The sealed capture plan names instances outside the sealed record")
         document = item.get("document")
+        if document is None:
+            component = raw_components.get(name)
+            virtual = isinstance(component, dict) and sealed_embedded_virtual_document(
+                component, name, expected_files
+            )
+            cached = isinstance(component, dict) and sealed_cached_import_materialization(
+                component, name, expected_files, raw_selection
+            )
+            if component is None or not (virtual or cached):
+                raise PipelineError(
+                    "The sealed capture plan omits a native selector document without complete session proof"
+                )
+            provenance = (
+                component.get("source_provenance")
+                if isinstance(component.get("source_provenance"), dict)
+                else {}
+            )
+            closure = (record.get("source_selection") or {}).get("closure")
+            if cached:
+                _require_selector_state(item, component)
+                names.append(name)
+                continue
+            virtuals = closure.get("virtual_components") if isinstance(closure, dict) else None
+            matches = [
+                item
+                for item in (virtuals or [])
+                if isinstance(item, dict) and (item.get("instance") or item.get("name")) == name
+            ]
+            if len(matches) != 1:
+                raise PipelineError("The sealed closure carries no unique embedded-virtual occurrence")
+            entry = matches[0]
+            root = entry.get("session_temp_root")
+            path = entry.get("session_document_path")
+            pid = entry.get("native_api_pid")
+            root_name = root.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] if isinstance(root, str) else ""
+            if (
+                entry.get("kind") != provenance.get("kind")
+                or entry.get("state") != provenance.get("state")
+                or entry.get("is_virtual") is not True
+                or entry.get("occurrence", entry.get("instance")) != name
+                or entry.get("owner") != provenance.get("owner")
+                or entry.get("owner_sha256") != provenance.get("owner_sha256")
+                or entry.get("configuration") != component.get("configuration")
+                or entry.get("suppression_state") != component.get("suppression_state")
+                or entry.get("used_api") != provenance.get("used_api")
+                or entry.get("binding") != "owner_embedded_geometry"
+                or "author_imported_path" not in entry
+                or "author_imported_error" not in entry
+                or "owner_anchor" not in entry
+                or entry.get("author_imported_path") != provenance.get("author_imported_path")
+                or entry.get("author_imported_error") != provenance.get("author_imported_error")
+                or entry.get("owner_anchor") != provenance.get("defining_anchor")
+                or type(entry.get("suppression_state")) is not int
+                or not isinstance(root, str)
+                or not isinstance(path, str)
+                or type(pid) is not int
+                or pid <= 0
+                or not root_name.startswith("swx")
+                or not root_name[3:].isdigit()
+                or int(root_name[3:]) != pid
+                or not path.replace("\\", "/").casefold().startswith(root.replace("\\", "/").casefold() + "/")
+                or path.replace("\\", "/").casefold().count("/vc~~/") != 1
+            ):
+                raise PipelineError("The sealed closure does not bind the embedded-virtual occurrence")
         if document is not None:
+            component = raw_components.get(name)
+            if isinstance(component, dict) and sealed_cached_import_materialization(
+                component, name, expected_files, raw_selection
+            ):
+                raise PipelineError(
+                    "The sealed capture plan carries a cached-import session document"
+                )
             if not isinstance(document, str) or not document:
                 raise PipelineError("The sealed capture plan carries an unusable selector document")
             try:
@@ -540,6 +650,8 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             recorded_document = raw_documents.get(name, "")
             if recorded_document and recorded_document != document:
                 raise PipelineError("The sealed capture plan binds another document to a native instance")
+        component = raw_components.get(name)
+        _require_selector_state(item, component)
         names.append(name)
     if len(set(names)) != len(names):
         raise PipelineError("The sealed capture plan repeats a native object selector")

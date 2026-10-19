@@ -112,6 +112,8 @@ class WorkflowTests(unittest.TestCase):
 
     def acquisition_without_admin(self):
         """Byte-binding control only; these placeholders do not qualify CAD."""
+        from tests.sources.selection_support import sealed_selection
+
         author = read_data(self.package / "robot.yaml")
         author["hardware_id"] = None
         author["source"]["robot_name"] = "robot"
@@ -131,9 +133,19 @@ class WorkflowTests(unittest.TestCase):
             "derivation": {"main_assembly": "assembly.SLDASM"},
             "raw": {
                 "saved_configuration": "Default",
+                "files": dict(files),
+                "source_selection": sealed_selection(files, "assembly.SLDASM"),
                 "components": [
-                    {"instance_id": "assembly-1", "document": "assembly.SLDASM"},
-                    {"instance_id": "part-1", "document": "part.SLDPRT"},
+                    {
+                        "instance_id": "assembly-1",
+                        "document": "assembly.SLDASM",
+                        "suppression_state": 2,
+                    },
+                    {
+                        "instance_id": "part-1",
+                        "document": "part.SLDPRT",
+                        "suppression_state": 2,
+                    },
                 ],
             },
         }

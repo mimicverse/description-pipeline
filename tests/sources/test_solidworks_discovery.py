@@ -2584,6 +2584,78 @@ class DerivationSplitTests(unittest.TestCase):
             (self.tmp / "derived" / "source.json").read_bytes(),
         )
 
+    def test_derived_embedded_virtual_plan_is_consumed_by_the_capture_boundary(self) -> None:
+        from description_pipeline import steps
+
+        source, records = self._scene()
+        payload = record()
+        component = next(item for item in payload["components"] if item["name2"] == "arm-1")
+        owner_sha = payload["files"]["cad/robot.SLDASM"]
+        component["document"] = "c:/users/operator/appdata/local/temp/swx1/vc~~/arm/arm.sldprt"
+        component["suppression_state"] = 2
+        component["source_provenance"] = {
+            "kind": "native_embedded_virtual_component",
+            "state": "embedded_virtual_component",
+            "is_virtual": True,
+            "occurrence": "arm-1",
+            "owner": "cad/robot.SLDASM",
+            "owner_sha256": owner_sha,
+            "session_document_path": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT",
+            "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
+            "native_document_path": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT",
+            "materialization_path": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT",
+            "native_api_pid": 1,
+            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "document": None,
+        }
+        payload["source_selection"]["closure"]["virtual_components"] = [
+                {
+                    "instance": "arm-1",
+                    "name": "arm-1",
+                    "kind": "native_embedded_virtual_component",
+                    "state": "embedded_virtual_component",
+                    "is_virtual": True,
+                    "owner": "cad/robot.SLDASM",
+                    "owner_sha256": owner_sha,
+                    "configuration": "Default",
+                    "binding": "owner_embedded_geometry",
+                    "author_imported_path": None,
+                    "author_imported_error": None,
+                    "owner_anchor": None,
+                    "suppression_state": 2,
+                    "session_document_path": component["source_provenance"]["session_document_path"],
+                    "session_temp_root": component["source_provenance"]["session_temp_root"],
+                    "native_api_pid": 1,
+                    "used_api": component["source_provenance"]["used_api"],
+                }
+            ]
+        from description_pipeline.sources.solidworks.selection import seal_closure_selection
+
+        selection = payload["source_selection"]
+        payload["source_selection"] = seal_closure_selection(
+            {**selection["excluded_files"], **selection["files"]},
+            selection["main_assembly"],
+            selection["closure"],
+            reader_sha256=selection["reader_sha256"],
+        )
+        output = self.tmp / "derived-virtual"
+        result = derive_native_package(
+            source,
+            output,
+            "run-1",
+            payload,
+            settings=DiscoverySettings(record_roots=(records,)),
+        )
+        self.assertTrue(result.passed, result.findings)
+        plan = json.loads((output / "capture-plan.json").read_text(encoding="utf-8"))
+        selector = next(item for item in plan["objects"] if item["name"] == "arm-1")
+        self.assertNotIn("document", selector)
+        self.assertIn("arm-1", next(item for item in plan["groups"] if item["name"] == "arm_link")["components"])
+        _source, consumed = steps._consume_sealed_definition(output)
+        self.assertEqual(consumed, plan)
+
     def test_derivation_refuses_a_selected_main_outside_the_record(self) -> None:
         source, records = self._scene()
         settings = DiscoverySettings(record_roots=(records,), main_assembly="other.SLDASM")

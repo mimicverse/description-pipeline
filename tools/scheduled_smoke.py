@@ -255,6 +255,7 @@ def _mock_endpoint(
                     "run_id": fresh["run_id"],
                     "request": dict(payload),
                     "main_assembly": main_assembly,
+                    "handoff_sha256": fixture["handoff_sha256"],
                     "native_tool": fixture["native_tool"],
                     "status": "selecting",
                     "events": [{"stage": "job", "state": "selecting", "at": "t0"}],
@@ -365,10 +366,8 @@ def _mock_endpoint(
                 state["definition_posts"].append({"prepared_sha256": prepared, "size": len(body)})
                 job["_artifacts"][fixture["receipt"]["name"]] = archive
                 job["status"] = "native_complete"
-                job["events"] = [
-                    *fixture["native_stages"]["events"],
-                    {"stage": "job", "state": "native_complete", "at": "t0"},
-                ]
+                job["stages"] = fixture["native_stages"]
+                job["events"] = [*fixture["native_stages"]["events"]]
                 job["result"] = {
                     "native_complete": True,
                     "native_tool": fixture["native_tool"],

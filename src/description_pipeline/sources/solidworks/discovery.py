@@ -59,6 +59,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import ntpath
 import re
 import shutil
 import unicodedata
@@ -67,7 +68,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from ...io import PipelineError, confined, digest, inventory, parse_data, read_data
+from ...io import PipelineError, artifact_path_parts, confined, digest, inventory, parse_data, read_data
 from ...interface_records import (
     PREVIEW_RANGE_KEYS,
     PREVIEW_RANGE_SCHEMA,
@@ -80,6 +81,7 @@ from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .revision import package_inventory
+from .session_artifacts import session_materialization_under_root, session_root_pid
 from ...schemas import SOURCE_RECORD_SCHEMA, exporter_declaration_present
 
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -4159,6 +4161,298 @@ def read_native_record(frozen_source: Path, settings: DiscoverySettings, *, back
     return record
 
 
+def sealed_embedded_virtual_document(
+    component: dict, name: str, native_files: Mapping[str, str]
+) -> bool:
+    """Whether the sealed record proves an embedded virtual session document."""
+
+    provenance = component.get("source_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if (
+        provenance.get("kind") != "native_embedded_virtual_component"
+        or provenance.get("state") != "embedded_virtual_component"
+        or provenance.get("is_virtual") is not True
+        or provenance.get("occurrence") != name
+        or not isinstance(provenance.get("owner"), str)
+        or not provenance["owner"]
+        or not isinstance(provenance.get("owner_sha256"), str)
+        or _SHA256_HEX.fullmatch(provenance["owner_sha256"]) is None
+        or native_files.get(provenance["owner"]) != provenance["owner_sha256"]
+        or not isinstance(provenance.get("session_document_path"), str)
+        or not provenance["session_document_path"]
+        or not isinstance(provenance.get("session_temp_root"), str)
+        or not provenance["session_temp_root"]
+        or type(provenance.get("native_api_pid")) is not int
+        or provenance["native_api_pid"] <= 0
+        or not isinstance(provenance.get("used_api"), str)
+        or provenance["used_api"] != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+        or provenance.get("author_imported_path") is not None
+        or provenance.get("author_imported_error") is not None
+        or provenance.get("document") is not None
+        or not isinstance(component.get("configuration"), str)
+        or not component["configuration"]
+    ):
+        return False
+    session_path = provenance["session_document_path"].replace("\\", "/")
+    session_root = provenance["session_temp_root"].replace("\\", "/").rstrip("/")
+    root_name = session_root.rsplit("/", 1)[-1]
+    if not re.fullmatch(r"swx[0-9]+", root_name):
+        return False
+    if int(root_name[3:]) != provenance["native_api_pid"]:
+        return False
+    if not session_path.casefold().startswith(session_root.casefold() + "/"):
+        return False
+    if session_path.casefold().count("/vc~~/") != 1:
+        return False
+    for key in ("native_document_path", "materialization_path"):
+        value = provenance.get(key)
+        if (
+            not isinstance(value, str)
+            or value.replace("\\", "/").casefold() != session_path.casefold()
+        ):
+            return False
+    document = component.get("document")
+    return (
+        isinstance(document, str)
+        and bool(document)
+        and document.replace("\\", "/").casefold() == session_path.casefold()
+    )
+
+
+def sealed_cached_import_materialization(
+    component: object,
+    name: str,
+    native_files: Mapping[str, str],
+    source_selection: object,
+) -> bool:
+    """Whether raw and sealed closure prove a portable IC~~ import occurrence."""
+
+    if not isinstance(component, dict):
+        return False
+    provenance = component.get("source_provenance")
+    if not isinstance(provenance, dict) or (
+        provenance.get("state") != "cached_materialization"
+        or provenance.get("kind") != "native_import_materialization"
+        or provenance.get("is_virtual") is not False
+        or provenance.get("occurrence") != name
+        or not isinstance(provenance.get("owner"), str)
+        or not provenance["owner"]
+        or not isinstance(provenance.get("owner_sha256"), str)
+        or _SHA256_HEX.fullmatch(provenance["owner_sha256"]) is None
+        or native_files.get(provenance["owner"]) != provenance["owner_sha256"]
+        or not isinstance(provenance.get("materialization_path"), str)
+        or not provenance["materialization_path"]
+        or not isinstance(provenance.get("session_temp_root"), str)
+        or not provenance["session_temp_root"]
+        or type(provenance.get("native_api_pid")) is not int
+        or provenance["native_api_pid"] <= 0
+        or provenance.get("used_api") != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+        or provenance.get("error") is not None
+        or "author_imported_error" not in provenance
+        or provenance.get("author_imported_error") is not None
+        or not isinstance(component.get("configuration"), str)
+        or not component["configuration"]
+        or type(component.get("suppression_state")) is not int
+        or component.get("suppression_state") not in {0, 1, 2, 3, 4}
+    ):
+        return False
+    session_path = provenance["materialization_path"].replace("\\", "/")
+    session_root = provenance["session_temp_root"].replace("\\", "/").rstrip("/")
+    root_name = session_root.rsplit("/", 1)[-1]
+    if (
+        not re.fullmatch(r"swx[0-9]+", root_name)
+        or int(root_name[3:]) != provenance["native_api_pid"]
+        or not session_path.casefold().startswith(session_root.casefold() + "/")
+        or session_path.casefold().count("/ic~~/") != 1
+    ):
+        return False
+    for key in ("session_document_path", "native_document_path"):
+        value = provenance.get(key)
+        if (
+            not isinstance(value, str)
+            or value.replace("\\", "/").casefold() != session_path.casefold()
+        ):
+            return False
+    document = component.get("document")
+    if (
+        not isinstance(document, str)
+        or not document
+        or document.replace("\\", "/").casefold() != session_path.casefold()
+        or provenance.get("author_imported_in_source_root") is not True
+        or not _portable_relative(provenance.get("author_imported_relative"))
+        or not isinstance(provenance.get("author_imported_path"), str)
+        or not isinstance(provenance.get("source_root"), str)
+    ):
+        return False
+    author_relative = _relative_under_windows(
+        provenance["author_imported_path"],
+        provenance["source_root"],
+    )
+    if (
+        author_relative is None
+        or author_relative.casefold() != provenance["author_imported_relative"].casefold()
+    ):
+        return False
+    if not isinstance(source_selection, dict):
+        return False
+    files = source_selection.get("files")
+    closure = source_selection.get("closure")
+    if not isinstance(files, dict) or not isinstance(closure, dict):
+        return False
+    imports = closure.get("imports")
+    matches = [
+        entry
+        for entry in (imports or [])
+        if isinstance(entry, dict)
+        and entry.get("instance") == name
+        and entry.get("state") == "cached_materialization"
+    ]
+    if len(matches) != 1:
+        return False
+    entry = matches[0]
+    bound_source = entry.get("bound_source")
+    stage_root = closure.get("stage_root")
+    slot_author_relative = _relative_under_windows(entry.get("author_imported_path"), stage_root)
+    if (
+        entry.get("binding") != "author_metadata_only"
+        or entry.get("is_virtual") is not False
+        or str(entry.get("owner") or "").replace("\\", "/").casefold()
+        != provenance["owner"].replace("\\", "/").casefold()
+        or entry.get("owner_sha256") != provenance["owner_sha256"]
+        or (entry.get("owner_anchor") or None) != (provenance.get("defining_anchor") or None)
+        or entry.get("configuration") != component["configuration"]
+        or type(entry.get("suppression_state")) is not int
+        or entry.get("suppression_state") != component.get("suppression_state")
+        or entry.get("author_metadata_in_stage") is not True
+        or not _portable_relative(bound_source)
+        or bound_source not in files
+        or bound_source not in native_files
+        or files.get(bound_source) != native_files.get(bound_source)
+        or str(bound_source).replace("\\", "/").casefold()
+        != provenance["author_imported_relative"].replace("\\", "/").casefold()
+        or not isinstance(stage_root, str)
+        or slot_author_relative is None
+        or slot_author_relative.casefold() != bound_source.casefold()
+    ):
+        return False
+    slot_root = entry.get("session_temp_root")
+    slot_pid = entry.get("native_api_pid")
+    slot_path = entry.get("materialization")
+    if (
+        type(slot_pid) is not int
+        or slot_pid <= 0
+        or not isinstance(slot_root, str)
+        or not isinstance(slot_path, str)
+        or session_root_pid(slot_root) != slot_pid
+        or not session_materialization_under_root(slot_path, slot_root)
+    ):
+        return False
+    graph = closure.get("graph")
+    documents = closure.get("documents")
+    if not isinstance(graph, dict) or not isinstance(documents, dict):
+        return False
+    owner = provenance["owner"]
+    owner_graph = graph.get(owner)
+    source_graph = graph.get(bound_source)
+    owner_document = documents.get(owner)
+    if (
+        not isinstance(owner_graph, dict)
+        or owner_graph.get("sha256") != provenance["owner_sha256"]
+        or bound_source not in (owner_graph.get("references") or [])
+        or not isinstance(source_graph, dict)
+        or source_graph.get("sha256") != files[bound_source]
+        or not isinstance(owner_document, dict)
+    ):
+        return False
+    resolved = [
+        edge
+        for edge in owner_document.get("resolved_edges") or []
+        if isinstance(edge, dict)
+        and edge.get("kind") == "native_imported_document"
+        and edge.get("instance") == name
+        and edge.get("resolved") == bound_source
+        and edge.get("configuration") == component["configuration"]
+        and type(edge.get("suppression_state")) is int
+        and edge.get("suppression_state") == component.get("suppression_state")
+    ]
+    return len(resolved) == 1
+
+
+def _portable_relative(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return "/".join(artifact_path_parts(value)) == value
+    except PipelineError:
+        return False
+
+
+def _relative_under_windows(path: object, root: object) -> str | None:
+    if not isinstance(path, str) or not isinstance(root, str) or not path or not root:
+        return None
+    normalized = ntpath.normcase(ntpath.normpath(path))
+    base = ntpath.normcase(ntpath.normpath(root))
+    if not ntpath.isabs(normalized) or not ntpath.isabs(base):
+        return None
+    try:
+        relative = ntpath.relpath(normalized, base)
+    except ValueError:
+        return None
+    if relative == ".." or relative.startswith(".." + ntpath.sep) or ntpath.isabs(relative):
+        return None
+    return relative.replace("\\", "/")
+
+
+def _capture_plan_selector(
+    component: dict,
+    native_files: Mapping[str, str],
+    source_selection: object = None,
+) -> dict | None:
+    """Build one portable native selector for the sealed capture plan.
+
+    Fully sealed embedded-virtual and cached-import occurrences keep their
+    absolute session path in the raw diagnostic record only.  Their occurrence
+    name and suppression state are the portable selector; consumer-side closure
+    binding proves that an IC~~ occurrence can be re-materialized from a bound
+    staged source.
+    A delivered document must remain a portable staged path, so any other
+    non-portable value is refused instead of being silently removed.
+    """
+
+    if not isinstance(component, dict) or component.get("suppressed"):
+        return None
+    name = component.get("instance_id") or component.get("name2")
+    if not isinstance(name, str) or not name:
+        return None
+    selector = {"name": name}
+    document = component.get("document")
+    session_document = sealed_embedded_virtual_document(
+        component, name, native_files
+    ) or sealed_cached_import_materialization(
+        component,
+        name,
+        native_files,
+        source_selection,
+    )
+    if not session_document and (not isinstance(document, str) or not document):
+        raise PipelineError("A non-virtual native component carries no document selector")
+    if isinstance(document, str) and document and not session_document:
+        normalized = document.replace("\\", "/")
+        try:
+            artifact_path_parts(normalized)
+        except PipelineError as error:
+            raise PipelineError(
+                "A non-session native component carries a document outside the portable staged inventory"
+            ) from error
+        selector["document"] = normalized
+    state = component.get("suppression_state")
+    if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+        raise PipelineError("A native capture selector carries no truthful suppression state")
+    selector["state"] = state
+    return selector
+
+
 def derive_native_package(
     frozen_source: Path,
     output: Path,
@@ -4438,20 +4732,17 @@ def derive_native_package(
     # requested evidence items, bound to the sealed discovery bytes.  It is the
     # only plan traveling to Windows; the full engineering representation is
     # never copied into it.
+    from .selection import selection_bindings
+
+    source_selection = record.get("source_selection")
+    selection = selection_bindings(source_selection)
+    if selection["files"] != native_files or selection["main_assembly"] != recorded_main:
+        raise PipelineError("The sealed source selection differs from the frozen native package")
     plan_objects = []
     for component in record.get("components") or ():
-        if not isinstance(component, dict) or component.get("suppressed"):
-            continue
-        name = component.get("instance_id") or component.get("name2")
-        if not isinstance(name, str) or not name:
-            continue
-        selector = {"name": name}
-        document = component.get("document")
-        if isinstance(document, str) and document:
-            selector["document"] = document.replace("\\", "/")
-        state = component.get("state")
-        selector["state"] = int(state) if type(state) is int else 2
-        plan_objects.append(selector)
+        selector = _capture_plan_selector(component, native_files, source_selection)
+        if selector is not None:
+            plan_objects.append(selector)
     plan_objects.sort(key=lambda item: item["name"])
     write_json(
         output / PLAN_FILE,
