@@ -2592,6 +2592,7 @@ class DerivationSplitTests(unittest.TestCase):
         component = next(item for item in payload["components"] if item["name2"] == "arm-1")
         owner_sha = payload["files"]["cad/robot.SLDASM"]
         component["document"] = "c:/users/operator/appdata/local/temp/swx1/vc~~/arm/arm.sldprt"
+        component["suppression_state"] = 2
         component["source_provenance"] = {
             "kind": "native_embedded_virtual_component",
             "state": "embedded_virtual_component",
@@ -2623,6 +2624,7 @@ class DerivationSplitTests(unittest.TestCase):
                     "author_imported_path": None,
                     "author_imported_error": None,
                     "owner_anchor": None,
+                    "suppression_state": 2,
                     "session_document_path": component["source_provenance"]["session_document_path"],
                     "session_temp_root": component["source_provenance"]["session_temp_root"],
                     "native_api_pid": 1,

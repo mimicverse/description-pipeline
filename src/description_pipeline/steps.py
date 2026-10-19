@@ -580,6 +580,8 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 or entry.get("author_imported_path") != provenance.get("author_imported_path")
                 or entry.get("author_imported_error") != provenance.get("author_imported_error")
                 or entry.get("owner_anchor") != provenance.get("defining_anchor")
+                or type(entry.get("suppression_state")) is not int
+                or entry.get("suppression_state") != component.get("suppression_state")
                 or not isinstance(root, str)
                 or not isinstance(path, str)
                 or type(pid) is not int

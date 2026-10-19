@@ -285,6 +285,7 @@ class CapturePlanTests(unittest.TestCase):
         session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT"
         component["document"] = session_path.replace("\\", "/").lower()
         component["configuration"] = "Default"
+        component["suppression_state"] = 2
         component["source_provenance"] = {
             "kind": "native_embedded_virtual_component",
             "state": "embedded_virtual_component",
@@ -315,6 +316,7 @@ class CapturePlanTests(unittest.TestCase):
             "author_imported_path": None,
             "author_imported_error": None,
             "owner_anchor": None,
+            "suppression_state": 2,
             "session_document_path": session_path,
             "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
             "native_api_pid": 1,
@@ -331,6 +333,13 @@ class CapturePlanTests(unittest.TestCase):
         )
         steps._consume_sealed_definition(self.root)
         entry.pop("binding")
+        write_json(self.root / "discovery" / "native-discovery.json", discovery)
+        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
+        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
+        with self.assertRaisesRegex(PipelineError, "does not bind the embedded-virtual occurrence"):
+            steps._consume_sealed_definition(self.root)
+        entry["binding"] = "owner_embedded_geometry"
+        entry.pop("suppression_state")
         write_json(self.root / "discovery" / "native-discovery.json", discovery)
         discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
         self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
