@@ -548,6 +548,14 @@ def _failure(job: dict, stage: dict) -> dict:
             "the pipeline does not guess by filename or size."
         )
         kind = "definition"
+    elif stage.get("error_code") == "cad_link_group_payload_invalid":
+        kind = "runtime"
+        title = "Native link-group mass read rejected"
+        meaning = (
+            "The native link-group payload did not match the requested instance, configuration, "
+            "and selection identity. The stage did not generate or verify a delivery; review the "
+            "raw diagnostic and retry from a corrected native run."
+        )
     elif stage.get("id") == "discover" and "discovery.definition" in raw_error and blocking_findings:
         counts: dict[str, int] = {}
         samples: dict[str, list[dict]] = {}
