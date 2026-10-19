@@ -53,7 +53,9 @@ class ContractConvergenceTests(unittest.TestCase):
             r"\b(?:name|label|state|title|meaning|note|scope|reason|"
             r"resume_from_name|stage_name|headline|manual_scope_note)_zh\b|_ZH\b"
         )
-        for base in ("src", "deploy", "tools"):
+        # Scan the product namespace, not generated editable-install metadata
+        # (for example src/mimicverse_description.egg-info/PKG-INFO).
+        for base in ("src/description_pipeline", "deploy", "tools"):
             for path in (REPO / base).rglob("*"):
                 if not path.is_file() or "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
                     continue
