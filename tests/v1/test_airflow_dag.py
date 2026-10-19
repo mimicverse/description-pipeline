@@ -3391,12 +3391,14 @@ class PlatformRegistrationTests(unittest.TestCase):
 
     def test_native_selection_failure_converges_discover_without_overwriting_freeze(self) -> None:
         from description_pipeline.orchestration.airflow_client import JOB_SCHEMA
+        from description_pipeline.orchestration.airflow_client import native_run_id
         from description_pipeline.platform import flow
         from description_pipeline.platform.store import PlatformStore
         from tests.v1.test_platform_store import FakeWorld
 
-        run_id = "4f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
-        request_id = "portal-native-failure"
+        dag_run_id = "portal-native-failure"
+        run_id = native_run_id(dag_run_id)
+        request_id = dag_run_id
         config_digest = "c" * 64
         world = FakeWorld()
         store = PlatformStore(
@@ -3426,7 +3428,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                 "operation_key": f"{run_id}/freeze:0",
                 "params_digest": "a" * 64,
                 "dag_id": self.module.DAG_ID,
-                "dag_run_id": "portal-native-failure",
+                "dag_run_id": dag_run_id,
                 "task_id": "freeze",
                 "map_index": -1,
             },
@@ -3447,7 +3449,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         operation_key = f"{run_id}/native:0"
         dispatch = {
             "dag_id": self.module.DAG_ID,
-            "dag_run_id": "portal-native-failure",
+            "dag_run_id": dag_run_id,
             "task_id": "discover",
             "map_index": -1,
         }
@@ -3523,7 +3525,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             ["blocked", "blocked", "blocked", "blocked"],
         )
         self.assertEqual(store.run_record(run_id)["state"], "failed")
-        self._settle_terminal_discover_failure(world, store, request, "portal-native-failure")
+        self._settle_terminal_discover_failure(world, store, request, dag_run_id)
         settled = store.register_operation(
             run_id=run_id,
             stage="discover",
@@ -3543,6 +3545,7 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         run_id = "c5d1a559-4a25-52eb-a6dc-8855f9b0654d"
         request_id = "portal-portal-20261019T140447-01d47dba"
+        dag_run_id = "portal-20261019T140447-01d47dba"
         config_digest = "c" * 64
         world = FakeWorld()
         store = PlatformStore(
@@ -3572,7 +3575,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                 "operation_key": f"{request_id}/freeze:0",
                 "params_digest": "a" * 64,
                 "dag_id": self.module.DAG_ID,
-                "dag_run_id": request_id,
+                "dag_run_id": dag_run_id,
                 "task_id": "freeze",
                 "map_index": -1,
             },
@@ -3593,7 +3596,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         operation_key = f"{run_id}/native:0"
         dispatch = {
             "dag_id": self.module.DAG_ID,
-            "dag_run_id": request_id,
+            "dag_run_id": dag_run_id,
             "task_id": "discover",
             "map_index": -1,
         }
@@ -3756,7 +3759,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             ["blocked", "blocked", "blocked", "blocked"],
         )
         self.assertEqual(store.run_record(run_id)["state"], "failed")
-        self._settle_terminal_discover_failure(world, store, request, request_id)
+        self._settle_terminal_discover_failure(world, store, request, dag_run_id)
         settled = store.register_operation(
             run_id=run_id,
             stage="discover",
