@@ -1925,6 +1925,7 @@ class PlatformStore:
         if (
             not isinstance(request_files, dict)
             or any(not isinstance(name, str) or not _is_sha256(value) for name, value in request_files.items())
+            or request_main not in request_files
             or receipt.get("selection_files") != request_files
             or digest(request_files) != baseline.get("handoff_sha256")
             or baseline.get("files") != len(request_files)

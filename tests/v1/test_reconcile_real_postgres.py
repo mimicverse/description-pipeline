@@ -209,7 +209,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
         subject, artifacts, self.upload_sha, _native_handoff = build_sealed_delivery(self.sealed_root)
         index = read_data(self.sealed_root / "input" / "handoff.json")
         self.upload_files = dict(index["package_files"])
-        self.main_assembly = "cad/robot.SLDASM"
+        self.main_assembly = "cad/cad/robot.SLDASM"
         self.store.open_admission(reason="bound native reconcile proof", actor="reconcile-test")
         self.store.admit_run(
             request_id=f"portal-{self.dag_run_id}",

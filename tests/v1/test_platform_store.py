@@ -2795,7 +2795,7 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         subject, artifacts, self.upload_sha, _native_handoff = build_sealed_delivery(self.sealed_root)
         index = read_data(self.sealed_root / "input" / "handoff.json")
         self.upload_files = dict(index["package_files"])
-        self.main_assembly = "cad/robot.SLDASM"
+        self.main_assembly = "cad/cad/robot.SLDASM"
         self.store = PlatformStore(
             self.world.connect,
             sealed=lambda uri: self.tmp / uri.removeprefix("store://sealed/"),
@@ -2907,6 +2907,14 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
 
     def _write_document(self, document: dict) -> None:
         self.log.write_text(json.dumps(document, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _set_platform_main(self, main_assembly: str) -> None:
+        request_id = f"portal-{self.dag_run_id}"
+        for index, row in enumerate(self.world.requests):
+            if row[0] == request_id:
+                self.world.requests[index] = (*row[:3], main_assembly, *row[4:])
+                return
+        raise AssertionError("test request row is missing")
 
     def _reconcile(self) -> dict:
         return {
@@ -3026,6 +3034,13 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         )
         variants.append(
             (
+                "main_not_in_upload_files",
+                lambda: self._set_platform_main("missing.SLDASM"),
+                "missing_main",
+            )
+        )
+        variants.append(
+            (
                 "discover_task_green",
                 lambda: self.world.task_instances.__setitem__(
                     (DAG_ID, "discover", self.dag_run_id, -1), "success"
@@ -3053,6 +3068,10 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 document = json.loads(json.dumps(self.document))
                 if kind == "document":
                     mutate(document)
+                    self._write_document(document)
+                elif kind == "missing_main":
+                    mutate()
+                    document["request"]["main_assembly"] = "missing.SLDASM"
                     self._write_document(document)
                 else:
                     mutate()

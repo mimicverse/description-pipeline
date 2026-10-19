@@ -1121,6 +1121,72 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn('reconcile_frame["reported_stage"] = reported_stage', control_text)
             self.assertIn('"params_digest": io.digest(reconcile_frame)', control_text)
 
+    def test_embedded_reconcile_digest_changes_with_reported_stage(self) -> None:
+        from description_pipeline import io
+        import io as standard_io
+        import types
+        from unittest import mock
+
+        control_text = CONTROL.read_text(encoding="utf-8")
+        marker = control_text.index("# platform-reconcile")
+        start = control_text.index("\n", marker) + 1
+        end = control_text.index("\nPY\n", start)
+        script = control_text[start:end]
+        captured: dict = {}
+
+        class FakePlatformStore:
+            @classmethod
+            def from_environment(cls):
+                return cls()
+
+            def confirm_stage(self, **kwargs):
+                captured.update(kwargs)
+
+        fake_store = types.ModuleType("description_pipeline.platform.store")
+        fake_store.PlatformStore = FakePlatformStore
+        common = {
+            "RECONCILE_RUN_ID": "run-1",
+            "RECONCILE_STAGE": "discover",
+            "RECONCILE_OUTCOME": "failed",
+            "RECONCILE_EVIDENCE": json.dumps(["receipt.json"]),
+            "RECONCILE_NATIVE_RECEIPT": "receipt.json",
+            "RECONCILE_NATIVE_RUN_ID": "3324bcb0-085a-5f77-8edc-a4c1be2f1a5a",
+            "RECONCILE_ORPHAN_OPERATION_ID": "e88a68da-6bac-49c6-a325-8f2f979daf76",
+            "RECONCILE_ORPHAN_TASK_ID": "discover",
+            "RECONCILE_ORPHAN_MAP_INDEX": "-1",
+        }
+        frame = {
+            "outcome": "failed",
+            "evidence": ["receipt.json"],
+            "binding": {
+                "operation_id": common["RECONCILE_ORPHAN_OPERATION_ID"],
+                "task_id": "discover",
+                "map_index": -1,
+            },
+        }
+
+        def run_embedded(reported_stage: str) -> dict:
+            captured.clear()
+            environment = {**common, "RECONCILE_REPORTED_STAGE": reported_stage}
+            with (
+                mock.patch.dict(sys.modules, {"description_pipeline.platform.store": fake_store}),
+                mock.patch.dict(os.environ, environment, clear=False),
+                contextlib.redirect_stdout(standard_io.StringIO()),
+            ):
+                exec(compile(script, "<operatorctl-platform-reconcile>", "exec"), {"__name__": "__main__"})
+            return dict(captured["reconcile"])
+
+        classic = run_embedded("")
+        reported = run_embedded("freeze")
+        self.assertNotIn("reported_stage", classic)
+        self.assertEqual(reported["reported_stage"], "freeze")
+        self.assertEqual(classic["params_digest"], io.digest(frame))
+        self.assertEqual(
+            reported["params_digest"],
+            io.digest({**frame, "reported_stage": "freeze"}),
+        )
+        self.assertNotEqual(classic["params_digest"], reported["params_digest"])
+
     def test_unpause_failure_does_not_start_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, admission, order, control = self._admission_fixture(Path(tmp), unpause_rc=7)
