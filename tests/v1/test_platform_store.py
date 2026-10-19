@@ -312,7 +312,7 @@ class FakeCursor:
                 state = world.run_states.get(entry[0])
                 self._rows = [(state, entry[1], entry[2], entry[3], entry[4])]
         elif normalized.startswith(
-            "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at"
+            "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at, updated_at"
             " FROM stage WHERE run_id = %s"
         ):
             self._rows = [
@@ -323,6 +323,7 @@ class FakeCursor:
                     record[2],
                     record[3] if len(record) > 3 else None,
                     record[4] if len(record) > 4 else None,
+                    record[5] if len(record) > 5 else NOW,
                 )
                 for (run_id, stage), record in world.stages.items()
                 if run_id == params[0]
@@ -2369,6 +2370,7 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(stages["generate"]["state"], "completed")
         self.assertEqual(stages["generate"]["checkpoint_uri"], CHECKPOINT)
         self.assertEqual(stages["generate"]["receipt"]["stage"], "generate")
+        self.assertIsNotNone(stages["generate"]["updated_at"])
         self.assertIsNone(self.store.run_record("absent"))
 
     def test_confirmed_stage_returns_sealed_receipts_or_refuses(self) -> None:

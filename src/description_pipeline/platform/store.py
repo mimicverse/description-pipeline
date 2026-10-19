@@ -597,7 +597,8 @@ _READ_REQUEST_RECORD = (
     " FROM request WHERE request_id = %s"
 )
 _READ_STAGE_RECORDS = (
-    "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at FROM stage WHERE run_id = %s"
+    "SELECT stage, state, receipt, checkpoint_uri, reused_from_run, original_executed_at, updated_at "
+    "FROM stage WHERE run_id = %s"
 )
 _CONFIRMED_PUBLISH = "SELECT 1 FROM operation WHERE run_id = %s AND kind = 'publish' AND state = 'succeeded' LIMIT 1"
 _READ_STAGE_ROW = "SELECT state, receipt, checkpoint_uri, reused_from_run FROM stage WHERE run_id = %s AND stage = %s"
@@ -3596,6 +3597,7 @@ class PlatformStore:
                 "checkpoint_uri": row[3],
                 "reused_from_run": row[4],
                 "original_executed_at": row[5],
+                "updated_at": row[6],
             }
             for row in rows
         }

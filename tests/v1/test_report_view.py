@@ -304,6 +304,21 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(failure["title"], "Stage failed (cause undetermined)")
         self.assertEqual(failure["kind"], "unknown")
 
+    def test_link_group_payload_failure_has_a_specific_native_explanation(self) -> None:
+        job = passed_job()
+        job["status"] = "failed"
+        job["events"] = protocol_events(subject=SHA, failed_stage="capture")
+        job["error"] = "PipelineError: the link group payload echoes another selection"
+        job["error_code"] = "cad_link_group_payload_invalid"
+        job["detail"] = {"body": "r_thigh_yaw"}
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["stage"], "capture")
+        self.assertEqual(failure["title"], "Native link-group mass read rejected")
+        self.assertEqual(failure["kind"], "runtime")
+        self.assertEqual(failure["error_code"], "cad_link_group_payload_invalid")
+        self.assertEqual(failure["raw_detail"], {"body": "r_thigh_yaw"})
+        self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
+
     def test_failed_summary_points_to_findings_and_never_blanks(self) -> None:
         from description_pipeline.orchestration.report_view import _failed_summary
 
