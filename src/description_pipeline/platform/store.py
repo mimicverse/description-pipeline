@@ -411,6 +411,33 @@ _CLAIM_OPERATION = (
     " WHERE operation_key = %s AND run_id = %s AND stage = %s AND state = 'queued'"
     " RETURNING operation_id, state, operation_key, params_digest, run_id, stage, kind"
 )
+_BIND_MISSING_DISPATCH = (
+    "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now()"
+    " WHERE operation_key = %s AND run_id = %s AND kind = 'dispatch' AND state = 'queued'"
+    " AND dag_id = %s AND dag_run_id = %s"
+    " AND task_id IS NULL AND map_index IS NULL"
+    " RETURNING operation_id"
+)
+_READ_OPERATION_BINDING = (
+    "SELECT operation_id, state, operation_key, params_digest, run_id, stage, kind,"
+    " dag_id, dag_run_id, task_id, map_index"
+    " FROM operation WHERE operation_key = %s FOR UPDATE"
+)
+_READ_RUN_DISPATCH_FOR_BINDING = (
+    "SELECT operation_id, stage, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+    " FROM operation WHERE run_id = %s AND kind = 'dispatch' FOR UPDATE"
+)
+_READ_DISPATCH_TASK_FACT = (
+    "SELECT ti.map_index, ti.state, ti.try_number, dr.state"
+    " FROM task_instance ti JOIN dag_run dr"
+    " ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id"
+    " WHERE ti.dag_id = %s AND ti.run_id = %s AND ti.task_id = %s"
+)
+_BIND_LEGACY_DISPATCH = (
+    "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND kind = 'dispatch'"
+    " AND task_id IS NULL AND map_index IS NULL RETURNING operation_id"
+)
 _SET_RUN_OUTCOME = (
     "UPDATE run SET state = %s, updated_at = now()"
     " WHERE run_id = %s AND state NOT IN ('succeeded', 'failed', 'cancelled')"
@@ -812,6 +839,17 @@ class PlatformStore:
             run_id=run_id, stage=stage, kind=kind, operation_key=operation_key, params_digest=params_digest
         )
         if existing is not None:
+            if kind == "dispatch":
+                with self._transaction() as connection:
+                    return self._register_operation_locked(
+                        connection,
+                        run_id=run_id,
+                        stage=stage,
+                        kind=kind,
+                        operation_key=operation_key,
+                        params_digest=params_digest,
+                        dispatch=dispatch or {},
+                    )
             return existing
         binding = self._rebind_predecessor(run_id=run_id, stage=stage, kind=kind)
         with self._transaction() as connection:
@@ -848,10 +886,47 @@ class PlatformStore:
         """
 
         cursor = connection.cursor()
-        cursor.execute(_FIND_OPERATION, (operation_key,))
-        row = cursor.fetchone()
+        if kind == "dispatch":
+            cursor.execute(_READ_OPERATION_BINDING, (operation_key,))
+            row = cursor.fetchone()
+        else:
+            cursor.execute(_FIND_OPERATION, (operation_key,))
+            row = cursor.fetchone()
         if row is not None:
-            return _matching_operation(row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest)
+            if kind != "dispatch":
+                return _matching_operation(
+                    row, run_id=run_id, stage=stage, kind=kind, params_digest=params_digest
+                )
+            existing = _matching_operation(
+                row[:7], run_id=run_id, stage=stage, kind=kind, params_digest=params_digest
+            )
+            if kind != "dispatch" or not dispatch:
+                return existing
+            task_id = dispatch.get("task_id")
+            map_index = dispatch.get("map_index")
+            if (
+                dispatch.get("dag_id") != row[7]
+                or dispatch.get("dag_run_id") != row[8]
+                or not isinstance(task_id, str)
+                or not task_id
+                or task_id != operation_key.rsplit("/", 1)[-1].split(":", 1)[0]
+                or type(map_index) is not int
+                or map_index < -1
+            ):
+                raise OperationConflictError("The duplicate dispatch registration names a different Airflow binding")
+            if row[9] is not None or row[10] is not None:
+                if (row[9], row[10]) == (task_id, map_index):
+                    return existing
+                raise OperationConflictError("The dispatch intent is already bound to another Airflow task")
+            if existing.state != "queued":
+                raise PlatformStoreError("Only a queued dispatch intent can accept its first task binding")
+            cursor.execute(
+                _BIND_MISSING_DISPATCH,
+                (task_id, map_index, operation_key, run_id, row[7], row[8]),
+            )
+            if cursor.fetchone() is None:
+                raise PlatformStoreError("The dispatch binding lost its operation to another writer")
+            return existing
         if stage not in STAGE_IDS:
             raise PlatformStoreError(f"The stage must be one of {tuple(STAGE_IDS)}: {stage!r}")
         self._guard_domain(connection, run_id=run_id, stage=stage, kind=kind, claiming=False)
@@ -1260,6 +1335,19 @@ class PlatformStore:
                         ):
                             # The same operation, evidence, binding, native identity and outcome
                             # repeated: return the recorded result and change nothing.
+                            if (
+                                stage == "discover"
+                                and isinstance(stored_receipt, dict)
+                                and stored_receipt.get("reported_stage") == "freeze"
+                                and stored_receipt.get("actual_stage") == "discover"
+                            ):
+                                self._bind_legacy_dispatch_freeze(
+                                    connection,
+                                    cursor,
+                                    run_id=run_id,
+                                    receipt=receipt,
+                                    reconcile=reconcile,
+                                )
                             return
                     raise PlatformStoreError(
                         f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
@@ -1905,35 +1993,6 @@ class PlatformStore:
         if native_run != native_run_id(dag_run_id):
             raise PlatformStoreError("The native receipt names another run's endpoint job")
 
-        cursor.execute(_READ_RUN_RECORD, (run_id,))
-        run_record = cursor.fetchone()
-        if run_record is None or not isinstance(run_record[1], str) or not run_record[1]:
-            raise PlatformStoreError("The bound native recovery cannot resolve its admitted request")
-        cursor.execute(_READ_REQUEST_RECORD, (run_record[1],))
-        request_row = cursor.fetchone()
-        if request_row is None:
-            raise PlatformStoreError("The bound native recovery cannot read its admitted request")
-        request_main = request_row[2]
-        baseline = request_row[6]
-        request_files = receipt.get("request_upload_files")
-        if not isinstance(request_main, str) or not request_main:
-            raise PlatformStoreError("The admitted request carries no main assembly")
-        if receipt.get("request_main_assembly") != request_main:
-            raise PlatformStoreError("The native receipt's main assembly differs from the admitted request")
-        if not isinstance(baseline, dict):
-            raise PlatformStoreError("The admitted request carries no frozen baseline")
-        if (
-            not isinstance(request_files, dict)
-            or any(not isinstance(name, str) or not _is_sha256(value) for name, value in request_files.items())
-            or request_main not in request_files
-            or receipt.get("selection_files") != request_files
-            or digest(request_files) != baseline.get("handoff_sha256")
-            or baseline.get("files") != len(request_files)
-            or receipt.get("request_upload_sha256") != baseline.get("handoff_sha256")
-            or receipt.get("selection_upload_sha256") != baseline.get("handoff_sha256")
-        ):
-            raise PlatformStoreError("The native receipt's upload identity differs from the admitted request")
-
         cursor.execute(_READ_STAGE_RECORDS, (run_id,))
         stage_rows = cursor.fetchall()
         if len(stage_rows) != 1 or stage_rows[0][0] != "freeze" or stage_rows[0][1] != "completed":
@@ -1978,8 +2037,12 @@ class PlatformStore:
             definition=definition,
             root=sealed_root,
         )
-        if freeze_receipt.get("handoff_sha256") != baseline.get("handoff_sha256"):
-            raise PlatformStoreError("The completed freeze receipt differs from the admitted upload identity")
+        self._verify_dispatch_request_identity(
+            cursor,
+            run_id=run_id,
+            receipt=receipt,
+            freeze_receipt=freeze_receipt,
+        )
 
         cursor.execute(_READ_ADMITTED_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id))
         facts = cursor.fetchall()
@@ -2061,6 +2124,144 @@ class PlatformStore:
         )
         self._stage_outcome(connection, run_id=run_id, stage="discover", state="failed")
         cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
+        self._bind_legacy_dispatch_freeze(
+            connection,
+            cursor,
+            run_id=run_id,
+            receipt=receipt,
+            reconcile=reconcile,
+        )
+
+    def _verify_dispatch_request_identity(
+        self, cursor, *, run_id: str, receipt: dict, freeze_receipt: dict
+    ) -> None:
+        """The shared immutable request/upload and direct-freeze identity check."""
+
+        cursor.execute(_READ_RUN_RECORD, (run_id,))
+        run_record = cursor.fetchone()
+        if run_record is None or not isinstance(run_record[1], str) or not run_record[1]:
+            raise PlatformStoreError("The recovery cannot resolve its admitted request")
+        cursor.execute(_READ_REQUEST_RECORD, (run_record[1],))
+        request_row = cursor.fetchone()
+        if request_row is None:
+            raise PlatformStoreError("The recovery cannot read its admitted request")
+        baseline = request_row[6]
+        request_files = receipt.get("request_upload_files")
+        if (
+            not isinstance(baseline, dict)
+            or not isinstance(request_row[2], str)
+            or not request_row[2]
+            or receipt.get("request_main_assembly") != request_row[2]
+            or receipt.get("request_upload_sha256") != baseline.get("handoff_sha256")
+            or not isinstance(request_files, dict)
+            or any(not isinstance(name, str) or not _is_sha256(value) for name, value in request_files.items())
+            or len(request_files) != baseline.get("files")
+            or digest(request_files) != baseline.get("handoff_sha256")
+            or receipt.get("selection_files") != request_files
+            or request_row[2] not in request_files
+            or receipt.get("selection_upload_sha256") != baseline.get("handoff_sha256")
+            or freeze_receipt.get("handoff_sha256") != baseline.get("handoff_sha256")
+        ):
+            raise PlatformStoreError("The recovery receipt does not match the admitted request")
+
+    def _bind_legacy_dispatch_freeze(self, connection, cursor, *, run_id: str, receipt: dict, reconcile: dict) -> None:
+        """Repair the one legacy freeze dispatch whose task key is missing."""
+
+        cursor.execute(_READ_RUN_DISPATCH_FOR_BINDING, (run_id,))
+        rows = cursor.fetchall()
+        if len(rows) != 1:
+            raise PlatformStoreError("The run does not carry exactly one dispatch intent")
+        operation_id, stage, op_state, dag_id, dag_run_id, bound_task, bound_map, operation_key = rows[0]
+        target = operation_key.rsplit("/", 1)[-1].split(":", 1)[0]
+        if stage != "freeze" or target != "freeze" or op_state != "succeeded":
+            raise PlatformStoreError("The legacy dispatch is not the settled freeze intent")
+        if not isinstance(dag_id, str) or not dag_id or not isinstance(dag_run_id, str) or not dag_run_id:
+            raise PlatformStoreError("The legacy dispatch lacks its DagRun identity")
+        if native_run_id(dag_run_id) != run_id:
+            raise PlatformStoreError("The legacy dispatch DagRun does not derive this platform run")
+        already_bound = (bound_task, bound_map) == ("freeze", -1)
+        if (bound_task is not None or bound_map is not None) and not already_bound:
+            raise PlatformStoreError("The legacy dispatch is already bound to another Airflow task")
+        if not already_bound:
+            cursor.execute(_LOCK_ADMISSION)
+            admission = cursor.fetchone()
+            if admission is None or admission[0] != "closed":
+                raise PlatformStoreError("A legacy dispatch binding requires a closed admission")
+        cursor.execute(_READ_STAGE_ROW, (run_id, "freeze"))
+        freeze = cursor.fetchone()
+        if freeze is None or freeze[0] != "completed":
+            raise PlatformStoreError("The legacy dispatch has no completed freeze")
+        freeze_receipt = _stored_receipt(freeze)
+        checkpoint = freeze[2]
+        reused = freeze[3] if len(freeze) > 3 else None
+        if (
+            not isinstance(freeze_receipt, dict)
+            or reused is not None
+            or checkpoint != f"store://sealed/{run_id}/freeze"
+        ):
+            raise PlatformStoreError("The legacy dispatch freeze checkpoint is not the direct run checkpoint")
+        self._verify_checkpoint_scope(checkpoint, run_id=run_id, stage="freeze", reused_from_run=None)
+        try:
+            definition, sealed_root = self._verify_sealed(checkpoint, freeze_receipt)
+        except PipelineError as error:
+            raise PlatformStoreError("The legacy dispatch sealed freeze cannot be verified") from error
+        _sealed_receipt(
+            freeze_receipt,
+            run_id=run_id,
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=checkpoint,
+            definition=definition,
+            root=sealed_root,
+        )
+        self._verify_dispatch_request_identity(
+            cursor,
+            run_id=run_id,
+            receipt=receipt,
+            freeze_receipt=freeze_receipt,
+        )
+        cursor.execute(_READ_ORPHAN_LIFECYCLE, (operation_id, f"{dag_id}/{dag_run_id}"))
+        lifecycle = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        task = lifecycle.get("scheduling")
+        dag_run = lifecycle.get("dag_run")
+        cursor.execute(_READ_DISPATCH_TASK_FACT, (dag_id, dag_run_id, "freeze"))
+        fact = cursor.fetchall()
+        expected_task = ("success", "terminal") if already_bound else (None, "unknown")
+        if task != expected_task or len(fact) != 1:
+            raise PlatformStoreError("The legacy dispatch task key is not uniquely provable")
+        map_index, task_state, try_number, dag_run_state = fact[0]
+        if (
+            map_index != -1
+            or dag_run != ("failed", "terminal")
+            or task_state != "success"
+            or dag_run_state != "failed"
+        ):
+            raise PlatformStoreError("The legacy dispatch has no successful freeze under a failed DagRun")
+        if already_bound:
+            return
+        cursor.execute(_BIND_LEGACY_DISPATCH, ("freeze", -1, operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The legacy dispatch binding lost its operation to another writer")
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage="freeze",
+            kind="binding",
+            operation_id=operation_id,
+            payload={
+                "binding_kind": "dispatch",
+                "operation_key": operation_key,
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": "freeze",
+                "map_index": -1,
+                "try_number": try_number,
+                "task_state": task_state,
+                "dag_run_state": dag_run_state,
+                "native_receipt_sha256": receipt.get("native_receipt_sha256"),
+                "evidence": reconcile.get("evidence"),
+            },
+        )
 
     def _stage_outcome(self, connection, *, run_id: str, stage: str, state: str) -> None:
         """The run-terminal transition a stage record concludes, in the same transaction.

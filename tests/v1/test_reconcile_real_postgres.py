@@ -19,6 +19,7 @@ transaction, not a production-side reconciliation.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -124,6 +125,10 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             session.commit()
         self.log = self._write_log(try_number=3)
         self.reconcile = self._reconcile(self.log)
+
+    def tearDown(self) -> None:
+        with contextlib.suppress(Exception):
+            self.store.open_admission(reason="test cleanup", actor="reconcile-test")
 
     def _write_log(self, *, try_number: int, run_id: str | None = None) -> Path:
         path = self.evidence / f"failure-{try_number}-{uuid.uuid4().hex[:8]}.log"
@@ -478,6 +483,240 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                     )
                 self.assertEqual(self._bound_rows(), before, "unsealed or changed freeze performs zero writes")
 
+    def test_bound_native_reconcile_repairs_the_legacy_freeze_dispatch_binding(self) -> None:
+        self._prepare_bound_native_discover()
+        import psycopg2
+        from description_pipeline.platform.store import PlatformStoreError
+
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE operation SET task_id=NULL, map_index=NULL"
+                " WHERE run_id=%s AND kind='dispatch'",
+                (self.run_id,),
+            )
+            connection.commit()
+        self.store.close_admission(reason="legacy dispatch proof", actor="reconcile-test")
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self.bound_reconcile,
+        )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT task_id, map_index FROM operation WHERE run_id=%s AND kind='dispatch'",
+                (self.run_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("freeze", -1))
+            cursor.execute(
+                "SELECT bucket FROM lifecycle_projection WHERE run_id=%s",
+                (self.run_id,),
+            )
+            self.assertEqual({row[0] for row in cursor.fetchall()}, {"terminal"})
+            cursor.execute(
+                "SELECT count(*) FROM run_event WHERE run_id=%s AND kind='binding'"
+                " AND payload->>'binding_kind'='dispatch'",
+                (self.run_id,),
+            )
+            self.assertEqual(cursor.fetchone()[0], 1)
+        before = self._bound_rows()
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE operation SET task_id=NULL, map_index=NULL"
+                " WHERE run_id=%s AND kind='dispatch'",
+                (self.run_id,),
+            )
+            connection.commit()
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self.bound_reconcile,
+        )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT task_id, map_index FROM operation WHERE run_id=%s AND kind='dispatch'",
+                (self.run_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("freeze", -1))
+        before = self._bound_rows()
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self.bound_reconcile,
+        )
+        self.assertEqual(self._bound_rows(), before, "the repeated legacy repair is a no-op")
+        sealed_file = self.sealed_root / "input" / self.main_assembly
+        original = sealed_file.read_bytes()
+        sealed_file.write_bytes(original + b"corrupt")
+        try:
+            with self.assertRaises(PlatformStoreError):
+                self.store.confirm_stage(
+                    run_id=self.run_id,
+                    stage="discover",
+                    state="failed",
+                    reconcile=self.bound_reconcile,
+                )
+        finally:
+            sealed_file.write_bytes(original)
+        self.assertEqual(self._bound_rows(), before, "a changed sealed freeze is refused with zero writes")
+        changed_log = self.log.with_name("changed-" + self.log.name)
+        changed_log.write_bytes(self.log.read_bytes() + b"\n")
+        conflicting = dict(self.bound_reconcile)
+        conflicting["evidence"] = [str(changed_log)]
+        with self.assertRaises(PlatformStoreError):
+            self.store.confirm_stage(
+                run_id=self.run_id,
+                stage="discover",
+                state="failed",
+                reconcile=conflicting,
+            )
+        self.assertEqual(self._bound_rows(), before, "changed repair evidence is refused with zero writes")
+
+    def test_legacy_dispatch_repair_refuses_unproven_airflow_identity(self) -> None:
+        from description_pipeline.platform.store import PlatformStoreError
+
+        variants = (
+            ("missing_dag_run", "UPDATE operation SET dag_run_id='missing-run' WHERE run_id=%s AND kind='dispatch'"),
+            ("wrong_dag", "UPDATE operation SET dag_id='another-dag' WHERE run_id=%s AND kind='dispatch'"),
+            (
+                "wrong_target",
+                "UPDATE operation SET operation_key=replace(operation_key, '/freeze:0', '/discover:0')"
+                " WHERE run_id=%s AND kind='dispatch'",
+            ),
+            ("operation_failed", "UPDATE operation SET state='failed' WHERE run_id=%s AND kind='dispatch'"),
+            ("extra_mapped_freeze", None),
+        )
+        import psycopg2
+
+        for name, sql in variants:
+            with self.subTest(name=name):
+                self._prepare_bound_native_discover()
+                with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE operation SET task_id=NULL, map_index=NULL"
+                        " WHERE run_id=%s AND kind='dispatch'",
+                        (self.run_id,),
+                    )
+                    if sql is None:
+                        from airflow.models.taskinstance import TaskInstance
+                        from airflow.settings import Session
+
+                        with Session() as session:
+                            session.execute(
+                                TaskInstance.__table__.insert().values(
+                                    dag_id=DAG_ID,
+                                    run_id=self.dag_run_id,
+                                    task_id="freeze",
+                                    map_index=0,
+                                    state="success",
+                                    try_number=1,
+                                    pool="default_pool",
+                                    pool_slots=1,
+                                )
+                            )
+                            session.commit()
+                    else:
+                        cursor.execute(sql, (self.run_id,))
+                    if name == "wrong_target":
+                        cursor.execute(
+                            "SELECT operation_key FROM operation WHERE run_id=%s AND kind='dispatch'",
+                            (self.run_id,),
+                        )
+                        self.assertTrue(cursor.fetchone()[0].endswith("/discover:0"))
+                    connection.commit()
+                self.store.close_admission(reason="legacy dispatch proof", actor="reconcile-test")
+                before = self._bound_rows()
+                with self.assertRaises(PlatformStoreError):
+                    self.store.confirm_stage(
+                        run_id=self.run_id,
+                        stage="discover",
+                        state="failed",
+                        reconcile=self.bound_reconcile,
+                    )
+                self.assertEqual(self._bound_rows(), before, "unproven dispatch identity performs zero writes")
+
+    def test_replay_legacy_dispatch_repair_rechecks_admitted_identity(self) -> None:
+        from description_pipeline.platform.store import PlatformStoreError
+        import psycopg2
+
+        variants = (
+            (
+                "freeze_handoff_mismatch",
+                "UPDATE stage SET receipt=jsonb_set(receipt, '{handoff_sha256}', to_jsonb(%s::text))"
+                " WHERE run_id=%s AND stage='freeze'",
+            ),
+            (
+                "request_main_mismatch",
+                "UPDATE request SET main_assembly='other.SLDASM' WHERE request_id=%s",
+            ),
+            (
+                "request_file_count_mismatch",
+                "UPDATE request SET baseline=jsonb_set(baseline, '{files}', to_jsonb(999))"
+                " WHERE request_id=%s",
+            ),
+        )
+        for name, sql in variants:
+            with self.subTest(name=name):
+                self._prepare_bound_native_discover()
+                with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE operation SET task_id=NULL, map_index=NULL"
+                        " WHERE run_id=%s AND kind='dispatch'",
+                        (self.run_id,),
+                    )
+                    self.assertEqual(cursor.rowcount, 1)
+                    connection.commit()
+                self.store.close_admission(reason="legacy replay identity proof", actor="reconcile-test")
+                self.store.confirm_stage(
+                    run_id=self.run_id,
+                    stage="discover",
+                    state="failed",
+                    reconcile=self.bound_reconcile,
+                )
+                with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE operation SET task_id=NULL, map_index=NULL"
+                        " WHERE run_id=%s AND kind='dispatch'",
+                        (self.run_id,),
+                    )
+                    self.assertEqual(cursor.rowcount, 1)
+                    if name == "freeze_handoff_mismatch":
+                        params = ("0" * 64, self.run_id)
+                    else:
+                        params = (f"portal-{self.dag_run_id}",)
+                    cursor.execute(sql, params)
+                    self.assertEqual(cursor.rowcount, 1)
+                    if name == "freeze_handoff_mismatch":
+                        cursor.execute(
+                            "SELECT receipt->>'handoff_sha256' FROM stage WHERE run_id=%s AND stage='freeze'",
+                            (self.run_id,),
+                        )
+                        self.assertEqual(cursor.fetchone()[0], "0" * 64)
+                    elif name == "request_main_mismatch":
+                        cursor.execute(
+                            "SELECT main_assembly FROM request WHERE request_id=%s",
+                            (f"portal-{self.dag_run_id}",),
+                        )
+                        self.assertEqual(cursor.fetchone()[0], "other.SLDASM")
+                    else:
+                        cursor.execute(
+                            "SELECT baseline->>'files' FROM request WHERE request_id=%s",
+                            (f"portal-{self.dag_run_id}",),
+                        )
+                        self.assertEqual(cursor.fetchone()[0], "999")
+                    connection.commit()
+                before = self._bound_rows()
+                with self.assertRaises(PlatformStoreError):
+                    self.store.confirm_stage(
+                        run_id=self.run_id,
+                        stage="discover",
+                        state="failed",
+                        reconcile=self.bound_reconcile,
+                    )
+                self.assertEqual(self._bound_rows(), before, "identity mismatch performs zero writes")
+
     def test_freeze_intent_closes_atomically_and_replays_without_writes(self) -> None:
         self.store.confirm_stage(
             run_id=self.run_id,
@@ -559,6 +798,77 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                 reconcile=self._reconcile(earlier),
             )
         self.assertEqual(self._rows(), before)
+
+    def test_duplicate_registration_binds_the_initial_dispatch_intent(self) -> None:
+        operation_key = f"portal-{self.dag_run_id}/freeze:0"
+        from description_pipeline.platform.store import OperationConflictError
+
+        with self.assertRaises(OperationConflictError):
+            self.store.register_operation(
+                run_id=self.run_id,
+                stage="freeze",
+                kind="dispatch",
+                operation_key=operation_key,
+                params_digest="a" * 64,
+                dispatch={
+                    "dag_id": DAG_ID,
+                    "dag_run_id": "another-run",
+                    "task_id": "freeze",
+                    "map_index": -1,
+                },
+            )
+        with self.assertRaises(OperationConflictError):
+            self.store.register_operation(
+                run_id=self.run_id,
+                stage="freeze",
+                kind="dispatch",
+                operation_key=operation_key,
+                params_digest="a" * 64,
+                dispatch={
+                    "dag_id": DAG_ID,
+                    "dag_run_id": self.dag_run_id,
+                    "task_id": "discover",
+                    "map_index": -1,
+                },
+            )
+        import psycopg2
+
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute("UPDATE operation SET task_id='freeze' WHERE operation_key=%s", (operation_key,))
+            connection.commit()
+        with self.assertRaises(OperationConflictError):
+            self.store.register_operation(
+                run_id=self.run_id,
+                stage="freeze",
+                kind="dispatch",
+                operation_key=operation_key,
+                params_digest="a" * 64,
+                dispatch={
+                    "dag_id": DAG_ID,
+                    "dag_run_id": self.dag_run_id,
+                    "task_id": "freeze",
+                    "map_index": -1,
+                },
+            )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute("UPDATE operation SET task_id=NULL, map_index=NULL WHERE operation_key=%s", (operation_key,))
+            connection.commit()
+        self.store.register_operation(
+            run_id=self.run_id,
+            stage="freeze",
+            kind="dispatch",
+            operation_key=operation_key,
+            params_digest="a" * 64,
+            dispatch={
+                "dag_id": DAG_ID,
+                "dag_run_id": self.dag_run_id,
+                "task_id": "freeze",
+                "map_index": -1,
+            },
+        )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT task_id, map_index FROM operation WHERE operation_key=%s", (operation_key,))
+            self.assertEqual(cursor.fetchone(), ("freeze", -1))
 
     def test_a_log_from_another_dag_run_is_refused_with_zero_writes(self) -> None:
         foreign = self._write_log(try_number=3, run_id="portal-foreign-run")
