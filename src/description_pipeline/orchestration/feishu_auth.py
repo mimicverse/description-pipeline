@@ -87,11 +87,11 @@ STATE_COOKIE_PATH = f"{AUTH_MANAGER_FASTAPI_APP_PREFIX}/feishu"
 def _login_page(message: str, status_code: int) -> HTMLResponse:
     """A fixed, escaped-by-construction sign-in failure page; no request data is interpolated."""
     body = (
-        '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
-        "<title>飞书登录</title></head><body>"
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        "<title>Feishu sign-in</title></head><body>"
         '<main style="font-family:system-ui;max-width:32rem;margin:15vh auto;line-height:1.7">'
-        f'<h1 style="font-size:1.2rem">飞书登录未完成</h1><p>{message}</p>'
-        '<p><a href="/">返回操作平台</a></p></main></body></html>'
+        f'<h1 style="font-size:1.2rem">Feishu sign-in did not complete</h1><p>{message}</p>'
+        '<p><a href="/">Return to the operator portal</a></p></main></body></html>'
     )
     return HTMLResponse(body, status_code=status_code)
 
@@ -318,21 +318,33 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             error: str | None = None,
         ) -> Response:
             if self.settings is None or self._state is None:
-                return _login_page("本部署尚未配置飞书企业应用。", status.HTTP_503_SERVICE_UNAVAILABLE)
+                return _login_page(
+                    "This deployment has no Feishu enterprise application configured.",
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
             if error:
-                return _login_page("已取消飞书授权，请重新发起登录。", status.HTTP_400_BAD_REQUEST)
+                return _login_page(
+                    "Feishu authorization was cancelled; start sign-in again.", status.HTTP_400_BAD_REQUEST
+                )
             if not code or not state or not state_cookie_matches(request.cookies.get(STATE_COOKIE), state):
-                return _login_page("登录状态校验失败，请重新发起飞书登录。", status.HTTP_400_BAD_REQUEST)
+                return _login_page(
+                    "Sign-in state validation failed; start Feishu sign-in again.", status.HTTP_400_BAD_REQUEST
+                )
             consumed = self._state.consume(state)
             if consumed is None:
-                return _login_page("登录状态已过期或已使用，请重新登录。", status.HTTP_400_BAD_REQUEST)
+                return _login_page(
+                    "Sign-in state expired or was already used; sign in again.", status.HTTP_400_BAD_REQUEST
+                )
             try:
                 token = exchange_code(self.settings, code, consumed)
                 identity = fetch_identity(self.settings, token)
                 user = self._user(identity)
             except FeishuAuthError as failure:
                 log.warning("Feishu sign-in refused: %s", failure)
-                return _login_page("飞书登录未通过，请联系管理员核对企业应用配置。", status.HTTP_403_FORBIDDEN)
+                return _login_page(
+                    "Feishu sign-in failed; contact an administrator to verify the enterprise application.",
+                    status.HTTP_403_FORBIDDEN,
+                )
             response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
             response.set_cookie(
                 COOKIE_NAME_JWT_TOKEN,

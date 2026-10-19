@@ -53,63 +53,63 @@ const state = {
 };
 
 const RUN_STATES = {
-  queued: "排队中",
-  running: "运行中",
-  success: "成功",
-  failed: "失败",
+  queued: "Queued",
+  running: "Running",
+  success: "Succeeded",
+  failed: "Failed",
 };
 const TASK_STATES = {
-  success: "成功",
-  failed: "失败",
-  running: "运行中",
-  queued: "排队",
-  scheduled: "已调度",
-  up_for_retry: "等待重试",
-  up_for_reschedule: "等待重排",
-  upstream_failed: "上游失败",
-  skipped: "跳过",
-  deferred: "等待",
-  none: "待执行",
-  completed: "完成",
+  success: "Succeeded",
+  failed: "Failed",
+  running: "Running",
+  queued: "Queued",
+  scheduled: "Scheduled",
+  up_for_retry: "Waiting to retry",
+  up_for_reschedule: "Waiting to reschedule",
+  upstream_failed: "Upstream failed",
+  skipped: "Skipped",
+  deferred: "Deferred",
+  none: "Not started",
+  completed: "Completed",
 };
 const TASK_LABELS = {
-  freeze: "冻结输入",
-  discover: "解析结构",
-  capture: "采集证据",
-  generate: "生成 URDF",
-  verify: "独立验证",
-  publish: "提交评审 PR",
+  freeze: "Freeze inputs",
+  discover: "Discover structure",
+  capture: "Capture evidence",
+  generate: "Generate URDF",
+  verify: "Independent verification",
+  publish: "Publish review PR",
 };
-const CHECK_STATES = { passed: "通过", failed: "失败", not_run: "未执行", unsupported: "不支持" };
-const STAGE_STATES = { not_run: "未执行", running: "执行中", completed: "完成", failed: "失败", blocked: "上游阻断" };
+const CHECK_STATES = { passed: "Passed", failed: "Failed", not_run: "Not run", unsupported: "Unsupported" };
+const STAGE_STATES = { not_run: "Not run", running: "Running", completed: "Completed", failed: "Failed", blocked: "Upstream blocked" };
 // Compact state words for the stepper; the full reason stays in the tooltip.
-const STEP_STATE_SHORT = { completed: "已完成", running: "进行中", failed: "失败", blocked: "已阻断", not_run: "未执行" };
-const PREREQ_STATE_ZH = { ok: "就绪", invalid: "不可用", absent: "缺失", changed: "已变更", unknown: "未知" };
+const STEP_STATE_SHORT = { completed: "Completed", running: "Running", failed: "Failed", blocked: "Blocked", not_run: "Not run" };
+const PREREQ_STATE = { ok: "ready", invalid: "unavailable", absent: "missing", changed: "changed", unknown: "unknown" };
 const AUTOMATIC_STATES = {
-  passed: "自动校验通过",
-  failed: "自动校验失败",
-  unverified: "未通过独立校验",
-  pending: "等待自动检查",
-  queued: "排队中",
-  running: "检查中",
+  passed: "Automatic checks passed",
+  failed: "Automatic checks failed",
+  unverified: "Independent verification failed",
+  pending: "Waiting for automatic checks",
+  queued: "Queued",
+  running: "Checking",
 };
 const RETRY_REASONS = {
-  temporary_disconnection: "继续原作业，不重新采集 CAD。",
-  evidence_corruption: "捕获证据已封存：恢复只重读封存证据，不重采 CAD。",
-  engineering_terminal_failure: "工程阶段已终态失败：请按检查结果修复后新建关联运行。",
-  publication_response_unknown: "发布响应未知：请先完成结果对账，不可原地重试。",
-  run_active: "运行尚未结束。",
-  run_succeeded: "运行已成功。",
-  run_missing: "该运行已不存在，请刷新运行列表。",
-  admission_failed: "原输入未完成冻结，请查看问题并新建运行。",
-  unknown_failed_task: "无法确认可恢复的任务，请联系平台维护人员。",
-  no_failed_operation: "没有失败的操作可恢复，请查看问题与发现。",
-  native_terminal_failure: "原作业已终止；可查看检查结果后新建关联运行。",
-  native_evidence_unavailable: "无法确认原生作业证据，稍后再试。",
-  sealed_evidence_reimport: "捕获证据已封存：恢复只重读封存证据，不重采 CAD。",
-  portable_retry: "继续无副作用阶段，不重新采集 CAD。",
-  endpoint_evidence_unavailable: "无法确认原作业状态，稍后再试。",
-  deleted: "此运行已删除：请先恢复后再重试或重跑。",
+  temporary_disconnection: "Continue the original job without repeating CAD capture.",
+  evidence_corruption: "Capture evidence is sealed; recovery rereads sealed evidence without repeating CAD.",
+  engineering_terminal_failure: "An engineering stage failed terminally; fix the findings and start a linked run.",
+  publication_response_unknown: "Publication response is unknown; reconcile the result first, because in-place retry is not allowed.",
+  run_active: "The run has not finished.",
+  run_succeeded: "The run succeeded.",
+  run_missing: "The run no longer exists; refresh the run list.",
+  admission_failed: "The original input was not frozen; review the findings and start a new run.",
+  unknown_failed_task: "No recoverable task can be identified; contact platform maintenance.",
+  no_failed_operation: "No failed operation can be recovered; review the issues and findings.",
+  native_terminal_failure: "The original job terminated; review the checks and start a linked run.",
+  native_evidence_unavailable: "Native job evidence cannot be confirmed; retry later.",
+  sealed_evidence_reimport: "Capture evidence is sealed; recovery rereads sealed evidence without repeating CAD.",
+  portable_retry: "Continue side-effect-free stages without repeating CAD capture.",
+  endpoint_evidence_unavailable: "The original job state cannot be confirmed; retry later.",
+  deleted: "This run is deleted; restore it before retrying or rerunning.",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -142,7 +142,7 @@ function shortRunId(value) {
 
 function rerunStageName(rows, stageId) {
   const row = rows.find((item) => item && item.stage === stageId);
-  return row ? row.name_zh || row.stage : String(stageId || "");
+  return row ? row.name || row.stage : String(stageId || "");
 }
 
 function normalizeRelativePath(raw) {
@@ -169,7 +169,7 @@ function applyUploadLimits(advertised) {
   if (Number.isFinite(fileBytes) && fileBytes > 0) uploadLimits.maxFileBytes = Math.floor(fileBytes);
   const label = $("upload-limits");
   if (label) {
-    label.textContent = `总大小 ${formatBytes(uploadLimits.maxTotalBytes)}、文件数 ${uploadLimits.maxFiles}、单个文件 ${formatBytes(uploadLimits.maxFileBytes)}`;
+    label.textContent = `${formatBytes(uploadLimits.maxTotalBytes)} total, ${uploadLimits.maxFiles} files, ${formatBytes(uploadLimits.maxFileBytes)} per file`;
   }
 }
 
@@ -179,22 +179,22 @@ function folderPick(files) {
   let bytes = 0;
   for (const file of files) {
     const path = normalizeRelativePath(file.webkitRelativePath || file.name);
-    if (!path) return { error: `存在不受支持的文件名：${String(file.name || "").slice(0, 120)}` };
+    if (!path) return { error: `Unsupported filename: ${String(file.name || "").slice(0, 120)}` };
     const name = path.split("/").pop() || "";
     if (name.startsWith("~$")) {
-      return { error: "包含 ~$ 临时锁文件将拒绝上传：请关闭 SolidWorks 或删除这些文件后重试。" };
+      return { error: "Upload contains ~$ temporary lock files. Close SolidWorks or remove them before retrying." };
     }
     const first = path.split("/")[0];
     if (top === null) top = first;
-    if (first !== top) return { error: "所选内容来自多个顶层文件夹，请一次选择一个完整的工程文件夹。" };
+    if (first !== top) return { error: "The selection spans multiple top-level folders; select one complete engineering folder." };
     records.push({ file, path });
     bytes += file.size;
   }
-  if (!records.length || !top) return { error: "所选文件夹中没有可上传的文件。" };
-  if (records.length > uploadLimits.maxFiles) return { error: `文件数量超出上限（${uploadLimits.maxFiles}）。` };
-  if (bytes > uploadLimits.maxTotalBytes) return { error: `文件夹总大小超出上限（${formatBytes(uploadLimits.maxTotalBytes)}）。` };
+  if (!records.length || !top) return { error: "The selected folder contains no uploadable files." };
+  if (records.length > uploadLimits.maxFiles) return { error: `File count exceeds the ${uploadLimits.maxFiles}-file limit.` };
+  if (bytes > uploadLimits.maxTotalBytes) return { error: `Folder size exceeds the ${formatBytes(uploadLimits.maxTotalBytes)} limit.` };
   const oversized = records.find((item) => item.file.size > uploadLimits.maxFileBytes);
-  if (oversized) return { error: `单个文件超出上限（${formatBytes(uploadLimits.maxFileBytes)}）：${oversized.path.slice(0, 120)}` };
+  if (oversized) return { error: `A file exceeds the ${formatBytes(uploadLimits.maxFileBytes)} limit: ${oversized.path.slice(0, 120)}` };
   const prefix = `${top}/`;
   const assemblies = records
     .map((item) => item.path.slice(prefix.length))
@@ -226,21 +226,21 @@ function applyAssemblies(pick) {
   if (!assemblies.length) {
     select.hidden = true;
     note.hidden = false;
-    note.textContent = "所选文件夹中没有 .SLDASM，无法提交：请选择包含主装配的工程文件夹。";
+    note.textContent = "The selected folder contains no .SLDASM file; select a folder that contains the main assembly.";
     return;
   }
   if (assemblies.length === 1) {
     state.assemblyChoice = assemblies[0];
     select.hidden = true;
     note.hidden = false;
-    note.textContent = `主装配（自动）：${assemblies[0]}`;
+    note.textContent = `Main assembly (automatic): ${assemblies[0]}`;
     return;
   }
   select.hidden = false;
   note.hidden = true;
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = "请选择主装配…";
+  placeholder.textContent = "Select the main assembly...";
   placeholder.disabled = true;
   placeholder.selected = true;
   select.append(placeholder);
@@ -273,17 +273,17 @@ async function loadTargets(pick) {
     state.targetsRetryPick = pick;
     const failure = document.createElement("option");
     failure.value = "";
-    failure.textContent = "发布目标加载失败";
+    failure.textContent = "Failed to load publication targets";
     failure.disabled = true;
     failure.selected = true;
     select.append(failure);
     note.hidden = false;
     if (error.status === 401) {
-      note.textContent = "会话已失效，发布目标加载失败：请重新登录后再试。";
+      note.textContent = "The session expired and publication targets could not load; sign in again.";
       clearSession();
-      setError($("login-error"), "会话已失效，请重新登录后再试。");
+      setError($("login-error"), "The session expired; sign in again.");
     } else {
-      note.textContent = "发布目标加载失败：网络或服务异常，请重新选择文件夹后重试。";
+      note.textContent = "Publication targets could not load because the network or service failed; reselect the folder and retry.";
     }
     updateStartEnabled();
     return;
@@ -293,7 +293,7 @@ async function loadTargets(pick) {
   const placeholder = document.createElement("option");
   placeholder.value = "";
   // Success with configured:false lands here; a fetch failure never does (handled above).
-  placeholder.textContent = targets.length ? "请选择发布目标" : "平台未配置发布目标";
+  placeholder.textContent = targets.length ? "Select a publication target" : "No publication target is configured";
   select.append(placeholder);
   for (const item of targets) {
     const option = document.createElement("option");
@@ -304,7 +304,7 @@ async function loadTargets(pick) {
   if (payload.suggestion) {
     select.value = payload.suggestion;
     note.hidden = false;
-    note.textContent = `已按文件夹名匹配：${payload.suggestion}`;
+    note.textContent = `Matched from the folder name: ${payload.suggestion}`;
   } else {
     note.hidden = true;
     note.textContent = "";
@@ -341,19 +341,19 @@ function submitRun(pick, { onProgress } = {}) {
     if (state.assemblyChoice) form.append("main_assembly", state.assemblyChoice);
     const targetSelect = $("target-select");
     if (!targetSelect || !targetSelect.value) {
-      reject(new Error("发布目标为必填：请选择发布目标后重试"));
+      reject(new Error("Publication target is required"));
       return;
     }
     form.append("target_hardware", targetSelect.value);
     const purposeSelect = $("purpose-select");
     if (!purposeSelect || !purposeSelect.value) {
-      reject(new Error("用途为必填：请选择用途后重试"));
+      reject(new Error("Purpose is required"));
       return;
     }
     form.append("purpose", purposeSelect.value);
     const summaryInput = $("change-summary");
     if (!summaryInput || !summaryInput.value.trim()) {
-      reject(new Error("变更说明为必填：请填写后重试"));
+      reject(new Error("Change summary is required"));
       return;
     }
     form.append("change_summary", summaryInput.value.trim());
@@ -376,18 +376,18 @@ function submitRun(pick, { onProgress } = {}) {
         resolve(payload);
         return;
       }
-      const error = new Error(payload.error || `上传失败（HTTP ${request.status}）`);
+      const error = new Error(payload.error || `Upload failed (HTTP ${request.status})`);
       error.status = request.status;
       if (payload && payload.dag_run_id) error.dagRunId = String(payload.dag_run_id);
       reject(error);
     });
     request.addEventListener("error", () => {
-      const error = new Error("网络中断，上传响应未收到；如已提交成功，请在运行列表中确认，系统不会自动重试。");
+      const error = new Error("The network was interrupted before an upload response arrived. If the submission succeeded, confirm it in the run list; the system will not retry automatically.");
       error.network = true;
       reject(error);
     });
     request.addEventListener("abort", () => {
-      const error = new Error("已取消上传。");
+      const error = new Error("Upload cancelled.");
       error.aborted = true;
       reject(error);
     });
@@ -429,7 +429,7 @@ async function api(path, { method = "GET", body, signal } = {}) {
     }
   }
   if (!response.ok) {
-    const error = new Error(payload.error || `请求失败（HTTP ${response.status}）`);
+    const error = new Error(payload.error || `Request failed (HTTP ${response.status})`);
     error.status = response.status;
     error.payload = payload;
     throw error;
@@ -461,7 +461,7 @@ function expandable(parent, title) {
 function formatTime(value) {
   if (!value) return "—";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("en-US", { hour12: false });
 }
 
 function showSession(session) {
@@ -529,7 +529,7 @@ function clearSession() {
 
 function runDisplayTitle(run) {
   const custom = String(run.title || "").trim();
-  return custom || folderLabel(run.handoff_path) || "工程交付";
+  return custom || folderLabel(run.handoff_path) || "Engineering delivery";
 }
 
 function pad2(value) {
@@ -547,8 +547,8 @@ function formatRunTime(value) {
 
 function deleteBlockedReason(run) {
   if (run.state === "success" || run.state === "failed") return "";
-  if (run.state === "queued" || run.state === "running") return "运行结束前不能删除。";
-  return "运行状态未知，暂不能删除。";
+  if (run.state === "queued" || run.state === "running") return "This run cannot be deleted before it ends.";
+  return "Run state is unknown, so deletion is unavailable.";
 }
 
 function runsForView(runs, view) {
@@ -587,7 +587,7 @@ async function refreshRuns() {
     list.textContent = "";
     const item = document.createElement("li");
     item.className = "muted";
-    item.textContent = `运行列表不可用：${error.message}`;
+    item.textContent = `Run list unavailable: ${error.message}`;
     list.append(item);
   }
 }
@@ -603,7 +603,7 @@ async function loadMoreRuns() {
     state.runsNextOffset = typeof payload.next_offset === "number" ? payload.next_offset : null;
     setError($("runs-error"), "");
   } catch (error) {
-    setError($("runs-error"), error.message || "加载更多失败，请重试。");
+    setError($("runs-error"), error.message || "Failed to load more runs; retry.");
   } finally {
     state.runsLoadingMore = false;
     renderRunsList();
@@ -618,15 +618,15 @@ function renderRunsList() {
     const empty = document.createElement("li");
     empty.className = "muted";
     empty.textContent = state.runsNextOffset !== null
-      ? "当前已加载记录中没有可显示的运行，可继续加载更多。"
-      : state.runView === "deleted" ? "暂无已删除运行" : "暂无运行";
+      ? "No runs are visible in the loaded records; load more."
+      : state.runView === "deleted" ? "No deleted runs" : "No runs";
     list.append(empty);
   }
   for (const run of rows) list.append(buildRunItem(run));
   if (state.runsNextOffset !== null) {
     const footer = document.createElement("li");
     footer.className = "runs-footer";
-    const more = ghostButton(state.runsLoadingMore ? "正在加载…" : "加载更多");
+    const more = ghostButton(state.runsLoadingMore ? "Loading..." : "Load more");
     more.disabled = state.runsLoadingMore;
     more.addEventListener("click", () => {
       void loadMoreRuns();
@@ -636,7 +636,7 @@ function renderRunsList() {
   } else if (rows.length) {
     const footer = document.createElement("li");
     footer.className = "muted small runs-footer";
-    footer.textContent = "已显示全部";
+    footer.textContent = "All runs shown";
     list.append(footer);
   }
 }
@@ -652,21 +652,21 @@ function buildRunItem(run) {
   const heading = document.createElement("span");
   heading.className = "run-heading";
   heading.textContent = runDisplayTitle(run);
-  if (run.resume_from_name_zh) {
+  if (run.resume_from_name) {
     const chip = document.createElement("span");
     chip.className = "run-chip";
-    chip.textContent = `从${run.resume_from_name_zh}重跑`;
-    chip.title = `重跑来源：${run.parent_dag_run_id || "未记录"}`;
+    chip.textContent = `Rerun from ${run.resume_from_name}`;
+    chip.title = `Rerun source: ${run.parent_dag_run_id || "not recorded"}`;
     heading.append(chip);
   }
   const meta = document.createElement("span");
   meta.className = "run-meta-line";
-  const stateText = RUN_STATES[run.state] || run.state || "状态待确认";
-  meta.textContent = `${[formatRunTime(run.started_at), stateText].filter(Boolean).join(" · ")}\n发起人：${run.user || "未记录"}`;
+  const stateText = RUN_STATES[run.state] || run.state || "State unconfirmed";
+  meta.textContent = `${[formatRunTime(run.started_at), stateText].filter(Boolean).join(" · ")}\nInitiator: ${run.user || "not recorded"}`;
   open.append(heading, meta);
   open.title = [
     runDisplayTitle(run),
-    folderLabel(run.handoff_path) || "工程文件夹",
+    folderLabel(run.handoff_path) || "Engineering folder",
     formatTime(run.started_at),
     run.dag_run_id,
   ].join("\n");
@@ -676,7 +676,7 @@ function buildRunItem(run) {
     const tombstone = document.createElement("span");
     tombstone.className = "run-tombstone";
     tombstone.textContent =
-      `已删除 · ${formatRunTime(run.deleted_at) || "时间未记录"} · 删除人：${run.deleted_by || "未记录"}`;
+      `Deleted · ${formatRunTime(run.deleted_at) || "time not recorded"} · Deleted by: ${run.deleted_by || "not recorded"}`;
     box.append(tombstone);
   }
   if (run.can_manage === true) box.append(buildRunMenu(run));
@@ -693,7 +693,7 @@ function buildRunMenu(run) {
   trigger.type = "button";
   trigger.className = "ghost run-menu-trigger";
   trigger.textContent = "⋯";
-  trigger.setAttribute("aria-label", `操作：${runDisplayTitle(run)}`);
+  trigger.setAttribute("aria-label", `Actions: ${runDisplayTitle(run)}`);
   trigger.setAttribute("aria-haspopup", "true");
   trigger.setAttribute("aria-expanded", "false");
   const pop = document.createElement("div");
@@ -707,12 +707,12 @@ function buildRunMenu(run) {
   };
   const showMenu = () => {
     pop.textContent = "";
-    const rename = ghostButton("重命名");
+    const rename = ghostButton("Rename");
     rename.setAttribute("role", "menuitem");
     rename.addEventListener("click", showRename);
     pop.append(rename);
     if (run.deleted === true) {
-      const restore = ghostButton("恢复");
+      const restore = ghostButton("Restore");
       restore.setAttribute("role", "menuitem");
       restore.addEventListener("click", () => {
         close(false);
@@ -720,7 +720,7 @@ function buildRunMenu(run) {
       });
       pop.append(restore);
     } else {
-      const remove = ghostButton("删除");
+      const remove = ghostButton("Delete");
       remove.setAttribute("role", "menuitem");
       const blocked = deleteBlockedReason(run);
       if (blocked) {
@@ -744,16 +744,16 @@ function buildRunMenu(run) {
     input.type = "text";
     input.maxLength = 120;
     input.value = String(run.title || "");
-    input.placeholder = folderLabel(run.handoff_path) || "工程交付";
-    input.title = "留空并保存可恢复为工程文件夹名称；名称仅影响列表显示。";
-    input.setAttribute("aria-label", `重命名「${runDisplayTitle(run)}」`);
+    input.placeholder = folderLabel(run.handoff_path) || "Engineering delivery";
+    input.title = "Leave empty and save to restore the engineering folder name; the title affects list display only.";
+    input.setAttribute("aria-label", `Rename ${runDisplayTitle(run)}`);
     const buttons = document.createElement("div");
     buttons.className = "run-menu-buttons";
     const save = document.createElement("button");
     save.type = "submit";
     save.className = "ghost";
-    save.textContent = "保存";
-    const cancel = ghostButton("取消");
+    save.textContent = "Save";
+    const cancel = ghostButton("Cancel");
     cancel.addEventListener("click", showMenu);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -772,11 +772,11 @@ function buildRunMenu(run) {
     pop.textContent = "";
     const note = document.createElement("p");
     note.className = "muted small";
-    note.textContent = "从运行列表移除，可在「已删除」中恢复；模型、证据和 PR 保留。";
+    note.textContent = "Remove this run from the list. It can be restored from Deleted; models, evidence, and PRs remain.";
     const buttons = document.createElement("div");
     buttons.className = "run-menu-buttons";
-    const confirm = ghostButton("移入已删除");
-    const cancel = ghostButton("取消");
+    const confirm = ghostButton("Move to Deleted");
+    const cancel = ghostButton("Cancel");
     cancel.addEventListener("click", showMenu);
     confirm.addEventListener("click", () => {
       close(false);
@@ -825,7 +825,7 @@ async function mutateRun(run, method, title) {
     renderRunsList();
     if (state.dagRunId === run.dag_run_id) await selectRun(run.dag_run_id);
   } catch (error) {
-    setError($("runs-error"), error.message || "操作未完成，请重试。");
+    setError($("runs-error"), error.message || "Operation did not complete; retry.");
   }
 }
 
@@ -878,7 +878,7 @@ function boundedJson(value, limit = 1400) {
     text = String(value);
   }
   if (typeof text !== "string") text = String(text);
-  return text.length > limit ? `${text.slice(0, limit)}\n…（内容过长，已截断）` : text;
+  return text.length > limit ? `${text.slice(0, limit)}\n... (truncated because the content is too long)` : text;
 }
 
 function appendEvidence(parent, title, value) {
@@ -941,7 +941,7 @@ function countChecks(rows) {
     const ran = row.executed === true || (row.executed === undefined && (row.state === "passed" || row.state === "failed"));
     if (ran) executed += 1;
   }
-  return `通过 ${passed}/${rows.length} · 已执行 ${executed}/${rows.length}`;
+  return `Passed ${passed}/${rows.length} · Executed ${executed}/${rows.length}`;
 }
 
 function countsText(counts, rows) {
@@ -949,7 +949,7 @@ function countsText(counts, rows) {
   if (counts && Number.isFinite(counts.total)) {
     const passed = Number.isFinite(counts.passed) ? counts.passed : 0;
     const executed = Number.isFinite(counts.executed) ? counts.executed : 0;
-    return `通过 ${passed}/${counts.total} · 已执行 ${executed}/${counts.total}`;
+    return `Passed ${passed}/${counts.total} · Executed ${executed}/${counts.total}`;
   }
   return countChecks(rows);
 }
@@ -959,11 +959,11 @@ function reportRow(row, boundary) {
   return {
     id: String(row.id || ""),
     boundary,
-    label: row.label_zh || row.label || String(row.id || ""),
+    label: row.label || String(row.id || ""),
     state: row.state || "not_run",
-    stateZh: row.state_zh || CHECK_STATES[row.state] || "未执行",
+    stateLabel: row.state_label || CHECK_STATES[row.state] || "Not run",
     executed: typeof row.executed === "boolean" ? row.executed : undefined,
-    scope: summary.scope_zh || "",
+    scope: summary.scope || "",
     expected: summary.expected,
     actual: summary.actual,
     details: row.raw_details,
@@ -982,9 +982,9 @@ function stageList(run) {
       (Number.isFinite(independentCounts[key]) ? independentCounts[key] : 0);
     return {
       id: stage.id,
-      nameZh: stage.name_zh || stage.id,
+      name: stage.name || stage.id,
       state: stage.state || "not_run",
-      stateZh: stage.state_zh || "未执行",
+      stateLabel: stage.state_label || "Not run",
       at: stage.at,
       reuse: stage.reuse || null,
       counts,
@@ -999,7 +999,7 @@ function stageList(run) {
       unsupported: (Array.isArray(stage.unsupported) ? stage.unsupported : [])
         .map((item) => (item && typeof item === "object" ? item.label || item.id : item))
         .filter(Boolean),
-      manualNote: typeof stage.manual_scope_note_zh === "string" ? stage.manual_scope_note_zh : "",
+      manualNote: typeof stage.manual_scope_note === "string" ? stage.manual_scope_note : "",
     };
   });
 }
@@ -1011,16 +1011,16 @@ function checkRow(parent, row) {
   head.className = "check-head";
   const name = document.createElement("span");
   name.className = "check-name";
-  name.textContent = row.label || row.id || "检查";
+  name.textContent = row.label || row.id || "Check";
   const chip = document.createElement("span");
   chip.className = `chip ${stateKind(row.state)}`.trim();
-  chip.textContent = row.stateZh;
+  chip.textContent = row.stateLabel;
   head.append(name, chip);
   item.append(head);
   if (row.scope) {
     const scope = document.createElement("p");
     scope.className = "check-scope";
-    scope.textContent = `检查内容：${row.scope}`;
+    scope.textContent = `Scope: ${row.scope}`;
     item.append(scope);
   }
   const expected = inlineValue(row.expected);
@@ -1028,12 +1028,12 @@ function checkRow(parent, row) {
   if (expected || actual) {
     const kv = document.createElement("p");
     kv.className = "check-kv";
-    if (expected) kv.append(`预期：${expected}`);
-    if (expected && actual) kv.append("；");
-    if (actual) kv.append(`实际：${actual}`);
+    if (expected) kv.append(`Expected: ${expected}`);
+    if (expected && actual) kv.append("; ");
+    if (actual) kv.append(`Actual: ${actual}`);
     item.append(kv);
   }
-  appendEvidence(item, "原始证据", row.details);
+  appendEvidence(item, "Raw evidence", row.details);
   parent.append(item);
   return item;
 }
@@ -1063,12 +1063,12 @@ function warningValueText(value) {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
     const shown = value.slice(0, WARNING_VALUE_LIMIT).map((item) => warningValueText(item));
-    return `${shown.join("、")}${value.length > shown.length ? ` 等 ${value.length} 项` : ""}`;
+    return `${shown.join(", ")}${value.length > shown.length ? ` and ${value.length} items total` : ""}`;
   }
   if (typeof value === "object") {
     const entries = Object.entries(value).slice(0, WARNING_VALUE_LIMIT);
     const shown = entries.map(([key, item]) => `${key}=${warningValueText(item)}`);
-    return `${shown.join("；")}${Object.keys(value).length > entries.length ? " …" : ""}`;
+    return `${shown.join("; ")}${Object.keys(value).length > entries.length ? " ..." : ""}`;
   }
   return String(value);
 }
@@ -1080,10 +1080,10 @@ function stageWarningRow(row) {
   head.className = "warning-head";
   const label = document.createElement("span");
   label.className = "warning-label";
-  label.textContent = row.label_zh || row.code || "警告";
+  label.textContent = row.label || row.code || "Warning";
   const chip = document.createElement("span");
   chip.className = "chip warning";
-  chip.textContent = row.state_zh || "警告";
+  chip.textContent = row.state_label || "Warning";
   head.append(label, chip);
   item.append(head);
   const meta = [row.object, row.code].filter(Boolean).join(" · ");
@@ -1100,28 +1100,28 @@ function stageWarningRow(row) {
     item.append(message);
   }
   const blockers = [];
-  if (row.qualification_blocker) blockers.push(`限定资格阻断：${row.qualification_blocker}`);
-  if (row.publication_blocker) blockers.push(`发布阻断：${row.publication_blocker}`);
+  if (row.qualification_blocker) blockers.push(`Qualification blocker: ${row.qualification_blocker}`);
+  if (row.publication_blocker) blockers.push(`Publication blocker: ${row.publication_blocker}`);
   if (blockers.length) {
     const line = document.createElement("p");
     line.className = "warning-blocker";
-    line.textContent = blockers.join("；");
+    line.textContent = blockers.join("; ");
     item.append(line);
   }
   const keys = WARNING_VALUE_KEYS.filter((key) => row[key] !== undefined && row[key] !== null);
   const residual = row.residual && typeof row.residual === "object" ? Object.entries(row.residual) : [];
   if (keys.length || residual.length) {
-    const details = expandable(item, "记录值");
+    const details = expandable(item, "Recorded values");
     const list = document.createElement("div");
     list.className = "warning-values";
     for (const key of keys) {
       const line = document.createElement("p");
-      line.textContent = `${key}：${warningValueText(row[key])}`;
+      line.textContent = `${key}: ${warningValueText(row[key])}`;
       list.append(line);
     }
     for (const [key, value] of residual) {
       const line = document.createElement("p");
-      line.textContent = `residual.${key}：${warningValueText(value)}`;
+      line.textContent = `residual.${key}: ${warningValueText(value)}`;
       list.append(line);
     }
     details.append(list);
@@ -1135,17 +1135,17 @@ function renderStageWarnings(root, stage, note) {
   const group = document.createElement("div");
   group.className = "check-group warning-group";
   const title = document.createElement("h4");
-  title.textContent = `警告（${rows.length}）`;
+  title.textContent = `Warnings (${rows.length})`;
   group.append(title);
   const hint = document.createElement("p");
   hint.className = "stage-note muted small";
-  hint.textContent = note || "记录项，不阻断采集与生成；不计为通过，也不作为验收或发布依据。";
+  hint.textContent = note || "Recorded observations do not block capture or generation and are neither passes nor acceptance/publication evidence.";
   group.append(hint);
   for (const row of rows.slice(0, WARNING_ROW_LIMIT)) group.append(stageWarningRow(row));
   if (rows.length > WARNING_ROW_LIMIT) {
     const more = document.createElement("p");
     more.className = "muted small";
-    more.textContent = `另有 ${rows.length - WARNING_ROW_LIMIT} 项警告，详见报告记录。`;
+    more.textContent = `${rows.length - WARNING_ROW_LIMIT} more warnings; see the report records.`;
     group.append(more);
   }
   root.append(group);
@@ -1155,7 +1155,7 @@ function buildFailureCard(failure, report) {
   const card = document.createElement("div");
   card.className = "fail-card";
   const title = document.createElement("strong");
-  title.textContent = failure.title_zh || "运行失败";
+  title.textContent = failure.title || "Run failed";
   card.append(title);
   const stage =
     report && Array.isArray(report.stages) ? report.stages.find((entry) => entry && entry.id === failure.stage) : null;
@@ -1164,51 +1164,51 @@ function buildFailureCard(failure, report) {
         .filter((row) => row && row.state === "failed")
     : [];
   const warningCount = stage && Number.isFinite(stage.counts && stage.counts.warnings) ? stage.counts.warnings : 0;
-  if (failure.meaning_zh && !(failure.kind === "unknown" && failedChecks.length)) {
+  if (failure.meaning && !(failure.kind === "unknown" && failedChecks.length)) {
     const meaning = document.createElement("p");
-    meaning.textContent = failure.meaning_zh;
+    meaning.textContent = failure.meaning;
     card.append(meaning);
   }
   if (failedChecks.length) {
     const heading = document.createElement("p");
-    heading.textContent = `未通过的自动检查（${failedChecks.length} 项）：`;
+    heading.textContent = `Failed automatic checks (${failedChecks.length}):`;
     card.append(heading);
     for (const row of failedChecks.slice(0, 5)) {
       const line = document.createElement("p");
       line.className = "muted small";
-      const message = row.summary && row.summary.actual ? row.summary.actual : "未通过";
-      line.textContent = `${row.label_zh || row.id || "检查"}：${message}`;
+      const message = row.summary && row.summary.actual ? row.summary.actual : "Failed";
+      line.textContent = `${row.label || row.id || "Check"}: ${message}`;
       card.append(line);
     }
     if (failedChecks.length > 5) {
       const more = document.createElement("p");
       more.className = "muted small";
-      more.textContent = `另有 ${failedChecks.length - 5} 项未通过检查，逐项证据见下方阶段检查。`;
+      more.textContent = `${failedChecks.length - 5} more checks failed; see the stage checks below for per-item evidence.`;
       card.append(more);
     }
     if (failedChecks.some((row) => String(row.id || "").startsWith("source."))) {
       const hint = document.createElement("p");
       hint.className = "muted small";
       hint.textContent =
-        "来源证据检查未通过；请依据失败检查及原始证据区分输入缺失、来源不一致或解析问题。";
+        "A source-evidence check failed. Use the failed checks and raw evidence to distinguish missing input, inconsistent provenance, or a discovery defect.";
       card.append(hint);
     } else {
       const detail = document.createElement("p");
       detail.className = "muted small";
-      detail.textContent = "逐项证据见下方阶段检查的“原始证据”。";
+      detail.textContent = "See Raw evidence in the stage checks below for per-item evidence.";
       card.append(detail);
     }
   }
   if (warningCount > 0) {
     const warnings = document.createElement("p");
     warnings.className = "muted small";
-    warnings.textContent = `该阶段另有 ${warningCount} 项记录警告：警告不计为通过，也不作为验收或发布依据。`;
+    warnings.textContent = `This stage has ${warningCount} recorded warnings. Warnings are neither passes nor acceptance/publication evidence.`;
     card.append(warnings);
   }
   if (failure.kind === "definition" || failure.kind === "runtime") {
     const kind = document.createElement("p");
     kind.className = "muted small";
-    kind.textContent = failure.kind === "definition" ? "分类：工程定义检查" : "分类：运行时问题";
+    kind.textContent = failure.kind === "definition" ? "Class: engineering-definition check" : "Class: runtime issue";
     card.append(kind);
   }
   if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
@@ -1216,24 +1216,24 @@ function buildFailureCard(failure, report) {
     groups.className = "muted small";
     const shown = failure.finding_counts.slice(0, 8);
     groups.textContent =
-      "分类汇总：" +
-      shown.map((group) => `${group.label_zh || group.code}×${group.count}`).join("、") +
-      (failure.finding_counts.length > shown.length ? "…" : "") +
-      (failure.finding_total ? `（共 ${failure.finding_total} 项，逐项见下方问题清单，可展开查看）` : "");
+      "Finding groups: " +
+      shown.map((group) => `${group.label || group.code} x ${group.count}`).join(", ") +
+      (failure.finding_counts.length > shown.length ? "..." : "") +
+      (failure.finding_total ? ` (${failure.finding_total} total; expand the issue list below for details)` : "");
     card.append(groups);
   }
   if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
     const note = document.createElement("p");
     note.className = "muted small";
-    note.textContent = "以上计数为平台报告发现与受影响实例，不代表 CAD 缺陷；逐项证据见下方问题清单（默认折叠）。";
+    note.textContent = "Counts describe reported findings and affected instances, not CAD defects. The issue list below is collapsed by default.";
     card.append(note);
     if (failure.finding_counts.some((group) => group && group.code === "discovery.link_name_missing")) {
       const hint = document.createElement("p");
       hint.className = "muted small";
       hint.textContent =
-        "未识别刚体坐标系（discovery.link_name_missing）：记录表示刚体归属与命名尚未证明，并不代表 CAD 中不存在坐标系；" +
-        "处置方向为补齐交付定义与坐标系归属（由结构交付侧在原生工程中完成），" +
-        "不需要为每个供应商内部叶件单独添加坐标系。";
+        "discovery.link_name_missing means rigid-body ownership and naming are not proven; it does not prove that CAD has no coordinate system. " +
+        "Complete the delivery definition and coordinate-system ownership in the native project. " +
+        "Do not add a separate coordinate system for every supplier-internal leaf.";
       card.append(hint);
       const samples = failure.finding_samples && Array.isArray(failure.finding_samples["discovery.link_name_missing"])
         ? failure.finding_samples["discovery.link_name_missing"]
@@ -1242,15 +1242,15 @@ function buildFailureCard(failure, report) {
       if (objects.length) {
         const sample = document.createElement("p");
         sample.className = "muted small";
-        sample.textContent = `示例对象：${objects.join("、")}（完整清单见下方问题清单）`;
+        sample.textContent = `Example objects: ${objects.join(", ")} (see the complete issue list below)`;
         card.append(sample);
       }
     }
   }
-  if (failure.stage_name_zh) {
+  if (failure.stage_name) {
     const stage = document.createElement("p");
     stage.className = "muted small";
-    stage.textContent = `涉及阶段：${failure.stage_name_zh}`;
+    stage.textContent = `Stage: ${failure.stage_name}`;
     card.append(stage);
   }
   const affected = failure.object
@@ -1259,18 +1259,18 @@ function buildFailureCard(failure, report) {
       ? failure.unresolved_dependencies
           .map((item) => (item && (item.name || item.path)) || "")
           .filter(Boolean)
-          .join("、")
+          .join(", ")
       : "";
   if (affected) {
     const object = document.createElement("p");
-    object.textContent = `涉及对象：${affected}`;
+    object.textContent = `Objects: ${affected}`;
     card.append(object);
   }
   const raw = {};
   for (const key of ["raw_type", "raw_error", "raw_detail"]) {
     if (failure[key] !== undefined && failure[key] !== null) raw[key] = failure[key];
   }
-  if (Object.keys(raw).length) appendEvidence(card, "原始错误（供排查）", raw);
+  if (Object.keys(raw).length) appendEvidence(card, "Raw error (diagnostic)", raw);
   return card;
 }
 
@@ -1278,7 +1278,7 @@ function renderStageDetail() {
   const root = $("stage-detail");
   root.textContent = "";
   if (!state.stages.length) {
-    root.textContent = "报告数据暂不可用：无法显示阶段检查，请刷新重试或联系平台维护人员。";
+    root.textContent = "Report data is unavailable, so stage checks cannot be shown. Refresh or contact platform maintenance.";
     return;
   }
   const stage = state.stages[state.selectedStage];
@@ -1289,34 +1289,34 @@ function renderStageDetail() {
   const head = document.createElement("div");
   head.className = "stage-summary-head";
   const title = document.createElement("strong");
-  title.textContent = stage.nameZh;
+  title.textContent = stage.name;
   const chip = document.createElement("span");
   chip.className = `chip ${stateKind(stage.state)}`.trim();
-  chip.textContent = stage.stateZh;
+  chip.textContent = stage.stateLabel;
   head.append(title, chip);
   summary.append(head);
   const counts = document.createElement("p");
   counts.className = "stage-counts muted small";
   const pieces = [];
-  if (stage.boundary.length) pieces.push(`边界检查：${countsText(stage.counts.boundary, stage.boundary)}`);
-  if (stage.independent.length) pieces.push(`独立检查：${countsText(stage.counts.independent, stage.independent)}`);
+  if (stage.boundary.length) pieces.push(`Boundary checks: ${countsText(stage.counts.boundary, stage.boundary)}`);
+  if (stage.independent.length) pieces.push(`Independent checks: ${countsText(stage.counts.independent, stage.independent)}`);
   if (Number.isFinite(stage.counts.warnings) && stage.counts.warnings > 0) {
-    pieces.push(`警告：${stage.counts.warnings} 项`);
+    pieces.push(`Warnings: ${stage.counts.warnings}`);
   }
-  counts.textContent = pieces.join("　•　") || "无检查记录";
+  counts.textContent = pieces.join(" • ") || "No check records";
   summary.append(counts);
   if (stage.at) {
     const at = document.createElement("p");
     at.className = "muted small";
-    at.textContent = `记录时间：${formatTime(stage.at)}`;
+    at.textContent = `Recorded: ${formatTime(stage.at)}`;
     summary.append(at);
   }
   if (stage.reuse && stage.reuse.reused === true) {
     const reused = document.createElement("p");
     reused.className = "muted small";
-    reused.textContent = "复用已验证结果；上方时间为原检查时间。";
+    reused.textContent = "Verified results were reused; the timestamp above is the original check time.";
     summary.append(reused);
-    appendEvidence(summary, "复用来源", stage.reuse);
+    appendEvidence(summary, "Reuse source", stage.reuse);
   }
   root.append(summary);
 
@@ -1334,13 +1334,13 @@ function renderStageDetail() {
     const block = document.createElement("div");
     block.className = "stage-quick-summary";
     const title = document.createElement("h4");
-    title.textContent = "轻量摘要";
+    title.textContent = "Summary";
     block.append(title);
     for (const row of quick.rows) {
       const line = document.createElement("p");
       line.className = "muted small";
       const label = document.createElement("strong");
-      label.textContent = `${row.label}：`;
+      label.textContent = `${row.label}: `;
       const value = document.createElement("code");
       value.textContent = row.value;
       line.append(label, value);
@@ -1349,23 +1349,23 @@ function renderStageDetail() {
     if (quick.necessity) {
       const note = document.createElement("p");
       note.className = "muted small";
-      note.textContent = `必要性：${quick.necessity}`;
+      note.textContent = `Why: ${quick.necessity}`;
       block.append(note);
     }
     root.append(block);
   }
 
   const groups = [
-    ["输入检查", stage.boundary.filter((row) => row.boundary === "input")],
-    ["输出检查", stage.boundary.filter((row) => row.boundary === "output")],
-    ["独立检查", stage.independent],
+    ["Input checks", stage.boundary.filter((row) => row.boundary === "input")],
+    ["Output checks", stage.boundary.filter((row) => row.boundary === "output")],
+    ["Independent checks", stage.independent],
   ];
   for (const [heading, rows] of groups) {
     if (!rows.length) continue;
     const group = document.createElement("div");
     group.className = "check-group";
     const titleRow = document.createElement("h4");
-    titleRow.textContent = `${heading}（${countChecks(rows)}）`;
+    titleRow.textContent = `${heading} (${countChecks(rows)})`;
     group.append(titleRow);
     for (const row of rows) checkRow(group, row);
     root.append(group);
@@ -1375,18 +1375,18 @@ function renderStageDetail() {
   renderStageWarnings(
     root,
     stage,
-    reportWarnings && typeof reportWarnings.note_zh === "string" ? reportWarnings.note_zh : "",
+    reportWarnings && typeof reportWarnings.note === "string" ? reportWarnings.note : "",
   );
 
   const fileRows = (stage.files || []).map((file) => ({
-    label: file.label_zh || file.path || "文件",
-    boundary: file.boundary === "output" ? "输出" : file.boundary === "input" ? "输入" : "",
+    label: file.label || file.path || "File",
+    boundary: file.boundary === "output" ? "Output" : file.boundary === "input" ? "Input" : "",
     path: file.path || "",
     availability: file.availability || "",
     count: Number.isFinite(file.files) ? file.files : null,
   }));
   if (fileRows.length) {
-    const details = expandable(root, `输入与输出记录（${fileRows.length} 项）`);
+    const details = expandable(root, `Input and output records (${fileRows.length})`);
     const list = document.createElement("div");
     list.className = "stage-files";
     const authorized = state.previewFiles || {};
@@ -1409,7 +1409,7 @@ function renderStageDetail() {
       }
       if (Number.isFinite(row.count) && row.count > 0) {
         const tag = document.createElement("code");
-        tag.textContent = `${row.count} 个文件`;
+        tag.textContent = `${row.count} files`;
         line.append(" ", tag);
       } else if (row.availability) {
         const tag = document.createElement("code");
@@ -1430,7 +1430,7 @@ function renderStageDetail() {
   if (stage.unsupported.length) {
     const row = document.createElement("p");
     row.className = "stage-note muted small";
-    row.append("尚未自动覆盖：");
+    row.append("Not covered automatically: ");
     for (const text of stage.unsupported) {
       const tag = document.createElement("span");
       tag.className = "chip";
@@ -1469,7 +1469,7 @@ function applyPreviewExpansion() {
   }
   const button = $("preview-collapse");
   button.hidden = !expansion.collapse_control;
-  button.textContent = expansion.expanded ? "收起预览" : "展开预览";
+  button.textContent = expansion.expanded ? "Collapse preview" : "Expand preview";
   button.setAttribute("aria-expanded", expansion.expanded ? "true" : "false");
 }
 
@@ -1540,21 +1540,21 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     const key = document.createElement("dt");
     key.textContent = row.key;
     const value = document.createElement("dd");
-    value.textContent = row.value || "未记录";
+    value.textContent = row.value || "not recorded";
     info.append(key, value);
   }
   const limits = jointRows(records ? records.joints : []);
-  const fmt = (value, digits) => (Number.isFinite(value) ? value.toFixed(digits) : "未提供");
+  const fmt = (value, digits) => (Number.isFinite(value) ? value.toFixed(digits) : "not provided");
   const modelJoints = new Map(((data.robot && data.robot.joints) || []).map((joint) => [joint.name, joint]));
-  const windowLabel = "检查/预览分析窗口，非机械限位";
-  const absentDrive = "未提供（未建立驱动能力）";
+  const windowLabel = "inspection/preview analysis window, not a mechanical limit";
+  const absentDrive = "not provided (drive capability not established)";
   const sourceLabel = (source) =>
     source === "policy_preview_window" || source === "declared_preview_window"
-      ? `${source}（${windowLabel}）`
-      : source || "未记录";
+      ? `${source} (${windowLabel})`
+      : source || "not recorded";
   fillPanelTable(
     $("panel-limits"),
-    ["关节", "类型", "下限", "上限", "力矩", "速度", "轴 (xyz)", "限位来源"],
+    ["Joint", "Type", "Lower", "Upper", "Effort", "Velocity", "Axis (xyz)", "Limit source"],
     limits.map((row) => {
       const source = modelJoints.get(row.name) && modelJoints.get(row.name).limit_source;
       return [
@@ -1569,26 +1569,26 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
       ];
     }),
   );
-  $("limits-title").textContent = `限位 / 轴读数（${limits.length}）`;
+  $("limits-title").textContent = `Limits and axis readings (${limits.length})`;
   const links = linkRows(records ? records.links : []);
   fillPanelTable(
     $("panel-links"),
-    ["链接", "质量 kg", "质心 m", "惯量 (kg·m²)"],
+    ["Link", "Mass kg", "COM m", "Inertia (kg*m^2)"],
     links.map((row) => [
       row.name,
-      row.mass_kg === null ? "未提供" : row.mass_kg.toFixed(6),
+      row.mass_kg === null ? "not provided" : row.mass_kg.toFixed(6),
       row.com_m ? row.com_m.map((value) => fmt(value, 4)).join(", ") : null,
       row.inertia_kg_m2
         ? `ixx ${fmt(row.inertia_kg_m2.ixx, 6)} · iyy ${fmt(row.inertia_kg_m2.iyy, 6)} · izz ${fmt(row.inertia_kg_m2.izz, 6)}`
         : null,
     ]),
   );
-  $("links-title").textContent = `链接/刚体质量惯量（${links.length}）`;
+  $("links-title").textContent = `Link/body mass and inertia (${links.length})`;
   const frames = frameRows(data.robot ? data.robot.frames : []);
   const closure = closureRows(data.quality ? data.quality.checks : []);
   fillPanelTable(
     $("panel-frames"),
-    ["坐标系 / 接口", "父级", "xyz (m)", "rpy (rad)"],
+    ["Frame / interface", "Parent", "xyz (m)", "rpy (rad)"],
     frames.map((row) => [
       row.name,
       row.parent,
@@ -1598,10 +1598,10 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   );
   fillPanelTable(
     $("panel-closure"),
-    ["检查", "状态"],
+    ["Check", "State"],
     closure.map((row) => [row.id, row.state]),
   );
-  $("frames-title").textContent = `坐标系 / 接口位姿与物理闭合（${frames.length} / ${closure.length}）`;
+  $("frames-title").textContent = `Frames, interface poses, and physical closure (${frames.length} / ${closure.length})`;
 }
 
 function stopActivityTimer() {
@@ -1624,13 +1624,13 @@ function startActivityTimer() {
 function buildActivityCard(view) {
   const card = document.createElement("section");
   card.className = `activity-card state-${view.state}`;
-  card.setAttribute("aria-label", "实时活动");
+  card.setAttribute("aria-label", "Live activity");
   const head = document.createElement("div");
   head.className = "activity-head";
   const dot = document.createElement("span");
   dot.className = `dot ${view.state === "busy" || view.state === "queued" ? "run" : "idle"}`;
   const title = document.createElement("strong");
-  title.textContent = view.final ? "最后活动" : "实时活动";
+  title.textContent = view.final ? "Last activity" : "Live activity";
   const chip = document.createElement("span");
   chip.className = `chip ${view.state === "busy" ? "running" : view.state === "queued" ? "queued" : "blocked"}`;
   chip.textContent = view.stateText;
@@ -1638,7 +1638,7 @@ function buildActivityCard(view) {
   if (view.stageText) {
     const stage = document.createElement("span");
     stage.className = "muted small";
-    stage.textContent = `阶段：${view.stageText}`;
+    stage.textContent = `Stage: ${view.stageText}`;
     head.append(stage);
   }
   card.append(head);
@@ -1651,7 +1651,7 @@ function buildActivityCard(view) {
   if (view.objectText) {
     const object = document.createElement("p");
     object.className = "activity-object muted small";
-    object.textContent = view.final ? `相关对象：${view.objectText}` : `当前对象：${view.objectText}`;
+    object.textContent = view.final ? `Related object: ${view.objectText}` : `Current object: ${view.objectText}`;
     card.append(object);
   }
   const metaParts = view.final
@@ -1660,7 +1660,7 @@ function buildActivityCard(view) {
   if (metaParts.length) {
     const meta = document.createElement("p");
     meta.className = view.stale ? "activity-meta muted small stale" : "activity-meta muted small";
-    meta.textContent = metaParts.join("　•　");
+    meta.textContent = metaParts.join(" • ");
     card.append(meta);
   }
   if (view.note) {
@@ -1709,8 +1709,8 @@ function renderActivity(run) {
     const note = document.createElement("p");
     note.className = "activity-note muted small";
     note.textContent = view.state === "busy" && view.stageText && selected && view.stage !== selected.id
-      ? `当前活动阶段为「${view.stageText}」，此阶段暂无详细进度。`
-      : "此阶段暂无详细进度可用。";
+      ? `Live stage is ${view.stageText}; no detailed progress is available for this stage.`
+      : "No detailed progress is available for this stage.";
     stageHost.append(note);
   }
 }
@@ -1727,19 +1727,19 @@ function renderStepper() {
     dot.className = `dot ${stageDotState(stage.state)}`;
     const label = document.createElement("span");
     label.className = "step-label";
-    label.textContent = stage.nameZh || stage.id;
+    label.textContent = stage.name || stage.id;
     const meta = document.createElement("span");
     meta.className = "step-meta";
     if (!Number.isFinite(stage.total) || stage.total <= 0) {
       // No recorded checks: a short neutral state word instead of a failed percentage.
-      meta.textContent = STEP_STATE_SHORT[stage.state] || stage.stateZh;
+      meta.textContent = STEP_STATE_SHORT[stage.state] || stage.stateLabel;
     } else {
-      meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} 通过`;
+      meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} passed`;
     }
     const warningCount = Number.isFinite(stage.counts.warnings) ? stage.counts.warnings : 0;
-    const tooltip = `${stage.nameZh} · ${stage.stateZh}${warningCount > 0 ? ` · 警告 ${warningCount}` : ""}${
+    const tooltip = `${stage.name} · ${stage.stateLabel}${warningCount > 0 ? ` · warnings ${warningCount}` : ""}${
       Number.isFinite(stage.total) && stage.total > 0
-        ? ` · 通过 ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · 已执行 ${
+        ? ` · passed ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · executed ${
             Number.isFinite(stage.executed) ? stage.executed : 0
           }/${stage.total}`
         : ""
@@ -1795,7 +1795,7 @@ function renderRerunPanel(run) {
   line.className = "rerun-row";
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = busy ? "正在创建尝试…" : "从此步骤重新运行";
+  button.textContent = busy ? "Creating attempt..." : "Rerun from this stage";
   button.disabled = busy || !canManage || !eligible || deleted;
   button.addEventListener("click", () => {
     void rerunFromStage(stage.id);
@@ -1807,16 +1807,16 @@ function renderRerunPanel(run) {
   if (state.rerunNotice) {
     note.textContent = state.rerunNotice;
   } else if (deleted) {
-    note.textContent = "此运行已删除：请先恢复后再重跑。";
+    note.textContent = "This run is deleted; restore it before rerunning.";
   } else if (!canManage) {
-    note.textContent = "仅发起人或平台管理员可重新运行。";
-  } else if (row && row.reason_zh) {
+    note.textContent = "Only the initiator or a platform administrator can rerun.";
+  } else if (row && row.message) {
     // Canonical backend reason shown verbatim whenever the stage is not eligible.
-    note.textContent = row.reason_zh;
+    note.textContent = row.message;
   } else if (eligible) {
-    note.textContent = "将重算该步骤及其后续阶段；原始运行与证据保留，重跑为新关联运行。";
+    note.textContent = "This stage and downstream stages will be recomputed. The original run and evidence remain, and the rerun is a new linked run.";
   } else {
-    note.textContent = "暂时无法确认此步骤的重跑条件，请稍后刷新。";
+    note.textContent = "Rerun conditions for this stage cannot be confirmed; refresh later.";
   }
   line.append(note);
   host.append(line);
@@ -1828,35 +1828,35 @@ function renderRerunPanel(run) {
     const prereq = row.prerequisites && typeof row.prerequisites === "object" ? row.prerequisites : null;
     if (prereq) {
       const parts = [];
-      for (const [key, label] of [["inputs", "输入"], ["tool", "工具"], ["receipt", "回执"]]) {
+      for (const [key, label] of [["inputs", "inputs"], ["tool", "tool"], ["receipt", "receipt"]]) {
         const value = prereq[key];
-        if (typeof value === "string" && value) parts.push(`${label}〈${PREREQ_STATE_ZH[value] || value}〉`);
+        if (typeof value === "string" && value) parts.push(`${label}: ${PREREQ_STATE[value] || value}`);
       }
-      if (parts.length) pieces.push(`前置条件：${parts.join(" · ")}`);
+      if (parts.length) pieces.push(`Prerequisites: ${parts.join(" · ")}`);
     }
     const recomputes = Array.isArray(row.recomputes) ? row.recomputes : [];
     if (recomputes.length) {
-      pieces.push(`将重算：${recomputes.map((id) => rerunStageName(rows, id)).join(" → ")}`);
+      pieces.push(`Recomputes: ${recomputes.map((id) => rerunStageName(rows, id)).join(" -> ")}`);
     }
     if (prereq && prereq.earliest_required && prereq.earliest_required !== stage.id) {
-      pieces.push(`最早可重新运行：${rerunStageName(rows, prereq.earliest_required)}`);
+      pieces.push(`Earliest restart: ${rerunStageName(rows, prereq.earliest_required)}`);
     }
     if (pieces.length) {
-      meta.textContent = pieces.join("；");
+      meta.textContent = pieces.join("; ");
       host.append(meta);
     }
     const retains = Array.isArray(row.retains) ? row.retains : [];
     if (retains.length) {
       const details = document.createElement("details");
       const summary = document.createElement("summary");
-      summary.textContent = `复用既有输入/结果（${retains.length} 项）`;
+      summary.textContent = `Reused inputs/results (${retains.length})`;
       details.append(summary);
       const list = document.createElement("div");
       list.className = "rerun-retains";
       for (const item of retains) {
         if (!item || typeof item !== "object") continue;
         const entry = document.createElement("p");
-        entry.textContent = [item.label_zh || item.path || "", item.availability || ""].filter(Boolean).join(" · ");
+        entry.textContent = [item.label || item.path || "", item.availability || ""].filter(Boolean).join(" · ");
         list.append(entry);
       }
       details.append(list);
@@ -1890,8 +1890,8 @@ async function rerunFromStage(stageId) {
     await refreshRuns();
     if (state.dagRunId !== runId) return; // the operator moved on; the list is refreshed
     if (!nextRunId) {
-      const name = payload.resume_from_name_zh || stageId;
-      state.rerunNotice = `已创建新关联运行，自「${name}」重新执行；原始运行与证据保留。`;
+      const name = payload.resume_from_name || stageId;
+      state.rerunNotice = `Created a new linked run from ${name}; the original run and evidence remain.`;
       if (!state.timer) {
         state.timer = window.setInterval(() => {
           void poll();
@@ -1914,7 +1914,7 @@ async function rerunFromStage(stageId) {
     }
     if (state.dagRunId === runId) {
       const detail = error.payload && typeof error.payload === "object" ? error.payload : {};
-      state.rerunError = detail.reason_zh || error.message || "重新运行未受理。";
+      state.rerunError = detail.message || error.message || "Rerun was not accepted.";
       if (detail.earliest_required) {
         const target = String(detail.earliest_required);
         const index = state.stages.findIndex((item) => item.id === target);
@@ -1942,15 +1942,15 @@ function renderRun(run) {
   const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
   const deleted = resolveDeleted(run, listEntry);
   const customTitle = resolveTitle(run, listEntry);
-  $("run-heading").textContent = customTitle || folderLabel(run.handoff_path) || "工程文件夹";
-  $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "状态待确认";
+  $("run-heading").textContent = customTitle || folderLabel(run.handoff_path) || "Engineering folder";
+  $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "State unconfirmed";
   $("run-dot").className = `dot ${runDotState(run.state)}`;
-  $("run-initiator").textContent = `发起人：${run.operator || run.user || "未记录"}`;
+  $("run-initiator").textContent = `Initiator: ${run.operator || run.user || "not recorded"}`;
   const deletedTag = $("run-deleted");
   const deletedAt = run.deleted_at || (listEntry && listEntry.deleted_at) || null;
   const deletedBy = run.deleted_by || (listEntry && listEntry.deleted_by) || null;
   deletedTag.textContent = deleted
-    ? `已删除 · ${formatRunTime(deletedAt) || "时间未记录"} · 删除人：${deletedBy || "未记录"}`
+    ? `Deleted · ${formatRunTime(deletedAt) || "time not recorded"} · Deleted by: ${deletedBy || "not recorded"}`
     : "";
   deletedTag.hidden = !deleted;
   const actionsHost = $("run-actions");
@@ -1969,8 +1969,8 @@ function renderRun(run) {
   // link never depends on that row being on a loaded page.
   const parentId = run.parent_dag_run_id || (listEntry && listEntry.parent_dag_run_id) || null;
   if (parentId) {
-    const parentStage = run.resume_from_name_zh || (listEntry && listEntry.resume_from_name_zh) || "上游阶段";
-    origin.append(`自「${parentStage}」重新运行 · 来源 `);
+    const parentStage = run.resume_from_name || (listEntry && listEntry.resume_from_name) || "upstream stage";
+    origin.append(`Rerun from ${parentStage} · source `);
     const link = document.createElement("button");
     link.type = "button";
     link.className = "ghost";
@@ -1989,31 +1989,31 @@ function renderRun(run) {
   const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
   const coverage = run.coverage || {};
   const rows = [
-    ["工程文件夹", folderLabel(run.handoff_path) || "—"],
-    ["状态", RUN_STATES[run.state] || run.state || "—"],
-    ["开始时间", formatTime(run.started_at)],
-    ["结束时间", formatTime(run.ended_at)],
+    ["Engineering folder", folderLabel(run.handoff_path) || "—"],
+    ["State", RUN_STATES[run.state] || run.state || "—"],
+    ["Started", formatTime(run.started_at)],
+    ["Ended", formatTime(run.ended_at)],
   ];
   if (typeof run.main_assembly === "string" && run.main_assembly) {
-    rows.splice(1, 0, ["主装配", run.main_assembly]);
+    rows.splice(1, 0, ["Main assembly", run.main_assembly]);
   }
-  rows.splice(1, 0, ["用途", purposeLabel(run.purpose)]);
+  rows.splice(1, 0, ["Purpose", purposeLabel(run.purpose)]);
   const measured = report && report.measured ? report.measured : null;
   if (measured) {
-    if (measured.subject_sha256) rows.push(["交付摘要", `${String(measured.subject_sha256).slice(0, 12)}…`]);
+    if (measured.subject_sha256) rows.push(["Delivery subject", `${String(measured.subject_sha256).slice(0, 12)}...`]);
     const window = measured.expected_mass_window;
     if (window && Number.isFinite(window.mass_kg)) {
       const range = Array.isArray(window.expected_kg) && window.expected_kg.length === 2
-        ? `[${window.expected_kg[0]}，${window.expected_kg[1]}] kg`
+        ? `[${window.expected_kg[0]}, ${window.expected_kg[1]}] kg`
         : "—";
-      rows.push(["质量期望窗口", `实测 ${window.mass_kg} kg，窗口 ${range}`]);
+      rows.push(["Expected mass range", `measured ${window.mass_kg} kg; range ${range}`]);
     }
     const closure = measured.mass_closure;
     if (closure && Number.isFinite(closure.urdf_mass_kg)) {
-      const delta = Number.isFinite(closure.delta_kg) ? `，差值 ${closure.delta_kg} kg` : "";
+      const delta = Number.isFinite(closure.delta_kg) ? `; difference ${closure.delta_kg} kg` : "";
       rows.push([
-        "质量闭合",
-        `URDF ${closure.urdf_mass_kg} kg / 整机 CAD ${closure.whole_cad_mass_kg} kg${delta}`,
+        "Mass closure",
+        `URDF ${closure.urdf_mass_kg} kg / whole CAD ${closure.whole_cad_mass_kg} kg${delta}`,
       ]);
     }
   }
@@ -2028,7 +2028,7 @@ function renderRun(run) {
   }
 
   const headline = $("run-headline");
-  const headlineText = report && report.overall ? report.overall.headline_zh : "";
+  const headlineText = report && report.overall ? report.overall.headline : "";
   headline.textContent = headlineText || "";
   headline.hidden = !headlineText;
   const failureCard = $("failure-card");
@@ -2047,22 +2047,22 @@ function renderRun(run) {
   const retry = run.retry || {};
   const canRetry = !deleted && run.can_manage === true && retry.eligible === true;
   const retryReason = typeof retry.reason === "string" ?
-    RETRY_REASONS[retry.reason] || "暂不可重试，请查看检查结果。" : "";
+    RETRY_REASONS[retry.reason] || "Retry is currently unavailable; review the check results." : "";
   $("retry-panel").hidden = !deleted && !canRetry && !(run.state === "failed" && retryReason);
   $("retry-button").hidden = !canRetry;
   $("retry-button").disabled = state.retryingRunId !== null;
-  $("retry-button").textContent = state.retryingRunId === runId ? "正在重试…" : "继续原作业";
+  $("retry-button").textContent = state.retryingRunId === runId ? "Retrying..." : "Continue original job";
   $("retry-note").textContent = deleted ?
     RETRY_REASONS.deleted :
     retry.eligible === true && run.can_manage !== true ?
-      "该运行可由发起人或平台管理员重试。" : retryReason;
+      "The initiator or a platform administrator can retry this run." : retryReason;
 
   const progress = $("task-progress");
   progress.textContent = "";
   for (const task of run.tasks || []) {
     const chip = document.createElement("span");
     chip.className = `chip ${task.state || ""}`.trim();
-    chip.textContent = `${TASK_LABELS[task.task_id] || task.task_id}：${TASK_STATES[task.state] || task.state || "—"}`;
+    chip.textContent = `${TASK_LABELS[task.task_id] || task.task_id}: ${TASK_STATES[task.state] || task.state || "—"}`;
     progress.append(chip);
   }
 
@@ -2088,7 +2088,7 @@ function renderRun(run) {
   for (const text of (coverage.automatic && coverage.automatic.unsupported) || []) {
     const chip = document.createElement("span");
     chip.className = "chip";
-    chip.textContent = `未自动覆盖：${text}`;
+    chip.textContent = `Not covered automatically: ${text}`;
     chipRow.append(chip);
   }
   automatic.append(chipRow);
@@ -2099,7 +2099,7 @@ function renderRun(run) {
       const group = document.createElement("div");
       group.className = "check-group";
       const titleRow = document.createElement("h4");
-      titleRow.textContent = `${stage.nameZh}（${countChecks(rows)}）`;
+      titleRow.textContent = `${stage.name} (${countChecks(rows)})`;
       group.append(titleRow);
       for (const row of rows) checkRow(group, row);
       automatic.append(group);
@@ -2107,7 +2107,7 @@ function renderRun(run) {
   } else {
     const note = document.createElement("p");
     note.className = "muted small";
-    note.textContent = "报告数据暂不可用：无法显示逐项检查，请刷新重试或联系平台维护人员。";
+    note.textContent = "Report data is unavailable, so per-check results cannot be shown. Refresh or contact platform maintenance.";
     chipRow.append(note);
   }
 
@@ -2119,17 +2119,17 @@ function renderRun(run) {
   if (!report) {
     const note = document.createElement("p");
     note.className = "muted small";
-    note.textContent = "报告数据暂不可用：工程评审范围无法显示，请刷新重试或联系平台维护人员。";
+    note.textContent = "Report data is unavailable, so engineering review scopes cannot be shown. Refresh or contact platform maintenance.";
     confirmations.append(note);
   } else if (engineeringState !== "external_review") {
     const note = document.createElement("p");
     note.className = "muted small";
-    note.textContent = "工程评审范围未就绪：独立验证通过后，这里显示需要人工确认的外部事实。";
+    note.textContent = "Engineering review scopes are not ready; after independent verification passes, externally confirmed facts appear here.";
     confirmations.append(note);
   } else if (scopes.length) {
     const lead = document.createElement("p");
     lead.className = "muted small";
-    lead.textContent = "工程评审范围（自动检查无法核验、需由外部评审确认的事实）：";
+    lead.textContent = "Engineering review scopes (facts that automatic checks cannot verify and external review must confirm):";
     confirmations.append(lead);
     for (const scope of scopes) {
       const item = document.createElement("div");
@@ -2148,25 +2148,25 @@ function renderRun(run) {
         text.textContent = scope.automatic_exclusion;
         item.append(text);
       }
-      const stageName = (state.stages.find((entry) => entry.id === scope.stage) || {}).nameZh;
+      const stageName = (state.stages.find((entry) => entry.id === scope.stage) || {}).name;
       if (stageName) {
         const text = document.createElement("p");
         text.className = "muted small";
-        text.textContent = `涉及阶段：${stageName}`;
+        text.textContent = `Stage: ${stageName}`;
         item.append(text);
       }
       confirmations.append(item);
     }
-    if (external.note_zh) {
+    if (external.note) {
       const note = document.createElement("p");
       note.className = "muted small";
-      note.textContent = external.note_zh;
+      note.textContent = external.note;
       confirmations.append(note);
     }
   } else {
     const note = document.createElement("p");
     note.className = "muted small";
-    note.textContent = "报告未列出需要人工确认的外部事实。";
+    note.textContent = "The report lists no external facts requiring manual confirmation.";
     confirmations.append(note);
   }
 
@@ -2179,14 +2179,14 @@ function renderRun(run) {
     const item = document.createElement("li");
     item.className = "report-download";
     const label = document.createElement("span");
-    label.textContent = "结构团队报告（自动生成）：";
+    label.textContent = "Structural-team report (generated):";
     item.append(label, " ");
     for (const entry of retainedReports) {
       const link = document.createElement("a");
       link.href = String(entry.url || "");
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = entry.label_zh || entry.path || "结构团队报告";
+      link.textContent = entry.label || entry.path || "Structural-team report";
       item.append(link, " ");
     }
     findings.append(item);
@@ -2198,7 +2198,7 @@ function renderRun(run) {
     (finding) => !(failure && !finding.id && finding.message === failure.raw_error),
   );
   const codeLabels = new Map(
-    ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label_zh || group.code]),
+    ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label || group.code]),
   );
   const findingNameValue = (finding) => {
     const evidence = finding && finding.evidence && typeof finding.evidence === "object" ? finding.evidence : {};
@@ -2213,8 +2213,8 @@ function renderRun(run) {
     // A missing robot name is not a malformed name; keep the two cases distinct.
     message.textContent =
       finding.id === "discovery.robot_name_invalid" && findingNameValue(finding) === null
-        ? "未读取到机器人名称（detail.name 为空）。"
-        : finding.message || "未提供说明";
+        ? "No robot name was read (detail.name is empty)."
+        : finding.message || "No description provided";
     const context = document.createElement("div");
     context.className = "object";
     context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
@@ -2223,14 +2223,14 @@ function renderRun(run) {
       const evidence = document.createElement("pre");
       evidence.className = "object";
       evidence.textContent = JSON.stringify(finding.evidence, null, 2);
-      expandable(item, "查看证据").append(evidence);
+      expandable(item, "View evidence").append(evidence);
     }
     return item;
   };
   if (!visibleFindings.length) {
     const item = document.createElement("li");
     item.className = "muted";
-    item.textContent = "暂无问题";
+    item.textContent = "No issues";
     findings.append(item);
   }
   // Coded findings are grouped by their check code so a large discovery set stays a
@@ -2255,9 +2255,9 @@ function renderRun(run) {
     let groupLabel = codeLabels.get(code) || code;
     if (code === "discovery.robot_name_invalid") {
       const missing = items.filter((finding) => findingNameValue(finding) === null).length;
-      if (missing === items.length) groupLabel = "缺少机器人名称";
+      if (missing === items.length) groupLabel = "Missing robot name";
     }
-    header.textContent = `${groupLabel}（${items.length} 项）`;
+    header.textContent = `${groupLabel} (${items.length})`;
     const nested = document.createElement("ul");
     nested.className = "finding-group";
     // Bounded first paint: a large group renders its rows only when the operator opens it.
@@ -2286,7 +2286,7 @@ function renderRun(run) {
     link.href = run.pr.url;
     link.target = "_blank";
     link.rel = "noreferrer noopener";
-    link.textContent = "查看 PR";
+    link.textContent = "View PR";
     link.title = String(run.pr.url || "");
     pr.append(link);
     const stateText = document.createElement("span");
@@ -2295,7 +2295,7 @@ function renderRun(run) {
     pr.append(stateText);
     pr.hidden = false;
   } else if (automaticState === "passed") {
-    pr.textContent = "模型已通过独立校验；PR 尚未创建或发布服务失败，可先查看左侧已验证 URDF。";
+    pr.textContent = "The model passed independent verification, but no PR is available yet (not created or publication failed). The verified URDF is available on the left.";
     pr.hidden = false;
   } else {
     pr.hidden = true;
@@ -2311,18 +2311,18 @@ function renderPreviewDiagnostic(preview) {
     node.textContent = "";
     return;
   }
-  const lines = ["未通过工程校验：该交付仅供诊断，禁止发布。"];
+  const lines = ["Engineering verification failed: this delivery is diagnostic only and must not be published."];
   const checks = Array.isArray(preview.failing_checks) ? preview.failing_checks : [];
   const checksTotal = Number.isInteger(preview.failing_checks_total) ? preview.failing_checks_total : checks.length;
   if (checks.length) {
-    const shown = checks.slice(0, 8).map((check) => `${check.id}（${check.message || "检查未通过"}）`);
-    lines.push(`未通过检查：${shown.join("、")}${checksTotal > shown.length ? ` 等 ${checksTotal} 项` : ""}`);
+    const shown = checks.slice(0, 8).map((check) => `${check.id} (${check.message || "check failed"})`);
+    lines.push(`Failed checks: ${shown.join(", ")}${checksTotal > shown.length ? ` and ${checksTotal} total` : ""}`);
   }
   const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
   const warningsTotal = Number.isInteger(preview.warnings_total) ? preview.warnings_total : warnings.length;
   if (warnings.length) {
-    const shown = warnings.slice(0, 6).map((item) => `${item.code || "警告"}${item.object ? `（${item.object}）` : ""}`);
-    lines.push(`警告：${shown.join("、")}${warningsTotal > shown.length ? ` 等 ${warningsTotal} 条` : ""}`);
+    const shown = warnings.slice(0, 6).map((item) => `${item.code || "warning"}${item.object ? ` (${item.object})` : ""}`);
+    lines.push(`Warnings: ${shown.join(", ")}${warningsTotal > shown.length ? ` and ${warningsTotal} total` : ""}`);
   }
   node.textContent = lines.join("\n");
   node.hidden = false;
@@ -2337,7 +2337,7 @@ async function loadPreview(dagRunId) {
     const preview = await api(`/api/runs/${encodeURIComponent(dagRunId)}/preview`, { signal: request.signal });
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.previewSubject === preview.subject_sha256) return;
-    $("preview-meta").textContent = `交付摘要 ${String(preview.subject_sha256).slice(0, 12)}… · URDF ${preview.urdf}`;
+    $("preview-meta").textContent = `Delivery subject ${String(preview.subject_sha256).slice(0, 12)}... · URDF ${preview.urdf}`;
     renderPreviewDiagnostic(preview);
     note.hidden = true;
     setError($("preview-note"), "");
@@ -2354,14 +2354,14 @@ async function loadPreview(dagRunId) {
       signal: request.signal,
       onWarning: (warnings) => {
         if (warnings.length) {
-          note.textContent = warnings.join("；");
+          note.textContent = warnings.join("; ");
           note.hidden = false;
         }
       },
     });
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     state.controls = buildJointControls($("joint-controls"), loaded.joints, {});
-    $("joints-title").textContent = `关节滑杆（${loaded.joints.length}）`;
+    $("joints-title").textContent = `Joint controls (${loaded.joints.length})`;
     state.previewSubject = preview.subject_sha256;
     state.previewFiles = preview.files || {};
     if (state.previewCollapseFor !== dagRunId) {
@@ -2391,10 +2391,10 @@ async function loadPreview(dagRunId) {
     $("joint-controls").textContent = "";
     updatePreviewLayout();
     if (error.status === 404 || error.status === 409) {
-      setError($("preview-note"), `尚未提供已验证交付：${error.message}`);
+      setError($("preview-note"), `No verified delivery is available: ${error.message}`);
       return;
     }
-    setError($("preview-note"), `交付预览不可用：${error.message}`);
+    setError($("preview-note"), `Delivery preview unavailable: ${error.message}`);
   } finally {
     if (state.previewRequest === request) state.previewRequest = null;
   }
@@ -2555,7 +2555,7 @@ function wire() {
     }
     state.folderPick = picked;
     summary.hidden = false;
-    summary.textContent = `${picked.top} · ${picked.count} 个文件 · ${formatBytes(picked.bytes)}`;
+    summary.textContent = `${picked.top} · ${picked.count} files · ${formatBytes(picked.bytes)}`;
     setError($("run-error"), "");
     applyAssemblies(picked);
     loadTargets(picked);
@@ -2576,15 +2576,15 @@ function wire() {
     if (state.uploading) return;
     const picked = state.folderPick;
     if (!picked) {
-      setError($("run-error"), "请先选择本机的工程文件夹。");
+      setError($("run-error"), "Select a local engineering folder first.");
       return;
     }
     if (state.blockedPick) {
-      setError($("run-error"), "上一提交状态尚未确认；请在上方运行列表中确认，或重新选择文件夹后再提交。");
+      setError($("run-error"), "The previous submission state is unconfirmed; check the run list above or reselect the folder before submitting again.");
       return;
     }
     if (!state.assemblyChoice || !picked.assemblies.includes(state.assemblyChoice)) {
-      setError($("run-error"), "请先选择主装配。");
+      setError($("run-error"), "Select the main assembly first.");
       return;
     }
     const start = $("start-button");
@@ -2596,25 +2596,25 @@ function wire() {
     $("assembly-select").disabled = true;
     $("cancel-button").hidden = false;
     status.hidden = false;
-    status.textContent = "正在上传工程文件夹…";
+    status.textContent = "Uploading engineering folder...";
     setError($("run-error"), "");
     try {
       const payload = await submitRun(picked, {
         onProgress: (ratio) => {
           if (ratio >= 1) {
-            status.textContent = "上传完成，正在创建运行…";
+            status.textContent = "Upload complete; creating run...";
             $("cancel-button").hidden = true;
           } else {
-            status.textContent = `正在上传工程文件夹… ${Math.round(ratio * 100)}%`;
+            status.textContent = `Uploading engineering folder... ${Math.round(ratio * 100)}%`;
           }
         },
       });
-      status.textContent = "上传完成，正在创建运行…";
+      status.textContent = "Upload complete; creating run...";
       await selectRun(payload.dag_run_id);
       resetPick();
     } catch (error) {
       if (error.aborted) {
-        status.textContent = "已取消上传；正在刷新运行列表，如无新运行则表示未提交。";
+        status.textContent = "Upload cancelled; refreshing runs. If no new run appears, nothing was submitted.";
         await refreshRuns().catch(() => {});
       } else if (error.network) {
         status.textContent = error.message;
@@ -2622,13 +2622,13 @@ function wire() {
       } else if (error.status === 401) {
         clearSession();
         resetPick();
-        setError($("login-error"), "会话已失效，请重新登录后再试。");
+        setError($("login-error"), "The session expired; sign in again.");
         return;
       } else if (error.status === 502 && error.dagRunId) {
         state.blockedPick = true;
         setError(
           $("run-error"),
-          `启动状态尚未确认，请检查运行列表；不要重复提交。运行 ID: ${error.dagRunId}`,
+          `Start state is unconfirmed; check the run list and do not submit again. Run ID: ${error.dagRunId}`,
         );
         await refreshRuns().catch(() => {});
       } else {

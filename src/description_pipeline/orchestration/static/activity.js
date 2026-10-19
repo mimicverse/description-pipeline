@@ -9,48 +9,48 @@
 // explicitly and never replaced by a guess from the stage name.
 
 export const ACTIVITY_STATE_TEXT = {
-  queued: "排队中",
-  waiting: "等待进度",
-  busy: "进行中",
-  none: "无详细进度",
-  finished: "已结束",
+  queued: "Queued",
+  waiting: "Waiting for progress",
+  busy: "In progress",
+  none: "No detailed progress",
+  finished: "Finished",
 };
 
 export const FRESH_SOON_MS = 20000;
 export const FRESH_STALE_MS = 90000;
 
 const STAGE_TEXT = {
-  freeze: "冻结输入",
-  discover: "解析结构",
-  capture: "采集证据",
-  generate: "生成 URDF",
-  verify: "独立验证",
-  publish: "提交评审 PR",
+  freeze: "Freeze inputs",
+  discover: "Discover structure",
+  capture: "Capture evidence",
+  generate: "Generate URDF",
+  verify: "Independent verification",
+  publish: "Publish review PR",
 };
 
 // Starter vocabulary from the emit side; unknown codes fall back to a neutral stage phrase and
 // are never turned into invented specifics.
 const ACTION_TEXT = {
-  "discover.session_start": "正在启动 SolidWorks",
-  "discover.scan_documents": "扫描工程文件",
-  "discover.open_document": "打开文档",
-  "discover.select_configuration": "切换配置",
-  "discover.read_document_state": "读取已保存的模型状态",
-  "discover.read_components": "读取装配组件",
-  "discover.read_mates": "读取配合关系",
-  "discover.read_datums": "读取基准与坐标系",
-  "discover.read_properties": "读取属性与交付定义",
-  "discover.hash_sources": "计算文件摘要",
-  "discover.build_record": "生成发现记录",
+  "discover.session_start": "Starting SolidWorks",
+  "discover.scan_documents": "Scanning engineering files",
+  "discover.open_document": "Opening document",
+  "discover.select_configuration": "Switching configuration",
+  "discover.read_document_state": "Reading saved model state",
+  "discover.read_components": "Reading assembly components",
+  "discover.read_mates": "Reading mates",
+  "discover.read_datums": "Reading datums and coordinate systems",
+  "discover.read_properties": "Reading properties and delivery definitions",
+  "discover.hash_sources": "Computing file digests",
+  "discover.build_record": "Building discovery record",
 };
 
 const UNIT_TEXT = {
-  instances: "个实例",
-  documents: "个文档",
-  files: "个文件",
-  components: "个组件",
-  occurrences: "个实例",
-  mates: "组配合",
+  instances: "instances",
+  documents: "documents",
+  files: "files",
+  components: "components",
+  occurrences: "occurrences",
+  mates: "mates",
 };
 
 export function stageText(stage) {
@@ -63,7 +63,7 @@ export function actionText(code, stage) {
     return ACTION_TEXT[code];
   }
   const label = stageText(stage);
-  return label ? `${label}进行中` : "进行中";
+  return label ? `${label} in progress` : "In progress";
 }
 
 export function countsText(counts) {
@@ -72,33 +72,33 @@ export function countsText(counts) {
   const total = Number.isFinite(counts.total) ? counts.total : null;
   const unit = typeof counts.unit === "string" && UNIT_TEXT[counts.unit] ? ` ${UNIT_TEXT[counts.unit]}` : "";
   if (done === null && total === null) return "";
-  if (done !== null && total !== null) return `已处理 ${done}/${total}${unit}`;
-  if (done !== null) return `已处理 ${done}${unit}`;
-  return `计划 ${total}${unit}`;
+  if (done !== null && total !== null) return `Processed ${done}/${total}${unit}`;
+  if (done !== null) return `Processed ${done}${unit}`;
+  return `Planned ${total}${unit}`;
 }
 
 export function formatDuration(ms) {
   const safe = Number.isFinite(ms) && ms > 0 ? ms : 0;
   const seconds = Math.floor(safe / 1000);
-  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   const restSeconds = seconds % 60;
-  if (minutes < 60) return restSeconds ? `${minutes} 分 ${restSeconds} 秒` : `${minutes} 分`;
+  if (minutes < 60) return restSeconds ? `${minutes}m ${restSeconds}s` : `${minutes}m`;
   const hours = Math.floor(minutes / 60);
   const restMinutes = minutes % 60;
-  return restMinutes ? `${hours} 小时 ${restMinutes} 分` : `${hours} 小时`;
+  return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
 }
 
 export function freshnessText(updatedAt, nowMs) {
   const at = typeof updatedAt === "string" ? Date.parse(updatedAt) : NaN;
   if (!Number.isFinite(at)) return { text: "", stale: false, known: false, ageMs: null };
   const age = Math.max(0, Number.isFinite(nowMs) ? nowMs - at : 0);
-  if (age <= FRESH_SOON_MS) return { text: "刚刚更新", stale: false, known: true, ageMs: age };
+  if (age <= FRESH_SOON_MS) return { text: "Updated just now", stale: false, known: true, ageMs: age };
   if (age < FRESH_STALE_MS) {
-    return { text: `${Math.floor(age / 1000)} 秒前更新`, stale: false, known: true, ageMs: age };
+    return { text: `Updated ${Math.floor(age / 1000)}s ago`, stale: false, known: true, ageMs: age };
   }
   return {
-    text: `暂无新更新（上次更新 ${formatDuration(age)}前）`,
+    text: `No new update (last updated ${formatDuration(age)} ago)`,
     stale: true,
     known: true,
     ageMs: age,
@@ -162,7 +162,7 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
   };
   const terminalRun = runState === "success" || runState === "failed";
   if (terminalRun || rawState === "finished") {
-    // Terminal runs keep at most a compact 最后活动 record for diagnosis: the live visuals
+    // Terminal runs keep at most a compact last-activity record for diagnosis.
     // (dot animation, elapsed ticking, staleness nagging) are gone. Legacy terminal runs
     // without any preserved record stay hidden.
     const recent = recentRows(record || {});
@@ -183,7 +183,7 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
       stageText: stageText(stage),
       actionText: action && action.code ? actionText(action.code, stage) : "",
       objectText,
-      freshnessText: stamp ? `最后活动：${stamp}` : "",
+      freshnessText: stamp ? `Last activity: ${stamp}` : "",
       recent,
     };
   }
@@ -209,7 +209,7 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
       actionText: actionText(action && action.code, stage),
       objectText: typeof record.object === "string" ? record.object : "",
       countsText: countsText(record.counts),
-      elapsedText: Number.isFinite(startedAt) ? `已进行 ${formatDuration(Math.max(0, nowMs - startedAt))}` : "",
+      elapsedText: Number.isFinite(startedAt) ? `Elapsed ${formatDuration(Math.max(0, nowMs - startedAt))}` : "",
       note: "",
     };
   }
@@ -218,7 +218,7 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
       ...base,
       state: "queued",
       stateText: ACTIVITY_STATE_TEXT.queued,
-      note: "已进入队列，等待开始。",
+    note: "Queued and waiting to start.",
     };
   }
   // waiting | none | anything without a usable record: state the gap explicitly and never
@@ -227,7 +227,7 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
     ...base,
     state: rawState === "waiting" ? "waiting" : "none",
     stateText: rawState === "waiting" ? ACTIVITY_STATE_TEXT.waiting : ACTIVITY_STATE_TEXT.none,
-    note: runState === "running" ? "运行进行中，但暂无详细进度可用（未上报实时活动）。" : "暂无详细进度可用。",
+    note: runState === "running" ? "The run is active but no detailed progress is available (no live activity was reported)." : "No detailed progress is available.",
   };
 }
 

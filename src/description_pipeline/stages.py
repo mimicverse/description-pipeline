@@ -23,10 +23,7 @@ STAGE_IDS = tuple(stage["id"] for stage in CONTRACT["stages"])
 #: native; generation, verification and publication stay portable.
 HOST_IDS = ("linux", "windows")
 HOST_BY_STAGE = {stage["id"]: tuple(stage.get("hosts") or ()) for stage in CONTRACT["stages"]}
-if any(
-    not hosts or len(set(hosts)) != len(hosts) or set(hosts) - set(HOST_IDS)
-    for hosts in HOST_BY_STAGE.values()
-):
+if any(not hosts or len(set(hosts)) != len(hosts) or set(hosts) - set(HOST_IDS) for hosts in HOST_BY_STAGE.values()):
     raise PipelineError("Every engineering stage must declare its execution hosts")
 if any(
     not isinstance(stage.get("host_text"), str)
@@ -140,6 +137,7 @@ def required_rows_complete(required, rows) -> bool:
         and set(required) <= set(names)
         and all(row.get("state") == "passed" and row.get("passed") is True for row in rows)
     )
+
 
 # ---------------------------------------------------------------------------
 # Live activity — what a running stage is doing right now.  This is deliberately
@@ -566,18 +564,14 @@ def require_complete(view):
 
 
 def contract_markdown():
-    """The six-stage table rendered cell-for-cell from the machine contract.
-
-    The same definition the runtime consumes renders this table, so
-    ``docs/contracts.md`` is compared exactly against this output.
-    """
+    """Render the English machine-contract summary used in Airflow documentation."""
     rows = [
-        "| 阶段 | 执行 | 输入与输入检查 | 封存输出与输出检查 |",
+        "| Stage | Execution | Input and input checks | Sealed output and output checks |",
         "|---|---|---|---|",
     ]
     for stage in CONTRACT["stages"]:
         rows.append(
-            f"| `{stage['id']}` {stage['name_zh']} | {stage['host_text']} | "
+            f"| `{stage['id']}` {stage['name']} | {stage['host_text']} | "
             f"{stage['doc']['input']} | {stage['doc']['output']} |"
         )
     return "\n".join(rows)

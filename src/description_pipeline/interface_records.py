@@ -331,12 +331,12 @@ RESOURCE_POLICY_V1 = {
         "max_upload_bytes": 2 * 1024**3 + 4096 * 1024 + 65536,  # uploads.py:68-69 MAX_BODY_BYTES derivation
     },
     "timeouts": {
-        # W1 新默认: no absolute timeout exists today (only per-request socket
-        # deadlines); rationale per key.
-        "upload_seconds": 3600,  # W1 新默认: 2 GiB upload on a slow link
-        "unpack_seconds": 900,  # W1 新默认: bounded for the 16 GiB accept limit
-        "admission_seconds": 300,  # W1 新默认: path/inventory/capacity admission checks
-        "job_seconds": 86400,  # W1 新默认: long native capture on the serial endpoint queue
+        # W1 defaults: no absolute timeout exists today, only per-request socket
+        # deadlines.  Rationale is recorded per key.
+        "upload_seconds": 3600,  # 2 GiB upload on a slow link
+        "unpack_seconds": 900,  # bounded for the 16 GiB accept limit
+        "admission_seconds": 300,  # path, inventory, and capacity admission checks
+        "job_seconds": 86400,  # long native capture on the serial endpoint queue
     },
     "capacity": {
         "min_free_bytes": 2
@@ -951,7 +951,7 @@ def _string_list(value, code: str, where: str, *, allow_empty: bool) -> list:
 def validate_config_snapshot(snapshot) -> dict:
     """Immutable generation snapshot (IF-16): the full rendered platform tree, no secrets.
 
-    Shape per ``docs/deployment.md`` §配置权威 and C's authoritative field table
+    Shape per ``docs/deployment.md`` configuration authority and C's authoritative field table
     (``config-snapshot-resolved-fields-C.md``): every level rejects unknown keys,
     paths are absolute without ``..`` (symlink/mode/readability checks belong to
     the consuming host), and configured roots must not overlap.  ``derived``
@@ -1362,7 +1362,7 @@ def validate_delivery_manifest(manifest) -> dict:
     _require(manifest["schema_version"] == DELIVERY_MANIFEST_SCHEMA, code, {"where": "schema_version"})
     _exact_keys(manifest["subject"], {"files", "digest"}, code, "subject")
     files = manifest["subject"]["files"]
-    # Each record carries path, byte length and SHA-256 (contracts §交付格式与摘要);
+    # Each record carries path, byte length and SHA-256 (contracts delivery format and digest);
     # the inventory owner enforces the shape and unique paths, the manifest
     # additionally requires sorted relative POSIX paths and bound bytes.
     mapping, paths = subject_file_records(files, code)
@@ -1553,9 +1553,7 @@ def release_support() -> dict:
             }
             for role in RELEASE_ROLES
         },
-        "hosts": {
-            host: [stage for stage in STAGE_IDS if host in HOST_BY_STAGE[stage]] for host in HOST_IDS
-        },
+        "hosts": {host: [stage for stage in STAGE_IDS if host in HOST_BY_STAGE[stage]] for host in HOST_IDS},
     }
 
 

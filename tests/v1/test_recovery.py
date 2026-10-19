@@ -33,7 +33,7 @@ class RecoveryTests(unittest.TestCase):
                 plan = start_plan(job(), stage, probe=ALL_OK, tool="ok")
                 self.assertTrue(plan["accepted"], plan)
                 self.assertEqual(plan["start_stage"], stage)
-                self.assertTrue(plan["stage_name_zh"])
+                self.assertTrue(plan["stage_name"])
 
     def test_completed_parent_runs_are_allowed(self) -> None:
         plan = start_plan(job(status="passed"), "publish", probe=ALL_OK, tool="ok")
@@ -45,7 +45,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(plan["accepted"])
         self.assertEqual(plan["reason"], "prerequisite_invalid")
         self.assertEqual(plan["earliest_required"], "generate")
-        self.assertIn("生成 URDF", plan["reason_zh"])
+        self.assertIn("Generate URDF", plan["message"])
         self.assertTrue(start_plan(job(), "generate", probe=probe, tool="ok")["accepted"])
 
     def test_tool_change_forces_freeze_restart_and_never_mixes_receipts(self) -> None:

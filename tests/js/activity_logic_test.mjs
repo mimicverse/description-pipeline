@@ -45,19 +45,19 @@ const busy = activityView(
 );
 assert.equal(busy.visible, true);
 assert.equal(busy.state, "busy");
-assert.equal(busy.stateText, "进行中");
-assert.equal(busy.stageText, "解析结构");
-assert.equal(busy.actionText, "读取装配组件");
+assert.equal(busy.stateText, "In progress");
+assert.equal(busy.stageText, "Discover structure");
+assert.equal(busy.actionText, "Reading assembly components");
 assert.equal(busy.objectText, "3.0 总装1008.SLDASM");
-assert.equal(busy.countsText, "已处理 120/483 个实例");
-assert.equal(busy.elapsedText, "已进行 2 分 5 秒");
-assert.equal(busy.freshnessText, "刚刚更新");
+assert.equal(busy.countsText, "Processed 120/483 instances");
+assert.equal(busy.elapsedText, "Elapsed 2m 5s");
+assert.equal(busy.freshnessText, "Updated just now");
 assert.equal(busy.stale, false);
 assert.equal(busy.note, "");
 assert.equal(busy.recent.length, 3);
 assert.match(busy.recent[0].timeText, /^\d{2}:\d{2}:\d{2}$/);
 assert.ok(busy.recent[0].at >= busy.recent[1].at && busy.recent[1].at >= busy.recent[2].at, "newest first");
-assert.equal(busy.recent[0].text, "读取装配组件");
+assert.equal(busy.recent[0].text, "Reading assembly components");
 assert.equal(busy.recent[0].object, "3.0 总装1008.SLDASM");
 
 // Hard rules: no percentage figures, no forecasts, in any produced string.
@@ -68,7 +68,7 @@ const strings = [
 ];
 for (const value of strings) {
   assert.ok(!value.includes("%"), `percent leaked: ${value}`);
-  assert.ok(!value.includes("预计") && !value.includes("剩余"), `forecast leaked: ${value}`);
+  assert.ok(!value.toLowerCase().includes("forecast") && !value.toLowerCase().includes("remaining"), `forecast leaked: ${value}`);
 }
 
 // Stale record: recency comes only from updated_at; wording states "no new update" only.
@@ -85,7 +85,7 @@ const stale = activityView(
   { runState: "running", nowMs },
 );
 assert.equal(stale.stale, true);
-assert.ok(stale.freshnessText.startsWith("暂无新更新"), stale.freshnessText);
+assert.ok(stale.freshnessText.startsWith("No new update"), stale.freshnessText);
 
 // No telemetry: explicit unavailable, no fabricated action, still visible while running.
 const none = activityView(
@@ -96,7 +96,7 @@ assert.equal(none.visible, true);
 assert.equal(none.state, "none");
 assert.equal(none.actionText, "");
 assert.equal(none.freshnessText, "");
-assert.ok(none.note.includes("暂无详细进度"), none.note);
+assert.ok(none.note.includes("no detailed progress"), none.note);
 
 // waiting: runner active without a telemetry record — same explicit wording.
 const waiting = activityView(
@@ -104,8 +104,8 @@ const waiting = activityView(
   { runState: "running", nowMs },
 );
 assert.equal(waiting.state, "waiting");
-assert.equal(waiting.stateText, "等待进度");
-assert.ok(waiting.note.includes("暂无详细进度"));
+assert.equal(waiting.stateText, "Waiting for progress");
+assert.ok(waiting.note.includes("no detailed progress"));
 
 // queued: accepted but not started — no elapsed, no action.
 const queued = activityView(
@@ -113,9 +113,9 @@ const queued = activityView(
   { runState: "queued", nowMs },
 );
 assert.equal(queued.visible, true);
-assert.equal(queued.stateText, "排队中");
+assert.equal(queued.stateText, "Queued");
 assert.equal(queued.elapsedText, "");
-assert.equal(queued.note, "已进入队列，等待开始。");
+assert.equal(queued.note, "Queued and waiting to start.");
 
 // Terminal runs and finished records never render a live block.
 assert.equal(
@@ -144,10 +144,10 @@ const finalView = activityView(
 );
 assert.equal(finalView.visible, true);
 assert.equal(finalView.final, true);
-assert.equal(finalView.stateText, "已结束");
-assert.equal(finalView.actionText, "读取配合关系");
+assert.equal(finalView.stateText, "Finished");
+assert.equal(finalView.actionText, "Reading mates");
 assert.equal(finalView.objectText, "headM3.0.SLDASM");
-assert.ok(finalView.freshnessText.startsWith("最后活动："), finalView.freshnessText);
+assert.ok(finalView.freshnessText.startsWith("Last activity:"), finalView.freshnessText);
 assert.equal(finalView.recent.length, 1);
 assert.equal(activityPlacement(finalView, { stageId: "capture", stageRunning: false, stageFailed: true }), "final");
 assert.equal(activityPlacement(finalView, { stageId: "capture", stageRunning: false, stageFailed: false }), "hidden");
@@ -156,17 +156,17 @@ assert.equal(activityPlacement(finalView, { stageId: "discover", stageRunning: f
 // The full emitted vocabulary maps to concrete labels (a slow open/rebuild call must not stay
 // at a blind 进行中); unknown codes keep the neutral fallback.
 const EMITTED_ACTIONS = [
-  ["discover.session_start", "正在启动 SolidWorks"],
-  ["discover.scan_documents", "扫描工程文件"],
-  ["discover.open_document", "打开文档"],
-  ["discover.select_configuration", "切换配置"],
-  ["discover.read_document_state", "读取已保存的模型状态"],
-  ["discover.read_components", "读取装配组件"],
-  ["discover.read_mates", "读取配合关系"],
-  ["discover.read_datums", "读取基准与坐标系"],
-  ["discover.read_properties", "读取属性与交付定义"],
-  ["discover.hash_sources", "计算文件摘要"],
-  ["discover.build_record", "生成发现记录"],
+  ["discover.session_start", "Starting SolidWorks"],
+  ["discover.scan_documents", "Scanning engineering files"],
+  ["discover.open_document", "Opening document"],
+  ["discover.select_configuration", "Switching configuration"],
+  ["discover.read_document_state", "Reading saved model state"],
+  ["discover.read_components", "Reading assembly components"],
+  ["discover.read_mates", "Reading mates"],
+  ["discover.read_datums", "Reading datums and coordinate systems"],
+  ["discover.read_properties", "Reading properties and delivery definitions"],
+  ["discover.hash_sources", "Computing file digests"],
+  ["discover.build_record", "Building discovery record"],
 ];
 assert.equal(EMITTED_ACTIONS.length, 11);
 for (const [code, label] of EMITTED_ACTIONS) {
@@ -174,25 +174,25 @@ for (const [code, label] of EMITTED_ACTIONS) {
 }
 
 // Unknown codes fall back to a neutral stage phrase, never an invented specific.
-assert.equal(actionText("discover.something_new", "discover"), "解析结构进行中");
-assert.equal(actionText(null, null), "进行中");
-assert.equal(stageText("capture"), "采集证据");
+assert.equal(actionText("discover.something_new", "discover"), "Discover structure in progress");
+assert.equal(actionText(null, null), "In progress");
+assert.equal(stageText("capture"), "Capture evidence");
 assert.equal(stageText("mystery"), "mystery");
 
 // Counts: real numbers only, unit optional, never a percentage.
-assert.equal(countsText({ done: 5, total: 10 }), "已处理 5/10");
-assert.equal(countsText({ done: 5 }), "已处理 5");
-assert.equal(countsText({ total: 10 }), "计划 10");
-assert.equal(countsText({ done: 5, total: 10, unit: "documents" }), "已处理 5/10 个文档");
+assert.equal(countsText({ done: 5, total: 10 }), "Processed 5/10");
+assert.equal(countsText({ done: 5 }), "Processed 5");
+assert.equal(countsText({ total: 10 }), "Planned 10");
+assert.equal(countsText({ done: 5, total: 10, unit: "documents" }), "Processed 5/10 documents");
 assert.equal(countsText(null), "");
 
 // Duration and freshness formatting.
-assert.equal(formatDuration(45000), "45 秒");
-assert.equal(formatDuration(125000), "2 分 5 秒");
-assert.equal(formatDuration(120000), "2 分");
-assert.equal(formatDuration(3600000 + 120000), "1 小时 2 分");
+assert.equal(formatDuration(45000), "45s");
+assert.equal(formatDuration(125000), "2m 5s");
+assert.equal(formatDuration(120000), "2m");
+assert.equal(formatDuration(3600000 + 120000), "1h 2m");
 assert.equal(freshnessText(null, nowMs).known, false);
-assert.equal(freshnessText(new Date(nowMs - 30000).toISOString(), nowMs).text, "30 秒前更新");
+assert.equal(freshnessText(new Date(nowMs - 30000).toISOString(), nowMs).text, "Updated 30s ago");
 
 // Placement: live only for the running stage's own activity; otherwise an explicit note.
 assert.equal(activityPlacement(busy, { stageId: "discover", stageRunning: true }), "live");

@@ -25,6 +25,7 @@ from .inertia_convention import normalize_capture_inertia
 from .native import session_materialization_path
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, read_json, sha256_file, write_json
+
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
 from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
@@ -72,18 +73,21 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _mass_evidence_binding(value: Any, *, required: bool) -> dict[str, str] | str | None:
-    """质量证据必须归档成模型仓库里的文件并按内容摘要绑定。
+    """Mass evidence must be archived in the model repository and bound by its content digest.
 
-    合同（``documented_masses`` 非空时 ``required=True``）：
+    Contract (``required=True`` when ``documented_masses`` is non-empty):
 
-    * ``source.mass_evidence`` 是对象：``reference``（人读说明）+ ``file``（模型仓库内相对
-      路径）+ ``sha256``（小写 64 位十六进制）；只允许这四个键；
-    * 每条 ``documented_masses[].evidence`` 是**该文件内的定位锚点**——独立校验会确认
-      这个字符串确实出现在归档文件里；
-    * 不声明文档化质量时，仍接受一段说明字符串（此时材料来自 CAD，不是声明值）。
+    * ``source.mass_evidence`` is an object with ``reference`` (human-readable note),
+      ``file`` (relative path in the model repository), and ``sha256`` (64 lowercase
+      hexadecimal digits); exactly these keys are accepted.
+    * Every ``documented_masses[].evidence`` value is an anchor inside that file; the
+      independent verifier confirms that the string occurs in the archived content.
+    * Without documented masses, a descriptive string is still accepted because the
+      material source is CAD rather than a declared value.
 
-    文件是否存在、是否越界、摘要是否一致由独立校验在模型仓库根目录上核对：本函数运行在
-    采集侧（Windows worker），那里没有模型仓库，因此只校验形状。
+    File existence, confinement, and digest matching are checked by the independent
+    verifier at the model-repository root. This function runs on the capture-side
+    Windows worker, where no model repository exists, so it validates shape only.
     """
 
     if value is None or value == "":
@@ -310,8 +314,8 @@ def validate_source_config(config: object) -> dict[str, Any]:
             "documented mass needs a stated reason",
             {"component": name},
         )
-        # 证据文件由 source.mass_evidence 绑定（file + sha256）；每条质量必须给出
-        # **该文件内的定位锚点**，独立校验会确认锚点确实出现在文件内容里。
+        # The evidence file is bound by source.mass_evidence (file + sha256); every
+        # mass must provide an anchor that the independent verifier finds in the file.
         evidence = value.get("evidence")
         _require(
             isinstance(evidence, str) and evidence.strip() != "",
@@ -327,17 +331,14 @@ def validate_source_config(config: object) -> dict[str, Any]:
         material_source != "documented_table" or bool(documented),
         "material_source=documented_table requires a non-empty source.documented_masses table",
     )
-    # 质量模式合同（配置层，能查就早查）：
-    #  * 任何声明了质量的组件都必须真的被某个 body 纳入——拼错/改名的键不能静默失效；
-    #  * documented_table 模式必须为每个被纳入的组件给出质量，缺一个就直接拒绝，
-    #    不允许落回 CAD 的默认密度占位值。
+    # Mass-mode contract at configuration time:
+    #  * every component with a declared mass must be included by a body;
+    #  * documented_table mode must provide a mass for every included component and
+    #    must never fall back to a CAD default-density placeholder.
     if documented:
         declared_groups = [item for item in (config.get("groups") or []) if isinstance(item, dict)]
         included = {
-            str(component)
-            for group in declared_groups
-            for component in (group.get("components") or [])
-            if component
+            str(component) for group in declared_groups for component in (group.get("components") or []) if component
         }
         if included:
             unknown = sorted(set(documented) - included)
@@ -353,8 +354,8 @@ def validate_source_config(config: object) -> dict[str, Any]:
                     "documented_table requires a mass for every included component",
                     {"missing": missing[:20]},
                 )
-    # 物理上已计入的几何排除项：只允许"组件 + 原因 + 结构化证据"的对象，
-    # 不允许用裸字符串或空原因悄悄跳过几何。
+    # Geometry exclusions already charged in the physics model must be objects with
+    # component, reason, and structured evidence; bare strings cannot skip geometry.
     raw_exclusions = config.get("geometry_exclusions") or {}
     _require(
         isinstance(raw_exclusions, dict),
@@ -606,6 +607,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         for entry in closure.get("imports") or []
         if isinstance(entry, dict) and entry.get("materialization")
     }
+
     # Exact-occurrence binding: the closure records which occurrences were
     # session materializations.  The current session's materialization paths
     # differ from the selection session's, so the stable key is the exact
@@ -629,6 +631,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         token = _closure_owner_token(entry)
         if isinstance(instance, str) and instance and token is not None:
             materialization_keys.add((token, instance))
+
     # Stale author source links recorded by the closure (import metadata): the
     # exact author path may still be listed by the engine, but after the
     # coverage proof below it is excluded from the required graph and copied
@@ -754,10 +757,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         if not document:
             continue
         key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
-        if (
-            key in materialization_keys
-            or os.path.normcase(os.path.abspath(document)) in cached_import_paths
-        ):
+        if key in materialization_keys or os.path.normcase(os.path.abspath(document)) in cached_import_paths:
             import_temp_documents.append(document)
             continue
         original_documents.append(document)
@@ -1586,9 +1586,7 @@ def _effective_instance_record(
     """
 
     readings_payload = {
-        str(name): dict(reading)
-        for name, reading in sorted((readings or {}).items())
-        if isinstance(reading, dict)
+        str(name): dict(reading) for name, reading in sorted((readings or {}).items()) if isinstance(reading, dict)
     }
     warnings: list[dict[str, Any]] = []
     for name, reading in sorted(readings_payload.items()):
@@ -1601,14 +1599,15 @@ def _effective_instance_record(
             {
                 "code": (
                     "cad_instance_measurement_differs_from_part"
-                    if instance_difference else "cad_instance_override_effective"
+                    if instance_difference
+                    else "cad_instance_override_effective"
                 ),
                 "blocking": False,
                 "message": (
                     "the native assembly-instance measurement differs from the part-document measurement; "
                     "the cause is unproven and both are retained"
-                    if instance_difference else
-                    "the instance carries CAD-authored mass-property overrides; these are effective CAD values, "
+                    if instance_difference
+                    else "the instance carries CAD-authored mass-property overrides; these are effective CAD values, "
                     "not geometry qualification"
                 ),
                 "component": name,
@@ -1623,8 +1622,8 @@ def _effective_instance_record(
                 "qualification": (
                     "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
                     "not geometry-derived, not independently physically qualified"
-                    if instance_difference else
-                    "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
+                    if instance_difference
+                    else "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
                 ),
                 **({"part_measurement": reading.get("part_measurement")} if instance_difference else {}),
                 "measurement": {

@@ -1,6 +1,6 @@
 """The delivery file boundary shared by verification and PR submission.
 
-Target tree (contracts §交付格式与摘要): the subject is ``input/``, ``evidence/``,
+Target tree (contracts delivery format and digest): the subject is ``input/``, ``evidence/``,
 ``model/``, ``urdf/``, ``meshes/`` and ``tool.json``.  ``manifest.json`` and
 ``reports/quality.json`` stay outside the subject; every other file is refused.
 """

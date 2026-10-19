@@ -372,7 +372,7 @@ class RunMetadataTests(unittest.TestCase):
             with self.subTest(case=method):
                 status, _, body = self.client.request(method, path, payload)
                 self.assertEqual(status, 404, body)
-                self.assertIn("平台登记", json.loads(body)["error"])
+                self.assertIn("platform registration", json.loads(body)["error"])
         status, _, body = self.client.request("GET", f"/api/runs/{run_id}")
         self.assertEqual(status, 200, body)
         self.assertFalse(json.loads(body)["deleted"])
@@ -417,7 +417,7 @@ class RunMetadataTests(unittest.TestCase):
         # Detail exposes the same authoritative lineage as the list rows.
         self.assertEqual(detail["parent_dag_run_id"], parent)
         self.assertEqual(detail["resume_from"], "verify")
-        self.assertTrue(detail["resume_from_name_zh"])
+        self.assertTrue(detail["resume_from_name"])
         status, payload = self._list(self.client)
         row = next(item for item in payload["runs"] if item["dag_run_id"] == child)
         self.assertEqual(row["parent_dag_run_id"], parent)

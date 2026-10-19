@@ -110,12 +110,12 @@ class UploadGate:
     @contextmanager
     def slot(self, principal: str) -> Iterator[None]:
         if not self._portal.acquire(blocking=False):
-            raise UploadRejected(429, "上传通道繁忙，请稍后重试")
+            raise UploadRejected(429, "Upload channel is busy; retry later")
         with self._lock:
             per_principal = self._principals.setdefault(principal, threading.BoundedSemaphore(1))
         if not per_principal.acquire(blocking=False):
             self._portal.release()
-            raise UploadRejected(429, "已有一个上传正在进行，请等待完成")
+            raise UploadRejected(429, "Another upload is already in progress; wait for it to finish")
         try:
             yield
         finally:
@@ -126,30 +126,34 @@ class UploadGate:
 def admit_member(filename: object) -> tuple[str, tuple[str, ...]]:
     """Admit one uploaded member name; returns the NFC relative path and its parts."""
     if not isinstance(filename, str) or not filename:
-        raise UploadRejected(400, "上传文件缺少名称")
+        raise UploadRejected(400, "Uploaded file has no name")
     if "\\" in filename:
-        raise UploadRejected(400, "文件路径不能包含反斜杠")
+        raise UploadRejected(400, "File paths cannot contain backslashes")
     name = unicodedata.normalize("NFC", filename)
     segments = name.split("/")
     if any(segment == "" for segment in segments):
-        raise UploadRejected(400, "文件路径包含空路径段")
+        raise UploadRejected(400, "File path contains an empty segment")
     if len(segments) < 2:
-        raise UploadRejected(400, "请选择整个工程文件夹，而不是单个文件")
+        raise UploadRejected(400, "Select the complete engineering folder, not an individual file")
     for segment in segments:
         if segment in {".", ".."}:
-            raise UploadRejected(400, "文件路径不能包含 . 或 .. 路径段")
+            raise UploadRejected(400, "File paths cannot contain '.' or '..' segments")
         if len(segment) > MAX_COMPONENT:
-            raise UploadRejected(400, "文件名超过 255 个字符")
+            raise UploadRejected(400, "A file name exceeds 255 characters")
         if segment.startswith(TRANSIENT_PREFIX):
-            raise UploadRejected(400, "上传包含 SolidWorks 临时锁文件（~$ 开头）；请关闭 SolidWorks 或删除后重试")
+            raise UploadRejected(
+                400,
+                "Upload contains a SolidWorks temporary lock file (~$ prefix); "
+                "close SolidWorks or remove it before retrying",
+            )
     if len(name) > MAX_RELATIVE_PATH:
-        raise UploadRejected(400, "文件相对路径超过 1024 个字符")
+        raise UploadRejected(400, "A relative file path exceeds 1024 characters")
     try:
         parts = artifact_path_parts(name)
     except PipelineError as error:
-        raise UploadRejected(400, f"不符合平台文件命名规则：{str(error)[:200]}") from error
+        raise UploadRejected(400, f"Path does not satisfy platform naming rules: {str(error)[:200]}") from error
     if parts != tuple(segments):
-        raise UploadRejected(400, "文件路径规范化结果不一致")
+        raise UploadRejected(400, "File-path normalization is inconsistent")
     return name, parts
 
 
@@ -165,24 +169,24 @@ def receive_folder(
     root = Path(intake_root)
     final = root / run_id
     if final.exists():
-        raise UploadRejected(409, "该运行的上传目录已存在")
+        raise UploadRejected(409, "The upload directory for this run already exists")
     kind, options = parse_options_header(str(environ.get("CONTENT_TYPE") or ""))
     if kind.lower() != b"multipart/form-data":
-        raise UploadRejected(400, "请通过页面上的文件夹按钮上传工程文件夹")
+        raise UploadRejected(400, "Use the folder control on the page to upload the engineering folder")
     boundary = options.get(b"boundary")
     if not boundary:
-        raise UploadRejected(400, "上传请求缺少 multipart 边界")
+        raise UploadRejected(400, "Upload request has no multipart boundary")
     declared_raw = environ.get("CONTENT_LENGTH")
     if not declared_raw:
-        raise UploadRejected(411, "上传请求缺少长度声明，无法安全校验")
+        raise UploadRejected(411, "Upload request has no length declaration and cannot be validated safely")
     try:
         declared = int(str(declared_raw))
     except ValueError as error:
-        raise UploadRejected(400, "上传长度声明不是整数") from error
+        raise UploadRejected(400, "Upload length declaration is not an integer") from error
     if declared <= 0:
-        raise UploadRejected(400, "上传内容为空")
+        raise UploadRejected(400, "Upload content is empty")
     if declared > MAX_BODY_BYTES:
-        raise UploadRejected(413, "上传超过 2 GiB 或 4096 个文件的上限")
+        raise UploadRejected(413, "Upload exceeds the 2 GiB or 4096-file limit")
     staging = root / STAGING_DIRNAME / run_id
     with gate.slot(principal):
         _require_disk(root, declared)
@@ -190,8 +194,8 @@ def receive_folder(
             staging.mkdir(parents=True, exist_ok=False)
         except OSError as error:
             if error.errno in {errno.ENOSPC, errno.EDQUOT}:
-                raise UploadRejected(507, "服务器存储空间不足，请稍后重试") from error
-            raise UploadRejected(500, "无法创建上传暂存目录") from error
+                raise UploadRejected(507, "Server storage is insufficient; retry later") from error
+            raise UploadRejected(500, "Cannot create the upload staging directory") from error
         try:
             receiver = _Receiver(staging, root)
             try:
@@ -215,7 +219,7 @@ def _require_disk(intake_root: Path, declared: int) -> None:
     usage = shutil.disk_usage(intake_root)
     reserve = max(DISK_RESERVE_FLOOR, int(usage.total * DISK_RESERVE_FRACTION))
     if usage.free - declared - reserve < 0:
-        raise UploadRejected(507, "服务器存储空间不足，请稍后重试")
+        raise UploadRejected(507, "Server storage is insufficient; retry later")
 
 
 def _parse_body(stream: Any, boundary: bytes | str, receiver: _Receiver, declared: int) -> None:
@@ -224,18 +228,18 @@ def _parse_body(stream: Any, boundary: bytes | str, receiver: _Receiver, declare
     while remaining > 0:
         chunk = stream.read(min(_READ_CHUNK, remaining))
         if not chunk:
-            raise UploadRejected(400, "上传中断，数据不完整")
+            raise UploadRejected(400, "Upload was interrupted and the data is incomplete")
         remaining -= len(chunk)
         try:
             parser.write(chunk)
         except (MultipartParseError, FormParserError) as error:
-            raise UploadRejected(400, "上传内容无法解析为 multipart 数据") from error
+            raise UploadRejected(400, "Upload content is not valid multipart data") from error
     try:
         parser.finalize()
     except (MultipartParseError, FormParserError) as error:
-        raise UploadRejected(400, "上传内容不完整") from error
+        raise UploadRejected(400, "Upload content is incomplete") from error
     if not receiver.ended:
-        raise UploadRejected(400, "上传内容不完整（缺少结束边界）")
+        raise UploadRejected(400, "Upload content is incomplete (missing closing boundary)")
 
 
 class _Receiver:
@@ -301,16 +305,16 @@ class _Receiver:
 
     def _on_headers_finished(self) -> None:
         if self._handle is not None:
-            raise UploadRejected(400, "上传分片未正确闭合")
+            raise UploadRejected(400, "Upload part is not correctly closed")
         disposition, params = parse_options_header(self._disposition)
         if disposition.lower() != b"form-data":
-            raise UploadRejected(400, "上传分片缺少表单描述")
+            raise UploadRejected(400, "Upload part has no form disposition")
         field = params.get(b"name")
         if field == MAIN_ASSEMBLY_FIELD.encode("ascii"):
             if params.get(b"filename"):
-                raise UploadRejected(400, "主装配选择不能作为文件上传")
+                raise UploadRejected(400, "Main-assembly selection cannot be uploaded as a file")
             if self._assembly_seen:
-                raise UploadRejected(400, "上传包含重复的主装配选择")
+                raise UploadRejected(400, "Upload contains duplicate main-assembly selections")
             self._assembly_seen = True
             self._text_field = MAIN_ASSEMBLY_FIELD
             return
@@ -321,14 +325,14 @@ class _Receiver:
         }:
             name = bytes(field).decode("ascii")
             if params.get(b"filename"):
-                raise UploadRejected(400, "发布身份字段不能作为文件上传")
+                raise UploadRejected(400, "Publication identity fields cannot be uploaded as files")
             seen = {
                 TARGET_HARDWARE_FIELD: self._target_seen,
                 CHANGE_SUMMARY_FIELD: self._summary_seen,
                 PURPOSE_FIELD: self._purpose_seen,
             }[name]
             if seen:
-                raise UploadRejected(400, "上传包含重复的发布身份字段")
+                raise UploadRejected(400, "Upload contains duplicate publication identity fields")
             if name == TARGET_HARDWARE_FIELD:
                 self._target_seen = True
             elif name == CHANGE_SUMMARY_FIELD:
@@ -339,50 +343,51 @@ class _Receiver:
             return
         if field != UPLOAD_FIELD.encode("ascii"):
             raise UploadRejected(
-                400, "只接受 files 文件部分与 main_assembly/target_hardware/change_summary/purpose 选择"
+                400,
+                "Only files plus the main_assembly, target_hardware, change_summary, and purpose fields are accepted",
             )
         raw_name = params.get(b"filename")
         if not raw_name:
-            raise UploadRejected(400, "上传分片缺少文件名")
+            raise UploadRejected(400, "Upload part has no filename")
         try:
             filename = raw_name.decode("utf-8", "strict")
         except UnicodeDecodeError as error:
-            raise UploadRejected(400, "文件名不是有效的 UTF-8 文本") from error
+            raise UploadRejected(400, "Filename is not valid UTF-8 text") from error
         name, parts = admit_member(filename)
         top = parts[0]
         if self.top is None:
             self.top = top
         elif top != self.top:
             if top.casefold() == self.top.casefold():
-                raise UploadRejected(400, "文件夹名称大小写不一致")
-            raise UploadRejected(400, "一次只能上传一个工程文件夹")
+                raise UploadRejected(400, "Folder names differ only by case")
+            raise UploadRejected(400, "Only one engineering folder may be uploaded at a time")
         key = name.casefold()
         if key in self.files:
-            raise UploadRejected(400, "上传包含重复文件路径")
+            raise UploadRejected(400, "Upload contains duplicate file paths")
         if key in self.directories:
-            raise UploadRejected(400, "上传包含文件与目录同名冲突")
+            raise UploadRejected(400, "Upload contains a file/directory name collision")
         for index in range(1, len(parts)):
             prefix = "/".join(parts[:index])
             prefix_key = prefix.casefold()
             if prefix_key in self.files:
-                raise UploadRejected(400, "上传包含文件与目录同名冲突")
+                raise UploadRejected(400, "Upload contains a file/directory name collision")
             prior = self.directories.get(prefix_key)
             if prior is None:
                 self.directories[prefix_key] = prefix
             elif prior != prefix:
-                raise UploadRejected(400, "目录名称大小写不一致")
+                raise UploadRejected(400, "Directory names differ only by case")
         if self.count >= MAX_FILES:
-            raise UploadRejected(413, "上传文件数量超过 4096 个上限")
+            raise UploadRejected(413, "Upload contains more than 4096 files")
         target = self.staging.joinpath(*parts)
         try:
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             self._handle = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         except FileExistsError as error:
-            raise UploadRejected(400, "上传包含重复文件路径") from error
+            raise UploadRejected(400, "Upload contains duplicate file paths") from error
         except OSError as error:
             if error.errno in {errno.ENOSPC, errno.EDQUOT}:
-                raise UploadRejected(507, "服务器存储空间不足，请稍后重试") from error
-            raise UploadRejected(500, "无法写入上传文件") from error
+                raise UploadRejected(507, "Server storage is insufficient; retry later") from error
+            raise UploadRejected(500, "Cannot write the uploaded file") from error
         self.files[key] = name
         self.count += 1
 
@@ -396,24 +401,24 @@ class _Receiver:
             }.get(self._text_field, MAX_MAIN_ASSEMBLY_BYTES)
             if len(self._text_data) > limit:
                 if self._text_field == MAIN_ASSEMBLY_FIELD:
-                    raise UploadRejected(400, "主装配选择过长")
-                raise UploadRejected(400, "发布身份文本过长")
+                    raise UploadRejected(400, "Main-assembly selection is too long")
+                raise UploadRejected(400, "Publication identity text is too long")
             return
         if self._handle is None:
-            raise UploadRejected(400, "上传分片数据出现在文件打开之前")
+            raise UploadRejected(400, "Upload data appeared before the file was opened")
         chunk = bytes(data[start:end])
         self._part_bytes += len(chunk)
         self.total += len(chunk)
         if self._part_bytes > MAX_FILE_BYTES:
-            raise UploadRejected(413, "单个文件超过 512 MiB 上限")
+            raise UploadRejected(413, "An individual file exceeds the 512 MiB limit")
         if self.total > MAX_TOTAL_BYTES:
-            raise UploadRejected(413, "上传总大小超过 2 GiB 上限")
+            raise UploadRejected(413, "Upload exceeds the 2 GiB total limit")
         if self.total - self._last_disk_check >= DISK_RECHECK_BYTES:
             self._last_disk_check = self.total
             usage = shutil.disk_usage(self.intake_root)
             reserve = max(DISK_RESERVE_FLOOR, int(usage.total * DISK_RESERVE_FRACTION))
             if usage.free - reserve < 0:
-                raise UploadRejected(507, "服务器存储空间不足，请稍后重试")
+                raise UploadRejected(507, "Server storage is insufficient; retry later")
         view = memoryview(chunk)
         written = 0
         try:
@@ -421,8 +426,8 @@ class _Receiver:
                 written += os.write(self._handle, view[written:])
         except OSError as error:
             if error.errno in {errno.ENOSPC, errno.EDQUOT}:
-                raise UploadRejected(507, "服务器存储空间不足，请稍后重试") from error
-            raise UploadRejected(500, "写入上传文件失败") from error
+                raise UploadRejected(507, "Server storage is insufficient; retry later") from error
+            raise UploadRejected(500, "Failed to write the uploaded file") from error
 
     def _on_part_end(self) -> None:
         if self._text_field is not None:
@@ -443,12 +448,12 @@ class _Receiver:
             try:
                 self._assembly = raw.decode("utf-8", "strict")
             except UnicodeDecodeError as error:
-                raise UploadRejected(400, "主装配选择不是有效的 UTF-8 文本") from error
+                raise UploadRejected(400, "Main-assembly selection is not valid UTF-8 text") from error
             return
         try:
             value = raw.decode("utf-8", "strict")
         except UnicodeDecodeError as error:
-            raise UploadRejected(400, "发布身份文本不是有效的 UTF-8 文本") from error
+            raise UploadRejected(400, "Publication identity text is not valid UTF-8") from error
         if field == TARGET_HARDWARE_FIELD:
             self._target = value.strip() or None
             return
@@ -458,46 +463,48 @@ class _Receiver:
         if field == PURPOSE_FIELD:
             self._purpose = value.strip() or None
             return
-        raise UploadRejected(400, "未知的上传文本字段")
+        raise UploadRejected(400, "Unknown upload text field")
 
     def _validate_main_assembly(self) -> str | None:
         """One canonical, case-exact selection inside the uploaded top folder."""
         prefix = f"{self.top}/"
-        relative = {name[len(prefix):]: name for name in self.files.values() if name.startswith(prefix)}
+        relative = {name[len(prefix) :]: name for name in self.files.values() if name.startswith(prefix)}
         assemblies = [name for name in relative if Path(name).suffix.casefold() == ".sldasm"]
         raw = self._assembly
         if raw is None:
             if len(assemblies) == 1:
                 return assemblies[0]
-            raise UploadRejected(400, "请在页面上选择主装配后再提交")
+            raise UploadRejected(400, "Select a main assembly on the page before submitting")
         value = unicodedata.normalize("NFC", raw)
         if raw != raw.strip():
-            raise UploadRejected(400, "主装配路径不能包含首尾空白")
+            raise UploadRejected(400, "Main-assembly path cannot have leading or trailing whitespace")
         if not value:
-            raise UploadRejected(400, "主装配选择为空")
+            raise UploadRejected(400, "Main-assembly selection is empty")
         try:
             parts = artifact_path_parts(value)
         except PipelineError as error:
-            raise UploadRejected(400, f"主装配路径不符合平台文件命名规则：{str(error)[:200]}") from error
+            raise UploadRejected(
+                400, f"Main-assembly path does not satisfy platform naming rules: {str(error)[:200]}"
+            ) from error
         if parts != tuple(value.split("/")):
-            raise UploadRejected(400, "主装配路径规范化结果不一致")
+            raise UploadRejected(400, "Main-assembly path normalization is inconsistent")
         if Path(value).suffix.casefold() != ".sldasm":
-            raise UploadRejected(400, "主装配必须是 .SLDASM 文件")
+            raise UploadRejected(400, "Main assembly must be an .SLDASM file")
         if value in relative:
             return value
         if any(key.casefold() == value.casefold() for key in relative):
-            raise UploadRejected(400, "主装配路径的大小写与上传文件不一致，请从列表中选择")
-        raise UploadRejected(400, "主装配不在所选工程文件夹中")
+            raise UploadRejected(400, "Main-assembly path case differs from the uploaded file; select it from the list")
+        raise UploadRejected(400, "Main assembly is not inside the selected engineering folder")
 
     def finish(self) -> UploadReceipt:
         self.close()
         if self.top is None or self.count == 0:
-            raise UploadRejected(400, "未收到任何文件，请选择工程文件夹后重试")
+            raise UploadRejected(400, "No files were received; select an engineering folder and retry")
         source = self.staging / self.top
         try:
             identity = describe_handoff(source)
         except PipelineError as error:
-            raise UploadRejected(400, f"工程文件夹未通过平台校验：{str(error)[:200]}") from error
+            raise UploadRejected(400, f"Engineering folder failed platform validation: {str(error)[:200]}") from error
         return UploadReceipt(
             folder=self.top,
             files=self.count,

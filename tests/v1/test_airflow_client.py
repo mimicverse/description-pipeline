@@ -52,10 +52,10 @@ def rerun_plan_payload(run_id: str, status: str = "failed") -> dict:
     rows = [
         {
             "stage": stage,
-            "name_zh": stage,
+            "name": stage,
             "eligible": True,
             "reason": "ok",
-            "reason_zh": "",
+            "message": "",
             "recomputes": [stage],
             "retains": [],
             "prerequisites": {
@@ -589,12 +589,8 @@ class ClientTests(unittest.TestCase):
             ):
                 with self.subTest(record_root=value):
                     with self.assertRaises(EndpointProtocolError) as caught:
-                        EndpointConfig(
-                            base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [value]}
-                        )
-                    self.assertIn(
-                        "discovery record root must be a dedicated absolute path", str(caught.exception)
-                    )
+                        EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [value]})
+                    self.assertIn("discovery record root must be a dedicated absolute path", str(caught.exception))
             for value in (
                 str(records / ".." / "names.json"),
                 str(records) + "//names.json",
@@ -602,9 +598,7 @@ class ClientTests(unittest.TestCase):
             ):
                 with self.subTest(registry=value):
                     with self.assertRaises(EndpointProtocolError) as caught:
-                        EndpointConfig(
-                            base_url="http://127.0.0.1", token=TOKEN, discovery={"frozen_names_file": value}
-                        )
+                        EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"frozen_names_file": value})
                     self.assertIn(
                         "discovery frozen-name registry must be a dedicated absolute path",
                         str(caught.exception),
@@ -970,9 +964,7 @@ class ClientTests(unittest.TestCase):
                 with self.assertRaises(EndpointProtocolError):
                     endpoint.download_failure_diagnostics(RUN_ID, job, Path(tmp) / "tiny", limit=8)
         with self.assertRaises(EndpointProtocolError):
-            _validate_failure_diagnostics(
-                {"failure_diagnostics": {"path": "other.json", "sha256": "0" * 64}}
-            )
+            _validate_failure_diagnostics({"failure_diagnostics": {"path": "other.json", "sha256": "0" * 64}})
 
     def test_failure_diagnostics_refuses_cross_run_receipt_and_unknown_members(self) -> None:
         foreign = b'{"run_id": "not-this-run", "error": "boom"}'

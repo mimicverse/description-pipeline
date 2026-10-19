@@ -237,7 +237,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         client = self.client(manager)
         denied = client.get("/feishu/callback?error=access_denied&state=state-1")
         self.assertEqual(denied.status_code, 400)
-        self.assertIn("取消飞书授权", denied.text)
+        self.assertIn("authorization was cancelled", denied.text)
 
     def test_profile_rejects_missing_and_tampered_tokens(self) -> None:
         manager = self.manager(_environment(self.root))
@@ -975,9 +975,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         recorded.clear()
         auth.initialize_metadata_state(_RecordingSession)
         self.assertEqual(len(recorded), 1)
-        self.assertTrue(
-            str(recorded[0]).lstrip().upper().startswith("CREATE TABLE IF NOT EXISTS FEISHU_AUTH_STATE")
-        )
+        self.assertTrue(str(recorded[0]).lstrip().upper().startswith("CREATE TABLE IF NOT EXISTS FEISHU_AUTH_STATE"))
 
     def test_runtime_store_fails_closed_on_an_unreadable_probe_without_fallback_ddl(self) -> None:
         recorded: list[str] = []

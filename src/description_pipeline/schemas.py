@@ -34,15 +34,15 @@ DELIVERY_MANIFEST_SCHEMA = "solidworks-to-urdf.delivery-manifest/v1"
 SOURCE_RECORD_SCHEMA = "solidworks-to-urdf.source-record/v1"
 
 #: Platform configuration schema rendered into the immutable config snapshot
-#: (deployment.md §配置权威; consumed by IF-11/IF-16).
+#: (deployment.md configuration authority; consumed by IF-11/IF-16).
 PLATFORM_CONFIG_SCHEMA = "solidworks-to-urdf.platform/v1"
 
-#: Check-strategy machine definition shipped with the release (contracts §系统契约:
+#: Check-strategy machine definition shipped with the release (contracts system contract:
 #: schema + stage definition + check policy).  Owner B; consumers reference this id
 #: instead of quoting an arbitrary policy string.
 CHECK_POLICY_SCHEMA = "solidworks-to-urdf.check-policy/v1"
 
-#: Qualification record machine schema (quality §警告与资格, IF-14): a policy
+#: Qualification record machine schema (quality warnings and qualification, IF-14): a policy
 #: fact plus its three-state conclusion and its evidence references.
 QUALIFICATION_SCHEMA = "solidworks-to-urdf.qualification/v1"
 

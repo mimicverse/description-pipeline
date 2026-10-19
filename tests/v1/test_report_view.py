@@ -102,27 +102,27 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(report["overall"]["stages_total"], 6)
         self.assertIsNone(report["failure"])
         stages = {stage["id"]: stage for stage in report["stages"]}
-        self.assertEqual(stages["discover"]["name_zh"], "解析结构")
+        self.assertEqual(stages["discover"]["name"], "Discover structure")
         freeze_counts = stages["freeze"]["counts"]["boundary"]
         self.assertEqual(freeze_counts, {"passed": 2, "executed": 2, "total": 2})
         self.assertTrue(all(row["executed"] for row in stages["freeze"]["boundary"]))
         self.assertEqual(
-            stages["freeze"]["boundary"][0]["label_zh"],
-            "交接包准入（路径、常规文件与原生包）",
+            stages["freeze"]["boundary"][0]["label"],
+            "Handoff admission (path, regular files, native package)",
         )
         verify = stages["verify"]
         independent = {row["id"]: row for row in verify["independent"]}
         window = independent["physics.expected_mass"]
-        self.assertEqual(window["label_zh"], "质量期望范围")
+        self.assertEqual(window["label"], "Expected mass range")
         self.assertEqual(window["summary"]["expected"], "2.0–4.5 kg")
         self.assertIn("3.3948682203507135", window["summary"]["actual"])
         closure = independent["physics.mass_closure_equality"]
-        self.assertEqual(closure["summary"]["expected"], "绝对误差 ≤ 1e-12 kg")
+        self.assertEqual(closure["summary"]["expected"], "absolute error <= 1e-12 kg")
         self.assertIn("URDF", closure["summary"]["actual"])
-        self.assertEqual(independent["joints.shoulder_pitch_joint"]["label_zh"], "关节：shoulder_pitch_joint")
-        self.assertEqual(independent["custom.unknown"]["label_zh"], "custom.unknown")
+        self.assertEqual(independent["joints.shoulder_pitch_joint"]["label"], "Joint: shoulder_pitch_joint")
+        self.assertEqual(independent["custom.unknown"]["label"], "custom.unknown")
         gate_row = next(row for row in verify["boundary"] if row["id"] == "verification.gates")
-        self.assertEqual(gate_row["summary"]["actual"], "1/1 通过（已记录 1 项）")
+        self.assertEqual(gate_row["summary"]["actual"], "1/1 passed (1 recorded)")
         self.assertEqual(
             verify["counts"]["independent"],
             {"passed": 6, "executed": 7, "total": 8},
@@ -155,36 +155,43 @@ class ReportViewTests(unittest.TestCase):
             self.assertTrue(item["reference"])
         self.assertEqual(report["overall"]["engineering_state"], "external_review")
         self.assertEqual(report["external_review"]["tracking"], "external")
-        self.assertIn("不读取", report["external_review"]["note_zh"])
+        self.assertIn("does not read", report["external_review"]["note"])
         self.assertTrue(report["external_review"]["scopes"])
-        self.assertIn("交接包准入（路径、常规文件与原生包）", stages["freeze"]["automatic"]["passed_labels"])
+        self.assertIn(
+            "Handoff admission (path, regular files, native package)",
+            stages["freeze"]["automatic"]["passed_labels"],
+        )
         self.assertEqual(stages["freeze"]["automatic"]["failed_labels"], [])
-        self.assertIn("外部评审", discover["manual_scope_note_zh"])
+        self.assertIn("external review", discover["manual_scope_note"])
         freeze_rows = {row["id"]: row for row in stages["freeze"]["boundary"]}
-        self.assertEqual(freeze_rows["handoff.integrity"]["summary"]["actual"], "3 个文件，清单校验通过")
-        self.assertIn("清单与交接摘要一致", freeze_rows["handoff.integrity"]["summary"]["expected"])
+        self.assertEqual(freeze_rows["handoff.integrity"]["summary"]["actual"], "3 files; inventory verified")
+        self.assertIn(
+            "Inventory agrees with the handoff digest", freeze_rows["handoff.integrity"]["summary"]["expected"]
+        )
         definition = next(row for row in discover["boundary"] if row["id"] == "discovery.definition")
-        self.assertIn("型号 nd_cfg_gap", definition["summary"]["actual"])
-        self.assertIn("阻塞发现 0 项", definition["summary"]["actual"])
+        self.assertIn("Hardware nd_cfg_gap", definition["summary"]["actual"])
+        self.assertIn("blocking findings 0", definition["summary"]["actual"])
         runtime = next(row for row in stages["capture"]["boundary"] if row["id"] == "runtime.ready")
         # Native readiness reports prerequisites; the CAD session itself is not claimed here, and
         # the raw host executable path never reaches the operator summary.
-        self.assertEqual(runtime["summary"]["expected"], "原生平台与 SolidWorks 就绪")
-        self.assertIn("Windows、COM 与 SolidWorks 前置条件", runtime["summary"]["actual"])
-        self.assertIn("采集会话", runtime["summary"]["actual"])
-        self.assertNotIn("未记录", runtime["summary"]["actual"])
+        self.assertEqual(runtime["summary"]["expected"], "Native platform and SolidWorks are ready")
+        self.assertIn("Windows, COM, and SolidWorks prerequisites", runtime["summary"]["actual"])
+        self.assertIn("capture session", runtime["summary"]["actual"])
+        self.assertNotIn("not recorded", runtime["summary"]["actual"])
         self.assertNotIn("SLDWORKS.exe", runtime["summary"]["actual"])
         consumer = independent["consumer.urdf"]
-        self.assertEqual(consumer["label_zh"], "消费端 URDF 可加载性")
-        self.assertIn("4 个消费端刚体", consumer["summary"]["actual"])
+        self.assertEqual(consumer["label"], "Consumer URDF loadability")
+        self.assertIn("4 consumer bodies", consumer["summary"]["actual"])
         self.assertIn("3.13.0", consumer["summary"]["actual"])
         publish_rows = {row["id"]: row for row in stages["publish"]["boundary"]}
-        self.assertEqual(publish_rows["publication.git"]["label_zh"], "发布提交字节一致性（复制/暂存/提交）")
-        self.assertIn("字节一致性", publish_rows["publication.git"]["summary"]["scope_zh"])
+        self.assertEqual(
+            publish_rows["publication.git"]["label"], "Published commit byte consistency (copy/stage/commit)"
+        )
+        self.assertIn("byte consistency", publish_rows["publication.git"]["summary"]["scope"])
         self.assertIn("reverified", publish_rows["publication.git"]["summary"]["actual"])
         file_rows = stages["freeze"]["files"]
         self.assertEqual(file_rows[0]["boundary"], "input")
-        self.assertEqual(file_rows[0]["label_zh"], "已保存的 SolidWorks 工程文件夹")
+        self.assertEqual(file_rows[0]["label"], "Saved SolidWorks engineering folder")
         self.assertTrue(any(row["boundary"] == "output" for row in file_rows))
 
     def test_failed_discovery_meaning_is_safe_and_downstream_is_blocked(self) -> None:
@@ -198,23 +205,23 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(report["overall"]["engineering_state"], "not_ready")
         failure = report["failure"]
         self.assertEqual(failure["stage"], "discover")
-        self.assertEqual(failure["stage_name_zh"], "解析结构")
+        self.assertEqual(failure["stage_name"], "Discover structure")
         self.assertEqual(failure["object"], "lowerbody.SLDASM")
-        self.assertIn("无法定位", failure["meaning_zh"])
-        self.assertNotIn("缺少零件", failure["meaning_zh"])
-        self.assertNotIn("损坏", failure["meaning_zh"])
+        self.assertIn("cannot be located", failure["meaning"])
+        self.assertNotIn("missing part", failure["meaning"])
+        self.assertNotIn("damaged", failure["meaning"])
         self.assertEqual(failure["solidworks_codes"], {"errors": 2, "warnings": 0})
         self.assertEqual(failure["raw_type"], "CadError")
         stages = {stage["id"]: stage for stage in report["stages"]}
         self.assertEqual(stages["discover"]["state"], "failed")
-        self.assertIn("先修复问题", stages["discover"]["manual_scope_note_zh"])
-        self.assertIn("结构定义生成", stages["discover"]["automatic"]["failed_labels"])
+        self.assertIn("Fix the issues", stages["discover"]["manual_scope_note"])
+        self.assertIn("Structure definition generation", stages["discover"]["automatic"]["failed_labels"])
         definition = next(row for row in stages["discover"]["boundary"] if row["id"] == "discovery.definition")
-        self.assertIn("未通过", definition["summary"]["actual"])
+        self.assertIn("Failed", definition["summary"]["actual"])
         for downstream in ("capture", "generate", "verify", "publish"):
             with self.subTest(stage=downstream):
                 self.assertEqual(stages[downstream]["state"], "blocked")
-                self.assertEqual(stages[downstream]["state_zh"], "上游阶段失败（未执行）")
+                self.assertEqual(stages[downstream]["state_label"], "Blocked by upstream failure")
                 self.assertEqual(stages[downstream]["counts"]["boundary"]["executed"], 0)
                 self.assertTrue(all(not row["executed"] for row in stages[downstream]["boundary"]))
 
@@ -249,20 +256,24 @@ class ReportViewTests(unittest.TestCase):
             ],
         }
         failure = build_report(job)["failure"]
-        self.assertEqual(failure["title_zh"], "结构解析检查未通过")
+        self.assertEqual(failure["title"], "Structure discovery checks failed")
         self.assertEqual(failure["kind"], "definition")
         self.assertEqual(failure["finding_total"], 6)
         self.assertEqual(failure["discovery_sha256"], "c" * 64)
         self.assertEqual(
             failure["finding_counts"][0],
-            {"code": "discovery.link_name_missing", "label_zh": "未识别刚体坐标系", "count": 4},
+            {
+                "code": "discovery.link_name_missing",
+                "label": "Rigid-body coordinate system is unidentified",
+                "count": 4,
+            },
         )
-        labels = {group["code"]: group["label_zh"] for group in failure["finding_counts"]}
+        labels = {group["code"]: group["label"] for group in failure["finding_counts"]}
         self.assertEqual(labels["discovery.unknown_code"], "discovery.unknown_code")
         self.assertEqual(len(failure["finding_samples"]["discovery.link_name_missing"]), 3)
-        self.assertIn("共 6 项", failure["meaning_zh"])
-        for word in ("损坏", "输入有误", "错误"):
-            self.assertNotIn(word, failure["meaning_zh"])
+        self.assertIn("6 checks failed", failure["meaning"])
+        for word in ("damaged", "input is wrong", "error"):
+            self.assertNotIn(word, failure["meaning"])
 
     def test_later_runtime_failure_is_not_overridden_by_stale_discovery_findings(self) -> None:
         job = passed_job()
@@ -279,7 +290,7 @@ class ReportViewTests(unittest.TestCase):
         }
         failure = build_report(job)["failure"]
         self.assertEqual(failure["stage"], "capture")
-        self.assertEqual(failure["title_zh"], "原生 CAD 打开失败")
+        self.assertEqual(failure["title"], "Native CAD open failed")
         self.assertEqual(failure["kind"], "runtime")
         self.assertNotIn("finding_counts", failure)
         self.assertNotIn("finding_total", failure)
@@ -290,18 +301,18 @@ class ReportViewTests(unittest.TestCase):
         job["events"] = protocol_events(subject=SHA, failed_stage="discover")
         job["error"] = "PipelineError: Required check failed: discovery.definition"
         failure = build_report(job)["failure"]
-        self.assertEqual(failure["title_zh"], "阶段失败（原因未判定）")
+        self.assertEqual(failure["title"], "Stage failed (cause undetermined)")
         self.assertEqual(failure["kind"], "unknown")
 
     def test_failed_summary_points_to_findings_and_never_blanks(self) -> None:
         from description_pipeline.orchestration.report_view import _failed_summary
 
-        long_row = _failed_summary("结构定义生成", None, {"error": "x" * 300})
-        self.assertTrue(long_row["actual"].startswith("未通过："))
-        self.assertIn("完整诊断见问题清单", long_row["actual"])
-        blank_row = _failed_summary("结构定义生成", None, {})
-        self.assertIn("未通过", blank_row["actual"])
-        self.assertIn("原因未记录", blank_row["actual"])
+        long_row = _failed_summary("Structure definition generation", None, {"error": "x" * 300})
+        self.assertTrue(long_row["actual"].startswith("Failed: "))
+        self.assertIn("see the issue list and raw evidence", long_row["actual"])
+        blank_row = _failed_summary("Structure definition generation", None, {})
+        self.assertIn("Failed", blank_row["actual"])
+        self.assertIn("reason not recorded", blank_row["actual"])
 
     def test_exact_unresolved_references_render_only_when_recorded(self) -> None:
         job = passed_job()
@@ -322,9 +333,9 @@ class ReportViewTests(unittest.TestCase):
             [item["name"] for item in failure["unresolved_dependencies"]],
             ["imported_part.SLDPRT", "bracket_a.stp.SLDASM"],
         )
-        self.assertIn("imported_part.SLDPRT", failure["meaning_zh"])
-        self.assertIn("无法定位", failure["meaning_zh"])
-        self.assertIn("尚未证明", failure["meaning_zh"])
+        self.assertIn("imported_part.SLDPRT", failure["meaning"])
+        self.assertIn("cannot be located", failure["meaning"])
+        self.assertIn("not yet proven", failure["meaning"])
         self.assertEqual(failure["applicability"], "unproven")
         plain = passed_job()
         plain["status"] = "failed"
@@ -333,8 +344,8 @@ class ReportViewTests(unittest.TestCase):
         plain["detail"] = {"errors": 2, "warnings": 0}
         generic = build_report(plain)["failure"]
         self.assertNotIn("unresolved_dependencies", generic)
-        self.assertIn("无法定位", generic["meaning_zh"])
-        self.assertIn("尚未证明", generic["meaning_zh"])
+        self.assertIn("cannot be located", generic["meaning"])
+        self.assertIn("not yet proven", generic["meaning"])
         self.assertEqual(generic["applicability"], "unproven")
 
     def test_missing_details_are_explicit_and_terminal_failure_cannot_pass(self) -> None:
@@ -349,9 +360,12 @@ class ReportViewTests(unittest.TestCase):
                 check["details"] = {"findings": [{"blocking": None}, {"blocking": False}]}
         report = build_report(job)
         rows = {row["id"]: row for stage in report["stages"] for row in stage["boundary"]}
-        self.assertIn("字节复核 未记录", rows["publication.git"]["summary"]["actual"])
-        self.assertEqual(rows["discovery.inputs"]["summary"]["actual"], "清单 未记录、命名 未记录")
-        self.assertIn("阻塞发现 1 项", rows["discovery.definition"]["summary"]["actual"])
+        self.assertIn("byte recheck not recorded", rows["publication.git"]["summary"]["actual"])
+        self.assertEqual(
+            rows["discovery.inputs"]["summary"]["actual"],
+            "Inventory not recorded; names not recorded",
+        )
+        self.assertIn("blocking findings 1", rows["discovery.definition"]["summary"]["actual"])
         job["status"] = "failed"
         self.assertEqual(build_report(job)["overall"]["state"], "failed")
 
@@ -364,7 +378,7 @@ class ReportViewTests(unittest.TestCase):
         report = build_report(job)
         capture = next(stage for stage in report["stages"] if stage["id"] == "capture")
         row = next(row for row in capture["boundary"] if row["id"] == "input.valid")
-        self.assertEqual(row["summary"]["actual"], "CAD 修订 r3")
+        self.assertEqual(row["summary"]["actual"], "CAD revision r3")
         self.assertIn("owner", row["raw_details"]["cad_revision"])
 
     def test_reused_stage_retains_provenance_without_claiming_new_execution(self) -> None:
@@ -393,15 +407,15 @@ class ReportViewTests(unittest.TestCase):
             error_code="native_discovery_main_assembly_ambiguous",
         )
         failure = build_report(job)["failure"]
-        self.assertEqual(failure["title_zh"], "无法唯一确定主装配")
-        self.assertIn("dp.delivery_configuration", failure["meaning_zh"])
+        self.assertEqual(failure["title"], "Main assembly is not unique")
+        self.assertIn("dp.delivery_configuration", failure["meaning"])
 
     def test_external_review_passes_scope_and_automatic_exclusion_through(self) -> None:
         view = {
             "stages": [
                 {
                     "id": "discover",
-                    "name_zh": "解析结构",
+                    "name": "Discover structure",
                     "state": "completed",
                     "input_qc": [{"id": "discovery.inputs", "state": "passed", "details": {}}],
                     "output_qc": [],
@@ -411,11 +425,14 @@ class ReportViewTests(unittest.TestCase):
                     "confirmations": [
                         {
                             "id": "design_fidelity",
-                            "label": "设计与实物对应",
+                            "label": "Design-to-physical correspondence",
                             "reference": "docs/mechanical-handoff-spec.md#design",
                             "review_stage": "discover",
-                            "scope": "确认图纸/模型与实物装配一致",
-                            "automatic_exclusion": "文件存在性、依赖闭包与版本一致性已由自动校验覆盖",
+                            "scope": "Confirm that drawings, model, and physical assembly agree",
+                            "automatic_exclusion": (
+                                "File existence, dependency closure, and revision consistency "
+                                "are already covered by automatic checks"
+                            ),
                             "state": "needs_review",
                         }
                     ],
@@ -429,8 +446,8 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(confirmation["id"], "design_fidelity")
         self.assertEqual(confirmation["state"], "needs_review")
         self.assertIsNone(confirmation["approval_tracking"])
-        self.assertIn("实物", confirmation["scope"])
-        self.assertIn("自动校验", confirmation["automatic_exclusion"])
+        self.assertIn("physical", confirmation["scope"])
+        self.assertIn("automatic checks", confirmation["automatic_exclusion"])
         scopes = report["external_review"]["scopes"]
         self.assertEqual(scopes[0]["id"], "design_fidelity")
         self.assertEqual(scopes[0]["stage"], "discover")
@@ -451,7 +468,7 @@ class ReportViewTests(unittest.TestCase):
         self.assertTrue(any(row["state"] == "failed" for row in rows))
         for row in rows:
             if row["state"] == "failed":
-                self.assertTrue(row["summary"]["actual"].startswith("未通过"))
+                self.assertTrue(row["summary"]["actual"].startswith("Failed"))
             else:
                 self.assertEqual(row["state"], "not_run")
                 self.assertFalse(row["executed"])
@@ -561,7 +578,7 @@ class ReportViewTests(unittest.TestCase):
         uncovered = next(
             row for row in report["warnings"]["items"] if row["code"] == "discovery.exporter_membership_uncovered"
         )
-        self.assertEqual(uncovered["label_zh"], "存在未归属实例（保留几何与质量）")
+        self.assertEqual(uncovered["label"], "Unassigned instances remain (geometry and mass retained)")
         self.assertEqual(uncovered["components"], ["unowned-1", "unowned-2"])
         self.assertEqual(uncovered["mass_kg"], 0.42)
         degenerate = next(
@@ -569,20 +586,19 @@ class ReportViewTests(unittest.TestCase):
         )
         self.assertEqual(degenerate["object"], "joint:r_knee")
         self.assertEqual(degenerate["limits"], {"lower": 0.0, "upper": 0.0})
-        self.assertEqual(degenerate["state_zh"], "警告")
+        self.assertEqual(degenerate["state_label"], "Warning")
         for row in report["warnings"]["items"]:
             with self.subTest(code=row["code"]):
-                self.assertEqual(row["state_zh"], "警告")
+                self.assertEqual(row["state_label"], "Warning")
                 self.assertIs(row["blocking"], False)
-                self.assertNotIn("通过", row["state_zh"])
+                self.assertNotIn("Passed", row["state_label"])
         self.assertNotIn("link_name_missing", {row["code"] for row in report["warnings"]["items"]})
         self.assertNotIn(
-            "存在未归属实例（保留几何与质量）", stages["discover"]["automatic"]["passed_labels"]
+            "Unassigned instances remain (geometry and mass retained)",
+            stages["discover"]["automatic"]["passed_labels"],
         )
         baseline = build_report(passed_job())
-        self.assertEqual(
-            len(report["external_review"]["scopes"]), len(baseline["external_review"]["scopes"])
-        )
+        self.assertEqual(len(report["external_review"]["scopes"]), len(baseline["external_review"]["scopes"]))
         scopes = repr(report["external_review"]["scopes"])
         for code in ("discovery.exporter_membership_uncovered", "discovery.joint_limits_degenerate"):
             self.assertNotIn(code, scopes)
@@ -627,8 +643,8 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(verify["counts"]["warnings"], 1)
         warning = verify["warnings"][0]
         self.assertEqual(warning["code"], "v14.saved_pose_restriction")
-        self.assertEqual(warning["label_zh"], "已保存姿态限制（诊断）")
-        self.assertEqual(warning["state_zh"], "警告")
+        self.assertEqual(warning["label"], "Saved-pose restriction (diagnostic)")
+        self.assertEqual(warning["state_label"], "Warning")
         self.assertEqual(warning["object"], "joint:r_knee")
         self.assertEqual(warning["mate"], "平行24")
         self.assertEqual(warning["components"], ["hip-1", "thigh_link-1"])

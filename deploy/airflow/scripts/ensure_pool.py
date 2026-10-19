@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ensure the native-stage Airflow pool exists with the contract capacity.
 
-Contract: ``docs/contracts.md`` §六阶段契约 (native operations use a
+Contract: ``docs/contracts.md`` stage contract (native operations use a
 capacity-1 pool; waiting for native results releases Airflow worker slots)
 and frozen interface IF-02.  The DAG's native tasks wait on pool
 ``windows_native``; a missing pool makes the first triggered run fail, so

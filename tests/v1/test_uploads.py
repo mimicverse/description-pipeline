@@ -106,7 +106,7 @@ class UploadTests(unittest.TestCase):
 
     def test_directory_case_aliases_are_rejected(self) -> None:
         error = self.assert_rejected(multipart([("top/Foo/a.SLDASM", b"x"), ("top/foo/b.SLDPRT", b"x")]), 400)
-        self.assertIn("目录名称大小写不一致", str(error))
+        self.assertIn("Directory names differ only by case", str(error))
         receipt = self.receive(multipart([("top/子目录/model.SLDASM", b"x"), ("top/子目录/part.SLDPRT", b"y")]))
         self.assertEqual(receipt.folder, "top")
 
@@ -173,7 +173,7 @@ class UploadTests(unittest.TestCase):
 
     def test_transport_shapes_are_rejected(self) -> None:
         error = self.assert_rejected(multipart(FOLDER), 400, environ={"CONTENT_TYPE": "application/json"})
-        self.assertIn("文件夹", str(error))
+        self.assertIn("folder", str(error))
         self.assert_rejected(multipart(FOLDER), 400, environ={"CONTENT_TYPE": "multipart/form-data"})
         environ = environ_for(multipart(FOLDER))
         environ.pop("CONTENT_LENGTH")

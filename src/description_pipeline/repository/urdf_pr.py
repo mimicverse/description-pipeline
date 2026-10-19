@@ -31,7 +31,7 @@ from ..io import PipelineError, acquire_process_lock, confined, file_digest
 from ..request_evidence import read_request_evidence
 from ..stages import record_check
 
-#: The target delivery tree (contracts §交付格式与摘要): manifest.json is the
+#: The target delivery tree (contracts delivery format and digest): manifest.json is the
 #: subject manifest, tool.json carries the tool identity, reports/ holds only the
 #: quality report; all other files travel inside their subject directories.
 DELIVERY_PATHS = ("manifest.json", "input", "evidence", "model", "urdf", "meshes", "tool.json", "reports")
@@ -47,7 +47,7 @@ GIT_ATTRIBUTES = (
 ).encode("ascii")
 #: Reports copied into a publication branch: only the deterministic quality
 #: report stays outside the subject; every other receipt lives in platform run
-#: storage (contracts §交付格式与摘要).
+#: storage (contracts delivery format and digest).
 REPORTS_FILES = ("quality.json",)
 REQUIRED_FILES = (
     "manifest.json",
@@ -496,7 +496,7 @@ def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
     )
     qualification_lines = "".join(
         f"- {fact_id}{f'[{object_id}]' if object_id else ''}: {status}"
-        f"{'（未建立）' if status == 'unqualified' else ''}\n"
+        f"{' (unqualified)' if status == 'unqualified' else ''}\n"
         for object_id, fact_id, status in qualifications
     )
     return (

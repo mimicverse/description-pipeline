@@ -1,92 +1,94 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SolidWorks2URDF 交付操作台</title>
+  <title>SolidWorks2URDF Delivery Portal</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
-      <h1>SolidWorks2URDF 交付操作台</h1>
+      <h1>SolidWorks2URDF Delivery Portal</h1>
     </div>
     <div id="account" class="account" hidden>
       <span id="account-user"></span>
-      <button id="logout" type="button" class="ghost">退出</button>
+      <button id="logout" type="button" class="ghost">Sign out</button>
     </div>
   </header>
 
   <main>
     <section id="login-card" class="login-shell">
       <div class="card narrow">
-        <h2>登录</h2>
-        <p class="muted">使用企业飞书账号登录。</p>
-        <a id="feishu-login" class="button" href="/auth/feishu/login">使用飞书登录</a>
+        <h2>Sign in</h2>
+        <p class="muted">Sign in with your enterprise Feishu account.</p>
+        <a id="feishu-login" class="button" href="/auth/feishu/login">Sign in with Feishu</a>
         <p id="login-error" class="error" role="alert" hidden></p>
       </div>
     </section>
 
     <section id="workspace" class="workspace" hidden>
-      <aside class="sidebar" aria-label="运行">
-        <button type="button" id="new-run-button" class="button primary sidebar-action">＋ 新建交付</button>
-        <div class="runs-views" role="group" aria-label="运行视图">
-          <button type="button" id="runs-view-active" class="runs-view active" aria-pressed="true">最近运行</button>
-          <button type="button" id="runs-view-deleted" class="runs-view" aria-pressed="false">已删除</button>
+      <aside class="sidebar" aria-label="Runs">
+        <button type="button" id="new-run-button" class="button primary sidebar-action">+ New delivery</button>
+        <div class="runs-views" role="group" aria-label="Run views">
+          <button type="button" id="runs-view-active" class="runs-view active" aria-pressed="true">Recent runs</button>
+          <button type="button" id="runs-view-deleted" class="runs-view" aria-pressed="false">Deleted</button>
         </div>
-        <ul id="runs" class="runs"><li class="muted">暂无运行</li></ul>
+        <ul id="runs" class="runs"><li class="muted">No runs</li></ul>
         <p id="runs-error" class="error small" role="alert" hidden></p>
         <details class="runs-help">
-          <summary>关于运行历史</summary>
+          <summary>About run history</summary>
           <p class="muted small">
-            名称默认为工程文件夹名；重命名只影响列表显示，留空可恢复默认。「删除」会把运行移到「已删除」视图，
-            可随时恢复；模型、证据与 PR 均保留。早期联调产生的运行也会保留在列表中。
+            The title defaults to the engineering folder name. Renaming affects only
+            the list display; leave it empty to restore the default. Delete moves a
+            run to the Deleted view and it can be restored at any time; models,
+            evidence, and PRs remain. Earlier integration runs remain in the list.
           </p>
         </details>
       </aside>
 
       <div class="content">
         <section id="upload-view" class="card upload-card">
-          <h2>新建交付运行</h2>
-          <p class="muted small">选择本机的完整 SolidWorks 工程文件夹，上传后自动冻结并执行六个工程阶段。</p>
+          <h2>New delivery run</h2>
+          <p class="muted small">Select a complete local SolidWorks engineering folder. It is frozen after upload and then runs the six engineering stages.</p>
           <form id="run-form">
             <input id="folder-input" type="file" webkitdirectory directory multiple class="hidden-input">
             <label class="dropzone" for="folder-input">
-              <strong>选择工程文件夹…</strong>
-              <span class="muted small">支持 Chrome / Edge；文件夹不会离开本机，直到你点击“开始”。</span>
+              <strong>Select engineering folder...</strong>
+              <span class="muted small">Supports Chrome and Edge. Files stay local until you select Start.</span>
             </label>
             <div id="target-row" class="assembly-row" hidden>
-              <label for="target-select" class="muted small">发布目标（必填）</label>
+              <label for="target-select" class="muted small">Publication target (required)</label>
               <select id="target-select" hidden></select>
-              <label for="purpose-select" class="muted small">用途（必填）</label>
+              <label for="purpose-select" class="muted small">Purpose (required)</label>
               <select id="purpose-select">
-                <option value="">请选择用途</option>
-                <option value="engineering">工程交付</option>
-                <option value="inspection_preview">检查预览</option>
+                <option value="">Select a purpose</option>
+                <option value="engineering">Engineering delivery</option>
+                <option value="inspection_preview">Inspection preview</option>
               </select>
-              <textarea id="change-summary" rows="3" placeholder="变更说明（必填）" hidden></textarea>
+              <textarea id="change-summary" rows="3" placeholder="Change summary (required)" hidden></textarea>
               <p id="target-note" class="muted small" hidden></p>
             </div>
             <div id="assembly-row" class="assembly-row" hidden>
-              <label for="assembly-select" class="muted small">主装配</label>
+              <label for="assembly-select" class="muted small">Main assembly</label>
               <select id="assembly-select" hidden></select>
               <p id="assembly-note" class="muted small" hidden></p>
             </div>
             <div class="upload-row">
-              <button type="button" id="choose-button" class="button">选择文件夹…</button>
-              <button type="submit" id="start-button" disabled>开始</button>
-              <button type="button" id="cancel-button" class="ghost" hidden>取消上传</button>
+              <button type="button" id="choose-button" class="button">Select folder...</button>
+              <button type="submit" id="start-button" disabled>Start</button>
+              <button type="button" id="cancel-button" class="ghost" hidden>Cancel upload</button>
               <span id="folder-summary" class="folder-summary muted" hidden></span>
             </div>
             <p id="upload-status" class="muted" hidden></p>
             <p id="run-error" class="error" role="alert" hidden></p>
             <details class="requirements">
-              <summary>文件要求</summary>
+              <summary>File requirements</summary>
               <p class="muted small">
-                上限：<span id="upload-limits">总大小 2 GB、文件数 4096、单个文件 512 MB</span>（以平台设置为准）。
-                空子文件夹不会上传；包含 ~$ 临时锁文件将被拒绝上传，请先关闭 SolidWorks 或删除后重试；请勿包含平台生成的
-                source.json / discovery 身份与发现记录。
+                Limits: <span id="upload-limits">2 GB total, 4096 files, 512 MB per file</span> (platform settings are authoritative).
+                Empty subfolders are not uploaded. Uploads containing ~$ temporary lock files are rejected; close SolidWorks or remove them first.
+                Do not include platform-generated source.json or discovery identity records.
               </p>
             </details>
           </form>
@@ -96,7 +98,7 @@
           <header class="run-header">
             <div class="run-title">
               <span id="run-dot" class="dot idle" aria-hidden="true"></span>
-              <h2 id="run-heading">运行状态</h2>
+              <h2 id="run-heading">Run status</h2>
               <span id="run-state-label" class="muted"></span>
             </div>
             <div class="run-header-side">
@@ -106,7 +108,7 @@
               <span id="run-actions" class="run-actions-host"></span>
               <div id="pr" class="pr" hidden></div>
               <div id="retry-panel" class="run-actions" hidden>
-                <button id="retry-button" type="button" hidden>重试</button>
+                <button id="retry-button" type="button" hidden>Retry</button>
                 <p id="retry-note" class="muted small"></p>
                 <p id="retry-error" class="error" role="alert" hidden></p>
               </div>
@@ -117,15 +119,15 @@
           <p id="run-headline" class="headline" hidden></p>
           <div id="failure-card" class="fail-card" hidden></div>
 
-          <nav id="stages" class="stepper" aria-label="工程阶段"></nav>
+          <nav id="stages" class="stepper" aria-label="Engineering stages"></nav>
           <p id="preview-note" class="viewer-note" hidden></p>
 
           <div class="run-workspace no-preview">
             <div class="pane pane-preview">
               <div id="viewer-card" hidden>
                 <div class="viewer-head">
-                  <span class="viewer-title">URDF 交互预览</span>
-                  <button id="preview-collapse" type="button" class="ghost" aria-expanded="true" hidden>收起预览</button>
+                  <span class="viewer-title">Interactive URDF preview</span>
+                  <button id="preview-collapse" type="button" class="ghost" aria-expanded="true" hidden>Collapse preview</button>
                 </div>
                 <div id="viewer" class="viewer"></div>
                 <p class="muted small" id="preview-meta"></p>
@@ -134,67 +136,67 @@
                 <p class="viewer-note" id="viewer-note" hidden></p>
                 <div class="viewer-footer">
                   <div class="panel-block">
-                    <p class="panel-title" id="joints-title">关节滑杆</p>
+                    <p class="panel-title" id="joints-title">Joint controls</p>
                     <div id="joint-controls" class="joint-controls"></div>
-                    <button id="reset-joints" type="button" class="ghost">回到零位</button>
+                    <button id="reset-joints" type="button" class="ghost">Reset to zero</button>
                   </div>
                 </div>
                 <div id="preview-panels" class="preview-panels">
                   <details class="preview-panel" open>
-                    <summary id="links-title">链接/刚体质量惯量</summary>
+                    <summary id="links-title">Link/body mass and inertia</summary>
                     <div class="panel-table" id="panel-links"></div>
                   </details>
                   <details class="preview-panel" open>
-                    <summary id="limits-title">限位 / 轴读数</summary>
+                    <summary id="limits-title">Limits and axis readings</summary>
                     <div class="panel-table" id="panel-limits"></div>
                   </details>
                   <details class="preview-panel" open>
-                    <summary id="frames-title">坐标系 / 接口位姿与物理闭合</summary>
+                    <summary id="frames-title">Frames, interface poses, and physical closure</summary>
                     <div class="panel-table" id="panel-frames"></div>
                     <div class="panel-table" id="panel-closure"></div>
                   </details>
                 </div>
               </div>
-              <p id="viewer-placeholder" class="muted small viewer-placeholder">交付生成后这里显示 URDF 预览；未通过独立校验的交付只会作为诊断预览并明确标注。</p>
+              <p id="viewer-placeholder" class="muted small viewer-placeholder">The URDF preview appears here after generation. A delivery that failed independent verification is shown only as a clearly marked diagnostic preview.</p>
             </div>
 
             <div class="pane pane-inspect">
-              <nav id="inspect-tabs" class="tabs" aria-label="检查视图">
-                <button type="button" class="tab active" data-tab="overview">概览</button>
-                <button type="button" class="tab" data-tab="stage">阶段</button>
-                <button type="button" class="tab" data-tab="checks">检查</button>
-                <button type="button" class="tab" data-tab="engineering">工程</button>
+              <nav id="inspect-tabs" class="tabs" aria-label="Inspection views">
+                <button type="button" class="tab active" data-tab="overview">Overview</button>
+                <button type="button" class="tab" data-tab="stage">Stages</button>
+                <button type="button" class="tab" data-tab="checks">Checks</button>
+                <button type="button" class="tab" data-tab="engineering">Engineering</button>
               </nav>
 
               <section id="tab-overview" class="tab-pane">
                 <div id="activity-overview" class="activity-host"></div>
                 <dl class="meta" id="run-meta"></dl>
                 <details class="meta-more">
-                  <summary>运行标识</summary>
+                  <summary>Run identity</summary>
                   <p id="run-ident" class="muted small"></p>
                 </details>
                 <details class="meta-more">
-                  <summary>任务与传输</summary>
+                  <summary>Tasks and transfer</summary>
                   <div id="task-progress" class="progress"></div>
                 </details>
-                <h3>问题与发现</h3>
+                <h3>Issues and findings</h3>
                 <ul id="findings" class="findings"></ul>
               </section>
 
               <section id="tab-stage" class="tab-pane" hidden>
-                <p class="muted small">点击上方阶段查看该阶段的检查摘要与结果；原始证据与文件摘要默认折叠。</p>
+                <p class="muted small">Select a stage above to view its check summary and results. Raw evidence and file digests are collapsed by default.</p>
                 <div id="activity-stage" class="activity-host"></div>
                 <div id="stage-detail"></div>
                 <div id="stage-rerun" class="stage-rerun" hidden></div>
               </section>
 
               <section id="tab-checks" class="tab-pane" hidden>
-                <h3>自动检查</h3>
+                <h3>Automatic checks</h3>
                 <div id="automatic" class="automatic"></div>
               </section>
 
               <section id="tab-engineering" class="tab-pane" hidden>
-                <h3>工程评审范围</h3>
+                <h3>Engineering review scope</h3>
                 <div id="confirmations" class="confirmations"></div>
               </section>
             </div>

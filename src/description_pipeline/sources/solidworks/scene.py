@@ -52,10 +52,22 @@ def identity_matrix() -> Matrix3:
 
 #: Row-major identity placement for readings already expressed in assembly axes.
 IDENTITY_PLACEMENT = (
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-    0.0, 0.0, 0.0, 1.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
 )
 
 
@@ -327,14 +339,16 @@ def _kinematic_root(cfg: dict[str, Any], link_names: Sequence[str]) -> str | Non
 
 
 def material_unverified(payload: Any) -> bool:
-    """原始读数是否明确记录了"这块实体没有经过验证的材料"。
+    """Whether a raw reading explicitly records that its material is unverified.
 
-    真实采集会写 ``reference.material_assignment``：材料齐全时是逐实体材料读数，
-    没有材料时带 ``unverified_reason``（如 ``cad_material_provenance_missing``）。
-    SolidWorks 的默认密度会给出一个"看起来正常"的 CAD 质量，所以这类读数不能当作
-    已验证质量：cad 模式下 build_scene 保留原值并记录非阻塞警告，documented_table
-    模式下质量必须由声明表覆盖。夹具/历史读数完全没有这一段时这里返回 False：
-    无法证伪就不擅自判失败，但仍由下文的声明覆盖规则约束。
+    Real captures write ``reference.material_assignment``: a complete assignment is
+    a per-entity material reading, while a missing assignment carries an
+    ``unverified_reason`` such as ``cad_material_provenance_missing``. SolidWorks
+    default density can produce a plausible-looking CAD mass, so such a reading is
+    not verified mass: in CAD mode ``build_scene`` preserves the value and records
+    a non-blocking warning; in documented-table mode the declared table must
+    replace it. Fixtures and historical readings without this block return False,
+    but declaration coverage rules still apply.
     """
 
     reference = payload.get("reference") if isinstance(payload, dict) else None
@@ -343,14 +357,14 @@ def material_unverified(payload: Any) -> bool:
 
 
 def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: dict[str, Any]) -> list[str]:
-    """质量来源的模式合同（生成侧，基于实际纳入的组件）。
+    """Validate the mass-source contract against the components actually included.
 
-    * ``documented_table``：每个被纳入的组件都必须有声明质量；缺一个即拒绝，
-      不能让某个组件悄悄落回 CAD 的默认密度占位值。
-    * 任何模式：声明表里出现未被纳入的组件（拼错/改名）即拒绝——静默忽略等于质量没生效。
-    * ``cad``：材料未验证属于**可警告缺陷**：读数与几何原样保留（不猜密度、不替换
-      数值），组件名返回给调用方记录成非阻塞警告；独立校验据此要求"使用未验证读数
-      必须留下警告记录"。
+    * ``documented_table`` requires a declared mass for every included component.
+    * Every mode refuses declared entries for components outside the included set;
+      silently ignoring a misspelled or renamed key would remove its effect.
+    * In ``cad`` mode an unverified material is a warning-level defect. Readings and
+      geometry remain unchanged, and the component names are returned for a
+      non-blocking warning that independent verification requires downstream.
     """
 
     documented = dict(cfg.get("documented_masses") or {})
@@ -374,11 +388,7 @@ def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: di
 
 
 def _material_warnings(unverified: Sequence[str], masses: dict[str, Any]) -> list[dict[str, Any]]:
-    """非阻塞警告：CAD 质量来自未经验证的材料（默认密度不是证据）。
-
-    读数保持原样——不猜密度、不替换数值；警告只保证下游无法把默认密度误当证据，
-    每个组件的原因逐字来自原始读数。
-    """
+    """Emit non-blocking warnings for CAD mass backed by unverified material."""
 
     reasons = sorted(
         {
@@ -497,8 +507,8 @@ def build_scene(
     if not bodies:
         raise ConfigError("native discovery must define the rigid bodies")
 
-    # 质量模式合同用**实际读数**复核（配置层只能查到声明层）：documented_table 必须覆盖
-    # 每个被纳入的组件；cad 模式下"材料未验证"的读数保留原值，但必须带警告记录。
+    # Recheck the mass-mode contract against actual readings: documented_table must
+    # cover every included component; CAD readings remain unchanged but carry warnings.
     included = {str(item) for body in bodies for item in (body.get("components") or [])}
     unverified_material = check_mass_contract(cfg, included, masses)
     # The direct one-shot link reads are the authoritative link inertials.  The
@@ -558,9 +568,7 @@ def build_scene(
         for instance, reading in sorted(effective_instances.items()):
             if str(reading.get("document_type") or "") != "assembly":
                 continue
-            full_descendants = {
-                leaf for leaf in all_leaves if leaf == instance or leaf.startswith(instance + "/")
-            }
+            full_descendants = {leaf for leaf in all_leaves if leaf == instance or leaf.startswith(instance + "/")}
             local = full_descendants & member_set
             if not local or full_descendants != local:
                 # A parent substitutes only when its ENTIRE descendant leaf
@@ -585,9 +593,7 @@ def build_scene(
             # frame exactly like a leaf reading: with an identity placement. Using
             # the component's own transform here would map assembly coordinates a
             # second time and displace the delivered COM of every rotating link.
-            substituted = _PartReading(
-                str(instance), IDENTITY_PLACEMENT, reading, link_rotation, link_translation
-            )
+            substituted = _PartReading(str(instance), IDENTITY_PLACEMENT, reading, link_rotation, link_translation)
             entries.append(substituted.mass_entry())
         entries.extend(reading.mass_entry() for reading in readings if reading.name not in covered)
         combined = combine_mass_properties(entries)
@@ -671,7 +677,9 @@ def build_scene(
             }
         )
         used_context = {
-            component for component in components if component not in covered
+            component
+            for component in components
+            if component not in covered
             and ((effective_instances.get(component) or {}).get("reference") or {}).get("measurement_basis")
             == "cad_assembly_instance_measurement"
         }
@@ -918,12 +926,7 @@ def _read_declared_masses(root: Path) -> dict[str, dict[str, Any]]:
 
 
 def _apply_declared_masses(scene: dict[str, Any], declared: dict[str, dict[str, Any]]) -> None:
-    """Replace declared component masses and scale their inertia accordingly.
-
-    惯量是**按质量整体缩放的 CAD 张量**：保留"几何均匀密度"的质量分布形状，
-    只改总量级。这里把该假设写进 provenance（``inertia_model``），避免下游把它当实测；
-    目录件（电机/电池/电子）的真实质量分布与几何形状不同，缩放值只作量级估计。
-    """
+    """Replace declared component masses and scale their inertia consistently."""
 
     if declared:
         known_parts = {
@@ -1007,10 +1010,10 @@ def _apply_declared_masses(scene: dict[str, Any], declared: dict[str, dict[str, 
             provenance["declared_masses"] = records
             provenance["inertia_model"] = "scaled_cad_uniform_density"
             provenance["inertia_model_scope"] = (
-                "声明质量按 used/raw 整体缩放 CAD 的均匀密度张量：保留几何形状假设，"
-                "不等于实测惯量；打印件可作量级估计，目录件（电机/电池/电子）不成立"
+                "Declared mass scales the CAD uniform-density tensor by used/raw mass; "
+                "this preserves the geometric shape assumption and is not measured inertia. "
+                "It is only an order-of-magnitude estimate for printed parts and does not "
+                "hold for catalog parts such as motors, batteries, or electronics."
             )
         provenance["mass_sources"] = sorted(set(sources))
         link["provenance"] = provenance
-
-

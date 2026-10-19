@@ -74,7 +74,7 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         for stage in LINUX_STAGES:
             self.assertFalse(rows[stage]["eligible"], stage)
             self.assertEqual(rows[stage]["reason"], "linux_owned")
-            self.assertTrue(rows[stage]["reason_zh"])
+            self.assertTrue(rows[stage]["message"])
             self.assertEqual(rows[stage]["recomputes"], [])
         for stage in LINUX_STAGES:
             with self.assertRaises(RequestError) as caught:
@@ -191,7 +191,7 @@ class ResumeEndpointTests(EndpointFixture, unittest.TestCase):
         resumed = self.jobs(lambda *args, **kwargs: self.fail("Re-probe must refuse before running"))
         finished = self.await_terminal(resumed, request["run_id"])
         self.assertEqual(finished["status"], "failed")
-        self.assertIn("重新开始", finished["error"])
+        self.assertIn("restart from that step", finished["error"])
 
     def test_queued_freeze_restart_can_complete_its_definition_exchange(self) -> None:
         jobs, parent = self.native_parent()
