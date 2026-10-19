@@ -388,6 +388,26 @@ class CapturePlanTests(unittest.TestCase):
         )
         steps._consume_sealed_definition(self.root)
 
+        wrong_state = {**entry, "suppression_state": 3}
+        discovery_document["raw"]["source_selection"] = sealed_selection(
+            files,
+            MAIN,
+            virtual_components=[wrong_state],
+        )
+        write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
+        discovery_sha = hashlib.sha256(
+            (self.root / "discovery" / "native-discovery.json").read_bytes()
+        ).hexdigest()
+        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
+        with self.assertRaisesRegex(PipelineError, "does not bind the embedded-virtual occurrence"):
+            steps._consume_sealed_definition(self.root)
+
+        unbound = dict(entry)
+        unbound.pop("binding")
+        with self.assertRaisesRegex(PipelineError, "owner-bound"):
+            sealed_selection(files, MAIN, virtual_components=[unbound])
+
+        discovery_document["raw"]["source_selection"] = manifest
         for field in (
             "schema_version",
             "scope",
