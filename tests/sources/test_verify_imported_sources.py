@@ -568,6 +568,11 @@ class ImportedSourceTests(unittest.TestCase):
                 cached_carrier(sha),
                 "owner bytes are unproven",
             ),
+            "session_pid_mismatch": (
+                cached_component(sha, source_provenance=cached_provenance(sha, native_api_pid=99999)),
+                cached_carrier(sha),
+                "root does not match its native API session",
+            ),
         }
         for label, (component, carrier, token) in cases.items():
             with self.subTest(case=label):

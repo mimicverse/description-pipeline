@@ -1019,6 +1019,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             "not_cached_in_pid": {"state": "unread"},
             "external_document": {"materialization_path": r"D:\author\imported_part.step"},
             "author_metadata_divergence": {"author_imported_path": r"D:\elsewhere\imported_part.step"},
+            "native_pid_mismatch": {"native_api_pid": 99999},
         }
         for label, patch in cases.items():
             with self.subTest(case=label):

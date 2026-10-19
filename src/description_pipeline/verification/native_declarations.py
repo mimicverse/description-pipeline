@@ -98,6 +98,7 @@ def _pid_occurrence(row, components, raw):
                 and left.get("used_api") == right.get("used_api")
                 and left.get("materialization_path") == materialization
                 and left.get("session_temp_root") == session_root
+                and left.get("native_api_pid") == right.get("native_api_pid")
                 and left.get("is_virtual") == right.get("is_virtual"),
                 "v14.imported_binding",
                 "the PID and the active occurrence record different cached materializations",

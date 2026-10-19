@@ -490,6 +490,7 @@ def _cached_materialization_reason(
         or provenance.get("native_document_path")
     )
     temp_root = provenance.get("session_temp_root")
+    native_api_pid = provenance.get("native_api_pid")
     author = provenance.get("author_imported_path")
     virtual = provenance.get("is_virtual")
     if not (isinstance(owner, str) and owner.strip()):
@@ -509,6 +510,12 @@ def _cached_materialization_reason(
         if not any(part.casefold() == "ic~~" for part in parts if part):
             return "the recorded materialization is not a session temp materialization"
         return "the session materialization is outside its recorded owned session temp root"
+    if (
+        type(native_api_pid) is not int
+        or native_api_pid <= 0
+        or session_root_pid(temp_root) != native_api_pid
+    ):
+        return "the cached materialization root does not match its native API session"
     if author is not None and not isinstance(author, str):
         return "the cached materialization author metadata is unreadable"
     if virtual is not False:
@@ -539,6 +546,12 @@ def _cached_materialization_reason(
             continue
         if not session_materialization_under_root(
             slot.get("materialization"), slot.get("session_temp_root")
+        ):
+            continue
+        if (
+            type(slot.get("native_api_pid")) is not int
+            or slot["native_api_pid"] <= 0
+            or session_root_pid(slot.get("session_temp_root")) != slot["native_api_pid"]
         ):
             continue
         if provenance.get("author_imported_in_source_root") is True:
