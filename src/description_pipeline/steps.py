@@ -456,6 +456,21 @@ def _require_plan_against_capture(staging: Path, plan: dict) -> None:
             raise PipelineError(f"The capture did not produce a planned evidence item: {requested}")
 
 
+def _require_selector_state(item: dict, component: object) -> None:
+    """Require the plan state to be the raw component's exact suppression integer."""
+
+    component_state = component.get("suppression_state") if isinstance(component, dict) else None
+    plan_state = item.get("state")
+    if (
+        component is None
+        or type(component_state) is not int
+        or component_state not in {0, 1, 2, 3, 4}
+        or type(plan_state) is not int
+        or plan_state != component_state
+    ):
+        raise PipelineError("The sealed capture plan does not bind the native suppression state")
+
+
 def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     """Consume the sealed Linux-origin definition of one prepared package.
 
@@ -571,6 +586,7 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             )
             closure = (record.get("source_selection") or {}).get("closure")
             if cached:
+                _require_selector_state(item, component)
                 names.append(name)
                 continue
             virtuals = closure.get("virtual_components") if isinstance(closure, dict) else None
@@ -635,16 +651,7 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             if recorded_document and recorded_document != document:
                 raise PipelineError("The sealed capture plan binds another document to a native instance")
         component = raw_components.get(name)
-        component_state = component.get("suppression_state") if isinstance(component, dict) else None
-        plan_state = item.get("state")
-        if (
-            component is None
-            or type(component_state) is not int
-            or component_state not in {0, 1, 2, 3, 4}
-            or type(plan_state) is not int
-            or plan_state != component_state
-        ):
-            raise PipelineError("The sealed capture plan does not bind the native suppression state")
+        _require_selector_state(item, component)
         names.append(name)
     if len(set(names)) != len(names):
         raise PipelineError("The sealed capture plan repeats a native object selector")

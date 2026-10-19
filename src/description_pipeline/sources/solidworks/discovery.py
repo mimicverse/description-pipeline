@@ -4253,6 +4253,8 @@ def sealed_cached_import_materialization(
         or provenance.get("author_imported_error") is not None
         or not isinstance(component.get("configuration"), str)
         or not component["configuration"]
+        or type(component.get("suppression_state")) is not int
+        or component.get("suppression_state") not in {0, 1, 2, 3, 4}
     ):
         return False
     session_path = provenance["materialization_path"].replace("\\", "/")
@@ -4320,6 +4322,7 @@ def sealed_cached_import_materialization(
         or entry.get("owner_sha256") != provenance["owner_sha256"]
         or (entry.get("owner_anchor") or None) != (provenance.get("defining_anchor") or None)
         or entry.get("configuration") != component["configuration"]
+        or type(entry.get("suppression_state")) is not int
         or entry.get("suppression_state") != component.get("suppression_state")
         or entry.get("author_metadata_in_stage") is not True
         or not _portable_relative(bound_source)
@@ -4370,6 +4373,7 @@ def sealed_cached_import_materialization(
         and edge.get("instance") == name
         and edge.get("resolved") == bound_source
         and edge.get("configuration") == component["configuration"]
+        and type(edge.get("suppression_state")) is int
         and edge.get("suppression_state") == component.get("suppression_state")
     ]
     return len(resolved) == 1

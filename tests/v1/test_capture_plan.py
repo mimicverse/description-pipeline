@@ -583,6 +583,15 @@ class CapturePlanTests(unittest.TestCase):
         )
         steps._consume_sealed_definition(self.root)
 
+        for state in (True, 0, 3, "2"):
+            with self.subTest(plan_state=state):
+                self._rewrite_plan(
+                    lambda plan, selected=state: plan["objects"][1].update(state=selected)
+                )
+                with self.assertRaisesRegex(PipelineError, "native suppression state"):
+                    steps._consume_sealed_definition(self.root)
+        self._rewrite_plan(lambda plan: plan["objects"][1].update(state=2))
+
         for field, value in (
             ("bound_source", "cad/missing.SLDPRT"),
             ("author_metadata_in_stage", False),
