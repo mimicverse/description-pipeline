@@ -1405,7 +1405,7 @@ class PlatformStore:
                             if (
                                 stage == "discover"
                                 and isinstance(stored_receipt, dict)
-                                and stored_receipt.get("reported_stage") == "freeze"
+                                and stored_receipt.get("reported_stage") in {"freeze", "discover"}
                                 and stored_receipt.get("actual_stage") == "discover"
                             ):
                                 self._bind_legacy_dispatch_freeze(
@@ -2441,6 +2441,16 @@ class PlatformStore:
             or dag_run_state != "failed"
         ):
             raise PlatformStoreError("The legacy dispatch has no successful freeze under a failed DagRun")
+        if receipt.get("stage") == "discover":
+            binding = reconcile.get("binding")
+            if not isinstance(binding, dict):
+                raise PlatformStoreError("The repeated discover closure carries no scheduling binding")
+            self._verify_bound_discover_airflow(
+                cursor,
+                dag_id=dag_id,
+                dag_run_id=dag_run_id,
+                binding=binding,
+            )
         if already_bound:
             return
         cursor.execute(_BIND_LEGACY_DISPATCH, ("freeze", -1, operation_id, run_id))

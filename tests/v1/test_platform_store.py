@@ -3164,6 +3164,15 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         apply()
         self.assertEqual(self.world.snapshot_state(), before, "the identical direct discover recovery is a no-op")
 
+        (self.sealed_root / "input" / "handoff.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(PlatformStoreError, "sealed freeze cannot be verified"):
+            apply()
+        self.assertEqual(
+            self.world.snapshot_state(),
+            before,
+            "a repeated direct recovery must revalidate the frozen bytes and change nothing",
+        )
+
     def test_wrong_selection_or_airflow_fact_leaves_zero_writes(self) -> None:
         variants = []
         for name, mutate in (
