@@ -58,11 +58,6 @@ class RealAirflowConfigIdentityTests(unittest.TestCase):
         get_fernet.cache_clear()
 
     def tearDown(self) -> None:
-        snapshot = getattr(self, "_connection_snapshot", None)
-        if snapshot is not None:
-            # A failed assertion must not leave the shared real-Airflow connection
-            # in the deliberately corrupted state used by this test.
-            self._writer(snapshot)
         self.temporary.cleanup()
         os.environ.clear()
         os.environ.update(self.original_environ)
@@ -309,7 +304,6 @@ class RealAirflowConfigIdentityTests(unittest.TestCase):
         document_b = platform_document(self.root)
         document_b["targets"]["m3.0"]["base"] = "release-b"
         snapshot_b, _record = activate(self.root, "gen-2", document_b)
-        self._connection_snapshot = snapshot_b
         self._writer(snapshot_b)
         self.assertEqual(self._config(None).targets["m3.0"]["base"], "release-b")
         frozen = self._config(digest_a)
@@ -328,29 +322,35 @@ class RealAirflowConfigIdentityTests(unittest.TestCase):
         self.assertEqual(reference["path"], str(snapshot_b))
         self.assertEqual(portal_module._verified_admission_config_digest(), self._config(None).config_digest)
 
-        with Session() as session:
-            row = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one()
-            row.host = "127.0.0.1"
-            row.port = 8765
-            row.password = "legacy-secret"
-            row.extra = json.dumps({"store_root": str(self.root / "legacy")})
-            session.commit()
-        with self.assertRaisesRegex(
-            portal_module.PortalError,
-            "Platform configuration identity is unavailable; submission was not admitted",
-        ):
-            portal_module._verified_admission_config_digest()
-        self._writer(snapshot_b)
-        with Session() as session:
-            row = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one()
-            session.delete(row)
-            session.commit()
-        with self.assertRaisesRegex(
-            portal_module.PortalError,
-            "Platform configuration identity is unavailable; submission was not admitted",
-        ):
-            portal_module._verified_admission_config_digest()
-        self._writer(snapshot_b)
+        try:
+            with Session() as session:
+                row = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one()
+                row.host = "127.0.0.1"
+                row.port = 8765
+                row.password = "legacy-secret"
+                row.extra = json.dumps({"store_root": str(self.root / "legacy")})
+                session.commit()
+            with self.assertRaisesRegex(
+                portal_module.PortalError,
+                "Platform configuration identity is unavailable; submission was not admitted",
+            ):
+                portal_module._verified_admission_config_digest()
+        finally:
+            # Restore while generation B is still the active record; the test
+            # switches back to generation A later in its normal flow.
+            self._writer(snapshot_b)
+        try:
+            with Session() as session:
+                row = session.query(Connection).filter(Connection.conn_id == "solidworks_windows").one()
+                session.delete(row)
+                session.commit()
+            with self.assertRaisesRegex(
+                portal_module.PortalError,
+                "Platform configuration identity is unavailable; submission was not admitted",
+            ):
+                portal_module._verified_admission_config_digest()
+        finally:
+            self._writer(snapshot_b)
 
         dag_path = ROOT / "deploy/airflow/dags/solidworks_to_urdf.py"
         spec = importlib.util.spec_from_file_location("config_identity_real_dag", dag_path)
