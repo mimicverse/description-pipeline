@@ -63,20 +63,32 @@ class LinkGroupSelectionTests(unittest.TestCase):
 
     def test_top_most_provider_replaces_its_subtree(self):
         selections = _link_group_selections(self._base_cfg(), _scene(self.LEAVES), {"sub-1": {}})
-        self.assertEqual(selections["body_b"]["selection"], ["sub-1", "c-1"])
+        self.assertEqual(selections["body_b"]["selection"], ["c-1", "sub-1"])
         self.assertEqual(selections["body_b"]["providers"], ["sub-1"])
         self.assertEqual(selections["body_b"]["uncovered_leaves"], ["c-1"])
 
     def test_nested_providers_collapse_to_the_shallowest(self):
         effective = {"sub-1": {}, "sub-1/b-1": {}}
         selections = _link_group_selections(self._base_cfg(), _scene(self.LEAVES), effective)
-        self.assertEqual(selections["body_b"]["selection"], ["sub-1", "c-1"])
+        self.assertEqual(selections["body_b"]["selection"], ["c-1", "sub-1"])
         self.assertEqual(selections["body_b"]["providers"], ["sub-1"])
 
     def test_effective_rows_with_mode_are_providers_too(self):
         masses = {"sub-1/b-1": {"mode": "effective_instance"}}
         selections = _link_group_selections(self._base_cfg(), _scene(self.LEAVES, masses), {})
-        self.assertEqual(selections["body_b"]["selection"], ["sub-1/b-1", "c-1", "sub-1/b-2"])
+        self.assertEqual(selections["body_b"]["selection"], ["c-1", "sub-1/b-1", "sub-1/b-2"])
+
+    def test_mixed_provider_and_uncovered_leaf_use_one_global_order(self):
+        cfg = _cfg(("body", ["body-1/z-provider-1", "body-1/m-leaf-1", "body-1/a-provider-2"]))
+        leaves = ["body-1/z-provider-1", "body-1/m-leaf-1", "body-1/a-provider-2"]
+        effective = {"body-1/z-provider-1": {}, "body-1/a-provider-2": {}}
+        selections = _link_group_selections(cfg, _scene(leaves), effective)
+        self.assertEqual(
+            selections["body"]["selection"],
+            ["body-1/a-provider-2", "body-1/m-leaf-1", "body-1/z-provider-1"],
+        )
+        self.assertEqual(selections["body"]["providers"], ["body-1/a-provider-2", "body-1/z-provider-1"])
+        self.assertEqual(selections["body"]["uncovered_leaves"], ["body-1/m-leaf-1"])
 
     def test_provider_spanning_bodies_fails_closed(self):
         cfg = _cfg(("body_a", ["sub-1/b-1"]), ("body_b", ["sub-1/b-2", "c-1"]))
@@ -138,8 +150,16 @@ class LinkGroupRecordTests(unittest.TestCase):
             },
         }
 
+    def _record(self, payload, *, configuration="Default"):
+        return _link_group_record_from_payload(
+            payload,
+            self._selections(),
+            "C:/copy/robot.SLDASM",
+            configuration=configuration,
+        )
+
     def test_record_wraps_the_native_payload_with_the_schema(self):
-        record = _link_group_record_from_payload(self._payload(), self._selections(), "C:/copy/robot.SLDASM")
+        record = self._record(self._payload())
         self.assertEqual(record["schema_version"], "solidworks-to-urdf.link-group-mass-properties/v1")
         self.assertEqual(record["assembly"], "C:/copy/robot.SLDASM")
         self.assertEqual(record["configuration"], "Default")
@@ -158,43 +178,56 @@ class LinkGroupRecordTests(unittest.TestCase):
         bad = self._payload()
         bad["used_api"] = "other"
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
+            self._record(bad)
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
         bad = self._payload()
         bad["selection_rule"] = "other"
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
+            self._record(bad)
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
         bad = self._payload()
         bad["links"] = {}
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
+            self._record(bad)
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
 
     def test_selection_echo_mismatch_fails_closed(self):
-        bad = self._payload(selection=["a-1"])
+        cases = {
+            "missing": ["a-1", "a-2", "sub-1/b-1"],
+            "extra": [*self.SELECTION, "sub-1/b-3"],
+            "duplicate": ["a-1", "a-1", "a-2", "sub-1/b-1", "sub-1/b-2"],
+            "same-members-wrong-order": ["a-1", "sub-1/b-1", "a-2", "sub-1/b-2"],
+        }
+        for label, selection in cases.items():
+            with self.subTest(label=label):
+                bad = self._payload(selection=selection)
+                with self.assertRaises(BridgeError) as caught:
+                    self._record(bad)
+                self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
+
+    def test_payload_configuration_must_match_the_requested_configuration(self):
+        payload = self._payload()
+        payload["configuration"] = "Other"
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record_from_payload(bad, self._selections(), "C:/copy/robot.SLDASM")
+            self._record(payload)
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
+        self.assertEqual(caught.exception.detail["expected"], "Default")
+        self.assertEqual(caught.exception.detail["received"], "Other")
 
     def test_single_read_and_bad_read_fields_fail_closed(self):
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record_from_payload(
-                self._payload(reads=[_read()]), self._selections(), "C:/copy/robot.SLDASM"
-            )
+            self._record(self._payload(reads=[_read()]))
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
         bad_read = _read()
         bad_read["mass_kg"] = -1.0
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record_from_payload(
-                self._payload(reads=[bad_read, _read()]), self._selections(), "C:/copy/robot.SLDASM"
-            )
+            self._record(self._payload(reads=[bad_read, _read()]))
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
 
     def test_other_document_read_fails_closed(self):
         payload = self._payload(assembly="C:/elsewhere/robot.SLDASM")
         with self.assertRaises(BridgeError) as caught:
-            _link_group_record_from_payload(payload, self._selections(), "C:/copy/robot.SLDASM")
+            self._record(payload)
         self.assertEqual(caught.exception.code, "capture_source_mismatch")
 
 

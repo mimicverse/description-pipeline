@@ -11,6 +11,7 @@ number in ``raw/`` comes from the CAD API during this capture.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -2173,7 +2174,11 @@ def _compose_link_selections(
         for provider in top_most:
             covered |= providers[provider]
         uncovered = sorted(members - covered)
-        selection = sorted(top_most) + uncovered
+        # The native reader canonicalizes the complete selection before
+        # echoing it, so the producer must do the same. Sorting providers and
+        # uncovered leaves separately creates a second, incompatible order for
+        # mixed groups.
+        selection = sorted([*top_most, *uncovered])
         if not selection:
             raise BridgeError(
                 "link_group_empty_selection",
@@ -2186,7 +2191,10 @@ def _compose_link_selections(
 
 
 def _link_group_record_from_payload(
-    payload: Any, selections: dict[str, dict[str, Any]], document: str | None
+    payload: Any,
+    selections: dict[str, dict[str, Any]],
+    document: str | None,
+    configuration: str,
 ) -> dict[str, Any]:
     """Validate one native link group payload against the composed selections."""
 
@@ -2198,6 +2206,16 @@ def _link_group_record_from_payload(
         raise BridgeError(
             "cad_link_group_payload_invalid",
             "the backend returned an unexpected link group payload",
+            exit_code=3,
+        )
+    if payload.get("configuration") != configuration:
+        raise BridgeError(
+            "cad_link_group_payload_invalid",
+            "the link group payload names another configuration",
+            {
+                "expected": configuration,
+                "received": payload.get("configuration"),
+            },
             exit_code=3,
         )
     links = payload.get("links")
@@ -2215,7 +2233,11 @@ def _link_group_record_from_payload(
             raise BridgeError(
                 "cad_link_group_payload_invalid",
                 "the link group payload echoes another selection",
-                {"body": name},
+                {
+                    "body": name,
+                    "expected": entry["selection"],
+                    "received": row.get("selection") if isinstance(row, dict) else None,
+                },
                 exit_code=3,
             )
         if not isinstance(reads, list) or len(reads) != 2:
@@ -2270,6 +2292,15 @@ def _link_group_record_from_payload(
             for name in selections
         },
     }
+
+
+def _write_link_group_diagnostic(path: Path, payload: Any) -> None:
+    """Preserve the native payload even when CAD supplied non-finite numbers."""
+
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=True),
+        encoding="utf-8",
+    )
 
 
 def _link_group_read_valid(body: str, index: int, read: Any) -> None:
@@ -2331,6 +2362,7 @@ def _pristine_readout_window(
     closure: dict[str, Any],
     selections: dict[str, dict[str, Any]],
     activity=None,
+    diagnostic_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Whole-assembly and direct link reads in the pristine reopen window.
 
@@ -2376,8 +2408,35 @@ def _pristine_readout_window(
             exit_code=3,
         )
     _capture_note(activity, "window_read", params={"scope": "link_groups"})
+    if diagnostic_dir is not None:
+        diagnostic_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            diagnostic_dir / "link-group-read-request.json",
+            {
+                "assembly": document,
+                "configuration": cfg.get("configuration"),
+                "selection_order": "lexicographic_full_list",
+                "units": {
+                    "mass": "kg",
+                    "length": "m",
+                    "inertia": "kg_m2",
+                },
+                "groups": cfg.get("groups") or [],
+                "selections": selections,
+            },
+        )
     payload = reader(document, {name: entry["selection"] for name, entry in selections.items()})
-    record = _link_group_record_from_payload(payload, selections, document)
+    if diagnostic_dir is not None:
+        _write_link_group_diagnostic(
+            diagnostic_dir / "link-group-mass-properties.payload.json",
+            payload,
+        )
+    record = _link_group_record_from_payload(
+        payload,
+        selections,
+        document,
+        configuration=str(cfg.get("configuration") or ""),
+    )
     record["readout_window"] = PRISTINE_WINDOW
     assembly = getattr(backend, "assembly_mass_properties", None)
     top_level = None
@@ -2571,7 +2630,15 @@ def _freeze_local(
         stage = "pristine_readout"
         _capture_note(activity, "pristine_readout")
         selections = _link_group_selections(cfg, scene, backend_readings)
-        window = _pristine_readout_window(backend, cfg, closure, selections, activity=activity)
+        diagnostic_dir = staging / "reports" / "diagnostics"
+        window = _pristine_readout_window(
+            backend,
+            cfg,
+            closure,
+            selections,
+            activity=activity,
+            diagnostic_dir=diagnostic_dir,
+        )
         if isinstance(mass_closure, dict) and mass_closure.get("status") == "recorded":
             if not isinstance(window["top_level"], dict):
                 raise BridgeError(
@@ -2655,6 +2722,8 @@ def _freeze_local(
 
         stage = "publish"
         _capture_note(activity, "seal")
+        if diagnostic_dir.exists():
+            shutil.rmtree(diagnostic_dir)
         write_manifest = _shared_manifest_writer()
         manifest = write_manifest(
             staging,

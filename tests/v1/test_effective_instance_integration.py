@@ -89,6 +89,7 @@ def _capture_from_raw(evidence: Path, *, identity: dict) -> dict:
             "kind": "solidworks",
             "evidence_class": "cad",
             "identity": copy.deepcopy(identity),
+            "capture": {"collected_document": COLLECTED},
             "limits": {"native_cad": True},
             "environment": {"solidworks": {"revision": "34.0"}},
         },
@@ -461,7 +462,7 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
         (raw / "link_group_mass_properties.json").write_text(
             json.dumps(
                 _fixture_link_group_record(
-                    self.source, scene_obj.components, scene_obj.notes, scene_obj.mass_properties, ORIGINAL
+                    self.source, scene_obj.components, scene_obj.notes, scene_obj.mass_properties, COLLECTED
                 )
             ),
             encoding="utf-8",
@@ -901,7 +902,7 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
                     scene_obj.components,
                     scene_payload["notes"],
                     scene_payload["mass_properties"],
-                    ORIGINAL,
+                    COLLECTED,
                 )
             ),
             encoding="utf-8",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -464,6 +465,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(
             base["reproducibility"], {"mass_delta_kg": 0.0, "com_delta_norm_m": 0.0, "tensor_delta_max_abs": 0.0}
         )
+        self.assertFalse((self.destination / "reports" / "diagnostics").exists())
         scene = load_scene(self.destination)
         link = next(row for row in scene["links"] if row["name"] == "base_link")
         self.assertAlmostEqual(link["inertial"]["mass"], 1.0, places=12)
@@ -490,9 +492,28 @@ class FreezeTests(unittest.TestCase):
 
     def test_freeze_fails_closed_when_the_window_payload_echo_differs(self) -> None:
         self.backend.link_group_selection_override = {"base_link": ["arm-1"]}
+        self.backend.link_group_payload_nonfinite = True
         with self.assertRaises(BridgeError) as caught:
             freeze(self.config, self.destination, backend=self.backend)
         self.assertEqual(caught.exception.code, "cad_link_group_payload_invalid")
+        self.assertEqual(caught.exception.detail["body"], "base_link")
+        self.assertEqual(caught.exception.detail["expected"], ["base-1"])
+        self.assertEqual(caught.exception.detail["received"], ["arm-1"])
+        diagnostics = (
+            self.destination.with_name(self.destination.name + ".failed-001")
+            / "partial"
+            / "reports"
+            / "diagnostics"
+        )
+        request = json.loads((diagnostics / "link-group-read-request.json").read_text(encoding="utf-8"))
+        payload = json.loads(
+            (diagnostics / "link-group-mass-properties.payload.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(request["selections"]["base_link"]["selection"], ["base-1"])
+        self.assertEqual(payload["links"]["base_link"]["selection"], ["arm-1"])
+        self.assertTrue(
+            math.isnan(payload["links"]["base_link"]["reads"][0]["inertia_values_about_origin_api"]["values"][0])
+        )
 
     def test_freeze_fails_closed_when_documents_cannot_close(self) -> None:
         self.backend.close_refuses = True
