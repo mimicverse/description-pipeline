@@ -479,6 +479,9 @@ class CapturePlanTests(unittest.TestCase):
     def test_a_cached_import_selector_binds_its_portable_owner_source(self) -> None:
         session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7\\IC~~\\arm.step.SLDPRT"
         session_root = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7"
+        selection_root = "C:\\selection\\m3-flat"
+        selection_path = selection_root + "\\swx8\\IC~~\\arm.step.SLDPRT"
+        source_root = "C:\\discovery\\m3-flat"
         discovery_document = json.loads(
             (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
         )
@@ -501,30 +504,30 @@ class CapturePlanTests(unittest.TestCase):
                 "native_document_path": session_path,
                 "session_temp_root": session_root,
                 "native_api_pid": 7,
-                "author_imported_path": "cad/arm.SLDPRT",
+                "author_imported_in_source_root": True,
+                "author_imported_relative": "cad/arm.SLDPRT",
+                "author_imported_path": source_root + "\\cad\\arm.SLDPRT",
+                "source_root": source_root,
                 "defining_anchor": None,
                 "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
                 "error": None,
+                "author_imported_error": None,
             },
         )
-        self.assertEqual(
-            discovery._capture_plan_selector(component, discovery_document["native_files"]),
-            {"name": "arm-1", "state": 2},
-        )
         entry = {
-            "document": session_path,
+            "document": selection_path,
             "owner": MAIN,
             "owner_sha256": "a" * 64,
             "bound_source": "cad/arm.SLDPRT",
             "defining_materialization": None,
             "instance": "arm-1",
             "name": "arm-1",
-            "author_imported_path": "cad/arm.SLDPRT",
+            "author_imported_path": selection_root + "\\cad\\arm.SLDPRT",
             "author_metadata_in_stage": True,
             "is_virtual": False,
-            "materialization": session_path,
-            "session_temp_root": session_root,
-            "native_api_pid": 7,
+            "materialization": selection_path,
+            "session_temp_root": selection_root + "\\swx8",
+            "native_api_pid": 8,
             "configuration": "Default",
             "suppression_state": 2,
             "state": "cached_materialization",
@@ -532,11 +535,42 @@ class CapturePlanTests(unittest.TestCase):
             "owner_anchor": None,
         }
         files = dict(discovery_document["raw"]["files"])
-        discovery_document["raw"]["source_selection"] = sealed_selection(
+        from description_pipeline.sources.solidworks.selection import seal_closure_selection
+        from tests.sources.selection_support import closure_evidence
+
+        evidence = closure_evidence(
             files,
             MAIN,
+            edges={
+                MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+                "cad/base.SLDPRT": [],
+                "cad/arm.SLDPRT": [],
+            },
             imports=[entry],
+            stage_root=selection_root,
         )
+        next(
+            edge
+            for edge in evidence["documents"][MAIN]["resolved_edges"]
+            if edge["resolved"].replace("\\", "/") == "cad/arm.SLDPRT"
+        ).update(
+            kind="native_imported_document",
+            instance="arm-1",
+            resolved="cad/arm.SLDPRT",
+            configuration="Default",
+            suppression_state=2,
+        )
+        manifest = seal_closure_selection(
+            files,
+            MAIN,
+            evidence,
+            reader_sha256=evidence["reader_sha256"],
+        )
+        self.assertEqual(
+            discovery._capture_plan_selector(component, discovery_document["native_files"], manifest),
+            {"name": "arm-1", "state": 2},
+        )
+        discovery_document["raw"]["source_selection"] = manifest
         write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
         discovery_sha = hashlib.sha256(
             (self.root / "discovery" / "native-discovery.json").read_bytes()
@@ -567,7 +601,7 @@ class CapturePlanTests(unittest.TestCase):
                     (self.root / "discovery" / "native-discovery.json").read_bytes()
                 ).hexdigest()
                 self._rewrite_plan(lambda plan, sha=changed_sha: plan.update(discovery_sha256=sha))
-                with self.assertRaisesRegex(PipelineError, "cached-import occurrence"):
+                with self.assertRaisesRegex(PipelineError, "complete session proof"):
                     steps._consume_sealed_definition(self.root)
 
     def test_a_plan_naming_another_run_is_refused(self) -> None:

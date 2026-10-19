@@ -558,7 +558,7 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 component, name, expected_files
             )
             cached = isinstance(component, dict) and sealed_cached_import_materialization(
-                component, name, expected_files
+                component, name, expected_files, raw_selection
             )
             if component is None or not (virtual or cached):
                 raise PipelineError(
@@ -571,36 +571,6 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             )
             closure = (record.get("source_selection") or {}).get("closure")
             if cached:
-                imports = closure.get("imports") if isinstance(closure, dict) else None
-                matches = [
-                    entry
-                    for entry in (imports or [])
-                    if isinstance(entry, dict)
-                    and entry.get("instance") == name
-                    and entry.get("state") == "cached_materialization"
-                ]
-                if len(matches) != 1:
-                    raise PipelineError("The sealed closure carries no unique cached-import occurrence")
-                entry = matches[0]
-                bound_source = entry.get("bound_source")
-                if (
-                    entry.get("binding") != "author_metadata_only"
-                    or entry.get("owner") != provenance.get("owner")
-                    or entry.get("owner_sha256") != provenance.get("owner_sha256")
-                    or entry.get("materialization") != provenance.get("materialization_path")
-                    or entry.get("session_temp_root") != provenance.get("session_temp_root")
-                    or entry.get("native_api_pid") != provenance.get("native_api_pid")
-                    or entry.get("author_imported_path") != provenance.get("author_imported_path")
-                    or entry.get("author_metadata_in_stage") is not True
-                    or entry.get("configuration") != component.get("configuration")
-                    or entry.get("suppression_state") != component.get("suppression_state")
-                    or not isinstance(bound_source, str)
-                    or bound_source not in expected_files
-                    or (entry.get("owner_anchor") or None) != (provenance.get("defining_anchor") or None)
-                ):
-                    raise PipelineError(
-                        "The sealed closure does not bind the cached-import occurrence to a staged source"
-                    )
                 names.append(name)
                 continue
             virtuals = closure.get("virtual_components") if isinstance(closure, dict) else None
@@ -648,7 +618,7 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         if document is not None:
             component = raw_components.get(name)
             if isinstance(component, dict) and sealed_cached_import_materialization(
-                component, name, expected_files
+                component, name, expected_files, raw_selection
             ):
                 raise PipelineError(
                     "The sealed capture plan carries a cached-import session document"
