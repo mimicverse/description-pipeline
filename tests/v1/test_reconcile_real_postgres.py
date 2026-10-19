@@ -550,12 +550,14 @@ class ReconcileRealPostgresTests(unittest.TestCase):
         from description_pipeline.io import digest as pipeline_digest
         from description_pipeline.io import read_data
         from description_pipeline.platform.storage import seal_stage_confirmation
+        from tests.v1.test_native_recovery import stage_view
         from tests.v1.test_platform_store import build_sealed_delivery
 
         self._prepare_bound_native_discover()
         discover_root = self.evidence / "planned-discover"
         subject, artifacts, _upload, native_handoff = build_sealed_delivery(discover_root)
         native_tool = read_data(discover_root / "reports" / "native-tool.json")
+        native_stages = stage_view(handoff_sha256=native_handoff, run_id=self.run_id)
         discover_receipt = {
             "schema_version": BUNDLE_SCHEMA,
             "pipeline_id": PIPELINE_ID,
@@ -566,6 +568,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             "handoff_sha256": native_handoff,
             "subject_sha256": subject,
             "native_tool": native_tool,
+            "native_stages_sha256": pipeline_digest(native_stages),
             "artifacts": artifacts,
         }
         discover_checkpoint, discover_receipt = seal_stage_confirmation(
@@ -604,6 +607,8 @@ class ReconcileRealPostgresTests(unittest.TestCase):
         ]
         job["error"] = "PipelineError: The sealed capture plan carries an unsafe selector document"
         job["error_code"] = "capture_plan_unsafe_selector"
+        job["handoff_sha256"] = native_handoff
+        job["stages"] = native_stages
         self.log.write_text(json.dumps(job, ensure_ascii=False) + "\n", encoding="utf-8")
         reconcile = {
             "operation_key": f"operatorctl-reconcile:{self.run_id}:discover:failed",
@@ -663,6 +668,28 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             )
         )
         before = self._bound_rows()
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+
+        with Session() as session:
+            task = (
+                session.query(TaskInstance)
+                .filter_by(dag_id=DAG_ID, run_id=self.dag_run_id, task_id="discover", map_index=-1)
+                .one()
+            )
+            task.state = "running"
+            session.commit()
+        with self.assertRaisesRegex(Exception, "real discover task"):
+            self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+        self.assertEqual(self._bound_rows(), before, "a non-terminal Airflow fact refuses without writes")
+        with Session() as session:
+            task = (
+                session.query(TaskInstance)
+                .filter_by(dag_id=DAG_ID, run_id=self.dag_run_id, task_id="discover", map_index=-1)
+                .one()
+            )
+            task.state = "failed"
+            session.commit()
         self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
         self.assertEqual(self._bound_rows(), before, "the repeated capture recovery is a no-op")
 
