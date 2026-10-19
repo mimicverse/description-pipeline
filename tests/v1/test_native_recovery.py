@@ -13,6 +13,8 @@ from pathlib import Path
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import PipelineError, digest, file_digest, write_json
 from description_pipeline.platform.native_recovery import build_discovery_tree_from_prepared
+from description_pipeline.platform.native_recovery import discovery_receipt
+from description_pipeline.platform.store import PlatformStore, PlatformStoreError
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 from description_pipeline.schemas import TOOL_SCHEMA
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
@@ -32,7 +34,13 @@ def native_tool(role: str) -> dict:
     }
 
 
-def stage_view(*, discover_qc: str = "passed", handoff_sha256: str, run_id: str = RUN_ID) -> dict:
+def stage_view(
+    *,
+    discover_qc: str = "passed",
+    handoff_sha256: str,
+    run_id: str = RUN_ID,
+    capture_state: str = "failed",
+) -> dict:
     rows = [{"id": stage["id"]} for stage in CONTRACT["stages"]]
     by_id = {row["id"]: row for row in rows}
     discover_definition = next(stage for stage in CONTRACT["stages"] if stage["id"] == "discover")
@@ -48,7 +56,7 @@ def stage_view(*, discover_qc: str = "passed", handoff_sha256: str, run_id: str 
             for item in discover_definition["output_qc"]
         ],
     )
-    by_id["capture"].update(state="failed", in_scope=True)
+    by_id["capture"].update(state=capture_state, in_scope=True)
     return {
         "schema_version": "solidworks-to-urdf.stages/v1",
         "pipeline_id": PIPELINE_ID,
@@ -146,6 +154,54 @@ class NativeRecoveryTests(unittest.TestCase):
         self.assertTrue((tree / "input" / "request.json").is_file())
         self.assertTrue((tree / "reports" / "native-stages.json").is_file())
         self.assertTrue((tree / "tool.json").is_file())
+
+    def test_native_success_recovery_uses_the_expected_completed_capture(self) -> None:
+        completed = stage_view(
+            handoff_sha256=self.handoff,
+            capture_state="completed",
+        )
+        built = self._build(native_stages=completed, capture_state="completed")
+        self.assertEqual(built["native_stages_sha256"], digest(completed))
+        for stages, capture_state in (
+            (completed, "failed"),
+            (stage_view(handoff_sha256=self.handoff), "completed"),
+        ):
+            with self.subTest(capture_state=capture_state), self.assertRaises(PipelineError):
+                self._build(native_stages=stages, capture_state=capture_state)
+
+    def test_sealed_receipt_digests_are_recomputed_from_their_files(self) -> None:
+        built = self._build()
+        tree = self.root / "discover"
+        receipt = discovery_receipt(
+            run_id=RUN_ID,
+            tree=tree,
+            native_tool=self.native,
+            native_handoff=built["native_handoff"],
+            native_stages_sha256=built["native_stages_sha256"],
+            request_evidence_sha256=built["request_evidence_sha256"],
+            portable_tool_sha256=built["portable_tool_sha256"],
+        )
+        store = PlatformStore(lambda: None, sealed=lambda _uri: tree)
+        checkpoint = f"store://sealed/{RUN_ID}/discover"
+        row = ("discover", "completed", receipt, checkpoint, None, None)
+        self.assertEqual(
+            store._verified_direct_completed_stage(
+                None,
+                run_id=RUN_ID,
+                stage="discover",
+                row=row,
+            )["native_stages_sha256"],
+            built["native_stages_sha256"],
+        )
+        changed = dict(receipt)
+        changed["native_stages_sha256"] = "f" * 64
+        with self.assertRaisesRegex(PlatformStoreError, "digests differ"):
+            store._verified_direct_completed_stage(
+                None,
+                run_id=RUN_ID,
+                stage="discover",
+                row=("discover", "completed", changed, checkpoint, None, None),
+            )
 
     def test_recovery_refuses_missing_or_contradictory_original_evidence(self) -> None:
         cases = (

@@ -726,6 +726,20 @@ class FakeCursor:
                     settled = "succeeded" if record[6] == "cancel" else outcome
                     world.operations[key] = (record[0], settled, *record[2:])
             self._rows = []
+        elif normalized.startswith(
+            "UPDATE operation SET state = 'cancelled', updated_at = now()"
+            " WHERE run_id = %s AND stage = %s AND kind = 'native' AND state = 'queued'"
+        ):
+            run_id, stage = params
+            for key, record in list(world.operations.items()):
+                if (
+                    record[4] == run_id
+                    and record[5] == stage
+                    and record[6] == "native"
+                    and record[1] == "queued"
+                ):
+                    world.operations[key] = (record[0], "cancelled", *record[2:])
+            self._rows = []
         elif normalized.startswith("UPDATE operation SET state = 'cancelled', updated_at = now()"):
             run_id, stage = params
             for key, record in list(world.operations.items()):
@@ -3335,6 +3349,33 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         before = self.world.snapshot_state()
         settle()
         self.assertEqual(self.world.snapshot_state(), before)
+
+    def test_a_queued_native_intent_closes_when_discover_never_started(self) -> None:
+        operation_id, _state, key, params_digest, run_id, stage, kind = self.world.operations[self.native_key]
+        self.world.operations[key] = (
+            operation_id,
+            "queued",
+            key,
+            params_digest,
+            run_id,
+            stage,
+            kind,
+        )
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            receipt={
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": self.run_id,
+                "stage": "discover",
+                "state": "failed",
+                "passed": False,
+                "error": "native submission claim was never granted",
+            },
+        )
+        self.assertEqual(self.world.operations[self.native_key][1], "cancelled")
 
     def test_native_success_settles_the_owner_before_capture_import(self) -> None:
         job = dict(self.document)

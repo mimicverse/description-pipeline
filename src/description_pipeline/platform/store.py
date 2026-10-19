@@ -528,6 +528,10 @@ _SETTLE_BLOCKED_OPERATIONS = (
     " AND kind NOT IN ('reconcile', 'cache_release', 'native')"
     " AND state = 'queued'"
 )
+_SETTLE_QUEUED_NATIVE = (
+    "UPDATE operation SET state = 'cancelled', updated_at = now()"
+    " WHERE run_id = %s AND stage = %s AND kind = 'native' AND state = 'queued'"
+)
 _SETTLE_UNKNOWN = (
     "UPDATE operation SET state = 'unresolved', updated_at = now()"
     " WHERE run_id = %s AND stage = %s"
@@ -2702,6 +2706,29 @@ class PlatformStore:
             definition=definition,
             root=sealed_root,
         )
+        recovery_keys = (
+            "native_stages_sha256",
+            "request_evidence_sha256",
+            "portable_tool_sha256",
+        )
+        if stage == "discover" and all(key in receipt for key in recovery_keys):
+            if any(
+                not isinstance(receipt.get(key), str) or not _is_sha256(receipt[key])
+                for key in recovery_keys
+            ):
+                raise PlatformStoreError("The recovered discover receipt carries invalid file digests")
+            try:
+                native_stages = read_data(sealed_root / "reports" / "native-stages.json")
+                portable_tool = read_data(sealed_root / "tool.json")
+                request_bytes = (sealed_root / "input" / "request.json").read_bytes()
+            except (OSError, PipelineError) as error:
+                raise PlatformStoreError("The recovered discover evidence files are missing or unreadable") from error
+            if (
+                digest(native_stages) != receipt["native_stages_sha256"]
+                or hashlib.sha256(request_bytes).hexdigest() != receipt["request_evidence_sha256"]
+                or digest(portable_tool) != receipt["portable_tool_sha256"]
+            ):
+                raise PlatformStoreError("The recovered discover receipt digests differ from the sealed evidence")
         return receipt
 
     def _native_owner_binding_matches(
@@ -3106,13 +3133,16 @@ class PlatformStore:
             # A blocked stage never entered execution: its still-queued intents are the
             # evidenced non-execution - they close as cancelled, never as failed, and a
             # claimed (possibly dispatched) operation is never rewritten here.
-            connection.cursor().execute(_SETTLE_BLOCKED_OPERATIONS, (run_id, stage))
+            cursor = connection.cursor()
+            cursor.execute(_SETTLE_QUEUED_NATIVE, (run_id, stage))
+            cursor.execute(_SETTLE_BLOCKED_OPERATIONS, (run_id, stage))
             return
         elif state == "unresolved":
             outcome = "unresolved"
         else:
             return
         cursor = connection.cursor()
+        cursor.execute(_SETTLE_QUEUED_NATIVE, (run_id, stage))
         if outcome == "unresolved":
             cursor.execute(_SETTLE_UNKNOWN, (run_id, stage))
             cursor.execute(_SET_RUN_UNRESOLVED, (run_id,))

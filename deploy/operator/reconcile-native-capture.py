@@ -91,6 +91,7 @@ def main() -> int:
         ),
         request_upload_files=native_request.get("upload_files"),
         request_upload_sha256=native_request.get("upload_sha256"),
+        capture_state="failed",
     )
     if job.get("handoff_sha256") != built["native_handoff"]:
         raise PlatformStoreError("The native prepared inventory differs from the failed job handoff")

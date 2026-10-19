@@ -194,6 +194,7 @@ def build_discovery_tree_from_prepared(
     portable_tool: object,
     request_upload_files: object,
     request_upload_sha256: object,
+    capture_state: str = "failed",
 ) -> dict:
     """Reconstruct the completed discover tree from the prepared package.
 
@@ -203,6 +204,8 @@ def build_discovery_tree_from_prepared(
     and after the copy.  No native or CAD operation occurs here.
     """
 
+    if capture_state not in {"completed", "failed"}:
+        raise PipelineError("The native recovery carries an unsupported expected capture state")
     if not prepared:
         raise PipelineError("The native prepared inventory is empty")
     if "source.json" not in prepared:
@@ -299,6 +302,7 @@ def build_discovery_tree_from_prepared(
         native_stages,
         run_id=run_id,
         handoff_sha256=native_handoff,
+        capture_state=capture_state,
     )
     request_record = _request_evidence(
         request_evidence,

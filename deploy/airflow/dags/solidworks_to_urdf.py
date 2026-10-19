@@ -1480,6 +1480,11 @@ def _seal_native_discovery(request: dict, job: dict, *, settle_operations: bool 
         ),
         request_upload_files=native_request.get("upload_files"),
         request_upload_sha256=native_request.get("upload_sha256"),
+        capture_state=(
+            "completed"
+            if job.get("status") in {"passed", "native_complete"}
+            else "failed"
+        ),
     )
     native_handoff = built["native_handoff"]
     if job.get("handoff_sha256") != native_handoff:

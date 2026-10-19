@@ -813,10 +813,12 @@ class DagTests(unittest.TestCase):
                 "import_native_capture",
                 side_effect=RuntimeError("capture import failed"),
             ),
+            patch.object(module, "_seal_native_discovery") as seal,
             patch.object(module, "_converge_failed_stage") as converge,
             self.assertRaisesRegex(RuntimeError, "capture import failed"),
         ):
             module.dag.task_dict["capture"].python_callable(request)
+        seal.assert_called_once_with(request, job)
         self.assertEqual(converge.call_args.args[:2], (request["run_id"], "capture"))
 
     def test_capture_retries_owner_settlement_after_a_successful_import(self) -> None:
@@ -3139,6 +3141,23 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertIs(self.calls[-1]["settle_operations"], False)
         self.assertEqual(self.calls[-1]["stage"], "discover")
         self.assertEqual(self.calls[-1]["state"], "completed")
+
+        completed_job = json.loads(json.dumps(job))
+        completed_job["status"] = "native_complete"
+        completed_job["events"] = [
+            {"stage": "discover", "state": "completed"},
+            {"stage": "capture", "state": "completed"},
+        ]
+        completed_job["stages"] = stage_view(
+            handoff_sha256=handoff,
+            run_id=run_id,
+            capture_state="completed",
+        )
+        with patch.object(self.module, "_work_paths", return_value=flow.RunPaths(self.root, run_id)):
+            self.module._seal_native_discovery(request, completed_job)
+        self.assertEqual(self.calls[-1]["stage"], "discover")
+        self.assertEqual(self.calls[-1]["state"], "completed")
+        self.assertEqual(self.calls[-1]["receipt"]["handoff_sha256"], handoff)
 
     def test_native_failure_marker_binds_settlement_to_the_exact_failed_task(self) -> None:
         from types import SimpleNamespace
