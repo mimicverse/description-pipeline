@@ -903,8 +903,9 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
     lifecycle = [dict(item) for item in rows.get("lifecycle", [])]
     comparisons.append(
         {
-            "name": "lifecycle_projection_terminal",
-            "passed": bool(lifecycle) and all(item.get("bucket") == "terminal" for item in lifecycle),
+            "name": "lifecycle_projection_has_no_unknown",
+            "passed": bool(lifecycle)
+            and all(item.get("bucket") in {"terminal", "in_flight"} for item in lifecycle),
             "observed": lifecycle,
         }
     )

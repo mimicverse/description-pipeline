@@ -159,7 +159,7 @@ class SettlementCheckerTests(unittest.TestCase):
     def test_an_unknown_lifecycle_bucket_is_rejected(self) -> None:
         rows = self.rows()
         rows["lifecycle"][-1]["bucket"] = "unknown"
-        self.assertFalse(self.compare(rows)["lifecycle_projection_terminal"]["passed"])
+        self.assertFalse(self.compare(rows)["lifecycle_projection_has_no_unknown"]["passed"])
 
     def test_capture_completed_without_a_native_operation_is_rejected(self) -> None:
         rows = self.rows()
