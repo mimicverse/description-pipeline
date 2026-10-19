@@ -255,6 +255,7 @@ def _mock_endpoint(
                     "run_id": fresh["run_id"],
                     "request": dict(payload),
                     "main_assembly": main_assembly,
+                    "handoff_sha256": fixture["handoff_sha256"],
                     "native_tool": fixture["native_tool"],
                     "status": "selecting",
                     "events": [{"stage": "job", "state": "selecting", "at": "t0"}],

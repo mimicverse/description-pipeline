@@ -208,10 +208,11 @@ class MockEndpointHealthTests(unittest.TestCase):
             root = Path(directory)
             archive = root / "archive.zip"
             archive.write_bytes(b"")
-            server, _ = self.module._mock_endpoint(
+            server, state = self.module._mock_endpoint(
                 {
                     "archive": str(archive),
                     "main_assembly": "cad/robot.SLDASM",
+                    "handoff_sha256": "e" * 64,
                     "native_tool": {"source_sha256": "a" * 64},
                 },
                 run_id=run_id,
@@ -232,6 +233,7 @@ class MockEndpointHealthTests(unittest.TestCase):
                     upload_files={"cad/robot.SLDASM": "d" * 64},
                     main_assembly="cad/robot.SLDASM",
                 )
+                self.assertEqual(state["jobs"][run_id]["handoff_sha256"], "e" * 64)
                 request = cache_release_request(
                     run_id=run_id,
                     linux_run_id=run_id,
