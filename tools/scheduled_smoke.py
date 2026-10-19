@@ -365,6 +365,7 @@ def _mock_endpoint(
                 state["definition_posts"].append({"prepared_sha256": prepared, "size": len(body)})
                 job["_artifacts"][fixture["receipt"]["name"]] = archive
                 job["status"] = "native_complete"
+                job["stages"] = fixture["native_stages"]
                 job["events"] = [
                     *fixture["native_stages"]["events"],
                     {"stage": "job", "state": "native_complete", "at": "t0"},

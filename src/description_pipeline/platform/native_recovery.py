@@ -26,6 +26,7 @@ from ..stages import (
     CONFIRMED_STAGE_STATES,
     CONTRACT,
     CONTRACT_SHA256,
+    STAGE_IDS,
     VIEW_SCHEMA,
 )
 from .storage import seal_stage_confirmation
@@ -107,7 +108,7 @@ def validate_native_discovery_stage(
         or native_stages.get("contract_sha256") != CONTRACT_SHA256
         or native_stages.get("run_id") != run_id
         or native_stages.get("handoff_sha256") != handoff_sha256
-        or native_stages.get("execution_scope") != ["discover", "capture"]
+        or not _valid_native_execution_scope(native_stages.get("execution_scope"))
     ):
         raise PipelineError("The native capture failure carries another stage contract or run identity")
     rows = native_stages.get("stages")
@@ -139,6 +140,21 @@ def validate_native_discovery_stage(
     if capture.get("state") != capture_state or capture.get("in_scope") is not True:
         raise PipelineError(f"The native stage view does not prove capture {capture_state}")
     return native_stages
+
+
+def _valid_native_execution_scope(scope: object) -> bool:
+    """A native half may include freeze but must include discover and capture in contract order."""
+
+    if (
+        not isinstance(scope, list)
+        or not scope
+        or any(not isinstance(stage, str) for stage in scope)
+        or len(set(scope)) != len(scope)
+        or set(scope) - set(STAGE_IDS)
+    ):
+        return False
+    expected = [stage for stage in STAGE_IDS if stage in set(scope)]
+    return scope == expected and {"discover", "capture"} <= set(scope)
 
 
 def _request_evidence(

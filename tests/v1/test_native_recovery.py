@@ -40,6 +40,7 @@ def stage_view(
     handoff_sha256: str,
     run_id: str = RUN_ID,
     capture_state: str = "failed",
+    execution_scope: list[str] | None = None,
 ) -> dict:
     rows = [{"id": stage["id"]} for stage in CONTRACT["stages"]]
     by_id = {row["id"]: row for row in rows}
@@ -63,7 +64,7 @@ def stage_view(
         "contract_sha256": CONTRACT_SHA256,
         "run_id": run_id,
         "handoff_sha256": handoff_sha256,
-        "execution_scope": ["discover", "capture"],
+        "execution_scope": execution_scope or ["discover", "capture"],
         "stages": rows,
     }
 
@@ -168,6 +169,29 @@ class NativeRecoveryTests(unittest.TestCase):
         ):
             with self.subTest(capture_state=capture_state), self.assertRaises(PipelineError):
                 self._build(native_stages=stages, capture_state=capture_state)
+
+    def test_native_execution_scope_allows_freeze_with_discover_and_capture(self) -> None:
+        stages = stage_view(
+            handoff_sha256=self.handoff,
+            capture_state="completed",
+            execution_scope=["freeze", "discover", "capture"],
+        )
+        self._build(native_stages=stages, capture_state="completed")
+        for scope in (
+            ["discover"],
+            ["capture", "discover"],
+            ["discover", "capture", "discover"],
+            ["discover", "capture", "unknown"],
+        ):
+            with self.subTest(scope=scope), self.assertRaises(PipelineError):
+                self._build(
+                    native_stages=stage_view(
+                        handoff_sha256=self.handoff,
+                        capture_state="completed",
+                        execution_scope=scope,
+                    ),
+                    capture_state="completed",
+                )
 
     def test_sealed_receipt_digests_are_recomputed_from_their_files(self) -> None:
         built = self._build()
