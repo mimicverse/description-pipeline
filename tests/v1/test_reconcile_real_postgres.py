@@ -483,14 +483,13 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             "binding": binding,
             "native_receipt": {"path": str(self.log), "native_run_id": self.run_id},
         }
-        self.store.settle_native_owner_failure(
-            run_id=self.run_id,
-            operation_key=self.native_operation_key,
-            receipt_path=self.log,
-            native_run_id=self.run_id,
-            evidence=[str(self.log)],
-            reported_stage="discover",
-        )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE operation SET state='failed' WHERE operation_id=%s AND run_id=%s",
+                (self.native_operation_id, self.run_id),
+            )
+            self.assertEqual(cursor.rowcount, 1)
+            connection.commit()
 
     def _bound_rows(self) -> dict:
         import psycopg2
