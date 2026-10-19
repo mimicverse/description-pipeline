@@ -48,6 +48,15 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+from description_pipeline.interface_records import (
+    InterfaceRecordError,
+    cache_release_params_digest,
+    cache_release_receipt_digest,
+    validate_cache_release_receipt,
+    validate_cache_release_request,
+)
+from description_pipeline.schemas import CACHE_RELEASE_RECEIPT_SCHEMA
+
 TOKEN = "scheduled-token"
 ROOT = Path(__file__).resolve().parents[1]
 #: One smoke enterprise app; the api-server and the minted operator token must agree on it.
@@ -105,7 +114,14 @@ def _mock_endpoint(
     reader_sha256 = fixture["native_tool"]["source_sha256"]
     stage_root = str(bundle_dir.parent / "native-stage")
     edges = {main_assembly: list(dependencies), **{name: [] for name in dependencies}}
-    state = {"jobs": {}, "artifact_paths": [], "definition_posts": [], "uploads": 0}
+    state = {
+        "jobs": {},
+        "artifact_paths": [],
+        "definition_posts": [],
+        "uploads": 0,
+        "cache_receipts": {},
+        "cache_releases": [],
+    }
     archive = Path(fixture["archive"]).read_bytes()
 
     def sealed_manifest() -> dict:
@@ -217,6 +233,41 @@ def _mock_endpoint(
                 return
             if job is None:
                 self._send(404, {"error": "unknown run_id"})
+                return
+            if len(segments) == 3 and segments[1:] == ["cache", "release"]:
+                payload = json.loads(body or b"{}")
+                try:
+                    validate_cache_release_request(payload)
+                except InterfaceRecordError:
+                    self._send(409, {"error": "cache release request is invalid"})
+                    return
+                operation_id = payload["operation_id"]
+                existing = state["cache_receipts"].get(operation_id)
+                if existing is not None:
+                    self._send(200, existing)
+                    return
+                import_block = payload["import"]
+                imported = import_block["confirmation"]["imported"]
+                receipt = {
+                    "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
+                    "status": "released",
+                    "operation_id": operation_id,
+                    "params_sha256": cache_release_params_digest(import_block),
+                    "import": import_block,
+                    "released": {
+                        "files": len(imported),
+                        "bytes": sum(int(entry["bytes"]) for entry in imported),
+                    },
+                    "retained": [],
+                    "released_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "identity": {**payload["binding"]["release"], "role": "native"},
+                    "receipt_sha256": "",
+                }
+                receipt["receipt_sha256"] = cache_release_receipt_digest(receipt)
+                validate_cache_release_receipt(receipt)
+                state["cache_receipts"][operation_id] = receipt
+                state["cache_releases"].append(receipt)
+                self._send(200, receipt)
                 return
             if len(segments) == 2 and segments[1] == "files":
                 block = job["selection"]
@@ -903,9 +954,8 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
     lifecycle = [dict(item) for item in rows.get("lifecycle", [])]
     comparisons.append(
         {
-            "name": "lifecycle_projection_has_no_unknown",
-            "passed": bool(lifecycle)
-            and all(item.get("bucket") in {"terminal", "in_flight"} for item in lifecycle),
+            "name": "lifecycle_projection_terminal",
+            "passed": bool(lifecycle) and all(item.get("bucket") == "terminal" for item in lifecycle),
             "observed": lifecycle,
         }
     )
