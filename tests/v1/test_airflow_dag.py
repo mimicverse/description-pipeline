@@ -568,6 +568,217 @@ class DagTests(unittest.TestCase):
             self.assertEqual(stages["generate"], "blocked")
             self.assertEqual(sum("engineering result=" in line for line in terminal.output), 6)
 
+    def test_discover_propagates_a_converged_terminal_native_failure(self):
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+        request = {
+            "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
+            "upload_files": {"assembly.SLDASM": "a" * 64},
+            "upload_sha256": "b" * 64,
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+        endpoint = SimpleNamespace(get_job=lambda run_id: {"run_id": run_id, "status": "running"})
+        original = AirflowFailException(
+            "definition derivation failed: the derivation did not pass; its findings must be resolved before capture"
+        )
+        replacement = AirflowFailException("SolidWorks job failed: definition_derivation_failed")
+        replacement.code = "definition_derivation_failed"
+        replacement.detail = {"discovery": {"passed": False}}
+        replacement.native_terminal_failure_converged = True
+        with (
+            patch.object(module, "_endpoint", return_value=endpoint),
+            patch.object(module, "_poke", side_effect=original),
+            patch.object(module, "_converge_terminal_native_failure", return_value=replacement) as converge,
+            self.assertRaises(AirflowFailException) as caught,
+        ):
+            module.dag.task_dict["discover"].python_callable(
+                request,
+                dag_run=SimpleNamespace(run_id="portal-e2e"),
+                ti=SimpleNamespace(task_id="discover", map_index=-1),
+            )
+        self.assertIs(caught.exception, replacement)
+        self.assertIs(caught.exception.__cause__, original)
+        converge.assert_called_once_with(endpoint, request)
+
+    def test_terminal_native_failure_convergence_refuses_unknown_or_active_work(self):
+        from description_pipeline.orchestration.airflow_client import EndpointError
+
+        module = self._module()
+        request = {
+            "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
+            "upload_files": {"assembly.SLDASM": "a" * 64},
+            "upload_sha256": "b" * 64,
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+        for job, expected in (
+            ({"run_id": request["run_id"], "status": "running", "events": []}, None),
+            (
+                {
+                    "run_id": request["run_id"],
+                    "status": "failed",
+                    "request": {
+                        "run_id": request["run_id"],
+                        "upload_files": request["upload_files"],
+                        "upload_sha256": request["upload_sha256"],
+                        "main_assembly": request["main_assembly"],
+                    },
+                    "events": [],
+                },
+                None,
+            ),
+            (
+                {
+                    "run_id": request["run_id"],
+                    "status": "failed",
+                    "request": {
+                        "run_id": request["run_id"],
+                        "upload_files": request["upload_files"],
+                        "upload_sha256": request["upload_sha256"],
+                        "main_assembly": "other.SLDASM",
+                    },
+                    "events": [{"stage": "discover", "state": "failed"}],
+                },
+                None,
+            ),
+        ):
+            endpoint = SimpleNamespace(get_job=lambda run_id, job=job: job)
+            with (
+                patch.object(module, "_converge_failed_stage") as converge,
+                patch.object(module, "_store_failure_report") as report,
+            ):
+                result = module._converge_terminal_native_failure(endpoint, request)
+            self.assertIs(result, expected)
+            converge.assert_not_called()
+            report.assert_not_called()
+        endpoint = SimpleNamespace(
+            get_job=lambda run_id: (_ for _ in ()).throw(EndpointError("endpoint unavailable"))
+        )
+        with patch.object(module, "_converge_failed_stage") as converge:
+            self.assertIsNone(module._converge_terminal_native_failure(endpoint, request))
+        converge.assert_not_called()
+
+    def test_terminal_native_failure_claims_convergence_only_after_the_store_confirms(self):
+        module = self._module()
+        request = {
+            "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
+            "upload_files": {"assembly.SLDASM": "a" * 64},
+            "upload_sha256": "b" * 64,
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+        job = {
+            "run_id": request["run_id"],
+            "status": "failed",
+            "error": "native failure",
+            "error_code": "discovery_failed",
+            "request": {
+                "run_id": request["run_id"],
+                "upload_files": request["upload_files"],
+                "upload_sha256": request["upload_sha256"],
+                "main_assembly": request["main_assembly"],
+            },
+            "events": [{"stage": "discover", "state": "failed"}],
+        }
+        endpoint = SimpleNamespace(get_job=lambda run_id: job)
+        for converged in (False, True):
+            with (
+                patch.object(module, "_converge_failed_stage", return_value=converged),
+                patch.object(module, "_store_failure_report", side_effect=RuntimeError("render failed")),
+            ):
+                failure = module._converge_terminal_native_failure(endpoint, request)
+            self.assertIsNotNone(failure)
+            self.assertEqual(
+                getattr(failure, "native_terminal_failure_converged", False),
+                converged,
+            )
+
+    def test_capture_remote_uncertainty_never_registers_a_local_failure(self):
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.orchestration.airflow_client import EndpointError
+
+        module = self._module()
+        upload = {"assembly.SLDASM": "a" * 64}
+        request = {
+            "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
+            "upload_files": upload,
+            "upload_sha256": digest(upload),
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+        matching = {
+            "run_id": request["run_id"],
+            "upload_files": upload,
+            "upload_sha256": request["upload_sha256"],
+            "main_assembly": request["main_assembly"],
+        }
+        endpoints = (
+            SimpleNamespace(
+                get_job=lambda run_id: (_ for _ in ()).throw(EndpointError("endpoint unavailable"))
+            ),
+            SimpleNamespace(get_job=lambda run_id: {"run_id": run_id, "status": "running", "request": matching}),
+            SimpleNamespace(
+                get_job=lambda run_id: {
+                    "run_id": run_id,
+                    "status": "native_complete",
+                    "request": {**matching, "main_assembly": "other.SLDASM"},
+                }
+            ),
+        )
+        for endpoint in endpoints:
+            with (
+                patch.object(module, "_endpoint", return_value=endpoint),
+                patch.object(module, "_converge_failed_stage") as converge,
+                self.assertRaises((AirflowFailException, EndpointError)),
+            ):
+                module.dag.task_dict["capture"].python_callable(request)
+            converge.assert_not_called()
+
+    def test_capture_local_failure_converges_after_a_proven_native_complete_job(self):
+        import tempfile
+
+        module = self._module()
+        upload = {"assembly.SLDASM": "a" * 64}
+        request = {
+            "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
+            "upload_files": upload,
+            "upload_sha256": digest(upload),
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+        job = {
+            "run_id": request["run_id"],
+            "status": "native_complete",
+            "request": {
+                "run_id": request["run_id"],
+                "upload_files": upload,
+                "upload_sha256": request["upload_sha256"],
+                "main_assembly": request["main_assembly"],
+            },
+        }
+        endpoint = SimpleNamespace(get_job=lambda run_id: job)
+        with (
+            tempfile.TemporaryDirectory(prefix="dag-capture-local-failure-") as store_root,
+            patch.object(module, "_endpoint", return_value=endpoint),
+            patch.object(module, "_platform_binding", return_value=(SimpleNamespace(), Path(store_root))),
+            patch.object(
+                module.native_capture,
+                "import_native_capture",
+                side_effect=RuntimeError("capture import failed"),
+            ),
+            patch.object(module, "_converge_failed_stage") as converge,
+            self.assertRaisesRegex(RuntimeError, "capture import failed"),
+        ):
+            module.dag.task_dict["capture"].python_callable(request)
+        self.assertEqual(converge.call_args.args[:2], (request["run_id"], "capture"))
+
     def test_terminal_summary_without_task_instance_warns_and_never_crashes(self):
         from types import SimpleNamespace
         from tests.v1.protocol_support import protocol_events
@@ -2744,6 +2955,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             ],
         }
         self.assertEqual(self.module._failed_native_stage(job), "discover")
+        self.assertIsNone(self.module._failed_native_stage({"events": []}))
 
     def test_replayed_failed_stage_only_fills_missing_blocked_rows(self) -> None:
         calls: list[dict] = []
@@ -2773,7 +2985,6 @@ class PlatformRegistrationTests(unittest.TestCase):
         )
 
     def test_native_selection_failure_converges_discover_without_overwriting_freeze(self) -> None:
-        from airflow.sdk.exceptions import AirflowFailException
         from description_pipeline.platform import flow
         from description_pipeline.platform.store import PlatformStore
         from tests.v1.test_platform_store import FakeWorld
@@ -2845,27 +3056,267 @@ class PlatformRegistrationTests(unittest.TestCase):
         claimed = store.claim_operation(run_id=run_id, stage="discover", operation_key=operation_key)
         self.assertTrue(claimed.granted)
 
-        failure = AirflowFailException(
-            "SolidWorks job failed: SelectionError: the staged main opened with CAD-reported errors"
-        )
-        failure.code = "selection_open_errors"
-        failure.detail = {
-            "open_status": {"already_open": False, "errors": 2, "warnings": 1, "open_exception": None},
-            "problems": [{"code": "selection_open_errors", "document": "assembly.SLDASM"}],
+        job = {
+            "request": {
+                "run_id": run_id,
+                "upload_files": upload_files,
+                "upload_sha256": digest(upload_files),
+                "main_assembly": "assembly.SLDASM",
+            },
+            "run_id": run_id,
+            "status": "failed",
+            "error": "SelectionError: the staged main opened with CAD-reported errors",
+            "error_code": "selection_open_errors",
+            "detail": {
+                "open_status": {"already_open": False, "errors": 2, "warnings": 1, "open_exception": None},
+                "problems": [{"code": "selection_open_errors", "document": "assembly.SLDASM"}],
+            },
+            "events": [
+                {"stage": "freeze", "state": "completed"},
+                {"stage": "discover", "state": "running"},
+                {"stage": "discover", "state": "failed"},
+            ],
         }
-        self.module._converge_failed_stage(
-            run_id,
-            "discover",
-            failure,
-            bound_platform=store,
-            bound_store_root=self.root,
-        )
+        request = {
+            "run_id": run_id,
+            "upload_files": upload_files,
+            "upload_sha256": digest(upload_files),
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": config_digest,
+        }
+        endpoint = SimpleNamespace(get_job=lambda value: job)
+        with patch.object(self.module, "_platform_binding", return_value=(store, self.root)):
+            failure = self.module._converge_terminal_native_failure(endpoint, request)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.code, "selection_open_errors")
+        self.assertEqual(failure.detail, job["detail"])
+        self.assertTrue(failure.native_terminal_failure_converged)
 
         records = store.stage_records(run_id)
         self.assertEqual(records["freeze"]["state"], "completed")
         self.assertEqual(records["discover"]["state"], "failed")
         self.assertEqual(records["discover"]["receipt"]["error_code"], "selection_open_errors")
         self.assertEqual(records["discover"]["receipt"]["detail"], failure.detail)
+        self.assertEqual(
+            [records[stage]["state"] for stage in ("capture", "generate", "verify", "publish")],
+            ["blocked", "blocked", "blocked", "blocked"],
+        )
+        self.assertEqual(store.run_record(run_id)["state"], "failed")
+        settled = store.register_operation(
+            run_id=run_id,
+            stage="discover",
+            kind="native",
+            operation_key=operation_key,
+            params_digest="b" * 64,
+            dispatch=dispatch,
+        )
+        self.assertEqual(settled.state, "failed")
+
+    def test_definition_derivation_failure_converges_the_real_e2e_shape(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.platform import flow
+        from description_pipeline.platform.store import PlatformStore
+        from tests.v1.test_platform_store import FakeWorld
+
+        run_id = "c5d1a559-4a25-52eb-a6dc-8855f9b0654d"
+        request_id = "portal-portal-20261019T140447-01d47dba"
+        config_digest = "c" * 64
+        world = FakeWorld()
+        store = PlatformStore(
+            world.connect,
+            sealed=lambda uri: self.root / "sealed" / uri.removeprefix("store://sealed/"),
+        )
+        intake = Path(self.temporary.name) / "definition-failure-intake"
+        intake.mkdir()
+        (intake / "M3.0.3_20261016.SLDASM").write_bytes(b"assembly-bytes")
+        upload_files = {"M3.0.3_20261016.SLDASM": file_digest(intake / "M3.0.3_20261016.SLDASM")}
+        store.admit_run(
+            request_id=request_id,
+            run_id=run_id,
+            principal="portal",
+            target_hardware="m3.0",
+            main_assembly="M3.0.3_20261016.SLDASM",
+            configuration={"purpose": "inspection_preview"},
+            baseline={
+                "platform_config_digest": config_digest,
+                "handoff_sha256": digest(upload_files),
+                "files": len(upload_files),
+                "bytes": (intake / "M3.0.3_20261016.SLDASM").stat().st_size,
+                "folder": intake.name,
+            },
+            dispatch={
+                "stage": "freeze",
+                "operation_key": f"{request_id}/freeze:0",
+                "params_digest": "a" * 64,
+                "dag_id": self.module.DAG_ID,
+                "dag_run_id": request_id,
+                "task_id": "freeze",
+                "map_index": -1,
+            },
+        )
+        run_dir = self.root / run_id
+        (run_dir / "input").mkdir(parents=True)
+        (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        with patch.object(self.module, "_platform_binding", return_value=(store, self.root)):
+            self.module._register_freeze_stage(
+                flow.RunPaths(self.root, run_id),
+                run_id,
+                request_id=request_id,
+                intake=intake,
+                upload_files=upload_files,
+                main_assembly="M3.0.3_20261016.SLDASM",
+                config_digest=config_digest,
+            )
+        operation_key = f"{run_id}/native:0"
+        dispatch = {
+            "dag_id": self.module.DAG_ID,
+            "dag_run_id": request_id,
+            "task_id": "discover",
+            "map_index": -1,
+        }
+        store.register_operation(
+            run_id=run_id,
+            stage="discover",
+            kind="native",
+            operation_key=operation_key,
+            params_digest="b" * 64,
+            dispatch=dispatch,
+        )
+        claimed = store.claim_operation(run_id=run_id, stage="discover", operation_key=operation_key)
+        self.assertTrue(claimed.granted)
+
+        detail = {
+            "discovery": {
+                "discovery_sha256": "749bc6dbefa630051ee21016d3f5a5bcda9fb5622a3bc0b1864c5fd8f405f0fa",
+                "findings": [
+                    {
+                        "blocking": False,
+                        "code": "discovery.revision_missing",
+                        "detail": {"publication_blocker": "revision"},
+                        "message": "structural revision is not recorded in the CAD records",
+                        "object": "assembly",
+                        "schema_version": "solidworks-to-urdf.discovery-finding/v1",
+                    },
+                    {
+                        "blocking": True,
+                        "code": "discovery.configuration_unproven",
+                        "detail": {
+                            "configuration": "Default",
+                            "document_state": {
+                                "after": {
+                                    "configuration": "Default",
+                                    "configuration_needs_rebuild": False,
+                                    "needs_rebuild2_value": 0,
+                                    "read_only": True,
+                                    "save_flag": True,
+                                },
+                                "before": {
+                                    "configuration": "Default",
+                                    "configuration_needs_rebuild": False,
+                                    "needs_rebuild2_value": 1,
+                                    "read_only": True,
+                                    "save_flag": False,
+                                },
+                                "used_api": (
+                                    "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
+                                    "IConfiguration.Name/IConfiguration.NeedsRebuild"
+                                ),
+                            },
+                        },
+                        "message": (
+                            "the delivery configuration is not observed as the saved active configuration; "
+                            "a recorded name alone is not evidence"
+                        ),
+                        "object": "assembly",
+                        "schema_version": "solidworks-to-urdf.discovery-finding/v1",
+                    },
+                    {
+                        "blocking": True,
+                        "code": "discovery.exporter_binding_mismatch",
+                        "detail": {
+                            "configuration": "Default",
+                            "document": "M3.0.3_20261016.SLDASM",
+                        },
+                        "message": (
+                            "saved declaration does not bind the observed main document "
+                            "and delivery configuration"
+                        ),
+                        "object": "assembly",
+                        "schema_version": "solidworks-to-urdf.discovery-finding/v1",
+                    },
+                ],
+                "hardware_id": "m3.0",
+                "passed": False,
+                "revision": None,
+            },
+            "work_dir": f"/home/andy/operator/runs/{run_id}/definition",
+        }
+        job = {
+            "request": {
+                "main_assembly": "M3.0.3_20261016.SLDASM",
+                "run_id": run_id,
+                "upload_files": upload_files,
+                "upload_sha256": digest(upload_files),
+            },
+            "run_id": run_id,
+            "status": "failed",
+            "error": "the derivation did not pass; its findings must be resolved before capture",
+            "error_code": "definition_derivation_failed",
+            "detail": detail,
+            "completed_at": "2026-10-19T14:07:27.086715+00:00",
+            "failure_diagnostics": {
+                "path": "diagnostic.json",
+                "sha256": "b303544fa0507fa984c0fe1e46d485cc6aad5e2bb4077137d2ae448eb9539d51",
+            },
+            "events": [
+                {
+                    "at": "2026-10-19T14:05:15.376225+00:00",
+                    "stage": "discover",
+                    "state": "running",
+                },
+                {
+                    "at": "2026-10-19T14:07:27.079428+00:00",
+                    "error": "the derivation did not pass; its findings must be resolved before capture",
+                    "stage": "discover",
+                    "state": "failed",
+                },
+            ],
+        }
+        request = {
+            "run_id": run_id,
+            "upload_files": upload_files,
+            "upload_sha256": digest(upload_files),
+            "main_assembly": "M3.0.3_20261016.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": config_digest,
+        }
+        original = AirflowFailException(
+            "definition derivation failed: the derivation did not pass; "
+            "its findings must be resolved before capture"
+        )
+        endpoint = SimpleNamespace(get_job=lambda value: job)
+        with (
+            patch.object(self.module, "_endpoint", return_value=endpoint),
+            patch.object(self.module, "_platform_binding", return_value=(store, self.root)),
+            patch.object(self.module, "_poke", side_effect=original),
+            self.assertRaises(AirflowFailException) as caught,
+        ):
+            self.module.dag.task_dict["discover"].python_callable(
+                request,
+                dag_run=SimpleNamespace(run_id=request_id),
+                ti=SimpleNamespace(task_id="discover", map_index=-1),
+            )
+
+        self.assertIs(caught.exception.__cause__, original)
+        self.assertEqual(caught.exception.code, "definition_derivation_failed")
+        self.assertEqual(caught.exception.detail, detail)
+        self.assertTrue(caught.exception.native_terminal_failure_converged)
+        records = store.stage_records(run_id)
+        self.assertEqual(records["freeze"]["state"], "completed")
+        self.assertEqual(records["discover"]["state"], "failed")
+        self.assertEqual(records["discover"]["receipt"]["error_code"], "definition_derivation_failed")
+        self.assertEqual(records["discover"]["receipt"]["detail"], detail)
         self.assertEqual(
             [records[stage]["state"] for stage in ("capture", "generate", "verify", "publish")],
             ["blocked", "blocked", "blocked", "blocked"],

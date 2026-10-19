@@ -403,11 +403,13 @@ def _converge_failed_stage(
     config_digest: str | None = None,
     bound_platform: PlatformStore | None = None,
     bound_store_root: Path | None = None,
-) -> None:
+) -> bool:
     """Best-effort failure convergence; the original stage failure is never masked.
 
     ``products`` snapshots the attempt's actual files (its reports included)
-    so a real failure registers what it actually produced, never less.
+    so a real failure registers what it actually produced, never less.  The
+    boolean says whether the requested stage is now a failed terminal record;
+    an unreachable store or a conflicting terminal record remains unknown.
     """
     try:
         if bound_platform is None:
@@ -426,7 +428,7 @@ def _converge_failed_stage(
                 stage,
                 current,
             )
-            return
+            return current == "failed"
         if tree is None and products:
             try:
                 tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir, stage)
@@ -435,8 +437,10 @@ def _converge_failed_stage(
                 tree = None
         _register_failed_stage(platform, store_root, run_id, stage, error, tree=tree)
         _register_blocked_downstream(platform, run_id, stage)
+        return True
     except Exception:  # pragma: no cover - the stage failure stays the primary signal
         log.exception("failed-stage registration unavailable run=%s stage=%s", run_id, stage)
+        return False
 
 
 def _converge_early_freeze_failure(run_id: str, error: Exception) -> None:
@@ -929,8 +933,8 @@ def _release_registered_cache(
         log.warning("cache release deferred run=%s error=%s", run_id, error)
 
 
-def _failed_native_stage(job: dict) -> str:
-    """The engineering stage of the terminal native event (fallback: capture)."""
+def _failed_native_stage(job: dict) -> str | None:
+    """The engineering stage of the terminal native event, if it can be proven."""
 
     events = [
         event
@@ -940,7 +944,7 @@ def _failed_native_stage(job: dict) -> str:
     for event in reversed(events):
         if event.get("state") == "failed":
             return event["stage"]
-    return events[-1]["stage"] if events else "capture"
+    return events[-1]["stage"] if events else None
 
 
 def _boundary_failure(message: str, source: dict) -> AirflowFailException:
@@ -1397,8 +1401,59 @@ def _store_failure_report(endpoint: WindowsEndpoint, request: dict, job: dict) -
         )
     except EndpointNotFound:
         log.info("structural report run_id=%s absent", run_id)
-    except (AirflowFailException, EndpointError, EndpointProtocolError, PipelineError, OSError, ValueError) as error:
+    except Exception as error:  # noqa: BLE001 - diagnostics never replace the stage failure
         log.warning("structural report unavailable run_id=%s error=%s", run_id, error)
+
+
+def _converge_terminal_native_failure(
+    endpoint: WindowsEndpoint,
+    request: dict,
+    job: dict | None = None,
+) -> AirflowFailException | None:
+    """Converge a task-local exception only when the endpoint proves a terminal failure.
+
+    The endpoint is re-read after the exception because definition derivation aborts
+    the native job before raising. A failed terminal job is the only authority that
+    closes the platform stage: transport uncertainty and still-active work remain
+    recoverable and are never turned into a fabricated terminal result.
+    """
+
+    run_id = request["run_id"]
+    if job is None:
+        try:
+            job = endpoint.get_job(run_id)
+        except (EndpointError, EndpointProtocolError) as error:
+            log.warning("native terminal failure probe unavailable run=%s error=%s", run_id, error)
+            return None
+    if not isinstance(job, dict) or job.get("status") != "failed":
+        return None
+    try:
+        _same_request(job, request)
+    except AirflowFailException as error:
+        log.warning("native terminal failure has another request identity run=%s error=%s", run_id, error)
+        return None
+
+    stage = _failed_native_stage(job)
+    if stage is None:
+        log.warning("native terminal failure carries no executable stage run=%s", run_id)
+        return None
+
+    log.error("native failure run=%s error=%s events=%s", run_id, job.get("error"), job.get("events"))
+    try:
+        _store_failure_report(endpoint, request, job)
+    except Exception:  # pragma: no cover - report rendering never blocks convergence
+        log.exception("structural report unavailable run=%s", run_id)
+    failure = _boundary_failure(f"SolidWorks job {run_id} failed: {job.get('error')}", job)
+    converged = _converge_failed_stage(
+        run_id,
+        stage,
+        failure,
+        products=True,
+        config_digest=request["platform_config_digest"],
+    )
+    if converged:
+        failure.native_terminal_failure_converged = True
+    return failure
 
 
 def _materialize_selection(intake: Path, files: dict[str, str], target: Path) -> Path:
@@ -1637,17 +1692,9 @@ def _poke(request: dict, **context) -> bool:
         else:
             log.warning("Terminal engineering summary has no task instance; XCom was not stored")
     if job["status"] == "failed":
-        result = job.get("result") or {}
-        log.error("native diagnostics=%s events=%s", result.get("diagnostic_path"), job["events"])
-        _store_failure_report(endpoint, request, job)
-        failure = _boundary_failure(f"SolidWorks job {request['run_id']} failed: {job.get('error')}", job)
-        _converge_failed_stage(
-            request["run_id"],
-            _failed_native_stage(job),
-            failure,
-            products=True,
-            config_digest=request["platform_config_digest"],
-        )
+        failure = _converge_terminal_native_failure(endpoint, request, job)
+        if failure is None:
+            raise AirflowFailException("The terminal native job could not be bound for failure convergence")
         raise failure
     return job["status"] in {"passed", "native_complete"}
 
@@ -2075,36 +2122,44 @@ def solidworks_to_urdf():
             return True
         endpoint = _endpoint(request["conn_id"], request["platform_config_digest"])
         try:
-            endpoint.get_job(request["run_id"])
-        except EndpointNotFound:
-            platform, _store_root = _platform_binding(request["platform_config_digest"])
-            _claim_operation_intent(
-                platform,
-                run_id=request["run_id"],
-                stage="discover",
-                kind="native",
-                operation_key=f"{request['run_id']}/native:0",
-                params_digest=digest(
-                    {
-                        "run_id": request["run_id"],
-                        "upload_sha256": request["upload_sha256"],
-                        "main_assembly": request["main_assembly"],
-                        "resume": request.get("resume"),
-                        "conn_id": request["conn_id"],
-                    }
-                ),
-                what="native submission",
-                context=context,
-            )
-            job = endpoint.start_staging_job(
-                run_id=request["run_id"],
-                upload_files=request["upload_files"],
-                main_assembly=request["main_assembly"],
-                resume=request.get("resume"),
-            )
-            log.info("started run_id=%s status=%s", job["run_id"], job["status"])
-            return False  # the reschedule poll continues on the next poke
-        return _poke(request, **context)
+            try:
+                endpoint.get_job(request["run_id"])
+            except EndpointNotFound:
+                platform, _store_root = _platform_binding(request["platform_config_digest"])
+                _claim_operation_intent(
+                    platform,
+                    run_id=request["run_id"],
+                    stage="discover",
+                    kind="native",
+                    operation_key=f"{request['run_id']}/native:0",
+                    params_digest=digest(
+                        {
+                            "run_id": request["run_id"],
+                            "upload_sha256": request["upload_sha256"],
+                            "main_assembly": request["main_assembly"],
+                            "resume": request.get("resume"),
+                            "conn_id": request["conn_id"],
+                        }
+                    ),
+                    what="native submission",
+                    context=context,
+                )
+                job = endpoint.start_staging_job(
+                    run_id=request["run_id"],
+                    upload_files=request["upload_files"],
+                    main_assembly=request["main_assembly"],
+                    resume=request.get("resume"),
+                )
+                log.info("started run_id=%s status=%s", job["run_id"], job["status"])
+                return False  # the reschedule poll continues on the next poke
+            return _poke(request, **context)
+        except Exception as error:
+            if getattr(error, "native_terminal_failure_converged", False):
+                raise
+            failure = _converge_terminal_native_failure(endpoint, request)
+            if failure is not None:
+                raise failure from error
+            raise
 
     @task(
         doc_md=("Capture stage: import the sealed native capture into the Linux store and bind routing for generation.")
@@ -2137,12 +2192,15 @@ def solidworks_to_urdf():
                 "state": "linked",
             }
         else:
+            # Remote preconditions must stay unknown when the endpoint cannot
+            # prove the same completed native job. Only a guaranteed
+            # native_complete job may enter the local capture failure boundary.
+            endpoint = _endpoint(request["conn_id"], request["platform_config_digest"])
+            job = endpoint.get_job(run_id)
+            _same_request(job, request)
+            if job.get("status") != "native_complete":
+                raise AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
             try:
-                endpoint = _endpoint(request["conn_id"], request["platform_config_digest"])
-                job = endpoint.get_job(run_id)
-                _same_request(job, request)
-                if job.get("status") != "native_complete":
-                    raise AirflowFailException(f"native job {run_id} is {job.get('status')}, not native_complete")
                 platform, store_root = _platform_binding(request["platform_config_digest"])
                 paths = flow.RunPaths(store_root, run_id)
                 binding = native_capture.import_native_capture(platform, paths, run_id, job, endpoint)
