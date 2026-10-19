@@ -88,6 +88,8 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 ## 安装 Windows 执行端
 
+内嵌虚拟组件随同版原生端点与 Linux 验证器部署，不增加服务、环境变量或配置字段。Windows 读取受控会话中的组件及所属装配绑定，Linux 按封存契约独立验证；不得将 `VC~~` 临时文档复制成上传来源或配置额外搜索目录。
+
 校验 Windows 离线运行档案与发行清单摘要，提取到独立发行目录并安装其 hash-locked 依赖：
 
 ```powershell
