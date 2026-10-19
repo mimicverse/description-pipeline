@@ -140,6 +140,8 @@ Linux 是工程任务的唯一发起者。Windows 接口只提供健康查询、
 
 状态、健康及漂移查询不得安装、下载或修复持久工具链文件。已绑定的工具缺失或不可执行时如实报告，不通过自动安装掩盖漂移。
 
+选择闭包的 `virtual_components` 单独记录内嵌虚拟组件：`state=embedded_virtual_component`、`binding=owner_embedded_geometry`、`kind=native_embedded_virtual_component`。每项保留 `IComponent2.GetPathName/GetImportedPath/IsVirtual` 的直接读取依据，要求 `is_virtual=true`，并绑定可达上传图中的 `owner` 及其 SHA-256、精确 `instance`、可空的 `owner_anchor`、引用 `configuration`、`session_document_path`、`session_temp_root` 和正整数 `native_api_pid`。原生端从实际 SolidWorks API 读取进程 ID，并核对它与会话根 `swxNNNN` 的进程编号一致；文档须位于该受控会话的 `VC~~` 内，路径形状本身不是归属证明。不得携带非空作者导入路径或读取错误，不得与 `imports` 中的 `IC~~` 缓存共享实例身份。后续会话可以产生不同临时路径，但须重新读取原生对象，并以相同所属装配字节、实例与配置对应封存记录；原生采集和独立验证双向核对当前对象与封存清单，拒绝遗漏、额外对象和冲突绑定。临时文档不进入上传文件图，Linux 只验证封存证据，不访问 Windows 临时目录。
+
 采集计划由 Linux 依据封存发现及实际规格生成，在原生采集前封存并传给 Windows。Windows 核验并消费同一份计划，只将受约束的相对路径定位到已登记工程副本，不重新推导结构。计划只保存原生对象、选择集合、基准和证据项目；不另存完整机器人模型，也不在采集结束后从配置或结果倒造计划。
 
 原生记录仅包含直接读数、API 状态、原生引用、配置、保存状态、环境及网格。长度、角度、质量和惯量转换为 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法。适配器只在 COM 边界转换单位和厂商矩阵布局；推导、闭包比较、几何统计、诊断解释与报告渲染全部在 Linux 完成。格式校验和封存摘要计算属于传输职责。

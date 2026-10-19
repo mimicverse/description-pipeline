@@ -239,6 +239,7 @@ class _Component:
         # reference, False on part references.  Mocks default to the part case.
         self.IsRoot = is_root
         self.ReferencedConfiguration = configuration
+        self.IsVirtual = False
 
     def GetPathName(self):
         return self._path
@@ -461,6 +462,9 @@ class _App:
 
     def GetBuildNumbers(self):
         return "portable-mock"
+
+    def GetProcessID(self):
+        return 21040
 
     def GetCurrentLicenseType(self):
         return 1
@@ -1242,6 +1246,35 @@ class SolverObservationTests(unittest.TestCase):
 
 
 class CaptureSceneTests(unittest.TestCase):
+    def test_capture_excludes_embedded_virtual_session_documents_from_source_files(self) -> None:
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            virtual_path = (
+                root
+                / "swx21040"
+                / "VC~~"
+                / "waist"
+                / "Copy of 复件 (2) 零件10^waist.SLDPRT"
+            )
+            virtual_path.parent.mkdir(parents=True)
+            virtual_path.write_bytes(b"engine virtual document")
+            virtual = _Component(
+                "Copy of 复件 (2) 零件10^waist-1",
+                virtual_path,
+                doc=_Doc(virtual_path, configuration="默认"),
+                configuration="默认",
+            )
+            virtual.IsVirtual = True
+            virtual.GetImportedPath = lambda: None
+            assembly = _write(root, "robot.SLDASM")
+            main = _Doc(assembly, doc_type=2, children=[virtual])
+            backend = _CaptureBackend(session_factory=lambda: _Session(_App({assembly: main})))
+            scene = backend.collect_scene(str(assembly), [])
+
+            self.assertIn(str(virtual_path), {component.path for component in scene.components})
+            self.assertNotIn(str(virtual_path), backend.source_files)
+            self.assertNotIn(str(virtual_path), backend.verify_sources_unchanged())
+
     def test_copy_inspection_releases_occurrences_before_read_only_mutation(self):
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
@@ -3791,6 +3824,19 @@ class ComponentSourceDocumentTests(unittest.TestCase):
         self.assertEqual(provenance["state"], "unread")
         self.assertIs(provenance["is_virtual"], True)
 
+    def test_in_root_document_requires_an_explicit_false_virtual_reading(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        part = self.source_root / "part.SLDPRT"
+        part.write_bytes(b"delivered")
+        result = _component_source_document(
+            self.component(part, imported=None, virtual=None),
+            self.source_root,
+        )
+        self.assertIsNone(result["document"])
+        self.assertEqual(result["source_provenance"]["state"], "unread")
+        self.assertIn("explicit False IsVirtual", result["source_provenance"]["error"])
+
     def test_in_stage_author_source_does_not_override_the_cached_class(self) -> None:
         from description_pipeline.sources.solidworks.native import _component_source_document
 
@@ -3807,6 +3853,95 @@ class ComponentSourceDocumentTests(unittest.TestCase):
         self.assertIsNone(result["document"])
         self.assertTrue(provenance["author_imported_in_source_root"])
         self.assertEqual(provenance["author_imported_relative"], "imported_part.step")
+
+    def test_embedded_virtual_component_requires_vc_and_true_virtual_state(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        virtual_document = self.tmp / "swx21040" / "VC~~" / "waist" / "Copy of 复件 (2) 零件10^waist.SLDPRT"
+        virtual_document.parent.mkdir(parents=True)
+        virtual_document.write_bytes(b"virtual")
+        result = _component_source_document(
+            self.component(virtual_document, imported=None, virtual=True),
+            self.source_root,
+        )
+        self.assertIsNone(result["document"])
+        provenance = result["source_provenance"]
+        self.assertEqual(provenance["state"], "embedded_virtual_component")
+        self.assertEqual(provenance["kind"], "native_embedded_virtual_component")
+        self.assertEqual(provenance["session_document_path"], str(virtual_document))
+        self.assertEqual(provenance["session_temp_root"], str(virtual_document.parent.parent.parent))
+        self.assertIs(provenance["is_virtual"], True)
+        self.assertIsNone(provenance["author_imported_path"])
+        self.assertNotIn("error", provenance)
+
+        cases = {
+            "false_virtual": self.component(virtual_document, imported=None, virtual=False),
+            "unknown_virtual": self.component(virtual_document, imported=None, virtual=None),
+            "import_path_present": self.component(
+                virtual_document,
+                imported=r"D:\author\Copy of 复件 (2) 零件10^waist.step",
+                virtual=True,
+            ),
+            "import_path_non_text": self.component(
+                virtual_document,
+                imported=123,
+                virtual=True,
+            ),
+            "in_stage_path_with_virtual": self.component(
+                self.source_root / "part.SLDPRT",
+                imported=None,
+                virtual=True,
+            ),
+        }
+        unreadable_import = self.component(virtual_document, imported=None, virtual=True)
+
+        def fail_import_read():
+            raise RuntimeError("GetImportedPath failed")
+
+        unreadable_import.GetImportedPath = fail_import_read
+        cases["unreadable_import_path"] = unreadable_import
+        wrong_root = self.tmp / "not-a-session" / "VC~~" / "waist" / "part.SLDPRT"
+        wrong_root.parent.mkdir(parents=True)
+        wrong_root.write_bytes(b"virtual")
+        cases["wrong_session_root"] = self.component(wrong_root, imported=None, virtual=True)
+        mixed_markers = (
+            self.tmp
+            / "swx21042"
+            / "VC~~"
+            / "IC~~"
+            / "waist"
+            / "part.SLDPRT"
+        )
+        mixed_markers.parent.mkdir(parents=True)
+        mixed_markers.write_bytes(b"virtual")
+        cases["mixed_session_markers"] = self.component(
+            mixed_markers, imported=None, virtual=True
+        )
+        for label, component in cases.items():
+            with self.subTest(case=label):
+                rejected = _component_source_document(component, self.source_root)
+                self.assertEqual(rejected["source_provenance"]["state"], "unread")
+                self.assertIn("error", rejected["source_provenance"])
+
+    def test_ic_and_vc_session_classes_do_not_cross(self) -> None:
+        from description_pipeline.sources.solidworks.native import _component_source_document
+
+        ic_but_virtual = _component_source_document(
+            self.component(self.materialization, imported=None, virtual=True),
+            self.source_root,
+        )
+        self.assertEqual(ic_but_virtual["source_provenance"]["state"], "unread")
+        self.assertIn("cannot be conflated", ic_but_virtual["source_provenance"]["error"])
+
+        virtual_document = self.tmp / "swx21041" / "VC~~" / "waist" / "part.SLDPRT"
+        virtual_document.parent.mkdir(parents=True)
+        virtual_document.write_bytes(b"virtual")
+        vc_but_import = _component_source_document(
+            self.component(virtual_document, imported=r"D:\author\part.step", virtual=False),
+            self.source_root,
+        )
+        self.assertEqual(vc_but_import["source_provenance"]["state"], "unread")
+        self.assertIn("explicit True IsVirtual", vc_but_import["source_provenance"]["error"])
 
 
 class MaterializationSessionOwnershipTests(unittest.TestCase):
@@ -3831,7 +3966,7 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
 
         def identity(self):
             return {
-                "pid": 1,
+                "pid": 4242,
                 "executable": "fake",
                 "ownership": "windows_job",
                 "state": "closed" if self.closed else "active",
@@ -3854,7 +3989,9 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
         backend = N.SolidWorksBackend()
         backend._sessions = {"source": self.Session(closed=True), "copy": self.Session(app=app)}
         self.assertEqual(backend._role_for_path(self.materialization), "copy")
-        key = backend._record_source_document(self.materialization, "Default")
+        key = backend._record_source_document(
+            self.materialization, "Default", session_document=True
+        )
         self.assertEqual(key[0], "copy")
         doc = backend._document_by_path(str(self.materialization))
         self.assertEqual(doc.GetPathName(), str(self.materialization))
@@ -3869,6 +4006,73 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
         backend._sessions = {"source": self.Session(app=object()), "copy": self.Session(app=object())}
         backend._local.role = "copy"
         self.assertEqual(backend._role_for_path(self.materialization), "copy")
+
+    def test_session_documents_must_share_one_controlled_temp_root(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        other = self.tmp / "swx4243" / "VC~~" / "other" / "part.SLDPRT"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"other session")
+        backend = N.SolidWorksBackend()
+        backend._sessions = {"copy": self.Session(app=object())}
+        backend._local.role = "copy"
+        backend._record_source_document(self.materialization, "Default", session_document=True)
+        with self.assertRaises(CadError) as caught:
+            backend._record_source_document(other, "Default", session_document=True)
+        self.assertEqual(caught.exception.code, "cad_materialization_session_mismatch")
+
+    def test_session_document_registration_is_bound_to_its_role_and_session(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        backend = N.SolidWorksBackend()
+        backend._sessions = {
+            "source": self.Session(app=object()),
+            "copy": self.Session(app=object()),
+        }
+        backend._local.role = "source"
+        backend._record_source_document(
+            self.materialization, "Default", session_document=True
+        )
+        backend._sealed_documents = set()
+        backend._local.role = "copy"
+        with self.assertRaises(CadError) as caught:
+            backend._require_sealed(self.materialization)
+        self.assertEqual(caught.exception.code, "document_not_sealed")
+        backend._local.role = "source"
+        backend._require_sealed(self.materialization)
+        backend.release()
+        self.assertEqual(backend._session_document_paths, {})
+        self.assertEqual(backend._session_artifact_roots, {})
+        self.assertEqual(backend._session_artifact_root_owners, {})
+
+    def test_session_document_cannot_be_rebound_or_share_a_temp_root_across_sessions(self) -> None:
+        from description_pipeline.sources.solidworks import native as N
+        from description_pipeline.sources.solidworks.errors import CadError
+
+        backend = N.SolidWorksBackend()
+        backend._sessions = {
+            "source": self.Session(app=object()),
+            "copy": self.Session(app=object()),
+        }
+        backend._local.role = "source"
+        backend._record_source_document(
+            self.materialization, "Default", session_document=True
+        )
+        backend._local.role = "copy"
+        with self.assertRaises(CadError) as caught:
+            backend._record_source_document(
+                self.materialization, "Default", session_document=True
+            )
+        self.assertEqual(caught.exception.code, "cad_materialization_session_mismatch")
+
+        other_in_same_root = self.materialization.with_name("other.step.SLDPRT")
+        with self.assertRaises(CadError) as caught:
+            backend._record_source_document(
+                other_in_same_root, "Default", session_document=True
+            )
+        self.assertEqual(caught.exception.code, "cad_materialization_session_mismatch")
 
     def test_ambiguity_and_missing_owner_refuse_precisely(self) -> None:
         from description_pipeline.sources.solidworks import native as N
@@ -3889,7 +4093,9 @@ class MaterializationSessionOwnershipTests(unittest.TestCase):
         backend3 = N.SolidWorksBackend()
         backend3._role_for_path = lambda path: "ghost"  # type: ignore[method-assign]
         with self.assertRaises(CadError) as caught:
-            backend3._record_source_document(self.materialization, "Default")
+            backend3._record_source_document(
+                self.materialization, "Default", session_document=True
+            )
         self.assertEqual(caught.exception.code, "cad_materialization_session_unavailable")
 
 

@@ -49,7 +49,16 @@ from pathlib import Path
 
 from ...io import PipelineError, _filesystem_path, artifact_path_parts, digest
 from .handoff import MAX_HANDOFF_BYTES, _directory
-from .native import session_materialization_path, session_temp_root
+from .session_artifacts import (
+    SESSION_DOCUMENT_API,
+    embedded_virtual_component_path,
+    embedded_virtual_component_root,
+    has_session_document_marker,
+    session_artifact_path,
+    session_materialization_path,
+    session_root_pid,
+    session_temp_root,
+)
 from .selection import MAX_SELECTION_FILES, SelectionError, validate_file_index
 
 __all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
@@ -211,6 +220,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     graph: dict[str, dict] = {}
     documents: dict[str, dict] = {}
     imports: list[dict] = []
+    virtual_components: list[dict] = []
     suppressed: list[dict] = []
     warnings: list[dict] = []
     problems: list[dict] = []
@@ -301,6 +311,10 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     declarations = readings.get("identity_properties")
     declarations = dict(declarations) if isinstance(declarations, Mapping) else {}
     declarations_error = readings.get("identity_properties_error")
+    session_evidence = readings.get("session")
+    native_api_pid = session_evidence.get("native_api_pid") if isinstance(session_evidence, Mapping) else None
+    if type(native_api_pid) is not int or native_api_pid <= 0:
+        native_api_pid = None
     missing_declarations = [
         key
         for key in IDENTITY_DECLARATIONS
@@ -356,6 +370,10 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         raw_anchor = anchor if isinstance(anchor, str) and anchor else None
         resolved = record.get("resolved_path")
         resolved = resolved if isinstance(resolved, str) else ""
+        virtual = record.get("is_virtual")
+        imported_reading = record.get("imported_path")
+        imported = imported_reading if isinstance(imported_reading, str) and imported_reading.strip() else None
+        invalid_import_reading = imported_reading is not None and not isinstance(imported_reading, str)
         state = record.get("suppression_state")
         if type(state) is not int or state not in _COMPONENT_STATES:
             if state == _COMPONENT_INTERNAL_ID_MISMATCH:
@@ -380,6 +398,30 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             )
             continue
         if state == _COMPONENT_SUPPRESSED:
+            if virtual is not False:
+                problems.append(
+                    _problem(
+                        "selection_virtual_state_unproven",
+                        "a suppressed delivered occurrence requires an explicit False IsVirtual reading",
+                        document=defining_name or raw_defining,
+                        instance=instance,
+                        resolved=resolved or None,
+                        is_virtual=virtual if type(virtual) is bool else None,
+                    )
+                )
+                continue
+            if has_session_document_marker(resolved) and not session_materialization_path(resolved):
+                problems.append(
+                    _problem(
+                        "selection_suppressed_session_document_unproven",
+                        "a suppressed occurrence cannot carry a VC~~ or mixed session document",
+                        document=defining_name or raw_defining,
+                        instance=instance,
+                        resolved=resolved or None,
+                    )
+                )
+                continue
+        if state == _COMPONENT_SUPPRESSED:
             if not resolved:
                 problems.append(
                     _problem(
@@ -402,20 +444,190 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 }
             )
             continue
-        virtual = record.get("is_virtual")
-        imported = record.get("imported_path")
-        imported = imported if isinstance(imported, str) and imported.strip() else None
         lightweight = state in (_COMPONENT_LIGHTWEIGHT, _COMPONENT_FULLY_LIGHTWEIGHT)
         cached_defining = bool(raw_defining) and cached_key(raw_defining) in cached_materializations
         structural = bool(resolved) and session_materialization_path(resolved)
-        importish = cached_defining or structural or (not resolved and imported is not None)
+        virtual_document = bool(resolved) and embedded_virtual_component_path(resolved)
+        importish = (
+            cached_defining
+            or structural
+            or virtual_document
+            or virtual is True
+            or (not resolved and imported is not None)
+        )
         if importish:
             label = defining_name or raw_defining
+            if virtual is True:
+                conflict = structural or imported is not None
+                if conflict:
+                    problems.append(
+                        _problem(
+                            "selection_virtual_component_import_conflict",
+                            "a virtual component is also represented as a 3D Interconnect import; "
+                            "the two native geometry classes cannot be conflated",
+                            document=label,
+                            instance=instance,
+                            resolved=resolved or None,
+                            imported_path=imported,
+                        )
+                    )
+                    continue
+                owner = record.get("native_owner")
+                owner = owner if isinstance(owner, str) and owner in files else None
+                if owner is None and raw_defining in files:
+                    owner = raw_defining
+                if owner is None:
+                    problems.append(
+                        _problem(
+                            "selection_virtual_component_unproven",
+                            "an embedded virtual component names no ultimate owner in the staged inventory",
+                            document=raw_defining,
+                            instance=instance,
+                            resolved=resolved or None,
+                            owner=record.get("native_owner"),
+                        )
+                    )
+                    continue
+                if raw_defining in files and owner.casefold() != raw_defining.casefold():
+                    problems.append(
+                        _problem(
+                            "selection_virtual_component_unproven",
+                            "the virtual component owner differs from its defining staged document",
+                            document=raw_defining,
+                            instance=instance,
+                            resolved=resolved or None,
+                            owner=owner,
+                        )
+                    )
+                    continue
+                session_root = embedded_virtual_component_root(resolved)
+                configuration = record.get("configuration")
+                if (
+                    not virtual_document
+                    or session_root is None
+                    or native_api_pid is None
+                    or session_root_pid(session_root) != native_api_pid
+                    or not isinstance(instance, str)
+                    or not instance.strip()
+                    or not isinstance(configuration, str)
+                    or not configuration.strip()
+                    or record.get("import_error") is not None
+                    or invalid_import_reading
+                ):
+                    problems.append(
+                        _problem(
+                            "selection_virtual_component_unproven",
+                            "IsVirtual=True requires an exact VC~~ document under the current "
+                            "controlled session temp root plus an occurrence and configuration",
+                            document=label,
+                            instance=instance,
+                            resolved=resolved or None,
+                            session_temp_root=session_root,
+                            native_api_pid=native_api_pid,
+                            configuration=configuration,
+                            imported_path_error=record.get("import_error"),
+                            imported_path_reading=imported_reading,
+                        )
+                    )
+                    continue
+                if raw_anchor is not None and not instance.startswith(raw_anchor + "/"):
+                    problems.append(
+                        _problem(
+                            "selection_virtual_component_unproven",
+                            "the virtual component defining anchor does not corroborate its occurrence",
+                            document=label,
+                            instance=instance,
+                            owner_anchor=raw_anchor,
+                        )
+                    )
+                    continue
+                graph_entry(owner)
+                document_entry(owner)
+                virtual_components.append(
+                    {
+                        "document": label,
+                        "owner": owner,
+                        "owner_anchor": raw_anchor,
+                        "owner_sha256": files[owner],
+                        "instance": instance,
+                        "name": record.get("name"),
+                        "session_document_path": resolved,
+                        "session_temp_root": session_root,
+                        "native_api_pid": native_api_pid,
+                        "configuration": configuration,
+                        "suppression_state": state,
+                        "is_virtual": True,
+                        "state": "embedded_virtual_component",
+                        "binding": "owner_embedded_geometry",
+                        "kind": "native_embedded_virtual_component",
+                        "author_imported_path": None,
+                        "author_imported_error": None,
+                        "used_api": SESSION_DOCUMENT_API,
+                    }
+                )
+                warnings.append(
+                    {
+                        "code": "embedded_virtual_component_geometry",
+                        "message": (
+                            "an embedded virtual component supplies geometry from the owner "
+                            "assembly's in-memory definition; its VC~~ session document is not "
+                            "an upload source"
+                        ),
+                        "document": label,
+                        "owner": owner,
+                        "owner_anchor": raw_anchor,
+                        "owner_sha256": files[owner],
+                        "instance": instance,
+                        "session_document_path": resolved,
+                        "session_temp_root": session_root,
+                        "requires_owner_binding": True,
+                        "used_api": SESSION_DOCUMENT_API,
+                    }
+                )
+                continue
+            if virtual_document:
+                problems.append(
+                    _problem(
+                        "selection_virtual_component_unproven",
+                        "a VC~~ document requires an explicit True IsVirtual reading",
+                        document=label,
+                        instance=instance,
+                        resolved=resolved,
+                        is_virtual=virtual if type(virtual) is bool else None,
+                    )
+                )
+                continue
+            if structural and virtual is not False:
+                problems.append(
+                    _problem(
+                        "selection_cached_materialization_unproven",
+                        "an IC~~ materialization requires an explicit False IsVirtual reading",
+                        document=label,
+                        instance=instance,
+                        resolved=resolved,
+                        is_virtual=virtual if type(virtual) is bool else None,
+                    )
+                )
+                continue
             if resolved and (structural or cached_defining):
                 # A materialized imported occurrence: geometry comes from the
                 # session materialization; GetImportedPath is author-path
                 # metadata, never an in-package binding.  Recorded as a warning
                 # (no graph edge); the absence test decides cache provenance.
+                cached_root = session_temp_root(resolved)
+                if native_api_pid is None or session_root_pid(cached_root) != native_api_pid:
+                    problems.append(
+                        _problem(
+                            "selection_cached_materialization_unproven",
+                            "an IC~~ materialization is not owned by the current native session",
+                            document=label,
+                            instance=instance,
+                            resolved=resolved,
+                            session_temp_root=cached_root,
+                            native_api_pid=native_api_pid,
+                        )
+                    )
+                    continue
                 cached_materializations.add(cached_key(resolved))
                 author_in_stage = _indexed(stage_root, imported, files) is not None if imported else None
                 owner = record.get("native_owner")
@@ -486,7 +698,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "author_metadata_in_stage": author_in_stage,
                         "is_virtual": virtual if type(virtual) is bool else None,
                         "materialization": resolved,
-                        "session_temp_root": session_temp_root(resolved),
+                        "session_temp_root": cached_root,
+                        "native_api_pid": native_api_pid,
                         "configuration": record.get("configuration"),
                         "suppression_state": state,
                         "state": "cached_materialization",
@@ -529,7 +742,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 _problem(
                     "selection_resolved_outside_stage",
                     "an out-of-stage resolved document is not a session materialization",
-                    document=label,
+                    document=defining_name or raw_defining,
                     instance=instance,
                     resolved=resolved,
                     imported_path=imported,
@@ -537,7 +750,30 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 )
             )
             continue
-        if defining_name is None:
+        if virtual is not False:
+            problems.append(
+                _problem(
+                    "selection_virtual_state_unproven",
+                    "a delivered occurrence requires an explicit False IsVirtual reading",
+                    document=defining_name or raw_defining,
+                    instance=instance,
+                    resolved=resolved or None,
+                    is_virtual=virtual if type(virtual) is bool else None,
+                )
+            )
+            continue
+        graph_owner = defining_name
+        nested_anchor = None
+        if graph_owner is None and raw_anchor and raw_defining and session_artifact_path(raw_defining):
+            native_owner = record.get("native_owner")
+            if (
+                isinstance(native_owner, str)
+                and native_owner in files
+                and instance.startswith(raw_anchor + "/")
+            ):
+                graph_owner = native_owner
+                nested_anchor = raw_anchor
+        if graph_owner is None:
             problems.append(
                 _problem(
                     "selection_resolved_outside_stage",
@@ -548,8 +784,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 )
             )
             continue
-        graph_entry(defining_name)
-        document_entry(defining_name)
+        graph_entry(graph_owner)
+        document_entry(graph_owner)
         if not resolved:
             problems.append(
                 _problem(
@@ -574,10 +810,10 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             continue
         if not staged_ok(name):
             continue
-        graph_entry(defining_name)["references"].add(name)
+        graph_entry(graph_owner)["references"].add(name)
         graph_entry(name)
         document_entry(name)
-        document_entry(defining_name)["resolved_edges"].append(
+        document_entry(graph_owner)["resolved_edges"].append(
             {
                 "name": record.get("name"),
                 "instance": instance,
@@ -587,6 +823,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 "configuration": record.get("configuration"),
                 "suppression_state": state,
                 "lightweight": lightweight,
+                "owner_anchor": nested_anchor,
+                "defining_session_document": raw_defining if nested_anchor else None,
             }
         )
     if problems:
@@ -642,6 +880,9 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "graph": graph_out,
         "documents": documents_out,
         "imports": sorted(imports, key=lambda item: (str(item.get("document")), str(item.get("instance")))),
+        "virtual_components": sorted(
+            virtual_components, key=lambda item: (str(item.get("owner")), str(item.get("instance")))
+        ),
         "warnings": sorted(
             warnings, key=lambda item: (str(item.get("code")), str(item.get("document")), str(item.get("instance")))
         ),

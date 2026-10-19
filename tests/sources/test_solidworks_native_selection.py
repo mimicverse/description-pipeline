@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,7 +64,7 @@ def occurrence(
     *,
     defining: str = "robot.SLDASM",
     state: int | None = 2,
-    virtual=None,
+    virtual=False,
     imported=None,
     name=None,
     native_owner=None,
@@ -87,6 +89,12 @@ def occurrence(
 
 
 def readings(stage: Path, occurrences: list[dict], *, stored=None, **extra) -> dict:
+    native_api_pid = None
+    for item in occurrences:
+        match = re.search(r"(?i)(?:^|[\\/])swx([0-9]+)(?:[\\/]|$)", str(item.get("resolved_path") or ""))
+        if match is not None:
+            native_api_pid = int(match.group(1))
+            break
     value = {
         "stage_root": str(stage),
         "occurrences": occurrences,
@@ -103,7 +111,7 @@ def readings(stage: Path, occurrences: list[dict], *, stored=None, **extra) -> d
         },
         "open": {"errors": 0, "warnings": 0},
         "session": {
-            "native_api_pid": 111,
+            "native_api_pid": native_api_pid or 111,
             "solidworks_revision": "34.0.0",
             "sealed": True,
             "closed": True,
@@ -208,6 +216,363 @@ class ClosureAdmissionTests(unittest.TestCase):
             self.observe([occurrence("arm-1", "")])
         self.assertEqual(caught.exception.code, "selection_dependency_unresolved")
         self.assertEqual(caught.exception.detail["problems"][0]["instance"], "arm-1")
+
+    def test_delivered_occurrence_requires_an_explicit_false_virtual_reading(self) -> None:
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [
+                    occurrence(
+                        "arm-1",
+                        self.resolved("arm.SLDPRT"),
+                        virtual=None,
+                    )
+                ]
+            )
+        self.assertEqual(caught.exception.code, "selection_virtual_state_unproven")
+
+    def test_suppressed_virtual_component_is_refused_without_an_active_binding(self) -> None:
+        document = session_temp("swx21040", "VC~~", "waist", "virtual_part.SLDPRT")
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [
+                    occurrence(
+                        "waist-1/virtual_part-1",
+                        document,
+                        state=0,
+                        virtual=True,
+                        native_owner="robot.SLDASM",
+                    )
+                ]
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "selection_virtual_state_unproven",
+        )
+
+    def test_suppressed_occurrence_requires_false_virtual_and_no_mixed_session_marker(self) -> None:
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [
+                    occurrence(
+                        "arm-1",
+                        self.resolved("arm.SLDPRT"),
+                        state=0,
+                        virtual=None,
+                    )
+                ]
+            )
+        self.assertEqual(caught.exception.code, "selection_virtual_state_unproven")
+
+        mixed = session_temp("swx21040", "VC~~", "IC~~", "waist", "virtual_part.SLDPRT")
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [
+                    occurrence(
+                        "virtual_part-1",
+                        mixed,
+                        state=0,
+                        virtual=False,
+                    )
+                ]
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "selection_suppressed_session_document_unproven",
+        )
+
+    def test_embedded_virtual_component_is_owner_bound_without_an_import(self) -> None:
+        document = session_temp(
+            "swx21040",
+            "VC~~",
+            "waist",
+            "Copy of 复件 (2) 零件10^waist.SLDPRT",
+        )
+        instance = "waist-1/Copy of 复件 (2) 零件10^waist-1"
+        payload = self.observe(
+            [
+                occurrence(
+                    instance,
+                    document,
+                    defining="robot.SLDASM",
+                    virtual=True,
+                    native_owner="robot.SLDASM",
+                    configuration="默认",
+                )
+            ]
+        )
+        self.assertEqual(payload["imports"], [])
+        self.assertEqual(sorted(payload["graph"]), ["robot.SLDASM"])
+        self.assertEqual(len(payload["virtual_components"]), 1)
+        entry = payload["virtual_components"][0]
+        self.assertEqual(entry["state"], "embedded_virtual_component")
+        self.assertEqual(entry["binding"], "owner_embedded_geometry")
+        self.assertEqual(entry["owner"], "robot.SLDASM")
+        self.assertEqual(entry["owner_sha256"], self.files["robot.SLDASM"])
+        self.assertEqual(entry["instance"], instance)
+        self.assertEqual(entry["configuration"], "默认")
+        self.assertEqual(entry["session_document_path"], document)
+        self.assertEqual(entry["session_temp_root"], session_temp("swx21040"))
+        self.assertEqual(entry["native_api_pid"], 21040)
+        self.assertIs(entry["is_virtual"], True)
+        self.assertEqual(
+            entry["used_api"],
+            "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+        )
+        warning = payload["warnings"][0]
+        self.assertEqual(warning["code"], "embedded_virtual_component_geometry")
+        self.assertTrue(warning["requires_owner_binding"])
+        manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
+        self.assertEqual(manifest["closure"]["virtual_components"], [entry])
+        self.assertEqual(sorted(manifest["files"]), ["robot.SLDASM"])
+
+    def test_embedded_virtual_component_requires_complete_api_and_owner_evidence(self) -> None:
+        document = session_temp("swx21040", "VC~~", "waist", "virtual_part.SLDPRT")
+        instance = "waist-1/virtual_part-1"
+        valid = occurrence(
+            instance,
+            document,
+            defining="robot.SLDASM",
+            virtual=True,
+            native_owner="robot.SLDASM",
+            configuration="默认",
+        )
+        cases = {
+            "missing_virtual": (
+                {**valid, "is_virtual": None},
+                "selection_virtual_component_unproven",
+            ),
+            "false_virtual": (
+                {**valid, "is_virtual": False},
+                "selection_virtual_component_unproven",
+            ),
+            "outside_session_temp": (
+                {**valid, "resolved_path": r"C:\Users\operator\Documents\VC~~\waist\virtual_part.SLDPRT"},
+                "selection_virtual_component_unproven",
+            ),
+            "wrong_session_root": (
+                {
+                    **valid,
+                    "resolved_path": session_temp("not-a-session", "VC~~", "waist", "virtual_part.SLDPRT"),
+                },
+                "selection_virtual_component_unproven",
+            ),
+            "mixed_session_markers": (
+                {
+                    **valid,
+                    "resolved_path": session_temp(
+                        "swx21040", "VC~~", "IC~~", "waist", "virtual_part.SLDPRT"
+                    ),
+                },
+                "selection_virtual_component_unproven",
+            ),
+            "ic_mislabeled_virtual": (
+                {
+                    **valid,
+                    "resolved_path": session_temp("swx21040", "IC~~", "virtual_part.SLDPRT"),
+                },
+                "selection_virtual_component_import_conflict",
+            ),
+            "import_path_present": (
+                {**valid, "imported_path": r"D:\author\virtual_part.step"},
+                "selection_virtual_component_import_conflict",
+            ),
+            "import_path_unread": (
+                {**valid, "import_error": "RuntimeError: GetImportedPath failed"},
+                "selection_virtual_component_unproven",
+            ),
+            "import_path_non_text": (
+                {**valid, "imported_path": 123},
+                "selection_virtual_component_unproven",
+            ),
+            "normal_path_marked_virtual": (
+                {**valid, "resolved_path": r"C:\Users\operator\Documents\virtual_part.SLDPRT"},
+                "selection_virtual_component_unproven",
+            ),
+            "missing_owner": (
+                {
+                    **valid,
+                    "defining": str(Path(document).parent),
+                    "native_owner": str(Path(document).parent),
+                },
+                "selection_virtual_component_unproven",
+            ),
+            "different_owner": (
+                {**valid, "native_owner": "arm.SLDPRT"},
+                "selection_virtual_component_unproven",
+            ),
+            "missing_configuration": (
+                {**valid, "configuration": ""},
+                "selection_virtual_component_unproven",
+            ),
+            "anchor_mismatch": (
+                {**valid, "defining_anchor": "other-1"},
+                "selection_virtual_component_unproven",
+            ),
+        }
+        for label, (record, code) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(SelectionError) as caught:
+                    self.observe([record])
+                self.assertEqual(caught.exception.code, code)
+
+    def test_virtual_component_root_must_match_the_native_session_pid(self) -> None:
+        document = session_temp("swx99999", "VC~~", "waist", "virtual_part.SLDPRT")
+        record = occurrence(
+            "waist-1/virtual_part-1",
+            document,
+            defining="robot.SLDASM",
+            virtual=True,
+            native_owner="robot.SLDASM",
+            configuration="默认",
+        )
+        with self.assertRaises(SelectionError) as caught:
+            self.observe(
+                [record],
+                session={
+                    "native_api_pid": 111,
+                    "solidworks_revision": "34.0.0",
+                    "sealed": True,
+                    "closed": True,
+                },
+            )
+        self.assertEqual(caught.exception.code, "selection_virtual_component_unproven")
+
+    def test_normal_child_of_a_virtual_assembly_binds_through_its_anchor(self) -> None:
+        virtual_assembly = session_temp(
+            "swx21040",
+            "VC~~",
+            "waist",
+            "virtual_assembly.SLDASM",
+        )
+        parent = occurrence(
+            "waist-1/virtual_assembly-1",
+            virtual_assembly,
+            defining="robot.SLDASM",
+            virtual=True,
+            native_owner="robot.SLDASM",
+            configuration="默认",
+        )
+        child = occurrence(
+            "waist-1/virtual_assembly-1/arm-1",
+            self.resolved("arm.SLDPRT"),
+            defining=virtual_assembly,
+            virtual=False,
+            native_owner="robot.SLDASM",
+            configuration="默认",
+        )
+        child["defining_anchor"] = "waist-1/virtual_assembly-1"
+        payload = self.observe([parent, child])
+        self.assertEqual(sorted(payload["graph"]), ["arm.SLDPRT", "robot.SLDASM"])
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["arm.SLDPRT"])
+        edge = payload["documents"]["robot.SLDASM"]["resolved_edges"][0]
+        self.assertEqual(edge["resolved"], "arm.SLDPRT")
+        self.assertEqual(edge["owner_anchor"], "waist-1/virtual_assembly-1")
+        self.assertEqual(edge["defining_session_document"], virtual_assembly)
+        self.assertEqual(len(payload["virtual_components"]), 1)
+        manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
+        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
+        forged = copy.deepcopy(payload)
+        forged["documents"]["robot.SLDASM"]["resolved_edges"][0][
+            "defining_session_document"
+        ] = session_temp("swx21040", "VC~~", "waist", "other_virtual_assembly.SLDASM")
+        with self.assertRaises(SelectionError) as caught:
+            seal_closure_selection(self.files, "robot.SLDASM", forged, reader_sha256=READER)
+        self.assertEqual(caught.exception.code, "selection_closure_invalid")
+
+    def test_virtual_child_under_a_normal_assembly_uses_the_anchored_owner_chain(self) -> None:
+        extra = write_stage(self.stage, {"sub.SLDASM": b"sub-bytes"})
+        files = {**self.files, **extra}
+        outer = session_temp("swx21040", "VC~~", "robot", "outer.SLDASM")
+        inner = session_temp("swx21040", "VC~~", "sub", "inner.SLDPRT")
+        parent = occurrence(
+            "outer-1",
+            outer,
+            defining="robot.SLDASM",
+            virtual=True,
+            native_owner="robot.SLDASM",
+            configuration="默认",
+        )
+        normal = occurrence(
+            "outer-1/sub-1",
+            self.resolved("sub.SLDASM"),
+            defining=outer,
+            virtual=False,
+            native_owner="robot.SLDASM",
+            configuration="默认",
+        )
+        normal["defining_anchor"] = "outer-1"
+        nested = occurrence(
+            "outer-1/sub-1/inner-1",
+            inner,
+            defining="sub.SLDASM",
+            virtual=True,
+            native_owner="sub.SLDASM",
+            configuration="默认",
+        )
+        nested["defining_anchor"] = "outer-1"
+        payload = self.observe([parent, normal, nested], files=files)
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["sub.SLDASM"])
+        self.assertEqual({row["owner"] for row in payload["virtual_components"]}, {"robot.SLDASM", "sub.SLDASM"})
+        manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
+        self.assertEqual(sorted(manifest["files"]), ["robot.SLDASM", "sub.SLDASM"])
+        forged = copy.deepcopy(payload)
+        nested_slot = next(
+            row for row in forged["virtual_components"] if row["owner"] == "sub.SLDASM"
+        )
+        nested_slot["document"] = session_temp(
+            "swx21040", "VC~~", "other", "other_owner.SLDASM"
+        )
+        with self.assertRaises(SelectionError) as caught:
+            seal_closure_selection(files, "robot.SLDASM", forged, reader_sha256=READER)
+        self.assertEqual(caught.exception.code, "selection_closure_invalid")
+
+    def test_virtual_component_seal_rejects_forged_identity(self) -> None:
+        document = session_temp("swx21040", "VC~~", "waist", "virtual_part.SLDPRT")
+        instance = "waist-1/virtual_part-1"
+        payload = self.observe(
+            [
+                occurrence(
+                    instance,
+                    document,
+                    defining="robot.SLDASM",
+                    virtual=True,
+                    native_owner="robot.SLDASM",
+                    configuration="默认",
+                )
+            ]
+        )
+        cases = {
+            "not_virtual": lambda row: row.update(is_virtual=False),
+            "wrong_kind": lambda row: row.update(kind="native_import_materialization"),
+            "ic_document": lambda row: row.update(
+                session_document_path=session_temp("swx21040", "IC~~", "virtual_part.SLDPRT")
+            ),
+            "unknown_owner": lambda row: row.update(owner="other.SLDASM"),
+            "owner_sha": lambda row: row.update(owner_sha256="f" * 64),
+            "missing_instance": lambda row: row.update(instance=""),
+            "missing_configuration": lambda row: row.update(configuration=""),
+            "author_path": lambda row: row.update(author_imported_path=r"D:\author\part.step"),
+            "author_path_missing": lambda row: row.pop("author_imported_path"),
+            "author_read_error": lambda row: row.update(author_imported_error="RuntimeError: failed"),
+            "wrong_anchor": lambda row: row.update(owner_anchor="other-1"),
+            "orphan_anchor": lambda row: row.update(
+                owner_anchor="ghost-1", instance="ghost-1/virtual_part-1"
+            ),
+            "wrong_api": lambda row: row.update(used_api="basename_guess"),
+            "wrong_native_pid": lambda row: row.update(native_api_pid=99999),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                forged = copy.deepcopy(payload)
+                mutate(forged["virtual_components"][0])
+                with self.assertRaises(SelectionError) as caught:
+                    seal_closure_selection(self.files, "robot.SLDASM", forged, reader_sha256=READER)
+                self.assertEqual(caught.exception.code, "selection_closure_invalid")
+        forged = copy.deepcopy(payload)
+        forged["virtual_components"].append(copy.deepcopy(forged["virtual_components"][0]))
+        with self.assertRaises(SelectionError) as caught:
+            seal_closure_selection(self.files, "robot.SLDASM", forged, reader_sha256=READER)
+        self.assertEqual(caught.exception.code, "selection_closure_invalid")
 
     def test_materialized_import_is_a_recorded_warning_not_a_binding(self) -> None:
         temp = session_temp("swx39388", "IC~~", "imported_part.step.SLDPRT")
@@ -362,6 +727,14 @@ class ClosureAdmissionTests(unittest.TestCase):
     def _nested_payload(self):
         parent = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
         child = session_temp("swx25524", "IC~~", "HL-3608_ASM_52_ASM.stp.SLDASM")
+        child_record = occurrence(
+            "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1",
+            child,
+            defining=parent,
+            imported=r"D:\M2.2\change11\HD.stp",
+            native_owner="robot.SLDASM",
+        )
+        child_record["defining_anchor"] = "bracket_a.stp-2"
         payload = self.observe(
             [
                 occurrence(
@@ -370,13 +743,7 @@ class ClosureAdmissionTests(unittest.TestCase):
                     imported=r"D:\M2.2\change11\HD.stp",
                     native_owner="robot.SLDASM",
                 ),
-                occurrence(
-                    "bracket_a.stp-2/HL-3608_ASM_52_ASM.stp-1",
-                    child,
-                    defining=parent,
-                    imported=r"D:\M2.2\change11\HD.stp",
-                    native_owner="robot.SLDASM",
-                ),
+                child_record,
             ]
         )
         return parent, child, payload
@@ -399,13 +766,17 @@ class ClosureAdmissionTests(unittest.TestCase):
         def wrong_anchor(entry):
             entry["owner_anchor"] = "not-an-ancestor"
 
-        for tamper in (drop_owner, ghost_owner, forged_sha, wrong_anchor):
-            forged = copy.deepcopy(payload)
-            entry = next(item for item in forged["imports"] if item["instance"] == child_instance)
-            tamper(entry)
-            with self.subTest(tamper=tamper.__name__), self.assertRaises(SelectionError) as caught:
-                seal_closure_selection(self.files, "robot.SLDASM", forged, reader_sha256=READER)
-            self.assertEqual(caught.exception.code, "selection_closure_invalid")
+        def wrong_parent_document(entry):
+            entry["document"] = session_temp("swx25524", "IC~~", "other_parent.SLDASM")
+
+        for tamper in (drop_owner, ghost_owner, forged_sha, wrong_anchor, wrong_parent_document):
+            with self.subTest(tamper=tamper.__name__):
+                forged = copy.deepcopy(payload)
+                entry = next(item for item in forged["imports"] if item["instance"] == child_instance)
+                tamper(entry)
+                with self.assertRaises(SelectionError) as caught:
+                    seal_closure_selection(self.files, "robot.SLDASM", forged, reader_sha256=READER)
+                self.assertEqual(caught.exception.code, "selection_closure_invalid")
 
     def test_nested_bound_source_is_retained_under_the_ultimate_owner(self) -> None:
         extra = write_stage(self.stage, {"imported_part.step": b"np-bytes"})
@@ -768,7 +1139,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
         self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
 
-    def test_real_walk_nested_materialization_seals_with_ultimate_owner(self) -> None:
+    def test_real_walk_nested_materialization_and_virtual_component_seal_with_owner(self) -> None:
         from .test_solidworks_native_reader import _Component, _Doc, _com_stubs
         from description_pipeline.sources.solidworks.native import SolidWorksBackend
 
@@ -776,15 +1147,32 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         stage = Path(tmp.name).resolve()
         files = write_stage(stage, {"robot.SLDASM": b"robot", "arm.SLDPRT": b"arm"})
-        parent_doc = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
-        child_doc = session_temp("swx25524", "IC~~", "3915_ASM_2_ASM.stp.SLDASM")
+        parent_doc = session_temp("swx111", "IC~~", "bracket_a.stp.SLDASM")
+        child_doc = session_temp("swx111", "IC~~", "3915_ASM_2_ASM.stp.SLDASM")
         child = _Component("3915_ASM_2_ASM.stp-1", child_doc, doc=_Doc(child_doc))
         parent = _Component(
             "bracket_a.stp-2", parent_doc, doc=_Doc(parent_doc), children=(child,)
         )
+        virtual_doc = session_temp(
+            "swx111",
+            "VC~~",
+            "waist",
+            "Copy of 复件 (2) 零件10^waist.SLDPRT",
+        )
+        virtual = _Component(
+            "Copy of 复件 (2) 零件10^waist-1",
+            virtual_doc,
+            doc=_Doc(virtual_doc),
+            configuration="默认",
+        )
+        virtual.IsVirtual = True
+        virtual.GetImportedPath = lambda: None
         arm = _Component("arm-1", str(stage / "arm.SLDPRT"), doc=_Doc(str(stage / "arm.SLDPRT")))
         robot = _Doc(
-            str(stage / "robot.SLDASM"), children=(arm, parent), configuration="默认", properties=dict(DECLARED)
+            str(stage / "robot.SLDASM"),
+            children=(arm, parent, virtual),
+            configuration="默认",
+            properties=dict(DECLARED),
         )
 
         class FakeApp:
@@ -863,6 +1251,15 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         for entry in entries:
             self.assertEqual(entry["owner"], "robot.SLDASM")
             self.assertIn(entry["owner"], payload["graph"])
+        self.assertEqual(len(payload["virtual_components"]), 1)
+        virtual_entry = payload["virtual_components"][0]
+        self.assertEqual(virtual_entry["state"], "embedded_virtual_component")
+        self.assertEqual(virtual_entry["owner"], "robot.SLDASM")
+        self.assertEqual(virtual_entry["owner_sha256"], files["robot.SLDASM"])
+        self.assertEqual(virtual_entry["instance"], "Copy of 复件 (2) 零件10^waist-1")
+        self.assertEqual(virtual_entry["configuration"], "默认")
+        self.assertEqual(virtual_entry["session_document_path"], virtual_doc)
+        self.assertIs(virtual_entry["is_virtual"], True)
         self.assertIsNone(by_instance["bracket_a.stp-2"]["owner_anchor"])
         self.assertEqual(
             by_instance["bracket_a.stp-2/3915_ASM_2_ASM.stp-1"]["owner_anchor"],

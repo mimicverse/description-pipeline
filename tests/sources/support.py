@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import struct
 from pathlib import Path
 from typing import Any, cast
@@ -351,7 +352,6 @@ class FixtureCadBackend(CadBackend):
         destination_dir: str,
         *,
         skip_missing=(),
-        skip_session_temp: bool = False,
         excluded_paths=(),
         required_names=(),
         admitted_roots=(),
@@ -360,7 +360,6 @@ class FixtureCadBackend(CadBackend):
     ) -> dict[str, Any]:
         self.collect_skips = {
             "skip_missing": sorted(str(item) for item in skip_missing),
-            "skip_session_temp": bool(skip_session_temp),
             "excluded_paths": sorted(str(item) for item in excluded_paths),
             "required_names": sorted(str(item) for item in required_names),
             "admitted_roots": [str(item) for item in admitted_roots],
@@ -372,8 +371,11 @@ class FixtureCadBackend(CadBackend):
         target = Path(destination_dir)
         target.mkdir(parents=True, exist_ok=True)
         self.collected = []
+        excluded = {os.path.normcase(os.path.abspath(str(item))) for item in excluded_paths}
         for item in [self.document, *self._dependencies]:
             source = Path(item)
+            if os.path.normcase(os.path.abspath(source)) in excluded:
+                continue
             if not source.is_file() or source.name in self.pack_drop_files:
                 continue
             destination = target / source.name
@@ -404,7 +406,6 @@ class FixtureCadBackend(CadBackend):
             },
             "files": list(self.collected),
             "skipped_missing": self.collect_skips["skip_missing"],
-            "skipped_session_temp": [],
             "skipped_excluded": self.collect_skips["excluded_paths"],
             "mapping": {
                 str(item): str(target / Path(item).name)
@@ -469,6 +470,9 @@ class FixtureCadBackend(CadBackend):
                     "configuration": configuration,
                     "defining": str(Path(assembly_path)),
                     "defining_anchor": None,
+                    "virtual": False,
+                    "imported_path": None,
+                    "imported_error": None,
                     "suppressed": is_suppressed,
                     "depth": 0,
                 }

@@ -16,13 +16,20 @@ import os
 import re
 import shutil
 import contextlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Callable, Sequence
 
 from .errors import BridgeError, ConfigError
 from .inertia_convention import normalize_capture_inertia
-from .native import session_materialization_path
+from .session_artifacts import (
+    SESSION_DOCUMENT_API,
+    embedded_virtual_component_path,
+    embedded_virtual_component_under_root,
+    session_artifact_path,
+    session_materialization_path,
+    session_root_pid,
+)
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, read_json, sha256_file, write_json
 
@@ -261,7 +268,7 @@ def validate_source_config(config: object) -> dict[str, Any]:
             closure.get("schema_version") in (None, "solidworks-to-urdf.native-closure/v1"),
             "source.closure must carry the native closure schema",
         )
-        for name in ("graph", "documents", "imports", "suppressed"):
+        for name in ("graph", "documents", "imports", "virtual_components", "suppressed"):
             if name in closure:
                 _require(isinstance(closure[name], (dict, list)), f"source.closure.{name} has the wrong shape")
     geometry = config.get("geometry") or {}
@@ -598,16 +605,6 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         for entry in closure.get("suppressed") or []
         if isinstance(entry, dict) and entry.get("resolved_path")
     }
-    # Session materializations recorded by the closure walk (imported
-    # occurrences): they are evidence, not snapshot members, and are excluded
-    # from the required file graph by the manifest itself -- never by a path
-    # string heuristic.
-    cached_import_paths = {
-        os.path.normcase(os.path.abspath(str(entry.get("materialization"))))
-        for entry in closure.get("imports") or []
-        if isinstance(entry, dict) and entry.get("materialization")
-    }
-
     # Exact-occurrence binding: the closure records which occurrences were
     # session materializations.  The current session's materialization paths
     # differ from the selection session's, so the stable key is the exact
@@ -623,14 +620,92 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             return None
         return ("document", owner.replace("\\", "/").casefold())
 
-    materialization_keys: set[tuple[str, str]] = set()
+    session_document_keys: set[tuple[str, str]] = set()
+    cached_materialization_keys: set[tuple[str, str]] = set()
+    virtual_component_keys: set[tuple[str, str]] = set()
+    session_bindings: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in closure.get("imports") or []:
         if not isinstance(entry, dict) or entry.get("state") != "cached_materialization":
             continue
+        native_api_pid = entry.get("native_api_pid")
+        if (
+            type(native_api_pid) is not int
+            or native_api_pid <= 0
+            or session_root_pid(entry.get("session_temp_root")) != native_api_pid
+        ):
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the admitted cached materialization has no current-session identity",
+                exit_code=3,
+            )
         instance = entry.get("instance")
         token = _closure_owner_token(entry)
         if isinstance(instance, str) and instance and token is not None:
-            materialization_keys.add((token, instance))
+            key = (token, instance)
+            if key in session_bindings:
+                raise BridgeError(
+                    "dependency_materialization_uncovered",
+                    "the admitted closure records one occurrence as multiple session documents",
+                    {"occurrence": instance},
+                    exit_code=3,
+                )
+            session_document_keys.add((token, instance))
+            cached_materialization_keys.add((token, instance))
+            session_bindings[(token, instance)] = entry
+    for entry in closure.get("virtual_components") or []:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("state") != "embedded_virtual_component"
+            or entry.get("binding") != "owner_embedded_geometry"
+            or entry.get("kind") != "native_embedded_virtual_component"
+            or entry.get("used_api") != SESSION_DOCUMENT_API
+            or entry.get("is_virtual") is not True
+            or "author_imported_path" not in entry
+            or entry["author_imported_path"] is not None
+            or "author_imported_error" not in entry
+            or entry["author_imported_error"] is not None
+            or not isinstance(entry.get("owner"), str)
+            or not entry["owner"]
+            or not isinstance(entry.get("instance"), str)
+            or not entry["instance"]
+            or not isinstance(entry.get("owner_sha256"), str)
+            or SHA256_RE.match(entry["owner_sha256"]) is None
+            or not isinstance(entry.get("configuration"), str)
+            or not entry["configuration"].strip()
+            or not embedded_virtual_component_under_root(
+                entry.get("session_document_path"), entry.get("session_temp_root")
+            )
+            or type(entry.get("native_api_pid")) is not int
+            or entry["native_api_pid"] <= 0
+            or session_root_pid(entry.get("session_temp_root")) != entry["native_api_pid"]
+            or (
+                entry.get("owner_anchor") is not None
+                and (
+                    not isinstance(entry.get("owner_anchor"), str)
+                    or not entry["owner_anchor"]
+                    or not entry["instance"].startswith(entry["owner_anchor"] + "/")
+                )
+            )
+        ):
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the admitted embedded virtual component evidence is incomplete",
+                exit_code=3,
+            )
+        instance = entry.get("instance")
+        token = _closure_owner_token(entry)
+        if isinstance(instance, str) and instance and token is not None:
+            key = (token, instance)
+            if key in session_bindings:
+                raise BridgeError(
+                    "dependency_materialization_uncovered",
+                    "the admitted closure records one occurrence as multiple session documents",
+                    {"occurrence": instance},
+                    exit_code=3,
+                )
+            virtual_component_keys.add(key)
+            session_document_keys.add(key)
+            session_bindings[key] = entry
 
     # Stale author source links recorded by the closure (import metadata): the
     # exact author path may still be listed by the engine, but after the
@@ -668,11 +743,22 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     for name, entry in (closure.get("documents") or {}).items():
         if not isinstance(entry, dict):
             continue
-        token = ("document", str(name).replace("\\", "/").casefold())
         for edge in entry.get("resolved_edges") or []:
-            if isinstance(edge, dict) and isinstance(edge.get("instance"), str) and edge["instance"]:
-                covered_keys.add((token, edge["instance"]))
+            if not isinstance(edge, dict) or not isinstance(edge.get("instance"), str) or not edge["instance"]:
+                continue
+            anchor = edge.get("owner_anchor")
+            if isinstance(anchor, str) and anchor:
+                token = ("anchor", anchor)
+            else:
+                token = ("document", str(name).replace("\\", "/").casefold())
+            covered_keys.add((token, edge["instance"]))
     for item in closure.get("imports") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
+            continue
+        token = _closure_owner_token(item)
+        if token is not None:
+            covered_keys.add((token, item["instance"]))
+    for item in closure.get("virtual_components") or []:
         if not isinstance(item, dict) or not isinstance(item.get("instance"), str) or not item["instance"]:
             continue
         token = _closure_owner_token(item)
@@ -685,12 +771,12 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         if token is not None:
             covered_keys.add((token, item["instance"]))
 
-    def _actual_owner_token(entry: dict) -> tuple[str, str]:
+    def _actual_owner_token(entry: dict, roots: list[str] | None = None) -> tuple[str, str]:
         anchor = entry.get("defining_anchor")
         if isinstance(anchor, str) and anchor:
             return ("anchor", anchor)
         defining = str(entry.get("defining") or "")
-        for root in cfg.get("allowed_roots") or []:
+        for root in roots if roots is not None else (cfg.get("allowed_roots") or []):
             try:
                 relative = Path(defining).resolve().relative_to(Path(str(root)).resolve()).as_posix()
                 return ("document", relative.casefold())
@@ -703,6 +789,129 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         for entry in original.get("instances") or []
         if entry.get("instance")
     }
+    unread_virtual = [
+        str(entry.get("instance") or "")
+        for entry in original.get("instances") or []
+        if type(entry.get("virtual")) is not bool
+    ]
+    if unread_virtual:
+        raise BridgeError(
+            "dependency_instance_mismatch",
+            "the source occurrence inventory has an unread IsVirtual state",
+            {"instances": unread_virtual[:20], "count": len(unread_virtual)},
+            exit_code=3,
+        )
+
+    def _current_owner_path(slot: dict[str, Any]) -> str:
+        owner = slot.get("owner")
+        if not isinstance(owner, str) or not owner:
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the admitted session document names no ultimate owner",
+                exit_code=3,
+            )
+        relative = PurePosixPath(owner.replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the admitted session document owner is not a confined relative path",
+                {"owner": owner},
+                exit_code=3,
+            )
+        candidates = set()
+        for root in [*(cfg.get("allowed_roots") or []), str(Path(cfg["assembly"]).parent)]:
+            candidate = Path(str(root)).joinpath(*relative.parts)
+            if candidate.is_file():
+                candidates.add(os.path.normcase(os.path.abspath(candidate)))
+        anchor = slot.get("owner_anchor")
+        if isinstance(anchor, str) and anchor:
+            ancestor = next(
+                (
+                    entry
+                    for entry in original.get("instances") or []
+                    if str(entry.get("instance") or "") == anchor
+                ),
+                None,
+            )
+            ancestor_path = str((ancestor or {}).get("document") or "")
+            if (
+                ancestor_path
+                and not session_artifact_path(ancestor_path)
+                and (not cfg.get("allowed_roots") or _under(ancestor_path, cfg["allowed_roots"]))
+                and os.path.isfile(ancestor_path)
+            ):
+                candidates.add(os.path.normcase(os.path.abspath(ancestor_path)))
+        if len(candidates) != 1:
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the admitted session document owner does not resolve to one current source file",
+                {"owner": owner, "candidates": sorted(candidates)},
+                exit_code=3,
+            )
+        return candidates.pop()
+
+    owner_hashes: dict[str, str] = {}
+    original_session_paths: set[str] = set()
+    for entry in original.get("instances") or []:
+        instance = str(entry.get("instance") or "")
+        key = (_actual_owner_token(entry), instance)
+        slot = session_bindings.get(key)
+        if slot is None:
+            continue
+        document = str(entry.get("document") or "")
+        if key in virtual_component_keys:
+            path_matches = embedded_virtual_component_path(document)
+            expected_state = "embedded_virtual_component"
+            expected_virtual = True
+        elif key in cached_materialization_keys:
+            path_matches = session_materialization_path(document)
+            expected_state = "cached_materialization"
+            expected_virtual = False
+        else:
+            path_matches = False
+            expected_state = None
+            expected_virtual = None
+        if (
+            slot.get("state") != expected_state
+            or not path_matches
+            or entry.get("virtual") is not expected_virtual
+            or (
+                key in virtual_component_keys
+                and (
+                    "imported_path" not in entry
+                    or entry["imported_path"] is not None
+                    or "imported_error" not in entry
+                    or entry["imported_error"] is not None
+                )
+            )
+            or entry.get("configuration") != slot.get("configuration")
+            or bool(entry.get("suppressed")) != (slot.get("suppression_state") == 0)
+        ):
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the current occurrence is not the admitted session document, configuration, and state",
+                {
+                    "occurrence": instance,
+                    "document": document,
+                    "configuration": entry.get("configuration"),
+                    "sealed_configuration": slot.get("configuration"),
+                    "virtual": entry.get("virtual"),
+                    "state": slot.get("state"),
+                },
+                exit_code=3,
+            )
+        original_session_paths.add(os.path.normcase(os.path.abspath(document)))
+        owner_path = _current_owner_path(slot)
+        normalized_owner = os.path.normcase(owner_path)
+        if normalized_owner not in owner_hashes:
+            owner_hashes[normalized_owner] = sha256_file(Path(owner_path))
+        if owner_hashes[normalized_owner] != slot.get("owner_sha256"):
+            raise BridgeError(
+                "dependency_materialization_uncovered",
+                "the admitted session document owner bytes changed since selection",
+                {"occurrence": instance, "owner": owner_path},
+                exit_code=3,
+            )
     materializations_verified = False
     if closure:
         if actual_keys != covered_keys:
@@ -732,7 +941,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         if path and materializations_verified and normalized in author_metadata_external:
             stale_source_links.append(path)
             continue
-        if path and materializations_verified and session_materialization_path(path):
+        if path and normalized in original_session_paths:
             session_temp_dependencies.append(path)
             continue
         if not entry.get("exists", True):
@@ -751,21 +960,21 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
     # Bind every saved source file before copying, then recheck after all reads.
     original_files: dict[str, str] = {}
     original_documents = [str(cfg["assembly"])]
-    import_temp_documents: list[str] = []
+    session_temp_documents: list[str] = []
     for entry in original.get("instances") or []:
         document = str(entry.get("document") or "")
         if not document:
             continue
         key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
-        if key in materialization_keys or os.path.normcase(os.path.abspath(document)) in cached_import_paths:
-            import_temp_documents.append(document)
+        if key in session_document_keys:
+            session_temp_documents.append(document)
             continue
         original_documents.append(document)
     for entry in dependencies:
         path = str(entry.get("path") or "")
         if not path or os.path.normcase(os.path.abspath(path)) in suppressed_paths:
             continue
-        if materializations_verified and session_materialization_path(path):
+        if materializations_verified and os.path.normcase(os.path.abspath(path)) in original_session_paths:
             continue
         if materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
             continue
@@ -837,8 +1046,10 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             cfg["assembly"],
             str(source_dir),
             skip_missing=sorted(suppressed_paths),
-            skip_session_temp=materializations_verified,
-            excluded_paths=sorted(author_metadata_external) if materializations_verified else (),
+            excluded_paths=sorted(
+                (author_metadata_external if materializations_verified else set())
+                | original_session_paths
+            ),
             required_names=sorted((closure.get("graph") or {}).keys()),
             admitted_roots=[str(source_dir), *(cfg.get("allowed_roots") or [])],
             closure_documents=closure_documents,
@@ -886,6 +1097,14 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             "the backend cannot prove where the collected copy resolves its references",
             exit_code=3,
         )
+    copy = dict(inspector(top) or {})
+    copy_session_paths = {
+        os.path.normcase(os.path.abspath(str(entry.get("document"))))
+        for entry in copy.get("instances") or []
+        if (_actual_owner_token(entry, [str(source_dir)]), str(entry.get("instance") or ""))
+        in session_document_keys
+        and entry.get("document")
+    }
     entries = list(resolved(top) or [])
     if not entries:
         raise BridgeError(
@@ -911,7 +1130,7 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         if path and materializations_verified and os.path.normcase(os.path.abspath(path)) in author_metadata_external:
             stale_source_links.append(path)
             continue
-        if path and materializations_verified and session_materialization_path(path):
+        if path and os.path.normcase(os.path.abspath(path)) in copy_session_paths:
             session_temp_dependencies.append(path)
             continue
         if not path or not _under(path, [str(source_dir)]):
@@ -925,8 +1144,6 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             {"problems": problems[:20], "count": len(problems), "top_level": top},
             exit_code=3,
         )
-
-    copy = dict(inspector(top) or {})
 
     # A copy that opened in a different configuration is a different model, so the
     # instance comparison below would be meaningless.
@@ -978,12 +1195,14 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
             exit_code=3,
         )
 
-    def signatures(report: dict[str, Any]) -> dict[str, tuple[Any, Any, bool]]:
+    def signatures(report: dict[str, Any]) -> dict[str, tuple[Any, Any, bool, Any, Any]]:
         return {
             str(entry["instance"]): (
                 entry.get("document_name"),
                 entry.get("configuration"),
                 bool(entry.get("suppressed")),
+                entry.get("virtual"),
+                entry.get("defining_anchor"),
             )
             for entry in report.get("instances") or []
         }
@@ -1044,13 +1263,37 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         path = str(entry.get("document") or "")
         if not path:
             continue  # suppressed instances are tracked, not resolved
-        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
-        if (
-            key in materialization_keys
-            or os.path.normcase(os.path.abspath(path)) in cached_import_paths
-            or (materializations_verified and session_materialization_path(path))
+        key = (_actual_owner_token(entry, [str(source_dir)]), str(entry.get("instance") or ""))
+        if key in virtual_component_keys and (
+            not embedded_virtual_component_path(path)
+            or entry.get("virtual") is not True
+            or "imported_path" not in entry
+            or entry["imported_path"] is not None
+            or "imported_error" not in entry
+            or entry["imported_error"] is not None
         ):
-            import_temp_documents.append(path)
+            raise BridgeError(
+                "dependency_instance_mismatch",
+                "the reopened copy no longer resolves the admitted embedded virtual component class",
+                {
+                    "instance": str(entry.get("instance") or ""),
+                    "document": path,
+                    "imported_path": entry.get("imported_path"),
+                    "imported_error": entry.get("imported_error"),
+                },
+                exit_code=3,
+            )
+        if key in cached_materialization_keys and not session_materialization_path(path):
+            raise BridgeError(
+                "dependency_instance_mismatch",
+                "the reopened copy no longer resolves the admitted IC~~ import materialization",
+                {"instance": str(entry.get("instance") or ""), "document": path},
+                exit_code=3,
+            )
+        if (
+            key in session_document_keys
+        ):
+            session_temp_documents.append(path)
             continue  # session materializations are evidence, not snapshot members
         if not _under(path, [str(source_dir)]):
             outside_copy.append(path)
@@ -1113,12 +1356,10 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         mapping[(str(cfg["assembly"]), top)] = "top_level"
     for entry in copy.get("instances") or []:
         path = str(entry.get("document") or "")
-        key = (_actual_owner_token(entry), str(entry.get("instance") or ""))
+        key = (_actual_owner_token(entry, [str(source_dir)]), str(entry.get("instance") or ""))
         if (
             not path
-            or key in materialization_keys
-            or os.path.normcase(os.path.abspath(path)) in cached_import_paths
-            or (materializations_verified and session_materialization_path(path))
+            or key in session_document_keys
         ):
             continue
         for source_entry in original.get("instances") or []:
@@ -1145,8 +1386,13 @@ def _dependency_closure(backend: Any, cfg: dict[str, Any], source_dir: Path) -> 
         ),
         "seeded_required_leaves": sorted(collected.get("seeded_required_leaves") or []),
         "materializations_verified": materializations_verified,
-        "materialization_keys": sorted([token[0], token[1], instance] for token, instance in materialization_keys),
-        "import_temp_documents": sorted(set(import_temp_documents)),
+        "session_document_keys": sorted(
+            [token[0], token[1], instance] for token, instance in session_document_keys
+        ),
+        "virtual_component_keys": sorted(
+            [token[0], token[1], instance] for token, instance in virtual_component_keys
+        ),
+        "session_temp_documents": sorted(set(session_temp_documents)),
         "resolved_inside_snapshot": len(entries),
         "collected_files": len(collected.get("files") or []),
         "configuration": copy_config,

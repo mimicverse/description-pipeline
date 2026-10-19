@@ -16,7 +16,6 @@ import re
 import shutil
 import struct
 import sys
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -24,6 +23,16 @@ from pathlib import Path
 
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
+from .session_artifacts import (
+    SESSION_DOCUMENT_API,
+    embedded_virtual_component_path,
+    embedded_virtual_component_root,
+    session_artifact_path,
+    session_document_marker,
+    session_materialization_path,
+    session_root_pid,
+    session_temp_root,
+)
 
 # Published dual-interface IIDs in the SolidWorks type library.
 ICOMPONENT2_IID = "{655D6F2A-5441-45D1-8CBA-D35FB26988E4}"
@@ -681,79 +690,6 @@ def _index_spelling(index, relative) -> str | None:
     folded = relative.casefold()
     matches = [name for name in index if name.casefold() == folded]
     return matches[0] if len(matches) == 1 else None
-
-
-def import_materialization_path(value) -> bool:
-    """True for a session 3D-Interconnect materialization path (``...\\IC~~\\...``).
-
-    ``IC~~`` is the documented SolidWorks session temp materialization marker
-    (the selection reader has classified it that way since its first release);
-    this is an exact path-*component* test, never a basename, suffix or
-    machine-specific rule.
-    """
-
-    text = str(value or "").replace("\\", "/")
-    return any(part.casefold() == "ic~~" for part in text.split("/") if part)
-
-
-def session_materialization_path(value) -> bool:
-    """True only for a session materialization inside the owned temp area.
-
-    A cached import requires an ``IC~~`` path component *under the system
-    temporary directory* (the owned session temp area): the bare marker or a
-    virtual/imported reading alone must never convert an actual out-of-stage
-    on-disk file into cached geometry.  Path flavour follows the value, so the
-    same rule answers Windows engine paths and portable test paths.
-    """
-
-    if not import_materialization_path(value):
-        return False
-    text = str(value)
-    module = ntpath if (re.match(r"^[A-Za-z]:", text) or text.startswith("\\\\") or "\\" in text) else posixpath
-    try:
-        candidate = module.normcase(module.normpath(text))
-        root = module.normcase(module.normpath(str(tempfile.gettempdir())))
-    except (TypeError, ValueError):
-        return False
-    separator = "\\" if module is ntpath else "/"
-    return candidate == root or candidate.startswith(root.rstrip("\\/") + separator)
-
-
-def session_temp_root(value) -> str | None:
-    """Absolute per-session temp root that contains a materialization's IC~~ dir.
-
-    For ``<temp>\\swxNNNN\\IC~~\\X.ext`` this is ``<temp>\\swxNNNN`` -- the
-    owned session temp area -- returned only when the path has an ``IC~~``
-    component and the root lies under (or is) the system temp area.  Never a
-    basename or suffix rule; ``None`` when the shape is not a session
-    materialization.
-    """
-
-    text = str(value or "")
-    if not text.strip():
-        return None
-    module = ntpath if (re.match(r"^[A-Za-z]:", text) or text.startswith("\\\\") or "\\" in text) else posixpath
-    separator = "\\" if module is ntpath else "/"
-    try:
-        normalized = module.normpath(text)
-    except (TypeError, ValueError):
-        return None
-    parts = normalized.split(separator)
-    for position, part in enumerate(parts):
-        if part.casefold() == "ic~~":
-            head = separator.join(parts[:position]).rstrip("\\/")
-            break
-    else:
-        return None
-    try:
-        temp = module.normcase(module.normpath(str(tempfile.gettempdir())))
-        candidate = module.normcase(head)
-    except (TypeError, ValueError):
-        return None
-    prefix = temp.rstrip("\\/") + separator
-    if candidate == temp or candidate.startswith(prefix):
-        return head
-    return None
 
 
 def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
@@ -1638,10 +1574,19 @@ def _urdf_exporter_attribute(app, doc, source_root, configuration):
         version = float(_method(version_parameter, "GetDoubleValue"))
         if not math.isfinite(version):
             raise ValueError("stored exporter version is not finite")
+        try:
+            native_api_pid = int(_method(app, "GetProcessID"))
+        except Exception:  # noqa: BLE001 - PID provenance is optional on legacy test surfaces
+            native_api_pid = None
         result.update(
             {
                 "exporter_version": version,
-                "pid_bindings": _urdf_exporter_pid_bindings(xml, _member(doc, "Extension"), source_root),
+                "pid_bindings": _urdf_exporter_pid_bindings(
+                    xml,
+                    _member(doc, "Extension"),
+                    source_root,
+                    native_api_pid=native_api_pid,
+                ),
                 "state": "extracted",
             }
         )
@@ -1650,7 +1595,7 @@ def _urdf_exporter_attribute(app, doc, source_root, configuration):
     return result
 
 
-def _urdf_exporter_pid_bindings(xml_text, extension, source_root):
+def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_pid=None):
     """Resolve each unique declared PID as exact bytes, preserving XML separately."""
 
     import base64
@@ -1693,21 +1638,22 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root):
                 component = _component(_dynamic(resolved))
                 row["name2"] = str(_member(component, "Name2") or "") or None
                 row.update(_component_source_document(component, source_root))
+                if isinstance(row.get("source_provenance"), dict) and type(native_api_pid) is int:
+                    row["source_provenance"]["native_api_pid"] = native_api_pid
                 row["configuration"] = str(_member(component, "ReferencedConfiguration") or "") or None
                 provenance = row.get("source_provenance")
-                cached = (
+                session_document = (
                     isinstance(provenance, dict)
-                    and provenance.get("state") == "cached_materialization"
-                    and bool(provenance.get("materialization_path"))
+                    and provenance.get("state")
+                    in {"cached_materialization", "embedded_virtual_component"}
+                    and bool(provenance.get("session_document_path"))
                 )
-                if cached and not row["document"]:
-                    # The exact active occurrence identity for a cached import is
-                    # the engine-resolved session materialization; record it in
-                    # the *same* normalized spelling the component walk uses so
-                    # the PID binding and the active node compare equal.  This
-                    # is the occurrence's own resolved document in the same
-                    # session -- never the author path and never a substitution.
-                    row["document"] = normalize_document_path(str(provenance["materialization_path"]))
+                if session_document and not row["document"]:
+                    # The exact active occurrence identity is the engine-resolved
+                    # session document; record it in the same normalized spelling
+                    # the component walk uses. This is never an author path or a
+                    # name substitution.
+                    row["document"] = normalize_document_path(str(provenance["session_document_path"]))
                 bound = bool(row["document"])
                 if (
                     type(row["error_code"]) is not int
@@ -1813,7 +1759,21 @@ def _relative_document(path_value, source_root):
         return None
 
 
-def _component_source_document(component, source_root):
+def _imported_path_reading(component) -> tuple[str | None, str | None]:
+    """One imported-path reading: text, API error, or non-text API failure."""
+
+    try:
+        value = _method(component, "GetImportedPath")
+    except Exception as error:  # noqa: BLE001 - recorded verbatim for the policy gate
+        return None, f"{type(error).__name__}: {error}"[:300]
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, f"non-text reading: {type(value).__name__}: {value!r}"[:300]
+    return (value if value.strip() else None), None
+
+
+def _component_source_document(component, source_root, *, native_path=None):
     """Bind an occurrence to a delivered file, including native linked imports.
 
     SolidWorks materializes 3D Interconnect parts in an owned temporary path.
@@ -1828,31 +1788,26 @@ def _component_source_document(component, source_root):
     source root; that in-stage source is then reported as validated author
     metadata (``author_imported_in_source_root``/``author_imported_relative``)
     and retained as a selection-level bound edge, never as a raw binding.
-    Temporary names and basenames are never proof.
+    A ``VC~~`` document is a separate class: it is accepted only when
+    ``IComponent2.IsVirtual`` is exactly ``True``, it lies in the owning
+    session's temporary root, and the API reports no imported path.  The
+    sealed carrier must additionally bind its ultimate owner, occurrence, and
+    configuration.  Temporary names and basenames are never proof.
     """
 
-    native_path = str(_method(component, "GetPathName") or "")
-    relative = _relative_document(native_path, source_root)
-    if relative:
-        return {"document": relative}
+    native_path = str(native_path if native_path is not None else _method(component, "GetPathName") or "")
     provenance = {
         "state": "unread",
         "source_root": str(Path(source_root).resolve()),
         "native_document_path": native_path,
         "materialization_path": native_path or None,
+        "session_document_path": native_path or None,
         "is_virtual": None,
         "author_imported_path": None,
-        "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+        "author_imported_error": None,
+        "used_api": SESSION_DOCUMENT_API,
     }
     result = {"document": None, "source_provenance": provenance}
-    imported_path = None
-    try:
-        imported_path = _method(component, "GetImportedPath")
-        provenance["author_imported_path"] = (
-            imported_path if isinstance(imported_path, str) and imported_path.strip() else None
-        )
-    except Exception as error:  # noqa: BLE001 - a temp or foreign path is never an implicit source
-        provenance["author_imported_error"] = f"{type(error).__name__}: {error}"[:300]
     virtual = None
     try:
         reading = _member(component, "IsVirtual")
@@ -1860,7 +1815,48 @@ def _component_source_document(component, source_root):
     except Exception as error:  # noqa: BLE001 - an unreadable virtual flag stays unknown
         provenance["virtual_error"] = f"{type(error).__name__}: {error}"[:200]
     provenance["is_virtual"] = virtual
-    if session_materialization_path(native_path):
+    relative = _relative_document(native_path, source_root)
+    if relative and virtual is False:
+        return {"document": relative}
+    if relative and virtual is None:
+        provenance["error"] = (
+            "ValueError: a delivered document requires an explicit False IsVirtual reading"
+        )
+        return result
+    imported_path, imported_error = _imported_path_reading(component)
+    provenance["author_imported_path"] = imported_path
+    if imported_error is not None:
+        provenance["author_imported_error"] = imported_error
+    if virtual is True:
+        if provenance.get("author_imported_error") is not None:
+            provenance["error"] = (
+                "ValueError: a virtual component's imported-path absence could not be proven"
+            )
+        elif provenance["author_imported_path"] is not None:
+            provenance["error"] = (
+                "ValueError: a virtual component reports an imported path; virtual geometry "
+                "and a 3D Interconnect source cannot be conflated"
+            )
+        elif session_materialization_path(native_path):
+            provenance["error"] = (
+                "ValueError: an IC~~ import materialization is marked virtual; "
+                "the two session document classes cannot be conflated"
+            )
+        elif embedded_virtual_component_path(native_path):
+            provenance.update(
+                {
+                    "state": "embedded_virtual_component",
+                    "kind": "native_embedded_virtual_component",
+                    "document": None,
+                    "session_temp_root": embedded_virtual_component_root(native_path),
+                }
+            )
+        else:
+            provenance["error"] = (
+                "ValueError: IsVirtual=True is not sufficient without an exact VC~~ document "
+                "inside the owning session temporary root"
+            )
+    elif session_materialization_path(native_path) and virtual is False:
         author_relative = _relative_document(imported_path, source_root) if imported_path else None
         provenance.update(
             {
@@ -1873,10 +1869,19 @@ def _component_source_document(component, source_root):
             }
         )
     else:
-        provenance["error"] = (
-            "ValueError: the resolved document is not a delivered file and not a structural "
-            "session materialization (IC~~ under the owned session temp area)"
-        )
+        if session_materialization_path(native_path):
+            provenance["error"] = (
+                "ValueError: an IC~~ materialization requires an explicit False IsVirtual reading"
+            )
+        elif embedded_virtual_component_path(native_path):
+            provenance["error"] = (
+                "ValueError: a VC~~ document requires an explicit True IsVirtual reading"
+            )
+        else:
+            provenance["error"] = (
+                "ValueError: the resolved document is not a delivered file, an IC~~ import "
+                "materialization, or an API-proven VC~~ embedded virtual component"
+            )
     return result
 
 
@@ -2192,6 +2197,11 @@ class SolidWorksBackend(CadBackend):
         #: ``None`` disables the pre-open gate; a set of normalized absolute
         #: source paths seals exactly which documents may be opened.
         self._sealed_documents: set[str] | None = None
+        #: Session documents proven by the active occurrence walk.  A temporary
+        #: path shape alone never grants a sealed-source-open exemption.
+        self._session_document_paths: dict[str, tuple[str, object]] = {}
+        self._session_artifact_roots: dict[object, str] = {}
+        self._session_artifact_root_owners: dict[str, tuple[str, object]] = {}
         #: Pinned staged search scope applied to every owned session before any
         #: reference resolution happens (``None`` leaves machine search settings
         #: untouched); evidence is recorded per owned process.
@@ -2265,14 +2275,14 @@ class SolidWorksBackend(CadBackend):
         normalized = normalize_document_path(os.path.abspath(path))
         if any(normalized.startswith(root + "\\") for root in self._capture_roots):
             return "copy"
-        if session_materialization_path(path):
-            # An engine-resolved session materialization belongs to the session
-            # whose walk produced it, never to a path-derived role: during
-            # capture of a collected copy the source session is retired, and
-            # routing the materialization to "source" would look up (or worse,
-            # create) the wrong application.  Prefer the walk's current role;
-            # otherwise require exactly one live session.  Ambiguity refuses
-            # with a precise error instead of guessing.
+        if session_artifact_path(path):
+            # An engine-resolved session artifact (IC~~ import cache or VC~~
+            # embedded component) belongs to the session whose walk produced
+            # it, never to a path-derived role. During capture of a collected
+            # copy the source session is retired, and routing the artifact to
+            # "source" would look up (or worse, create) the wrong application.
+            # Prefer the walk's current role; otherwise require exactly one
+            # live session. Ambiguity refuses instead of guessing.
             role = getattr(self._local, "role", None)
             if role is not None and role in self._sessions and not self._sessions[role].closed:
                 return role
@@ -2360,14 +2370,65 @@ class SolidWorksBackend(CadBackend):
 
         return [dict(item) for item in self._staged_search_evidence]
 
+    def _bind_session_document(self, role, session, path):
+        if session is None or session.closed:
+            raise CadError(
+                "cad_materialization_session_unavailable",
+                "the owning CAD session for a session artifact is not available",
+                {"path": str(path), "role": role},
+            )
+        artifact_root = session_temp_root(path) or embedded_virtual_component_root(path)
+        if not artifact_root:
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "a session artifact has no canonical controlled temporary root",
+                {"path": str(path), "role": role},
+            )
+        session_pid = session.identity().get("pid")
+        if type(session_pid) is int and session_pid > 0 and session_root_pid(artifact_root) != session_pid:
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "a session artifact root does not match the owning process id",
+                {"path": str(path), "role": role, "session_pid": session_pid, "root": artifact_root},
+            )
+        recorded_root = self._session_artifact_roots.setdefault(session, artifact_root)
+        if recorded_root != artifact_root:
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "a session artifact does not belong to the controlled session temporary root",
+                {"path": str(path), "role": role, "recorded_root": recorded_root, "root": artifact_root},
+            )
+        root_key = normalize_document_path(os.path.abspath(artifact_root))
+        root_owner = self._session_artifact_root_owners.setdefault(root_key, (role, session))
+        if root_owner != (role, session):
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "one controlled session temporary root cannot be shared by multiple CAD sessions",
+                {"path": str(path), "role": role, "root": artifact_root},
+            )
+        normalized = normalize_document_path(os.path.abspath(str(path)))
+        recorded_owner = self._session_document_paths.get(normalized)
+        if recorded_owner is not None and recorded_owner != (role, session):
+            raise CadError(
+                "cad_materialization_session_mismatch",
+                "a session document cannot be rebound to another CAD session",
+                {"path": str(path), "role": role},
+            )
+        self._session_document_paths[normalized] = (role, session)
+
     def _require_sealed(self, path):
         """Refuse an unsealed source open before any COM call is made."""
 
         if self._sealed_documents is None:
             return
-        if self._role_for_path(path) == "copy":
+        role = self._role_for_path(path)
+        normalized = normalize_document_path(os.path.abspath(str(path)))
+        session = self._sessions.get(role)
+        if self._session_document_paths.get(normalized) == (role, session) and session is not None:
             return
-        if normalize_document_path(os.path.abspath(str(path))) not in self._sealed_documents:
+        if role == "copy" and not session_artifact_path(path):
+            return
+        if normalized not in self._sealed_documents:
             raise CadError(
                 "document_not_sealed",
                 "The document is not in the sealed selection; refusing to open it",
@@ -2438,6 +2499,9 @@ class SolidWorksBackend(CadBackend):
         self._components.clear()
         self._source_components.clear()
         self._source_documents.clear()
+        self._session_document_paths.clear()
+        self._session_artifact_roots.clear()
+        self._session_artifact_root_owners.clear()
         self._scene_document_key = None
         self._part_mass_properties = {}
         self._effective_instance_readings = {}
@@ -3598,6 +3662,7 @@ class SolidWorksBackend(CadBackend):
 
     def collect_scene(self, doc_path, coordinate_systems, on_activity=None, require_material=True):
         activity = _ActivityEmitter(on_activity)
+        source_root = Path(doc_path).resolve().parent
 
         def note(action: str, **fields) -> None:
             activity.emit(action, phase="capture", **fields)
@@ -3611,6 +3676,9 @@ class SolidWorksBackend(CadBackend):
         self._components = set()
         self._source_components = {}
         self._source_documents = {}
+        self._session_document_paths = {}
+        self._session_artifact_roots = {}
+        self._session_artifact_root_owners = {}
         self.notes = {"capture_preparation": preparation}
         self.source_files = {doc_path: _hash(doc_path)}
         _manager, config = _active_configuration_view(doc)
@@ -3669,6 +3737,19 @@ class SolidWorksBackend(CadBackend):
                 # Without a file on disk there is no revision to hash or copy, so the
                 # snapshot could not name what it read.
                 raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
+            source_document = _component_source_document(comp, source_root, native_path=path)
+            provenance = source_document.get("source_provenance")
+            session_document = (
+                isinstance(provenance, dict)
+                and provenance.get("state")
+                in {"cached_materialization", "embedded_virtual_component"}
+            )
+            if provenance is not None and not session_document:
+                raise CadError(
+                    "cad_component_source_unread",
+                    "a component did not resolve to a delivered file or an admitted session document",
+                    {"component": name, "path": path, "source_provenance": provenance},
+                )
             self._record_save_flag(part, path)
             referenced = _member(comp, "ReferencedConfiguration")
             # Configuration changes can invalidate borrowed occurrence interfaces.
@@ -3688,9 +3769,13 @@ class SolidWorksBackend(CadBackend):
                     "solid": self._body_count(comp, 0, name),
                     "sheet": self._body_count(comp, 1, name),
                 }
-            document_key = self._record_source_document(path, _active_configuration(part))
+            document_key = self._record_source_document(
+                path,
+                _active_configuration(part),
+                session_document=session_document,
+            )
             self._source_components[name] = (document_key, str(referenced))
-            if path not in self.source_files:
+            if not session_document and path not in self.source_files:
                 self.source_files[path] = _hash(path)
             occurrences.append((RawComponent(name, path, placement, fixed, document_type), referenced))
 
@@ -4135,15 +4220,15 @@ class SolidWorksBackend(CadBackend):
             },
         }
 
-    def _record_source_document(self, path, configuration):
+    def _record_source_document(self, path, configuration, *, session_document=False):
         role = self._role_for_path(path)
         key = (role, normalize_document_path(os.path.abspath(path)))
         session = self._sessions.get(role)
         if session is None or session.closed:
-            if session_materialization_path(path):
+            if session_document:
                 raise CadError(
                     "cad_materialization_session_unavailable",
-                    "the owning CAD session for a session materialization is not available",
+                    "the owning CAD session for a session artifact is not available",
                     {"path": str(path), "role": role},
                 )
             raise CadError(
@@ -4151,6 +4236,8 @@ class SolidWorksBackend(CadBackend):
                 "the CAD session for a captured document is not available",
                 {"path": str(path), "role": role},
             )
+        if session_document:
+            self._bind_session_document(role, session, path)
         previous = self._source_documents.setdefault(key, (path, role, configuration, session))
         if previous[2] != configuration or previous[3] is not session:
             raise CadError("cad_source_changed", "a shared document's captured state changed", {"path": path})
@@ -4275,6 +4362,8 @@ class SolidWorksBackend(CadBackend):
         with self._current_components("verify_sources"):
             pass
         for path, digest in self.source_files.items():
+            if normalize_document_path(os.path.abspath(path)) in self._session_document_paths:
+                continue
             if _hash(path) != digest:
                 raise CadError("cad_source_changed", path)
         # Source identity stays hashes only: the save flag is an observation and lives
@@ -4406,7 +4495,6 @@ class SolidWorksBackend(CadBackend):
         destination_dir,
         *,
         skip_missing=(),
-        skip_session_temp=False,
         excluded_paths=(),
         required_names=None,
         admitted_roots=(),
@@ -4421,10 +4509,8 @@ class SolidWorksBackend(CadBackend):
         ``skip_missing`` lists absolute paths whose absence is already recorded
         (suppressed placements): they are reported instead of failing the
         collection, and they never enter the copied graph.  ``excluded_paths``
-        (closure-recorded stale author source links) and, when
-        ``skip_session_temp`` is set after the occurrence coverage proof,
-        session 3D-Interconnect materializations are likewise reported and
-        never copied or rewritten.
+        contains exact admitted session-document paths and stale author source
+        links; they are likewise reported and never copied or rewritten.
 
         ``required_names`` (the sealed closure's selected canonical document
         names), ``admitted_roots`` and ``closure_documents`` bind
@@ -4472,7 +4558,6 @@ class SolidWorksBackend(CadBackend):
                     },
                 }
         graph_skipped: list[str] = []
-        graph_skipped_temp: list[str] = []
         graph_excluded: list[str] = []
         graph_stale: list[dict] = []
         graph = {}
@@ -4493,12 +4578,6 @@ class SolidWorksBackend(CadBackend):
                 reference = str(Path(resolve_dependency_path(value, document)).resolve())
                 if os.path.normcase(os.path.abspath(reference)) in excluded_normalized:
                     graph_excluded.append(reference)
-                    continue
-                if skip_session_temp and import_materialization_path(reference):
-                    # A session 3D-Interconnect materialization is not a saved
-                    # document: it is never copied into the snapshot and never
-                    # rewritten; the copy regenerates its own materializations.
-                    graph_skipped_temp.append(reference)
                     continue
                 if required_folded is not None:
                     normalized_ref = os.path.normcase(os.path.abspath(reference))
@@ -4637,7 +4716,6 @@ class SolidWorksBackend(CadBackend):
             "mapping": mapping,
             "reference_edges": replaced,
             "skipped_missing": sorted(graph_skipped),
-            "skipped_session_temp": sorted(graph_skipped_temp),
             "skipped_excluded": sorted(graph_excluded),
             "seeded_required_leaves": sorted(seeded_leaves),
             "skipped_stale": sorted(
@@ -4786,20 +4864,23 @@ class SolidWorksBackend(CadBackend):
                     resolved = record["resolved_path"]
                     relative = _stage_relative(stage, resolved) if resolved else None
                     record["resolved_relative"] = relative
-                    materialized = session_materialization_path(resolved)
+                    materialized = session_materialization_path(resolved) or (
+                        virtual is True and embedded_virtual_component_path(resolved)
+                    )
                     anchor_for_children = instance if materialized else anchor
                     child_owner = native_owner
                     if not materialized and relative:
                         child_owner = _index_spelling(index, relative) or native_owner
-                    if (not resolved) or relative is None or virtual is True or "IC~~" in resolved:
-                        try:
-                            imported = _method(component, "GetImportedPath")
-                            record["imported_path"] = (
-                                imported if isinstance(imported, str) and imported.strip() else None
-                            )
-                        except Exception as error:  # noqa: BLE001 - a non-imported component has no binding
-                            record["imported_path"] = None
-                            record["import_error"] = f"{type(error).__name__}: {error}"[:200]
+                    if (
+                        (not resolved)
+                        or relative is None
+                        or virtual is True
+                        or session_artifact_path(resolved)
+                    ):
+                        imported, import_error = _imported_path_reading(component)
+                        record["imported_path"] = imported
+                        if import_error is not None:
+                            record["import_error"] = import_error
                     occurrences.append(record)
                     if record["suppression_state"] == COMPONENT_SUPPRESSED:
                         continue
@@ -4864,6 +4945,8 @@ class SolidWorksBackend(CadBackend):
 
         opened = self.open_document(assembly_path)
         doc = self._document_by_path(assembly_path)
+        report_role = self._role_for_path(assembly_path)
+        report_session = self._sessions.get(report_role)
         document_path = str(_member(doc, "GetPathName") or assembly_path)
         _manager, configuration = _active_configuration_view(doc)
         root = _component(_member(configuration, "GetRootComponent3", True))
@@ -4893,14 +4976,34 @@ class SolidWorksBackend(CadBackend):
                 virtual = reading if type(reading) is bool else None
             except Exception:  # noqa: BLE001 - an unreadable virtual flag stays unknown
                 virtual = None
-            imported_path = None
-            if (not document) or virtual is True or "IC~~" in str(document):
-                try:
-                    reading = _method(component, "GetImportedPath")
-                    imported_path = reading if isinstance(reading, str) and reading.strip() else None
-                except Exception:  # noqa: BLE001 - a non-imported component has no binding
-                    imported_path = None
-            materialized = session_materialization_path(str(document))
+            imported_path, imported_error = (
+                _imported_path_reading(component)
+                if (not document) or virtual is True or session_materialization_path(document)
+                else (None, None)
+            )
+            ic_materialization = session_materialization_path(str(document))
+            vc_materialization = embedded_virtual_component_path(str(document))
+            if session_document_marker(str(document)) and not (ic_materialization or vc_materialization):
+                raise CadError(
+                    "cad_materialization_session_mismatch",
+                    "a session document does not use one canonical controlled temporary-root layout",
+                    {"instance": instance, "document": str(document)},
+                )
+            if virtual is True and not vc_materialization:
+                raise CadError(
+                    "cad_materialization_session_mismatch",
+                    "a virtual occurrence does not resolve to a canonical VC~~ session document",
+                    {"instance": instance, "document": str(document)},
+                )
+            if ic_materialization and virtual is not False:
+                raise CadError(
+                    "cad_materialization_session_mismatch",
+                    "an IC~~ materialization requires an explicit False IsVirtual reading",
+                    {"instance": instance, "document": str(document), "is_virtual": virtual},
+                )
+            materialized = ic_materialization or vc_materialization
+            if materialized:
+                self._bind_session_document(report_role, report_session, str(document))
             anchor_for_children = instance if materialized else anchor
             instances.append(
                 {
@@ -4911,6 +5014,7 @@ class SolidWorksBackend(CadBackend):
                     "configuration": str(referenced) if referenced is not None else None,
                     "virtual": virtual,
                     "imported_path": imported_path,
+                    "imported_error": imported_error,
                     "defining": defining,
                     "defining_anchor": anchor,
                     "suppressed": suppressed,
@@ -5119,6 +5223,7 @@ class SolidWorksBackend(CadBackend):
             selection_mode = "sole_candidate"
         activity.emit("session_start", force=True)
         with self.session():
+            native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
             # Exactly the selected frozen entry is opened; zero or several
             # assemblies already failed before this session started.
             activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
@@ -5246,7 +5351,13 @@ class SolidWorksBackend(CadBackend):
                     # make cached descendants lose their defining anchor.
                     source_provenance = source_document.get("source_provenance") or {}
                     materialization_path = source_provenance.get("materialization_path")
-                    materialized = bool(materialization_path) and session_materialization_path(materialization_path)
+                    materialized = bool(materialization_path) and (
+                        session_materialization_path(materialization_path)
+                        or (
+                            source_provenance.get("state") == "embedded_virtual_component"
+                            and embedded_virtual_component_path(materialization_path)
+                        )
+                    )
                     anchor_for_children = path_name if materialized else anchor
                     # Ultimate native owner: the nearest ancestor delivered
                     # document that owns this occurrence's subtree; nested
@@ -5258,6 +5369,7 @@ class SolidWorksBackend(CadBackend):
                             child_owner_path = str(Path(source_root) / child_relative)
                     provenance = source_document.get("source_provenance")
                     if provenance is not None:
+                        provenance["native_api_pid"] = native_api_pid
                         owner_relative = _relative_document(owner_path, source_root)
                         if not owner_relative:
                             owner_relative = normalize_document_path(str(owner_path))

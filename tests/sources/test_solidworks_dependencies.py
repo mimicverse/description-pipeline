@@ -145,10 +145,14 @@ class NativeReferenceCopyTests(unittest.TestCase):
                 side_effect=[SimpleNamespace(GetDocumentDependencies2=lambda path, *args: graph[path]), copied]
             )
             result = backend.collect_dependencies(
-                str(assembly), str(root / "copy"), skip_session_temp=True, excluded_paths=[str(author)]
+                str(assembly),
+                str(root / "copy"),
+                excluded_paths=[str(author), str(materialization)],
             )
-            self.assertEqual(result["skipped_session_temp"], [str(materialization)])
-            self.assertEqual(result["skipped_excluded"], [str(author)])
+            self.assertEqual(
+                set(result["skipped_excluded"]),
+                {str(materialization), str(author)},
+            )
             self.assertEqual(len(result["files"]), 2)  # assembly + part only
             self.assertEqual(len(rewritten), 1)  # only the real reference is rewritten
 
@@ -443,7 +447,6 @@ class NativeReferenceCopyTests(unittest.TestCase):
                 side_effect=[SimpleNamespace(GetDocumentDependencies2=lambda path, *args: graph.get(path, [])), copied]
             )
             result = backend.collect_dependencies(str(assembly), str(root / "copy"))
-            self.assertEqual(result["skipped_session_temp"], [])
             self.assertEqual(len(result["files"]), 2)  # without the coverage proof it is copied
 
     def test_rejected_reference_rewrite_never_reports_success(self):

@@ -27,6 +27,7 @@ def closure_evidence(
     stage_root: str = STAGE_ROOT,
     suppressed: Sequence[Mapping[str, Any]] = (),
     imports: Sequence[Mapping[str, Any]] = (),
+    virtual_components: Sequence[Mapping[str, Any]] = (),
     search_configuration: Mapping[str, Any] | None = None,
     open_status: Mapping[str, Any] | None = None,
     session: Mapping[str, Any] | None = None,
@@ -83,6 +84,7 @@ def closure_evidence(
         "documents": documents,
         "suppressed": [dict(item) for item in suppressed],
         "imports": [dict(item) for item in imports],
+        "virtual_components": [dict(item) for item in virtual_components],
         "session": dict(session or {"sealed": True, "closed": True}),
     }
 

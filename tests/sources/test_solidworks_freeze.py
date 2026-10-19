@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +15,7 @@ from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError, ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
+    _dependency_closure,
     _relative_document_name,
     _source_inputs,
     freeze as _freeze,
@@ -181,13 +185,14 @@ class FreezeTests(unittest.TestCase):
                     "materialization": r"C:\Temp\swx1\IC~~\HD.stp.SLDASM",
                 }
             ],
+            "virtual_components": [],
             "suppressed": [],
         }
         validated = validate_source_config(
             support.capture_requests(json.loads(json.dumps({**self.config, "closure": closure})))
         )
         self.assertEqual(validated["closure"], closure)
-        for bad in ("nope", {"schema_version": "other"}, {"graph": 3}):
+        for bad in ("nope", {"schema_version": "other"}, {"graph": 3}, {"virtual_components": 3}):
             with self.assertRaises(ConfigError):
                 validate_source_config(
                     support.capture_requests(json.loads(json.dumps({**self.config, "closure": bad})))
@@ -212,10 +217,235 @@ class FreezeTests(unittest.TestCase):
         freeze(config, self.destination, backend=self.backend)
         payload = json.loads((self.destination / "raw" / "dependency_closure.json").read_text(encoding="utf-8"))
         self.assertTrue(payload["materializations_verified"])
-        self.assertEqual(payload["materialization_keys"], [])
+        self.assertEqual(payload["session_document_keys"], [])
         self.assertEqual(payload["stale_source_links"], [])
         self.assertIn("suppressed_skipped", payload)
         self.assertIn("session_temp_dependencies", payload)
+
+    def test_dependency_closure_skips_the_owner_bound_virtual_component(self) -> None:
+        owner_sha = hashlib.sha256(self.assembly.read_bytes()).hexdigest()
+        source_root = Path(tempfile.gettempdir()) / f"swx{os.getpid()}"
+        copy_root = Path(tempfile.gettempdir()) / f"swx{os.getpid() + 1}"
+        source_virtual = source_root / "VC~~" / "waist" / "virtual_part.SLDPRT"
+        copy_virtual = copy_root / "VC~~" / "waist" / "virtual_part.SLDPRT"
+        for path in (source_virtual, copy_virtual):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"engine virtual document")
+        self.addCleanup(shutil.rmtree, source_root, True)
+        self.addCleanup(shutil.rmtree, copy_root, True)
+        closure = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {
+                "robot.SLDASM": {"sha256": "0" * 64, "references": ["base.SLDPRT", "arm.SLDPRT"]},
+                "base.SLDPRT": {"sha256": "0" * 64, "references": []},
+                "arm.SLDPRT": {"sha256": "0" * 64, "references": []},
+            },
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [
+                        {"instance": "base-1", "resolved": "base.SLDPRT"},
+                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
+                        {
+                            "instance": "virtual-1/arm-child-1",
+                            "resolved": "arm.SLDPRT",
+                            "owner_anchor": "virtual-1",
+                            "defining_session_document": str(source_virtual),
+                        },
+                    ]
+                }
+            },
+            "imports": [],
+            "virtual_components": [
+                {
+                    "document": "robot.SLDASM",
+                    "owner": "robot.SLDASM",
+                    "owner_anchor": None,
+                    "owner_sha256": owner_sha,
+                    "instance": "virtual-1",
+                    "state": "embedded_virtual_component",
+                    "binding": "owner_embedded_geometry",
+                    "kind": "native_embedded_virtual_component",
+                    "session_document_path": str(source_virtual),
+                    "session_temp_root": str(source_root),
+                    "native_api_pid": os.getpid(),
+                    "configuration": "Default",
+                    "suppression_state": 2,
+                    "is_virtual": True,
+                    "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                    "author_imported_path": None,
+                    "author_imported_error": None,
+                }
+            ],
+            "suppressed": [],
+        }
+        config = {**self.config, "closure": closure}
+        real_inspect = self.backend.inspect_copy
+        copy_imported_path = {"value": None}
+        copy_anchor = {"value": "virtual-1"}
+
+        def inspect_copy(path):
+            report = real_inspect(path)
+            is_copy = Path(path).resolve() != self.assembly.resolve()
+            report["instances"].append(
+                {
+                    "instance": "virtual-1",
+                    "name": "virtual-1",
+                    "document": str(
+                        source_virtual
+                        if not is_copy
+                        else copy_virtual
+                    ),
+                    "configuration": "Default",
+                    "defining": str(Path(path)),
+                    "defining_anchor": None,
+                    "virtual": True,
+                    "imported_path": copy_imported_path["value"] if is_copy else None,
+                    "imported_error": None,
+                    "suppressed": False,
+                    "depth": 0,
+                }
+            )
+            report["instances"].append(
+                {
+                    "instance": "virtual-1/arm-child-1",
+                    "name": "arm-child-1",
+                    "document": str(
+                        self.parts[1]
+                        if Path(path).resolve() == self.assembly.resolve()
+                        else Path(path).parent / self.parts[1].name
+                    ),
+                    "configuration": "Default",
+                    "defining": str(Path(path)),
+                    "defining_anchor": copy_anchor["value"] if is_copy else "virtual-1",
+                    "virtual": False,
+                    "imported_path": None,
+                    "imported_error": None,
+                    "suppressed": False,
+                    "depth": 1,
+                }
+            )
+            report["components"] += 2
+            return report
+
+        self.backend.inspect_copy = inspect_copy
+        self.backend.list_dependencies = lambda _path: [
+            {"path": str(path), "exists": path.is_file(), "type": path.suffix.lower()} for path in self.parts
+        ] + [{"path": str(source_virtual), "exists": True, "type": ".sldprt"}]
+        self.backend._dependencies.append(source_virtual)
+        self.backend.resolve_dependencies = lambda path: [
+            {
+                "path": str(Path(path).parent / self.assembly.name),
+                "exists": True,
+                "type": ".sldasm",
+            },
+            *[
+                {
+                    "path": str(Path(path).parent / part.name),
+                    "exists": True,
+                    "type": ".sldprt",
+                }
+                for part in self.parts
+            ],
+            {"path": str(copy_virtual), "exists": True, "type": ".sldprt"},
+        ]
+        payload = _dependency_closure(self.backend, config, self.tmp / "closure-source")
+        self.assertEqual(payload["virtual_component_keys"][0][0], "document")
+        self.assertEqual(payload["virtual_component_keys"][0][1], "robot.sldasm")
+        self.assertEqual(payload["virtual_component_keys"][0][2], "virtual-1")
+        self.assertIn(str(source_virtual), payload["session_temp_dependencies"])
+        self.assertIn(str(copy_virtual), payload["session_temp_dependencies"])
+        self.assertFalse(any(Path(path).name == copy_virtual.name for path in payload["copy_files"]))
+        copy_imported_path["value"] = r"D:\author\virtual_part.step"
+        with self.assertRaises(BridgeError) as raised:
+            _dependency_closure(
+                self.backend,
+                config,
+                self.tmp / "closure-source-import-path",
+            )
+        self.assertEqual(raised.exception.code, "dependency_instance_mismatch")
+        copy_imported_path["value"] = None
+        copy_anchor["value"] = None
+        with self.assertRaises(BridgeError) as raised:
+            _dependency_closure(
+                self.backend,
+                config,
+                self.tmp / "closure-source-anchor",
+            )
+        self.assertEqual(raised.exception.code, "dependency_instance_mismatch")
+
+    def test_dependency_closure_refuses_a_normal_document_marked_virtual(self) -> None:
+        owner_sha = hashlib.sha256(self.assembly.read_bytes()).hexdigest()
+        virtual_document = (
+            Path(tempfile.gettempdir())
+            / f"swx{os.getpid() + 2}"
+            / "VC~~"
+            / "waist"
+            / "virtual_part.SLDPRT"
+        )
+        closure = {
+            "schema_version": "solidworks-to-urdf.native-closure/v1",
+            "graph": {
+                "robot.SLDASM": {"sha256": "0" * 64, "references": ["base.SLDPRT", "arm.SLDPRT"]},
+                "base.SLDPRT": {"sha256": "0" * 64, "references": []},
+                "arm.SLDPRT": {"sha256": "0" * 64, "references": []},
+            },
+            "documents": {
+                "robot.SLDASM": {
+                    "resolved_edges": [
+                        {"instance": "base-1", "resolved": "base.SLDPRT"},
+                        {"instance": "arm-1", "resolved": "arm.SLDPRT"},
+                    ]
+                }
+            },
+            "imports": [],
+            "virtual_components": [
+                {
+                    "document": "robot.SLDASM",
+                    "owner": "robot.SLDASM",
+                    "owner_anchor": None,
+                    "owner_sha256": owner_sha,
+                    "instance": "base-1",
+                    "state": "embedded_virtual_component",
+                    "binding": "owner_embedded_geometry",
+                    "kind": "native_embedded_virtual_component",
+                    "session_document_path": str(virtual_document),
+                    "session_temp_root": str(virtual_document.parent.parent.parent),
+                    "native_api_pid": os.getpid() + 2,
+                    "configuration": "Default",
+                    "suppression_state": 2,
+                    "is_virtual": True,
+                    "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                    "author_imported_path": None,
+                    "author_imported_error": None,
+                }
+            ],
+            "suppressed": [],
+        }
+        destination = self.tmp / "refused-virtual-copy"
+        with self.assertRaises(BridgeError) as raised:
+            _dependency_closure(
+                self.backend,
+                {**self.config, "closure": closure},
+                destination,
+            )
+        self.assertEqual(raised.exception.code, "dependency_materialization_uncovered")
+        self.assertFalse(destination.exists())
+
+    def test_dependency_closure_refuses_an_unread_virtual_state(self) -> None:
+        real_inspect = self.backend.inspect_copy
+
+        def unread_virtual(path):
+            report = real_inspect(path)
+            if Path(path).resolve() == self.assembly.resolve():
+                report["instances"][0]["virtual"] = None
+            return report
+
+        self.backend.inspect_copy = unread_virtual
+        destination = self.tmp / "refused-unread-virtual"
+        with self.assertRaises(BridgeError) as raised:
+            _dependency_closure(self.backend, self.config, destination)
+        self.assertEqual(raised.exception.code, "dependency_instance_mismatch")
+        self.assertFalse(destination.exists())
 
     def test_freeze_records_the_direct_link_group_read(self) -> None:
         freeze(self.config, self.destination, backend=self.backend)
