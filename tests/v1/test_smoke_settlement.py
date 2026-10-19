@@ -164,6 +164,23 @@ class SettlementCheckerTests(unittest.TestCase):
         rows["operations"][0][5] = None
         self.assertFalse(self.compare(rows)["dispatch_task_binding"]["passed"])
 
+    def test_a_linked_start_boundary_is_executed_by_the_real_freeze_task(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][0] = f"portal-{RUN_ID}/capture:0"
+        rows["operations"][0][1] = "capture"
+        self.assertTrue(self.compare(rows)["dispatch_task_binding"]["passed"])
+
+    def test_the_requested_start_stage_cannot_stand_in_for_the_executing_task(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][1] = "capture"
+        rows["operations"][0][4] = "capture"
+        self.assertFalse(self.compare(rows)["dispatch_task_binding"]["passed"])
+
+    def test_a_mapped_key_cannot_stand_in_for_the_non_mapped_freeze_task(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][5] = 0
+        self.assertFalse(self.compare(rows)["dispatch_task_binding"]["passed"])
+
     def test_an_unknown_lifecycle_bucket_is_rejected(self) -> None:
         rows = self.rows()
         rows["lifecycle"][-1]["bucket"] = "unknown"

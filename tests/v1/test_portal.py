@@ -1586,7 +1586,10 @@ class PortalTests(unittest.TestCase):
         module._bind_initial_dispatch(
             store,
             run_id=admit["run_id"],
-            context={"dag_run": SimpleNamespace(run_id=dag_run_id)},
+            context={
+                "dag_run": SimpleNamespace(run_id=dag_run_id),
+                "ti": SimpleNamespace(task_id="freeze", map_index=-1),
+            },
         )
         operation = world.operations[admit["dispatch"]["operation_key"]]
         self.assertEqual(

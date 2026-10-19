@@ -671,7 +671,7 @@ def _bind_initial_dispatch(
     run_id: str,
     context: dict,
 ) -> None:
-    """Bind the Portal's existing dispatch intent before the run performs any work."""
+    """Bind the Portal's initial intent from the real task that starts the DAG."""
 
     run = platform.run_record(run_id)
     if not isinstance(run, dict) or not isinstance(run.get("request_id"), str) or not run["request_id"]:
@@ -683,12 +683,21 @@ def _bind_initial_dispatch(
     dag_run_id = getattr(dag_run, "run_id", None)
     if not isinstance(dag_run_id, str) or not dag_run_id:
         raise AirflowFailException("The initial dispatch binding requires the real Airflow DagRun identity")
+    task_instance = context.get("ti") or context.get("task_instance")
+    task_id = getattr(task_instance, "task_id", None)
+    map_index = getattr(task_instance, "map_index", None)
+    if task_id != "freeze":
+        raise AirflowFailException("The initial dispatch binding requires the executing freeze task identity")
+    if type(map_index) is not int or map_index != -1:
+        raise AirflowFailException("The initial dispatch binding requires the real freeze task-instance map index")
     platform.bind_initial_dispatch(
         run_id=run_id,
         stage=start_stage,
         operation_key=f"portal-{dag_run_id}/{start_stage}:0",
         dag_id=DAG_ID,
         dag_run_id=dag_run_id,
+        task_id=task_id,
+        map_index=map_index,
     )
 
 

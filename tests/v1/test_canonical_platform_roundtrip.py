@@ -109,7 +109,10 @@ def _run_scenario(root: Path) -> dict:
             module._bind_initial_dispatch(
                 store,
                 run_id=RUN,
-                context={"dag_run": SimpleNamespace(run_id=DAG_RUN)},
+                context={
+                    "dag_run": SimpleNamespace(run_id=DAG_RUN),
+                    "ti": SimpleNamespace(task_id="freeze", map_index=-1),
+                },
             )
             report["initial_dispatch"] = world.operation_bindings[
                 world.operations[f"portal-{DAG_RUN}/freeze:0"][0]

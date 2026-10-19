@@ -212,7 +212,11 @@ class DagTests(unittest.TestCase):
         )
 
         def context(conf):
-            return {"dag_run": SimpleNamespace(conf=conf, run_id="portal-child-9"), "params": {}}
+            return {
+                "dag_run": SimpleNamespace(conf=conf, run_id="portal-child-9"),
+                "ti": SimpleNamespace(task_id="freeze", map_index=-1),
+                "params": {},
+            }
 
         with (
             patch.object(module, "config_from_airflow_connection", return_value=config),
@@ -222,7 +226,7 @@ class DagTests(unittest.TestCase):
                 with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
                     dag.task_dict["freeze"].python_callable(**context(conf))
 
-    def test_initial_dispatch_binding_uses_the_admitted_start_stage_and_portal_key(self) -> None:
+    def test_initial_dispatch_binding_uses_the_real_freeze_task_for_every_start_stage(self) -> None:
         module = self._module()
 
         class Platform:
@@ -237,13 +241,14 @@ class DagTests(unittest.TestCase):
                 self.bound.append(payload)
 
         dag_run_id = "portal-start-stage"
+        task_instance = SimpleNamespace(task_id="freeze", map_index=-1)
         for stage in module.STAGE_IDS:
             with self.subTest(stage=stage):
                 platform = Platform(stage)
                 module._bind_initial_dispatch(
                     platform,
                     run_id="run-id",
-                    context={"dag_run": SimpleNamespace(run_id=dag_run_id)},
+                    context={"dag_run": SimpleNamespace(run_id=dag_run_id), "ti": task_instance},
                 )
                 self.assertEqual(
                     platform.bound,
@@ -254,6 +259,8 @@ class DagTests(unittest.TestCase):
                             "operation_key": f"portal-{dag_run_id}/{stage}:0",
                             "dag_id": "solidworks_to_urdf",
                             "dag_run_id": dag_run_id,
+                            "task_id": "freeze",
+                            "map_index": -1,
                         }
                     ],
                 )
@@ -261,9 +268,46 @@ class DagTests(unittest.TestCase):
         module._bind_initial_dispatch(
             platform,
             run_id="run-id",
-            context={"dag_run": SimpleNamespace(run_id=dag_run_id)},
+            context={"dag_run": SimpleNamespace(run_id=dag_run_id), "ti": task_instance},
         )
         self.assertEqual(platform.bound[0]["stage"], module.STAGE_IDS[0])
+
+    def test_initial_dispatch_binding_refuses_a_missing_or_wrong_task_key(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+
+        class Platform:
+            def __init__(self):
+                self.bound = []
+
+            def run_record(self, run_id):
+                return {"request_id": "portal-request", "from_stage": "capture"}
+
+            def bind_initial_dispatch(self, **payload):
+                self.bound.append(payload)
+
+        contexts = {
+            "missing_task_instance": {"dag_run": SimpleNamespace(run_id="portal-start-stage")},
+            "wrong_task": {
+                "dag_run": SimpleNamespace(run_id="portal-start-stage"),
+                "ti": SimpleNamespace(task_id="capture", map_index=-1),
+            },
+            "missing_map_index": {
+                "dag_run": SimpleNamespace(run_id="portal-start-stage"),
+                "ti": SimpleNamespace(task_id="freeze"),
+            },
+            "wrong_map_index": {
+                "dag_run": SimpleNamespace(run_id="portal-start-stage"),
+                "ti": SimpleNamespace(task_id="freeze", map_index=0),
+            },
+        }
+        for name, context in contexts.items():
+            with self.subTest(name=name):
+                platform = Platform()
+                with self.assertRaises(AirflowFailException):
+                    module._bind_initial_dispatch(platform, run_id="run-id", context=context)
+                self.assertEqual(platform.bound, [])
 
     def test_freeze_requires_the_admitted_config_digest(self) -> None:
         import shutil
@@ -296,6 +340,7 @@ class DagTests(unittest.TestCase):
                     run_id="portal-upload-digest",
                     triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
                 ),
+                "ti": SimpleNamespace(task_id="freeze", map_index=-1),
                 "params": {"handoff_path": str(intake)},
             }
 
@@ -790,6 +835,7 @@ class DagTests(unittest.TestCase):
                 run_id=dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": str(intake), "main_assembly": ""},
         }
         with (
@@ -853,6 +899,7 @@ class DagTests(unittest.TestCase):
                 run_id=dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": str(store_root / "missing-intake"), "main_assembly": ""},
         }
         with (
@@ -983,6 +1030,7 @@ class DagTests(unittest.TestCase):
                 run_id="portal-child-1",
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         import shutil
@@ -1058,6 +1106,7 @@ class DagTests(unittest.TestCase):
                         run_id="portal-child-1",
                         triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
                     ),
+                    "ti": SimpleNamespace(task_id="freeze", map_index=-1),
                     "params": {"handoff_path": "", "main_assembly": ""},
                 }
                 with self.subTest(purpose=label), self.assertRaisesRegex(AirflowFailException, "purpose"):
@@ -1259,6 +1308,7 @@ class DagTests(unittest.TestCase):
                 run_id=child_dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         with (
@@ -1505,6 +1555,7 @@ class DagTests(unittest.TestCase):
                 run_id=child_dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         self.assertFalse((store_root / "sealed" / parent_run_id / "freeze" / "input" / "request.json").exists())
@@ -1706,6 +1757,7 @@ class DagTests(unittest.TestCase):
                 run_id=child_dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         with (
@@ -1811,6 +1863,7 @@ class DagTests(unittest.TestCase):
                 run_id="portal-child-2",
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {},
         }
         with (
@@ -2336,6 +2389,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                         run_id=run_id,
                         triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
                     ),
+                    ti=SimpleNamespace(task_id="freeze", map_index=-1),
                     params=params,
                 )
             uuid = native_run_id(run_id)
@@ -2348,6 +2402,8 @@ class PlatformRegistrationTests(unittest.TestCase):
                         "operation_key": f"portal-{run_id}/freeze:0",
                         "dag_id": "solidworks_to_urdf",
                         "dag_run_id": run_id,
+                        "task_id": "freeze",
+                        "map_index": -1,
                     }
                 ],
                 "the initial dispatch is bound before an early refusal converges",

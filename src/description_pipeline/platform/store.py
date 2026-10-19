@@ -780,10 +780,10 @@ class PlatformStore:
 
         This is the only public new-admission root.  ``dispatch`` is required
         and carries ``stage``, ``operation_key``, ``params_digest`` and the
-        Airflow binding fields ``dag_id``/``dag_run_id``/``task_id``/
-        ``map_index`` (bound later by reconciliation when unknown).  The
-        admission row lock is taken inside the same transaction that inserts
-        all three rows: a closed gate (or any failure) leaves nothing behind.
+        Airflow binding fields ``dag_id``/``dag_run_id``.  The DAG entry task
+        adds its real ``task_id``/``map_index`` before any work.  The admission
+        row lock is taken inside the same transaction that inserts all three
+        rows: a closed gate (or any failure) leaves nothing behind.
         A linked admission additionally requires that its parent holds no
         non-terminal child: the reservation check runs under the same lock, so
         concurrent submissions can never each admit one.
@@ -886,16 +886,20 @@ class PlatformStore:
         operation_key: str,
         dag_id: str,
         dag_run_id: str,
+        task_id: str,
+        map_index: int,
     ) -> OperationRecord:
         """Bind the admitted dispatch intent from the task that actually starts the run.
 
         This is intentionally narrower than ``register_operation``: the initial intent must
         already exist under the exact Portal key.  A missing row is a refusal, never a new
-        dispatch record.  The run and stage come from that recorded intent, while the task key
-        comes from the real Airflow context and the operation key's canonical stage segment.
-        Existing partial or conflicting bindings are refused without writing.
+        dispatch record.  The intent stage records the requested start boundary; the binding is
+        the real non-mapped freeze task that executes before every fresh or linked run.  Existing
+        partial or conflicting bindings are refused without writing.
         """
 
+        if task_id != "freeze" or type(map_index) is not int or map_index != -1:
+            raise OperationConflictError("The initial dispatch must bind the executing freeze task")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_READ_OPERATION_BINDING, (operation_key,))
@@ -914,14 +918,14 @@ class PlatformStore:
             ):
                 raise OperationConflictError("The initial dispatch intent names another Portal or Airflow identity")
             if row[9] is not None or row[10] is not None:
-                if (row[9], row[10]) == (stage, -1):
+                if (row[9], row[10]) == (task_id, map_index):
                     return record
                 raise OperationConflictError("The initial dispatch intent is already bound to another Airflow task")
             if record.state != "queued":
                 raise PlatformStoreError("Only a queued initial dispatch intent can accept its first task binding")
             cursor.execute(
                 _BIND_MISSING_DISPATCH,
-                (stage, -1, operation_key, run_id, dag_id, dag_run_id),
+                (task_id, map_index, operation_key, run_id, dag_id, dag_run_id),
             )
             if cursor.fetchone() is None:
                 raise PlatformStoreError("The initial dispatch binding lost its operation to another writer")
@@ -1706,10 +1710,9 @@ class PlatformStore:
         records and exactly the one unclaimed, unbound dispatch intent may close here.  One
         statement reads the original Airflow authority (the terminal DagRun, freeze task with
         its terminal try number, and all five later tasks) inside this transaction; the freeze
-        failure text is the verbatim exception from the byte-bound original log.  The intent
-        stage decides the fact: a ``freeze`` intent is bound to the real failed freeze row and
-        settles failed, while a later intent is bound to its own never-executed task key and
-        settles cancelled.  The later intent key is never borrowed from freeze.  Any executed,
+        failure text is the verbatim exception from the byte-bound original log.  Every Portal
+        initial intent, including a linked restart boundary, was dispatched by the real freeze
+        task; its requested boundary never substitutes for that actual task key.  Any executed,
         unresolved, active, ambiguous, missing or mismatched fact refuses with zero writes.
         """
         if state != "failed" or stage != "freeze":
@@ -1747,8 +1750,6 @@ class PlatformStore:
             raise PlatformStoreError("The dispatch intent records no canonical stage")
         if loaded.dag_id != dag_id or loaded.run_id != dag_run_id:
             raise PlatformStoreError("The Airflow failure log names another DagRun than the recorded dispatch")
-        freeze_intent = op_stage == "freeze"
-
         cursor.execute(_READ_ADMITTED_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id))
         facts = cursor.fetchall()
         dag_run_rows = [row for row in facts if row[0] == "dag_run"]
@@ -1766,42 +1767,27 @@ class PlatformStore:
             or freeze_rows[0][2] != loaded.try_number
         ):
             raise PlatformStoreError("The freeze task does not prove its own terminal failed fact; refused")
-        successor_map = None
         for later in STAGE_IDS[STAGE_IDS.index("freeze") + 1 :]:
             rows = by_task.get(later) or []
             if len(rows) != 1 or rows[0][1] != "upstream_failed":
                 raise PlatformStoreError(
                     f"The successor task {later!r} does not prove its never-executed fact; refused"
                 )
-            if later == op_stage:
-                successor_map = rows[0][0]
-        if not freeze_intent and successor_map is None:
-            raise PlatformStoreError("The recorded dispatch successor is not a canonical downstream task; refused")
 
-        bound_task = "freeze" if freeze_intent else op_stage
-        bound_map = loaded.map_index if freeze_intent else successor_map
-        cursor.execute(_BIND_ORPHAN_OPERATION, (bound_task, bound_map, operation_id, run_id))
+        cursor.execute(_BIND_ORPHAN_OPERATION, ("freeze", loaded.map_index, operation_id, run_id))
         if cursor.fetchone() is None:
             raise PlatformStoreError("The dispatch intent lost its unbound queued row to another writer; refused")
-        if freeze_intent:
-            payload_receipt = {
-                **receipt,
-                "reconciliation": reconcile,
-                "closure_shape": "freeze_dispatch_failed",
-                "freeze_execution": {
-                    "task_id": "freeze",
-                    "map_index": loaded.map_index,
-                    "try_number": loaded.try_number,
-                    "state": "failed",
-                },
-            }
-        else:
-            payload_receipt = {
-                **receipt,
-                "reconciliation": reconcile,
-                "closure_shape": "admitted_before_dispatch",
-                "admitted_before_dispatch": True,
-            }
+        payload_receipt = {
+            **receipt,
+            "reconciliation": reconcile,
+            "closure_shape": "freeze_dispatch_failed",
+            "freeze_execution": {
+                "task_id": "freeze",
+                "map_index": loaded.map_index,
+                "try_number": loaded.try_number,
+                "state": "failed",
+            },
+        }
         cursor.execute(_INSERT_STAGE, (run_id, "freeze", "failed", _json(payload_receipt), None, None, None))
         if cursor.fetchone() is None:
             raise PlatformStoreError("The admitted freeze record lost its run to another writer")
@@ -1825,11 +1811,11 @@ class PlatformStore:
                 "reconciled_state": "failed",
                 "dag_id": dag_id,
                 "dag_run_id": dag_run_id,
-                "task_id": bound_task,
-                "map_index": bound_map,
+                "task_id": "freeze",
+                "map_index": loaded.map_index,
                 "try_number": loaded.try_number,
                 "closure_shape": payload_receipt["closure_shape"],
-                "freeze_dispatched": freeze_intent,
+                "freeze_dispatched": True,
                 "airflow_failure_sha256": loaded.sha256,
             },
         )
@@ -1842,7 +1828,7 @@ class PlatformStore:
             operation_id=reconcile_operation,
             payload={"state": "failed"},
         )
-        cursor.execute(_SETTLE_ORPHAN_INTENT, ("failed" if freeze_intent else "cancelled", operation_id, run_id))
+        cursor.execute(_SETTLE_ORPHAN_INTENT, ("failed", operation_id, run_id))
         self._stage_outcome(connection, run_id=run_id, stage="freeze", state="failed")
         cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "freeze"))
 

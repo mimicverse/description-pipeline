@@ -983,10 +983,9 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
             "name": "dispatch_task_binding",
             "passed": bool(dispatch)
             and all(
-                isinstance(item["task_id"], str)
-                and item["task_id"] == str(item["stage"])
+                item["task_id"] == "freeze"
                 and type(item["map_index"]) is int
-                and item["map_index"] >= -1
+                and item["map_index"] == -1
                 for item in dispatch
             ),
             "observed": dispatch,
