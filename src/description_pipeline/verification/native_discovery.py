@@ -209,26 +209,44 @@ def publication_metadata_state(raw: dict, namespace: str) -> dict:
 
 
 def _saved_configuration_observed(raw: dict, name: str) -> bool:
-    """Independent rebuild of the saved-configuration proof from the raw readings.
+    """Independently rebuild the immutable-configuration proof from raw evidence.
 
-    The verifier recomputes the qualification the admission gate applied: the
-    native document state must show the document saved (``save_flag`` strictly
-    false) and the active configuration matching on both readings; a recorded
-    name alone never qualifies.
+    The sealed selection inventory must equal the native post-read inventory.
+    Both document-state readings must be read-only, name the requested active
+    configuration and have ``IConfiguration.NeedsRebuild`` explicitly false.
+    ``NeedsRebuild2`` uses the documented integer enum (0/1/2); only the final
+    reading must be fully rebuilt (0).  ``GetSaveFlag`` is diagnostic because
+    native reads can legitimately dirty the in-memory document.
     """
 
     state = raw.get("document_state")
     if not isinstance(state, dict):
         return False
+    selection = raw.get("source_selection")
+    files = raw.get("files")
+    if (
+        not isinstance(selection, dict)
+        or not isinstance(files, dict)
+        or selection.get("files") != files
+    ):
+        return False
     readings = (state.get("before"), state.get("after"))
     if not all(isinstance(reading, dict) for reading in readings):
         return False
-    return all(
-        reading.get("save_flag") is False
-        and isinstance(reading.get("configuration"), str)
-        and reading["configuration"].strip() == name
-        for reading in readings
-    )
+
+    def proven(reading: dict) -> bool:
+        rebuild = reading.get("needs_rebuild2_value")
+        return (
+            reading.get("read_only") is True
+            and reading.get("configuration_needs_rebuild") is False
+            and isinstance(reading.get("configuration"), str)
+            and reading["configuration"].strip() == name
+            and type(rebuild) is int
+            and rebuild in {0, 1, 2}
+        )
+
+    before, after = readings
+    return proven(before) and proven(after) and after["needs_rebuild2_value"] == 0
 
 
 REQUEST_RECORD = "input/request.json"
@@ -3213,7 +3231,7 @@ def verify_discovery(package: Path) -> dict:
         _require(
             _saved_configuration_observed(raw, expected_configuration),
             "discovery.configuration",
-            "the delivery configuration is not observed as the saved active configuration",
+            "the delivery configuration and its read-only rebuild state are not proven",
             {"field": "delivery_configuration"},
         )
         configuration = claimed.get("delivery_configuration")

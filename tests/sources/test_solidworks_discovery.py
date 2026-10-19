@@ -1077,6 +1077,8 @@ class DiscoveryTests(unittest.TestCase):
             "saved_configuration": "Default",
             "document_state": support.saved_document_state(),
             "properties": {"document": {}},
+            "files": {"robot.SLDASM": "0" * 64},
+            "source_selection": {"files": {"robot.SLDASM": "0" * 64}},
         }
         for field, code, blocker in (
             ("hardware_id", "discovery.identity_missing", "hardware_id"),
@@ -2117,23 +2119,67 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
 
 
-    def test_verifier_refuses_an_unobserved_delivery_configuration(self):
+    def test_verifier_applies_the_same_read_only_rebuild_configuration_proof(self):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed, result.findings)
 
-        def set_flag(payload: dict, value) -> None:
-            for side in ("before", "after"):
-                payload["raw"]["document_state"][side]["save_flag"] = value
+        def set_state(payload: dict, side: str, key: str, value) -> None:
+            payload["raw"]["document_state"][side][key] = value
 
-        def set_observed_configuration(payload: dict, value: str) -> None:
+        def set_both(payload: dict, key: str, value) -> None:
             for side in ("before", "after"):
-                payload["raw"]["document_state"][side]["configuration"] = value
+                set_state(payload, side, key, value)
+
+        def change_source_hash(payload: dict) -> None:
+            selection = payload["raw"]["source_selection"]
+            selection["files"] = {**selection["files"], "cad/robot.SLDASM": "0" * 64}
+
+        def positive(payload: dict) -> None:
+            set_state(payload, "before", "save_flag", False)
+            set_state(payload, "before", "needs_rebuild2_value", 1)
+            set_state(payload, "after", "save_flag", True)
+            set_state(payload, "after", "needs_rebuild2_value", 0)
+
+        delivery = self._deliver(output)
+        self._tamper_delivered(delivery, "evidence/discovery.json", positive)
+        self.assertTrue(verify_discovery(delivery)["passed"])
 
         for label, mutate in (
             ("no_native_observation", lambda payload: payload["raw"].pop("document_state")),
-            ("unknown_save_state", lambda payload: set_flag(payload, None)),
-            ("unsaved_document", lambda payload: set_flag(payload, True)),
-            ("contradicting_active_configuration", lambda payload: set_observed_configuration(payload, "Other")),
+            (
+                "final_needs_rebuild_1",
+                lambda payload: set_state(payload, "after", "needs_rebuild2_value", 1),
+            ),
+            (
+                "final_needs_rebuild_2",
+                lambda payload: set_state(payload, "after", "needs_rebuild2_value", 2),
+            ),
+            (
+                "boolean_rebuild_status",
+                lambda payload: set_state(payload, "after", "needs_rebuild2_value", True),
+            ),
+            (
+                "unknown_rebuild_status",
+                lambda payload: set_state(payload, "after", "needs_rebuild2_value", None),
+            ),
+            (
+                "missing_rebuild_status",
+                lambda payload: payload["raw"]["document_state"]["after"].pop("needs_rebuild2_value"),
+            ),
+            (
+                "contradicting_active_configuration",
+                lambda payload: set_both(payload, "configuration", "Other"),
+            ),
+            ("read_write_open", lambda payload: set_both(payload, "read_only", False)),
+            ("unknown_read_only", lambda payload: set_both(payload, "read_only", None)),
+            (
+                "configuration_needs_rebuild",
+                lambda payload: set_both(payload, "configuration_needs_rebuild", True),
+            ),
+            (
+                "source_hash_changed",
+                change_source_hash,
+            ),
         ):
             with self.subTest(case=label):
                 delivery = self._deliver(output)
@@ -2583,23 +2629,59 @@ class DerivationSplitTests(unittest.TestCase):
                 settings=DiscoverySettings(record_roots=(records,)),
             )
 
-    def test_derivation_requires_the_saved_configuration_observation(self) -> None:
+    def test_derivation_requires_the_read_only_rebuild_configuration_proof(self) -> None:
         source, records = self._scene()
         settings = DiscoverySettings(record_roots=(records,))
 
-        def set_flag(payload, value):
-            for side in ("before", "after"):
-                payload["document_state"][side]["save_flag"] = value
+        def set_state(payload, side, key, value):
+            payload["document_state"][side][key] = value
 
-        def set_observed_configuration(payload, value):
+        def set_both(payload, key, value):
             for side in ("before", "after"):
-                payload["document_state"][side]["configuration"] = value
+                set_state(payload, side, key, value)
+
+        def change_source_hash(payload):
+            selection = payload["source_selection"]
+            selection["files"] = {**selection["files"], "cad/robot.SLDASM": "0" * 64}
+
+        positive = record()
+        positive["document_state"]["before"]["save_flag"] = False
+        positive["document_state"]["before"]["needs_rebuild2_value"] = 1
+        positive["document_state"]["after"]["save_flag"] = True
+        positive["document_state"]["after"]["needs_rebuild2_value"] = 0
+        result = derive_native_package(
+            source,
+            self.tmp / "derived-config-read-only-rebuild",
+            "run-1",
+            positive,
+            settings=settings,
+        )
+        self.assertTrue(result.passed, result.findings)
 
         for label, mutate in (
             ("no_native_observation", lambda payload: payload.pop("document_state")),
-            ("unknown_save_state", lambda payload: set_flag(payload, None)),
-            ("unsaved_document", lambda payload: set_flag(payload, True)),
-            ("contradicting_active_configuration", lambda payload: set_observed_configuration(payload, "Other")),
+            ("final_needs_rebuild_1", lambda payload: set_state(payload, "after", "needs_rebuild2_value", 1)),
+            ("final_needs_rebuild_2", lambda payload: set_state(payload, "after", "needs_rebuild2_value", 2)),
+            ("boolean_rebuild_status", lambda payload: set_state(payload, "after", "needs_rebuild2_value", True)),
+            ("unknown_rebuild_status", lambda payload: set_state(payload, "after", "needs_rebuild2_value", None)),
+            (
+                "missing_rebuild_status",
+                lambda payload: payload["document_state"]["after"].pop("needs_rebuild2_value"),
+            ),
+            (
+                "contradicting_active_configuration",
+                lambda payload: set_both(payload, "configuration", "Other"),
+            ),
+            ("read_write_open", lambda payload: set_both(payload, "read_only", False)),
+            ("unknown_read_only", lambda payload: set_both(payload, "read_only", None)),
+            (
+                "configuration_needs_rebuild",
+                lambda payload: set_both(payload, "configuration_needs_rebuild", True),
+            ),
+            (
+                "source_hash_changed",
+                change_source_hash,
+            ),
         ):
             with self.subTest(case=label):
                 payload = record()

@@ -795,7 +795,10 @@ def saved_document_state(configuration: str = "Default") -> dict:
     return {
         "before": copy.deepcopy(observed),
         "after": copy.deepcopy(observed),
-        "used_api": "IModelDoc2.GetSaveFlag/IConfiguration.Name",
+        "used_api": (
+            "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
+            "IConfiguration.Name/IConfiguration.NeedsRebuild"
+        ),
     }
 
 

@@ -4892,7 +4892,10 @@ class SolidWorksBackend(CadBackend):
                 readings["document_state"] = {
                     "before": document_state_before,
                     "after": _discovery_document_state(doc),
-                    "used_api": "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
+                    "used_api": (
+                        "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
+                        "IConfiguration.Name/IConfiguration.NeedsRebuild"
+                    ),
                 }
             finally:
                 try:
@@ -5858,7 +5861,10 @@ class SolidWorksBackend(CadBackend):
                 "document_state": {
                     "before": document_state_before,
                     "after": _discovery_document_state(self._document_by_path(str(main_path))),
-                    "used_api": "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild",
+                    "used_api": (
+                        "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
+                        "IConfiguration.Name/IConfiguration.NeedsRebuild"
+                    ),
                 },
                 "identity": {
                     "hardware_id": identity_properties.get("dp.hardware_id"),
