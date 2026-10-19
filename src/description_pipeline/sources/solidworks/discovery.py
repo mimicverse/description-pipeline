@@ -4205,8 +4205,9 @@ def sealed_embedded_virtual_document(
         return False
     for key in ("native_document_path", "materialization_path"):
         value = provenance.get(key)
-        if value is not None and (
-            not isinstance(value, str) or value.replace("\\", "/").casefold() != session_path.casefold()
+        if (
+            not isinstance(value, str)
+            or value.replace("\\", "/").casefold() != session_path.casefold()
         ):
             return False
     document = component.get("document")
@@ -4237,6 +4238,8 @@ def _capture_plan_selector(component: dict, native_files: Mapping[str, str]) -> 
     selector = {"name": name}
     document = component.get("document")
     session_document = sealed_embedded_virtual_document(component, name, native_files)
+    if document is None and not session_document:
+        raise PipelineError("A non-virtual native component carries no document selector")
     if isinstance(document, str) and document and not session_document:
         normalized = document.replace("\\", "/")
         try:

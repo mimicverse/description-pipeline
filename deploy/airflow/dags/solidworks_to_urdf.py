@@ -1511,6 +1511,10 @@ def _settle_native_owner_success(request: dict, job: dict) -> None:
     """Settle the native owner as succeeded when the native job is terminal."""
 
     receipt_path = _write_native_job_receipt(request, job, "native-job-success.json")
+    _settle_native_owner_success_from_receipt(request, receipt_path)
+
+
+def _settle_native_owner_success_from_receipt(request: dict, receipt_path: Path) -> None:
     platform, _store_root = _platform_binding(request["platform_config_digest"])
     platform.settle_native_owner_success(
         run_id=request["run_id"],
@@ -1539,7 +1543,8 @@ def _settle_native_owner_on_failure(context: dict) -> None:
 
     try:
         ti = context.get("ti") or context.get("task_instance")
-        if ti is None or getattr(ti, "task_id", None) != "discover":
+        task_id = getattr(ti, "task_id", None)
+        if ti is None or task_id not in {"discover", "capture"}:
             return
         request = ti.xcom_pull(task_ids="freeze")
         if not isinstance(request, dict):
@@ -1547,11 +1552,14 @@ def _settle_native_owner_on_failure(context: dict) -> None:
         receipt_path = (
             _work_paths(request["conn_id"], request["run_id"], request["platform_config_digest"]).run_dir
             / "reports"
-            / "native-job-failed.json"
+            / ("native-job-failed.json" if task_id == "discover" else "native-job-success.json")
         )
         if not receipt_path.is_file():
             return
-        _settle_native_owner_failure_from_receipt(request, receipt_path)
+        if task_id == "discover":
+            _settle_native_owner_failure_from_receipt(request, receipt_path)
+        else:
+            _settle_native_owner_success_from_receipt(request, receipt_path)
     except Exception:  # noqa: BLE001 - the original failure remains primary
         log.exception("native owner failure callback unavailable")
 

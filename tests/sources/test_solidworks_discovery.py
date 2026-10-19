@@ -2601,12 +2601,30 @@ class DerivationSplitTests(unittest.TestCase):
             "owner_sha256": owner_sha,
             "session_document_path": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT",
             "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
+            "native_document_path": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT",
+            "materialization_path": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT",
             "native_api_pid": 1,
             "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
             "author_imported_path": None,
             "author_imported_error": None,
             "document": None,
         }
+        payload["source_selection"]["closure"]["virtual_components"] = [
+                {
+                    "instance": "arm-1",
+                    "name": "arm-1",
+                    "kind": "native_embedded_virtual_component",
+                    "state": "embedded_virtual_component",
+                    "is_virtual": True,
+                    "owner": "cad/robot.SLDASM",
+                    "owner_sha256": owner_sha,
+                    "configuration": "Default",
+                    "session_document_path": component["source_provenance"]["session_document_path"],
+                    "session_temp_root": component["source_provenance"]["session_temp_root"],
+                    "native_api_pid": 1,
+                    "used_api": component["source_provenance"]["used_api"],
+                }
+            ]
         output = self.tmp / "derived-virtual"
         result = derive_native_package(
             source,

@@ -98,6 +98,12 @@ class CapturePlanTests(unittest.TestCase):
                         "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\waist\\virtual.SLDPRT"
                     ),
                     "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
+                    "native_document_path": (
+                        "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\waist\\virtual.SLDPRT"
+                    ),
+                    "materialization_path": (
+                        "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\waist\\virtual.SLDPRT"
+                    ),
                     "native_api_pid": 1,
                     "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
                     "author_imported_path": None,
@@ -257,6 +263,19 @@ class CapturePlanTests(unittest.TestCase):
         self._rewrite_plan(lambda plan: plan["objects"][1].pop("document"))
         with self.assertRaisesRegex(PipelineError, "without sealed virtual proof"):
             steps._consume_sealed_definition(self.root)
+
+    def test_a_producer_refuses_a_non_virtual_missing_document(self) -> None:
+        with self.assertRaisesRegex(PipelineError, "no document selector"):
+            discovery._capture_plan_selector(
+                {
+                    "instance_id": "part-1",
+                    "name2": "part-1",
+                    "document": None,
+                    "suppression_state": 2,
+                    "state": 2,
+                },
+                {},
+            )
 
     def test_a_plan_omitting_a_fake_virtual_document_is_refused(self) -> None:
         discovery = json.loads(

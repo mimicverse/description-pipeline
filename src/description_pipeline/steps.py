@@ -545,6 +545,45 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 raise PipelineError(
                     "The sealed capture plan omits a native selector document without sealed virtual proof"
                 )
+            provenance = (
+                component.get("source_provenance")
+                if isinstance(component.get("source_provenance"), dict)
+                else {}
+            )
+            closure = (record.get("source_selection") or {}).get("closure")
+            virtuals = closure.get("virtual_components") if isinstance(closure, dict) else None
+            matches = [
+                item
+                for item in (virtuals or [])
+                if isinstance(item, dict) and (item.get("instance") or item.get("name")) == name
+            ]
+            if len(matches) != 1:
+                raise PipelineError("The sealed closure carries no unique embedded-virtual occurrence")
+            entry = matches[0]
+            root = entry.get("session_temp_root")
+            path = entry.get("session_document_path")
+            pid = entry.get("native_api_pid")
+            root_name = root.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] if isinstance(root, str) else ""
+            if (
+                entry.get("kind") != provenance.get("kind")
+                or entry.get("state") != provenance.get("state")
+                or entry.get("is_virtual") is not True
+                or entry.get("occurrence", entry.get("instance")) != name
+                or entry.get("owner") != provenance.get("owner")
+                or entry.get("owner_sha256") != provenance.get("owner_sha256")
+                or entry.get("configuration") != component.get("configuration")
+                or entry.get("used_api") != provenance.get("used_api")
+                or not isinstance(root, str)
+                or not isinstance(path, str)
+                or type(pid) is not int
+                or pid <= 0
+                or not root_name.startswith("swx")
+                or not root_name[3:].isdigit()
+                or int(root_name[3:]) != pid
+                or not path.replace("\\", "/").casefold().startswith(root.replace("\\", "/").casefold() + "/")
+                or path.replace("\\", "/").casefold().count("/vc~~/") != 1
+            ):
+                raise PipelineError("The sealed closure does not bind the embedded-virtual occurrence")
         if document is not None:
             if not isinstance(document, str) or not document:
                 raise PipelineError("The sealed capture plan carries an unusable selector document")
