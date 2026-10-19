@@ -2257,6 +2257,48 @@ class PlatformRegistrationTests(unittest.TestCase):
         binding.start()
         self.addCleanup(binding.stop)
 
+    def _settle_terminal_discover_failure(self, world, store, request: dict, dag_run_id: str) -> None:
+        """Finish the exact task-level marker and DagRun-terminal settlement sequence."""
+
+        from description_pipeline.platform import flow
+
+        world.dag_runs[(self.module.DAG_ID, dag_run_id)] = "failed"
+        for task_id, state, try_number in (
+            ("freeze", "success", 1),
+            ("discover", "failed", 1),
+            ("capture", "upstream_failed", 0),
+            ("generate", "upstream_failed", 0),
+            ("verify", "upstream_failed", 0),
+            ("publish", "upstream_failed", 0),
+        ):
+            world.task_instances[(self.module.DAG_ID, task_id, dag_run_id, -1)] = state
+            world.task_try_numbers[(self.module.DAG_ID, task_id, dag_run_id, -1)] = try_number
+
+        class TaskInstance:
+            run_id = dag_run_id
+            task_id = "discover"
+            map_index = -1
+
+            def __init__(self):
+                self.values = {}
+
+            def xcom_pull(self, *, task_ids, key=None):
+                if task_ids == "freeze" and key is None:
+                    return request
+                return self.values.get((task_ids, key))
+
+            def xcom_push(self, *, key, value):
+                self.values[(self.task_id, key)] = value
+
+        ti = TaskInstance()
+        self.module._record_native_failure_binding({"ti": ti})
+        ti.task_id = "publish"
+        with (
+            patch.object(self.module, "_work_paths", return_value=flow.RunPaths(self.root, request["run_id"])),
+            patch.object(self.module, "_platform_binding", return_value=(store, self.root)),
+        ):
+            self.module._settle_native_owner_on_failure({"ti": ti})
+
     def _tree(self, *, run_id: str = "run-1", stage: str = "generate") -> Path:
         from tests.v1.test_platform_store import build_sealed_delivery
 
@@ -3156,14 +3198,15 @@ class PlatformRegistrationTests(unittest.TestCase):
             module._settle_native_owner_on_failure({"ti": ti})
         self.assertEqual(len(settled), 1, "ambiguous failure markers must never settle")
 
-    def test_direct_discover_failure_marker_routes_the_failure_receipt(self) -> None:
+    def test_discover_task_marker_uses_the_receipt_terminal_stage(self) -> None:
         from types import SimpleNamespace
+
+        from description_pipeline.orchestration.airflow_client import JOB_SCHEMA
 
         module = self.module
         run_dir = Path(self.temporary.name) / "runs" / "native-discover-marker"
         (run_dir / "reports").mkdir(parents=True)
         receipt = run_dir / "reports" / "native-job-failed.json"
-        receipt.write_text("{}", encoding="utf-8")
         request = {
             "run_id": "cfa3e725-abc5-5b60-94ad-6ba838110408",
             "conn_id": "test",
@@ -3186,22 +3229,37 @@ class PlatformRegistrationTests(unittest.TestCase):
             def xcom_push(self, *, key, value):
                 self.values[(self.task_id, key)] = value
 
-        ti = TaskInstance()
-        module._record_native_failure_binding({"ti": ti})
-        settled: list[tuple[dict, Path, str]] = []
-        ti.task_id = "publish"
-        with (
-            patch.object(module, "_work_paths", return_value=SimpleNamespace(run_dir=run_dir)),
-            patch.object(
-                module,
-                "_settle_native_owner_failure_from_receipt",
-                side_effect=lambda pulled, path, *, reported_stage: settled.append(
-                    (pulled, path, reported_stage)
-                ),
-            ),
-        ):
-            module._settle_native_owner_on_failure({"ti": ti})
-        self.assertEqual(settled, [(request, receipt, "discover")])
+        for terminal_stage in ("discover", "capture"):
+            with self.subTest(terminal_stage=terminal_stage):
+                receipt.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": JOB_SCHEMA,
+                            "pipeline_id": module.PIPELINE_ID,
+                            "run_id": request["run_id"],
+                            "request": {"run_id": request["run_id"]},
+                            "status": "failed",
+                            "events": [{"stage": terminal_stage, "state": "failed"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                ti = TaskInstance()
+                module._record_native_failure_binding({"ti": ti})
+                settled: list[tuple[dict, Path, str]] = []
+                ti.task_id = "publish"
+                with (
+                    patch.object(module, "_work_paths", return_value=SimpleNamespace(run_dir=run_dir)),
+                    patch.object(
+                        module,
+                        "_settle_native_owner_failure_from_receipt",
+                        side_effect=lambda pulled, path, *, reported_stage, output=settled: output.append(
+                            (pulled, path, reported_stage)
+                        ),
+                    ),
+                ):
+                    module._settle_native_owner_on_failure({"ti": ti})
+                self.assertEqual(settled, [(request, receipt, terminal_stage)])
 
     def test_a_repeated_freeze_confirmation_consumes_the_confirmed_fact(self) -> None:
         run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
@@ -3332,6 +3390,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         )
 
     def test_native_selection_failure_converges_discover_without_overwriting_freeze(self) -> None:
+        from description_pipeline.orchestration.airflow_client import JOB_SCHEMA
         from description_pipeline.platform import flow
         from description_pipeline.platform.store import PlatformStore
         from tests.v1.test_platform_store import FakeWorld
@@ -3404,6 +3463,8 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertTrue(claimed.granted)
 
         job = {
+            "schema_version": JOB_SCHEMA,
+            "pipeline_id": self.module.PIPELINE_ID,
             "request": {
                 "run_id": run_id,
                 "upload_files": upload_files,
@@ -3414,6 +3475,11 @@ class PlatformRegistrationTests(unittest.TestCase):
             "status": "failed",
             "error": "SelectionError: the staged main opened with CAD-reported errors",
             "error_code": "selection_open_errors",
+            "selection": {
+                "state": "reading",
+                "staged_files": upload_files,
+                "upload_sha256": digest(upload_files),
+            },
             "detail": {
                 "open_status": {"already_open": False, "errors": 2, "warnings": 1, "open_exception": None},
                 "problems": [{"code": "selection_open_errors", "document": "assembly.SLDASM"}],
@@ -3433,7 +3499,14 @@ class PlatformRegistrationTests(unittest.TestCase):
             "platform_config_digest": config_digest,
         }
         endpoint = SimpleNamespace(get_job=lambda value: job)
-        with patch.object(self.module, "_platform_binding", return_value=(store, self.root)):
+        with (
+            patch.object(self.module, "_platform_binding", return_value=(store, self.root)),
+            patch.object(
+                self.module,
+                "_work_paths",
+                return_value=flow.RunPaths(self.root, run_id),
+            ),
+        ):
             failure = self.module._converge_terminal_native_failure(endpoint, request)
         self.assertIsNotNone(failure)
         self.assertEqual(failure.code, "selection_open_errors")
@@ -3450,6 +3523,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             ["blocked", "blocked", "blocked", "blocked"],
         )
         self.assertEqual(store.run_record(run_id)["state"], "failed")
+        self._settle_terminal_discover_failure(world, store, request, "portal-native-failure")
         settled = store.register_operation(
             run_id=run_id,
             stage="discover",
@@ -3462,6 +3536,7 @@ class PlatformRegistrationTests(unittest.TestCase):
 
     def test_definition_derivation_failure_converges_the_real_e2e_shape(self) -> None:
         from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.orchestration.airflow_client import JOB_SCHEMA
         from description_pipeline.platform import flow
         from description_pipeline.platform.store import PlatformStore
         from tests.v1.test_platform_store import FakeWorld
@@ -3600,6 +3675,8 @@ class PlatformRegistrationTests(unittest.TestCase):
             "work_dir": f"/home/andy/operator/runs/{run_id}/definition",
         }
         job = {
+            "schema_version": JOB_SCHEMA,
+            "pipeline_id": self.module.PIPELINE_ID,
             "request": {
                 "main_assembly": "M3.0.3_20261016.SLDASM",
                 "run_id": run_id,
@@ -3610,6 +3687,11 @@ class PlatformRegistrationTests(unittest.TestCase):
             "status": "failed",
             "error": "the derivation did not pass; its findings must be resolved before capture",
             "error_code": "definition_derivation_failed",
+            "selection": {
+                "state": "reading",
+                "staged_files": upload_files,
+                "upload_sha256": digest(upload_files),
+            },
             "detail": detail,
             "completed_at": "2026-10-19T14:07:27.086715+00:00",
             "failure_diagnostics": {
@@ -3646,6 +3728,11 @@ class PlatformRegistrationTests(unittest.TestCase):
         with (
             patch.object(self.module, "_endpoint", return_value=endpoint),
             patch.object(self.module, "_platform_binding", return_value=(store, self.root)),
+            patch.object(
+                self.module,
+                "_work_paths",
+                return_value=flow.RunPaths(self.root, run_id),
+            ),
             patch.object(self.module, "_poke", side_effect=original),
             self.assertRaises(AirflowFailException) as caught,
         ):
@@ -3669,6 +3756,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             ["blocked", "blocked", "blocked", "blocked"],
         )
         self.assertEqual(store.run_record(run_id)["state"], "failed")
+        self._settle_terminal_discover_failure(world, store, request, request_id)
         settled = store.register_operation(
             run_id=run_id,
             stage="discover",

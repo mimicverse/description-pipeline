@@ -1586,6 +1586,22 @@ def _record_native_failure_binding(context: dict) -> None:
         log.exception("native owner failure marker unavailable")
 
 
+def _native_failure_reported_stage(receipt_path: Path) -> str | None:
+    """Derive the owner failure stage from the bound terminal receipt event."""
+
+    try:
+        document = read_data(receipt_path)
+        events = document.get("events") if isinstance(document, dict) else None
+        validate_native_failed_terminal(events)
+    except (OSError, PipelineError, ValueError):
+        return None
+    terminal = [event for event in events if event.get("state") in {"passed", "failed"}]
+    if len(terminal) != 1:
+        return None
+    stage = terminal[0].get("stage")
+    return stage if stage in {"discover", "capture"} else None
+
+
 def _settle_native_owner_on_failure(context: dict) -> None:
     """Settle after DagRun failure using the exact task-level failure marker."""
 
@@ -1621,10 +1637,13 @@ def _settle_native_owner_on_failure(context: dict) -> None:
         if not receipt_path.is_file():
             return
         if task_id == "discover":
+            reported_stage = _native_failure_reported_stage(receipt_path)
+            if reported_stage is None:
+                return
             _settle_native_owner_failure_from_receipt(
                 request,
                 receipt_path,
-                reported_stage="discover",
+                reported_stage=reported_stage,
             )
         else:
             _settle_native_owner_success_from_receipt(request, receipt_path)
