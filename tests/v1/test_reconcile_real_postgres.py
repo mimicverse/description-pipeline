@@ -846,6 +846,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                         "error": "AirflowFailException: controlled freeze failure",
                     },
                 )
+                module._register_blocked_downstream(self.store, run_id, "freeze")
                 with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
                     cursor.execute(
                         "SELECT object_kind, object_id, bucket FROM lifecycle_projection WHERE run_id=%s",
