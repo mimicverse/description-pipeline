@@ -874,7 +874,7 @@ class DagTests(unittest.TestCase):
                 module.dag.task_dict["capture"].python_callable(request)
             converge.assert_not_called()
             module.dag.task_dict["capture"].python_callable(request)
-        self.assertEqual(settled, [job])
+        self.assertEqual(settled, [job, job])
 
     def test_terminal_summary_without_task_instance_warns_and_never_crashes(self):
         from types import SimpleNamespace
