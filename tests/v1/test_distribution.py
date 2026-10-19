@@ -16,7 +16,7 @@ from pathlib import Path
 
 from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.io import PipelineError, inventory, write_json
-from tools.verify_distribution import safe_members, verify_release
+from tools.verify_distribution import safe_members, validate_deployment_boundary, verify_release
 
 VERSION = "1.4.0"
 
@@ -35,6 +35,10 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
     identity.setdefault("pipeline_id", "solidworks-to-urdf")
     identity.setdefault("package_files", {})
     identity.setdefault("source_sha256", hashlib.sha256(b"wheel bytes").hexdigest())
+    test_members = {"tests/v1/test_demo.py": b"def test_demo():\n    assert True\n"}
+    identity["test_files"] = {
+        name: hashlib.sha256(payload).hexdigest() for name, payload in test_members.items()
+    }
     wheel = root / f"mimicverse_description-{VERSION}-py3-none-any.whl"
     wheel.write_bytes(b"wheel bytes")
     demo_wheel = b"demo wheel bytes"
@@ -42,6 +46,7 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
         "requirements/linux-py312.lock": b"demo==1.0\n",
         "requirements/windows-py312.lock": b"demo==1.0\n",
         "deploy/operator/operatorctl.sh": b"operator tool",
+        "deploy/operator/example.py": b"value = 1\n",
     }
     identity["deployment_files"] = {
         name: hashlib.sha256(payload).hexdigest() for name, payload in deployment_members.items()
@@ -61,6 +66,8 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(),
         )
         for member_name, payload in deployment_members.items():
+            add(f"mimicverse_description-{VERSION}/{member_name}", payload)
+        for member_name, payload in test_members.items():
             add(f"mimicverse_description-{VERSION}/{member_name}", payload)
     with zipfile.ZipFile(root / f"description-{VERSION}-deployment.zip", "w") as archive:
         for name, payload in deployment_members.items():
@@ -337,6 +344,35 @@ class DistributionTests(unittest.TestCase):
             with self.assertRaises(PipelineError) as raised:
                 verify_release(root, identity)
             self.assertIn("source archive differ", str(raised.exception))
+
+    def test_source_archive_carries_the_exact_tracked_test_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = complete_release(root)
+            sdist = root / f"mimicverse_description-{VERSION}.tar.gz"
+            with tarfile.open(sdist) as source:
+                entries = [
+                    (member, source.extractfile(member).read() if member.isfile() else None)
+                    for member in source.getmembers()
+                ]
+            with tarfile.open(sdist, "w:gz") as target:
+                for member, payload in entries:
+                    if member.name.endswith("tests/v1/test_demo.py"):
+                        payload = b"def test_changed():\n    assert False\n"
+                        member.size = len(payload)
+                    target.addfile(member, io.BytesIO(payload) if payload is not None else None)
+            write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
+            with self.assertRaisesRegex(PipelineError, "tracked test closure"):
+                verify_release(root, identity)
+
+    def test_deployment_rejects_ci_only_scripts_and_test_imports(self):
+        for members in (
+            {"tools/scheduled_smoke.py": b"pass\n"},
+            {"deploy/example.py": b"from tests.v1 import fixture\n"},
+            {"deploy/example.py": b"import tests.sources.support\n"},
+        ):
+            with self.subTest(members=members), self.assertRaises(PipelineError):
+                validate_deployment_boundary(members)
 
     def test_the_manifest_binds_the_live_contract_and_support_identity(self):
         with tempfile.TemporaryDirectory() as directory:

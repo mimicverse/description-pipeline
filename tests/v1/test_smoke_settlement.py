@@ -18,7 +18,7 @@ from pathlib import Path
 from tests.v1.split_capture_fixture import CONTROL_LIMITS, REQUIRED_CONTROL_GATES
 
 ROOT = Path(__file__).resolve().parents[2]
-SMOKE = ROOT / "deploy" / "airflow" / "scripts" / "scheduled_smoke.py"
+SMOKE = ROOT / "tools" / "scheduled_smoke.py"
 
 RUN_ID = "portal-checker-only-failed-run"
 STAGES = {

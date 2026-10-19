@@ -385,7 +385,7 @@ jobs:
           ! grep -q "skipped" "$RUNNER_TEMP/config-identity-real-airflow.log"
       - name: The real-chain smoke (portal admission, six tasks, SQL settlement assertions)
         run: |
-          "$AIRFLOW_VENV/bin/python" deploy/airflow/scripts/scheduled_smoke.py \
+          "$AIRFLOW_VENV/bin/python" tools/scheduled_smoke.py \
             --root "$GITHUB_WORKSPACE" \
             --venv "$AIRFLOW_VENV" \
             --airflow-home "$AIRFLOW_HOME" \
@@ -407,7 +407,7 @@ jobs:
       - name: The interface-layer reuse fixtures (production store, real PostgreSQL)
         if: always()
         run: |
-          "$AIRFLOW_VENV/bin/python" deploy/airflow/scripts/settlement_fixtures.py \
+          "$AIRFLOW_VENV/bin/python" tools/settlement_fixtures.py \
             --report "$RUNNER_TEMP/settlement-fixtures.json"
       - name: Keep the real-chain evidence with the run
         if: always()

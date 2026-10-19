@@ -5479,7 +5479,7 @@ class ScheduledSmokePreparationTests(unittest.TestCase):
     keep the preparation and the sensor mode from regressing silently.
     """
 
-    SMOKE = ROOT / "deploy" / "airflow" / "scripts" / "scheduled_smoke.py"
+    SMOKE = ROOT / "tools" / "scheduled_smoke.py"
 
     def test_pool_preparation_uses_the_production_entry(self) -> None:
         text = self.SMOKE.read_text(encoding="utf-8")

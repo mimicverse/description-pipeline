@@ -49,6 +49,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 TOKEN = "scheduled-token"
+ROOT = Path(__file__).resolve().parents[1]
 #: One smoke enterprise app; the api-server and the minted operator token must agree on it.
 FEISHU_APP_ID = "cli_smoke"
 FEISHU_TENANT = "smoke-tenant"
@@ -491,7 +492,7 @@ def _write_smoke_install_record(state_root: Path, snapshot_path: Path, resolved:
         "source_sha256": source_sha256,
         "artifacts": [{"name": "scheduled-smoke", "sha256": "1" * 64}],
     }
-    dag = Path(__file__).resolve().parents[1] / "dags" / "solidworks_to_urdf.py"
+    dag = ROOT / "deploy/airflow/dags/solidworks_to_urdf.py"
     record = {
         "schema_version": interface_records.INSTALL_RECORD_SCHEMA,
         "install_id": install_id,
@@ -1261,7 +1262,7 @@ def main() -> int:
     # carries the stock default pool, and the DAG's native stage waits on windows_native; without
     # this the isolated scheduler smoke stalls at scheduling instead of exercising the run.
     pool = subprocess.run(
-        [str(args.venv / "bin/python"), str(Path(__file__).resolve().parent / "ensure_pool.py")],
+        [str(args.venv / "bin/python"), str(ROOT / "deploy/airflow/scripts/ensure_pool.py")],
         env=env,
         capture_output=True,
         text=True,
