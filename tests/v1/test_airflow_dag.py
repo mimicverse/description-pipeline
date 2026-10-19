@@ -639,6 +639,20 @@ class DagTests(unittest.TestCase):
                         "run_id": request["run_id"],
                         "upload_files": request["upload_files"],
                         "upload_sha256": request["upload_sha256"],
+                        "main_assembly": request["main_assembly"],
+                    },
+                    "events": [{"stage": "discover", "state": "running"}],
+                },
+                None,
+            ),
+            (
+                {
+                    "run_id": request["run_id"],
+                    "status": "failed",
+                    "request": {
+                        "run_id": request["run_id"],
+                        "upload_files": request["upload_files"],
+                        "upload_sha256": request["upload_sha256"],
                         "main_assembly": "other.SLDASM",
                     },
                     "events": [{"stage": "discover", "state": "failed"}],
@@ -2956,6 +2970,11 @@ class PlatformRegistrationTests(unittest.TestCase):
         }
         self.assertEqual(self.module._failed_native_stage(job), "discover")
         self.assertIsNone(self.module._failed_native_stage({"events": []}))
+        self.assertIsNone(
+            self.module._failed_native_stage(
+                {"events": [{"stage": "discover", "state": "running"}]}
+            )
+        )
 
     def test_replayed_failed_stage_only_fills_missing_blocked_rows(self) -> None:
         calls: list[dict] = []

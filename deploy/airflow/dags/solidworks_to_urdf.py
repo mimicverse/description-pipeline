@@ -944,7 +944,7 @@ def _failed_native_stage(job: dict) -> str | None:
     for event in reversed(events):
         if event.get("state") == "failed":
             return event["stage"]
-    return events[-1]["stage"] if events else None
+    return None
 
 
 def _boundary_failure(message: str, source: dict) -> AirflowFailException:
