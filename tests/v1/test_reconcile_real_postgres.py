@@ -618,8 +618,6 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                         "map_index": -1,
                     },
                     "reported_stage": "capture",
-                "discover_receipt": discover_receipt,
-                "discover_checkpoint": discover_checkpoint,
                 }
             ),
             "binding": {

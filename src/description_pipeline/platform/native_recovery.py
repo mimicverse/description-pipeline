@@ -56,6 +56,8 @@ def validate_capture_failure_events(events: object) -> int:
         raise PipelineError("The native terminal event is not a capture failure")
     if index <= discovery_index:
         raise PipelineError("The native capture failure precedes the completed discovery")
+    if index != len(rows) - 1:
+        raise PipelineError("The native capture failure is not the last event")
     return index
 
 
@@ -68,6 +70,9 @@ def build_discovery_tree_from_prepared(
     native_tool: dict,
     run_id: str,
     main_assembly: str,
+    native_stages: dict | None = None,
+    request_evidence: bytes | None = None,
+    portable_tool: dict | None = None,
 ) -> dict:
     """Reconstruct the completed discover tree from the prepared package.
 
@@ -175,7 +180,11 @@ def build_discovery_tree_from_prepared(
         (tree / name).mkdir()
     (tree / "reports").mkdir()
     write_json(tree / "reports" / "native-tool.json", native_tool)
-    write_json(tree / "tool.json", tool_record(role="portable"))
+    if isinstance(native_stages, dict):
+        write_json(tree / "reports" / "native-stages.json", native_stages)
+    if isinstance(request_evidence, bytes):
+        (tree / "input" / "request.json").write_bytes(request_evidence)
+    write_json(tree / "tool.json", portable_tool or tool_record(role="portable"))
     write_delivery_manifest(
         tree,
         contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -185,10 +194,18 @@ def build_discovery_tree_from_prepared(
         "native_handoff": native_handoff,
         "native_inventory": native_inventory,
         "native_tool": native_tool,
+        "native_stages_sha256": digest(native_stages) if isinstance(native_stages, dict) else None,
     }
 
 
-def discovery_receipt(*, run_id: str, tree: Path, native_tool: dict, native_handoff: str) -> dict:
+def discovery_receipt(
+    *,
+    run_id: str,
+    tree: Path,
+    native_tool: dict,
+    native_handoff: str,
+    native_stages_sha256: str | None = None,
+) -> dict:
     """The canonical completed-discover receipt for the reconstructed tree."""
 
     manifest = read_delivery_manifest(tree)
@@ -205,6 +222,7 @@ def discovery_receipt(*, run_id: str, tree: Path, native_tool: dict, native_hand
         "artifacts": artifacts,
         "handoff_sha256": native_handoff,
         "native_tool": native_tool,
+        "native_stages_sha256": native_stages_sha256,
     }
 
 
@@ -216,6 +234,7 @@ def seal_discovery_stage(
     *,
     native_tool: dict,
     native_handoff: str,
+    native_stages_sha256: str | None = None,
     settle_operations: bool = False,
 ) -> str:
     """Seal the reconstructed discover tree without settling the native owner."""
@@ -225,6 +244,7 @@ def seal_discovery_stage(
         tree=tree,
         native_tool=native_tool,
         native_handoff=native_handoff,
+        native_stages_sha256=native_stages_sha256,
     )
     uri, completed = seal_stage_confirmation(store_root, run_id, "discover", tree, receipt)
     confirmed = platform.confirmed_stage(run_id, "discover")

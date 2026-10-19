@@ -1465,6 +1465,17 @@ def _seal_native_discovery(request: dict, job: dict, *, settle_operations: bool 
         native_tool=native_tool,
         run_id=run_id,
         main_assembly=request["main_assembly"],
+        native_stages=job.get("stages") if isinstance(job.get("stages"), dict) else None,
+        request_evidence=(
+            (paths.run_dir / "stages" / "freeze" / "input" / "request.json").read_bytes()
+            if (paths.run_dir / "stages" / "freeze" / "input" / "request.json").is_file()
+            else None
+        ),
+        portable_tool=(
+            read_data(paths.run_dir / "stages" / "freeze" / "tool.json")
+            if (paths.run_dir / "stages" / "freeze" / "tool.json").is_file()
+            else None
+        ),
     )
     native_handoff = built["native_handoff"]
     if job.get("handoff_sha256") != native_handoff:
@@ -1476,6 +1487,7 @@ def _seal_native_discovery(request: dict, job: dict, *, settle_operations: bool 
         tree,
         native_tool=native_tool,
         native_handoff=native_handoff,
+        native_stages_sha256=built["native_stages_sha256"],
         settle_operations=settle_operations,
     )
 
@@ -1571,11 +1583,16 @@ def _converge_terminal_native_failure(
     except AirflowFailException as error:
         log.warning("native terminal failure has another request identity run=%s error=%s", run_id, error)
         return None
-
     stage = _failed_native_stage(job)
     if stage is None:
         log.warning("native terminal failure carries no executable stage run=%s", run_id)
         return None
+    if stage == "capture":
+        try:
+            validate_capture_failure_events(job.get("events") or [])
+        except PipelineError as error:
+            log.warning("native terminal failure is not one ordered capture failure run=%s error=%s", run_id, error)
+            return None
 
     log.error("native failure run=%s error=%s events=%s", run_id, job.get("error"), job.get("events"))
     try:

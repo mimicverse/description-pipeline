@@ -30,7 +30,7 @@ from typing import Any
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
 from ..orchestration.airflow_client import JOB_SCHEMA, native_run_id
-from .native_recovery import validate_capture_failure_events
+from .native_recovery import validate_capture_failure_events, validate_native_discovery_completed
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -127,6 +127,7 @@ class NativeReceiptEvidence:
     stage: str
     reported_stage: str
     actual_stage: str
+    native_stages_sha256: str | None
     state: str
     error: str | None
     error_code: str | None
@@ -221,6 +222,8 @@ def load_native_failed_receipt(
             validate_capture_failure_events(events)
         except PipelineError as error:
             raise PlatformStoreError(str(error)) from error
+    native_stages = document.get("stages")
+    native_stages_sha256 = digest(native_stages) if isinstance(native_stages, dict) else None
 
     detail = document.get("detail")
     if detail is None:
@@ -267,6 +270,7 @@ def load_native_failed_receipt(
         stage=stage,
         reported_stage=reported_stage,
         actual_stage=actual_stage,
+        native_stages_sha256=native_stages_sha256,
         state="failed",
         error=error if isinstance(error, str) and error else None,
         error_code=error_code if isinstance(error_code, str) and error_code else None,
@@ -1390,11 +1394,39 @@ class PlatformStore:
             raise PlatformStoreError("The native success receipt is unreadable") from error
         if (
             not isinstance(job, dict)
+            or job.get("schema_version") != JOB_SCHEMA
+            or job.get("pipeline_id") != PIPELINE_ID
             or job.get("status") not in {"passed", "native_complete"}
             or job.get("run_id") != run_id
             or (job.get("request") or {}).get("run_id") != run_id
         ):
             raise PlatformStoreError("The native success receipt is not the bound terminal success")
+        events = [event for event in job.get("events") or [] if isinstance(event, dict)]
+        try:
+            discovery_index = validate_native_discovery_completed(events)
+        except PipelineError as error:
+            raise PlatformStoreError(str(error)) from error
+        if any(event.get("state") == "failed" for event in events):
+            raise PlatformStoreError("The native success receipt carries a failed event")
+        completed_capture = [
+            index
+            for index, event in enumerate(events)
+            if event.get("stage") == "capture" and event.get("state") == "completed"
+        ]
+        if len(completed_capture) != 1 or completed_capture[0] <= discovery_index:
+            raise PlatformStoreError("The native success receipt does not carry one ordered capture completion")
+        request = job.get("request")
+        upload_files = request.get("upload_files") if isinstance(request, dict) else None
+        upload_sha = request.get("upload_sha256") if isinstance(request, dict) else None
+        main_assembly = request.get("main_assembly") if isinstance(request, dict) else None
+        if (
+            not isinstance(upload_files, dict)
+            or not isinstance(upload_sha, str)
+            or not _is_sha256(upload_sha)
+            or not isinstance(main_assembly, str)
+            or not main_assembly
+        ):
+            raise PlatformStoreError("The native success receipt carries no complete request identity")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))
@@ -1416,9 +1448,38 @@ class PlatformStore:
             ):
                 raise PlatformStoreError("The named native owner is not the bound discover operation")
             if state == "succeeded":
+                if not self._native_owner_binding_matches(
+                    cursor,
+                    run_id=run_id,
+                    operation_id=operation_id,
+                    operation_key=key,
+                    native_run=run_id,
+                    native_sha=file_digest(job_file),
+                    closure_shape="native_complete_owner_succeeded",
+                ):
+                    raise PlatformStoreError("The native owner success has another recorded identity")
                 return
             if state != "running":
                 raise PlatformStoreError("The native owner operation already has another terminal state")
+            cursor.execute(_READ_STAGE_RECORDS, (run_id,))
+            freeze_row = next((item for item in cursor.fetchall() if item[0] == "freeze"), None)
+            if freeze_row is None or freeze_row[1] != "completed":
+                raise PlatformStoreError("The native owner success requires the completed freeze stage")
+            freeze_receipt = self._verified_direct_completed_stage(
+                cursor, run_id=run_id, stage="freeze", row=freeze_row
+            )
+            self._verify_dispatch_request_identity(
+                cursor,
+                run_id=run_id,
+                receipt={
+                    "request_main_assembly": main_assembly,
+                    "request_upload_sha256": upload_sha,
+                    "request_upload_files": upload_files,
+                    "selection_files": upload_files,
+                    "selection_upload_sha256": upload_sha,
+                },
+                freeze_receipt=freeze_receipt,
+            )
             cursor.execute(_SETTLE_NAMED_OPERATION, ("succeeded", operation_id, run_id))
             if cursor.fetchone() is None:
                 raise PlatformStoreError("The native owner operation lost its running state to another writer")
@@ -1838,6 +1899,7 @@ class PlatformStore:
             "stage": loaded.stage,
             "reported_stage": loaded.reported_stage,
             "actual_stage": loaded.actual_stage,
+            "native_stages_sha256": loaded.native_stages_sha256,
             "request_main_assembly": loaded.request_main_assembly,
             "request_upload_sha256": loaded.request_upload_sha256,
             "request_upload_files": loaded.request_upload_files,
@@ -2576,6 +2638,7 @@ class PlatformStore:
         operation_key: str,
         native_run: str,
         native_sha: str,
+        closure_shape: str = "bound_native_capture_failed",
     ) -> bool:
         """Whether the recorded binding event is the identical capture failure."""
 
@@ -2596,7 +2659,7 @@ class PlatformStore:
             and payload.get("native_receipt_sha256") == native_sha
             and payload.get("reported_stage") == "capture"
             and payload.get("actual_stage") == "capture"
-            and payload.get("closure_shape") == "bound_native_capture_failed"
+            and payload.get("closure_shape") == closure_shape
         )
 
     def _settle_native_owner_failure(
@@ -2689,7 +2752,11 @@ class PlatformStore:
         freeze_receipt = self._verified_direct_completed_stage(
             cursor, run_id=run_id, stage="freeze", row=stages["freeze"]
         )
-        self._verified_direct_completed_stage(cursor, run_id=run_id, stage="discover", row=stages["discover"])
+        discover_receipt = self._verified_direct_completed_stage(
+            cursor, run_id=run_id, stage="discover", row=stages["discover"]
+        )
+        if discover_receipt.get("native_stages_sha256") != receipt.get("native_stages_sha256"):
+            raise PlatformStoreError("The completed discovery is not bound to the native stage facts")
         self._verify_dispatch_request_identity(
             cursor,
             run_id=run_id,

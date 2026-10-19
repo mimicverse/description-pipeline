@@ -77,6 +77,17 @@ def main() -> int:
         native_tool=native_tool,
         run_id=args.run_id,
         main_assembly=str(job["request"]["main_assembly"]),
+        native_stages=job.get("stages") if isinstance(job.get("stages"), dict) else None,
+        request_evidence=(
+            (run_root / "stages" / "freeze" / "input" / "request.json").read_bytes()
+            if (run_root / "stages" / "freeze" / "input" / "request.json").is_file()
+            else None
+        ),
+        portable_tool=(
+            json.loads((run_root / "stages" / "freeze" / "tool.json").read_text(encoding="utf-8"))
+            if (run_root / "stages" / "freeze" / "tool.json").is_file()
+            else None
+        ),
     )
     if job.get("handoff_sha256") != built["native_handoff"]:
         raise PlatformStoreError("The native prepared inventory differs from the failed job handoff")
@@ -90,6 +101,7 @@ def main() -> int:
             tree=tree,
             native_tool=native_tool,
             native_handoff=built["native_handoff"],
+            native_stages_sha256=built["native_stages_sha256"],
         )
         discover_checkpoint, discover_receipt = seal_stage_confirmation(
             store_root,
@@ -111,8 +123,6 @@ def main() -> int:
                     "map_index": args.map_index,
                 },
                 "reported_stage": "capture",
-                "discover_receipt": discover_receipt,
-                "discover_checkpoint": discover_checkpoint,
             }
         ),
         "evidence": evidence,

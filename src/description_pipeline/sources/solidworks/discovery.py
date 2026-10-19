@@ -4184,8 +4184,7 @@ def sealed_embedded_virtual_document(
         or type(provenance.get("native_api_pid")) is not int
         or provenance["native_api_pid"] <= 0
         or not isinstance(provenance.get("used_api"), str)
-        or "IComponent2.GetPathName" not in provenance["used_api"]
-        or "IComponent2.IsVirtual" not in provenance["used_api"]
+        or provenance["used_api"] != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
         or provenance.get("author_imported_path") is not None
         or provenance.get("author_imported_error") is not None
         or provenance.get("document") is not None
@@ -4195,12 +4194,21 @@ def sealed_embedded_virtual_document(
         return False
     session_path = provenance["session_document_path"].replace("\\", "/")
     session_root = provenance["session_temp_root"].replace("\\", "/").rstrip("/")
-    if not re.fullmatch(r"swx[0-9]+", session_root.rsplit("/", 1)[-1]):
+    root_name = session_root.rsplit("/", 1)[-1]
+    if not re.fullmatch(r"swx[0-9]+", root_name):
+        return False
+    if int(root_name[3:]) != provenance["native_api_pid"]:
         return False
     if not session_path.casefold().startswith(session_root.casefold() + "/"):
         return False
-    if "/vc~~/" not in session_path.casefold():
+    if session_path.casefold().count("/vc~~/") != 1:
         return False
+    for key in ("native_document_path", "materialization_path"):
+        value = provenance.get(key)
+        if value is not None and (
+            not isinstance(value, str) or value.replace("\\", "/").casefold() != session_path.casefold()
+        ):
+            return False
     document = component.get("document")
     return (
         isinstance(document, str)
