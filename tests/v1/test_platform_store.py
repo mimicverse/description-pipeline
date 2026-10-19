@@ -3131,6 +3131,39 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         self._apply()
         self.assertEqual(self.world.snapshot_state(), before, "the identical recovery is a no-op")
 
+    def test_bound_running_discover_with_its_own_failed_event_reconciles_once(self) -> None:
+        self.document["events"][0]["stage"] = "discover"
+        self._write_document(self.document)
+        reconcile = self._reconcile()
+        reconcile.pop("reported_stage")
+
+        def apply() -> None:
+            self.store.confirm_stage(
+                run_id=self.run_id,
+                stage="discover",
+                state="failed",
+                reconcile=reconcile,
+            )
+
+        apply()
+        stages = self.store.stage_records(self.run_id)
+        self.assertEqual(stages["freeze"]["state"], "completed")
+        self.assertEqual(stages["discover"]["state"], "failed")
+        self.assertEqual(
+            [stages[task]["state"] for task in ("capture", "generate", "verify", "publish")],
+            ["blocked", "blocked", "blocked", "blocked"],
+        )
+        receipt = stages["discover"]["receipt"]
+        self.assertEqual(receipt["reported_stage"], "discover")
+        self.assertEqual(receipt["actual_stage"], "discover")
+        self.assertEqual(receipt["closure_shape"], "bound_native_discover_failed")
+        self.assertEqual(self.store.run_record(self.run_id)["state"], "failed")
+        self.assertEqual(self.world.operations[self.native_key][1], "failed")
+
+        before = self.world.snapshot_state()
+        apply()
+        self.assertEqual(self.world.snapshot_state(), before, "the identical direct discover recovery is a no-op")
+
     def test_wrong_selection_or_airflow_fact_leaves_zero_writes(self) -> None:
         variants = []
         for name, mutate in (
