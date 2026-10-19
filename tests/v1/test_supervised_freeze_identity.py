@@ -165,12 +165,10 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
                 parent_run_id=parent_run_id,
                 dispatch={
                     "stage": "freeze",
-                    "operation_key": f"freeze:{run_id}",
+                    "operation_key": f"portal-{dag_run_id}/freeze:0",
                     "params_digest": "a" * 64,
                     "dag_id": DAG_ID,
                     "dag_run_id": dag_run_id,
-                    "task_id": "freeze",
-                    "map_index": -1,
                 },
             )
             cls.runs[label] = {"dag_run_id": dag_run_id, "run_id": run_id}

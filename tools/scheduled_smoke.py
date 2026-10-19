@@ -48,6 +48,18 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+from description_pipeline.interface_records import (
+    InterfaceRecordError,
+    cache_release_params_digest,
+    cache_release_receipt_digest,
+    resource_policy_v1_digest,
+    validate_cache_release_receipt,
+    validate_cache_release_request,
+    validate_health,
+)
+from description_pipeline.schemas import CACHE_RELEASE_RECEIPT_SCHEMA, HEALTH_SCHEMA, RESOURCE_POLICY_SCHEMA
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
 TOKEN = "scheduled-token"
 ROOT = Path(__file__).resolve().parents[1]
 #: One smoke enterprise app; the api-server and the minted operator token must agree on it.
@@ -90,6 +102,35 @@ def _native_record(fixture_root: Path) -> dict:
     return payload["raw"]
 
 
+def _mock_health_payload(port: int, free_bytes: int) -> dict:
+    """The canonical IF-09 identity needed by release and readiness consumers."""
+
+    payload = {
+        "schema_version": HEALTH_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "native_platform": True,
+        "ready": True,
+        "release": {
+            "version": "1.5.0-smoke",
+            "source_commit": "0" * 40,
+            "source_sha256": "0" * 64,
+            "role": "native",
+        },
+        "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+        "resource_policy": {
+            "schema_version": RESOURCE_POLICY_SCHEMA,
+            "digest": resource_policy_v1_digest(),
+        },
+        "install": {"config_digest": "0" * 64, "install_id": "scheduled-smoke-endpoint"},
+        "endpoint": {"port": port},
+        "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
+        "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+        "capacity": {"free_bytes": free_bytes, "reserved_bytes": 0},
+        "readiness": {"reason_code": None, "native": {"ok": True, "problems": []}},
+    }
+    return validate_health(payload)
+
+
 def _mock_endpoint(
     fixture: dict, *, run_id: str, upload_files: dict[str, str], record: dict, bundle_dir: Path, port: int = 0
 ) -> tuple[ThreadingHTTPServer, dict]:
@@ -105,7 +146,14 @@ def _mock_endpoint(
     reader_sha256 = fixture["native_tool"]["source_sha256"]
     stage_root = str(bundle_dir.parent / "native-stage")
     edges = {main_assembly: list(dependencies), **{name: [] for name in dependencies}}
-    state = {"jobs": {}, "artifact_paths": [], "definition_posts": [], "uploads": 0}
+    state = {
+        "jobs": {},
+        "artifact_paths": [],
+        "definition_posts": [],
+        "uploads": 0,
+        "cache_receipts": {},
+        "cache_releases": [],
+    }
     archive = Path(fixture["archive"]).read_bytes()
 
     def sealed_manifest() -> dict:
@@ -136,6 +184,15 @@ def _mock_endpoint(
 
         def do_GET(self) -> None:
             if not self._auth():
+                return
+            if self.path == "/health":
+                self._send(
+                    200,
+                    _mock_health_payload(
+                        int(self.server.server_address[1]),
+                        int(shutil.disk_usage(bundle_dir).free),
+                    ),
+                )
                 return
             if not self.path.startswith("/v1/jobs/"):
                 self._send(404, {"error": "unknown"})
@@ -217,6 +274,41 @@ def _mock_endpoint(
                 return
             if job is None:
                 self._send(404, {"error": "unknown run_id"})
+                return
+            if len(segments) == 3 and segments[1:] == ["cache", "release"]:
+                payload = json.loads(body or b"{}")
+                try:
+                    validate_cache_release_request(payload)
+                except InterfaceRecordError:
+                    self._send(409, {"error": "cache release request is invalid"})
+                    return
+                operation_id = payload["operation_id"]
+                existing = state["cache_receipts"].get(operation_id)
+                if existing is not None:
+                    self._send(200, existing)
+                    return
+                import_block = payload["import"]
+                imported = import_block["confirmation"]["imported"]
+                receipt = {
+                    "schema_version": CACHE_RELEASE_RECEIPT_SCHEMA,
+                    "status": "released",
+                    "operation_id": operation_id,
+                    "params_sha256": cache_release_params_digest(import_block),
+                    "import": import_block,
+                    "released": {
+                        "files": len(imported),
+                        "bytes": sum(int(entry["bytes"]) for entry in imported),
+                    },
+                    "retained": [],
+                    "released_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "identity": {**payload["binding"]["release"], "role": "native"},
+                    "receipt_sha256": "",
+                }
+                receipt["receipt_sha256"] = cache_release_receipt_digest(receipt)
+                validate_cache_release_receipt(receipt)
+                state["cache_receipts"][operation_id] = receipt
+                state["cache_releases"].append(receipt)
+                self._send(200, receipt)
                 return
             if len(segments) == 2 and segments[1] == "files":
                 block = job["selection"]
@@ -868,7 +960,15 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
         {"name": "admission_request_row", "passed": len(rows["request"]) == 1, "observed": rows["request"]},
     ]
     operations = [
-        {"operation_key": row[0], "stage": row[1], "kind": row[2], "state": row[3]} for row in rows["operations"]
+        {
+            "operation_key": row[0],
+            "stage": row[1],
+            "kind": row[2],
+            "state": row[3],
+            "task_id": row[4],
+            "map_index": row[5],
+        }
+        for row in rows["operations"]
     ]
     dispatch = [item for item in operations if item["kind"] == "dispatch"]
     comparisons.append(
@@ -876,6 +976,27 @@ def _settlement_comparisons(rows: dict, projection: dict) -> list[dict]:
             "name": "dispatch_operation_terminal",
             "passed": bool(dispatch) and all(item["state"] in terminal_operation_states for item in dispatch),
             "observed": operations,
+        }
+    )
+    comparisons.append(
+        {
+            "name": "dispatch_task_binding",
+            "passed": bool(dispatch)
+            and all(
+                item["task_id"] == "freeze"
+                and type(item["map_index"]) is int
+                and item["map_index"] == -1
+                for item in dispatch
+            ),
+            "observed": dispatch,
+        }
+    )
+    lifecycle = [dict(item) for item in rows.get("lifecycle", [])]
+    comparisons.append(
+        {
+            "name": "lifecycle_projection_terminal",
+            "passed": bool(lifecycle) and all(item.get("bucket") == "terminal" for item in lifecycle),
+            "observed": lifecycle,
         }
     )
     native = [item for item in operations if item["kind"] == "native"]
@@ -975,11 +1096,22 @@ def _platform_sql_evidence(platform_schema: str, run_id: str, projection: dict, 
         )
         rows["request"] = cursor.fetchall()
         cursor.execute(
-            f"SELECT operation_key, stage, kind, state FROM {platform_schema}.operation WHERE run_id=%s "
+            f"SELECT operation_key, stage, kind, state, task_id, map_index"
+            f" FROM {platform_schema}.operation WHERE run_id=%s "
             "ORDER BY operation_id",
             (run_id,),
         )
         rows["operations"] = cursor.fetchall()
+        cursor.execute(
+            f"SELECT object_kind, object_id, state, bucket"
+            f" FROM {platform_schema}.lifecycle_projection WHERE run_id=%s"
+            " ORDER BY object_kind, object_id",
+            (run_id,),
+        )
+        rows["lifecycle"] = [
+            {"object_kind": row[0], "object_id": row[1], "state": row[2], "bucket": row[3]}
+            for row in cursor.fetchall()
+        ]
         cursor.execute(f"SELECT stage, state FROM {platform_schema}.stage WHERE run_id=%s ORDER BY stage", (run_id,))
         rows["stages"] = cursor.fetchall()
         cursor.execute(

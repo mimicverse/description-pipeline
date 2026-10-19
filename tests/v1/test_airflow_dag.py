@@ -99,6 +99,15 @@ class _OperationRecorder:
         return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
 
 
+class _InitialDispatchBindingDouble:
+    def run_record(self, run_id):
+        return {"request_id": f"portal-{run_id}"}
+
+    def bind_initial_dispatch(self, **payload):
+        self.initial_dispatch = dict(payload)
+        return SimpleNamespace(state="queued")
+
+
 @unittest.skipUnless(AIRFLOW_AVAILABLE, "Airflow is not installed in this interpreter")
 class DagTests(unittest.TestCase):
     def test_submission_frame_requires_a_configured_target_and_summary(self) -> None:
@@ -203,7 +212,11 @@ class DagTests(unittest.TestCase):
         )
 
         def context(conf):
-            return {"dag_run": SimpleNamespace(conf=conf, run_id="portal-child-9"), "params": {}}
+            return {
+                "dag_run": SimpleNamespace(conf=conf, run_id="portal-child-9"),
+                "ti": SimpleNamespace(task_id="freeze", map_index=-1),
+                "params": {},
+            }
 
         with (
             patch.object(module, "config_from_airflow_connection", return_value=config),
@@ -212,6 +225,89 @@ class DagTests(unittest.TestCase):
             for conf in ({}, {"target_hardware": "m3.0"}, {"change_summary": "x"}):
                 with self.subTest(conf=str(conf)), self.assertRaises(AirflowFailException):
                     dag.task_dict["freeze"].python_callable(**context(conf))
+
+    def test_initial_dispatch_binding_uses_the_real_freeze_task_for_every_start_stage(self) -> None:
+        module = self._module()
+
+        class Platform:
+            def __init__(self, start_stage):
+                self.start_stage = start_stage
+                self.bound = []
+
+            def run_record(self, run_id):
+                return {"request_id": "portal-request", "from_stage": self.start_stage}
+
+            def bind_initial_dispatch(self, **payload):
+                self.bound.append(payload)
+
+        dag_run_id = "portal-start-stage"
+        task_instance = SimpleNamespace(task_id="freeze", map_index=-1)
+        for stage in module.STAGE_IDS:
+            with self.subTest(stage=stage):
+                platform = Platform(stage)
+                module._bind_initial_dispatch(
+                    platform,
+                    run_id="run-id",
+                    context={"dag_run": SimpleNamespace(run_id=dag_run_id), "ti": task_instance},
+                )
+                self.assertEqual(
+                    platform.bound,
+                    [
+                        {
+                            "run_id": "run-id",
+                            "stage": stage,
+                            "operation_key": f"portal-{dag_run_id}/{stage}:0",
+                            "dag_id": "solidworks_to_urdf",
+                            "dag_run_id": dag_run_id,
+                            "task_id": "freeze",
+                            "map_index": -1,
+                        }
+                    ],
+                )
+        platform = Platform(None)
+        module._bind_initial_dispatch(
+            platform,
+            run_id="run-id",
+            context={"dag_run": SimpleNamespace(run_id=dag_run_id), "ti": task_instance},
+        )
+        self.assertEqual(platform.bound[0]["stage"], module.STAGE_IDS[0])
+
+    def test_initial_dispatch_binding_refuses_a_missing_or_wrong_task_key(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+
+        module = self._module()
+
+        class Platform:
+            def __init__(self):
+                self.bound = []
+
+            def run_record(self, run_id):
+                return {"request_id": "portal-request", "from_stage": "capture"}
+
+            def bind_initial_dispatch(self, **payload):
+                self.bound.append(payload)
+
+        contexts = {
+            "missing_task_instance": {"dag_run": SimpleNamespace(run_id="portal-start-stage")},
+            "wrong_task": {
+                "dag_run": SimpleNamespace(run_id="portal-start-stage"),
+                "ti": SimpleNamespace(task_id="capture", map_index=-1),
+            },
+            "missing_map_index": {
+                "dag_run": SimpleNamespace(run_id="portal-start-stage"),
+                "ti": SimpleNamespace(task_id="freeze"),
+            },
+            "wrong_map_index": {
+                "dag_run": SimpleNamespace(run_id="portal-start-stage"),
+                "ti": SimpleNamespace(task_id="freeze", map_index=0),
+            },
+        }
+        for name, context in contexts.items():
+            with self.subTest(name=name):
+                platform = Platform()
+                with self.assertRaises(AirflowFailException):
+                    module._bind_initial_dispatch(platform, run_id="run-id", context=context)
+                self.assertEqual(platform.bound, [])
 
     def test_freeze_requires_the_admitted_config_digest(self) -> None:
         import shutil
@@ -244,6 +340,7 @@ class DagTests(unittest.TestCase):
                     run_id="portal-upload-digest",
                     triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
                 ),
+                "ti": SimpleNamespace(task_id="freeze", map_index=-1),
                 "params": {"handoff_path": str(intake)},
             }
 
@@ -263,6 +360,9 @@ class DagTests(unittest.TestCase):
         class Platform:
             def run_record(self, run_id):
                 return {"request_id": "portal-upload-digest"}
+
+            def bind_initial_dispatch(self, **payload):
+                return None
 
             def request_record(self, request_id):
                 return accepted
@@ -694,6 +794,7 @@ class DagTests(unittest.TestCase):
         confirmed: list[dict] = []
         platform = SimpleNamespace(
             run_record=lambda value: {"request_id": request_id} if value == run_id else None,
+            bind_initial_dispatch=lambda **payload: None,
             request_record=lambda value: accepted_freeze_record(
                 intake,
                 accepted_files,
@@ -734,6 +835,7 @@ class DagTests(unittest.TestCase):
                 run_id=dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": str(intake), "main_assembly": ""},
         }
         with (
@@ -770,6 +872,7 @@ class DagTests(unittest.TestCase):
         confirmed: list[dict] = []
         platform = SimpleNamespace(
             run_record=lambda value: {"request_id": request_id} if value == run_id else None,
+            bind_initial_dispatch=lambda **payload: None,
             request_record=lambda value: {
                 "target_hardware": "m3.0",
                 "main_assembly": "",
@@ -796,6 +899,7 @@ class DagTests(unittest.TestCase):
                 run_id=dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": str(store_root / "missing-intake"), "main_assembly": ""},
         }
         with (
@@ -926,6 +1030,7 @@ class DagTests(unittest.TestCase):
                 run_id="portal-child-1",
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         import shutil
@@ -946,7 +1051,7 @@ class DagTests(unittest.TestCase):
 
         started_child_runs: list[str] = []
 
-        class _Platform:
+        class _Platform(_InitialDispatchBindingDouble):
             def confirmed_stage(self, run_id, stage):
                 return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
 
@@ -1001,6 +1106,7 @@ class DagTests(unittest.TestCase):
                         run_id="portal-child-1",
                         triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
                     ),
+                    "ti": SimpleNamespace(task_id="freeze", map_index=-1),
                     "params": {"handoff_path": "", "main_assembly": ""},
                 }
                 with self.subTest(purpose=label), self.assertRaisesRegex(AirflowFailException, "purpose"):
@@ -1152,7 +1258,7 @@ class DagTests(unittest.TestCase):
             },
         }
 
-        class _Platform:
+        class _Platform(_InitialDispatchBindingDouble):
             def start_run(self, run_id):
                 return None
 
@@ -1202,6 +1308,7 @@ class DagTests(unittest.TestCase):
                 run_id=child_dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         with (
@@ -1398,7 +1505,7 @@ class DagTests(unittest.TestCase):
             },
         }
 
-        class _Platform:
+        class _Platform(_InitialDispatchBindingDouble):
             def start_run(self, run_id):
                 return None
 
@@ -1448,6 +1555,7 @@ class DagTests(unittest.TestCase):
                 run_id=child_dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         self.assertFalse((store_root / "sealed" / parent_run_id / "freeze" / "input" / "request.json").exists())
@@ -1602,7 +1710,7 @@ class DagTests(unittest.TestCase):
             },
         }
 
-        class _Platform:
+        class _Platform(_InitialDispatchBindingDouble):
             def start_run(self, run_id):
                 return None
 
@@ -1649,6 +1757,7 @@ class DagTests(unittest.TestCase):
                 run_id=child_dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {"handoff_path": "", "main_assembly": ""},
         }
         with (
@@ -1726,7 +1835,7 @@ class DagTests(unittest.TestCase):
 
         started_child_runs: list[str] = []
 
-        class _Platform:
+        class _Platform(_InitialDispatchBindingDouble):
             def confirmed_stage(self, run_id, stage):
                 return {"handoff_sha256": "d" * 64} if stage in {"freeze", "capture"} else None
 
@@ -1754,11 +1863,13 @@ class DagTests(unittest.TestCase):
                 run_id="portal-child-2",
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
             ),
+            "ti": SimpleNamespace(task_id="freeze", map_index=-1),
             "params": {},
         }
         with (
             patch.object(module, "config_from_airflow_connection", return_value=config),
             patch.object(module, "_platform_binding", return_value=(_Platform(), store_root)),
+            patch.object(module, "_store_only_platform_binding", return_value=(_Platform(), store_root)),
             patch.dict(
                 os.environ,
                 {"OPERATOR_STATE": str(store_root.parent), "PIPELINE_STORE_ROOT": str(store_root)},
@@ -2236,8 +2347,10 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         endpoint = IntakeDouble()
         admitted_request = {"value": "portal-early-digest"}
+        bindings: list[dict] = []
         platform = SimpleNamespace(
             run_record=lambda run_id: {"request_id": admitted_request["value"]},
+            bind_initial_dispatch=lambda **payload: bindings.append(payload),
             request_record=lambda request_id: {
                 "target_hardware": "m3.0",
                 "main_assembly": "",
@@ -2261,6 +2374,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             self.started.clear()
             self.calls.clear()
             endpoint.calls.clear()
+            bindings.clear()
             admitted_request["value"] = str(conf.get("request_id") or params.get("request_id") or "")
             with (
                 patch.object(self.module, "_platform_binding", return_value=(platform, self.root)),
@@ -2275,9 +2389,25 @@ class PlatformRegistrationTests(unittest.TestCase):
                         run_id=run_id,
                         triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
                     ),
+                    ti=SimpleNamespace(task_id="freeze", map_index=-1),
                     params=params,
                 )
             uuid = native_run_id(run_id)
+            self.assertEqual(
+                bindings,
+                [
+                    {
+                        "run_id": uuid,
+                        "stage": "freeze",
+                        "operation_key": f"portal-{run_id}/freeze:0",
+                        "dag_id": "solidworks_to_urdf",
+                        "dag_run_id": run_id,
+                        "task_id": "freeze",
+                        "map_index": -1,
+                    }
+                ],
+                "the initial dispatch is bound before an early refusal converges",
+            )
             self.assertEqual(self.started, [uuid], "the admitted run is claimed exactly once")
             failed = [call for call in self.calls if call["state"] == "failed"]
             self.assertEqual([call["stage"] for call in failed], ["freeze"])

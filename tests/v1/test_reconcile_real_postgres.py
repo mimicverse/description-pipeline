@@ -379,6 +379,111 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             "reported_stage": "freeze",
         }
 
+    def _prepare_terminal_native_discover_dispatch(self) -> None:
+        """Seed the production terminal-discover shape with a succeeded unbound freeze dispatch."""
+
+        import psycopg2
+
+        self._prepare_bound_native_discover()
+        error = "SelectionError: a reference resolves outside the staged root"
+        error_code = "selection_resolved_outside_stage"
+        diagnostic = {
+            "count": 1,
+            "problems": [
+                {
+                    "code": error_code,
+                    "document": "waist.SLDASM",
+                    "instance": "waist-1/virtual",
+                    "message": "a reference resolves outside the staged root",
+                    "resolved": "C:\\Temp\\swx111\\VC~~\\waist\\virtual.SLDPRT",
+                    "stored_location": None,
+                }
+            ],
+            "stage_root": "C:\\description\\selected\\run",
+        }
+        self.log = self.evidence / f"terminal-native-{uuid.uuid4().hex[:8]}.json"
+        self.log.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": "solidworks-to-urdf",
+                    "run_id": self.run_id,
+                    "request": {
+                        "run_id": self.run_id,
+                        "main_assembly": self.main_assembly,
+                        "upload_sha256": self.upload_sha,
+                        "upload_files": self.upload_files,
+                    },
+                    "selection": {
+                        "state": "reading",
+                        "staged_files": self.upload_files,
+                        "upload_sha256": self.upload_sha,
+                    },
+                    "status": "failed",
+                    "error": error,
+                    "error_code": error_code,
+                    "stages": {
+                        "stages": [
+                            {
+                                "id": "discover",
+                                "state": "failed",
+                                "diagnostic": diagnostic,
+                            }
+                        ]
+                    },
+                    "events": [
+                        {"stage": "discover", "state": "running"},
+                        {"stage": "discover", "state": "failed", "error": error},
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE operation SET task_id=NULL, map_index=NULL"
+                " WHERE run_id=%s AND kind='dispatch'",
+                (self.run_id,),
+            )
+            self.assertEqual(cursor.rowcount, 1)
+            connection.commit()
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            receipt={
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": self.run_id,
+                "stage": "discover",
+                "state": "failed",
+                "passed": False,
+                "error": f"AirflowFailException: SolidWorks job {self.run_id} failed: {error}",
+                "error_code": error_code,
+                "detail": diagnostic,
+            },
+        )
+        self.store.close_admission(reason="terminal native dispatch proof", actor="reconcile-test")
+        binding = {
+            "operation_id": self.native_operation_id,
+            "task_id": "discover",
+            "map_index": -1,
+        }
+        self.bound_reconcile = {
+            "operation_key": f"operatorctl-reconcile:{self.run_id}:discover:failed",
+            "evidence": [str(self.log)],
+            "params_digest": hashlib.sha256(
+                json.dumps(
+                    {"outcome": "failed", "evidence": [str(self.log)], "binding": binding},
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest(),
+            "binding": binding,
+            "native_receipt": {"path": str(self.log), "native_run_id": self.run_id},
+        }
+
     def _bound_rows(self) -> dict:
         import psycopg2
 
@@ -573,6 +678,449 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                 reconcile=conflicting,
             )
         self.assertEqual(self._bound_rows(), before, "changed repair evidence is refused with zero writes")
+
+    def test_terminal_native_discover_repairs_the_freeze_dispatch_once(self) -> None:
+        import psycopg2
+
+        self._prepare_terminal_native_discover_dispatch()
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT state, receipt, checkpoint_uri, original_executed_at, updated_at"
+                " FROM stage WHERE run_id=%s AND stage='discover'",
+                (self.run_id,),
+            )
+            original_stage = cursor.fetchone()
+            cursor.execute(
+                "SELECT state, task_id, map_index FROM operation"
+                " WHERE run_id=%s AND kind='dispatch'",
+                (self.run_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("succeeded", None, None))
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self.bound_reconcile,
+        )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT state, receipt, checkpoint_uri, original_executed_at, updated_at"
+                " FROM stage WHERE run_id=%s AND stage='discover'",
+                (self.run_id,),
+            )
+            self.assertEqual(cursor.fetchone(), original_stage, "the terminal discover row remains unchanged")
+            cursor.execute(
+                "SELECT state, task_id, map_index FROM operation"
+                " WHERE run_id=%s AND kind='dispatch'",
+                (self.run_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("succeeded", "freeze", -1))
+            cursor.execute(
+                "SELECT bucket FROM lifecycle_projection WHERE run_id=%s",
+                (self.run_id,),
+            )
+            self.assertEqual({row[0] for row in cursor.fetchall()}, {"terminal"})
+            cursor.execute(
+                "SELECT payload FROM run_event WHERE run_id=%s AND kind='binding'"
+                " AND payload->>'binding_kind'='dispatch'",
+                (self.run_id,),
+            )
+            events = cursor.fetchall()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0][0]["task_id"], "freeze")
+            self.assertEqual(events[0][0]["map_index"], -1)
+            self.assertEqual(events[0][0]["native_receipt_sha256"], _sha256(self.log))
+        before = self._bound_rows()
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self.bound_reconcile,
+        )
+        self.assertEqual(self._bound_rows(), before, "the identical terminal repair appends no event")
+
+    def test_new_portal_dispatch_failure_has_no_unknown_for_every_start_stage(self) -> None:
+        import psycopg2
+        from types import SimpleNamespace
+
+        from airflow.models import DagBag
+        from airflow.models.dagrun import DagRun
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+        from description_pipeline.delivery import BUNDLE_SCHEMA
+        from description_pipeline.io import digest as pipeline_digest
+        from description_pipeline.io import read_data
+        from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.orchestration.portal import _initial_dispatch
+        from tests.v1.test_platform_store import build_sealed_delivery
+
+        bag = DagBag(str(ROOT / "deploy/airflow/dags"))
+        module = __import__(
+            bag.dags[DAG_ID].task_dict["freeze"].python_callable.__module__,
+            fromlist=["_bind_initial_dispatch"],
+        )
+        for start_stage in module.STAGE_IDS:
+            with self.subTest(start_stage=start_stage):
+                dag_run_id = f"portal-new-start-{start_stage}-{uuid.uuid4().hex[:8]}"
+                run_id = native_run_id(dag_run_id)
+                sealed_root = self.evidence / "store" / "sealed" / run_id / "freeze"
+                _subject, _artifacts, upload_sha, _native_handoff = build_sealed_delivery(sealed_root)
+                upload_files = dict(read_data(sealed_root / "input" / "handoff.json")["package_files"])
+                main_assembly = "cad/cad/robot.SLDASM"
+                self.store.admit_run(
+                    request_id=f"portal-{dag_run_id}",
+                    run_id=run_id,
+                    principal="cli_reconcile:tenant:operator",
+                    target_hardware="m3.0",
+                    main_assembly=main_assembly,
+                    configuration={"purpose": "inspection_preview"},
+                    baseline={
+                        "handoff_sha256": upload_sha,
+                        "files": len(upload_files),
+                        "bytes": sum((sealed_root / "input" / name).stat().st_size for name in upload_files),
+                        "folder": "M3.0.3_20261016",
+                    },
+                    dispatch=_initial_dispatch(
+                        dag_id=DAG_ID,
+                        dag_run_id=dag_run_id,
+                        stage=start_stage,
+                        params_digest=pipeline_digest(
+                            {
+                                "handoff_path": str(sealed_root),
+                                "main_assembly": main_assembly,
+                                "target_hardware": "m3.0",
+                            }
+                        ),
+                    ),
+                    from_stage=None if start_stage == "freeze" else start_stage,
+                )
+                with Session() as session:
+                    session.add(
+                        DagRun(
+                            dag_id=DAG_ID,
+                            run_id=dag_run_id,
+                            run_type="manual",
+                            state="failed",
+                        )
+                    )
+                    session.flush()
+                    session.execute(
+                        TaskInstance.__table__.insert().values(
+                            dag_id=DAG_ID,
+                            run_id=dag_run_id,
+                            task_id="freeze",
+                            map_index=-1,
+                            state="failed",
+                            try_number=1,
+                            pool="default_pool",
+                            pool_slots=1,
+                        )
+                    )
+                    session.commit()
+                module._bind_initial_dispatch(
+                    self.store,
+                    run_id=run_id,
+                    context={
+                        "dag_run": SimpleNamespace(run_id=dag_run_id),
+                        "ti": SimpleNamespace(task_id="freeze", map_index=-1),
+                    },
+                )
+                with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT task_id, map_index FROM operation WHERE run_id=%s AND kind='dispatch'",
+                        (run_id,),
+                    )
+                    self.assertEqual(cursor.fetchone(), ("freeze", -1))
+                self.store.start_run(run_id)
+                self.store.confirm_stage(
+                    run_id=run_id,
+                    stage="freeze",
+                    state="failed",
+                    receipt={
+                        "schema_version": BUNDLE_SCHEMA,
+                        "pipeline_id": "solidworks-to-urdf",
+                        "run_id": run_id,
+                        "stage": "freeze",
+                        "state": "failed",
+                        "passed": False,
+                        "error": "AirflowFailException: controlled freeze failure",
+                    },
+                )
+                module._register_blocked_downstream(self.store, run_id, "freeze")
+                with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT object_kind, object_id, bucket FROM lifecycle_projection WHERE run_id=%s",
+                        (run_id,),
+                    )
+                    rows = cursor.fetchall()
+                    self.assertTrue(rows)
+                    self.assertEqual({row[2] for row in rows}, {"terminal"})
+
+    def test_new_portal_dispatch_success_has_no_unknown(self) -> None:
+        import psycopg2
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from airflow.models import DagBag
+        from airflow.models.dagrun import DagRun
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+        from description_pipeline.delivery import BUNDLE_SCHEMA
+        from description_pipeline.io import digest as pipeline_digest
+        from description_pipeline.io import file_digest, read_data, write_json
+        from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.orchestration.portal import _initial_dispatch
+        from description_pipeline.verification import solidworks_urdf
+        from description_pipeline.verification.solidworks_urdf import required_checks
+        from tests.v1.test_platform_store import build_sealed_delivery
+
+        bag = DagBag(str(ROOT / "deploy/airflow/dags"))
+        module = __import__(
+            bag.dags[DAG_ID].task_dict["freeze"].python_callable.__module__,
+            fromlist=["_bind_initial_dispatch"],
+        )
+        dag_run_id = f"portal-new-start-succeeded-{uuid.uuid4().hex[:8]}"
+        run_id = native_run_id(dag_run_id)
+        freeze_root = self.evidence / "store" / "sealed" / run_id / "freeze"
+        subject, artifacts, upload_sha, _native_handoff = build_sealed_delivery(freeze_root)
+        upload_files = dict(read_data(freeze_root / "input" / "handoff.json")["package_files"])
+        main_assembly = "cad/cad/robot.SLDASM"
+        self.store.admit_run(
+            request_id=f"portal-{dag_run_id}",
+            run_id=run_id,
+            principal="cli_reconcile:tenant:operator",
+            target_hardware="m3.0",
+            main_assembly=main_assembly,
+            configuration={"purpose": "inspection_preview"},
+            baseline={
+                "handoff_sha256": upload_sha,
+                "files": len(upload_files),
+                "bytes": sum((freeze_root / "input" / name).stat().st_size for name in upload_files),
+                "folder": "M3.0.3_20261016",
+            },
+            dispatch=_initial_dispatch(
+                dag_id=DAG_ID,
+                dag_run_id=dag_run_id,
+                stage="freeze",
+                params_digest=pipeline_digest(
+                    {
+                        "handoff_path": str(freeze_root),
+                        "main_assembly": main_assembly,
+                        "target_hardware": "m3.0",
+                    }
+                ),
+            ),
+        )
+        with Session() as session:
+            session.add(
+                DagRun(
+                    dag_id=DAG_ID,
+                    run_id=dag_run_id,
+                    run_type="manual",
+                    state="success",
+                )
+            )
+            session.flush()
+            session.execute(
+                TaskInstance.__table__.insert().values(
+                    dag_id=DAG_ID,
+                    run_id=dag_run_id,
+                    task_id="freeze",
+                    map_index=-1,
+                    state="success",
+                    try_number=1,
+                    pool="default_pool",
+                    pool_slots=1,
+                )
+            )
+            session.commit()
+        module._bind_initial_dispatch(
+            self.store,
+            run_id=run_id,
+            context={
+                "dag_run": SimpleNamespace(run_id=dag_run_id),
+                "ti": SimpleNamespace(task_id="freeze", map_index=-1),
+            },
+        )
+        self.store.start_run(run_id)
+        self.store.confirm_stage(
+            run_id=run_id,
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=f"store://sealed/{run_id}/freeze",
+            receipt={
+                "schema_version": BUNDLE_SCHEMA,
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": run_id,
+                "stage": "freeze",
+                "state": "frozen",
+                "passed": False,
+                "handoff_sha256": upload_sha,
+                "subject_sha256": subject,
+                "tool": read_data(freeze_root / "tool.json"),
+                "artifacts": artifacts,
+            },
+        )
+        publish_root = self.evidence / "store" / "sealed" / run_id / "publish"
+        publish_subject, publish_artifacts, _full, publish_handoff = build_sealed_delivery(publish_root)
+        definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+        expected = required_checks(definition)
+        checks = [{"id": name, "state": "passed", "passed": True, "details": {}} for name in expected]
+        quality = {
+            "passed": True,
+            "subject_sha256": publish_subject,
+            "checks": checks,
+            "required_checks": expected,
+            "qualifications": solidworks_urdf.qualifications(publish_root, definition, checks),
+        }
+        write_json(publish_root / "reports" / "quality.json", quality)
+        quality_member = {
+            "path": "reports/quality.json",
+            "bytes": (publish_root / "reports" / "quality.json").stat().st_size,
+            "sha256": file_digest(publish_root / "reports" / "quality.json"),
+        }
+        with mock.patch.object(solidworks_urdf, "rebuilt_definition", return_value=definition):
+            self.store.confirm_stage(
+                run_id=run_id,
+                stage="publish",
+                state="completed",
+                checkpoint_uri=f"store://sealed/{run_id}/publish",
+                receipt={
+                    "schema_version": BUNDLE_SCHEMA,
+                    "pipeline_id": "solidworks-to-urdf",
+                    "run_id": run_id,
+                    "stage": "publish",
+                    "state": "published",
+                    "passed": True,
+                    "subject_sha256": publish_subject,
+                    "handoff_sha256": publish_handoff,
+                    "artifacts": [*publish_artifacts, quality_member],
+                    "quality": quality,
+                    "submission": {
+                        "passed": True,
+                        "state": "published",
+                        "url": "https://example.test/repo/pull/1",
+                        "subject_sha256": publish_subject,
+                    },
+                },
+            )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT state FROM run WHERE run_id=%s", (run_id,))
+            self.assertEqual(cursor.fetchone(), ("succeeded",))
+            cursor.execute(
+                "SELECT task_id, map_index FROM operation WHERE run_id=%s AND kind='dispatch'",
+                (run_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("freeze", -1))
+            cursor.execute(
+                "SELECT object_kind, object_id, bucket FROM lifecycle_projection WHERE run_id=%s",
+                (run_id,),
+            )
+            rows = cursor.fetchall()
+            self.assertTrue(rows)
+            self.assertEqual({row[2] for row in rows}, {"terminal"})
+
+    def test_terminal_dispatch_repair_refuses_partial_foreign_or_ambiguous_facts(self) -> None:
+        import psycopg2
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+        from description_pipeline.platform.store import PlatformStoreError
+
+        for name in (
+            "partial_binding",
+            "binding_without_event",
+            "extra_freeze_task",
+            "extra_dispatch",
+            "foreign_native",
+            "foreign_detail",
+        ):
+            with self.subTest(name=name):
+                self.setUp()
+                self._prepare_terminal_native_discover_dispatch()
+                with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+                    if name == "partial_binding":
+                        cursor.execute(
+                            "UPDATE operation SET task_id='freeze'"
+                            " WHERE run_id=%s AND kind='dispatch'",
+                            (self.run_id,),
+                        )
+                    elif name == "binding_without_event":
+                        cursor.execute(
+                            "UPDATE operation SET task_id='freeze', map_index=-1"
+                            " WHERE run_id=%s AND kind='dispatch'",
+                            (self.run_id,),
+                        )
+                    elif name == "extra_dispatch":
+                        cursor.execute(
+                            "INSERT INTO operation"
+                            " (operation_id, run_id, stage, kind, state, operation_key, params_digest,"
+                            " dag_id, dag_run_id, task_id, map_index)"
+                            " VALUES (%s, %s, 'freeze', 'dispatch', 'queued', %s, %s, %s, %s, NULL, NULL)",
+                            (
+                                str(uuid.uuid4()),
+                                self.run_id,
+                                f"{self.run_id}/dispatch-extra:0",
+                                "b" * 64,
+                                DAG_ID,
+                                self.dag_run_id,
+                            ),
+                        )
+                    connection.commit()
+                if name == "extra_freeze_task":
+                    with Session() as session:
+                        session.execute(
+                            TaskInstance.__table__.insert().values(
+                                dag_id=DAG_ID,
+                                run_id=self.dag_run_id,
+                                task_id="freeze",
+                                map_index=0,
+                                state="success",
+                                try_number=1,
+                                pool="default_pool",
+                                pool_slots=1,
+                            )
+                        )
+                        session.commit()
+                reconcile = self.bound_reconcile
+                if name == "foreign_native":
+                    foreign = dict(json.loads(self.log.read_text(encoding="utf-8")))
+                    foreign["error"] = "SelectionError: a different failure"
+                    foreign["events"][-1]["error"] = foreign["error"]
+                    path = self.evidence / f"foreign-{uuid.uuid4().hex[:8]}.json"
+                    path.write_text(json.dumps(foreign) + "\n", encoding="utf-8")
+                    reconcile = {
+                        **self.bound_reconcile,
+                        "evidence": [str(path)],
+                        "native_receipt": {"path": str(path), "native_run_id": self.run_id},
+                    }
+                elif name == "foreign_detail":
+                    foreign = dict(json.loads(self.log.read_text(encoding="utf-8")))
+                    stage_rows = foreign["stages"]["stages"]
+                    stage_rows[0]["diagnostic"] = {
+                        **stage_rows[0]["diagnostic"],
+                        "problems": [
+                            {
+                                **stage_rows[0]["diagnostic"]["problems"][0],
+                                "instance": "other-instance",
+                            }
+                        ],
+                    }
+                    path = self.evidence / f"foreign-{uuid.uuid4().hex[:8]}.json"
+                    path.write_text(json.dumps(foreign) + "\n", encoding="utf-8")
+                    reconcile = {
+                        **self.bound_reconcile,
+                        "evidence": [str(path)],
+                        "native_receipt": {"path": str(path), "native_run_id": self.run_id},
+                    }
+                before = self._bound_rows()
+                with self.assertRaises(PlatformStoreError):
+                    self.store.confirm_stage(
+                        run_id=self.run_id,
+                        stage="discover",
+                        state="failed",
+                        reconcile=reconcile,
+                    )
+                self.assertEqual(self._bound_rows(), before, "a refused terminal repair performs zero writes")
 
     def test_legacy_dispatch_repair_refuses_unproven_airflow_identity(self) -> None:
         from description_pipeline.platform.store import PlatformStoreError

@@ -12,8 +12,16 @@ event count is assumed.
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
+
+from description_pipeline.interface_records import (
+    validate_cache_release_receipt,
+    validate_cache_release_request,
+    validate_health,
+)
+from description_pipeline.orchestration.airflow_client import EndpointConfig, WindowsEndpoint, cache_release_request
 
 from tests.v1.split_capture_fixture import CONTROL_LIMITS, REQUIRED_CONTROL_GATES
 
@@ -58,10 +66,20 @@ class SettlementCheckerTests(unittest.TestCase):
             "run_state": ["failed"],
             "request": [[f"portal-{RUN_ID}", "fixture", "app:tenant:ordinary-operator"]],
             "operations": [
-                ["dispatch-key", None, "dispatch", "succeeded"],
-                ["native-key", "capture", "native", "succeeded"],
+                [f"portal-{RUN_ID}/freeze:0", "freeze", "dispatch", "succeeded", "freeze", -1],
+                ["native-key", "capture", "native", "succeeded", "capture", -1],
             ],
             "stages": [[stage, state] for stage, state in STAGES.items()],
+            "lifecycle": [
+                {"object_kind": "run", "object_id": RUN_ID, "state": "failed", "bucket": "terminal"},
+                {"object_kind": "stage", "object_id": "verify", "state": "failed", "bucket": "terminal"},
+                {
+                    "object_kind": "scheduling",
+                    "object_id": "dispatch-key",
+                    "state": "success",
+                    "bucket": "terminal",
+                },
+            ],
             "events": events,
         }
 
@@ -140,6 +158,34 @@ class SettlementCheckerTests(unittest.TestCase):
         rows["operations"][1][3] = "running"
         self.assertFalse(self.compare(rows)["native_operation_terminal"]["passed"])
 
+    def test_an_unbound_dispatch_is_rejected(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][4] = None
+        rows["operations"][0][5] = None
+        self.assertFalse(self.compare(rows)["dispatch_task_binding"]["passed"])
+
+    def test_a_linked_start_boundary_is_executed_by_the_real_freeze_task(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][0] = f"portal-{RUN_ID}/capture:0"
+        rows["operations"][0][1] = "capture"
+        self.assertTrue(self.compare(rows)["dispatch_task_binding"]["passed"])
+
+    def test_the_requested_start_stage_cannot_stand_in_for_the_executing_task(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][1] = "capture"
+        rows["operations"][0][4] = "capture"
+        self.assertFalse(self.compare(rows)["dispatch_task_binding"]["passed"])
+
+    def test_a_mapped_key_cannot_stand_in_for_the_non_mapped_freeze_task(self) -> None:
+        rows = self.rows()
+        rows["operations"][0][5] = 0
+        self.assertFalse(self.compare(rows)["dispatch_task_binding"]["passed"])
+
+    def test_an_unknown_lifecycle_bucket_is_rejected(self) -> None:
+        rows = self.rows()
+        rows["lifecycle"][-1]["bucket"] = "unknown"
+        self.assertFalse(self.compare(rows)["lifecycle_projection_terminal"]["passed"])
+
     def test_capture_completed_without_a_native_operation_is_rejected(self) -> None:
         rows = self.rows()
         rows["operations"] = [operation for operation in rows["operations"] if operation[2] != "native"]
@@ -149,6 +195,60 @@ class SettlementCheckerTests(unittest.TestCase):
         rows = self.rows()
         rows["stages"] = [row for row in rows["stages"] if row[0] != "publish"]
         self.assertFalse(self.compare(rows)["stage_rows_match_projection"]["passed"])
+
+
+class MockEndpointHealthTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = _load_smoke()
+
+    def test_health_is_the_if09_identity_used_by_cache_release(self) -> None:
+        run_id = "00000000-0000-0000-0000-000000000001"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "archive.zip"
+            archive.write_bytes(b"")
+            server, _ = self.module._mock_endpoint(
+                {
+                    "archive": str(archive),
+                    "main_assembly": "cad/robot.SLDASM",
+                    "native_tool": {"source_sha256": "a" * 64},
+                },
+                run_id=run_id,
+                upload_files={"cad/robot.SLDASM": "d" * 64},
+                record={},
+                bundle_dir=root,
+            )
+            try:
+                endpoint = WindowsEndpoint(
+                    EndpointConfig(
+                        base_url=f"http://127.0.0.1:{server.server_address[1]}",
+                        token=self.module.TOKEN,
+                    )
+                )
+                health = endpoint.health()
+                endpoint.start_staging_job(
+                    run_id=run_id,
+                    upload_files={"cad/robot.SLDASM": "d" * 64},
+                    main_assembly="cad/robot.SLDASM",
+                )
+                request = cache_release_request(
+                    run_id=run_id,
+                    linux_run_id=run_id,
+                    production_operation_id="native-operation",
+                    operation_id="release-operation",
+                    health=health,
+                    imported=[{"path": "cad/robot.SLDASM", "bytes": 1, "sha256": "b" * 64}],
+                    sealed_receipt_sha256="c" * 64,
+                )
+                receipt = endpoint.release_cache(run_id, request)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        validate_health(health)
+        validate_cache_release_request(request)
+        validate_cache_release_receipt(receipt)
 
 
 class QualityRejectionTests(unittest.TestCase):

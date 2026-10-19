@@ -1299,6 +1299,100 @@ class PlatformStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(OperationConflictError, "different run or stage"):
             self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/freeze:0")
 
+    def test_initial_portal_dispatch_binds_only_the_existing_intent(self) -> None:
+        self.admit(
+            dispatch={
+                "stage": "freeze",
+                "operation_key": "portal-portal-r-1/freeze:0",
+                "params_digest": "a" * 64,
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": "portal-r-1",
+            }
+        )
+        record = self.store.bind_initial_dispatch(
+            run_id="r-1",
+            stage="freeze",
+            operation_key="portal-portal-r-1/freeze:0",
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-r-1",
+            task_id="freeze",
+            map_index=-1,
+        )
+        self.assertEqual(record.state, "queued")
+        operation_id = record.operation_id
+        self.assertEqual(
+            self.world.operation_bindings[operation_id],
+            ("solidworks_to_urdf", "portal-r-1", "freeze", -1),
+        )
+        before = dict(self.world.operation_bindings)
+        self.store.bind_initial_dispatch(
+            run_id="r-1",
+            stage="freeze",
+            operation_key="portal-portal-r-1/freeze:0",
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-r-1",
+            task_id="freeze",
+            map_index=-1,
+        )
+        self.assertEqual(self.world.operation_bindings, before)
+        with self.assertRaisesRegex(PlatformStoreError, "not registered"):
+            self.store.bind_initial_dispatch(
+                run_id="r-1",
+                stage="freeze",
+                operation_key="portal-portal-r-1/freeze:1",
+                dag_id="solidworks_to_urdf",
+                dag_run_id="portal-r-1",
+                task_id="freeze",
+                map_index=-1,
+            )
+        self.assertEqual(self.world.operation_bindings, before)
+        for task_id, map_index in (("capture", -1), ("freeze", 0)):
+            with self.subTest(task_id=task_id, map_index=map_index):
+                with self.assertRaisesRegex(OperationConflictError, "executing freeze task"):
+                    self.store.bind_initial_dispatch(
+                        run_id="r-1",
+                        stage="freeze",
+                        operation_key="portal-portal-r-1/freeze:0",
+                        dag_id="solidworks_to_urdf",
+                        dag_run_id="portal-r-1",
+                        task_id=task_id,
+                        map_index=map_index,
+                    )
+                self.assertEqual(self.world.operation_bindings, before)
+
+    def test_initial_portal_dispatch_at_a_linked_boundary_binds_the_real_freeze_task(self) -> None:
+        self.store.admit_run(
+            request_id="portal-portal-r-1",
+            run_id="r-1",
+            principal="portal",
+            target_hardware="nd",
+            main_assembly="cad/robot.SLDASM",
+            configuration={"purpose": "engineering"},
+            baseline={},
+            dispatch={
+                "stage": "capture",
+                "operation_key": "portal-portal-r-1/capture:0",
+                "params_digest": "a" * 64,
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": "portal-r-1",
+            },
+            from_stage="capture",
+            parent_run_id="parent-r-1",
+        )
+        record = self.store.bind_initial_dispatch(
+            run_id="r-1",
+            stage="capture",
+            operation_key="portal-portal-r-1/capture:0",
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-r-1",
+            task_id="freeze",
+            map_index=-1,
+        )
+        self.assertEqual(
+            self.world.operation_bindings[record.operation_id],
+            ("solidworks_to_urdf", "portal-r-1", "freeze", -1),
+        )
+
     def test_unknown_outcome_cannot_be_bypassed_with_a_new_key(self) -> None:
         self._running_run()
         self.store.register_operation(
@@ -3240,7 +3334,7 @@ class PredispatchClosureTests(unittest.TestCase):
         self.store.confirm_stage(run_id=PREDISPATCH_RUN, stage="freeze", state="failed", reconcile=self._reconcile(log))
 
     # ------------------------------------------------------------------ positive
-    def test_the_closure_records_the_real_failure_and_cancels_the_never_issued_intent(self) -> None:
+    def test_the_closure_binds_every_initial_intent_to_the_real_failed_freeze_task(self) -> None:
         run_id = self._admit()
         self._airflow_facts()
         log = self._log()
@@ -3249,7 +3343,12 @@ class PredispatchClosureTests(unittest.TestCase):
         self.assertEqual(freeze[0], "failed")
         receipt = freeze[1]
         self.assertEqual(receipt["error"], f"AirflowFailException: {self.EXCEPTION}")
-        self.assertTrue(receipt["admitted_before_dispatch"])
+        self.assertNotIn("admitted_before_dispatch", receipt)
+        self.assertEqual(receipt["closure_shape"], "freeze_dispatch_failed")
+        self.assertEqual(
+            receipt["freeze_execution"],
+            {"task_id": "freeze", "map_index": -1, "try_number": 1, "state": "failed"},
+        )
         self.assertEqual(
             receipt["airflow_failure"],
             {"path": str(log), "sha256": file_digest(log), "try_number": 1},
@@ -3258,15 +3357,20 @@ class PredispatchClosureTests(unittest.TestCase):
             self.assertEqual(self.world.stages[(run_id, later)][0], "blocked")
         self.assertEqual(self.world.run_states[run_id], "failed")
         intent = self.world.operations["portal-portal-predispatch-1/capture:0"]
-        self.assertEqual(intent[1], "cancelled", "the never-issued intent closes as cancelled")
+        self.assertEqual(intent[1], "failed", "the real failed freeze dispatch closes the initial intent")
         self.assertEqual(
             self.world.operation_bindings[intent[0]],
-            ("solidworks_to_urdf", "portal-predispatch-1", "capture", -1),
-            "the recorded successor key is completed from its real unique row",
+            ("solidworks_to_urdf", "portal-predispatch-1", "freeze", -1),
+            "the linked start boundary never substitutes for the task that actually executed",
         )
         self.assertEqual(self.world.operations[f"operatorctl-reconcile:{run_id}:freeze:failed"][1], "succeeded")
         kinds = [row[2] for row in self.world.events if row[0] == run_id]
         self.assertEqual(kinds, ["stage", "stage", "stage", "stage", "stage", "binding", "stage"])
+        binding = next(json.loads(row[5]) for row in self.world.events if row[0] == run_id and row[2] == "binding")
+        self.assertEqual(binding["intent_stage"], "capture")
+        self.assertEqual(binding["task_id"], "freeze")
+        self.assertEqual(binding["map_index"], -1)
+        self.assertTrue(binding["freeze_dispatched"])
 
     def test_the_same_evidence_replays_as_a_no_op(self) -> None:
         self._admit()
