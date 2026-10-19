@@ -1671,8 +1671,8 @@ class PlatformStore:
         The composed receipt binds the original bytes by digest and preserves the exception
         verbatim; every later guard (queued run, no stage rows, the one unclaimed unbound
         dispatch intent, the real Airflow facts and terminal try number read in one snapshot)
-        runs inside the one write transaction.  The dispatch stage decides whether the
-        intent itself executed (``freeze``) or points at a never-dispatched successor.
+        runs inside the one write transaction.  The real failed freeze task proves the
+        execution of every initial intent, including a linked restart boundary.
         """
         if stage != "freeze" or state != "failed":
             return None
