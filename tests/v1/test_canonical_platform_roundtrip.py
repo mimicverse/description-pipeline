@@ -15,9 +15,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from description_pipeline.io import digest, file_digest, inventory, read_data
+from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.platform import capture, flow
 from description_pipeline.platform.storage import sealed_resolver
 from description_pipeline.platform.store import PlatformStore
@@ -28,8 +30,10 @@ from tests.v1 import split_capture_fixture as producer
 from tests.v1.test_airflow_dag import DagBag, DAG_DIR
 from tests.v1.test_platform_store import FakeWorld
 
-RUN = "b7fb535e-4f61-443d-9cb8-5cfa5ca23331"
+DAG_RUN = "portal-canonical-roundtrip"
+RUN = native_run_id(DAG_RUN)
 MAIN = "cad/robot.SLDASM"
+REQUEST_ID = f"portal-{DAG_RUN}"
 
 
 class ByteEndpoint:
@@ -62,13 +66,19 @@ def _run_scenario(root: Path) -> dict:
     upload = inventory(native_root)
     handoff = digest(upload)
     store.admit_run(
-        request_id="independent-real-roundtrip",
+        request_id=REQUEST_ID,
         run_id=RUN,
         principal="portal",
         target_hardware="nd_fixture",
         main_assembly=MAIN,
         configuration={"purpose": "engineering"},
-        dispatch={"stage": "freeze", "operation_key": f"{RUN}/dispatch:0", "params_digest": "a" * 64},
+        dispatch={
+            "stage": "freeze",
+            "operation_key": f"portal-{DAG_RUN}/freeze:0",
+            "params_digest": "a" * 64,
+            "dag_id": "solidworks_to_urdf",
+            "dag_run_id": DAG_RUN,
+        },
         baseline={
             "platform_config_digest": "b" * 64,
             "handoff_sha256": handoff,
@@ -80,7 +90,7 @@ def _run_scenario(root: Path) -> dict:
     freeze_request_evidence(
         paths.run_dir,
         purpose="engineering",
-        request_id="independent-real-roundtrip",
+        request_id=REQUEST_ID,
         target_hardware="nd_fixture",
         change_summary="Independent control roundtrip",
         main_assembly=MAIN,
@@ -96,10 +106,18 @@ def _run_scenario(root: Path) -> dict:
     phase = "freeze"
     with patch.object(module, "_platform_binding", return_value=(store, store_root)):
         try:
+            module._bind_initial_dispatch(
+                store,
+                run_id=RUN,
+                context={"dag_run": SimpleNamespace(run_id=DAG_RUN)},
+            )
+            report["initial_dispatch"] = world.operation_bindings[
+                world.operations[f"portal-{DAG_RUN}/freeze:0"][0]
+            ]
             module._register_freeze_stage(
                 paths,
                 RUN,
-                request_id="independent-real-roundtrip",
+                request_id=REQUEST_ID,
                 intake=native_root,
                 upload_files=upload,
                 main_assembly=MAIN,
@@ -202,7 +220,8 @@ def _run_scenario(root: Path) -> dict:
                     and registered_quality.get("sha256") == file_digest(quality_path)
                 )
             report["ok"] = (
-                bool(failed)
+                report.get("initial_dispatch") == ("solidworks_to_urdf", DAG_RUN, "freeze", -1)
+                and bool(failed)
                 and set(failed) <= producer.CONTROL_LIMITS
                 and not report.get("unexpected_verification_acceptance")
                 and report["required_control_gates_pass"]
@@ -221,6 +240,7 @@ class CanonicalPlatformRoundtripTests(unittest.TestCase):
     def test_the_real_producer_registers_and_the_actual_tail_verifies(self) -> None:
         with tempfile.TemporaryDirectory(prefix="canonical-platform-roundtrip-") as temporary:
             report = _run_scenario(Path(temporary))
+        self.assertEqual(report.get("initial_dispatch"), ("solidworks_to_urdf", DAG_RUN, "freeze", -1), report)
         self.assertEqual(report.get("admitted_state"), "capture_admitted", report)
         self.assertEqual(report.get("downloads"), 1, report)
         self.assertFalse(report.get("unexpected_verification_acceptance"), report)

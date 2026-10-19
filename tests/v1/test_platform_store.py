@@ -1299,6 +1299,48 @@ class PlatformStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(OperationConflictError, "different run or stage"):
             self.store.claim_operation(run_id="r-1", stage="capture", operation_key="r-1/freeze:0")
 
+    def test_initial_portal_dispatch_binds_only_the_existing_intent(self) -> None:
+        self.admit(
+            dispatch={
+                "stage": "freeze",
+                "operation_key": "portal-portal-r-1/freeze:0",
+                "params_digest": "a" * 64,
+                "dag_id": "solidworks_to_urdf",
+                "dag_run_id": "portal-r-1",
+            }
+        )
+        record = self.store.bind_initial_dispatch(
+            run_id="r-1",
+            stage="freeze",
+            operation_key="portal-portal-r-1/freeze:0",
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-r-1",
+        )
+        self.assertEqual(record.state, "queued")
+        operation_id = record.operation_id
+        self.assertEqual(
+            self.world.operation_bindings[operation_id],
+            ("solidworks_to_urdf", "portal-r-1", "freeze", -1),
+        )
+        before = dict(self.world.operation_bindings)
+        self.store.bind_initial_dispatch(
+            run_id="r-1",
+            stage="freeze",
+            operation_key="portal-portal-r-1/freeze:0",
+            dag_id="solidworks_to_urdf",
+            dag_run_id="portal-r-1",
+        )
+        self.assertEqual(self.world.operation_bindings, before)
+        with self.assertRaisesRegex(PlatformStoreError, "not registered"):
+            self.store.bind_initial_dispatch(
+                run_id="r-1",
+                stage="freeze",
+                operation_key="portal-portal-r-1/freeze:1",
+                dag_id="solidworks_to_urdf",
+                dag_run_id="portal-r-1",
+            )
+        self.assertEqual(self.world.operation_bindings, before)
+
     def test_unknown_outcome_cannot_be_bypassed_with_a_new_key(self) -> None:
         self._running_run()
         self.store.register_operation(

@@ -427,6 +427,10 @@ _READ_RUN_DISPATCH_FOR_BINDING = (
     "SELECT operation_id, stage, state, dag_id, dag_run_id, task_id, map_index, operation_key"
     " FROM operation WHERE run_id = %s AND kind = 'dispatch' FOR UPDATE"
 )
+_READ_DISPATCH_BINDING_EVENTS = (
+    "SELECT payload FROM run_event WHERE run_id = %s AND operation_id = %s"
+    " AND kind = 'binding' AND payload->>'binding_kind' = 'dispatch' ORDER BY seq"
+)
 _READ_DISPATCH_TASK_FACT = (
     "SELECT ti.map_index, ti.state, ti.try_number, dr.state"
     " FROM task_instance ti JOIN dag_run dr"
@@ -863,6 +867,55 @@ class PlatformStore:
                 dispatch=dispatch or {},
                 binding=binding,
             )
+
+    def bind_initial_dispatch(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        operation_key: str,
+        dag_id: str,
+        dag_run_id: str,
+    ) -> OperationRecord:
+        """Bind the admitted dispatch intent from the task that actually starts the run.
+
+        This is intentionally narrower than ``register_operation``: the initial intent must
+        already exist under the exact Portal key.  A missing row is a refusal, never a new
+        dispatch record.  The run and stage come from that recorded intent, while the task key
+        comes from the real Airflow context and the operation key's canonical stage segment.
+        Existing partial or conflicting bindings are refused without writing.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_OPERATION_BINDING, (operation_key,))
+            row = cursor.fetchone()
+            if row is None:
+                raise PlatformStoreError(f"The initial dispatch intent is not registered: {operation_key!r}")
+            record = OperationRecord(*row[:7])
+            if record.run_id != run_id or record.stage != stage or record.kind != "dispatch":
+                raise OperationConflictError("The initial dispatch intent names another run or stage")
+            target = operation_key.rsplit("/", 1)[-1].split(":", 1)[0]
+            if (
+                row[7] != dag_id
+                or row[8] != dag_run_id
+                or target != stage
+                or operation_key != f"portal-{dag_run_id}/{stage}:0"
+            ):
+                raise OperationConflictError("The initial dispatch intent names another Portal or Airflow identity")
+            if row[9] is not None or row[10] is not None:
+                if (row[9], row[10]) == (stage, -1):
+                    return record
+                raise OperationConflictError("The initial dispatch intent is already bound to another Airflow task")
+            if record.state != "queued":
+                raise PlatformStoreError("Only a queued initial dispatch intent can accept its first task binding")
+            cursor.execute(
+                _BIND_MISSING_DISPATCH,
+                (stage, -1, operation_key, run_id, dag_id, dag_run_id),
+            )
+            if cursor.fetchone() is None:
+                raise PlatformStoreError("The initial dispatch binding lost its operation to another writer")
+            return record
 
     def _register_operation_locked(
         self,
@@ -1348,6 +1401,17 @@ class PlatformStore:
                                     receipt=receipt,
                                     reconcile=reconcile,
                                 )
+                            return
+                        if self._repair_terminal_native_discover_dispatch(
+                            connection,
+                            cursor,
+                            run_id=run_id,
+                            stage=stage,
+                            state=state,
+                            receipt=receipt,
+                            reconcile=reconcile,
+                            stored_receipt=stored_receipt,
+                        ):
                             return
                     raise PlatformStoreError(
                         f"The {stage!r} stage of run {run_id!r} is already terminal; start a linked run instead"
@@ -1920,6 +1984,124 @@ class PlatformStore:
         cursor.execute(_SETTLE_ORPHAN_INTENT, (state, operation_id, run_id))
         cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, stage))
 
+    def _repair_terminal_native_discover_dispatch(
+        self,
+        connection,
+        cursor,
+        *,
+        run_id: str,
+        stage: str,
+        state: str,
+        receipt: dict,
+        reconcile: dict,
+        stored_receipt: dict | None,
+    ) -> bool:
+        """Repair one missing freeze dispatch key beside an already terminal discover failure.
+
+        The discover row itself stays byte-for-byte and timestamp-for-timestamp unchanged.
+        The original native job, immutable request, sealed freeze and real Airflow facts prove
+        the unique succeeded freeze intent; only its missing task key is added.  An identical
+        replay revalidates the same facts and appends no event.
+        """
+
+        if stage != "discover" or state != "failed" or not isinstance(stored_receipt, dict):
+            return False
+        if stored_receipt.get("stage") != "discover" or stored_receipt.get("state") != "failed":
+            return False
+        binding = reconcile.get("binding")
+        if not isinstance(binding, dict) or binding.get("task_id") != "discover" or binding.get("map_index") != -1:
+            return False
+        operation_id = binding.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            return False
+        cursor.execute(_READ_ORPHAN_OPERATION, (operation_id, run_id))
+        orphan = cursor.fetchone()
+        if orphan is None:
+            return False
+        op_stage, kind, op_state, dag_id, dag_run_id, task_id, map_index, _operation_key = orphan
+        if (
+            op_stage != "discover"
+            or kind != "native"
+            or op_state != "failed"
+            or task_id != "discover"
+            or map_index != -1
+            or not isinstance(dag_id, str)
+            or not dag_id
+            or not isinstance(dag_run_id, str)
+            or not dag_run_id
+        ):
+            return False
+
+        native_code = receipt.get("error_code")
+        stored_code = stored_receipt.get("error_code")
+        native_error = receipt.get("error")
+        stored_error = stored_receipt.get("error")
+        if (
+            not isinstance(native_code, str)
+            or not native_code
+            or native_code != stored_code
+            or not isinstance(native_error, str)
+            or not native_error
+            or not isinstance(stored_error, str)
+            or native_error not in stored_error
+        ):
+            raise PlatformStoreError("The original native failure does not match the terminal discover record")
+
+        self._verify_bound_discover_airflow(cursor, dag_id=dag_id, dag_run_id=dag_run_id, binding=binding)
+        cursor.execute(_READ_RUN_DISPATCH_FOR_BINDING, (run_id,))
+        dispatch = cursor.fetchone()
+        if dispatch is None:
+            raise PlatformStoreError("The run carries no freeze dispatch intent")
+        dispatch_id, dispatch_stage, dispatch_state, dispatch_dag, dispatch_run, bound_task, bound_map, key = dispatch
+        if (
+            dispatch_stage != "freeze"
+            or dispatch_state != "succeeded"
+            or dispatch_dag != dag_id
+            or dispatch_run != dag_run_id
+        ):
+            raise PlatformStoreError("The unique dispatch intent is not the settled freeze dispatch")
+
+        cursor.execute(_READ_DISPATCH_BINDING_EVENTS, (run_id, dispatch_id))
+        events = cursor.fetchall()
+        native_sha = receipt.get("native_receipt_sha256")
+        if bound_task is None and bound_map is None:
+            if events:
+                raise PlatformStoreError("The terminal dispatch repair carries binding evidence without a binding")
+        elif (bound_task, bound_map) == ("freeze", -1):
+            payloads = []
+            for (payload,) in events:
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except ValueError as error:
+                        raise PlatformStoreError("The recorded dispatch binding event is unreadable") from error
+                payloads.append(payload)
+            if (
+                len(payloads) != 1
+                or not isinstance(payloads[0], dict)
+                or payloads[0].get("operation_key") != key
+                or payloads[0].get("task_id") != "freeze"
+                or payloads[0].get("map_index") != -1
+                or payloads[0].get("native_receipt_sha256") != native_sha
+            ):
+                raise PlatformStoreError("The terminal dispatch binding does not match its recorded evidence")
+        else:
+            raise PlatformStoreError("The terminal freeze dispatch carries a partial or foreign binding")
+
+        reconcile_operation = reconcile.get("operation_id")
+        cursor.execute(_FIND_RECONCILE, (reconcile_operation, run_id, stage))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The reconciliation names no registered reconcile operation of this run and stage")
+        self._bind_legacy_dispatch_freeze(
+            connection,
+            cursor,
+            run_id=run_id,
+            receipt=receipt,
+            reconcile=reconcile,
+        )
+        cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, stage))
+        return True
+
     def _reconcile_bound_native_discover(
         self,
         connection,
@@ -2044,31 +2226,7 @@ class PlatformStore:
             freeze_receipt=freeze_receipt,
         )
 
-        cursor.execute(_READ_ADMITTED_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id))
-        facts = cursor.fetchall()
-        dag_rows = [row for row in facts if row[0] == "dag_run"]
-        if len(dag_rows) != 1 or dag_rows[0][3] != "failed":
-            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact")
-        by_task: dict[str, list[tuple[int, object, int]]] = {}
-        for _, task, task_map, task_state, task_try in facts:
-            if isinstance(task, str):
-                by_task.setdefault(task, []).append((task_map, task_state, task_try))
-        freeze_rows = by_task.get("freeze") or []
-        if len(freeze_rows) != 1 or freeze_rows[0][1] != "success":
-            raise PlatformStoreError("The real freeze task is not the completed prerequisite of discover")
-        discover_rows = by_task.get("discover") or []
-        if (
-            len(discover_rows) != 1
-            or discover_rows[0][0] != map_index
-            or discover_rows[0][1] != "failed"
-            or type(discover_rows[0][2]) is not int
-            or discover_rows[0][2] < 1
-        ):
-            raise PlatformStoreError("The real discover task does not prove its bound failed fact")
-        for later in ("capture", "generate", "verify", "publish"):
-            rows = by_task.get(later) or []
-            if len(rows) != 1 or rows[0][1] != "upstream_failed":
-                raise PlatformStoreError(f"The successor task {later!r} does not prove its never-executed fact")
+        self._verify_bound_discover_airflow(cursor, dag_id=dag_id, dag_run_id=dag_run_id, binding=binding)
 
         payload_receipt = {
             **receipt,
@@ -2163,6 +2321,43 @@ class PlatformStore:
             or freeze_receipt.get("handoff_sha256") != baseline.get("handoff_sha256")
         ):
             raise PlatformStoreError("The recovery receipt does not match the admitted request")
+
+    def _verify_bound_discover_airflow(
+        self,
+        cursor,
+        *,
+        dag_id: str,
+        dag_run_id: str,
+        binding: dict,
+    ) -> None:
+        """Require the unique successful freeze, failed discover, and unexecuted successors."""
+
+        map_index = binding.get("map_index")
+        cursor.execute(_READ_ADMITTED_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id))
+        facts = cursor.fetchall()
+        dag_rows = [row for row in facts if row[0] == "dag_run"]
+        if len(dag_rows) != 1 or dag_rows[0][3] != "failed":
+            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact")
+        by_task: dict[str, list[tuple[int, object, int]]] = {}
+        for _, task, task_map, task_state, task_try in facts:
+            if isinstance(task, str):
+                by_task.setdefault(task, []).append((task_map, task_state, task_try))
+        freeze_rows = by_task.get("freeze") or []
+        if len(freeze_rows) != 1 or freeze_rows[0][1] != "success":
+            raise PlatformStoreError("The real freeze task is not the completed prerequisite of discover")
+        discover_rows = by_task.get("discover") or []
+        if (
+            len(discover_rows) != 1
+            or discover_rows[0][0] != map_index
+            or discover_rows[0][1] != "failed"
+            or type(discover_rows[0][2]) is not int
+            or discover_rows[0][2] < 1
+        ):
+            raise PlatformStoreError("The real discover task does not prove its bound failed fact")
+        for later in ("capture", "generate", "verify", "publish"):
+            rows = by_task.get(later) or []
+            if len(rows) != 1 or rows[0][1] != "upstream_failed":
+                raise PlatformStoreError(f"The successor task {later!r} does not prove its never-executed fact")
 
     def _bind_legacy_dispatch_freeze(self, connection, cursor, *, run_id: str, receipt: dict, reconcile: dict) -> None:
         """Repair the one legacy freeze dispatch whose task key is missing."""

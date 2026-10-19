@@ -1549,14 +1549,50 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(admit["main_assembly"], "model.SLDASM")
         self.assertEqual(admit["configuration"], {"purpose": "engineering"})
         dispatch = admit["dispatch"]
-        self.assertEqual(dispatch["stage"], "capture")
-        self.assertEqual(dispatch["operation_key"], f"portal-{dag_run_id}/capture:0")
+        self.assertEqual(dispatch["stage"], "freeze")
+        self.assertEqual(dispatch["operation_key"], f"portal-{dag_run_id}/freeze:0")
         self.assertEqual(dispatch["dag_run_id"], dag_run_id)
         self.assertEqual(dispatch["dag_id"], DEFAULT_DAG_ID)
         self.assertRegex(dispatch["params_digest"], r"^[0-9a-f]{64}$")
         self.assertEqual(len(self.airflow.trigger_payloads), 1)
         self.assertEqual(self.airflow.trigger_payloads[0]["dag_run_id"], dag_run_id)
         self.assertEqual(self.airflow.trigger_payloads[0]["conf"]["purpose"], "engineering")
+
+    def test_the_portal_dispatch_payload_binds_through_the_real_store_and_dag(self) -> None:
+        import importlib.util
+
+        from description_pipeline.platform.store import PlatformStore
+        from tests.v1.test_platform_store import FakeWorld
+
+        if importlib.util.find_spec("airflow") is None:
+            self.skipTest("Airflow is not installed in this interpreter")
+        from airflow.models import DagBag
+
+        self.client.login()
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=[("model.SLDASM", b"<assembly/>")], fields=list(UPLOAD_CHOICES)),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 201, body)
+        dag_run_id = json.loads(body)["dag_run_id"]
+        admit = self.platform.admits[0]
+        world = FakeWorld()
+        store = PlatformStore(world.connect)
+        store.admit_run(**admit)
+        bag = DagBag(str(Path(__file__).resolve().parents[2] / "deploy/airflow/dags"))
+        module = sys.modules[bag.dags["solidworks_to_urdf"].task_dict["freeze"].python_callable.__module__]
+        module._bind_initial_dispatch(
+            store,
+            run_id=admit["run_id"],
+            context={"dag_run": SimpleNamespace(run_id=dag_run_id)},
+        )
+        operation = world.operations[admit["dispatch"]["operation_key"]]
+        self.assertEqual(
+            world.operation_bindings[operation[0]],
+            ("solidworks_to_urdf", dag_run_id, "freeze", -1),
+        )
 
     def test_upload_requires_a_known_purpose(self) -> None:
         self.client.login()

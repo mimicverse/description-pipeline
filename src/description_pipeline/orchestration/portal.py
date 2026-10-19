@@ -1491,8 +1491,8 @@ class PortalApp:
                     "platform_config_digest": self._admission_config_digest(),
                 },
                 dispatch={
-                    "stage": "capture",
-                    "operation_key": f"portal-{dag_run_id}/capture:0",
+                    "stage": "freeze",
+                    "operation_key": f"portal-{dag_run_id}/freeze:0",
                     "params_digest": digest(
                         {
                             "handoff_path": handoff_path,
