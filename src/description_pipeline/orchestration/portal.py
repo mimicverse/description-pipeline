@@ -2904,6 +2904,16 @@ class PortalApp:
                         "Registered stage report check inventory is malformed",
                     )
                 reported = next(item for item in rows if item.get("id") == stage_id)
+            observed_at = {
+                (
+                    (event.get("check") or {}).get("boundary"),
+                    (event.get("check") or {}).get("id"),
+                ): event.get("at")
+                for event in original_stage_events
+                if isinstance(event.get("check"), dict)
+                and isinstance(event.get("at"), str)
+                and event.get("at")
+            }
             if isinstance(reported, dict):
                 for boundary in ("input", "output"):
                     rows = reported.get(f"{boundary}_qc")
@@ -2933,6 +2943,11 @@ class PortalApp:
                             {
                                 "stage": stage_id,
                                 "state": "running",
+                                **(
+                                    {"at": observed_at[(boundary, item["id"])]}
+                                    if (boundary, item["id"]) in observed_at
+                                    else {}
+                                ),
                                 **({"reuse": reuse} if reuse is not None else {}),
                                 "check": {
                                     "id": item["id"],
@@ -2942,6 +2957,38 @@ class PortalApp:
                                 },
                             }
                         )
+            else:
+                expected = {
+                    boundary: [item["id"] for item in definition[f"{boundary}_qc"]]
+                    for boundary in ("input", "output")
+                }
+                for event in original_stage_events:
+                    check = event.get("check")
+                    if not isinstance(check, dict):
+                        continue
+                    boundary = check.get("boundary")
+                    identifier = check.get("id")
+                    if boundary not in expected or identifier not in expected[boundary]:
+                        continue
+                    if check.get("state") not in {"passed", "failed"} or not isinstance(check.get("details"), dict):
+                        raise PortalError(
+                            HTTPStatus.BAD_GATEWAY,
+                            "Registered stage check observation is malformed",
+                        )
+                    events.append(
+                        {
+                            "stage": stage_id,
+                            "state": "running",
+                            **({"at": event["at"]} if isinstance(event.get("at"), str) else {}),
+                            **({"reuse": reuse} if reuse is not None else {}),
+                            "check": {
+                                "id": identifier,
+                                "boundary": boundary,
+                                "state": check["state"],
+                                "details": check["details"],
+                            },
+                        }
+                    )
             platform_state = row.get("state")
             at = row.get("updated_at") or row.get("original_executed_at")
             if hasattr(at, "isoformat"):

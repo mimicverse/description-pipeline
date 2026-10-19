@@ -181,6 +181,50 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         self.assertEqual(discover["state"], "failed")
         self.assertEqual(discover["checks_passed"], 0)
 
+    def test_completed_row_without_report_preserves_only_its_recorded_checks(self) -> None:
+        events = [
+            {
+                "stage": "freeze",
+                "state": "running",
+                "check": {
+                    "id": "handoff.admission",
+                    "boundary": "input",
+                    "state": "passed",
+                    "details": {"handoff_sha256": SUBJECT},
+                },
+            },
+            {
+                "stage": "freeze",
+                "state": "running",
+                "check": {
+                    "id": "handoff.integrity",
+                    "boundary": "output",
+                    "state": "passed",
+                    "details": {"handoff_sha256": SUBJECT},
+                },
+            },
+            {
+                "stage": "freeze",
+                "state": "running",
+                "check": {
+                    "id": "invented",
+                    "boundary": "output",
+                    "state": "passed",
+                    "details": {},
+                },
+            },
+            {"stage": "freeze", "state": "completed"},
+        ]
+        job = {"run_id": RUN_ID, "events": events}
+        display = self.app(None)._registered_stage_job(
+            job,
+            self.projection({"freeze": "completed"}),
+        )
+        freeze = next(stage for stage in stage_view(display)["stages"] if stage["id"] == "freeze")
+        self.assertEqual(freeze["state"], "completed")
+        self.assertEqual(freeze["checks_passed"], 2)
+        self.assertNotIn("invented", {row["id"] for row in freeze["input_qc"] + freeze["output_qc"]})
+
 
 if __name__ == "__main__":
     unittest.main()

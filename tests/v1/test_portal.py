@@ -1176,7 +1176,7 @@ class PortalTests(unittest.TestCase):
                 "state": state,
                 "receipt": {
                     "subject_sha256": None,
-                        "artifacts": [native_stages_member] if stage_id in {"freeze", "discover"} else [],
+                    "artifacts": [native_stages_member] if stage_id == "discover" else [],
                     "handoff_sha256": handoff,
                     **(failure if stage_id == "capture" else {}),
                 },
@@ -2856,6 +2856,8 @@ class PortalTests(unittest.TestCase):
 
         stages = {stage["id"]: stage for stage in payload["stage_view"]["stages"]}
         self.assertEqual(stages["freeze"]["state"], "completed")
+        self.assertEqual(stages["freeze"]["checks_passed"], 2)
+        self.assertEqual(stages["freeze"]["checks_total"], 2)
         self.assertEqual(stages["discover"]["state"], "completed")
         self.assertEqual(stages["discover"]["checks_passed"], 3)
         self.assertEqual(stages["discover"]["checks_total"], 3)
@@ -2893,7 +2895,7 @@ class PortalTests(unittest.TestCase):
         digest = hashlib.sha256(payload).hexdigest()
         entry["artifacts"]["reports/native-stages.json"] = payload
         entry["preview"]["report_files"]["reports/native-stages.json"] = digest
-        for stage in ("freeze", "discover"):
+        for stage in ("discover",):
             member = self.platform.stages[run_id][stage]["receipt"]["artifacts"][0]
             member.update(bytes=len(payload), sha256=digest)
 
@@ -2937,6 +2939,73 @@ class PortalTests(unittest.TestCase):
                 "publish": "not_run",
             },
         )
+
+    def test_run_page_refuses_a_later_malformed_known_check_state(self) -> None:
+        self.client.login()
+        run_id = self._seed_7b_stage_display()
+        self.store.runs[run_id]["merged"]["events"].append(
+            {
+                "stage": "freeze",
+                "state": "running",
+                "check": {
+                    "id": "handoff.admission",
+                    "boundary": "input",
+                    "state": "not_run",
+                    "details": {"handoff_sha256": "d" * 64},
+                },
+            }
+        )
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+
+        self.assertEqual(status, 502, body)
+        self.assertIn("check observation is malformed", json.loads(body)["error"])
+
+    def test_run_page_refuses_later_malformed_known_check_details(self) -> None:
+        self.client.login()
+        run_id = self._seed_7b_stage_display()
+        self.store.runs[run_id]["merged"]["events"].append(
+            {
+                "stage": "freeze",
+                "state": "running",
+                "check": {
+                    "id": "handoff.integrity",
+                    "boundary": "output",
+                    "state": "passed",
+                    "details": "malformed",
+                },
+            }
+        )
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+
+        self.assertEqual(status, 502, body)
+        self.assertIn("check observation is malformed", json.loads(body)["error"])
+
+    def test_run_page_uses_the_latest_registered_check_state(self) -> None:
+        self.client.login()
+        run_id = self._seed_7b_stage_display()
+        self.store.runs[run_id]["merged"]["events"].append(
+            {
+                "stage": "freeze",
+                "state": "running",
+                "check": {
+                    "id": "handoff.admission",
+                    "boundary": "input",
+                    "state": "failed",
+                    "details": {"error": "later registered failure"},
+                },
+            }
+        )
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+
+        self.assertEqual(status, 200, body)
+        stages = {stage["id"]: stage for stage in json.loads(body)["stage_view"]["stages"]}
+        self.assertEqual(stages["freeze"]["state"], "failed")
+        admission = next(row for row in stages["freeze"]["input_qc"] if row["id"] == "handoff.admission")
+        self.assertEqual(admission["state"], "failed")
+        self.assertEqual(admission["details"], {"error": "later registered failure"})
 
     def test_preview_waits_for_verification(self) -> None:
         self.client.login()
