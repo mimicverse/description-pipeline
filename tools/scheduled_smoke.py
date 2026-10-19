@@ -52,10 +52,13 @@ from description_pipeline.interface_records import (
     InterfaceRecordError,
     cache_release_params_digest,
     cache_release_receipt_digest,
+    resource_policy_v1_digest,
     validate_cache_release_receipt,
     validate_cache_release_request,
+    validate_health,
 )
-from description_pipeline.schemas import CACHE_RELEASE_RECEIPT_SCHEMA
+from description_pipeline.schemas import CACHE_RELEASE_RECEIPT_SCHEMA, HEALTH_SCHEMA, RESOURCE_POLICY_SCHEMA
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
 TOKEN = "scheduled-token"
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +100,35 @@ def _native_record(fixture_root: Path) -> dict:
 
     payload = json.loads((fixture_root / "prepared/discovery/native-discovery.json").read_text(encoding="utf-8"))
     return payload["raw"]
+
+
+def _mock_health_payload(port: int, free_bytes: int) -> dict:
+    """The canonical IF-09 identity needed by release and readiness consumers."""
+
+    payload = {
+        "schema_version": HEALTH_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "native_platform": True,
+        "ready": True,
+        "release": {
+            "version": "1.5.0-smoke",
+            "source_commit": "0" * 40,
+            "source_sha256": "0" * 64,
+            "role": "native",
+        },
+        "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+        "resource_policy": {
+            "schema_version": RESOURCE_POLICY_SCHEMA,
+            "digest": resource_policy_v1_digest(),
+        },
+        "install": {"config_digest": "0" * 64, "install_id": "scheduled-smoke-endpoint"},
+        "endpoint": {"port": port},
+        "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
+        "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+        "capacity": {"free_bytes": free_bytes, "reserved_bytes": 0},
+        "readiness": {"reason_code": None, "native": {"ok": True, "problems": []}},
+    }
+    return validate_health(payload)
 
 
 def _mock_endpoint(
@@ -152,6 +184,15 @@ def _mock_endpoint(
 
         def do_GET(self) -> None:
             if not self._auth():
+                return
+            if self.path == "/health":
+                self._send(
+                    200,
+                    _mock_health_payload(
+                        int(self.server.server_address[1]),
+                        int(shutil.disk_usage(bundle_dir).free),
+                    ),
+                )
                 return
             if not self.path.startswith("/v1/jobs/"):
                 self._send(404, {"error": "unknown"})
