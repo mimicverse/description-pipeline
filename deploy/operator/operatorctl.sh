@@ -2106,6 +2106,7 @@ PY
       [ -n "$NATIVE_DERIVED" ] && [ -n "$NATIVE_ARCHIVE" ] \
         && [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] \
         && [ "$REPORTED_STAGE" = "capture" ] \
+        && [ -n "$INSTALL_ID" ] \
         && [ -n "$RUN_ID" ] && [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] \
         && [ -n "$ORPHAN_OPERATION_ID" ] && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
         || die "native capture recovery requires the complete discover/capture receipt and operation binding"

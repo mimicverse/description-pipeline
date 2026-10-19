@@ -1427,6 +1427,18 @@ class PlatformStore:
             or not main_assembly
         ):
             raise PlatformStoreError("The native success receipt carries no complete request identity")
+        stages = job.get("stages")
+        stage_rows = stages.get("stages") if isinstance(stages, dict) else None
+        by_stage = {
+            row.get("id"): row
+            for row in (stage_rows if isinstance(stage_rows, list) else [])
+            if isinstance(row, dict)
+        }
+        if (
+            by_stage.get("discover", {}).get("state") != "completed"
+            or by_stage.get("capture", {}).get("state") != "completed"
+        ):
+            raise PlatformStoreError("The native success receipt carries no completed discover/capture stage view")
         with self._transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(_LOCK_RUN, (run_id,))

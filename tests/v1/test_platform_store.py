@@ -3251,6 +3251,12 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             {"stage": "discover", "state": "completed"},
             {"stage": "capture", "state": "completed"},
         ]
+        job["stages"] = {
+            "stages": [
+                {"id": "discover", "state": "completed"},
+                {"id": "capture", "state": "completed"},
+            ]
+        }
         self._write_document(job)
         self.store.settle_native_owner_success(
             run_id=self.run_id,
