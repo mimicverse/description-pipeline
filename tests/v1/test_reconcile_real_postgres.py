@@ -848,6 +848,166 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             self.assertTrue(rows)
             self.assertEqual({row[2] for row in rows}, {"terminal"})
 
+    def test_new_portal_dispatch_success_has_no_unknown(self) -> None:
+        import psycopg2
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from airflow.models import DagBag
+        from airflow.models.dagrun import DagRun
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+        from description_pipeline.delivery import BUNDLE_SCHEMA
+        from description_pipeline.io import digest as pipeline_digest
+        from description_pipeline.io import file_digest, read_data, write_json
+        from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.orchestration.portal import _initial_dispatch
+        from description_pipeline.verification import solidworks_urdf
+        from description_pipeline.verification.solidworks_urdf import required_checks
+        from tests.v1.test_platform_store import build_sealed_delivery
+
+        bag = DagBag(str(ROOT / "deploy/airflow/dags"))
+        module = __import__(
+            bag.dags[DAG_ID].task_dict["freeze"].python_callable.__module__,
+            fromlist=["_bind_initial_dispatch"],
+        )
+        dag_run_id = f"portal-new-start-succeeded-{uuid.uuid4().hex[:8]}"
+        run_id = native_run_id(dag_run_id)
+        freeze_root = self.evidence / "store" / "sealed" / run_id / "freeze"
+        subject, artifacts, upload_sha, _native_handoff = build_sealed_delivery(freeze_root)
+        upload_files = dict(read_data(freeze_root / "input" / "handoff.json")["package_files"])
+        main_assembly = "cad/cad/robot.SLDASM"
+        self.store.admit_run(
+            request_id=f"portal-{dag_run_id}",
+            run_id=run_id,
+            principal="cli_reconcile:tenant:operator",
+            target_hardware="m3.0",
+            main_assembly=main_assembly,
+            configuration={"purpose": "inspection_preview"},
+            baseline={
+                "handoff_sha256": upload_sha,
+                "files": len(upload_files),
+                "bytes": sum((freeze_root / "input" / name).stat().st_size for name in upload_files),
+                "folder": "M3.0.3_20261016",
+            },
+            dispatch=_initial_dispatch(
+                dag_id=DAG_ID,
+                dag_run_id=dag_run_id,
+                stage="freeze",
+                params_digest=pipeline_digest(
+                    {
+                        "handoff_path": str(freeze_root),
+                        "main_assembly": main_assembly,
+                        "target_hardware": "m3.0",
+                    }
+                ),
+            ),
+        )
+        with Session() as session:
+            session.add(
+                DagRun(
+                    dag_id=DAG_ID,
+                    run_id=dag_run_id,
+                    run_type="manual",
+                    state="success",
+                )
+            )
+            session.execute(
+                TaskInstance.__table__.insert().values(
+                    dag_id=DAG_ID,
+                    run_id=dag_run_id,
+                    task_id="freeze",
+                    map_index=-1,
+                    state="success",
+                    try_number=1,
+                    pool="default_pool",
+                    pool_slots=1,
+                )
+            )
+            session.commit()
+        module._bind_initial_dispatch(
+            self.store,
+            run_id=run_id,
+            context={"dag_run": SimpleNamespace(run_id=dag_run_id)},
+        )
+        self.store.start_run(run_id)
+        self.store.confirm_stage(
+            run_id=run_id,
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=f"store://sealed/{run_id}/freeze",
+            receipt={
+                "schema_version": BUNDLE_SCHEMA,
+                "pipeline_id": "solidworks-to-urdf",
+                "run_id": run_id,
+                "stage": "freeze",
+                "state": "frozen",
+                "passed": False,
+                "handoff_sha256": upload_sha,
+                "subject_sha256": subject,
+                "tool": read_data(freeze_root / "tool.json"),
+                "artifacts": artifacts,
+            },
+        )
+        publish_root = self.evidence / "store" / "sealed" / run_id / "publish"
+        publish_subject, publish_artifacts, _full, publish_handoff = build_sealed_delivery(publish_root)
+        definition = {"source": {"bodies": [{"name": "base_link"}]}, "checks": {}}
+        expected = required_checks(definition)
+        checks = [{"id": name, "state": "passed", "passed": True, "details": {}} for name in expected]
+        quality = {
+            "passed": True,
+            "subject_sha256": publish_subject,
+            "checks": checks,
+            "required_checks": expected,
+            "qualifications": solidworks_urdf.qualifications(publish_root, definition, checks),
+        }
+        write_json(publish_root / "reports" / "quality.json", quality)
+        quality_member = {
+            "path": "reports/quality.json",
+            "bytes": (publish_root / "reports" / "quality.json").stat().st_size,
+            "sha256": file_digest(publish_root / "reports" / "quality.json"),
+        }
+        with mock.patch.object(solidworks_urdf, "rebuilt_definition", return_value=definition):
+            self.store.confirm_stage(
+                run_id=run_id,
+                stage="publish",
+                state="completed",
+                checkpoint_uri=f"store://sealed/{run_id}/publish",
+                receipt={
+                    "schema_version": BUNDLE_SCHEMA,
+                    "pipeline_id": "solidworks-to-urdf",
+                    "run_id": run_id,
+                    "stage": "publish",
+                    "state": "published",
+                    "passed": True,
+                    "subject_sha256": publish_subject,
+                    "handoff_sha256": publish_handoff,
+                    "artifacts": [*publish_artifacts, quality_member],
+                    "quality": quality,
+                    "submission": {
+                        "passed": True,
+                        "state": "published",
+                        "url": "https://example.test/repo/pull/1",
+                        "subject_sha256": publish_subject,
+                    },
+                },
+            )
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT state FROM run WHERE run_id=%s", (run_id,))
+            self.assertEqual(cursor.fetchone(), ("succeeded",))
+            cursor.execute(
+                "SELECT task_id, map_index FROM operation WHERE run_id=%s AND kind='dispatch'",
+                (run_id,),
+            )
+            self.assertEqual(cursor.fetchone(), ("freeze", -1))
+            cursor.execute(
+                "SELECT object_kind, object_id, bucket FROM lifecycle_projection WHERE run_id=%s",
+                (run_id,),
+            )
+            rows = cursor.fetchall()
+            self.assertTrue(rows)
+            self.assertEqual({row[2] for row in rows}, {"terminal"})
+
     def test_terminal_dispatch_repair_refuses_partial_foreign_or_ambiguous_facts(self) -> None:
         import psycopg2
         from airflow.models.taskinstance import TaskInstance
