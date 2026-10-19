@@ -366,10 +366,7 @@ def _mock_endpoint(
                 job["_artifacts"][fixture["receipt"]["name"]] = archive
                 job["status"] = "native_complete"
                 job["stages"] = fixture["native_stages"]
-                job["events"] = [
-                    *fixture["native_stages"]["events"],
-                    {"stage": "job", "state": "native_complete", "at": "t0"},
-                ]
+                job["events"] = [*fixture["native_stages"]["events"]]
                 job["result"] = {
                     "native_complete": True,
                     "native_tool": fixture["native_tool"],
