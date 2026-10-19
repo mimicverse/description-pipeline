@@ -781,7 +781,7 @@ class DagTests(unittest.TestCase):
     def test_capture_local_failure_converges_after_a_proven_native_complete_job(self):
         import tempfile
 
-        module = self.module
+        module = self._module()
         upload = {"assembly.SLDASM": "a" * 64}
         request = {
             "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
@@ -853,6 +853,12 @@ class DagTests(unittest.TestCase):
             "state": "native",
         }
         settled: list[dict] = []
+
+        def settle(request_value, job_value):
+            settled.append(job_value)
+            if len(settled) == 1:
+                raise RuntimeError("store unavailable")
+
         with (
             tempfile.TemporaryDirectory(prefix="dag-capture-owner-retry-") as store_root,
             patch.object(module, "_endpoint", return_value=endpoint),
@@ -862,11 +868,7 @@ class DagTests(unittest.TestCase):
             patch.object(module, "_register_native_stages", return_value=None),
             patch.object(module, "_release_registered_cache", return_value=None),
             patch.object(module, "_converge_failed_stage") as converge,
-            patch.object(
-                module,
-                "_settle_native_owner_success",
-                side_effect=[RuntimeError("store unavailable"), lambda request, job: settled.append(job)],
-            ),
+            patch.object(module, "_settle_native_owner_success", side_effect=settle),
         ):
             with self.assertRaisesRegex(RuntimeError, "store unavailable"):
                 module.dag.task_dict["capture"].python_callable(request)
