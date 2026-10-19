@@ -793,7 +793,6 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                         ),
                     ),
                     from_stage=None if start_stage == "freeze" else start_stage,
-                    parent_run_id=None if start_stage == "freeze" else f"parent-{run_id}",
                 )
                 with Session() as session:
                     session.add(
