@@ -818,7 +818,7 @@ class DagTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "capture import failed"),
         ):
             module.dag.task_dict["capture"].python_callable(request)
-        seal.assert_called_once_with(request, job)
+        seal.assert_called_once_with(request, job, settle_operations=False)
         self.assertEqual(converge.call_args.args[:2], (request["run_id"], "capture"))
 
     def test_capture_retries_owner_settlement_after_a_successful_import(self) -> None:

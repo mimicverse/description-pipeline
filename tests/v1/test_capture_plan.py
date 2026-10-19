@@ -137,7 +137,7 @@ class CapturePlanTests(unittest.TestCase):
     def test_a_fake_or_incomplete_virtual_selector_is_refused(self) -> None:
         cases = (
             (
-                "not supported",
+                "portable staged inventory",
                 {
                 "kind": "native_import_materialization",
                 "state": "cached_materialization",
@@ -305,7 +305,7 @@ class CapturePlanTests(unittest.TestCase):
 
     def test_a_plan_omitting_a_non_virtual_document_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan["objects"][1].pop("document"))
-        with self.assertRaisesRegex(PipelineError, "without sealed virtual proof"):
+        with self.assertRaisesRegex(PipelineError, "without complete session proof"):
             steps._consume_sealed_definition(self.root)
 
     def test_a_producer_refuses_a_non_virtual_missing_document(self) -> None:
@@ -473,39 +473,101 @@ class CapturePlanTests(unittest.TestCase):
                 plan["objects"][1].pop("document"),
             )
         )
-        with self.assertRaisesRegex(PipelineError, "without sealed virtual proof"):
+        with self.assertRaisesRegex(PipelineError, "without complete session proof"):
             steps._consume_sealed_definition(self.root)
 
-    def test_the_consumer_explicitly_refuses_cached_ic_materializations(self) -> None:
+    def test_a_cached_import_selector_binds_its_portable_owner_source(self) -> None:
         session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7\\IC~~\\arm.step.SLDPRT"
-        for document in (None, session_path):
-            with self.subTest(document=document):
-                discovery_document = json.loads(
-                    (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
+        session_root = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7"
+        discovery_document = json.loads(
+            (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
+        )
+        component = next(
+            item for item in discovery_document["raw"]["components"] if item["instance_id"] == "arm-1"
+        )
+        component.update(
+            document=session_path,
+            configuration="Default",
+            suppression_state=2,
+            source_provenance={
+                "kind": "native_import_materialization",
+                "state": "cached_materialization",
+                "is_virtual": False,
+                "occurrence": "arm-1",
+                "owner": MAIN,
+                "owner_sha256": "a" * 64,
+                "materialization_path": session_path,
+                "session_document_path": session_path,
+                "native_document_path": session_path,
+                "session_temp_root": session_root,
+                "native_api_pid": 7,
+                "author_imported_path": "cad/arm.SLDPRT",
+                "defining_anchor": None,
+                "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                "error": None,
+            },
+        )
+        self.assertEqual(
+            discovery._capture_plan_selector(component, discovery_document["native_files"]),
+            {"name": "arm-1", "state": 2},
+        )
+        entry = {
+            "document": session_path,
+            "owner": MAIN,
+            "owner_sha256": "a" * 64,
+            "bound_source": "cad/arm.SLDPRT",
+            "defining_materialization": None,
+            "instance": "arm-1",
+            "name": "arm-1",
+            "author_imported_path": "cad/arm.SLDPRT",
+            "author_metadata_in_stage": True,
+            "is_virtual": False,
+            "materialization": session_path,
+            "session_temp_root": session_root,
+            "native_api_pid": 7,
+            "configuration": "Default",
+            "suppression_state": 2,
+            "state": "cached_materialization",
+            "binding": "author_metadata_only",
+            "owner_anchor": None,
+        }
+        files = dict(discovery_document["raw"]["files"])
+        discovery_document["raw"]["source_selection"] = sealed_selection(
+            files,
+            MAIN,
+            imports=[entry],
+        )
+        write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
+        discovery_sha = hashlib.sha256(
+            (self.root / "discovery" / "native-discovery.json").read_bytes()
+        ).hexdigest()
+        self._rewrite_plan(
+            lambda plan: (
+                plan.update(discovery_sha256=discovery_sha),
+                plan["objects"][1].pop("document"),
+            )
+        )
+        steps._consume_sealed_definition(self.root)
+
+        for field, value in (
+            ("bound_source", "cad/missing.SLDPRT"),
+            ("author_metadata_in_stage", False),
+            ("configuration", "Other"),
+        ):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(discovery_document))
+                changed_entry = {**entry, field: value}
+                changed["raw"]["source_selection"] = sealed_selection(
+                    files,
+                    MAIN,
+                    imports=[changed_entry],
                 )
-                component = next(
-                    item for item in discovery_document["raw"]["components"] if item["instance_id"] == "arm-1"
-                )
-                component.update(
-                    document=session_path,
-                    source_provenance={
-                        "kind": "native_import_materialization",
-                        "state": "cached_materialization",
-                        "is_virtual": False,
-                        "occurrence": "arm-1",
-                    },
-                )
-                write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
-                discovery_sha = hashlib.sha256(
+                write_json(self.root / "discovery" / "native-discovery.json", changed)
+                changed_sha = hashlib.sha256(
                     (self.root / "discovery" / "native-discovery.json").read_bytes()
                 ).hexdigest()
-                self._rewrite_plan(
-                    lambda plan, sha=discovery_sha, selected=document: (
-                        plan.update(discovery_sha256=sha),
-                        plan["objects"][1].update(document=selected),
-                    )
-                )
-                with self.assertRaisesRegex(PipelineError, "unsupported cached IC"):
+                self._rewrite_plan(lambda plan, sha=changed_sha: plan.update(discovery_sha256=sha))
+                with self.assertRaisesRegex(PipelineError, "cached-import occurrence"):
                     steps._consume_sealed_definition(self.root)
 
     def test_a_plan_naming_another_run_is_refused(self) -> None:

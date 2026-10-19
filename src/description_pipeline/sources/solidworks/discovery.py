@@ -4218,25 +4218,71 @@ def sealed_embedded_virtual_document(
     )
 
 
-def cached_import_materialization(component: object) -> bool:
-    """Whether a component is the explicitly unsupported IC~~ capture class."""
+def sealed_cached_import_materialization(
+    component: object,
+    name: str,
+    native_files: Mapping[str, str],
+) -> bool:
+    """Whether the raw record fully proves an IC~~ cached import occurrence."""
 
-    provenance = component.get("source_provenance") if isinstance(component, dict) else None
-    return isinstance(provenance, dict) and (
-        provenance.get("state") == "cached_materialization"
-        or provenance.get("kind") == "native_import_materialization"
+    if not isinstance(component, dict):
+        return False
+    provenance = component.get("source_provenance")
+    if not isinstance(provenance, dict) or (
+        provenance.get("state") != "cached_materialization"
+        or provenance.get("kind") != "native_import_materialization"
+        or provenance.get("is_virtual") is not False
+        or provenance.get("occurrence") != name
+        or not isinstance(provenance.get("owner"), str)
+        or not provenance["owner"]
+        or not isinstance(provenance.get("owner_sha256"), str)
+        or _SHA256_HEX.fullmatch(provenance["owner_sha256"]) is None
+        or native_files.get(provenance["owner"]) != provenance["owner_sha256"]
+        or not isinstance(provenance.get("materialization_path"), str)
+        or not provenance["materialization_path"]
+        or not isinstance(provenance.get("session_temp_root"), str)
+        or not provenance["session_temp_root"]
+        or type(provenance.get("native_api_pid")) is not int
+        or provenance["native_api_pid"] <= 0
+        or provenance.get("used_api") != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+        or provenance.get("error") is not None
+        or not isinstance(component.get("configuration"), str)
+        or not component["configuration"]
+    ):
+        return False
+    session_path = provenance["materialization_path"].replace("\\", "/")
+    session_root = provenance["session_temp_root"].replace("\\", "/").rstrip("/")
+    root_name = session_root.rsplit("/", 1)[-1]
+    if (
+        not re.fullmatch(r"swx[0-9]+", root_name)
+        or int(root_name[3:]) != provenance["native_api_pid"]
+        or not session_path.casefold().startswith(session_root.casefold() + "/")
+        or session_path.casefold().count("/ic~~/") != 1
+    ):
+        return False
+    for key in ("session_document_path", "native_document_path"):
+        value = provenance.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or value.replace("\\", "/").casefold() != session_path.casefold()
+        ):
+            return False
+    document = component.get("document")
+    return document is None or (
+        isinstance(document, str)
+        and bool(document)
+        and document.replace("\\", "/").casefold() == session_path.casefold()
     )
 
 
 def _capture_plan_selector(component: dict, native_files: Mapping[str, str]) -> dict | None:
     """Build one portable native selector for the sealed capture plan.
 
-    A fully sealed embedded virtual occurrence is the one supported session
-    document class whose absolute VC~~ path stays in the raw diagnostic record only.
-    Its occurrence name and suppression state are the portable selector;
-    copying the temporary path would make the plan unusable after it crosses
-    to the native host.  IC~~ cached materializations require a separate
-    cross-session proof and remain explicitly unsupported in a capture plan.
+    Fully sealed embedded-virtual and cached-import occurrences keep their
+    absolute session path in the raw diagnostic record only.  Their occurrence
+    name and suppression state are the portable selector; consumer-side closure
+    binding proves that an IC~~ occurrence can be re-materialized from a bound
+    staged source.
     A delivered document must remain a portable staged path, so any other
     non-portable value is refused instead of being silently removed.
     """
@@ -4246,13 +4292,11 @@ def _capture_plan_selector(component: dict, native_files: Mapping[str, str]) -> 
     name = component.get("instance_id") or component.get("name2")
     if not isinstance(name, str) or not name:
         return None
-    if cached_import_materialization(component):
-        raise PipelineError(
-            "Cached IC~~ import materializations are not supported by the portable capture plan"
-        )
     selector = {"name": name}
     document = component.get("document")
-    session_document = sealed_embedded_virtual_document(component, name, native_files)
+    session_document = sealed_embedded_virtual_document(
+        component, name, native_files
+    ) or sealed_cached_import_materialization(component, name, native_files)
     if not session_document and (not isinstance(document, str) or not document):
         raise PipelineError("A non-virtual native component carries no document selector")
     if isinstance(document, str) and document and not session_document:
