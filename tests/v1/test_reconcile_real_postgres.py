@@ -188,6 +188,255 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             "events": events,
         }
 
+    def _prepare_bound_native_discover(self) -> None:
+        """Seed one real running run with a bound native operation and a completed freeze."""
+
+        import psycopg2
+        import uuid as uuid_module
+
+        from airflow.models.dagrun import DagRun
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+        from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.io import digest as pipeline_digest
+
+        self.dag_run_id = f"portal-bound-discover-{uuid_module.uuid4().hex[:12]}"
+        self.run_id = native_run_id(self.dag_run_id)
+        self.upload_files = {
+            "3.0 总装.SLDASM": "a" * 64,
+            "parts/bracket.SLDPRT": "b" * 64,
+        }
+        self.upload_sha = pipeline_digest(self.upload_files)
+        self.store.open_admission(reason="bound native reconcile proof", actor="reconcile-test")
+        self.store.admit_run(
+            request_id=f"portal-{self.dag_run_id}",
+            run_id=self.run_id,
+            principal="cli_reconcile:tenant:operator",
+            target_hardware="m3.0",
+            main_assembly="3.0 总装.SLDASM",
+            configuration={"purpose": "inspection_preview"},
+            baseline={
+                "handoff_sha256": self.upload_sha,
+                "files": len(self.upload_files),
+                "bytes": 123,
+                "folder": "M3.0.3_20261016",
+            },
+            dispatch={
+                "stage": "freeze",
+                "operation_key": f"portal-{self.dag_run_id}/freeze:0",
+                "params_digest": "f" * 64,
+                "dag_id": DAG_ID,
+                "dag_run_id": self.dag_run_id,
+                "task_id": "freeze",
+                "map_index": -1,
+            },
+        )
+        self.store.start_run(self.run_id)
+        self.native_operation_id = str(uuid_module.uuid4())
+        self.native_operation_key = f"{self.run_id}/native:0"
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE operation SET state = 'succeeded' WHERE operation_key = %s",
+                (f"portal-{self.dag_run_id}/freeze:0",),
+            )
+            cursor.execute(
+                "INSERT INTO stage (run_id, stage, state, receipt) VALUES (%s, 'freeze', 'completed', '{}'::jsonb)",
+                (self.run_id,),
+            )
+            cursor.execute(
+                "INSERT INTO operation"
+                " (operation_id, run_id, stage, kind, state, operation_key, params_digest,"
+                " dag_id, dag_run_id, task_id, map_index)"
+                " VALUES (%s, %s, 'discover', 'native', 'running', %s, %s, %s, %s, 'discover', -1)",
+                (
+                    self.native_operation_id,
+                    self.run_id,
+                    self.native_operation_key,
+                    "e" * 64,
+                    DAG_ID,
+                    self.dag_run_id,
+                ),
+            )
+        with Session() as session:
+            session.add(
+                DagRun(
+                    dag_id=DAG_ID,
+                    run_id=self.dag_run_id,
+                    run_type="manual",
+                    state="failed",
+                )
+            )
+            session.flush()
+            for task_id, state, try_number in (
+                ("freeze", "success", 1),
+                ("discover", "failed", 1),
+                ("capture", "upstream_failed", 0),
+                ("generate", "upstream_failed", 0),
+                ("verify", "upstream_failed", 0),
+                ("publish", "upstream_failed", 0),
+            ):
+                session.execute(
+                    TaskInstance.__table__.insert().values(
+                        dag_id=DAG_ID,
+                        run_id=self.dag_run_id,
+                        task_id=task_id,
+                        map_index=-1,
+                        state=state,
+                        try_number=try_number,
+                        pool="default_pool",
+                        pool_slots=1,
+                    )
+                )
+            session.commit()
+        self.log = self.evidence / f"bound-native-{uuid_module.uuid4().hex[:8]}.json"
+        self.log.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.job/v1",
+                    "pipeline_id": "solidworks-to-urdf",
+                    "run_id": self.run_id,
+                    "request": {
+                        "run_id": self.run_id,
+                        "main_assembly": "3.0 总装.SLDASM",
+                        "upload_sha256": self.upload_sha,
+                        "upload_files": self.upload_files,
+                    },
+                    "selection": {
+                        "state": "reading",
+                        "staged_files": self.upload_files,
+                        "upload_sha256": self.upload_sha,
+                    },
+                    "status": "failed",
+                    "error": "SelectionError: the staged main opened with CAD-reported errors",
+                    "error_code": "selection_open_errors",
+                    "detail": {
+                        "open_status": {"errors": 2, "warnings": 1},
+                        "problems": [
+                            {
+                                "code": "selection_open_errors",
+                                "document": "3.0 总装.SLDASM",
+                                "message": "the staged main opened with CAD-reported errors",
+                            }
+                        ],
+                    },
+                    "events": [
+                        {
+                            "stage": "freeze",
+                            "state": "failed",
+                            "error": "SelectionError: the staged main opened with CAD-reported errors",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.bound_reconcile = {
+            "operation_key": f"operatorctl-reconcile:{self.run_id}:discover:failed",
+            "evidence": [str(self.log)],
+            "params_digest": pipeline_digest(
+                {
+                    "outcome": "failed",
+                    "evidence": [str(self.log)],
+                    "binding": {
+                        "operation_id": self.native_operation_id,
+                        "task_id": "discover",
+                        "map_index": -1,
+                    },
+                    "reported_stage": "freeze",
+                }
+            ),
+            "binding": {
+                "operation_id": self.native_operation_id,
+                "task_id": "discover",
+                "map_index": -1,
+            },
+            "native_receipt": {"path": str(self.log), "native_run_id": self.run_id},
+            "reported_stage": "freeze",
+        }
+
+    def _bound_rows(self) -> dict:
+        import psycopg2
+
+        with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT stage, state FROM stage WHERE run_id=%s ORDER BY stage", (self.run_id,))
+            stages = cursor.fetchall()
+            cursor.execute(
+                "SELECT operation_key, stage, kind, state, task_id, map_index"
+                " FROM operation WHERE run_id=%s ORDER BY kind, operation_key",
+                (self.run_id,),
+            )
+            operations = cursor.fetchall()
+            cursor.execute("SELECT state FROM run WHERE run_id=%s", (self.run_id,))
+            run_state = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT kind, payload FROM run_event WHERE run_id=%s ORDER BY seq",
+                (self.run_id,),
+            )
+            events = cursor.fetchall()
+        return {"stages": stages, "operations": operations, "run_state": run_state, "events": events}
+
+    def test_bound_native_discover_closes_and_replays_atomically(self) -> None:
+        self._prepare_bound_native_discover()
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self.bound_reconcile,
+        )
+        rows = self._bound_rows()
+        self.assertEqual(
+            rows["stages"],
+            [
+                ("capture", "blocked"),
+                ("discover", "failed"),
+                ("freeze", "completed"),
+                ("generate", "blocked"),
+                ("publish", "blocked"),
+                ("verify", "blocked"),
+            ],
+        )
+        self.assertEqual(rows["run_state"], "failed")
+        operations = {row[0]: row for row in rows["operations"]}
+        self.assertEqual(operations[self.native_operation_key][3], "failed")
+        self.assertEqual(
+            operations[f"operatorctl-reconcile:{self.run_id}:discover:failed"][3],
+            "succeeded",
+        )
+        receipt = self.store.stage_records(self.run_id)["discover"]["receipt"]
+        self.assertEqual(receipt["reported_stage"], "freeze")
+        self.assertEqual(receipt["actual_stage"], "discover")
+        self.assertEqual(receipt["native_receipt_sha256"], _sha256(self.log))
+        before = self._bound_rows()
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="failed",
+            reconcile=self.bound_reconcile,
+        )
+        self.assertEqual(self._bound_rows(), before, "the identical recovery is a no-op")
+
+    def test_bound_native_discover_refuses_a_green_discover_task_with_zero_writes(self) -> None:
+        self._prepare_bound_native_discover()
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+
+        with Session() as session:
+            session.query(TaskInstance).filter_by(
+                dag_id=DAG_ID, run_id=self.dag_run_id, task_id="discover", map_index=-1
+            ).update({"state": "success"})
+            session.commit()
+        before = self._bound_rows()
+        with self.assertRaisesRegex(Exception, "real discover task"):
+            self.store.confirm_stage(
+                run_id=self.run_id,
+                stage="discover",
+                state="failed",
+                reconcile=self.bound_reconcile,
+            )
+        self.assertEqual(self._bound_rows(), before, "a conflicting Airflow fact performs zero writes")
+
     def test_freeze_intent_closes_atomically_and_replays_without_writes(self) -> None:
         self.store.confirm_stage(
             run_id=self.run_id,

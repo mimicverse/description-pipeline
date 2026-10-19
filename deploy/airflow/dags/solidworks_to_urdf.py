@@ -416,6 +416,17 @@ def _converge_failed_stage(
             platform, store_root = bound_platform, bound_store_root
             if store_root is None:
                 raise AirflowFailException("failure convergence has no controlled store root")
+        current = ((platform.stage_records(run_id) or {}).get(stage) or {}).get("state")
+        if current in {"completed", "failed", "cancelled", "blocked", "unresolved"}:
+            if current == "failed":
+                _register_blocked_downstream(platform, run_id, stage)
+            log.error(
+                "failure convergence refused to overwrite terminal stage run=%s stage=%s state=%s",
+                run_id,
+                stage,
+                current,
+            )
+            return
         if tree is None and products:
             try:
                 tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir, stage)
@@ -661,18 +672,37 @@ def _register_freeze_stage(
     request_id: str,
     intake: Path,
     upload_files: dict[str, str],
+    main_assembly: str | None = None,
     config_digest: str,
 ) -> None:
-    """Seal the admitted originals with the frozen request evidence and confirm the freeze stage."""
+    """Run the shared freeze checks, seal the admitted originals and confirm the stage."""
     platform, store_root = _platform_binding(config_digest)
-    request = platform.request_record(request_id)
-    baseline = request.get("baseline") if isinstance(request, dict) else None
-    admitted_digest = str((baseline or {}).get("platform_config_digest") or "").strip()
-    if admitted_digest != config_digest:
-        raise AirflowFailException("The admitted request's configuration identity differs from its frozen binding")
-    platform.start_run(run_id)  # the first driver action claims the admitted run
     tree = paths.stage_dir("freeze")
     try:
+        platform.start_run(run_id)  # the first driver action claims the admitted run
+        _assert_accepted_freeze_request(
+            platform,
+            request_id,
+            config_digest=config_digest,
+            intake=intake,
+            upload_files=upload_files,
+            main_assembly=main_assembly,
+        )
+        if platform.confirmed_stage(run_id, "freeze") is None:
+            from description_pipeline import steps
+
+            steps.freeze_inputs(
+                intake,
+                digest(upload_files),
+                upload_files,
+                main_assembly=main_assembly,
+                on_event=lambda event: platform.append_event(
+                    run_id,
+                    stage="freeze",
+                    kind="stage",
+                    payload=event,
+                ),
+            )
         if not (tree / "manifest.json").is_file():
             _ensure_subject_layout(tree)
             for name in upload_files:
@@ -680,15 +710,21 @@ def _register_freeze_stage(
                 target = confined(tree, f"input/{name}", exists=False)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
-            request = paths.run_dir / "input" / "request.json"
-            if not request.is_file():
+            request_path = paths.run_dir / "input" / "request.json"
+            if not request_path.is_file():
                 raise AirflowFailException("The freeze stage carries no frozen input/request.json")
-            shutil.copy2(request, tree / "input" / "request.json")
+            shutil.copy2(request_path, tree / "input" / "request.json")
             write_json(
                 tree / "input" / "handoff.json", {"passed": True, "package_files": dict(sorted(upload_files.items()))}
             )
             contract, policy = _delivery_manifest_arguments()
             write_delivery_manifest(tree, contract=contract, policy=policy)
+        for name, expected in upload_files.items():
+            target = confined(tree, f"input/{name}")
+            if not target.is_file() or file_digest(target) != expected:
+                raise AirflowFailException(
+                    f"The frozen copy of {name!r} differs from the admitted intake inventory"
+                )
         receipt = {"tool": read_data(tree / "tool.json")}
         _seal_and_confirm(platform, store_root, run_id, "freeze", tree, receipt, state="completed")
     except Exception as error:
@@ -697,9 +733,60 @@ def _register_freeze_stage(
             "freeze",
             error,
             tree=tree if (tree / "manifest.json").is_file() else None,
-            config_digest=config_digest,
+            bound_platform=platform,
+            bound_store_root=store_root,
         )
         raise
+
+
+def _accepted_request_facts(request_row: dict) -> tuple[str, str]:
+    """The target and purpose from one admitted request row; no trigger fallback."""
+
+    if not isinstance(request_row, dict):
+        raise AirflowFailException("The admitted request has no registered row")
+    target = str(request_row.get("target_hardware") or "").strip()
+    purpose = request_row.get("purpose")
+    if not target:
+        raise AirflowFailException("The admitted request carries no target hardware")
+    if purpose not in REQUEST_PURPOSES:
+        raise AirflowFailException("The admitted request carries no valid purpose")
+    return target, purpose
+
+
+def _assert_accepted_freeze_request(
+    platform: PlatformStore,
+    request_id: str,
+    *,
+    config_digest: str,
+    intake: Path,
+    upload_files: dict[str, str],
+    main_assembly: str | None,
+) -> dict:
+    """Bind freeze to the request row that admitted these exact native bytes."""
+
+    request_row = platform.request_record(request_id)
+    _accepted_request_facts(request_row)
+    baseline = request_row.get("baseline")
+    if not isinstance(baseline, dict):
+        raise AirflowFailException("The admitted request carries no sealed intake baseline")
+    if baseline.get("platform_config_digest") != config_digest:
+        raise AirflowFailException("The admitted request's configuration identity differs from its frozen binding")
+    expected_digest = digest(upload_files)
+    if baseline.get("handoff_sha256") != expected_digest:
+        raise AirflowFailException("The admitted request binds a different native handoff digest")
+    accepted_files = baseline.get("files")
+    if type(accepted_files) is not int or accepted_files != len(upload_files):
+        raise AirflowFailException("The admitted request binds a different native file count")
+    actual_files = package_inventory(intake)
+    if actual_files != upload_files:
+        raise AirflowFailException("The sealed intake differs from the admitted native file inventory")
+    actual_bytes = sum(confined(intake, name).stat().st_size for name in actual_files)
+    if baseline.get("bytes") != actual_bytes:
+        raise AirflowFailException("The admitted request binds a different native byte count")
+    accepted_main = request_row.get("main_assembly")
+    if not isinstance(accepted_main, str) or not accepted_main or accepted_main != main_assembly:
+        raise AirflowFailException("The admitted request binds a different main assembly")
+    return request_row
 
 
 def _register_native_stages(
@@ -807,15 +894,17 @@ def _release_registered_cache(
 
 
 def _failed_native_stage(job: dict) -> str:
-    """The engineering stage a terminal native failure belongs to (fallback: capture)."""
-    try:
-        view = stage_view(job)
-    except Exception:  # pragma: no cover - a malformed view never hides the failure
-        return "capture"
-    for row in view.get("stages") or []:
-        if row.get("id") in STAGE_IDS and row.get("state") == "failed":
-            return row["id"]
-    return "capture"
+    """The engineering stage of the terminal native event (fallback: capture)."""
+
+    events = [
+        event
+        for event in job.get("events") or []
+        if isinstance(event, dict) and event.get("stage") in STAGE_IDS
+    ]
+    for event in reversed(events):
+        if event.get("state") == "failed":
+            return event["stage"]
+    return events[-1]["stage"] if events else "capture"
 
 
 def _boundary_failure(message: str, source: dict) -> AirflowFailException:
@@ -957,7 +1046,11 @@ def _linked_purpose(context, parent_record: dict) -> str:
 
 
 def _submission_frame(
-    context, purpose: str | None = None, *, config_digest: str | None = None
+    context,
+    purpose: str | None = None,
+    *,
+    config_digest: str | None = None,
+    accepted_target: str | None = None,
 ) -> tuple[dict, dict, EndpointConfig]:
     """The submission identity and configured target routing of one trigger.
 
@@ -969,7 +1062,11 @@ def _submission_frame(
     rebinds ``repository_slug``/``repository_base`` from.
     """
 
-    conf, target, summary, principal, config, routing = _submission_basics(context, config_digest=config_digest)
+    conf, target, summary, principal, config, routing = _submission_basics(
+        context,
+        config_digest=config_digest,
+        accepted_target=accepted_target,
+    )
     declared_purpose = str(purpose or conf.get("purpose") or context["params"].get("purpose") or "").strip()
     if declared_purpose not in REQUEST_PURPOSES:
         raise AirflowFailException(
@@ -994,7 +1091,7 @@ def _submission_frame(
     return identity, routing, config
 
 
-def _submission_basics(context, *, config_digest: str | None = None):
+def _submission_basics(context, *, config_digest: str | None = None, accepted_target: str | None = None):
     """The validated target/summary/actor frame of one trigger, without a purpose.
 
     The target and the change summary are required (conf first, then params): a
@@ -1007,7 +1104,17 @@ def _submission_basics(context, *, config_digest: str | None = None):
 
     conf = getattr(context["dag_run"], "conf", None)
     conf = conf if isinstance(conf, dict) else {}
-    target = str(conf.get("target_hardware") or context["params"].get("target_hardware") or "").strip()
+    triggered_target = str(conf.get("target_hardware") or context["params"].get("target_hardware") or "").strip()
+    if accepted_target is not None:
+        if not isinstance(accepted_target, str) or not accepted_target:
+            raise AirflowFailException("The admitted request carries no target hardware")
+        if not triggered_target:
+            raise AirflowFailException("target_hardware is required by the admitted request")
+        if triggered_target != accepted_target:
+            raise AirflowFailException("The trigger target does not match the admitted request target")
+        target = accepted_target
+    else:
+        target = triggered_target
     summary = normalize_change_summary(
         str(conf.get("change_summary") or context["params"].get("change_summary") or "")
     ).strip()
@@ -1124,6 +1231,7 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         raise AirflowFailException("The admitted child does not bind this parent and the freeze boundary")
     config_digest = _admitted_config_digest(platform, run_id, child["request_id"])
     child_request = platform.request_record(child["request_id"])
+    accepted_target, accepted_purpose = _accepted_request_facts(child_request)
     conf = getattr(context["dag_run"], "conf", None)
     conf = conf if isinstance(conf, dict) else {}
     parent_dag_run_id = str(conf.get("parent_dag_run_id") or "").strip()
@@ -1148,11 +1256,14 @@ def _linked_freeze_request(context, linked: dict) -> dict:
             "conf platform_config_digest does not match the parent's frozen configuration identity"
         )
     purpose = str(conf.get("purpose") or context["params"].get("purpose") or "").strip()
-    if purpose != resolved.purpose:
+    if purpose != resolved.purpose or purpose != accepted_purpose:
         raise AirflowFailException("A linked freeze retry must keep the parent's purpose")
     supplied = conf.get("main_assembly") or context["params"].get("main_assembly") or None
-    if supplied and validate_main_assembly(supplied) != resolved.main_assembly:
-        raise AirflowFailException("A linked freeze retry must keep the parent's main assembly")
+    selected_main = child_request.get("main_assembly") if isinstance(child_request, dict) else None
+    if not isinstance(selected_main, str) or not selected_main or selected_main not in resolved.upload_files:
+        raise AirflowFailException("The admitted child names no main assembly in the sealed originals")
+    if supplied and validate_main_assembly(supplied) != selected_main:
+        raise AirflowFailException("The linked freeze trigger differs from the admitted main assembly")
     intake = _endpoint(CONN_ID, config_digest).authorized_intake_dir(handoff_path)
     if Path(intake).resolve() != resolved.intake_path.resolve():
         raise AirflowFailException("The sealed intake is not the registered evidence intake")
@@ -1163,11 +1274,11 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         raise AirflowFailException("The admitted child carries no sealed intake identity")
     if child_baseline.get("handoff_sha256") != resolved.handoff_sha256:
         raise AirflowFailException("The admitted child binds a different upload identity")
-    if child_baseline.get("files") not in (None, resolved.files):
+    if type(child_baseline.get("files")) is not int or child_baseline.get("files") != resolved.files:
         raise AirflowFailException("The admitted child binds a different intake inventory")
-    if child_request.get("main_assembly") not in (None, "", resolved.main_assembly):
+    if child_request.get("main_assembly") != selected_main:
         raise AirflowFailException("The admitted child binds a different main assembly")
-    if child_request.get("purpose") not in (None, resolved.purpose):
+    if accepted_purpose != resolved.purpose:
         raise AirflowFailException("The admitted child binds a different purpose")
     provenance = child_baseline.get("provenance")
     if resolved.provenance is None:
@@ -1181,7 +1292,12 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         and provenance.get("parent_run_id") == resolved.provenance["parent_run_id"]
     ):
         raise AirflowFailException("The admitted child provenance does not match the resolved evidence")
-    identity, _routing, _config = _submission_frame(context, purpose=purpose, config_digest=config_digest)
+    identity, routing, _config = _submission_frame(
+        context,
+        purpose=accepted_purpose,
+        config_digest=config_digest,
+        accepted_target=accepted_target,
+    )
     paths = _work_paths(CONN_ID, run_id, config_digest)
     evidence = freeze_request_evidence(
         paths.run_dir,
@@ -1189,7 +1305,7 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         request_id=child["request_id"],
         target_hardware=identity["hardware_id"],
         change_summary=identity.get("change_summary") or "",
-        main_assembly=resolved.main_assembly,
+        main_assembly=selected_main,
         handoff_digest=resolved.handoff_sha256,
         platform_config_digest=config_digest,
     )
@@ -1197,7 +1313,7 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         "run_id": run_id,
         "upload_files": resolved.upload_files,
         "upload_sha256": resolved.handoff_sha256,
-        "main_assembly": resolved.main_assembly,
+        "main_assembly": selected_main,
         "intake_dir": str(intake),
         "conn_id": CONN_ID,
         "purpose": purpose,
@@ -1205,6 +1321,8 @@ def _linked_freeze_request(context, linked: dict) -> dict:
         "request_evidence": str(evidence),
         "platform_config_digest": config_digest,
         "identity": {**identity, "control_reference": resolved.handoff_sha256},
+        "repository_slug": routing["repository_slug"],
+        "repository_base": routing["base"],
     }
 
 
@@ -1678,8 +1796,13 @@ def solidworks_to_urdf():
                 request_id = _admitted_request_id(context)
                 admitted_platform, _admitted_store = _store_only_platform_binding()
                 admitted_digest = _admitted_config_digest(admitted_platform, run_id, request_id)
+                accepted_target, accepted_purpose = _accepted_request_facts(
+                    admitted_platform.request_record(request_id)
+                )
                 _conf, _target, _summary, _principal, _admitted_config, routing = _submission_basics(
-                    context, config_digest=admitted_digest
+                    context,
+                    config_digest=admitted_digest,
+                    accepted_target=accepted_target,
                 )
                 log.info("freeze fresh admitted config_digest=%s", admitted_digest)
             else:
@@ -1709,6 +1832,7 @@ def solidworks_to_urdf():
                     request_id=request["request_id"],
                     intake=Path(request["intake_dir"]),
                     upload_files=request["upload_files"],
+                    main_assembly=request["main_assembly"],
                     config_digest=request["platform_config_digest"],
                 )
                 return request
@@ -1845,8 +1969,20 @@ def solidworks_to_urdf():
                 raise AirflowFailException(
                     "purpose is required: the admitted request must declare engineering or inspection_preview"
                 )
-            identity, routing, _config = _submission_frame(context, purpose=purpose, config_digest=config_digest)
+            accepted_target, accepted_purpose = _accepted_request_facts(
+                admitted_platform.request_record(request_id)
+            )
+            if purpose != accepted_purpose:
+                raise AirflowFailException("The trigger purpose does not match the admitted request purpose")
+            identity, routing, _config = _submission_frame(
+                context,
+                purpose=accepted_purpose,
+                config_digest=config_digest,
+                accepted_target=accepted_target,
+            )
             request["identity"] = {**identity, "control_reference": request["upload_sha256"]}
+            request["repository_slug"] = routing["repository_slug"]
+            request["repository_base"] = routing["base"]
             paths = _work_paths(CONN_ID, run_id, config_digest)
             evidence = freeze_request_evidence(
                 paths.run_dir,
@@ -1872,6 +2008,7 @@ def solidworks_to_urdf():
             request_id=request["request_id"],
             intake=intake,
             upload_files=upload_files,
+            main_assembly=main,
             config_digest=config_digest,
         )
         return request

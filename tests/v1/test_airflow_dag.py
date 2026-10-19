@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from tests.v1._airflow_env import pinned_airflow_home
 
-from description_pipeline.io import digest
+from description_pipeline.io import digest, file_digest
 from description_pipeline.orchestration.airflow_client import EndpointConfig
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
 
@@ -25,6 +25,30 @@ DAG_DIR = ROOT / "deploy/airflow/dags"
 AIRFLOW_HOME = pinned_airflow_home()
 
 _MIGRATED = False
+
+
+def accepted_freeze_record(
+    intake: Path,
+    upload_files: dict[str, str],
+    config_digest: str,
+    main_assembly: str,
+    *,
+    target_hardware: str = "m3.0",
+    purpose: str = "engineering",
+) -> dict:
+    return {
+        "target_hardware": target_hardware,
+        "main_assembly": main_assembly,
+        "purpose": purpose,
+        "configuration": {"purpose": purpose},
+        "baseline": {
+            "platform_config_digest": config_digest,
+            "handoff_sha256": digest(upload_files),
+            "files": len(upload_files),
+            "bytes": sum((intake / name).stat().st_size for name in upload_files),
+            "folder": intake.name,
+        },
+    }
 
 
 def migrated_airflow_home(venv: Path) -> Path:
@@ -228,14 +252,20 @@ class DagTests(unittest.TestCase):
             "change_summary": "x",
             "request_id": "portal-upload-digest",
         }
-        baseline: dict[str, dict | None] = {"value": None}
+        accepted = {
+            "target_hardware": "m3.0",
+            "main_assembly": "assembly.SLDASM",
+            "purpose": "engineering",
+            "configuration": {"purpose": "engineering"},
+            "baseline": {},
+        }
 
         class Platform:
             def run_record(self, run_id):
                 return {"request_id": "portal-upload-digest"}
 
             def request_record(self, request_id):
-                return {"baseline": baseline["value"]}
+                return accepted
 
         converged = []
         with (
@@ -254,7 +284,14 @@ class DagTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(AirflowFailException, "carries no platform configuration identity"):
                 dag.task_dict["freeze"].python_callable(**context(dict(base)))
-            baseline["value"] = {"platform_config_digest": "a" * 64}
+            accepted.update(
+                accepted_freeze_record(
+                    intake,
+                    {"assembly.SLDASM": file_digest(intake / "assembly.SLDASM")},
+                    "a" * 64,
+                    "assembly.SLDASM",
+                )
+            )
             with self.assertRaisesRegex(AirflowFailException, "does not match"):
                 dag.task_dict["freeze"].python_callable(**context({**base, "platform_config_digest": "b" * 64}))
         self.assertEqual(len(converged), 2, "both early refusals must converge the admitted run as failed")
@@ -307,6 +344,68 @@ class DagTests(unittest.TestCase):
         self.addCleanup(sys.modules.pop, spec.name, None)
         spec.loader.exec_module(module)
         return module
+
+    def _assert_freeze_routing_reaches_publish(self, module, dag, request, store_root):
+        """Carry one real freeze return through capture and into publish."""
+
+        job_request = {
+            key: request[key] for key in ("run_id", "upload_files", "upload_sha256", "main_assembly")
+        }
+        if request.get("resume") is not None:
+            job_request["resume"] = request["resume"]
+        endpoint = SimpleNamespace(
+            get_job=lambda run_id: {
+                "run_id": run_id,
+                "status": "native_complete",
+                "request": job_request,
+            }
+        )
+        native_binding = {
+            "run_id": request["run_id"],
+            "handoff_sha256": request["upload_sha256"],
+            "hardware_id": "m3.0",
+            "revision": "r1",
+            "state": "native",
+        }
+        with (
+            patch.object(module, "_endpoint", return_value=endpoint),
+            patch.object(module, "_platform_binding", return_value=(SimpleNamespace(), store_root)),
+            patch.object(module.native_capture, "import_native_capture", return_value=dict(native_binding)),
+            patch.object(module, "carry_request_evidence", return_value=None),
+            patch.object(module, "_register_native_stages", return_value=None),
+            patch.object(module, "_release_registered_cache", return_value=None),
+        ):
+            binding = dag.task_dict["capture"].python_callable(request)
+        self.assertEqual(binding["repository_slug"], "mimicverse/description")
+        self.assertEqual(binding["repository_base"], "main")
+
+        repository = store_root.parent / "routing-repository"
+        publish_config = SimpleNamespace(repositories={"mimicverse/description": repository})
+        seen: dict = {}
+
+        def portable(run_id, stage, **kwargs):
+            seen.update(run_id=run_id, stage=stage, **kwargs)
+            return {
+                "state": "published",
+                "passed": True,
+                "subject_sha256": "a" * 64,
+                "submission": {"state": "created"},
+            }
+
+        verified = {**binding, "verify": {"subject_sha256": "a" * 64}}
+        with (
+            patch.object(module, "config_from_airflow_connection", return_value=publish_config),
+            patch.object(
+                module,
+                "_work_paths",
+                return_value=SimpleNamespace(output_dir=store_root.parent / "routing-output"),
+            ),
+            patch.object(module, "_portable_registered", side_effect=portable),
+            patch.object(module, "_confirm_delivery", side_effect=lambda value: value),
+        ):
+            dag.task_dict["publish"].python_callable(verified)
+        self.assertEqual(seen["repository"], repository)
+        self.assertEqual(seen["base"], "main")
 
     def test_task_source_identity_reports_the_loaded_dag_file(self) -> None:
         module = self._module()
@@ -586,6 +685,7 @@ class DagTests(unittest.TestCase):
         intake = store_root / "intake"
         intake.mkdir()
         (intake / "assembly.SLDASM").write_bytes(b"assembly")
+        accepted_files = {"assembly.SLDASM": file_digest(intake / "assembly.SLDASM")}
         dag_run_id = "portal-admitted-freeze"
         run_id = native_run_id(dag_run_id)
         request_id = "portal-admitted-request"
@@ -594,11 +694,17 @@ class DagTests(unittest.TestCase):
         confirmed: list[dict] = []
         platform = SimpleNamespace(
             run_record=lambda value: {"request_id": request_id} if value == run_id else None,
-            request_record=lambda value: {"baseline": {"platform_config_digest": baseline_digest}},
+            request_record=lambda value: accepted_freeze_record(
+                intake,
+                accepted_files,
+                baseline_digest,
+                "assembly.SLDASM",
+            ),
             start_run=lambda value: started.append(value),
             confirmed_stage=lambda *args, **kwargs: None,
             confirm_stage=lambda **payload: confirmed.append(payload),
             stage_records=lambda value: {},
+            append_event=lambda *args, **kwargs: None,
         )
         config = EndpointConfig(
             "http://127.0.0.1:1",
@@ -638,10 +744,13 @@ class DagTests(unittest.TestCase):
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
         self.assertEqual(request["platform_config_digest"], baseline_digest)
+        self.assertEqual(request["repository_slug"], "mimicverse/description")
+        self.assertEqual(request["repository_base"], "main")
         self.assertTrue(observed_digests)
         self.assertEqual(set(observed_digests), {baseline_digest})
         self.assertEqual(started, [run_id])
         self.assertEqual([row["stage"] for row in confirmed], ["freeze"])
+        self._assert_freeze_routing_reaches_publish(module, dag, request, store_root)
 
     def test_bad_connection_failure_still_registers_failed_and_blocked_rows(self) -> None:
         import shutil
@@ -661,7 +770,13 @@ class DagTests(unittest.TestCase):
         confirmed: list[dict] = []
         platform = SimpleNamespace(
             run_record=lambda value: {"request_id": request_id} if value == run_id else None,
-            request_record=lambda value: {"baseline": {"platform_config_digest": "a" * 64}},
+            request_record=lambda value: {
+                "target_hardware": "m3.0",
+                "main_assembly": "",
+                "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
+                "baseline": {"platform_config_digest": "a" * 64},
+            },
             start_run=lambda value: started.append(value),
             confirm_stage=lambda **payload: confirmed.append(payload),
             stage_records=lambda value: {},
@@ -967,6 +1082,7 @@ class DagTests(unittest.TestCase):
         intake = store_root / "intake" / "M3.0.3"
         (intake / "parts").mkdir(parents=True)
         (intake / "3.0 总装.SLDASM").write_bytes(b"assembly-bytes")
+        (intake / "M3.0.3_20261016.SLDASM").write_bytes(b"delivery-assembly-bytes")
         (intake / "parts" / "bracket.SLDPRT").write_bytes(b"part-bytes")
         upload_files = validate_file_index(package_inventory(intake))
         upload_sha = digest(upload_files)
@@ -1021,15 +1137,17 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装.SLDASM",
                 "sealed_at": None,
                 "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
                 "baseline": baseline,
             },
             f"portal-{child_dag_run_id}": {
                 "request_id": f"portal-{child_dag_run_id}",
                 "principal": "cli_smoke:smoke-tenant:ou_smoke",
                 "target_hardware": "m3.0",
-                "main_assembly": "3.0 总装.SLDASM",
+                "main_assembly": "M3.0.3_20261016.SLDASM",
                 "sealed_at": None,
                 "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
                 "baseline": baseline,
             },
         }
@@ -1061,6 +1179,9 @@ class DagTests(unittest.TestCase):
             def confirm_stage(self, **kwargs):
                 confirmed.append(kwargs)
 
+            def append_event(self, run_id, *, stage, kind, payload=None):
+                return None
+
         class Stub:
             def authorized_intake_dir(self, handoff_path):
                 self.seen = handoff_path
@@ -1076,6 +1197,7 @@ class DagTests(unittest.TestCase):
                     "purpose": "engineering",
                     "target_hardware": "m3.0",
                     "change_summary": "freeze retry",
+                    "main_assembly": "M3.0.3_20261016.SLDASM",
                 },
                 run_id=child_dag_run_id,
                 triggering_user_name=build_actor_name("cli_smoke:smoke-tenant:ou_smoke", "smoke"),
@@ -1101,15 +1223,20 @@ class DagTests(unittest.TestCase):
         self.assertEqual(request["run_id"], child_run_id)
         self.assertEqual(request["upload_files"], upload_files)
         self.assertEqual(request["upload_sha256"], upload_sha)
-        self.assertEqual(request["main_assembly"], "3.0 总装.SLDASM")
+        self.assertEqual(request["repository_slug"], "mimicverse/description")
+        self.assertEqual(request["repository_base"], "main")
+        self.assertEqual(request["main_assembly"], "M3.0.3_20261016.SLDASM")
         self.assertEqual(request["request_id"], f"portal-{child_dag_run_id}")
         # The child is a fresh native leg re-sealed from the same intake: no resume binding.
         self.assertNotIn("resume", request)
         self.assertNotIn("linux_owned", request)
+        self._assert_freeze_routing_reaches_publish(module, dag, request, store_root)
         self.assertIs(confirmed[-1]["state"], "completed")
         self.assertEqual(confirmed[-1]["run_id"], child_run_id)
         sealed_request = read_data(store_root / "sealed" / child_run_id / "freeze" / "input" / "request.json")
         self.assertEqual(sealed_request["handoff_digest"], upload_sha)
+        self.assertEqual(sealed_request["main_assembly"], "M3.0.3_20261016.SLDASM")
+        self.assertEqual(requests[f"portal-{parent_dag_run_id}"]["main_assembly"], "3.0 总装.SLDASM")
         self.assertEqual(sealed_request["request_id"], f"portal-{child_dag_run_id}")
         self.assertTrue((store_root / "sealed" / child_run_id / "freeze" / "input" / "handoff.json").is_file())
         # A forged purpose refuses and converges the child as a failed freeze.
@@ -1256,6 +1383,7 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装.SLDASM",
                 "sealed_at": None,
                 "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
                 "baseline": None,
             },
             f"portal-{child_dag_run_id}": {
@@ -1265,6 +1393,7 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装.SLDASM",
                 "sealed_at": None,
                 "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
                 "baseline": dict(baseline),
             },
         }
@@ -1298,6 +1427,9 @@ class DagTests(unittest.TestCase):
 
             def confirm_stage(self, **kwargs):
                 confirmed.append(kwargs)
+
+            def append_event(self, run_id, *, stage, kind, payload=None):
+                return None
 
         class Stub:
             def authorized_intake_dir(self, handoff_path):
@@ -1335,6 +1467,8 @@ class DagTests(unittest.TestCase):
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
         self.assertEqual(request["upload_sha256"], upload_sha)
+        self.assertEqual(request["repository_slug"], "mimicverse/description")
+        self.assertEqual(request["repository_base"], "main")
         self.assertEqual(request["main_assembly"], "3.0 总装.SLDASM")
         self.assertNotIn("resume", request)
         self.assertIs(confirmed[-1]["state"], "completed")
@@ -1453,6 +1587,7 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装.SLDASM",
                 "sealed_at": None,
                 "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
                 "baseline": dict(baseline),
             },
             f"portal-{child_dag_run_id}": {
@@ -1462,6 +1597,7 @@ class DagTests(unittest.TestCase):
                 "main_assembly": "3.0 总装.SLDASM",
                 "sealed_at": None,
                 "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
                 "baseline": dict(baseline),
             },
         }
@@ -1492,6 +1628,9 @@ class DagTests(unittest.TestCase):
 
             def confirm_stage(self, **kwargs):
                 confirmed.append(kwargs)
+
+            def append_event(self, run_id, *, stage, kind, payload=None):
+                return None
 
         class Stub:
             def authorized_intake_dir(self, handoff_path):
@@ -1528,6 +1667,8 @@ class DagTests(unittest.TestCase):
         ):
             request = dag.task_dict["freeze"].python_callable(**context)
         self.assertEqual(request["upload_sha256"], upload_sha)
+        self.assertEqual(request["repository_slug"], "mimicverse/description")
+        self.assertEqual(request["repository_base"], "main")
         self.assertNotIn("resume", request)
         self.assertIs(confirmed[-1]["state"], "completed")
         sealed_request = read_data(store_root / "sealed" / child_run_id / "freeze" / "input" / "request.json")
@@ -1668,6 +1809,7 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.registered: list[dict] = []
         self.claimed: list[dict] = []
         self.sequence: list[str] = []
+        self.accepted_request: dict | None = None
 
         def register_operation(**payload):
             self.registered.append(payload)
@@ -1681,9 +1823,8 @@ class PlatformRegistrationTests(unittest.TestCase):
         platform = SimpleNamespace(
             confirm_stage=lambda **payload: self.calls.append(payload),
             confirmed_stage=lambda *args, **kwargs: None,
-            request_record=lambda request_id: {
-                "baseline": {"platform_config_digest": "c" * 64},
-            },
+            stage_records=lambda run_id: {},
+            request_record=lambda request_id: self.accepted_request,
             start_run=lambda run_id: self.started.append(run_id),
             append_event=lambda run_id, *, stage, kind, payload=None: self.live_events.append(
                 {"run_id": run_id, "stage": stage, "kind": kind, "payload": payload}
@@ -1801,7 +1942,6 @@ class PlatformRegistrationTests(unittest.TestCase):
 
     def test_the_freeze_stage_seals_the_admitted_originals(self) -> None:
         from description_pipeline.delivery import read_delivery_manifest
-        from description_pipeline.io import digest as io_digest
 
         run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
         (run_dir / "input").mkdir(parents=True)
@@ -1810,7 +1950,16 @@ class PlatformRegistrationTests(unittest.TestCase):
         (intake / "cad").mkdir(parents=True)
         (intake / "cad" / "part.sldprt").write_bytes(b"cad-bytes")
         (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
-        upload_files = {"assembly.sldasm": "a" * 64, "cad/part.sldprt": "b" * 64}
+        upload_files = {
+            "assembly.sldasm": file_digest(intake / "assembly.sldasm"),
+            "cad/part.sldprt": file_digest(intake / "cad" / "part.sldprt"),
+        }
+        self.accepted_request = accepted_freeze_record(
+            intake,
+            upload_files,
+            "c" * 64,
+            "assembly.sldasm",
+        )
         from description_pipeline.platform import flow
 
         paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
@@ -1821,19 +1970,220 @@ class PlatformRegistrationTests(unittest.TestCase):
             request_id="portal-freeze",
             intake=intake,
             upload_files=upload_files,
+            main_assembly="assembly.sldasm",
             config_digest="c" * 64,
         )
         call = self.calls[0]
         self.assertEqual(call["stage"], "freeze")
         self.assertEqual(call["state"], "completed")
         self.assertEqual(call["receipt"]["state"], "frozen")
-        self.assertEqual(call["receipt"]["handoff_sha256"], io_digest(upload_files))
+        self.assertEqual(call["receipt"]["handoff_sha256"], digest(upload_files))
         tree = stages / "freeze"
         self.assertTrue((tree / "input" / "cad" / "part.sldprt").is_file())
         self.assertTrue((tree / "input" / "assembly.sldasm").is_file())
         self.assertTrue((tree / "input" / "request.json").is_file())
         manifest = read_delivery_manifest(tree)
         self.assertIn("input/assembly.sldasm", {record["path"] for record in manifest["subject"]["files"]})
+        checks = [
+            event["payload"]["check"]
+            for event in self.live_events
+            if isinstance(event["payload"], dict) and isinstance(event["payload"].get("check"), dict)
+        ]
+        self.assertEqual(
+            [(item["boundary"], item["id"], item["state"]) for item in checks],
+            [
+                ("input", "handoff.admission", "passed"),
+                ("output", "handoff.integrity", "passed"),
+            ],
+        )
+        view = self.module.stage_view(
+            {
+                "run_id": "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d",
+                "request": {"handoff_sha256": digest(upload_files)},
+                "events": [
+                    {"stage": event["stage"], **event["payload"]}
+                    for event in self.live_events
+                ],
+            }
+        )
+        freeze = next(stage for stage in view["stages"] if stage["id"] == "freeze")
+        self.assertEqual(freeze["state"], "completed")
+        self.assertEqual(freeze["checks_passed"], 2)
+
+    def test_freeze_refuses_missing_or_changed_original_bytes(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.platform import flow
+
+        run_id = "1f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
+        intake = Path(self.temporary.name) / "intake-refusal"
+        intake.mkdir()
+        (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
+        (intake / "part.sldprt").write_bytes(b"part-bytes")
+        expected = {
+            "assembly.sldasm": file_digest(intake / "assembly.sldasm"),
+            "part.sldprt": file_digest(intake / "part.sldprt"),
+        }
+        self.accepted_request = accepted_freeze_record(
+            intake,
+            expected,
+            "c" * 64,
+            "assembly.sldasm",
+        )
+        run_dir = Path(self.temporary.name) / "runs" / run_id
+        (run_dir / "input").mkdir(parents=True)
+        (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        paths = flow.RunPaths(run_dir.parent, run_id)
+
+        with self.assertRaises(AirflowFailException):
+            self.module._register_freeze_stage(
+                paths,
+                run_id,
+                request_id="portal-freeze",
+                intake=intake,
+                upload_files={"assembly.sldasm": expected["assembly.sldasm"]},
+                main_assembly="assembly.sldasm",
+                config_digest="c" * 64,
+            )
+        self.assertFalse(any(call["state"] == "completed" for call in self.calls))
+
+    def test_freeze_requires_every_admitted_request_fact(self) -> None:
+        import copy
+
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.platform import flow
+
+        run_id = "2f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
+        intake = Path(self.temporary.name) / "intake-admission"
+        intake.mkdir()
+        (intake / "assembly.SLDASM").write_bytes(b"assembly-bytes")
+        upload_files = {"assembly.SLDASM": file_digest(intake / "assembly.SLDASM")}
+        accepted = accepted_freeze_record(intake, upload_files, "c" * 64, "assembly.SLDASM")
+        run_dir = Path(self.temporary.name) / "runs" / run_id
+        (run_dir / "input").mkdir(parents=True)
+        (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        paths = flow.RunPaths(run_dir.parent, run_id)
+        mutations = {
+            "handoff": lambda row: row["baseline"].__setitem__("handoff_sha256", "f" * 64),
+            "files": lambda row: row["baseline"].__setitem__("files", 99),
+            "bytes": lambda row: row["baseline"].__setitem__("bytes", row["baseline"]["bytes"] + 1),
+            "main": lambda row: row.__setitem__("main_assembly", "other.SLDASM"),
+            "target": lambda row: row.__setitem__("target_hardware", ""),
+            "purpose": lambda row: row.__setitem__("purpose", "other"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                self.calls.clear()
+                self.live_events.clear()
+                self.accepted_request = copy.deepcopy(accepted)
+                mutate(self.accepted_request)
+                with self.assertRaises(AirflowFailException):
+                    self.module._register_freeze_stage(
+                        paths,
+                        run_id,
+                        request_id="portal-freeze",
+                        intake=intake,
+                        upload_files=upload_files,
+                        main_assembly="assembly.SLDASM",
+                        config_digest="c" * 64,
+                    )
+                self.assertFalse(any(call["state"] == "completed" for call in self.calls))
+
+    def test_a_baseline_refusal_converges_fresh_and_linked_registration(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.platform import flow
+        from description_pipeline.platform.store import PlatformStore
+        from tests.v1.test_platform_store import FakeWorld
+
+        intake = Path(self.temporary.name) / "intake-baseline-refusal"
+        intake.mkdir()
+        (intake / "assembly.SLDASM").write_bytes(b"assembly-bytes")
+        upload_files = {"assembly.SLDASM": file_digest(intake / "assembly.SLDASM")}
+
+        def dispatch(run_id: str) -> dict:
+            return {
+                "stage": "freeze",
+                "operation_key": f"{run_id}/freeze:0",
+                "params_digest": "a" * 64,
+                "dag_id": self.module.DAG_ID,
+                "dag_run_id": f"portal-{run_id}",
+                "task_id": "freeze",
+                "map_index": -1,
+            }
+
+        cases = (
+            ("fresh", None, None),
+            ("linked", "8f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d", "8f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"),
+        )
+        for label, parent_run, parent_reference in cases:
+            with self.subTest(path=label):
+                run_id = (
+                    "6f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
+                    if parent_run is None
+                    else "7f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
+                )
+                world = FakeWorld()
+                store = PlatformStore(world.connect, sealed=lambda uri: self.root / uri)
+                if parent_run is not None:
+                    store.admit_run(
+                        request_id=f"portal-{parent_run}",
+                        run_id=parent_run,
+                        principal="portal",
+                        target_hardware="m3.0",
+                        main_assembly="assembly.SLDASM",
+                        configuration={"purpose": "engineering"},
+                        baseline={
+                            "platform_config_digest": "c" * 64,
+                            "handoff_sha256": digest(upload_files),
+                            "files": len(upload_files),
+                            "bytes": (intake / "assembly.SLDASM").stat().st_size,
+                            "folder": intake.name,
+                        },
+                        dispatch=dispatch(parent_run),
+                    )
+                    world.run_states[parent_run] = "failed"
+                request_id = f"portal-{run_id}"
+                store.admit_run(
+                    request_id=request_id,
+                    run_id=run_id,
+                    principal="portal",
+                    target_hardware="m3.0",
+                    main_assembly="assembly.SLDASM",
+                    configuration={"purpose": "engineering"},
+                    baseline={
+                        "platform_config_digest": "c" * 64,
+                        "handoff_sha256": "f" * 64,
+                        "files": len(upload_files),
+                        "bytes": (intake / "assembly.SLDASM").stat().st_size,
+                        "folder": intake.name,
+                    },
+                    dispatch=dispatch(run_id),
+                    from_stage="freeze" if parent_reference is not None else None,
+                    parent_run_id=parent_reference,
+                )
+                paths = flow.RunPaths(self.root, run_id)
+                with (
+                    patch.object(self.module, "_platform_binding", return_value=(store, self.root)),
+                    self.assertRaises(AirflowFailException) as caught,
+                ):
+                    self.module._register_freeze_stage(
+                        paths,
+                        run_id,
+                        request_id=request_id,
+                        intake=intake,
+                        upload_files=upload_files,
+                        main_assembly="assembly.SLDASM",
+                        config_digest="c" * 64,
+                    )
+                self.assertIn("different native handoff digest", str(caught.exception))
+                records = store.stage_records(run_id)
+                self.assertEqual(records["freeze"]["state"], "failed")
+                self.assertIn("different native handoff digest", records["freeze"]["receipt"]["error"])
+                self.assertEqual(
+                    [records[stage]["state"] for stage in ("discover", "capture", "generate", "verify", "publish")],
+                    ["blocked", "blocked", "blocked", "blocked", "blocked"],
+                )
+                self.assertEqual(store.run_record(run_id)["state"], "failed")
+                self.assertEqual(world.operations[f"{run_id}/freeze:0"][1], "failed")
 
     def test_the_freeze_stage_starts_the_admitted_run(self) -> None:
         run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
@@ -1842,6 +2192,13 @@ class PlatformRegistrationTests(unittest.TestCase):
         intake = Path(self.temporary.name) / "intake-start"
         intake.mkdir()
         (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
+        upload_files = {"assembly.sldasm": file_digest(intake / "assembly.sldasm")}
+        self.accepted_request = accepted_freeze_record(
+            intake,
+            upload_files,
+            "c" * 64,
+            "assembly.sldasm",
+        )
         from description_pipeline.platform import flow
 
         paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
@@ -1850,7 +2207,8 @@ class PlatformRegistrationTests(unittest.TestCase):
             "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d",
             request_id="portal-freeze",
             intake=intake,
-            upload_files={"assembly.sldasm": "a" * 64},
+            upload_files=upload_files,
+            main_assembly="assembly.sldasm",
             config_digest="c" * 64,
         )
         self.assertEqual(self.started, ["0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"])
@@ -1880,7 +2238,13 @@ class PlatformRegistrationTests(unittest.TestCase):
         admitted_request = {"value": "portal-early-digest"}
         platform = SimpleNamespace(
             run_record=lambda run_id: {"request_id": admitted_request["value"]},
-            request_record=lambda request_id: {"baseline": {"platform_config_digest": "a" * 64}},
+            request_record=lambda request_id: {
+                "target_hardware": "m3.0",
+                "main_assembly": "",
+                "purpose": "engineering",
+                "configuration": {"purpose": "engineering"},
+                "baseline": {"platform_config_digest": "a" * 64},
+            },
             start_run=lambda run_id: self.started.append(run_id),
             confirm_stage=lambda **payload: self.calls.append(payload),
             stage_records=lambda run_id: {},
@@ -2173,13 +2537,14 @@ class PlatformRegistrationTests(unittest.TestCase):
         intake = Path(self.temporary.name) / "intake-retry"
         intake.mkdir()
         (intake / "assembly.sldasm").write_bytes(b"assembly-bytes")
-        upload_files = {"assembly.sldasm": "a" * 64}
+        upload_files = {"assembly.sldasm": file_digest(intake / "assembly.sldasm")}
         from description_pipeline.platform import flow
 
         paths = flow.RunPaths(run_dir.parent, "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d")
 
         records: dict[tuple[str, str], dict] = {}
         confirmations: list[str] = []
+        events: list[dict] = []
 
         class _RetainingPlatform:
             def start_run(self, run_id):
@@ -2192,8 +2557,23 @@ class PlatformRegistrationTests(unittest.TestCase):
             def confirmed_stage(self, run_id, stage):
                 return records.get((run_id, stage))
 
+            def stage_records(self, run_id):
+                return {
+                    stage: {"state": "completed"}
+                    for candidate, stage in records
+                    if candidate == run_id
+                }
+
+            def append_event(self, run_id, *, stage, kind, payload=None):
+                events.append({"run_id": run_id, "stage": stage, "kind": kind, "payload": payload})
+
             def request_record(self, request_id):
-                return {"baseline": {"platform_config_digest": "c" * 64}}
+                return accepted_freeze_record(
+                    intake,
+                    upload_files,
+                    "c" * 64,
+                    "assembly.sldasm",
+                )
 
         platform = _RetainingPlatform()
         with patch.object(self.module, "_platform_binding", return_value=(platform, self.root)):
@@ -2203,6 +2583,7 @@ class PlatformRegistrationTests(unittest.TestCase):
                 request_id="portal-freeze",
                 intake=intake,
                 upload_files=upload_files,
+                main_assembly="assembly.sldasm",
                 config_digest="c" * 64,
             )
             self.module._register_freeze_stage(
@@ -2211,9 +2592,164 @@ class PlatformRegistrationTests(unittest.TestCase):
                 request_id="portal-freeze",
                 intake=intake,
                 upload_files=upload_files,
+                main_assembly="assembly.sldasm",
                 config_digest="c" * 64,
             )
         self.assertEqual(confirmations, ["freeze"])
+        checks = [
+            event["payload"]["check"]["id"]
+            for event in events
+            if isinstance(event["payload"], dict) and isinstance(event["payload"].get("check"), dict)
+        ]
+        self.assertEqual(checks, ["handoff.admission", "handoff.integrity"])
+
+    def test_failed_native_stage_uses_the_terminal_operation_event(self) -> None:
+        job = {
+            "run_id": "run-1",
+            "status": "failed",
+            "events": [
+                {"stage": "freeze", "state": "completed"},
+                {"stage": "discover", "state": "running"},
+                {"stage": "discover", "state": "failed"},
+            ],
+        }
+        self.assertEqual(self.module._failed_native_stage(job), "discover")
+
+    def test_replayed_failed_stage_only_fills_missing_blocked_rows(self) -> None:
+        calls: list[dict] = []
+
+        class _TerminalPlatform:
+            def stage_records(self, run_id):
+                return {"discover": {"state": "failed", "receipt": {"error": "original"}}}
+
+            def confirm_stage(self, **payload):
+                calls.append(payload)
+
+        self.module._converge_failed_stage(
+            "5f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d",
+            "discover",
+            RuntimeError("replayed"),
+            bound_platform=_TerminalPlatform(),
+            bound_store_root=self.root,
+        )
+        self.assertEqual(
+            [(row["stage"], row["state"]) for row in calls],
+            [
+                ("capture", "blocked"),
+                ("generate", "blocked"),
+                ("verify", "blocked"),
+                ("publish", "blocked"),
+            ],
+        )
+
+    def test_native_selection_failure_converges_discover_without_overwriting_freeze(self) -> None:
+        from airflow.sdk.exceptions import AirflowFailException
+        from description_pipeline.platform import flow
+        from description_pipeline.platform.store import PlatformStore
+        from tests.v1.test_platform_store import FakeWorld
+
+        run_id = "4f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
+        request_id = "portal-native-failure"
+        config_digest = "c" * 64
+        world = FakeWorld()
+        store = PlatformStore(
+            world.connect,
+            sealed=lambda uri: self.root / "sealed" / uri.removeprefix("store://sealed/"),
+        )
+        intake = Path(self.temporary.name) / "native-failure-intake"
+        intake.mkdir()
+        (intake / "assembly.SLDASM").write_bytes(b"assembly-bytes")
+        upload_files = {"assembly.SLDASM": file_digest(intake / "assembly.SLDASM")}
+        store.admit_run(
+            request_id=request_id,
+            run_id=run_id,
+            principal="portal",
+            target_hardware="m3.0",
+            main_assembly="assembly.SLDASM",
+            configuration={"purpose": "engineering"},
+            baseline={
+                "platform_config_digest": config_digest,
+                "handoff_sha256": digest(upload_files),
+                "files": len(upload_files),
+                "bytes": (intake / "assembly.SLDASM").stat().st_size,
+                "folder": intake.name,
+            },
+            dispatch={
+                "stage": "freeze",
+                "operation_key": f"{run_id}/freeze:0",
+                "params_digest": "a" * 64,
+                "dag_id": self.module.DAG_ID,
+                "dag_run_id": "portal-native-failure",
+                "task_id": "freeze",
+                "map_index": -1,
+            },
+        )
+        run_dir = self.root / run_id
+        (run_dir / "input").mkdir(parents=True)
+        (run_dir / "input" / "request.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        with patch.object(self.module, "_platform_binding", return_value=(store, self.root)):
+            self.module._register_freeze_stage(
+                flow.RunPaths(self.root, run_id),
+                run_id,
+                request_id=request_id,
+                intake=intake,
+                upload_files=upload_files,
+                main_assembly="assembly.SLDASM",
+                config_digest=config_digest,
+            )
+        operation_key = f"{run_id}/native:0"
+        dispatch = {
+            "dag_id": self.module.DAG_ID,
+            "dag_run_id": "portal-native-failure",
+            "task_id": "discover",
+            "map_index": -1,
+        }
+        store.register_operation(
+            run_id=run_id,
+            stage="discover",
+            kind="native",
+            operation_key=operation_key,
+            params_digest="b" * 64,
+            dispatch=dispatch,
+        )
+        claimed = store.claim_operation(run_id=run_id, stage="discover", operation_key=operation_key)
+        self.assertTrue(claimed.granted)
+
+        failure = AirflowFailException(
+            "SolidWorks job failed: SelectionError: the staged main opened with CAD-reported errors"
+        )
+        failure.code = "selection_open_errors"
+        failure.detail = {
+            "open_status": {"already_open": False, "errors": 2, "warnings": 1, "open_exception": None},
+            "problems": [{"code": "selection_open_errors", "document": "assembly.SLDASM"}],
+        }
+        self.module._converge_failed_stage(
+            run_id,
+            "discover",
+            failure,
+            bound_platform=store,
+            bound_store_root=self.root,
+        )
+
+        records = store.stage_records(run_id)
+        self.assertEqual(records["freeze"]["state"], "completed")
+        self.assertEqual(records["discover"]["state"], "failed")
+        self.assertEqual(records["discover"]["receipt"]["error_code"], "selection_open_errors")
+        self.assertEqual(records["discover"]["receipt"]["detail"], failure.detail)
+        self.assertEqual(
+            [records[stage]["state"] for stage in ("capture", "generate", "verify", "publish")],
+            ["blocked", "blocked", "blocked", "blocked"],
+        )
+        self.assertEqual(store.run_record(run_id)["state"], "failed")
+        settled = store.register_operation(
+            run_id=run_id,
+            stage="discover",
+            kind="native",
+            operation_key=operation_key,
+            params_digest="b" * 64,
+            dispatch=dispatch,
+        )
+        self.assertEqual(settled.state, "failed")
 
     def test_a_failed_registration_tolerates_a_malformed_handoff(self) -> None:
         tree = Path(self.temporary.name) / "malformed"

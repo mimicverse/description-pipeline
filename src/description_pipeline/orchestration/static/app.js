@@ -45,6 +45,7 @@ const state = {
   rerunningRunId: null,
   rerunNotice: null,
   rerunError: null,
+  rerunMainByRun: {},
   runsList: [],
   runView: "active",
   runsNextOffset: null,
@@ -1790,16 +1791,62 @@ function renderRerunPanel(run) {
   const eligible = Boolean(row && row.eligible === true);
   const busy = state.rerunningRunId === runId;
   const deleted = run.deleted === true;
+  const isFreeze = stage.id === "freeze";
+  const options = isFreeze && row && Array.isArray(row.main_assembly_options)
+    ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
+    : [];
+  const savedMain = typeof state.rerunMainByRun[runId] === "string" ? state.rerunMainByRun[runId] : "";
+  const originalMain = typeof run.main_assembly === "string" ? run.main_assembly : "";
+  const selectedMain = options.includes(savedMain)
+    ? savedMain
+    : (options.includes(originalMain) ? originalMain : "");
 
   const line = document.createElement("div");
   line.className = "rerun-row";
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = busy ? "Creating attempt..." : "Rerun from this stage";
-  button.disabled = busy || !canManage || !eligible || deleted;
+  button.textContent = busy
+    ? "Creating attempt..."
+    : (isFreeze ? "Create new request from Freeze" : "Rerun from this stage");
+  button.disabled = busy || !canManage || !eligible || deleted || (isFreeze && !selectedMain);
   button.addEventListener("click", () => {
     void rerunFromStage(stage.id);
   });
+
+  if (isFreeze) {
+    const assemblyLine = document.createElement("div");
+    assemblyLine.className = "rerun-row rerun-assembly";
+    const label = document.createElement("label");
+    label.textContent = "New request from Freeze — main assembly in the sealed upload:";
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", "Main assembly for the new request");
+    if (!options.length) {
+      const unavailable = document.createElement("option");
+      unavailable.value = "";
+      unavailable.textContent = "Verified main assembly list unavailable";
+      unavailable.selected = true;
+      select.append(unavailable);
+      select.disabled = true;
+    } else {
+      for (const name of options) {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        select.append(option);
+      }
+      select.value = selectedMain;
+      select.disabled = busy || !canManage || deleted;
+      select.addEventListener("change", () => {
+        const value = String(select.value || "");
+        if (value) state.rerunMainByRun[runId] = value;
+        else delete state.rerunMainByRun[runId];
+        button.disabled = busy || !canManage || !eligible || deleted || !value;
+      });
+    }
+    assemblyLine.append(label, select);
+    host.append(assemblyLine);
+  }
+
   line.append(button);
 
   const note = document.createElement("span");
@@ -1814,7 +1861,9 @@ function renderRerunPanel(run) {
     // Canonical backend reason shown verbatim whenever the stage is not eligible.
     note.textContent = row.message;
   } else if (eligible) {
-    note.textContent = "This stage and downstream stages will be recomputed. The original run and evidence remain, and the rerun is a new linked run.";
+    note.textContent = isFreeze
+      ? "Freeze creates a new request from the sealed originals; freeze and all later stages rerun. The original run and evidence remain."
+      : "This stage and downstream stages will be recomputed. The original run and evidence remain, and the rerun is a new linked run.";
   } else {
     note.textContent = "Rerun conditions for this stage cannot be confirmed; refresh later.";
   }
@@ -1876,6 +1925,25 @@ async function rerunFromStage(stageId) {
   const run = state.lastRun;
   const runId = state.dagRunId;
   if (!run || !runId || state.rerunningRunId !== null || run.can_manage !== true || !stageId) return;
+  const body = { stage: stageId };
+  let selectedMain = "";
+  if (stageId === "freeze") {
+    const row = (Array.isArray(run.stage_reruns) ? run.stage_reruns : [])
+      .find((item) => item && item.stage === "freeze");
+    const options = row && Array.isArray(row.main_assembly_options)
+      ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
+      : [];
+    selectedMain = typeof state.rerunMainByRun[runId] === "string"
+      ? state.rerunMainByRun[runId]
+      : String(run.main_assembly || "");
+    if (!options.includes(selectedMain)) {
+      state.rerunError = (row && row.message)
+        || "Select a verified main assembly from the sealed originals before creating a new request.";
+      renderRerunPanel(run);
+      return;
+    }
+    body.main_assembly = selectedMain;
+  }
   state.rerunningRunId = runId;
   state.rerunNotice = "";
   state.rerunError = "";
@@ -1883,7 +1951,7 @@ async function rerunFromStage(stageId) {
   try {
     const payload = await api(`/api/runs/${encodeURIComponent(runId)}/attempts`, {
       method: "POST",
-      body: { stage: stageId },
+      body,
     });
     const nextRunId = String(payload.dag_run_id || "");
     const stageToShow = String(payload.resume_from || stageId);
@@ -1891,7 +1959,9 @@ async function rerunFromStage(stageId) {
     if (state.dagRunId !== runId) return; // the operator moved on; the list is refreshed
     if (!nextRunId) {
       const name = payload.resume_from_name || stageId;
-      state.rerunNotice = `Created a new linked run from ${name}; the original run and evidence remain.`;
+      state.rerunNotice = stageId === "freeze"
+        ? `Created a new request from ${name} with main ${selectedMain}; the original run and evidence remain.`
+        : `Created a new linked run from ${name}; the original run and evidence remain.`;
       if (!state.timer) {
         state.timer = window.setInterval(() => {
           void poll();

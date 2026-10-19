@@ -326,7 +326,7 @@ class EndpointFixture:
         archive.write_bytes(b"PK\x03\x04synthetic-transfer")
         write_json(manifest, {"schema_version": "solidworks-to-urdf.transfer/v1", "run_id": run_id})
         if on_event is not None:
-            for event in protocol_events(stages=("freeze", "discover", "capture")):
+            for event in protocol_events(stages=("discover", "capture")):
                 on_event(event)
         return {
             "native_complete": True,

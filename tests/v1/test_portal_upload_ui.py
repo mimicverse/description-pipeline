@@ -197,7 +197,13 @@ class RerunUiContractTests(unittest.TestCase):
         for token in (
             "stage_reruns",
             "/attempts",
-            "body: { stage: stageId }",
+            "const body = { stage: stageId }",
+            "main_assembly_options",
+            "New request from Freeze",
+            "Create new request from Freeze",
+            "Freeze creates a new request from the sealed originals",
+            "body.main_assembly = selectedMain",
+            "state.rerunMainByRun",
             "resume_from_name",
             "parent_dag_run_id",
             "message",
@@ -229,6 +235,7 @@ class RerunUiContractTests(unittest.TestCase):
         # The superseded picker design and its parameter name are gone.
         self.assertNotIn("from_stage", app)
         self.assertNotIn("Retry failed step", app)
+        self.assertNotIn("window.prompt", app)
 
 
 class ReportUiContractTests(unittest.TestCase):

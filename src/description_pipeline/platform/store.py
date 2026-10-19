@@ -124,10 +124,17 @@ class NativeReceiptEvidence:
     sha256: str
     native_run_id: str
     stage: str
+    reported_stage: str
     state: str
     error: str | None
     error_code: str | None
     detail: object
+    request_main_assembly: str | None
+    request_upload_sha256: str | None
+    request_upload_files: dict[str, str] | None
+    selection_state: str | None
+    selection_files: dict[str, str] | None
+    selection_upload_sha256: str | None
 
 
 #: The job contract's final states: a terminal event row is one of these, and only a
@@ -135,15 +142,24 @@ class NativeReceiptEvidence:
 NATIVE_TERMINAL_STATES = frozenset({"passed", "failed"})
 
 
-def load_native_failed_receipt(path: object, *, stage: str, native_run_id: str) -> NativeReceiptEvidence:
+def load_native_failed_receipt(
+    path: object,
+    *,
+    stage: str,
+    native_run_id: str,
+    reported_stage: str | None = None,
+) -> NativeReceiptEvidence:
     """Load and validate one original native failed receipt - the single acceptance source.
 
     The bytes on disk are the authority: they are read once, the receipt digest is
     computed from them, and the parsed document must be the bound endpoint job's own
     terminal failure under the real native job contract (``JOB_SCHEMA``): its identity
     fields name exactly the bound UUID, its request carries the same UUID, its status is
-    ``failed``, and its events carry exactly one terminal row - ``failed`` at the bound
-    stage.  A missing file, malformed bytes, a report-shaped document or any other
+    ``failed``, and its events carry exactly one terminal row - ``failed`` at the reported
+    stage.  The one exceptional reported/actual pairing is the historical selection
+    failure at ``discover`` whose old executor labeled the terminal row as ``freeze``;
+    that shape also requires a selection-read failure with a positive non-boolean error
+    count.  A missing file, malformed bytes, a report-shaped document or any other
     identity/state refuses here, before the store transaction is ever entered; every
     caller (the operator entry and the maintenance route alike) shares this one
     implementation.
@@ -180,7 +196,12 @@ def load_native_failed_receipt(path: object, *, stage: str, native_run_id: str) 
         raise PlatformStoreError("The native receipt must carry exactly one terminal event row")
     if terminal[0].get("state") != "failed":
         raise PlatformStoreError("The native receipt's terminal event is not a failure")
-    if terminal[0].get("stage") != stage:
+    reported_stage = reported_stage if reported_stage is not None else stage
+    if reported_stage != stage and (stage, reported_stage) != ("discover", "freeze"):
+        raise PlatformStoreError(
+            "The native receipt's reported and actual stages are not the one supported recovery shape"
+        )
+    if terminal[0].get("stage") != reported_stage:
         raise PlatformStoreError("The native receipt's terminal event names another stage")
 
     detail = document.get("detail")
@@ -188,16 +209,45 @@ def load_native_failed_receipt(path: object, *, stage: str, native_run_id: str) 
     if not isinstance(error, str) or not error:
         error = document.get("error")
     error_code = document.get("error_code")
+    selection = document.get("selection")
+    if reported_stage != stage:
+        if not isinstance(selection, dict) or selection.get("state") != "reading":
+            raise PlatformStoreError("The reported freeze-stage native failure is not a selection read in progress")
+        if error_code != "selection_open_errors":
+            raise PlatformStoreError("The reported freeze-stage native failure is not a selection-open failure")
+        open_status = detail.get("open_status") if isinstance(detail, dict) else None
+        if (
+            not isinstance(open_status, dict)
+            or type(open_status.get("errors")) is not int
+            or isinstance(open_status.get("errors"), bool)
+            or open_status.get("errors") <= 0
+            or type(open_status.get("warnings")) is not int
+            or isinstance(open_status.get("warnings"), bool)
+            or open_status.get("warnings") < 0
+        ):
+            raise PlatformStoreError("The reported freeze-stage native failure lacks valid selection-open counts")
+    request_files = request.get("upload_files")
+    request_main = request.get("main_assembly")
+    request_upload = request.get("upload_sha256")
+    selection_upload = selection.get("upload_sha256") if isinstance(selection, dict) else None
+    selection_files = selection.get("staged_files") if isinstance(selection, dict) else None
 
     return NativeReceiptEvidence(
         path=str(receipt_path),
         sha256=sha256,
         native_run_id=native_run_id,
         stage=stage,
+        reported_stage=reported_stage,
         state="failed",
         error=error if isinstance(error, str) and error else None,
         error_code=error_code if isinstance(error_code, str) and error_code else None,
         detail=detail,
+        request_main_assembly=request_main if isinstance(request_main, str) and request_main else None,
+        request_upload_sha256=request_upload if isinstance(request_upload, str) and request_upload else None,
+        request_upload_files=request_files if isinstance(request_files, dict) else None,
+        selection_state=selection.get("state") if isinstance(selection, dict) else None,
+        selection_files=selection_files if isinstance(selection_files, dict) else None,
+        selection_upload_sha256=selection_upload if isinstance(selection_upload, str) and selection_upload else None,
     )
 
 
@@ -1363,7 +1413,13 @@ class PlatformStore:
         native_run_id = inputs.get("native_run_id")
         if not isinstance(path, str) or not path or not isinstance(native_run_id, str) or not native_run_id:
             raise PlatformStoreError("The orphan receipt inputs name their original file and endpoint job UUID")
-        loaded = load_native_failed_receipt(path, stage=stage, native_run_id=native_run_id)
+        reported_stage = reconcile.get("reported_stage")
+        loaded = load_native_failed_receipt(
+            path,
+            stage=stage,
+            native_run_id=native_run_id,
+            reported_stage=reported_stage if isinstance(reported_stage, str) and reported_stage else None,
+        )
         digest_entry = f"{loaded.path}#sha256={loaded.sha256}"
         entries = reconcile.get("evidence")
         entries = list(entries) if isinstance(entries, list) else []
@@ -1386,6 +1442,14 @@ class PlatformStore:
             "pipeline_id": PIPELINE_ID,
             "run_id": run_id,
             "stage": loaded.stage,
+            "reported_stage": loaded.reported_stage,
+            "actual_stage": loaded.stage,
+            "request_main_assembly": loaded.request_main_assembly,
+            "request_upload_sha256": loaded.request_upload_sha256,
+            "request_upload_files": loaded.request_upload_files,
+            "selection_state": loaded.selection_state,
+            "selection_files": loaded.selection_files,
+            "selection_upload_sha256": loaded.selection_upload_sha256,
             "state": loaded.state,
             "passed": False,
             "native_run_id": loaded.native_run_id,
@@ -1636,9 +1700,10 @@ class PlatformStore:
     ) -> None:
         """Controlled orphan recovery: bind a queued intent's missing Airflow key, then confirm.
 
-        The one reconcile entry may fill only the missing binding columns of a
-        never-started queued intent (the 1.4.3 pre-candidate shape) from the
-        real Airflow full key the caller evidences.  The receipt must name this
+        The one reconcile entry fills either the missing binding columns of a
+        never-started queued intent (the 1.4.3 pre-candidate shape) or the one
+        exact bound native ``discover`` failure shape from the real Airflow
+        full key the caller evidences.  In both cases the receipt must name this
         run's own endpoint job - checked against the one canonical
         ``native_run_id`` derivation from the operation's recorded DagRun -
         and its failed-receipt digest must be the digest the reconciliation's
@@ -1654,12 +1719,24 @@ class PlatformStore:
 
         if state != "failed":
             raise PlatformStoreError("An orphan reconciliation records the observed failure")
-        if run_state != "queued":
-            raise PlatformStoreError("Orphan recovery requires the never-started queued run")
         if checkpoint_uri is not None or reused_from_run is not None:
             raise PlatformStoreError("An orphan reconciliation carries no checkpoint or reuse binding")
         if not isinstance(receipt, dict):
             raise PlatformStoreError("An orphan reconciliation carries its failed receipt")
+        if stage == "discover" and receipt.get("reported_stage") == "freeze":
+            self._reconcile_bound_native_discover(
+                connection,
+                cursor,
+                run_id=run_id,
+                stage=stage,
+                state=state,
+                receipt=receipt,
+                reconcile=reconcile,
+                run_state=run_state,
+            )
+            return
+        if run_state != "queued":
+            raise PlatformStoreError("Orphan recovery requires the never-started queued run")
         binding = reconcile.get("binding")
         operation_id = binding.get("operation_id") if isinstance(binding, dict) else None
         task_id = binding.get("task_id") if isinstance(binding, dict) else None
@@ -1754,6 +1831,193 @@ class PlatformStore:
         self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
         cursor.execute(_SETTLE_ORPHAN_INTENT, (state, operation_id, run_id))
         cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, stage))
+
+    def _reconcile_bound_native_discover(
+        self,
+        connection,
+        cursor,
+        *,
+        run_id: str,
+        stage: str,
+        state: str,
+        receipt: dict,
+        reconcile: dict,
+        run_state: object,
+    ) -> None:
+        """Close the one historical reported-freeze/actual-discover failure shape.
+
+        This is deliberately not a general stage alias.  It is accepted only
+        when the native receipt proves a selection read in progress, the bound
+        native operation is the actual ``discover`` operation, the frozen
+        request resolves to the same upload/main identity, and the real Airflow
+        facts show the one failed ``discover`` task with the later tasks still
+        unexecuted.  The completed freeze row is read-only here.
+        """
+
+        if (
+            stage != "discover"
+            or state != "failed"
+            or receipt.get("reported_stage") != "freeze"
+            or receipt.get("actual_stage") != "discover"
+        ):
+            raise PlatformStoreError("The bound native recovery is only the reported-freeze/actual-discover shape")
+        if run_state != "running":
+            raise PlatformStoreError("The bound native recovery requires a running admitted run")
+
+        binding = reconcile.get("binding")
+        operation_id = binding.get("operation_id") if isinstance(binding, dict) else None
+        task_id = binding.get("task_id") if isinstance(binding, dict) else None
+        map_index = binding.get("map_index") if isinstance(binding, dict) else None
+        if (
+            not isinstance(operation_id, str)
+            or not operation_id
+            or task_id != "discover"
+            or type(map_index) is not int
+            or map_index < -1
+        ):
+            raise PlatformStoreError("The bound native recovery names the discover operation and its full task key")
+        native_run = receipt.get("native_run_id")
+        native_sha = receipt.get("native_receipt_sha256")
+        if not _is_canonical_uuid(native_run) or not _is_sha256(native_sha):
+            raise PlatformStoreError("The bound native recovery binds its endpoint job and original receipt bytes")
+        if native_sha not in _evidence_digests(reconcile.get("evidence")):
+            raise PlatformStoreError("The native receipt digest is not bound by the recovery evidence")
+
+        reconcile_operation = reconcile.get("operation_id")
+        cursor.execute(_FIND_RECONCILE, (reconcile_operation, run_id, stage))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The reconciliation names no registered reconcile operation of this run and stage")
+        cursor.execute(_READ_ORPHAN_OPERATION, (operation_id, run_id))
+        row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError("The bound native recovery names no operation of this run")
+        op_stage, kind, op_state, dag_id, dag_run_id, bound_task, bound_map, operation_key = row
+        if (
+            op_stage != "discover"
+            or kind != "native"
+            or op_state != "running"
+            or bound_task != task_id
+            or bound_map != map_index
+        ):
+            raise PlatformStoreError("The bound native operation is not the recorded running discover operation")
+        if not (isinstance(dag_id, str) and dag_id and isinstance(dag_run_id, str) and dag_run_id):
+            raise PlatformStoreError("The bound native operation lacks its Airflow DagRun identity")
+        if native_run != native_run_id(dag_run_id):
+            raise PlatformStoreError("The native receipt names another run's endpoint job")
+
+        cursor.execute(_READ_RUN_RECORD, (run_id,))
+        run_record = cursor.fetchone()
+        if run_record is None or not isinstance(run_record[1], str) or not run_record[1]:
+            raise PlatformStoreError("The bound native recovery cannot resolve its admitted request")
+        cursor.execute(_READ_REQUEST_RECORD, (run_record[1],))
+        request_row = cursor.fetchone()
+        if request_row is None:
+            raise PlatformStoreError("The bound native recovery cannot read its admitted request")
+        request_main = request_row[2]
+        baseline = request_row[6]
+        request_files = receipt.get("request_upload_files")
+        if not isinstance(request_main, str) or not request_main:
+            raise PlatformStoreError("The admitted request carries no main assembly")
+        if receipt.get("request_main_assembly") != request_main:
+            raise PlatformStoreError("The native receipt's main assembly differs from the admitted request")
+        if not isinstance(baseline, dict):
+            raise PlatformStoreError("The admitted request carries no frozen baseline")
+        if (
+            not isinstance(request_files, dict)
+            or any(not isinstance(name, str) or not _is_sha256(value) for name, value in request_files.items())
+            or receipt.get("selection_files") != request_files
+            or digest(request_files) != baseline.get("handoff_sha256")
+            or baseline.get("files") != len(request_files)
+            or receipt.get("request_upload_sha256") != baseline.get("handoff_sha256")
+            or receipt.get("selection_upload_sha256") != baseline.get("handoff_sha256")
+        ):
+            raise PlatformStoreError("The native receipt's upload identity differs from the admitted request")
+
+        cursor.execute(_READ_STAGE_RECORDS, (run_id,))
+        stage_rows = {row[0]: row[1] for row in cursor.fetchall()}
+        if stage_rows != {"freeze": "completed"}:
+            raise PlatformStoreError("The bound native recovery requires only the completed freeze stage")
+
+        cursor.execute(_READ_ADMITTED_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id))
+        facts = cursor.fetchall()
+        dag_rows = [row for row in facts if row[0] == "dag_run"]
+        if len(dag_rows) != 1 or dag_rows[0][3] != "failed":
+            raise PlatformStoreError("The bound DagRun does not prove its terminal failed fact")
+        by_task: dict[str, list[tuple[int, object, int]]] = {}
+        for _, task, task_map, task_state, task_try in facts:
+            if isinstance(task, str):
+                by_task.setdefault(task, []).append((task_map, task_state, task_try))
+        freeze_rows = by_task.get("freeze") or []
+        if len(freeze_rows) != 1 or freeze_rows[0][1] != "success":
+            raise PlatformStoreError("The real freeze task is not the completed prerequisite of discover")
+        discover_rows = by_task.get("discover") or []
+        if (
+            len(discover_rows) != 1
+            or discover_rows[0][0] != map_index
+            or discover_rows[0][1] != "failed"
+            or type(discover_rows[0][2]) is not int
+            or discover_rows[0][2] < 1
+        ):
+            raise PlatformStoreError("The real discover task does not prove its bound failed fact")
+        for later in ("capture", "generate", "verify", "publish"):
+            rows = by_task.get(later) or []
+            if len(rows) != 1 or rows[0][1] != "upstream_failed":
+                raise PlatformStoreError(f"The successor task {later!r} does not prove its never-executed fact")
+
+        payload_receipt = {
+            **receipt,
+            "reconciliation": reconcile,
+            "closure_shape": "reported_freeze_actual_discover",
+            "reported_stage": "freeze",
+            "actual_stage": "discover",
+        }
+        cursor.execute(_INSERT_STAGE, (run_id, "discover", "failed", _json(payload_receipt), None, None, None))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The bound discover failure lost its run to another writer")
+        for later in ("capture", "generate", "verify", "publish"):
+            cursor.execute(_INSERT_STAGE, (run_id, later, "blocked", _json({}), None, None, None))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The bound blocked record for {later!r} lost its run to another writer")
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                stage=later,
+                kind="stage",
+                operation_id=None,
+                payload={"state": "blocked"},
+            )
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage="discover",
+            kind="binding",
+            operation_id=operation_id,
+            payload={
+                "operation_key": operation_key,
+                "intent_stage": op_stage,
+                "reconciled_stage": "discover",
+                "reconciled_state": "failed",
+                "reported_stage": "freeze",
+                "actual_stage": "discover",
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": task_id,
+                "map_index": map_index,
+                "native_run_id": native_run,
+                "native_receipt_sha256": native_sha,
+                "closure_shape": "reported_freeze_actual_discover",
+            },
+        )
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage="discover",
+            kind="stage",
+            operation_id=reconcile_operation,
+            payload={"state": "failed", "reported_stage": "freeze", "actual_stage": "discover"},
+        )
+        self._stage_outcome(connection, run_id=run_id, stage="discover", state="failed")
+        cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
 
     def _stage_outcome(self, connection, *, run_id: str, stage: str, state: str) -> None:
         """The run-terminal transition a stage record concludes, in the same transaction.

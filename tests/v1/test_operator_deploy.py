@@ -1225,6 +1225,12 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(usage.returncode, 2)
         self.assertIn("--keep-admission-closed", usage.stderr)
 
+    def test_reconcile_exposes_the_supported_reported_stage_input(self) -> None:
+        control = CONTROL.read_text(encoding="utf-8")
+        self.assertIn("--reported-stage STAGE", control)
+        self.assertIn('RECONCILE_REPORTED_STAGE="$REPORTED_STAGE"', control)
+        self.assertIn('reconcile["reported_stage"] = reported_stage', control)
+
     def _project(self, env: dict, data: dict, rc: int) -> None:
         Path(env["PROJECTION_FILE"]).write_text(json.dumps(data), encoding="utf-8")
         env["PROJECTION_RC"] = str(rc)

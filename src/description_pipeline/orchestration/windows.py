@@ -71,6 +71,7 @@ from ..stages import (
     CONTRACT,
     CONTRACT_SHA256,
     STAGE_IDS,
+    WINDOWS_STAGES,
     merge_activity,
     normalize_activity,
     stage_view,
@@ -96,10 +97,6 @@ CONFIG_SCHEMA = "solidworks-to-urdf.endpoint/v1"
 #: run's imported cache is the endpoint's only deletion path (IF-10).
 CACHE_RELEASE_SELECTED = "selected"
 CACHE_RELEASE_JOURNAL_SCHEMA = "solidworks-to-urdf.cache-release-journal/v1"
-
-#: Stages the Windows endpoint owns; generation, verification and publication run on Linux.
-NATIVE_STAGES = tuple(STAGE_IDS[:3])
-
 
 def _native_tool_record() -> dict:
     """The native-role tool identity for the sealed capture provenance."""
@@ -655,9 +652,9 @@ class Jobs:
 
     @staticmethod
     def _native_stage_rows(rows, *, reader_matches=True):
-        """The native endpoint owns freeze/discover/capture; the rest runs on Linux."""
+        """Keep only stages whose contract assigns Windows as their execution host."""
         for row in rows:
-            if row.get("stage") not in NATIVE_STAGES:
+            if row.get("stage") not in WINDOWS_STAGES:
                 row["eligible"] = False
                 row["reason"] = "linux_owned"
                 row["message"] = "This stage runs on Linux; restart it through the delivery workflow"
@@ -666,9 +663,15 @@ class Jobs:
                 row["eligible"] = False
                 row["reason"] = "tool_changed"
                 row["message"] = (
-                    "The native dependency reader changed; resubmit the engineering folder and complete file selection"
+                    "The native dependency reader changed; start a new Linux admission "
+                    "from Freeze inputs; Windows cannot rerun Freeze"
                 )
                 row["recomputes"] = []
+            if row.get("reason") == "tool_changed":
+                row["message"] = (
+                    "The native dependency reader changed; start a new Linux admission "
+                    "from Freeze inputs; Windows cannot rerun Freeze"
+                )
         return rows
 
     @staticmethod
@@ -824,13 +827,13 @@ class Jobs:
                 except (PipelineError, OSError, ValueError):
                     return "unknown"
         if not isinstance(recorded, dict):
-            # No historical identity: reuse cannot be proven, only a freeze restart may proceed.
+            # No historical identity: reuse cannot be proven; a new Linux admission is required.
             return "unknown"
         return "ok" if recorded and recorded == current else "changed"
 
     @staticmethod
     def _reuse_events(parent, from_stage):
-        upstream = set(STAGE_IDS[: STAGE_IDS.index(from_stage)])
+        upstream = set(STAGE_IDS[: STAGE_IDS.index(from_stage)]) & set(WINDOWS_STAGES)
         reused = []
         for event in parent.get("events") or []:
             if not isinstance(event, dict) or event.get("stage") not in upstream:
@@ -877,7 +880,7 @@ class Jobs:
         """Memoized linked-run plan for the run detail route; create() probes afresh."""
         job = self.snapshot(identifier)
         if job.get("status") not in {"passed", "failed", "native_complete"}:
-            rows = self._native_stage_rows(stage_reruns(job, probe={}, tool="ok"))
+            rows = self._native_stage_rows(stage_reruns(job, probe={}, tool="ok", host_scope=WINDOWS_STAGES))
             return {"run_id": identifier, "status": job.get("status"), "stage_reruns": rows}
         key = (job.get("status"), job.get("completed_at"))
         with self.mutex:
@@ -888,7 +891,12 @@ class Jobs:
             "run_id": identifier,
             "status": job.get("status"),
             "stage_reruns": self._native_stage_rows(
-                stage_reruns(job, probe=self._probe(job), tool=self._tool_state(job)),
+                stage_reruns(
+                    job,
+                    probe=self._probe(job),
+                    tool=self._tool_state(job),
+                    host_scope=WINDOWS_STAGES,
+                ),
                 reader_matches=job.get("native_tool") == self._tool_identity(),
             ),
         }
@@ -991,7 +999,7 @@ class Jobs:
                 "created_at": datetime.now(UTC).isoformat(),
             }
             if spec is not None:
-                if spec["from_stage"] not in NATIVE_STAGES:
+                if spec["from_stage"] not in WINDOWS_STAGES:
                     raise _refusal("linux_owned", "Linked reruns of Linux-owned stages belong to the Linux host")
                 parent = self.jobs.get(spec["parent_run"])
                 _require(parent is not None and parent["run_id"] != identifier, "The parent native run is unknown")
@@ -1001,7 +1009,13 @@ class Jobs:
                     raise _refusal(
                         "already_active", "The selected run already has an active linked attempt", active_run_id=active
                     )
-                plan = start_plan(parent, spec["from_stage"], probe=self._probe(parent), tool=self._tool_state(parent))
+                plan = start_plan(
+                    parent,
+                    spec["from_stage"],
+                    probe=self._probe(parent),
+                    tool=self._tool_state(parent),
+                    host_scope=WINDOWS_STAGES,
+                )
                 if not plan["accepted"]:
                     raise _refusal(plan["reason"], plan["message"], earliest=plan["earliest_required"])
                 _require(
@@ -1099,6 +1113,7 @@ class Jobs:
 
     def _select_native(self, identifier):
         """Resolve the fully staged folder once, then retain its proven native closure."""
+        self._ensure_native_stage_running(identifier, "discover")
         session = self.selections[identifier]
         factory = self.selection_reader_factory
         if factory is None:
@@ -1484,6 +1499,24 @@ class Jobs:
             self._retire_activity(job, entry)
             self._save(job)
 
+    def _ensure_native_stage_running(self, identifier, stage):
+        """Enter one native stage once; follow-up work joins the existing entry."""
+
+        with self.mutex:
+            events = self.jobs[identifier].get("events") or []
+            last_state = next(
+                (
+                    event.get("state")
+                    for event in reversed(events)
+                    if isinstance(event, dict)
+                    and event.get("stage") == stage
+                    and event.get("state") in {"running", "completed", "failed"}
+                ),
+                None,
+            )
+        if last_state != "running":
+            self._event(identifier, {"stage": stage, "state": "running"})
+
     @staticmethod
     def _retire_activity(job, event) -> None:
         """A stage transition retires telemetry that belongs to another or an ended stage.
@@ -1549,7 +1582,7 @@ class Jobs:
         from ..sources.solidworks.discovery import DiscoverySettings, read_native_record
 
         job = self.jobs[identifier]
-        self._event(identifier, {"stage": "discover", "state": "running"})
+        self._ensure_native_stage_running(identifier, "discover")
         settings = DiscoverySettings(main_assembly=selection)
 
         def activity(item):
@@ -1610,7 +1643,7 @@ class Jobs:
             terminal_guarded = False
             try:
                 spec = _resume_spec(job["request"])
-                if spec is not None and spec["from_stage"] not in NATIVE_STAGES:
+                if spec is not None and spec["from_stage"] not in WINDOWS_STAGES:
                     raise RequestError(
                         "The requested stage is owned by the Linux delivery flow",
                         409,
@@ -1632,8 +1665,6 @@ class Jobs:
                 with self.mutex:
                     job["status"] = "running"
                     self._save(job)
-                from ..steps import freeze_inputs
-
                 package = self._source_dir(job)
                 # The retained selected tree must still exist; without it the inventory
                 # validators would report an empty selection instead of the real cause.
@@ -1646,10 +1677,15 @@ class Jobs:
                     and job["selection"]["manifest"]["main_assembly"] == job["request"]["main_assembly"],
                     "The queued run's effective main assembly differs from its sealed selection",
                 )
+                selected_files = package_inventory(package)
+                _require(
+                    digest(selected_files) == job["handoff_sha256"],
+                    "Selected source digest changed after native closure resolution",
+                )
                 verify_selection(
                     job["selection"]["manifest"],
                     job["request"]["upload_files"],
-                    package_inventory(package),
+                    selected_files,
                     reader_sha256=job["native_tool"]["source_sha256"],
                 )
                 _require(self._tool_identity() == job["native_tool"], "Native tool changed after source selection")
@@ -1659,11 +1695,17 @@ class Jobs:
                     parent = self.jobs.get(spec["parent_run"]) or {}
                     selection = parent.get("main_assembly") if isinstance(parent, dict) else None
                 resume_kwargs = {"resume": spec} if spec is not None else {}
-                if spec is not None and from_stage != "freeze":
+                if spec is not None:
                     # Revalidate the retained checkpoints at execution time; enqueue-time
                     # checks are advisory because registries and pulls may change meanwhile.
                     parent = self.jobs[spec["parent_run"]]
-                    plan = start_plan(parent, from_stage, probe=self._probe(parent), tool=self._tool_state(parent))
+                    plan = start_plan(
+                        parent,
+                        from_stage,
+                        probe=self._probe(parent),
+                        tool=self._tool_state(parent),
+                        host_scope=WINDOWS_STAGES,
+                    )
                     if not plan["accepted"]:
                         failure = RequestError(
                             plan["message"],
@@ -1676,19 +1718,10 @@ class Jobs:
                         )
                         failure.code = plan["reason"]
                         raise failure
-                if from_stage not in {"discover", "capture", "generate", "verify", "publish"}:
-                    # A fresh job or a freeze restart re-admits the retained upload.
-                    freeze_inputs(
-                        package,
-                        job["handoff_sha256"],
-                        job["package_files"],
-                        main_assembly=selection,
-                        on_event=lambda item, identifier=identifier: self._event(identifier, item),
-                    )
-                if from_stage in {None, "freeze", "discover"}:
+                if from_stage in {None, "discover"}:
                     package = self._prepare_native(identifier, package, selection)
                 else:
-                    # A capture rerun reuses the parent's retained freeze+discover
+                    # A capture rerun reuses the parent's retained discovery
                     # checkpoints; the linked-run gate already refused the
                     # Linux-owned stages before enqueue.
                     package = self._prepared_dir(job)
@@ -1761,7 +1794,7 @@ class Jobs:
                         job.update(terminal)
                         self._clear_activity(job)
                     if job["status"] == "failed" and (not job["events"] or job["events"][-1]["state"] != "failed"):
-                        phase = (job["events"][-1] if job["events"] else {}).get("stage", "freeze")
+                        phase = (job["events"][-1] if job["events"] else {}).get("stage", "discover")
                         self._event(identifier, {"stage": phase, "state": "failed", "error": job.get("error")})
                     job["completed_at"] = datetime.now(UTC).isoformat()
                     if job["status"] == "failed":

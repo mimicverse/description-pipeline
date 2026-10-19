@@ -55,6 +55,7 @@ from .airflow_client import (
     native_run_id,
     normalize_change_summary,
     validate_artifact_name,
+    validate_main_assembly,
     verified_result,
 )
 from ..io import PipelineError, digest
@@ -2046,7 +2047,9 @@ class PortalApp:
 
     # ------------------------------------------------------------- rerun
     # ------------------------------------------------- freeze retry stand
-    def _freeze_retry_stand(self, native_id: str, conf: dict | None) -> tuple[bool, str, str] | None:
+    def _freeze_retry_stand(
+        self, native_id: str, conf: dict | None
+    ) -> tuple[bool, str, str, list[str]] | None:
         """The Linux-owned freeze-retry stand of one parent, from registered facts only.
 
         ``None`` keeps the existing stage row untouched (the parent is not a
@@ -2058,11 +2061,11 @@ class PortalApp:
         """
 
         record = self._platform_read(lambda: self._platform().run_record(native_id))
-        if not isinstance(record, dict) or record.get("state") != "failed":
+        if not isinstance(record, dict) or record.get("state") not in {"failed", "cancelled", "succeeded"}:
             return None
         stages = self._platform_read(lambda: self._platform().stage_records(native_id))
         freeze_row = stages.get("freeze") if isinstance(stages, dict) else None
-        if not (isinstance(freeze_row, dict) and freeze_row.get("state") == "failed"):
+        if not (isinstance(freeze_row, dict) and freeze_row.get("state") in {"failed", "completed"}):
             return None
         parent_dag_run_id = self._admitted_dag_run_id(record.get("request_id"))
         if parent_dag_run_id is None:
@@ -2070,6 +2073,7 @@ class PortalApp:
                 False,
                 "originals_identity_missing",
                 "The original run has no recoverable scheduling identity; Freeze inputs cannot be rerun",
+                [],
             )
         handoff_path = _optional_str(conf.get("handoff_path")) if isinstance(conf, dict) else None
         if handoff_path is None:
@@ -2077,9 +2081,10 @@ class PortalApp:
                 False,
                 "incomplete",
                 "The original run has no reusable upload directory and cannot be rerun from this step",
+                [],
             )
         try:
-            resolve_freeze_retry_identity(
+            resolved = resolve_freeze_retry_identity(
                 self._platform(),
                 native_id,
                 parent_dag_run_id=parent_dag_run_id,
@@ -2088,12 +2093,39 @@ class PortalApp:
                 intake_root=self.config.upload_root,
             )
         except FreezeRetryRefusal as refusal:
-            return (False, refusal.reason, refusal.message)
+            return (False, refusal.reason, refusal.message, [])
         except PlatformStoreError as error:
             raise PortalError(
                 HTTPStatus.SERVICE_UNAVAILABLE, "Run metadata is temporarily unavailable; retry later"
             ) from error
-        return (True, "linux_ready", "Freeze inputs can be rerun on Linux with the sealed originals")
+        options = sorted(
+            (
+                name
+                for name in resolved.upload_files
+                if isinstance(name, str) and name.lower().endswith(".sldasm")
+            ),
+            key=lambda value: (value.lower(), value),
+        )
+        if not options:
+            return (
+                False,
+                "originals_identity_missing",
+                "The sealed originals carry no selectable main assembly; rerun refused",
+                [],
+            )
+        if freeze_row.get("state") == "completed":
+            return (
+                True,
+                "linux_new_request",
+                "Create a new request from these sealed originals on Linux; freeze and all later stages rerun",
+                options,
+            )
+        return (
+            True,
+            "linux_ready",
+            "Freeze inputs can be rerun on Linux with the sealed originals",
+            options,
+        )
 
     def _rerun_rows(self, native_id: str, conf: dict | None = None) -> list[dict] | None:
         """Finished stage-rerun availability rows; unavailable data is omitted, never faked."""
@@ -2153,7 +2185,7 @@ class PortalApp:
             )
         verdict = self._freeze_retry_stand(native_id, conf) if conf is not None else None
         if verdict is not None:
-            eligible, reason, message = verdict
+            eligible, reason, message, main_assembly_options = verdict
             for row in rows:
                 if row.get("stage") != "freeze":
                     continue
@@ -2164,6 +2196,7 @@ class PortalApp:
                     recomputes=list(_STAGE_IDS) if eligible else [],
                     retains=[],
                     prerequisites={},
+                    main_assembly_options=main_assembly_options,
                 )
                 break
         return rows
@@ -2296,19 +2329,21 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         body = self._body(environ)
         stage = body.get("stage")
-        keys = {"stage", "target_hardware", "change_summary"}
+        keys = {"stage", "target_hardware", "change_summary", "main_assembly"}
         if set(body) - keys or not isinstance(stage, str) or stage not in _STAGE_IDS:
             raise PortalError(
                 HTTPStatus.BAD_REQUEST, "Rerun accepts only a valid stage and publication-target parameters"
             )
         overrides: dict[str, str] = {}
-        for key in ("target_hardware", "change_summary"):
+        for key in ("target_hardware", "change_summary", "main_assembly"):
             if key in body:
                 if not isinstance(body[key], str):
                     raise PortalError(
                         HTTPStatus.BAD_REQUEST, "Rerun accepts only a valid stage and publication-target parameters"
                     )
                 overrides[key] = body[key].strip()
+        if "main_assembly" in overrides and stage != "freeze":
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Only a freeze rerun may select a new main assembly")
         try:
             airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, airflow_run):
@@ -2354,6 +2389,37 @@ class PortalApp:
                 if not change_summary:
                     raise PortalError(HTTPStatus.BAD_REQUEST, "Change summary is required when rerunning")
                 parent_assembly = _optional_str(parent_conf.get("main_assembly"))
+                resolved_freeze = None
+                selected_assembly = parent_assembly
+                if stage == "freeze":
+                    try:
+                        resolved_freeze = resolve_freeze_retry_identity(
+                            self._platform(),
+                            native_run_id(dag_run_id),
+                            parent_dag_run_id=dag_run_id,
+                            expected_dag_id=self.config.dag_id,
+                            intake_path=Path(handoff_path),
+                            intake_root=self.config.upload_root,
+                        )
+                    except FreezeRetryRefusal as refusal:
+                        return self._rerun_refusal(start_response, refusal.reason, refusal.message, None)
+                    except PlatformStoreError:
+                        return _json_response(
+                            start_response,
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "Platform service is temporarily unavailable; rerun was not admitted"},
+                            self.config,
+                        )
+                    requested_assembly = overrides.get("main_assembly", parent_assembly or "")
+                    try:
+                        selected_assembly = validate_main_assembly(requested_assembly)
+                    except EndpointProtocolError as error:
+                        raise PortalError(HTTPStatus.BAD_REQUEST, str(error)) from error
+                    if selected_assembly not in resolved_freeze.upload_files:
+                        raise PortalError(
+                            HTTPStatus.BAD_REQUEST,
+                            "The selected main assembly is not part of the sealed originals",
+                        )
                 # The linked attempt inherits the parent's declared purpose and never
                 # accepts a new one; a parent without it cannot be re-run.
                 purpose = _optional_str(parent_conf.get("purpose"))
@@ -2388,7 +2454,7 @@ class PortalApp:
                             stage=stage,
                             target_hardware=target_hardware,
                             change_summary=change_summary,
-                            parent_assembly=parent_assembly,
+                            parent_assembly=selected_assembly,
                             purpose=purpose,
                         ):
                             return self._rerun_refusal(
@@ -2428,14 +2494,14 @@ class PortalApp:
                         admission,
                         principal=principal,
                         target_hardware=target_hardware,
-                        parent_assembly=parent_assembly,
+                        parent_assembly=selected_assembly,
                         purpose=purpose,
                         frame_digest=_attempt_frame_digest(
                             handoff_path=handoff_path,
                             stage=stage,
                             target_hardware=target_hardware,
                             change_summary=change_summary,
-                            parent_assembly=parent_assembly,
+                            parent_assembly=selected_assembly,
                             purpose=purpose,
                         ),
                     ):
@@ -2483,28 +2549,13 @@ class PortalApp:
                     "target_hardware": target_hardware,
                     "change_summary": change_summary,
                 }
-                if parent_assembly is not None:
-                    conf["main_assembly"] = parent_assembly
+                if selected_assembly is not None:
+                    conf["main_assembly"] = selected_assembly
                 admit_baseline: dict | None = None
                 if reserved_id is None and stage == "freeze":
-                    try:
-                        resolved = resolve_freeze_retry_identity(
-                            self._platform(),
-                            native_run_id(dag_run_id),
-                            parent_dag_run_id=dag_run_id,
-                            expected_dag_id=self.config.dag_id,
-                            intake_path=Path(handoff_path),
-                            intake_root=self.config.upload_root,
-                        )
-                    except FreezeRetryRefusal as refusal:
-                        return self._rerun_refusal(start_response, refusal.reason, refusal.message, None)
-                    except PlatformStoreError:
-                        return _json_response(
-                            start_response,
-                            HTTPStatus.SERVICE_UNAVAILABLE,
-                            {"error": "Platform service is temporarily unavailable; rerun was not admitted"},
-                            self.config,
-                        )
+                    resolved = resolved_freeze
+                    if resolved is None:
+                        raise PortalError(HTTPStatus.CONFLICT, "Freeze retry identity was not resolved")
                     admit_baseline = {
                         "handoff_sha256": resolved.handoff_sha256,
                         "files": resolved.files,
@@ -2524,7 +2575,7 @@ class PortalApp:
                             run_id=native_run_id(new_run_id),
                             principal=principal,
                             target_hardware=target_hardware,
-                            main_assembly=parent_assembly or "",
+                            main_assembly=selected_assembly or "",
                             configuration={"purpose": purpose},
                             baseline=admit_baseline,
                             dispatch={
@@ -2535,7 +2586,7 @@ class PortalApp:
                                     stage=stage,
                                     target_hardware=target_hardware,
                                     change_summary=change_summary,
-                                    parent_assembly=parent_assembly,
+                                    parent_assembly=selected_assembly,
                                     purpose=purpose,
                                 ),
                                 "dag_id": self.config.dag_id,

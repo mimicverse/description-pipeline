@@ -34,6 +34,8 @@ if any(
 ):
     raise PipelineError("Every engineering stage must declare its documented contract row")
 VIEW_SCHEMA = "solidworks-to-urdf.stages/v1"
+#: Stages whose contract assigns Windows as an execution host, in contract order.
+WINDOWS_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if "windows" in hosts)
 #: Stages only the portable Linux host owns, derived from the contract's hosts
 #: field so the set never depends on stage order (ORC-02).  Mixed Windows+Linux
 #: stages (discover, capture) are native-driven and stay out of this set.
