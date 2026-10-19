@@ -2259,7 +2259,18 @@ class DiscoveryTests(unittest.TestCase):
         upload_sha256 = payload["raw"]["source_selection"]["upload_sha256"]
         selected_sha256 = payload["raw"]["source_selection"]["handoff_sha256"]
         self.assertNotEqual(upload_sha256, selected_sha256)
-        self.assertNotEqual(request["handoff_digest"], upload_sha256)
+        self.assertEqual(request["handoff_digest"], upload_sha256)
+        source_record = json.loads((delivery / "input/source.json").read_text(encoding="utf-8"))
+        self.assertEqual(source_record["identity"]["handoff_digest"], upload_sha256)
+
+        self._tamper_delivered(
+            delivery,
+            "input/request.json",
+            lambda value: value.__setitem__("handoff_digest", selected_sha256),
+        )
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.request", [item["code"] for item in report["errors"]])
 
         self._tamper_delivered(
             delivery,
@@ -2297,7 +2308,7 @@ class DiscoveryTests(unittest.TestCase):
                 "target_hardware": target,
                 "change_summary": "真实提交说明\n第二行",
                 "main_assembly": "cad/robot.SLDASM",
-                "handoff_digest": payload["handoff_sha256"],
+                "handoff_digest": payload["raw"]["source_selection"]["upload_sha256"],
                 "platform_config_digest": "d" * 64,
             },
             ensure_ascii=False,

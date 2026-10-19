@@ -2786,6 +2786,12 @@ def verify_discovery(package: Path) -> dict:
             "the native discovery record is not bound to the selected closure handoff",
             {"field": "handoff_sha256"},
         )
+        _require(
+            (source.get("identity") or {}).get("handoff_digest") == sealed_selection.get("upload_sha256"),
+            "discovery.request",
+            "the source content identity is not bound to the full frozen upload",
+            {"field": "identity.handoff_digest"},
+        )
         state["request"] = request
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
         definition = {

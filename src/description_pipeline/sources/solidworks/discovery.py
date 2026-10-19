@@ -4225,6 +4225,13 @@ def derive_native_package(
             raise PipelineError("an explicit configuration cannot be bound: the record carries no usable configuration")
         if str(configuration) != str(recorded_configuration):
             raise PipelineError("the requested configuration does not match the recorded delivery configuration")
+    source_selection = record.get("source_selection") if isinstance(record.get("source_selection"), dict) else {}
+    upload_digest = source_selection.get("upload_sha256")
+    upload_handoff_digest = (
+        upload_digest
+        if _SHA256_HEX.fullmatch(str(upload_digest or ""))
+        else None
+    )
     findings: list[dict] = []
     components = record.get("components")
     if not isinstance(components, list):
@@ -4485,7 +4492,7 @@ def derive_native_package(
             ],
         },
     )
-    source_record = _source_record(identity, identity_sources, handoff_sha256, records)
+    source_record = _source_record(identity, identity_sources, upload_handoff_digest, records)
     if source_record is not None:
         write_json(output / SOURCE_FILE, source_record)
     return PreparedPackage(
@@ -4780,7 +4787,12 @@ def source_definition(
     return source
 
 
-def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, records: list[dict]) -> dict | None:
+def _source_record(
+    identity: dict,
+    identity_sources: dict,
+    handoff_digest: str | None,
+    records: list[dict],
+) -> dict | None:
     """The archived content identity (IF-06) that replaces the retired generated definition documents.
 
     Written only once the content identity is nameable - hardware, main assembly
@@ -4793,7 +4805,7 @@ def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, 
     hardware = identity.get("hardware_id")
     assembly = identity.get("main_assembly")
     configuration = identity.get("delivery_configuration")
-    if not (_text(hardware) and _text(assembly) and _text(configuration)):
+    if not (_text(hardware) and _text(assembly) and _text(configuration) and _text(handoff_digest)):
         return None
     references: dict[str, str] = {}
     for entry in records:
@@ -4803,7 +4815,7 @@ def _source_record(identity: dict, identity_sources: dict, handoff_sha256: str, 
             references[reference] = checksum
     content = {
         "kind": "source-revision",
-        "handoff_digest": handoff_sha256,
+        "handoff_digest": str(handoff_digest),
         "main_assembly": str(assembly),
         "configuration": str(configuration),
         "hardware_id": str(hardware),
