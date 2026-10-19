@@ -182,6 +182,8 @@ class NativeRecoveryTests(unittest.TestCase):
             ["capture", "discover"],
             ["discover", "capture", "discover"],
             ["discover", "capture", "unknown"],
+            ["freeze", "discover", "capture", "generate"],
+            ["verify", "discover", "capture"],
         ):
             with self.subTest(scope=scope), self.assertRaises(PipelineError):
                 self._build(

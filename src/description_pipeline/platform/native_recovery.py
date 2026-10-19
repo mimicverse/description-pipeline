@@ -26,7 +26,6 @@ from ..stages import (
     CONFIRMED_STAGE_STATES,
     CONTRACT,
     CONTRACT_SHA256,
-    STAGE_IDS,
     VIEW_SCHEMA,
 )
 from .storage import seal_stage_confirmation
@@ -143,18 +142,9 @@ def validate_native_discovery_stage(
 
 
 def _valid_native_execution_scope(scope: object) -> bool:
-    """A native half may include freeze but must include discover and capture in contract order."""
+    """The native half is exactly discover/capture, optionally led by freeze."""
 
-    if (
-        not isinstance(scope, list)
-        or not scope
-        or any(not isinstance(stage, str) for stage in scope)
-        or len(set(scope)) != len(scope)
-        or set(scope) - set(STAGE_IDS)
-    ):
-        return False
-    expected = [stage for stage in STAGE_IDS if stage in set(scope)]
-    return scope == expected and {"discover", "capture"} <= set(scope)
+    return scope in (["discover", "capture"], ["freeze", "discover", "capture"])
 
 
 def _request_evidence(
