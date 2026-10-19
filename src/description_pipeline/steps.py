@@ -468,7 +468,13 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     """
 
     from .io import artifact_path_parts
-    from .sources.solidworks.discovery import DISCOVERY_FILE, PLAN_FILE, PLAN_SCHEMA, SOURCE_FILE
+    from .sources.solidworks.discovery import (
+        DISCOVERY_FILE,
+        PLAN_FILE,
+        PLAN_SCHEMA,
+        SOURCE_FILE,
+        sealed_embedded_virtual_document,
+    )
 
     discovery_path = package / DISCOVERY_FILE
     source_path = package / SOURCE_FILE
@@ -516,6 +522,11 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         and not item.get("suppressed")
         and isinstance(item.get("instance_id") or item.get("name2"), str)
     }
+    raw_components = {
+        str(item.get("instance_id") or item.get("name2")): item
+        for item in (record.get("components") or [])
+        if isinstance(item, dict) and isinstance(item.get("instance_id") or item.get("name2"), str)
+    }
     registered = set(raw_documents)
     objects = plan.get("objects")
     if not isinstance(objects, list) or not objects:
@@ -528,6 +539,12 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         if not isinstance(name, str) or not name:
             raise PipelineError("The sealed capture plan carries no usable native object selectors")
         document = item.get("document")
+        if document is None:
+            component = raw_components.get(name)
+            if component is None or not sealed_embedded_virtual_document(component, name, expected_files):
+                raise PipelineError(
+                    "The sealed capture plan omits a native selector document without sealed virtual proof"
+                )
         if document is not None:
             if not isinstance(document, str) or not document:
                 raise PipelineError("The sealed capture plan carries an unusable selector document")

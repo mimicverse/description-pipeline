@@ -89,6 +89,7 @@ class _OperationRecorder:
     def __init__(self) -> None:
         self.registered: list[dict] = []
         self.claimed: list[dict] = []
+        self.success_settlements: list[dict] = []
 
     def register_operation(self, **kwargs):
         self.registered.append(dict(kwargs))
@@ -97,6 +98,15 @@ class _OperationRecorder:
     def claim_operation(self, **kwargs):
         self.claimed.append(dict(kwargs))
         return SimpleNamespace(granted=True, record=SimpleNamespace(state="running"))
+
+    def settle_native_owner_success(self, **kwargs):
+        self.success_settlements.append(dict(kwargs))
+
+    def confirmed_stage(self, _run_id, _stage):
+        return None
+
+    def confirm_stage(self, **kwargs):
+        return None
 
 
 class _InitialDispatchBindingDouble:
@@ -2885,6 +2895,99 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertTrue((self.root / "sealed" / "run-1" / "discover").is_dir())
         self.assertTrue((self.root / "sealed" / "run-1" / "capture").is_dir())
 
+    def test_a_capture_failure_builds_the_discover_stage_from_the_sealed_prepared_tree(self) -> None:
+        import hashlib
+        import json
+        import zipfile
+
+        from description_pipeline.io import digest, file_digest, read_data, write_json
+        from description_pipeline.platform import flow
+
+        run_id = "cfa3e725-abc5-5b60-94ad-6ba838110408"
+        run_dir = self.root / run_id
+        derived = run_dir / "definition" / "derived"
+        derived.mkdir(parents=True)
+        (derived / "assembly.SLDASM").write_bytes(b"assembly")
+        write_json(derived / "capture-plan.json", {"plan": "fixture"})
+        write_json(derived / "source.json", {"source": "fixture"})
+        (derived / "records").mkdir()
+        write_json(derived / "records" / "arm.json", {"record": "fixture"})
+        native_files = {"assembly.SLDASM": file_digest(derived / "assembly.SLDASM")}
+        handoff = digest(native_files)
+        discovery = {"native_files": native_files, "handoff_sha256": handoff}
+        archive_path = run_dir / "definition" / "capture-request.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("discovery/native-discovery.json", json.dumps(discovery))
+            archive.writestr("discovery/findings.json", "{}")
+            archive.writestr("discovery/identity-resolution.json", "{}")
+            archive.writestr("capture-plan.json", (derived / "capture-plan.json").read_bytes())
+            archive.writestr("source.json", (derived / "source.json").read_bytes())
+            archive.writestr("manifest.json", "{}")
+        prepared = {
+            "assembly.SLDASM": file_digest(derived / "assembly.SLDASM"),
+            "capture-plan.json": file_digest(derived / "capture-plan.json"),
+            "source.json": file_digest(derived / "source.json"),
+            "records/arm.json": file_digest(derived / "records" / "arm.json"),
+            "discovery/findings.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "discovery/identity-resolution.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "discovery/native-discovery.json": hashlib.sha256(json.dumps(discovery).encode()).hexdigest(),
+        }
+        native_tool = {
+            "schema_version": "solidworks-to-urdf.tool/v1",
+            "pipeline_id": "solidworks-to-urdf",
+            "version": "1.5.0",
+            "source_sha256": "a" * 64,
+            "runtime": {"role": "native"},
+        }
+        job = {
+            "run_id": run_id,
+            "status": "failed",
+            "request": {
+                "run_id": run_id,
+                "main_assembly": "assembly.SLDASM",
+                "upload_files": native_files,
+                "upload_sha256": handoff,
+            },
+            "events": [
+                {"stage": "discover", "state": "completed"},
+                {"stage": "capture", "state": "failed"},
+            ],
+            "prepared_files": prepared,
+            "capture_request": {"sha256": file_digest(archive_path)},
+            "native_tool": native_tool,
+            "handoff_sha256": handoff,
+        }
+        request = {
+            "run_id": run_id,
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+            "upload_sha256": handoff,
+            "main_assembly": "assembly.SLDASM",
+        }
+        with patch.object(self.module, "_work_paths", return_value=flow.RunPaths(self.root, run_id)):
+            self.module._seal_native_discovery(request, job)
+        tree = run_dir / "seal" / "native-discover"
+        self.assertTrue((tree / "input" / "cad" / "assembly.SLDASM").is_file())
+        self.assertTrue((tree / "input" / "records").is_dir())
+        self.assertTrue((tree / "input" / "source.json").is_file())
+        self.assertTrue((tree / "input" / "records" / "arm.json").is_file())
+        self.assertTrue((tree / "evidence" / "discovery.json").is_file())
+        self.assertTrue((tree / "evidence" / "capture-plan.json").is_file())
+        self.assertTrue((tree / "reports" / "native-tool.json").is_file())
+        handoff_record = read_data(tree / "input" / "handoff.json")
+        self.assertEqual(handoff_record["input_receipt"]["inventory"], native_files)
+        self.assertEqual(handoff_record["package_files"]["cad/assembly.SLDASM"], native_files["assembly.SLDASM"])
+        self.assertEqual(
+            handoff_record["package_files"]["records/arm.json"],
+            file_digest(derived / "records" / "arm.json"),
+        )
+        transfer = read_data(tree / "transfer-manifest.json")
+        self.assertEqual(transfer["handoff_sha256"], handoff)
+        self.assertTrue((tree / "manifest.json").is_file())
+        self.assertIs(self.calls[-1]["settle_operations"], False)
+        self.assertEqual(self.calls[-1]["stage"], "discover")
+        self.assertEqual(self.calls[-1]["state"], "completed")
+
     def test_a_repeated_freeze_confirmation_consumes_the_confirmed_fact(self) -> None:
         run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
         (run_dir / "input").mkdir(parents=True)
@@ -2905,7 +3008,17 @@ class PlatformRegistrationTests(unittest.TestCase):
             def start_run(self, run_id):
                 return {"run_id": run_id, "state": "running"}
 
-            def confirm_stage(self, *, run_id, stage, state, receipt, checkpoint_uri, original_executed_at=None):
+            def confirm_stage(
+                self,
+                *,
+                run_id,
+                stage,
+                state,
+                receipt,
+                checkpoint_uri=None,
+                original_executed_at=None,
+                settle_operations=True,
+            ):
                 records[(run_id, stage)] = dict(receipt)
                 confirmations.append(stage)
 

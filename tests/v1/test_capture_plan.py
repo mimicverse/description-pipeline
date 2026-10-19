@@ -10,6 +10,7 @@ from pathlib import Path
 
 from description_pipeline import steps
 from description_pipeline.io import PipelineError, digest, write_json
+from description_pipeline.sources.solidworks import discovery
 
 MAIN = "cad/robot.SLDASM"
 
@@ -78,6 +79,135 @@ class CapturePlanTests(unittest.TestCase):
         self.assertEqual(source["robot_name"], "robot")
         self.assertEqual(plan["run_id"], "r-1")
 
+    def test_a_sealed_embedded_virtual_selector_omits_the_session_document(self) -> None:
+        owner_sha = "a" * 64
+        selector = discovery._capture_plan_selector(
+            {
+                "instance_id": "waist-1/virtual-1",
+                "name2": "waist-1/virtual-1",
+                "document": "c:/users/operator/appdata/local/temp/swx1/vc~~/waist/virtual.sldprt",
+                "configuration": "默认",
+                "source_provenance": {
+                    "kind": "native_embedded_virtual_component",
+                    "state": "embedded_virtual_component",
+                    "is_virtual": True,
+                    "occurrence": "waist-1/virtual-1",
+                    "owner": "waist.SLDASM",
+                    "owner_sha256": owner_sha,
+                    "session_document_path": (
+                        "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\waist\\virtual.SLDPRT"
+                    ),
+                    "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
+                    "native_api_pid": 1,
+                    "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                    "author_imported_path": None,
+                    "author_imported_error": None,
+                    "document": None,
+                },
+                "suppression_state": 2,
+                "state": 2,
+            },
+            {"waist.SLDASM": owner_sha},
+        )
+        self.assertEqual(selector, {"name": "waist-1/virtual-1", "state": 2})
+
+    def test_a_fake_or_incomplete_virtual_selector_is_refused(self) -> None:
+        cases = (
+            {
+                "kind": "native_import_materialization",
+                "state": "cached_materialization",
+                "is_virtual": False,
+                "occurrence": "waist-1/virtual-1",
+                "owner": "waist.SLDASM",
+                "owner_sha256": "a" * 64,
+                "session_document_path": "c:/temp/VC~~/waist/virtual.sldprt",
+                "session_temp_root": "c:/temp",
+                "native_api_pid": 1,
+                "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                "author_imported_path": None,
+                "author_imported_error": None,
+                "document": None,
+            },
+            {
+                "kind": "native_embedded_virtual_component",
+                "state": "embedded_virtual_component",
+                "is_virtual": False,
+                "occurrence": "waist-1/virtual-1",
+                "owner": "waist.SLDASM",
+                "owner_sha256": "a" * 64,
+                "session_document_path": "c:/temp/VC~~/waist/virtual.sldprt",
+                "session_temp_root": "c:/temp",
+                "native_api_pid": 1,
+                "used_api": "IComponent2.GetPathName",
+                "author_imported_path": None,
+                "author_imported_error": None,
+                "document": None,
+            },
+            {
+                "kind": "native_embedded_virtual_component",
+                "state": "embedded_virtual_component",
+                "is_virtual": True,
+                "occurrence": "waist-1/virtual-1",
+                "owner": "waist.SLDASM",
+                "owner_sha256": "a" * 64,
+                "session_document_path": "c:/temp/VC~~/waist/virtual.sldprt",
+                "session_temp_root": "c:/temp",
+                "native_api_pid": 1,
+                "used_api": "IComponent2.GetPathName",
+                "author_imported_path": None,
+                "author_imported_error": None,
+                "document": None,
+            },
+        )
+        for provenance in cases:
+            with (
+                self.subTest(kind=provenance["kind"], is_virtual=provenance["is_virtual"]),
+                self.assertRaisesRegex(PipelineError, "portable staged inventory"),
+            ):
+                discovery._capture_plan_selector(
+                    {
+                        "instance_id": "waist-1/virtual-1",
+                        "name2": "waist-1/virtual-1",
+                        "document": "c:/temp/VC~~/waist/virtual.sldprt",
+                        "configuration": "默认",
+                        "source_provenance": provenance,
+                        "suppression_state": 2,
+                        "state": 2,
+                    },
+                    {"waist.SLDASM": "a" * 64},
+                )
+
+    def test_a_portable_delivered_selector_keeps_its_document(self) -> None:
+        selector = discovery._capture_plan_selector(
+            {
+                "instance_id": "part-1",
+                "name2": "part-1",
+                "document": "cad\\part.SLDPRT",
+                "suppression_state": 2,
+                "state": 2,
+            },
+            {},
+        )
+        self.assertEqual(selector, {"name": "part-1", "document": "cad/part.SLDPRT", "state": 2})
+
+    def test_a_non_session_selector_with_an_absolute_document_is_refused(self) -> None:
+        with self.assertRaisesRegex(PipelineError, "portable staged inventory"):
+            discovery._capture_plan_selector(
+                {
+                    "instance_id": "part-1",
+                    "name2": "part-1",
+                    "document": "c:/users/operator/part.SLDPRT",
+                    "suppression_state": 2,
+                    "state": 2,
+                },
+                {},
+            )
+
+    def test_a_duplicate_native_selector_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan["objects"].append(dict(plan["objects"][0])))
+        with self.assertRaisesRegex(PipelineError, "repeats a native object selector"):
+            steps._consume_sealed_definition(self.root)
+
     def test_a_missing_plan_is_refused(self) -> None:
         (self.root / "capture-plan.json").unlink()
         with self.assertRaisesRegex(PipelineError, "no sealed capture plan"):
@@ -121,6 +251,43 @@ class CapturePlanTests(unittest.TestCase):
     def test_a_plan_naming_an_unregistered_instance_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan["objects"][1].update(name="ghost-1"))
         with self.assertRaisesRegex(PipelineError, "outside the sealed record"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_omitting_a_non_virtual_document_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan["objects"][1].pop("document"))
+        with self.assertRaisesRegex(PipelineError, "without sealed virtual proof"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_omitting_a_fake_virtual_document_is_refused(self) -> None:
+        discovery = json.loads(
+            (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
+        )
+        component = next(item for item in discovery["raw"]["components"] if item["instance_id"] == "arm-1")
+        component["document"] = None
+        component["source_provenance"] = {
+            "kind": "native_embedded_virtual_component",
+            "state": "embedded_virtual_component",
+            "is_virtual": True,
+            "occurrence": "arm-1",
+            "owner": MAIN,
+            "owner_sha256": "a" * 64,
+            "session_document_path": "c:/temp/swx0/VC~~/arm/arm.sldprt",
+            "session_temp_root": "c:/temp/swx0",
+            "native_api_pid": 0,
+            "used_api": "IComponent2.GetPathName/IComponent2.ImportedPath/IComponent2.IsVirtual",
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "document": None,
+        }
+        write_json(self.root / "discovery" / "native-discovery.json", discovery)
+        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
+        self._rewrite_plan(
+            lambda plan: (
+                plan.update(discovery_sha256=discovery_sha),
+                plan["objects"][1].pop("document"),
+            )
+        )
+        with self.assertRaisesRegex(PipelineError, "without sealed virtual proof"):
             steps._consume_sealed_definition(self.root)
 
     def test_a_plan_naming_another_run_is_refused(self) -> None:

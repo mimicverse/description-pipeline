@@ -67,7 +67,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from ...io import PipelineError, confined, digest, inventory, parse_data, read_data
+from ...io import PipelineError, artifact_path_parts, confined, digest, inventory, parse_data, read_data
 from ...interface_records import (
     PREVIEW_RANGE_KEYS,
     PREVIEW_RANGE_SCHEMA,
@@ -4159,6 +4159,90 @@ def read_native_record(frozen_source: Path, settings: DiscoverySettings, *, back
     return record
 
 
+def sealed_embedded_virtual_document(
+    component: dict, name: str, native_files: Mapping[str, str]
+) -> bool:
+    """Whether the sealed record proves an embedded virtual session document."""
+
+    provenance = component.get("source_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if (
+        provenance.get("kind") != "native_embedded_virtual_component"
+        or provenance.get("state") != "embedded_virtual_component"
+        or provenance.get("is_virtual") is not True
+        or provenance.get("occurrence") != name
+        or not isinstance(provenance.get("owner"), str)
+        or not provenance["owner"]
+        or not isinstance(provenance.get("owner_sha256"), str)
+        or _SHA256_HEX.fullmatch(provenance["owner_sha256"]) is None
+        or native_files.get(provenance["owner"]) != provenance["owner_sha256"]
+        or not isinstance(provenance.get("session_document_path"), str)
+        or not provenance["session_document_path"]
+        or not isinstance(provenance.get("session_temp_root"), str)
+        or not provenance["session_temp_root"]
+        or type(provenance.get("native_api_pid")) is not int
+        or provenance["native_api_pid"] <= 0
+        or not isinstance(provenance.get("used_api"), str)
+        or "IComponent2.GetPathName" not in provenance["used_api"]
+        or "IComponent2.IsVirtual" not in provenance["used_api"]
+        or provenance.get("author_imported_path") is not None
+        or provenance.get("author_imported_error") is not None
+        or provenance.get("document") is not None
+        or not isinstance(component.get("configuration"), str)
+        or not component["configuration"]
+    ):
+        return False
+    session_path = provenance["session_document_path"].replace("\\", "/")
+    session_root = provenance["session_temp_root"].replace("\\", "/").rstrip("/")
+    if not re.fullmatch(r"swx[0-9]+", session_root.rsplit("/", 1)[-1]):
+        return False
+    if not session_path.casefold().startswith(session_root.casefold() + "/"):
+        return False
+    if "/vc~~/" not in session_path.casefold():
+        return False
+    document = component.get("document")
+    return (
+        isinstance(document, str)
+        and bool(document)
+        and document.replace("\\", "/").casefold() == session_path.casefold()
+    )
+
+
+def _capture_plan_selector(component: dict, native_files: Mapping[str, str]) -> dict | None:
+    """Build one portable native selector for the sealed capture plan.
+
+    A fully sealed embedded virtual occurrence is the one session document
+    class whose absolute VC~~ path stays in the raw diagnostic record only.
+    Its occurrence name and suppression state are the portable selector;
+    copying the temporary path would make the plan unusable after it crosses
+    to the native host.  A delivered document must remain a portable staged
+    path, so any other non-portable value is refused instead of being silently
+    removed from a binding.
+    """
+
+    if not isinstance(component, dict) or component.get("suppressed"):
+        return None
+    name = component.get("instance_id") or component.get("name2")
+    if not isinstance(name, str) or not name:
+        return None
+    selector = {"name": name}
+    document = component.get("document")
+    session_document = sealed_embedded_virtual_document(component, name, native_files)
+    if isinstance(document, str) and document and not session_document:
+        normalized = document.replace("\\", "/")
+        try:
+            artifact_path_parts(normalized)
+        except PipelineError as error:
+            raise PipelineError(
+                "A non-session native component carries a document outside the portable staged inventory"
+            ) from error
+        selector["document"] = normalized
+    state = component.get("state")
+    selector["state"] = int(state) if type(state) is int else 2
+    return selector
+
+
 def derive_native_package(
     frozen_source: Path,
     output: Path,
@@ -4440,18 +4524,9 @@ def derive_native_package(
     # never copied into it.
     plan_objects = []
     for component in record.get("components") or ():
-        if not isinstance(component, dict) or component.get("suppressed"):
-            continue
-        name = component.get("instance_id") or component.get("name2")
-        if not isinstance(name, str) or not name:
-            continue
-        selector = {"name": name}
-        document = component.get("document")
-        if isinstance(document, str) and document:
-            selector["document"] = document.replace("\\", "/")
-        state = component.get("state")
-        selector["state"] = int(state) if type(state) is int else 2
-        plan_objects.append(selector)
+        selector = _capture_plan_selector(component, native_files)
+        if selector is not None:
+            plan_objects.append(selector)
     plan_objects.sort(key=lambda item: item["name"])
     write_json(
         output / PLAN_FILE,

@@ -20,7 +20,7 @@ import hashlib
 import json
 import os
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +30,7 @@ from typing import Any
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
 from ..orchestration.airflow_client import JOB_SCHEMA, native_run_id
+from .native_recovery import validate_capture_failure_events
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -125,6 +126,7 @@ class NativeReceiptEvidence:
     native_run_id: str
     stage: str
     reported_stage: str
+    actual_stage: str
     state: str
     error: str | None
     error_code: str | None
@@ -156,13 +158,14 @@ def load_native_failed_receipt(
     terminal failure under the real native job contract (``JOB_SCHEMA``): its identity
     fields name exactly the bound UUID, its request carries the same UUID, its status is
     ``failed``, and its events carry exactly one terminal row - ``failed`` at the reported
-    stage.  The one exceptional reported/actual pairing is the historical selection
-    failure at ``discover`` whose old executor labeled the terminal row as ``freeze``;
-    that shape also requires a selection-read failure with a positive non-boolean error
-    count.  A missing file, malformed bytes, a report-shaped document or any other
-    identity/state refuses here, before the store transaction is ever entered; every
-    caller (the operator entry and the maintenance route alike) shares this one
-    implementation.
+    stage.  Two exceptional reported/actual pairings are admitted: the historical
+    selection failure at ``discover`` whose old executor labeled the terminal row as
+    ``freeze``, and the same native discover operation failing at ``capture`` after the
+    platform has already registered the capture stage.  The freeze alias also requires a
+    selection-read failure with a positive non-boolean error count.  A missing file,
+    malformed bytes, a report-shaped document or any other identity/state refuses here,
+    before the store transaction is ever entered; every caller (the operator entry and
+    the maintenance route alike) shares this one implementation.
     """
 
     receipt_path = Path(str(path))
@@ -197,12 +200,27 @@ def load_native_failed_receipt(
     if terminal[0].get("state") != "failed":
         raise PlatformStoreError("The native receipt's terminal event is not a failure")
     reported_stage = reported_stage if reported_stage is not None else stage
-    if reported_stage != stage and (stage, reported_stage) != ("discover", "freeze"):
+    if reported_stage != stage and (stage, reported_stage) not in {
+        ("discover", "freeze"),
+        ("discover", "capture"),
+    }:
         raise PlatformStoreError(
             "The native receipt's reported and actual stages are not the one supported recovery shape"
         )
     if terminal[0].get("stage") != reported_stage:
         raise PlatformStoreError("The native receipt's terminal event names another stage")
+    actual_stage = terminal[0].get("stage")
+    if not isinstance(actual_stage, str) or not actual_stage:
+        raise PlatformStoreError("The native receipt's terminal event names no stage")
+    if stage == "discover" and reported_stage == "freeze":
+        # The historical executor labeled the terminal event freeze, but the
+        # operation and the engineering stage that actually ran were discover.
+        actual_stage = "discover"
+    if actual_stage == "capture":
+        try:
+            validate_capture_failure_events(events)
+        except PipelineError as error:
+            raise PlatformStoreError(str(error)) from error
 
     detail = document.get("detail")
     if detail is None:
@@ -220,7 +238,7 @@ def load_native_failed_receipt(
         error = document.get("error")
     error_code = document.get("error_code")
     selection = document.get("selection")
-    if reported_stage != stage:
+    if stage == "discover" and reported_stage == "freeze":
         if not isinstance(selection, dict) or selection.get("state") != "reading":
             raise PlatformStoreError("The reported freeze-stage native failure is not a selection read in progress")
         if error_code != "selection_open_errors":
@@ -248,6 +266,7 @@ def load_native_failed_receipt(
         native_run_id=native_run_id,
         stage=stage,
         reported_stage=reported_stage,
+        actual_stage=actual_stage,
         state="failed",
         error=error if isinstance(error, str) and error else None,
         error_code=error_code if isinstance(error_code, str) and error_code else None,
@@ -478,6 +497,19 @@ _SETTLE_RECONCILE = (
     "UPDATE operation SET state = 'succeeded', updated_at = now()"
     " WHERE operation_id = %s AND run_id = %s AND stage = %s AND kind = 'reconcile'"
     " AND state <> 'succeeded'"
+)
+_READ_OPERATION_BY_KEY = (
+    "SELECT operation_id, stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+    " FROM operation WHERE operation_key = %s AND run_id = %s FOR UPDATE"
+)
+_SETTLE_NAMED_OPERATION = (
+    "UPDATE operation SET state = %s, updated_at = now()"
+    " WHERE operation_id = %s AND run_id = %s AND state = 'running'"
+    " RETURNING operation_id, state"
+)
+_READ_LAST_BINDING = (
+    "SELECT payload FROM run_event WHERE run_id = %s AND operation_id = %s"
+    " AND kind = 'binding' ORDER BY seq DESC LIMIT 1"
 )
 _LOCK_RUN_OPERATIONS = (
     "SELECT operation_id, stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
@@ -1281,6 +1313,138 @@ class PlatformStore:
 
     # ------------------------------------------------- stage confirmations
 
+    def settle_native_owner_failure(
+        self,
+        *,
+        run_id: str,
+        operation_key: str,
+        receipt_path: Path | str,
+        native_run_id: str,
+        evidence: Sequence[str] | None = None,
+    ) -> None:
+        """Settle only the native owner operation after a proven capture failure.
+
+        The engineering stage records are already final: discover completed and
+        capture failed.  This action updates the one operation bound to the
+        native job; it never rewrites a stage, never settles another running
+        operation, and never turns an unreachable or live endpoint job into a
+        result.
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            run_row = cursor.fetchone()
+            if run_row is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            cursor.execute(_READ_OPERATION_BY_KEY, (operation_key, run_id))
+            row = cursor.fetchone()
+            if row is None:
+                raise PlatformStoreError("The native owner operation is not registered")
+            operation_id, stage, kind, _state, _dag_id, _dag_run_id, task_id, map_index, _key = row
+            if (
+                stage != "discover"
+                or kind != "native"
+                or task_id != "discover"
+                or map_index != -1
+            ):
+                raise PlatformStoreError("The named operation is not the bound native discover owner")
+            reconcile = {
+                "binding": {"operation_id": operation_id, "task_id": task_id, "map_index": map_index},
+                "native_receipt": {"path": str(receipt_path), "native_run_id": native_run_id},
+                "evidence": list(evidence or ()),
+                "reported_stage": "capture",
+            }
+            receipt, reconcile = self._byte_bound_orphan_receipt(
+                run_id=run_id, stage="discover", state="failed", receipt=None, reconcile=reconcile
+            )
+            self._settle_native_owner_failure(
+                connection,
+                cursor,
+                run_id=run_id,
+                operation_id=operation_id,
+                receipt=receipt,
+                reconcile=reconcile,
+                run_state=run_row[0],
+            )
+
+    def settle_native_owner_success(
+        self,
+        *,
+        run_id: str,
+        operation_key: str,
+        job_path: Path | str,
+    ) -> None:
+        """Settle the native owner as succeeded at its terminal native success.
+
+        The native job can reach ``native_complete`` before the Linux capture
+        import runs.  The owner operation is still terminal: its side effect
+        succeeded.  A later capture import failure belongs to the capture stage
+        and must not leave this operation running.
+        """
+
+        job_file = Path(job_path)
+        try:
+            job = json.loads(job_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise PlatformStoreError("The native success receipt is unreadable") from error
+        if (
+            not isinstance(job, dict)
+            or job.get("status") not in {"passed", "native_complete"}
+            or job.get("run_id") != run_id
+            or (job.get("request") or {}).get("run_id") != run_id
+        ):
+            raise PlatformStoreError("The native success receipt is not the bound terminal success")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_LOCK_RUN, (run_id,))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+            cursor.execute(_READ_OPERATION_BY_KEY, (operation_key, run_id))
+            row = cursor.fetchone()
+            if row is None:
+                raise PlatformStoreError("The native owner operation is not registered")
+            operation_id, stage, kind, state, dag_id, dag_run_id, task_id, map_index, key = row
+            if (
+                stage != "discover"
+                or kind != "native"
+                or task_id != "discover"
+                or map_index != -1
+                or not isinstance(dag_id, str)
+                or not isinstance(dag_run_id, str)
+                or native_run_id(dag_run_id) != run_id
+            ):
+                raise PlatformStoreError("The named native owner is not the bound discover operation")
+            if state == "succeeded":
+                return
+            if state != "running":
+                raise PlatformStoreError("The native owner operation already has another terminal state")
+            cursor.execute(_SETTLE_NAMED_OPERATION, ("succeeded", operation_id, run_id))
+            if cursor.fetchone() is None:
+                raise PlatformStoreError("The native owner operation lost its running state to another writer")
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                stage="discover",
+                kind="binding",
+                operation_id=operation_id,
+                payload={
+                    "operation_key": key,
+                    "intent_stage": "discover",
+                    "reconciled_stage": "discover",
+                    "reconciled_state": "succeeded",
+                    "reported_stage": "capture",
+                    "actual_stage": "capture",
+                    "closure_shape": "native_complete_owner_succeeded",
+                    "dag_id": dag_id,
+                    "dag_run_id": dag_run_id,
+                    "task_id": task_id,
+                    "map_index": map_index,
+                    "native_run_id": run_id,
+                    "native_receipt_sha256": file_digest(job_file),
+                },
+            )
+
     def confirm_stage(
         self,
         *,
@@ -1292,6 +1456,7 @@ class PlatformStore:
         reused_from_run: str | None = None,
         original_executed_at: datetime | None = None,
         reconcile: dict | None = None,
+        settle_operations: bool = True,
     ) -> None:
         """Register one stage record: canonical state plus optional sealed receipt/checkpoint.
 
@@ -1325,6 +1490,68 @@ class PlatformStore:
             )
             if admitted_closure is not None:
                 receipt = admitted_closure
+        if (
+            reconcile is not None
+            and isinstance(reconcile.get("binding"), dict)
+            and stage == "discover"
+            and state == "failed"
+            and isinstance(receipt, dict)
+            and receipt.get("reported_stage") == "capture"
+            and receipt.get("actual_stage") == "capture"
+        ):
+            with self._transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute(_LOCK_RUN, (run_id,))
+                run_row = cursor.fetchone()
+                if run_row is None:
+                    raise PlatformStoreError(f"The run {run_id!r} is not admitted")
+                resolved = self._reconcile_operation(connection, run_id=run_id, stage=stage, reconcile=reconcile)
+                binding = resolved.get("binding")
+                operation_id = binding.get("operation_id") if isinstance(binding, dict) else None
+                if not isinstance(operation_id, str) or not operation_id:
+                    raise PlatformStoreError("The capture recovery names no owner operation")
+                cursor.execute(_READ_STAGE_ROW, (run_id, "discover"))
+                discover_row = cursor.fetchone()
+                if discover_row is None:
+                    planned_receipt = resolved.get("discover_receipt")
+                    planned_checkpoint = resolved.get("discover_checkpoint")
+                    if (
+                        not isinstance(planned_receipt, dict)
+                        or planned_receipt.get("stage") != "discover"
+                        or planned_receipt.get("state") not in CONFIRMED_STAGE_STATES["discover"]
+                        or planned_receipt.get("passed") is not CONFIRMED_STAGE_PASSED["discover"]
+                        or not isinstance(planned_checkpoint, str)
+                        or not planned_checkpoint
+                    ):
+                        raise PlatformStoreError(
+                            "The capture recovery names no completed discover stage or sealed discovery"
+                        )
+                    cursor.execute(
+                        _INSERT_STAGE,
+                        (run_id, "discover", "completed", _json(planned_receipt), planned_checkpoint, None, None),
+                    )
+                    if cursor.fetchone() is None:
+                        raise PlatformStoreError("The planned discover stage lost its run to another writer")
+                    self._insert_event(
+                        connection,
+                        run_id=run_id,
+                        stage="discover",
+                        kind="stage",
+                        operation_id=resolved.get("operation_id"),
+                        payload={"state": "completed", "source": "native_recovery"},
+                    )
+                elif discover_row[0] != "completed":
+                    raise PlatformStoreError("The capture recovery requires a completed discover stage")
+                self._settle_native_owner_failure(
+                    connection,
+                    cursor,
+                    run_id=run_id,
+                    operation_id=operation_id,
+                    receipt=receipt,
+                    reconcile=resolved,
+                    run_state=run_row[0],
+                )
+            return
         definition = None
         sealed_root = None
         reuse_binding = None
@@ -1551,7 +1778,8 @@ class PlatformStore:
                 operation_id=reconcile.get("operation_id") if reconcile is not None else None,
                 payload={"state": state},
             )
-            self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
+            if settle_operations:
+                self._stage_outcome(connection, run_id=run_id, stage=stage, state=state)
 
     def _byte_bound_orphan_receipt(
         self, *, run_id: str, stage: str, state: str, receipt: dict | None, reconcile: dict
@@ -1609,7 +1837,7 @@ class PlatformStore:
             "run_id": run_id,
             "stage": loaded.stage,
             "reported_stage": loaded.reported_stage,
-            "actual_stage": loaded.stage,
+            "actual_stage": loaded.actual_stage,
             "request_main_assembly": loaded.request_main_assembly,
             "request_upload_sha256": loaded.request_upload_sha256,
             "request_upload_files": loaded.request_upload_files,
@@ -2298,6 +2526,211 @@ class PlatformStore:
             receipt=receipt,
             reconcile=reconcile,
         )
+
+    def _verified_direct_completed_stage(self, cursor, *, run_id: str, stage: str, row) -> dict:
+        """Verify one directly owned completed stage and return its receipt."""
+
+        checkpoint = row[3] if len(row) > 3 else None
+        receipt = row[2] if len(row) > 2 else None
+        if isinstance(receipt, str):
+            try:
+                receipt = json.loads(receipt)
+            except ValueError:
+                receipt = None
+        reused_from_run = row[4] if len(row) > 4 else None
+        if (
+            not isinstance(receipt, dict)
+            or reused_from_run is not None
+            or not isinstance(checkpoint, str)
+            or not checkpoint
+        ):
+            raise PlatformStoreError(f"The completed {stage} carries no directly owned sealed checkpoint")
+        try:
+            checkpoint_run, checkpoint_stage = parse_sealed_uri(checkpoint)
+        except PipelineError as error:
+            raise PlatformStoreError(f"The completed {stage} carries no standard sealed checkpoint") from error
+        if checkpoint_run != run_id or checkpoint_stage != stage:
+            raise PlatformStoreError(f"The completed {stage} checkpoint belongs to another run or stage")
+        self._verify_checkpoint_scope(checkpoint, run_id=run_id, stage=stage, reused_from_run=None)
+        try:
+            definition, sealed_root = self._verify_sealed(checkpoint, receipt)
+        except PipelineError as error:
+            raise PlatformStoreError(f"The completed {stage} sealed bytes cannot be verified") from error
+        _sealed_receipt(
+            receipt,
+            run_id=run_id,
+            stage=stage,
+            state="completed",
+            checkpoint_uri=checkpoint,
+            definition=definition,
+            root=sealed_root,
+        )
+        return receipt
+
+    def _native_owner_binding_matches(
+        self,
+        cursor,
+        *,
+        run_id: str,
+        operation_id: str,
+        operation_key: str,
+        native_run: str,
+        native_sha: str,
+    ) -> bool:
+        """Whether the recorded binding event is the identical capture failure."""
+
+        cursor.execute(_READ_LAST_BINDING, (run_id, operation_id))
+        row = cursor.fetchone()
+        if row is None:
+            return False
+        payload = row[0]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("operation_key") == operation_key
+            and payload.get("native_run_id") == native_run
+            and payload.get("native_receipt_sha256") == native_sha
+            and payload.get("reported_stage") == "capture"
+            and payload.get("actual_stage") == "capture"
+            and payload.get("closure_shape") == "bound_native_capture_failed"
+        )
+
+    def _settle_native_owner_failure(
+        self,
+        connection,
+        cursor,
+        *,
+        run_id: str,
+        operation_id: str,
+        receipt: dict,
+        reconcile: dict | None,
+        run_state: object,
+    ) -> None:
+        """Settle only the named native owner operation.
+
+        The discover and capture engineering stage rows are already the
+        authority.  This action proves the operation is the bound running owner,
+        the real discover task is failed, the native job's terminal event is
+        capture, and the discover checkpoint is still byte-identical; then it
+        updates that operation alone.  It never rewrites a stage and never
+        settles another running operation.
+        """
+
+        if (
+            receipt.get("reported_stage") != "capture"
+            or receipt.get("actual_stage") != "capture"
+            or receipt.get("state") != "failed"
+        ):
+            raise PlatformStoreError("The native owner settlement is not a capture failure")
+        if run_state != "failed":
+            raise PlatformStoreError("The native owner settlement requires the terminal failed run")
+        binding = reconcile.get("binding") if isinstance(reconcile, dict) else None
+        if (
+            not isinstance(binding, dict)
+            or binding.get("operation_id") != operation_id
+            or binding.get("task_id") != "discover"
+            or binding.get("map_index") != -1
+        ):
+            raise PlatformStoreError("The native owner settlement names the discover operation and its task key")
+        native_run = receipt.get("native_run_id")
+        native_sha = receipt.get("native_receipt_sha256")
+        if not _is_canonical_uuid(native_run) or not _is_sha256(native_sha):
+            raise PlatformStoreError("The native owner settlement binds its endpoint job and receipt bytes")
+        if native_sha not in _evidence_digests(reconcile.get("evidence")):
+            raise PlatformStoreError("The native receipt digest is not bound by the settlement evidence")
+
+        cursor.execute(_READ_ORPHAN_OPERATION, (operation_id, run_id))
+        row = cursor.fetchone()
+        if row is None:
+            raise PlatformStoreError("The native owner settlement names no operation of this run")
+        op_stage, kind, op_state, dag_id, dag_run_id, bound_task, bound_map, operation_key = row
+        if (
+            op_stage != "discover"
+            or kind != "native"
+            or bound_task != "discover"
+            or bound_map != -1
+        ):
+            raise PlatformStoreError("The named operation is not the bound native discover owner")
+        if not (isinstance(dag_id, str) and dag_id and isinstance(dag_run_id, str) and dag_run_id):
+            raise PlatformStoreError("The native owner operation lacks its Airflow DagRun identity")
+        if native_run != native_run_id(dag_run_id):
+            raise PlatformStoreError("The native receipt names another run's endpoint job")
+        if op_state == "failed":
+            if not self._native_owner_binding_matches(
+                cursor,
+                run_id=run_id,
+                operation_id=operation_id,
+                operation_key=operation_key,
+                native_run=native_run,
+                native_sha=native_sha,
+            ):
+                raise PlatformStoreError("The native owner operation already has another terminal identity")
+            reconcile_operation = reconcile.get("operation_id") if isinstance(reconcile, dict) else None
+            if isinstance(reconcile_operation, str) and reconcile_operation:
+                cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
+            return
+        if op_state != "running":
+            raise PlatformStoreError("The native owner operation is not running")
+
+        cursor.execute(_READ_STAGE_RECORDS, (run_id,))
+        stages = {item[0]: item for item in cursor.fetchall()}
+        if set(stages) != {"freeze", "discover", "capture", "generate", "verify", "publish"}:
+            raise PlatformStoreError(
+                "The capture settlement requires freeze, discover, capture and three blocked stages"
+            )
+        if stages["discover"][1] != "completed" or stages["capture"][1] != "failed":
+            raise PlatformStoreError("The capture settlement requires completed discover and failed capture")
+        if any(stages[name][1] != "blocked" for name in ("generate", "verify", "publish")):
+            raise PlatformStoreError("The capture settlement requires blocked downstream stages")
+        freeze_receipt = self._verified_direct_completed_stage(
+            cursor, run_id=run_id, stage="freeze", row=stages["freeze"]
+        )
+        self._verified_direct_completed_stage(cursor, run_id=run_id, stage="discover", row=stages["discover"])
+        self._verify_dispatch_request_identity(
+            cursor,
+            run_id=run_id,
+            receipt=receipt,
+            freeze_receipt=freeze_receipt,
+        )
+        self._verify_bound_discover_airflow(
+            cursor,
+            dag_id=dag_id,
+            dag_run_id=dag_run_id,
+            binding={"operation_id": operation_id, "task_id": "discover", "map_index": -1},
+        )
+
+        cursor.execute(_SETTLE_NAMED_OPERATION, ("failed", operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The native owner operation lost its running state to another writer")
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage="capture",
+            kind="binding",
+            operation_id=operation_id,
+            payload={
+                "operation_key": operation_key,
+                "intent_stage": op_stage,
+                "reconciled_stage": "discover",
+                "reconciled_state": "failed",
+                "reported_stage": "capture",
+                "actual_stage": "capture",
+                "closure_shape": "bound_native_capture_failed",
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": bound_task,
+                "map_index": bound_map,
+                "native_run_id": native_run,
+                "native_receipt_sha256": native_sha,
+            },
+        )
+        reconcile_operation = reconcile.get("operation_id") if isinstance(reconcile, dict) else None
+        if isinstance(reconcile_operation, str) and reconcile_operation:
+            cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
 
     def _verify_dispatch_request_identity(
         self, cursor, *, run_id: str, receipt: dict, freeze_receipt: dict

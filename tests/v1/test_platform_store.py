@@ -362,6 +362,42 @@ class FakeCursor:
                 break
             self._rows = [bound] if bound is not None else []
         elif normalized.startswith(
+            "SELECT operation_id, stage, kind, state, dag_id, dag_run_id, task_id, map_index, operation_key"
+            " FROM operation WHERE operation_key = %s AND run_id = %s FOR UPDATE"
+        ):
+            key, run_id = params
+            record = world.operations.get(key)
+            if record is not None and record[4] == run_id:
+                dag_id, dag_run_id, task_id, map_index = world.operation_bindings.get(
+                    record[0], (None, None, None, None)
+                )
+                self._rows = [
+                    (
+                        record[0],
+                        record[5],
+                        record[6],
+                        record[1],
+                        dag_id,
+                        dag_run_id,
+                        task_id,
+                        map_index,
+                        record[2],
+                    )
+                ]
+            else:
+                self._rows = []
+        elif normalized.startswith(
+            "SELECT payload FROM run_event WHERE run_id = %s AND operation_id = %s"
+            " AND kind = 'binding' ORDER BY seq DESC LIMIT 1"
+        ):
+            run_id, operation_id = params
+            rows = [
+                item
+                for item in world.events
+                if item[0] == run_id and item[4] == operation_id and item[2] == "binding"
+            ]
+            self._rows = [(rows[-1][5],)] if rows else []
+        elif normalized.startswith(
             "UPDATE operation SET task_id = %s, map_index = %s, updated_at = now()"
             " WHERE operation_id = %s AND run_id = %s AND task_id IS NULL AND map_index IS NULL"
         ):
@@ -724,6 +760,18 @@ class FakeCursor:
                 ):
                     world.operations[key] = (record[0], "succeeded", *record[2:])
             self._rows = []
+        elif normalized.startswith(
+            "UPDATE operation SET state = %s, updated_at = now()"
+            " WHERE operation_id = %s AND run_id = %s AND state = 'running'"
+        ):
+            settled, operation_id, run_id = params
+            for key, record in list(world.operations.items()):
+                if record[0] == operation_id and record[4] == run_id and record[1] == "running":
+                    world.operations[key] = (record[0], settled, *record[2:])
+                    self._rows = [(record[0], settled)]
+                    break
+            else:
+                self._rows = []
         elif normalized.startswith(
             "UPDATE operation SET state = %s, updated_at = now() WHERE operation_id = %s AND run_id = %s"
         ):
@@ -3097,6 +3145,170 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             state="failed",
             reconcile=self._reconcile(),
         )
+
+    def _capture_reconcile(self) -> dict:
+        reconcile = self._reconcile()
+        reconcile["reported_stage"] = "capture"
+        return reconcile
+
+    def _prepare_capture_failure(self) -> None:
+        from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
+        from description_pipeline.io import read_data
+
+        discover_root = self.tmp / self.run_id / "discover"
+        subject, artifacts, _upload, native_handoff = build_sealed_delivery(discover_root)
+        native_tool = read_data(discover_root / "reports" / "native-tool.json")
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="completed",
+            receipt={
+                "schema_version": BUNDLE_SCHEMA,
+                "pipeline_id": PIPELINE_ID,
+                "run_id": self.run_id,
+                "stage": "discover",
+                "state": "discovered",
+                "passed": False,
+                "handoff_sha256": native_handoff,
+                "subject_sha256": subject,
+                "native_tool": native_tool,
+                "artifacts": artifacts,
+            },
+            checkpoint_uri=f"store://sealed/{self.run_id}/discover",
+            settle_operations=False,
+        )
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="capture",
+            state="failed",
+            receipt={
+                "schema_version": BUNDLE_SCHEMA,
+                "pipeline_id": PIPELINE_ID,
+                "run_id": self.run_id,
+                "stage": "capture",
+                "state": "failed",
+                "passed": False,
+                "error": "The sealed capture plan carries an unsafe selector document",
+            },
+        )
+        for stage in ("generate", "verify", "publish"):
+            self.store.confirm_stage(run_id=self.run_id, stage=stage, state="blocked", receipt={})
+        self.document["events"] = [
+            {"stage": "discover", "state": "running"},
+            {"stage": "discover", "state": "completed"},
+            {"stage": "capture", "state": "running"},
+            {
+                "stage": "capture",
+                "state": "failed",
+                "error": "PipelineError: The sealed capture plan carries an unsafe selector document",
+            },
+        ]
+        self.document["error"] = "PipelineError: The sealed capture plan carries an unsafe selector document"
+        self.document["error_code"] = "capture_plan_unsafe_selector"
+        self._write_document(self.document)
+
+    def test_direct_capture_failure_settles_only_the_owner_operation(self) -> None:
+        self._prepare_capture_failure()
+        self.store.settle_native_owner_failure(
+            run_id=self.run_id,
+            operation_key=self.native_key,
+            receipt_path=self.log,
+            native_run_id=self.native_run,
+            evidence=[str(self.log)],
+        )
+        stages = self.store.stage_records(self.run_id)
+        self.assertEqual(stages["discover"]["state"], "completed")
+        self.assertEqual(stages["capture"]["state"], "failed")
+        self.assertEqual(
+            [stages[task]["state"] for task in ("generate", "verify", "publish")],
+            ["blocked", "blocked", "blocked"],
+        )
+        self.assertEqual(self.world.operations[self.native_key][1], "failed")
+        self.assertEqual(self.store.run_record(self.run_id)["state"], "failed")
+        binding = [
+            json.loads(payload) if isinstance(payload, str) else payload
+            for _run_id, _seq, kind, _stage, _operation_id, payload in self.world.events
+            if kind == "binding"
+        ]
+        self.assertEqual(len(binding), 1)
+        self.assertEqual(binding[0]["actual_stage"], "capture")
+        self.assertEqual(binding[0]["closure_shape"], "bound_native_capture_failed")
+        self.assertEqual(binding[0]["native_receipt_sha256"], file_digest(self.log))
+        before = self.world.snapshot_state()
+        self.store.settle_native_owner_failure(
+            run_id=self.run_id,
+            operation_key=self.native_key,
+            receipt_path=self.log,
+            native_run_id=self.native_run,
+            evidence=[str(self.log)],
+        )
+        self.assertEqual(self.world.snapshot_state(), before, "the identical owner settlement is a no-op")
+
+    def test_native_success_settles_the_owner_before_capture_import(self) -> None:
+        job = dict(self.document)
+        job["status"] = "native_complete"
+        job["events"] = [
+            {"stage": "discover", "state": "completed"},
+            {"stage": "capture", "state": "completed"},
+        ]
+        self._write_document(job)
+        self.store.settle_native_owner_success(
+            run_id=self.run_id,
+            operation_key=self.native_key,
+            job_path=self.log,
+        )
+        self.assertEqual(self.world.operations[self.native_key][1], "succeeded")
+        self.assertEqual(self.store.run_record(self.run_id)["state"], "running")
+        stages = self.store.stage_records(self.run_id)
+        self.assertEqual(list(stages), ["freeze"])
+        before = self.world.snapshot_state()
+        self.store.settle_native_owner_success(
+            run_id=self.run_id,
+            operation_key=self.native_key,
+            job_path=self.log,
+        )
+        self.assertEqual(self.world.snapshot_state(), before, "the identical success settlement is a no-op")
+
+    def test_maintenance_capture_reconcile_reuses_the_owner_settlement(self) -> None:
+        self._prepare_capture_failure()
+        reconcile = self._capture_reconcile()
+        self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+        stages = self.store.stage_records(self.run_id)
+        self.assertEqual(stages["discover"]["state"], "completed")
+        self.assertEqual(stages["capture"]["state"], "failed")
+        self.assertEqual(self.world.operations[self.native_key][1], "failed")
+        reconcile_row = self.world.operations[f"operatorctl-reconcile:{self.run_id}:discover:failed"]
+        self.assertEqual(reconcile_row[1], "succeeded")
+        before = self.world.snapshot_state()
+        self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+        self.assertEqual(self.world.snapshot_state(), before, "the repeated maintenance settlement is a no-op")
+
+    def test_capture_settlement_refuses_a_foreign_owner_binding(self) -> None:
+        self._prepare_capture_failure()
+        self.world.operation_bindings[self.native_id] = (DAG_ID, self.dag_run_id, "freeze", -1)
+        before = self.world.snapshot_state()
+        with self.assertRaisesRegex(PlatformStoreError, "bound native discover owner"):
+            self.store.settle_native_owner_failure(
+                run_id=self.run_id,
+                operation_key=self.native_key,
+                receipt_path=self.log,
+                native_run_id=self.native_run,
+                evidence=[str(self.log)],
+            )
+        self.assertEqual(self.world.snapshot_state(), before)
+
+    def test_capture_settlement_refuses_a_tampered_receipt_digest(self) -> None:
+        self._prepare_capture_failure()
+        before = self.world.snapshot_state()
+        with self.assertRaisesRegex(PlatformStoreError, "contradicts the original receipt bytes"):
+            self.store.settle_native_owner_failure(
+                run_id=self.run_id,
+                operation_key=self.native_key,
+                receipt_path=self.log,
+                native_run_id=self.native_run,
+                evidence=[f"{self.log}#sha256={'f' * 64}"],
+            )
+        self.assertEqual(self.world.snapshot_state(), before)
 
     def test_bound_native_discover_closes_once_and_replays_without_writes(self) -> None:
         self._apply()
