@@ -781,7 +781,7 @@ class DagTests(unittest.TestCase):
     def test_capture_local_failure_converges_after_a_proven_native_complete_job(self):
         import tempfile
 
-        module = self._module()
+        module = self.module
         upload = {"assembly.SLDASM": "a" * 64}
         request = {
             "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
@@ -818,10 +818,13 @@ class DagTests(unittest.TestCase):
         self.assertEqual(converge.call_args.args[:2], (request["run_id"], "capture"))
 
     def test_capture_retries_owner_settlement_after_a_successful_import(self) -> None:
+        import shutil
         import tempfile
 
         module = self._module()
         upload = {"assembly.SLDASM": "a" * 64}
+        intake = Path(tempfile.mkdtemp(prefix="dag-capture-owner-intake-"))
+        self.addCleanup(shutil.rmtree, intake, ignore_errors=True)
         request = {
             "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
             "upload_files": upload,
@@ -829,6 +832,7 @@ class DagTests(unittest.TestCase):
             "main_assembly": "assembly.SLDASM",
             "conn_id": "test",
             "platform_config_digest": "c" * 64,
+            "intake_dir": str(intake),
         }
         job = {
             "run_id": request["run_id"],
@@ -3093,7 +3097,7 @@ class PlatformRegistrationTests(unittest.TestCase):
     def test_native_failure_marker_binds_settlement_to_the_exact_failed_task(self) -> None:
         from types import SimpleNamespace
 
-        module = self._module()
+        module = self.module
         run_dir = Path(self.temporary.name) / "runs" / "native-marker"
         (run_dir / "reports").mkdir(parents=True)
         (run_dir / "reports" / "native-job-success.json").write_text("{}", encoding="utf-8")
