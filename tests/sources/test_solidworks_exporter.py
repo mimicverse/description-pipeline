@@ -11,6 +11,7 @@ from unittest import mock
 
 from . import _paths  # noqa: F401
 from . import support  # noqa: E402
+from .selection_support import sealed_selection  # noqa: E402
 from .test_solidworks_discovery import IDENTITY, FakeBackend
 from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
@@ -110,6 +111,10 @@ def wire_xml(limit_values=None) -> str:
 
 def raw_record() -> dict:
     xml = wire_xml()
+    files = {
+        name: hashlib.sha256(b"native-file-test").hexdigest()
+        for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
+    }
     return {
         "schema_version": DISCOVERY_SCHEMA,
         "identity": {
@@ -125,10 +130,16 @@ def raw_record() -> dict:
         "document_state": support.saved_document_state(),
         # The exporter fixture's frozen bytes are the deterministic placeholder
         # written by the preparation test; the derive contract binds them.
-        "files": {
-            name: hashlib.sha256(b"native-file-test").hexdigest()
-            for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
-        },
+        "files": files,
+        "source_selection": sealed_selection(
+            files,
+            "robot.SLDASM",
+            edges={
+                "robot.SLDASM": ["base.SLDPRT", "arm.SLDPRT"],
+                "base.SLDPRT": [],
+                "arm.SLDPRT": [],
+            },
+        ),
         "components": [
             {
                 "name2": name,
