@@ -2996,7 +2996,7 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         self.dag_run_id = BOUND_DISCOVER_DAG_RUN
         self.native_run = native_run_id(self.dag_run_id)
         self.sealed_root = self.tmp / self.run_id / "freeze"
-        subject, artifacts, self.upload_sha, _native_handoff = build_sealed_delivery(self.sealed_root)
+        subject, artifacts, self.upload_sha, self.native_handoff = build_sealed_delivery(self.sealed_root)
         index = read_data(self.sealed_root / "input" / "handoff.json")
         self.upload_files = dict(index["package_files"])
         self.main_assembly = "cad/cad/robot.SLDASM"
@@ -3151,6 +3151,33 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         reconcile["reported_stage"] = "capture"
         return reconcile
 
+    def _capture_stage_view(self, *, capture_state: str = "failed") -> dict:
+        rows = [{"id": stage["id"]} for stage in CONTRACT["stages"]]
+        by_id = {row["id"]: row for row in rows}
+        discover_definition = next(stage for stage in CONTRACT["stages"] if stage["id"] == "discover")
+        by_id["discover"].update(
+            state="completed",
+            in_scope=True,
+            input_qc=[
+                {"id": item["id"], "state": "passed", "details": {"passed": True}}
+                for item in discover_definition["input_qc"]
+            ],
+            output_qc=[
+                {"id": item["id"], "state": "passed", "details": {"passed": True}}
+                for item in discover_definition["output_qc"]
+            ],
+        )
+        by_id["capture"].update(state=capture_state, in_scope=True)
+        return {
+            "schema_version": "solidworks-to-urdf.stages/v1",
+            "pipeline_id": PIPELINE_ID,
+            "contract_sha256": CONTRACT_SHA256,
+            "run_id": self.native_run,
+            "handoff_sha256": self.native_handoff,
+            "execution_scope": ["discover", "capture"],
+            "stages": rows,
+        }
+
     def _prepare_capture_failure(self) -> None:
         from description_pipeline.delivery import BUNDLE_SCHEMA, PIPELINE_ID
         from description_pipeline.io import read_data
@@ -3158,6 +3185,7 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         discover_root = self.tmp / self.run_id / "discover"
         subject, artifacts, _upload, native_handoff = build_sealed_delivery(discover_root)
         native_tool = read_data(discover_root / "reports" / "native-tool.json")
+        native_stages = self._capture_stage_view()
         self.store.confirm_stage(
             run_id=self.run_id,
             stage="discover",
@@ -3172,6 +3200,7 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 "handoff_sha256": native_handoff,
                 "subject_sha256": subject,
                 "native_tool": native_tool,
+                "native_stages_sha256": digest(native_stages),
                 "artifacts": artifacts,
             },
             checkpoint_uri=f"store://sealed/{self.run_id}/discover",
@@ -3205,7 +3234,22 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         ]
         self.document["error"] = "PipelineError: The sealed capture plan carries an unsafe selector document"
         self.document["error_code"] = "capture_plan_unsafe_selector"
+        self.document["handoff_sha256"] = self.native_handoff
+        self.document["stages"] = native_stages
         self._write_document(self.document)
+
+    def _assert_refused_without_writes(self, expected: str, operation) -> None:
+        before = self.world.snapshot_state()
+        statement_count = len(self.world.statements)
+        with self.assertRaisesRegex(PlatformStoreError, expected):
+            operation()
+        self.assertEqual(self.world.snapshot_state(), before)
+        writes = [
+            statement
+            for statement in self.world.statements[statement_count:]
+            if statement.startswith(("INSERT ", "UPDATE ", "DELETE "))
+        ]
+        self.assertEqual(writes, [])
 
     def test_direct_capture_failure_settles_only_the_owner_operation(self) -> None:
         self._prepare_capture_failure()
@@ -3251,12 +3295,8 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             {"stage": "discover", "state": "completed"},
             {"stage": "capture", "state": "completed"},
         ]
-        job["stages"] = {
-            "stages": [
-                {"id": "discover", "state": "completed"},
-                {"id": "capture", "state": "completed"},
-            ]
-        }
+        job["stages"] = self._capture_stage_view(capture_state="completed")
+        job["handoff_sha256"] = self.native_handoff
         self._write_document(job)
         self.store.settle_native_owner_success(
             run_id=self.run_id,
@@ -3274,6 +3314,61 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             job_path=self.log,
         )
         self.assertEqual(self.world.snapshot_state(), before, "the identical success settlement is a no-op")
+
+    def test_native_success_replay_reverifies_the_freeze_and_request(self) -> None:
+        job = dict(self.document)
+        job["status"] = "native_complete"
+        job["events"] = [
+            {"stage": "discover", "state": "completed"},
+            {"stage": "capture", "state": "completed"},
+        ]
+        job["stages"] = self._capture_stage_view(capture_state="completed")
+        job["handoff_sha256"] = self.native_handoff
+        self._write_document(job)
+        def settle():
+            return self.store.settle_native_owner_success(
+                run_id=self.run_id,
+                operation_key=self.native_key,
+                job_path=self.log,
+            )
+
+        settle()
+        freeze = self.world.stages[(self.run_id, "freeze")]
+        self.world.stages[(self.run_id, "freeze")] = ("completed", {}, *freeze[2:])
+        self._assert_refused_without_writes("sealed bytes cannot be verified", settle)
+        self.world.stages[(self.run_id, "freeze")] = freeze
+        self._set_platform_main("cad/other.SLDASM")
+        self._assert_refused_without_writes("does not match the admitted request", settle)
+
+    def test_native_success_rejects_trailing_and_malformed_events(self) -> None:
+        job = dict(self.document)
+        job["status"] = "native_complete"
+        job["stages"] = {
+            "stages": [
+                {"id": "discover", "state": "completed"},
+                {"id": "capture", "state": "completed"},
+            ]
+        }
+        for suffix, expected in (
+            ({"stage": "capture", "state": "running"}, "terminal capture completion"),
+            ("garbage", "event stream is not a list of objects"),
+        ):
+            with self.subTest(suffix=suffix):
+                candidate = dict(job)
+                candidate["events"] = [
+                    {"stage": "discover", "state": "completed"},
+                    {"stage": "capture", "state": "completed"},
+                    suffix,
+                ]
+                self._write_document(candidate)
+                self._assert_refused_without_writes(
+                    expected,
+                    lambda: self.store.settle_native_owner_success(
+                        run_id=self.run_id,
+                        operation_key=self.native_key,
+                        job_path=self.log,
+                    ),
+                )
 
     def test_maintenance_capture_reconcile_reuses_the_owner_settlement(self) -> None:
         self._prepare_capture_failure()
@@ -3315,6 +3410,38 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 evidence=[f"{self.log}#sha256={'f' * 64}"],
             )
         self.assertEqual(self.world.snapshot_state(), before)
+
+    def test_capture_settlement_replay_revalidates_all_bound_facts(self) -> None:
+        self._prepare_capture_failure()
+        def settle():
+            return self.store.settle_native_owner_failure(
+                run_id=self.run_id,
+                operation_key=self.native_key,
+                receipt_path=self.log,
+                native_run_id=self.native_run,
+                evidence=[str(self.log)],
+            )
+
+        settle()
+        freeze = self.world.stages[(self.run_id, "freeze")]
+        self.world.stages[(self.run_id, "freeze")] = ("completed", {}, *freeze[2:])
+        self._assert_refused_without_writes("sealed bytes cannot be verified", settle)
+        self.world.stages[(self.run_id, "freeze")] = freeze
+        self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "running"
+        self._assert_refused_without_writes("real discover task", settle)
+        self.world.task_instances[(DAG_ID, "discover", self.dag_run_id, -1)] = "failed"
+        self.world.dag_runs[(DAG_ID, self.dag_run_id)] = "success"
+        self._assert_refused_without_writes("terminal failed fact", settle)
+        self.world.dag_runs[(DAG_ID, self.dag_run_id)] = "failed"
+        discover = self.world.stages[(self.run_id, "discover")]
+        receipt = dict(discover[1])
+        receipt["native_stages_sha256"] = "f" * 64
+        self.world.stages[(self.run_id, "discover")] = (
+            discover[0],
+            receipt,
+            *discover[2:],
+        )
+        self._assert_refused_without_writes("not bound to the native stage facts", settle)
 
     def test_bound_native_discover_closes_once_and_replays_without_writes(self) -> None:
         self._apply()

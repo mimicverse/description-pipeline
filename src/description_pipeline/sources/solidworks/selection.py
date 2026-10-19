@@ -121,6 +121,48 @@ def verify_selection(
     return expected
 
 
+def selection_bindings(selection: object) -> dict:
+    """Validate one sealed selection manifest and return its bound identities.
+
+    The full intake index is reconstructed from the selected and excluded file
+    inventories, and ``verify_selection`` re-seals the complete manifest from
+    that index.  This is the one consumer-side proof for both transfer and
+    capture; no caller accepts a partial closure carrier.
+    """
+
+    if not isinstance(selection, Mapping):
+        raise PipelineError("selection manifest must be an object")
+    manifest = dict(selection)
+    if manifest.get("schema_version") != SELECTION_SCHEMA:
+        raise PipelineError("selection manifest uses an unknown schema")
+    files = manifest.get("files")
+    excluded = manifest.get("excluded_files")
+    if not isinstance(files, Mapping) or not files:
+        raise PipelineError("selection manifest must carry its selected files")
+    if not isinstance(excluded, Mapping):
+        raise PipelineError("selection manifest must carry its excluded files")
+    if set(files) & set(excluded):
+        raise PipelineError("selection manifest selected and excluded files overlap")
+    upload = {**dict(excluded), **dict(files)}
+    verify_selection(manifest, upload, files, reader_sha256=manifest.get("reader_sha256"))
+    for key in ("selection_sha256", "upload_sha256", "handoff_sha256"):
+        if not isinstance(manifest.get(key), str) or _SHA.fullmatch(manifest[key]) is None:
+            raise PipelineError(f"selection manifest lacks a usable {key}")
+    selected = validate_file_index(files)
+    main = manifest.get("main_assembly")
+    if not isinstance(main, str) or not main or not main.lower().endswith(".sldasm") or main not in selected:
+        raise PipelineError("selection manifest lacks its selected main assembly")
+    return {
+        "selection": manifest,
+        "files": selected,
+        "main_assembly": main,
+        "main_assembly_sha256": selected[main],
+        "selection_sha256": manifest["selection_sha256"],
+        "upload_sha256": manifest["upload_sha256"],
+        "handoff_sha256": manifest["handoff_sha256"],
+    }
+
+
 def reachable_closure(graph: Mapping[str, dict], main_assembly: str) -> set[str]:
     """Canonical upload-index names reachable from the main over resolved graph edges."""
 

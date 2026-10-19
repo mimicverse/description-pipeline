@@ -433,6 +433,19 @@ class DagTests(unittest.TestCase):
         self.assertEqual(
             set(dag.params), {"handoff_path", "main_assembly", "target_hardware", "change_summary", "purpose"}
         )
+        dag_callbacks = dag.on_failure_callback
+        dag_callbacks = dag_callbacks if isinstance(dag_callbacks, (list, tuple)) else [dag_callbacks]
+        self.assertEqual(
+            [getattr(callback, "__name__", None) for callback in dag_callbacks],
+            ["_settle_native_owner_on_failure"],
+        )
+        for task_id in ("discover", "capture"):
+            callbacks = dag.task_dict[task_id].on_failure_callback
+            callbacks = callbacks if isinstance(callbacks, (list, tuple)) else [callbacks]
+            self.assertEqual(
+                [getattr(callback, "__name__", None) for callback in callbacks],
+                ["_record_native_failure_binding"],
+            )
         handoff_param = dict(dag.params.items())["handoff_path"]
         self.assertEqual(handoff_param.schema["title"], "Engineering folder path")
         self.assertEqual(handoff_param.schema["type"], "string")
@@ -484,6 +497,7 @@ class DagTests(unittest.TestCase):
             patch.object(module, "carry_request_evidence", return_value=None),
             patch.object(module, "_register_native_stages", return_value=None),
             patch.object(module, "_release_registered_cache", return_value=None),
+            patch.object(module, "_settle_native_owner_success", return_value=None),
         ):
             binding = dag.task_dict["capture"].python_callable(request)
         self.assertEqual(binding["repository_slug"], "mimicverse/description")
@@ -802,6 +816,59 @@ class DagTests(unittest.TestCase):
         ):
             module.dag.task_dict["capture"].python_callable(request)
         self.assertEqual(converge.call_args.args[:2], (request["run_id"], "capture"))
+
+    def test_capture_retries_owner_settlement_after_a_successful_import(self) -> None:
+        import tempfile
+
+        module = self._module()
+        upload = {"assembly.SLDASM": "a" * 64}
+        request = {
+            "run_id": "c5d1a559-4a25-52eb-a6dc-8855f9b0654d",
+            "upload_files": upload,
+            "upload_sha256": digest(upload),
+            "main_assembly": "assembly.SLDASM",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+        job = {
+            "run_id": request["run_id"],
+            "status": "native_complete",
+            "request": {
+                "run_id": request["run_id"],
+                "upload_files": upload,
+                "upload_sha256": request["upload_sha256"],
+                "main_assembly": request["main_assembly"],
+            },
+        }
+        endpoint = SimpleNamespace(get_job=lambda run_id: job)
+        binding = {
+            "run_id": request["run_id"],
+            "handoff_sha256": request["upload_sha256"],
+            "hardware_id": "m3.0",
+            "revision": "r1",
+            "state": "native",
+        }
+        settled: list[dict] = []
+        with (
+            tempfile.TemporaryDirectory(prefix="dag-capture-owner-retry-") as store_root,
+            patch.object(module, "_endpoint", return_value=endpoint),
+            patch.object(module, "_platform_binding", return_value=(SimpleNamespace(), Path(store_root))),
+            patch.object(module.native_capture, "import_native_capture", return_value=dict(binding)),
+            patch.object(module, "carry_request_evidence", return_value=None),
+            patch.object(module, "_register_native_stages", return_value=None),
+            patch.object(module, "_release_registered_cache", return_value=None),
+            patch.object(module, "_converge_failed_stage") as converge,
+            patch.object(
+                module,
+                "_settle_native_owner_success",
+                side_effect=[RuntimeError("store unavailable"), lambda request, job: settled.append(job)],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "store unavailable"):
+                module.dag.task_dict["capture"].python_callable(request)
+            converge.assert_not_called()
+            module.dag.task_dict["capture"].python_callable(request)
+        self.assertEqual(settled, [job])
 
     def test_terminal_summary_without_task_instance_warns_and_never_crashes(self):
         from types import SimpleNamespace
@@ -2902,6 +2969,7 @@ class PlatformRegistrationTests(unittest.TestCase):
 
         from description_pipeline.io import digest, file_digest, read_data, write_json
         from description_pipeline.platform import flow
+        from description_pipeline.schemas import TOOL_SCHEMA
 
         run_id = "cfa3e725-abc5-5b60-94ad-6ba838110408"
         run_dir = self.root / run_id
@@ -2914,7 +2982,22 @@ class PlatformRegistrationTests(unittest.TestCase):
         write_json(derived / "records" / "arm.json", {"record": "fixture"})
         native_files = {"assembly.SLDASM": file_digest(derived / "assembly.SLDASM")}
         handoff = digest(native_files)
-        discovery = {"native_files": native_files, "handoff_sha256": handoff}
+        full_upload = {**native_files, "excluded.SLDPRT": "d" * 64}
+        full_upload_sha = digest(full_upload)
+        from tests.sources.selection_support import sealed_selection
+
+        discovery = {
+            "native_files": native_files,
+            "handoff_sha256": handoff,
+            "raw": {
+                "files": native_files,
+                "source_selection": sealed_selection(
+                    full_upload,
+                    "assembly.SLDASM",
+                    edges={"assembly.SLDASM": []},
+                ),
+            },
+        }
         archive_path = run_dir / "definition" / "capture-request.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr("discovery/native-discovery.json", json.dumps(discovery))
@@ -2933,20 +3016,38 @@ class PlatformRegistrationTests(unittest.TestCase):
             "discovery/native-discovery.json": hashlib.sha256(json.dumps(discovery).encode()).hexdigest(),
         }
         native_tool = {
-            "schema_version": "solidworks-to-urdf.tool/v1",
+            "schema_version": TOOL_SCHEMA,
             "pipeline_id": "solidworks-to-urdf",
             "version": "1.5.0",
             "source_sha256": "a" * 64,
             "runtime": {"role": "native"},
         }
+        portable_tool = {**native_tool, "runtime": {"role": "portable"}}
+        from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
+        from tests.v1.test_native_recovery import stage_view
+
+        request_evidence = request_evidence_bytes(
+            build_request_evidence(
+                purpose="inspection_preview",
+                request_id="portal-recovery-fixture",
+                target_hardware="m3.0",
+                change_summary="recovery fixture",
+                main_assembly="assembly.SLDASM",
+                handoff_digest=full_upload_sha,
+                platform_config_digest="c" * 64,
+            )
+        )
+        (run_dir / "stages" / "freeze" / "input").mkdir(parents=True)
+        (run_dir / "stages" / "freeze" / "input" / "request.json").write_bytes(request_evidence)
+        write_json(run_dir / "stages" / "freeze" / "tool.json", portable_tool)
         job = {
             "run_id": run_id,
             "status": "failed",
             "request": {
                 "run_id": run_id,
                 "main_assembly": "assembly.SLDASM",
-                "upload_files": native_files,
-                "upload_sha256": handoff,
+                "upload_files": full_upload,
+                "upload_sha256": full_upload_sha,
             },
             "events": [
                 {"stage": "discover", "state": "completed"},
@@ -2956,6 +3057,7 @@ class PlatformRegistrationTests(unittest.TestCase):
             "capture_request": {"sha256": file_digest(archive_path)},
             "native_tool": native_tool,
             "handoff_sha256": handoff,
+            "stages": stage_view(handoff_sha256=handoff, run_id=run_id),
         }
         request = {
             "run_id": run_id,
@@ -2987,6 +3089,64 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertIs(self.calls[-1]["settle_operations"], False)
         self.assertEqual(self.calls[-1]["stage"], "discover")
         self.assertEqual(self.calls[-1]["state"], "completed")
+
+    def test_native_failure_marker_binds_settlement_to_the_exact_failed_task(self) -> None:
+        from types import SimpleNamespace
+
+        module = self._module()
+        run_dir = Path(self.temporary.name) / "runs" / "native-marker"
+        (run_dir / "reports").mkdir(parents=True)
+        (run_dir / "reports" / "native-job-success.json").write_text("{}", encoding="utf-8")
+        request = {
+            "run_id": "cfa3e725-abc5-5b60-94ad-6ba838110408",
+            "conn_id": "test",
+            "platform_config_digest": "c" * 64,
+        }
+
+        class TaskInstance:
+            run_id = "portal-marker-run"
+            map_index = -1
+
+            def __init__(self):
+                self.task_id = "capture"
+                self.values = {}
+
+            def xcom_pull(self, *, task_ids, key=None):
+                if task_ids == "freeze" and key is None:
+                    return request
+                return self.values.get((task_ids, key))
+
+            def xcom_push(self, *, key, value):
+                self.values[(self.task_id, key)] = value
+
+        ti = TaskInstance()
+        module._record_native_failure_binding({"ti": ti})
+        marker = ti.values[("capture", module.NATIVE_FAILURE_MARKER)]
+        self.assertEqual(marker["task_id"], "capture")
+        self.assertEqual(marker["request_sha256"], digest(request))
+
+        settled: list[tuple[str, Path]] = []
+        ti.task_id = "publish"
+        with (
+            patch.object(
+                module,
+                "_work_paths",
+                return_value=SimpleNamespace(run_dir=run_dir),
+            ),
+            patch.object(
+                module,
+                "_settle_native_owner_success_from_receipt",
+                side_effect=lambda pulled, path: settled.append((pulled["run_id"], path)),
+            ),
+        ):
+            module._settle_native_owner_on_failure({"ti": ti})
+            self.assertEqual(settled, [(request["run_id"], run_dir / "reports" / "native-job-success.json")])
+            ti.values[("discover", module.NATIVE_FAILURE_MARKER)] = {
+                **marker,
+                "task_id": "discover",
+            }
+            module._settle_native_owner_on_failure({"ti": ti})
+        self.assertEqual(len(settled), 1, "ambiguous failure markers must never settle")
 
     def test_a_repeated_freeze_confirmation_consumes_the_confirmed_fact(self) -> None:
         run_dir = Path(self.temporary.name) / "runs" / "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"

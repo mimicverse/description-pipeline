@@ -11,6 +11,7 @@ from pathlib import Path
 from description_pipeline import steps
 from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.sources.solidworks import discovery
+from tests.sources.selection_support import sealed_selection
 
 MAIN = "cad/robot.SLDASM"
 
@@ -22,20 +23,36 @@ def build_package(root: Path) -> Path:
         "schema_version": "solidworks-to-urdf.native-discovery/v1",
         "run_id": "r-1",
         "derivation": {"main_assembly": MAIN, "configuration": None},
-        "native_files": {MAIN: "a" * 64, "cad/part.SLDPRT": "b" * 64},
+        "native_files": {
+            MAIN: "a" * 64,
+            "cad/base.SLDPRT": "b" * 64,
+            "cad/arm.SLDPRT": "c" * 64,
+        },
         "raw": {
             "saved_configuration": "Default",
             "components": [
-                {"instance_id": "base-1", "name2": "base-1", "document": "cad/base.SLDPRT"},
-                {"instance_id": "arm-1", "name2": "arm-1", "document": "cad/arm.SLDPRT"},
+                {
+                    "instance_id": "base-1",
+                    "name2": "base-1",
+                    "document": "cad/base.SLDPRT",
+                    "suppression_state": 2,
+                },
+                {
+                    "instance_id": "arm-1",
+                    "name2": "arm-1",
+                    "document": "cad/arm.SLDPRT",
+                    "suppression_state": 2,
+                },
             ],
         },
     }
+    files = {str(key): str(value) for key, value in discovery["native_files"].items()}
+    discovery["raw"]["files"] = files
+    discovery["raw"]["source_selection"] = sealed_selection(files, MAIN)
     (root / "discovery").mkdir(parents=True)
     discovery_path = root / "discovery" / "native-discovery.json"
     write_json(discovery_path, discovery)
     write_json(root / "source.json", {"schema_version": "solidworks-to-urdf.source/v1", "robot_name": "robot"})
-    files = {str(key): str(value) for key, value in discovery["native_files"].items()}
     plan = {
         "schema_version": "solidworks-to-urdf.capture-plan/v1",
         "run_id": "r-1",
@@ -119,7 +136,9 @@ class CapturePlanTests(unittest.TestCase):
 
     def test_a_fake_or_incomplete_virtual_selector_is_refused(self) -> None:
         cases = (
-            {
+            (
+                "not supported",
+                {
                 "kind": "native_import_materialization",
                 "state": "cached_materialization",
                 "is_virtual": False,
@@ -133,8 +152,11 @@ class CapturePlanTests(unittest.TestCase):
                 "author_imported_path": None,
                 "author_imported_error": None,
                 "document": None,
-            },
-            {
+                },
+            ),
+            (
+                "portable staged inventory",
+                {
                 "kind": "native_embedded_virtual_component",
                 "state": "embedded_virtual_component",
                 "is_virtual": False,
@@ -148,8 +170,11 @@ class CapturePlanTests(unittest.TestCase):
                 "author_imported_path": None,
                 "author_imported_error": None,
                 "document": None,
-            },
-            {
+                },
+            ),
+            (
+                "portable staged inventory",
+                {
                 "kind": "native_embedded_virtual_component",
                 "state": "embedded_virtual_component",
                 "is_virtual": True,
@@ -163,12 +188,13 @@ class CapturePlanTests(unittest.TestCase):
                 "author_imported_path": None,
                 "author_imported_error": None,
                 "document": None,
-            },
+                },
+            ),
         )
-        for provenance in cases:
+        for expected, provenance in cases:
             with (
                 self.subTest(kind=provenance["kind"], is_virtual=provenance["is_virtual"]),
-                self.assertRaisesRegex(PipelineError, "portable staged inventory"),
+                self.assertRaisesRegex(PipelineError, expected),
             ):
                 discovery._capture_plan_selector(
                     {
@@ -225,7 +251,7 @@ class CapturePlanTests(unittest.TestCase):
             steps._consume_sealed_definition(self.root)
 
     def test_a_plan_with_another_selection_is_refused(self) -> None:
-        self._rewrite_plan(lambda plan: plan["selection"]["files"].pop("cad/part.SLDPRT"))
+        self._rewrite_plan(lambda plan: plan["selection"]["files"].pop("cad/arm.SLDPRT"))
         with self.assertRaisesRegex(PipelineError, "selection differs"):
             steps._consume_sealed_definition(self.root)
 
@@ -249,6 +275,24 @@ class CapturePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "unknown native selector field"):
             steps._consume_sealed_definition(self.root)
 
+    def test_a_boolean_selector_state_is_refused(self) -> None:
+        self._rewrite_plan(lambda plan: plan["objects"][0].update(state=True))
+        with self.assertRaisesRegex(PipelineError, "native suppression state"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_source_selection_not_bound_to_the_raw_inventory_is_refused(self) -> None:
+        discovery_document = json.loads(
+            (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
+        )
+        discovery_document["raw"]["files"].pop("cad/arm.SLDPRT")
+        write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
+        discovery_sha = hashlib.sha256(
+            (self.root / "discovery" / "native-discovery.json").read_bytes()
+        ).hexdigest()
+        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
+        with self.assertRaisesRegex(PipelineError, "complete frozen inventory"):
+            steps._consume_sealed_definition(self.root)
+
     def test_a_plan_with_an_unknown_top_level_field_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan.update(invented=True))
         with self.assertRaisesRegex(PipelineError, "unknown field"):
@@ -265,44 +309,51 @@ class CapturePlanTests(unittest.TestCase):
             steps._consume_sealed_definition(self.root)
 
     def test_a_producer_refuses_a_non_virtual_missing_document(self) -> None:
-        with self.assertRaisesRegex(PipelineError, "no document selector"):
-            discovery._capture_plan_selector(
-                {
-                    "instance_id": "part-1",
-                    "name2": "part-1",
-                    "document": None,
-                    "suppression_state": 2,
-                    "state": 2,
-                },
-                {},
-            )
+        for document in (None, "", 7):
+            with (
+                self.subTest(document=document),
+                self.assertRaisesRegex(PipelineError, "no document selector"),
+            ):
+                discovery._capture_plan_selector(
+                    {
+                        "instance_id": "part-1",
+                        "name2": "part-1",
+                        "document": document,
+                        "suppression_state": 2,
+                    },
+                    {},
+                )
 
-    def test_a_missing_closure_binding_is_refused(self) -> None:
-        discovery = json.loads(
+    def test_an_embedded_virtual_selector_requires_the_complete_recomputed_selection(self) -> None:
+        discovery_document = json.loads(
             (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
         )
-        component = next(item for item in discovery["raw"]["components"] if item["instance_id"] == "arm-1")
+        component = next(
+            item for item in discovery_document["raw"]["components"] if item["instance_id"] == "arm-1"
+        )
         session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT"
-        component["document"] = session_path.replace("\\", "/").lower()
-        component["configuration"] = "Default"
-        component["suppression_state"] = 2
-        component["source_provenance"] = {
-            "kind": "native_embedded_virtual_component",
-            "state": "embedded_virtual_component",
-            "is_virtual": True,
-            "occurrence": "arm-1",
-            "owner": MAIN,
-            "owner_sha256": "a" * 64,
-            "session_document_path": session_path,
-            "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
-            "native_document_path": session_path,
-            "materialization_path": session_path,
-            "native_api_pid": 1,
-            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
-            "author_imported_path": None,
-            "author_imported_error": None,
-            "document": None,
-        }
+        component.update(
+            document=session_path.replace("\\", "/").lower(),
+            configuration="Default",
+            suppression_state=2,
+            source_provenance={
+                "kind": "native_embedded_virtual_component",
+                "state": "embedded_virtual_component",
+                "is_virtual": True,
+                "occurrence": "arm-1",
+                "owner": MAIN,
+                "owner_sha256": "a" * 64,
+                "session_document_path": session_path,
+                "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
+                "native_document_path": session_path,
+                "materialization_path": session_path,
+                "native_api_pid": 1,
+                "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+                "author_imported_path": None,
+                "author_imported_error": None,
+                "document": None,
+            },
+        )
         entry = {
             "instance": "arm-1",
             "name": "arm-1",
@@ -322,9 +373,13 @@ class CapturePlanTests(unittest.TestCase):
             "native_api_pid": 1,
             "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
         }
-        discovery["raw"]["source_selection"] = {"closure": {"virtual_components": [entry]}}
-        write_json(self.root / "discovery" / "native-discovery.json", discovery)
-        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
+        files = dict(discovery_document["raw"]["files"])
+        manifest = sealed_selection(files, MAIN, virtual_components=[entry])
+        discovery_document["raw"]["source_selection"] = manifest
+        write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
+        discovery_sha = hashlib.sha256(
+            (self.root / "discovery" / "native-discovery.json").read_bytes()
+        ).hexdigest()
         self._rewrite_plan(
             lambda plan: (
                 plan.update(discovery_sha256=discovery_sha),
@@ -332,18 +387,41 @@ class CapturePlanTests(unittest.TestCase):
             )
         )
         steps._consume_sealed_definition(self.root)
-        entry.pop("binding")
-        write_json(self.root / "discovery" / "native-discovery.json", discovery)
-        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
+
+        for field in (
+            "schema_version",
+            "scope",
+            "reader_sha256",
+            "upload_sha256",
+            "main_assembly",
+            "files",
+            "handoff_sha256",
+            "closure",
+            "excluded_files",
+            "selection_sha256",
+        ):
+            with self.subTest(field=field):
+                incomplete = json.loads(json.dumps(discovery_document))
+                incomplete["raw"]["source_selection"].pop(field)
+                write_json(self.root / "discovery" / "native-discovery.json", incomplete)
+                changed_sha = hashlib.sha256(
+                    (self.root / "discovery" / "native-discovery.json").read_bytes()
+                ).hexdigest()
+                self._rewrite_plan(
+                    lambda plan, sha=changed_sha: plan.update(discovery_sha256=sha)
+                )
+                with self.assertRaises(PipelineError):
+                    steps._consume_sealed_definition(self.root)
+
+        discovery_document["raw"]["source_selection"] = {
+            "closure": {"virtual_components": [entry]}
+        }
+        write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
+        discovery_sha = hashlib.sha256(
+            (self.root / "discovery" / "native-discovery.json").read_bytes()
+        ).hexdigest()
         self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
-        with self.assertRaisesRegex(PipelineError, "does not bind the embedded-virtual occurrence"):
-            steps._consume_sealed_definition(self.root)
-        entry["binding"] = "owner_embedded_geometry"
-        entry.pop("suppression_state")
-        write_json(self.root / "discovery" / "native-discovery.json", discovery)
-        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
-        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
-        with self.assertRaisesRegex(PipelineError, "does not bind the embedded-virtual occurrence"):
+        with self.assertRaises(PipelineError):
             steps._consume_sealed_definition(self.root)
 
     def test_a_plan_omitting_a_fake_virtual_document_is_refused(self) -> None:
@@ -377,6 +455,38 @@ class CapturePlanTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineError, "without sealed virtual proof"):
             steps._consume_sealed_definition(self.root)
+
+    def test_the_consumer_explicitly_refuses_cached_ic_materializations(self) -> None:
+        session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7\\IC~~\\arm.step.SLDPRT"
+        for document in (None, session_path):
+            with self.subTest(document=document):
+                discovery_document = json.loads(
+                    (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
+                )
+                component = next(
+                    item for item in discovery_document["raw"]["components"] if item["instance_id"] == "arm-1"
+                )
+                component.update(
+                    document=session_path,
+                    source_provenance={
+                        "kind": "native_import_materialization",
+                        "state": "cached_materialization",
+                        "is_virtual": False,
+                        "occurrence": "arm-1",
+                    },
+                )
+                write_json(self.root / "discovery" / "native-discovery.json", discovery_document)
+                discovery_sha = hashlib.sha256(
+                    (self.root / "discovery" / "native-discovery.json").read_bytes()
+                ).hexdigest()
+                self._rewrite_plan(
+                    lambda plan, sha=discovery_sha, selected=document: (
+                        plan.update(discovery_sha256=sha),
+                        plan["objects"][1].update(document=selected),
+                    )
+                )
+                with self.assertRaisesRegex(PipelineError, "unsupported cached IC"):
+                    steps._consume_sealed_definition(self.root)
 
     def test_a_plan_naming_another_run_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan.update(run_id="r-2"))

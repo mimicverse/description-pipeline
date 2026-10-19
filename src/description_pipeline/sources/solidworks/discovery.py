@@ -4218,16 +4218,27 @@ def sealed_embedded_virtual_document(
     )
 
 
+def cached_import_materialization(component: object) -> bool:
+    """Whether a component is the explicitly unsupported IC~~ capture class."""
+
+    provenance = component.get("source_provenance") if isinstance(component, dict) else None
+    return isinstance(provenance, dict) and (
+        provenance.get("state") == "cached_materialization"
+        or provenance.get("kind") == "native_import_materialization"
+    )
+
+
 def _capture_plan_selector(component: dict, native_files: Mapping[str, str]) -> dict | None:
     """Build one portable native selector for the sealed capture plan.
 
-    A fully sealed embedded virtual occurrence is the one session document
-    class whose absolute VC~~ path stays in the raw diagnostic record only.
+    A fully sealed embedded virtual occurrence is the one supported session
+    document class whose absolute VC~~ path stays in the raw diagnostic record only.
     Its occurrence name and suppression state are the portable selector;
     copying the temporary path would make the plan unusable after it crosses
-    to the native host.  A delivered document must remain a portable staged
-    path, so any other non-portable value is refused instead of being silently
-    removed from a binding.
+    to the native host.  IC~~ cached materializations require a separate
+    cross-session proof and remain explicitly unsupported in a capture plan.
+    A delivered document must remain a portable staged path, so any other
+    non-portable value is refused instead of being silently removed.
     """
 
     if not isinstance(component, dict) or component.get("suppressed"):
@@ -4235,10 +4246,14 @@ def _capture_plan_selector(component: dict, native_files: Mapping[str, str]) -> 
     name = component.get("instance_id") or component.get("name2")
     if not isinstance(name, str) or not name:
         return None
+    if cached_import_materialization(component):
+        raise PipelineError(
+            "Cached IC~~ import materializations are not supported by the portable capture plan"
+        )
     selector = {"name": name}
     document = component.get("document")
     session_document = sealed_embedded_virtual_document(component, name, native_files)
-    if document is None and not session_document:
+    if not session_document and (not isinstance(document, str) or not document):
         raise PipelineError("A non-virtual native component carries no document selector")
     if isinstance(document, str) and document and not session_document:
         normalized = document.replace("\\", "/")
@@ -4249,8 +4264,10 @@ def _capture_plan_selector(component: dict, native_files: Mapping[str, str]) -> 
                 "A non-session native component carries a document outside the portable staged inventory"
             ) from error
         selector["document"] = normalized
-    state = component.get("state")
-    selector["state"] = int(state) if type(state) is int else 2
+    state = component.get("suppression_state")
+    if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+        raise PipelineError("A native capture selector carries no truthful suppression state")
+    selector["state"] = state
     return selector
 
 

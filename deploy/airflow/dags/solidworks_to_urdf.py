@@ -1447,6 +1447,7 @@ def _seal_native_discovery(request: dict, job: dict, *, settle_operations: bool 
     derived = paths.run_dir / "definition" / "derived"
     archive_path = paths.run_dir / "definition" / "capture-request.zip"
     prepared = job.get("prepared_files")
+    native_request = job.get("request") if isinstance(job.get("request"), dict) else {}
     expected_archive = (job.get("capture_request") or {}).get("sha256")
     if not isinstance(prepared, dict) or not prepared:
         raise AirflowFailException("The failed native job carries no prepared inventory")
@@ -1477,6 +1478,8 @@ def _seal_native_discovery(request: dict, job: dict, *, settle_operations: bool 
             if (paths.run_dir / "stages" / "freeze" / "tool.json").is_file()
             else None
         ),
+        request_upload_files=native_request.get("upload_files"),
+        request_upload_sha256=native_request.get("upload_sha256"),
     )
     native_handoff = built["native_handoff"]
     if job.get("handoff_sha256") != native_handoff:
@@ -1489,12 +1492,21 @@ def _seal_native_discovery(request: dict, job: dict, *, settle_operations: bool 
         native_tool=native_tool,
         native_handoff=native_handoff,
         native_stages_sha256=built["native_stages_sha256"],
+        request_evidence_sha256=built["request_evidence_sha256"],
+        portable_tool_sha256=built["portable_tool_sha256"],
         settle_operations=settle_operations,
     )
 
 
-def _write_native_job_receipt(request: dict, job: dict, name: str) -> Path:
-    """Preserve the exact failed job bytes in the run-owned evidence tree."""
+def _write_native_job_snapshot(request: dict, job: dict, name: str) -> Path:
+    """Write the validated endpoint response as a canonical run-owned snapshot.
+
+    The endpoint client exposes a parsed JSON object, not the original wire
+    bytes.  This snapshot is therefore evidence of the validated terminal
+    response and is never described as the endpoint's byte-exact response.  A
+    separately retained raw download remains the authority for byte-level
+    incident evidence.
+    """
 
     run_id = request["run_id"]
     paths = _work_paths(request["conn_id"], run_id, request["platform_config_digest"])
@@ -1505,13 +1517,13 @@ def _write_native_job_receipt(request: dict, job: dict, name: str) -> Path:
 
 
 def _write_native_failure_receipt(request: dict, job: dict) -> Path:
-    return _write_native_job_receipt(request, job, "native-job-failed.json")
+    return _write_native_job_snapshot(request, job, "native-job-failed.json")
 
 
 def _settle_native_owner_success(request: dict, job: dict) -> None:
     """Settle the native owner as succeeded when the native job is terminal."""
 
-    receipt_path = _write_native_job_receipt(request, job, "native-job-success.json")
+    receipt_path = _write_native_job_snapshot(request, job, "native-job-success.json")
     _settle_native_owner_success_from_receipt(request, receipt_path)
 
 
@@ -1539,16 +1551,61 @@ def _settle_native_owner_failure_from_receipt(request: dict, receipt_path: Path)
     )
 
 
-def _settle_native_owner_on_failure(context: dict) -> None:
-    """Failure callback: settle the owner op only after Airflow marks the task failed."""
+NATIVE_FAILURE_TASKS = frozenset({"discover", "capture"})
+NATIVE_FAILURE_MARKER = "native_owner_failure_binding"
+
+
+def _record_native_failure_binding(context: dict) -> None:
+    """Bind the exact failed native task; settlement waits for the DagRun terminal fact."""
 
     try:
         ti = context.get("ti") or context.get("task_instance")
         task_id = getattr(ti, "task_id", None)
-        if ti is None or task_id not in {"discover", "capture"}:
+        if ti is None or task_id not in NATIVE_FAILURE_TASKS:
             return
         request = ti.xcom_pull(task_ids="freeze")
         if not isinstance(request, dict):
+            return
+        ti.xcom_push(
+            key=NATIVE_FAILURE_MARKER,
+            value={
+                "dag_id": DAG_ID,
+                "run_id": getattr(ti, "run_id", None),
+                "task_id": task_id,
+                "map_index": getattr(ti, "map_index", None),
+                "request_sha256": digest(request),
+            },
+        )
+    except Exception:  # noqa: BLE001 - the original task failure remains primary
+        log.exception("native owner failure marker unavailable")
+
+
+def _settle_native_owner_on_failure(context: dict) -> None:
+    """Settle after DagRun failure using the exact task-level failure marker."""
+
+    try:
+        ti = context.get("ti") or context.get("task_instance")
+        if ti is None:
+            return
+        request = ti.xcom_pull(task_ids="freeze")
+        if not isinstance(request, dict):
+            return
+        markers = []
+        for task_id in NATIVE_FAILURE_TASKS:
+            marker = ti.xcom_pull(task_ids=task_id, key=NATIVE_FAILURE_MARKER)
+            if marker is not None:
+                markers.append((task_id, marker))
+        if len(markers) != 1:
+            return
+        task_id, marker = markers[0]
+        if (
+            not isinstance(marker, dict)
+            or marker.get("dag_id") != DAG_ID
+            or marker.get("run_id") != getattr(ti, "run_id", None)
+            or marker.get("task_id") != task_id
+            or marker.get("map_index") != -1
+            or marker.get("request_sha256") != digest(request)
+        ):
             return
         receipt_path = (
             _work_paths(request["conn_id"], request["run_id"], request["platform_config_digest"]).run_dir
@@ -2292,6 +2349,7 @@ def solidworks_to_urdf():
         poke_interval=POLL_INTERVAL,
         timeout=POLL_TIMEOUT,
         pool=NATIVE_POOL,
+        on_failure_callback=_record_native_failure_binding,
         doc_md=(
             "Discover stage: submit the same UUID and frozen handoff to the serial Windows queue, "
             "then drive the transport/definition exchange until the native job is terminal; retries "
@@ -2348,6 +2406,7 @@ def solidworks_to_urdf():
             raise
 
     @task(
+        on_failure_callback=_record_native_failure_binding,
         doc_md=("Capture stage: import the sealed native capture into the Linux store and bind routing for generation.")
     )
     def capture(request: dict) -> dict:
@@ -2426,6 +2485,10 @@ def solidworks_to_urdf():
                     config_digest=request["platform_config_digest"],
                 )
                 raise
+            # The native owner is terminal at native_complete. Repeat its
+            # idempotent settlement after the successful import so a transient
+            # error from the discover poke cannot leave it running silently.
+            _settle_native_owner_success(request, job)
         log.info(
             "linux capture ready run_id=%s source=%s state=%s",
             run_id,

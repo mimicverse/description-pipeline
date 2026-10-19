@@ -47,7 +47,10 @@ from ..sources.solidworks.discovery import (
     derive_native_package,
 )
 from ..sources.solidworks.revision import package_inventory
-from ..sources.solidworks.selection import SELECTION_SCHEMA, validate_file_index, verify_selection
+from ..sources.solidworks.selection import (
+    selection_bindings as _selection_bindings,
+    validate_file_index,
+)
 
 __all__ = [
     "CAPTURE_REQUEST_ARCHIVE",
@@ -178,48 +181,6 @@ class RawRecordAdmission:
 
     record: dict
     manifest: dict
-
-
-def _selection_bindings(selection: Any) -> dict:
-    """Validate one sealed selection manifest via the shared verifier.
-
-    The full intake index is reconstructed from the selected and excluded files,
-    and the shared ``verify_selection`` re-seals the manifest from that index so
-    ``selection_sha256`` keeps its exact shared definition (digest of the manifest
-    without its own digest) instead of any locally invented hash.
-    """
-
-    if not isinstance(selection, Mapping):
-        raise PipelineError("selection manifest must be an object")
-    manifest = dict(selection)
-    if manifest.get("schema_version") != SELECTION_SCHEMA:
-        raise PipelineError("selection manifest uses an unknown schema")
-    files = manifest.get("files")
-    excluded = manifest.get("excluded_files")
-    if not isinstance(files, Mapping) or not files:
-        raise PipelineError("selection manifest must carry its selected files")
-    if not isinstance(excluded, Mapping):
-        raise PipelineError("selection manifest must carry its excluded files")
-    upload = {**dict(excluded), **dict(files)}
-    verify_selection(manifest, upload, files, reader_sha256=manifest.get("reader_sha256"))
-    for key in ("selection_sha256", "upload_sha256", "handoff_sha256"):
-        if not _is_sha256(manifest.get(key)):
-            raise PipelineError(f"selection manifest lacks a usable {key}")
-    # The digests are distinct concepts, not distinct values: a full closure
-    # without exclusions legitimately has upload_sha256 == handoff_sha256.
-    selected = validate_file_index(files)
-    main = manifest.get("main_assembly")
-    if not isinstance(main, str) or not main or not main.lower().endswith(".sldasm") or main not in selected:
-        raise PipelineError("selection manifest lacks its selected main assembly")
-    return {
-        "selection": manifest,
-        "files": selected,
-        "main_assembly": main,
-        "main_assembly_sha256": selected[main],
-        "selection_sha256": manifest["selection_sha256"],
-        "upload_sha256": manifest["upload_sha256"],
-        "handoff_sha256": manifest["handoff_sha256"],
-    }
 
 
 def _recorded_main(record: Mapping[str, Any]) -> str | None:

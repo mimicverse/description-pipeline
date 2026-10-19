@@ -33,6 +33,7 @@ from ..orchestration.airflow_client import JOB_SCHEMA, native_run_id
 from .native_recovery import (
     validate_capture_failure_events,
     validate_native_discovery_completed,
+    validate_native_discovery_stage,
     validate_native_failed_terminal,
 )
 from ..stages import (
@@ -132,6 +133,7 @@ class NativeReceiptEvidence:
     reported_stage: str
     actual_stage: str
     native_stages_sha256: str | None
+    native_handoff_sha256: str | None
     state: str
     error: str | None
     error_code: str | None
@@ -198,16 +200,16 @@ def load_native_failed_receipt(
         raise PlatformStoreError("The native receipt's request does not carry the bound endpoint job")
     if document.get("status") != "failed":
         raise PlatformStoreError("The native receipt is not the bound job's failed terminal fact")
-    events = [event for event in document.get("events") or [] if isinstance(event, dict)]
+    events = document.get("events")
+    try:
+        validate_native_failed_terminal(events)
+    except PipelineError as error:
+        raise PlatformStoreError(str(error)) from error
     terminal = [event for event in events if event.get("state") in NATIVE_TERMINAL_STATES]
     if len(terminal) != 1:
         raise PlatformStoreError("The native receipt must carry exactly one terminal event row")
     if terminal[0].get("state") != "failed":
         raise PlatformStoreError("The native receipt's terminal event is not a failure")
-    try:
-        validate_native_failed_terminal(events)
-    except PipelineError as error:
-        raise PlatformStoreError(str(error)) from error
     reported_stage = reported_stage if reported_stage is not None else stage
     if reported_stage != stage and (stage, reported_stage) not in {
         ("discover", "freeze"),
@@ -228,6 +230,23 @@ def load_native_failed_receipt(
     if actual_stage == "capture":
         try:
             validate_capture_failure_events(events)
+            request_upload_sha256 = request.get("upload_sha256")
+            request_upload_files = request.get("upload_files")
+            if (
+                not isinstance(request_upload_sha256, str)
+                or not _is_sha256(request_upload_sha256)
+                or not isinstance(request_upload_files, dict)
+                or digest(request_upload_files) != request_upload_sha256
+            ):
+                raise PipelineError("The native capture receipt does not bind its complete request upload")
+            native_handoff_sha256 = document.get("handoff_sha256")
+            if not isinstance(native_handoff_sha256, str) or not _is_sha256(native_handoff_sha256):
+                raise PipelineError("The native capture receipt carries no selected native handoff")
+            validate_native_discovery_stage(
+                document.get("stages"),
+                run_id=native_run_id,
+                handoff_sha256=native_handoff_sha256,
+            )
         except PipelineError as error:
             raise PlatformStoreError(str(error)) from error
     native_stages = document.get("stages")
@@ -279,6 +298,13 @@ def load_native_failed_receipt(
         reported_stage=reported_stage,
         actual_stage=actual_stage,
         native_stages_sha256=native_stages_sha256,
+        native_handoff_sha256=(
+            document.get("handoff_sha256")
+            if isinstance(document.get("handoff_sha256"), str)
+            and _is_sha256(document.get("handoff_sha256"))
+            and actual_stage == "capture"
+            else None
+        ),
         state="failed",
         error=error if isinstance(error, str) and error else None,
         error_code=error_code if isinstance(error_code, str) and error_code else None,
@@ -1397,7 +1423,8 @@ class PlatformStore:
 
         job_file = Path(job_path)
         try:
-            job = json.loads(job_file.read_text(encoding="utf-8"))
+            raw_job = job_file.read_bytes()
+            job = json.loads(raw_job)
         except (OSError, ValueError) as error:
             raise PlatformStoreError("The native success receipt is unreadable") from error
         if (
@@ -1409,11 +1436,11 @@ class PlatformStore:
             or (job.get("request") or {}).get("run_id") != run_id
         ):
             raise PlatformStoreError("The native success receipt is not the bound terminal success")
-        events = [event for event in job.get("events") or [] if isinstance(event, dict)]
         try:
-            discovery_index = validate_native_discovery_completed(events)
+            discovery_index = validate_native_discovery_completed(job.get("events"))
         except PipelineError as error:
             raise PlatformStoreError(str(error)) from error
+        events = job["events"]
         if any(event.get("state") == "failed" for event in events):
             raise PlatformStoreError("The native success receipt carries a failed event")
         completed_capture = [
@@ -1421,8 +1448,14 @@ class PlatformStore:
             for index, event in enumerate(events)
             if event.get("stage") == "capture" and event.get("state") == "completed"
         ]
-        if len(completed_capture) != 1 or completed_capture[0] <= discovery_index:
-            raise PlatformStoreError("The native success receipt does not carry one ordered capture completion")
+        if (
+            len(completed_capture) != 1
+            or completed_capture[0] <= discovery_index
+            or completed_capture[0] != len(events) - 1
+        ):
+            raise PlatformStoreError(
+                "The native success receipt does not carry one ordered terminal capture completion"
+            )
         request = job.get("request")
         upload_files = request.get("upload_files") if isinstance(request, dict) else None
         upload_sha = request.get("upload_sha256") if isinstance(request, dict) else None
@@ -1435,6 +1468,18 @@ class PlatformStore:
             or not main_assembly
         ):
             raise PlatformStoreError("The native success receipt carries no complete request identity")
+        native_handoff = job.get("handoff_sha256")
+        if not isinstance(native_handoff, str) or not _is_sha256(native_handoff):
+            raise PlatformStoreError("The native success receipt carries no selected native handoff")
+        try:
+            validate_native_discovery_stage(
+                job.get("stages"),
+                run_id=run_id,
+                handoff_sha256=native_handoff,
+                capture_state="completed",
+            )
+        except PipelineError as error:
+            raise PlatformStoreError(str(error)) from error
         stages = job.get("stages")
         stage_rows = stages.get("stages") if isinstance(stages, dict) else None
         by_stage = {
@@ -1467,20 +1512,6 @@ class PlatformStore:
                 or native_run_id(dag_run_id) != run_id
             ):
                 raise PlatformStoreError("The named native owner is not the bound discover operation")
-            if state == "succeeded":
-                if not self._native_owner_binding_matches(
-                    cursor,
-                    run_id=run_id,
-                    operation_id=operation_id,
-                    operation_key=key,
-                    native_run=run_id,
-                    native_sha=file_digest(job_file),
-                    closure_shape="native_complete_owner_succeeded",
-                ):
-                    raise PlatformStoreError("The native owner success has another recorded identity")
-                return
-            if state != "running":
-                raise PlatformStoreError("The native owner operation already has another terminal state")
             cursor.execute(_READ_STAGE_RECORDS, (run_id,))
             freeze_row = next((item for item in cursor.fetchall() if item[0] == "freeze"), None)
             if freeze_row is None or freeze_row[1] != "completed":
@@ -1500,6 +1531,21 @@ class PlatformStore:
                 },
                 freeze_receipt=freeze_receipt,
             )
+            native_sha = hashlib.sha256(raw_job).hexdigest()
+            if state == "succeeded":
+                if not self._native_owner_binding_matches(
+                    cursor,
+                    run_id=run_id,
+                    operation_id=operation_id,
+                    operation_key=key,
+                    native_run=run_id,
+                    native_sha=native_sha,
+                    closure_shape="native_complete_owner_succeeded",
+                ):
+                    raise PlatformStoreError("The native owner success has another recorded identity")
+                return
+            if state != "running":
+                raise PlatformStoreError("The native owner operation already has another terminal state")
             cursor.execute(_SETTLE_NAMED_OPERATION, ("succeeded", operation_id, run_id))
             if cursor.fetchone() is None:
                 raise PlatformStoreError("The native owner operation lost its running state to another writer")
@@ -1522,7 +1568,7 @@ class PlatformStore:
                     "task_id": task_id,
                     "map_index": map_index,
                     "native_run_id": run_id,
-                    "native_receipt_sha256": file_digest(job_file),
+                    "native_receipt_sha256": native_sha,
                 },
             )
 
@@ -1920,6 +1966,7 @@ class PlatformStore:
             "reported_stage": loaded.reported_stage,
             "actual_stage": loaded.actual_stage,
             "native_stages_sha256": loaded.native_stages_sha256,
+            "native_handoff_sha256": loaded.native_handoff_sha256,
             "request_main_assembly": loaded.request_main_assembly,
             "request_upload_sha256": loaded.request_upload_sha256,
             "request_upload_files": loaded.request_upload_files,
@@ -2742,23 +2789,6 @@ class PlatformStore:
             raise PlatformStoreError("The native owner operation lacks its Airflow DagRun identity")
         if native_run != native_run_id(dag_run_id):
             raise PlatformStoreError("The native receipt names another run's endpoint job")
-        if op_state == "failed":
-            if not self._native_owner_binding_matches(
-                cursor,
-                run_id=run_id,
-                operation_id=operation_id,
-                operation_key=operation_key,
-                native_run=native_run,
-                native_sha=native_sha,
-            ):
-                raise PlatformStoreError("The native owner operation already has another terminal identity")
-            reconcile_operation = reconcile.get("operation_id") if isinstance(reconcile, dict) else None
-            if isinstance(reconcile_operation, str) and reconcile_operation:
-                cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
-            return
-        if op_state != "running":
-            raise PlatformStoreError("The native owner operation is not running")
-
         cursor.execute(_READ_STAGE_RECORDS, (run_id,))
         stages = {item[0]: item for item in cursor.fetchall()}
         if set(stages) != {"freeze", "discover", "capture", "generate", "verify", "publish"}:
@@ -2775,7 +2805,10 @@ class PlatformStore:
         discover_receipt = self._verified_direct_completed_stage(
             cursor, run_id=run_id, stage="discover", row=stages["discover"]
         )
-        if discover_receipt.get("native_stages_sha256") != receipt.get("native_stages_sha256"):
+        if (
+            discover_receipt.get("native_stages_sha256") != receipt.get("native_stages_sha256")
+            or discover_receipt.get("handoff_sha256") != receipt.get("native_handoff_sha256")
+        ):
             raise PlatformStoreError("The completed discovery is not bound to the native stage facts")
         self._verify_dispatch_request_identity(
             cursor,
@@ -2789,6 +2822,23 @@ class PlatformStore:
             dag_run_id=dag_run_id,
             binding={"operation_id": operation_id, "task_id": "discover", "map_index": -1},
         )
+
+        if op_state == "failed":
+            if not self._native_owner_binding_matches(
+                cursor,
+                run_id=run_id,
+                operation_id=operation_id,
+                operation_key=operation_key,
+                native_run=native_run,
+                native_sha=native_sha,
+            ):
+                raise PlatformStoreError("The native owner operation already has another terminal identity")
+            reconcile_operation = reconcile.get("operation_id") if isinstance(reconcile, dict) else None
+            if isinstance(reconcile_operation, str) and reconcile_operation:
+                cursor.execute(_SETTLE_RECONCILE, (reconcile_operation, run_id, "discover"))
+            return
+        if op_state != "running":
+            raise PlatformStoreError("The native owner operation is not running")
 
         cursor.execute(_SETTLE_NAMED_OPERATION, ("failed", operation_id, run_id))
         if cursor.fetchone() is None:

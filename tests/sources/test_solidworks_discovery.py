@@ -2631,6 +2631,15 @@ class DerivationSplitTests(unittest.TestCase):
                     "used_api": component["source_provenance"]["used_api"],
                 }
             ]
+        from description_pipeline.sources.solidworks.selection import seal_closure_selection
+
+        selection = payload["source_selection"]
+        payload["source_selection"] = seal_closure_selection(
+            {**selection["excluded_files"], **selection["files"]},
+            selection["main_assembly"],
+            selection["closure"],
+            reader_sha256=selection["reader_sha256"],
+        )
         output = self.tmp / "derived-virtual"
         result = derive_native_package(
             source,

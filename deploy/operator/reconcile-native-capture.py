@@ -59,6 +59,7 @@ def main() -> int:
         raise PlatformStoreError(f"The maintenance receipt is not an ordered capture failure: {error}") from error
     prepared = job.get("prepared_files")
     native_tool = job.get("native_tool")
+    native_request = job.get("request") if isinstance(job.get("request"), dict) else {}
     expected_archive = (job.get("capture_request") or {}).get("sha256")
     if not isinstance(prepared, dict) or not isinstance(native_tool, dict):
         raise PlatformStoreError("The native failed job carries no prepared identity")
@@ -88,6 +89,8 @@ def main() -> int:
             if (run_root / "stages" / "freeze" / "tool.json").is_file()
             else None
         ),
+        request_upload_files=native_request.get("upload_files"),
+        request_upload_sha256=native_request.get("upload_sha256"),
     )
     if job.get("handoff_sha256") != built["native_handoff"]:
         raise PlatformStoreError("The native prepared inventory differs from the failed job handoff")
@@ -102,6 +105,8 @@ def main() -> int:
             native_tool=native_tool,
             native_handoff=built["native_handoff"],
             native_stages_sha256=built["native_stages_sha256"],
+            request_evidence_sha256=built["request_evidence_sha256"],
+            portable_tool_sha256=built["portable_tool_sha256"],
         )
         discover_checkpoint, discover_receipt = seal_stage_confirmation(
             store_root,
