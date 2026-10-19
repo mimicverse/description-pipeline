@@ -139,6 +139,24 @@ def source_inventory(directory: Path, bound: SimpleNamespace) -> dict[str, str]:
     }
 
 
+def tracked_test_inventory(root: Path, bound: SimpleNamespace) -> dict[str, str]:
+    """The complete tracked test tree, keyed by its source-archive path."""
+
+    raw = subprocess.check_output(["git", "ls-files", "-z", "--", "tests"], cwd=root)
+    files = {}
+    for encoded in raw.split(b"\0"):
+        if not encoded:
+            continue
+        name = encoded.decode("utf-8")
+        path = root / name
+        if not path.is_file():
+            raise bound.PipelineError(f"Tracked test file is missing or not a regular file: {name}")
+        files[name] = bound.file_digest(path)
+    if not files:
+        raise bound.PipelineError("The source checkout tracks no test files")
+    return files
+
+
 def offline_bundle(source, output, wheel, platform, bound):
     """Include exactly the resolved target wheels and a SHA-256 installation lock."""
     with tempfile.TemporaryDirectory(prefix="description-offline-") as temporary:
@@ -186,6 +204,7 @@ def build(root, output):
     for name, expected in builders.items():
         if importlib.metadata.version(name) != expected:
             raise bound.PipelineError(f"Install requirements/build-py312.lock: {name} must be {expected}")
+    test_files = tracked_test_inventory(root, bound)
     output.mkdir(parents=True, exist_ok=True)
     commit = git(root, "rev-parse", "HEAD")
     with tempfile.TemporaryDirectory(prefix="description-release-") as temporary:
@@ -199,6 +218,11 @@ def build(root, output):
         package = source / "src/description_pipeline"
         if source_inventory(root / "src/description_pipeline", bound) != source_inventory(package, bound):
             raise bound.PipelineError("the bound source closure differs from the archived commit")
+        archived_tests = {
+            f"tests/{name}": checksum for name, checksum in source_inventory(source / "tests", bound).items()
+        }
+        if archived_tests != test_files:
+            raise bound.PipelineError("the tracked test closure differs from the archived commit")
         files = bound.inventory(package)
         resources = [
             path
@@ -223,6 +247,7 @@ def build(root, output):
             "source_commit": commit,
             "source_sha256": bound.digest(files),
             "package_files": files,
+            "test_files": test_files,
             "deployment_files": deployment_files,
             "runtime_locks": runtime_locks,
             **bound.release_domain_identity(),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import csv
 import hashlib
@@ -31,6 +32,13 @@ from description_pipeline.io import (
 from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.runtime import LINUX_PLATFORMS, TARGET_ABI, TARGET_PYTHON, WINDOWS_PLATFORMS
 
+CI_ONLY_SCRIPTS = {
+    "deploy/airflow/scripts/scheduled_smoke.py",
+    "deploy/airflow/scripts/settlement_fixtures.py",
+    "tools/scheduled_smoke.py",
+    "tools/settlement_fixtures.py",
+}
+
 
 def safe_members(names):
     keys = []
@@ -39,6 +47,34 @@ def safe_members(names):
         keys.append(name.rstrip("/").casefold())
     if len(keys) != len(set(keys)):
         raise PipelineError("Duplicate or case-colliding archive member")
+
+
+def validate_deployment_boundary(members: dict[str, bytes]) -> None:
+    """Deployment output must carry neither CI-only scripts nor their test dependencies."""
+
+    forbidden = sorted(CI_ONLY_SCRIPTS & set(members))
+    if forbidden:
+        raise PipelineError(f"Deployment contains CI-only scripts: {forbidden}")
+    references = []
+    for name, payload in sorted(members.items()):
+        if not name.endswith(".py"):
+            continue
+        tree = ast.parse(payload.decode("utf-8"), filename=name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                references.extend(
+                    f"{name}:{alias.name}"
+                    for alias in node.names
+                    if alias.name == "tests" or alias.name.startswith("tests.")
+                )
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and (node.module == "tests" or node.module.startswith("tests."))
+            ):
+                references.append(f"{name}:{node.module}")
+    if references:
+        raise PipelineError(f"Deployment imports test-only modules: {sorted(references)}")
 
 
 def _locked_pins(data: bytes) -> dict:
@@ -116,9 +152,11 @@ def verify_release(directory, identity):
         safe_members(archive.namelist())
         if any(stat.S_ISLNK(info.external_attr >> 16) for info in archive.infolist()):
             raise PipelineError("Release ZIP contains a symlink")
-        members = {member: hashlib.sha256(archive.read(member)).hexdigest() for member in archive.namelist()}
+        payloads = {member: archive.read(member) for member in archive.namelist()}
+        members = {member: hashlib.sha256(payload).hexdigest() for member, payload in payloads.items()}
         if members != identity.get("deployment_files"):
             raise PipelineError("Deployment members do not come from this source release")
+        validate_deployment_boundary(payloads)
         source_locks = {}
         for platform in ("linux", "windows"):
             lock = f"requirements/{platform}-py312.lock"
@@ -164,6 +202,9 @@ def verify_release(directory, identity):
                 }
                 if deployment != identity.get("deployment_files"):
                     raise PipelineError("Deployment inputs in the source archive differ from the manifest")
+                tests = {member: checksum for member, checksum in relative.items() if member.startswith("tests/")}
+                if tests != identity.get("test_files"):
+                    raise PipelineError("Source archive test files differ from the tracked test closure")
         elif name.endswith(".zip"):
             if name == deployment_name:
                 continue

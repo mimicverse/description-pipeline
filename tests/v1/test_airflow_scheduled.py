@@ -41,7 +41,7 @@ class ScheduledSmokeTests(unittest.TestCase):
         result = subprocess.run(
             [
                 str(venv / "bin/python"),
-                str(ROOT / "deploy/airflow/scripts/scheduled_smoke.py"),
+                str(ROOT / "tools/scheduled_smoke.py"),
                 "--root",
                 str(ROOT),
                 "--venv",
