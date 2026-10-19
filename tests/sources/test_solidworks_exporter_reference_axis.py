@@ -103,7 +103,10 @@ class ExporterReadTests(unittest.TestCase):
         )
         received = []
         component = SimpleNamespace(
-            Name2="arm-2/part-1", GetPathName=lambda: "/locked/part.SLDPRT", ReferencedConfiguration="SavedConfig"
+            Name2="arm-2/part-1",
+            GetPathName=lambda: "/locked/part.SLDPRT",
+            ReferencedConfiguration="SavedConfig",
+            IsVirtual=False,
         )
 
         def resolve(value, errors):
@@ -406,8 +409,9 @@ class ImportedSourceBindingTests(unittest.TestCase):
         self.assertIsNone(result["document"])
         self.assertEqual(result["source_provenance"]["state"], "unread")
         error = result["source_provenance"]["error"]
-        self.assertIn("not a structural session materialization", error)
+        self.assertIn("not a delivered file", error)
         self.assertIn("IC~~", error)
+        self.assertIn("VC~~", error)
 
 
 if __name__ == "__main__":

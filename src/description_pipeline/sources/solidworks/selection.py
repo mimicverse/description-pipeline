@@ -8,11 +8,18 @@ searches the filesystem nor guesses a stored reference's relocated path.
 
 from __future__ import annotations
 
+import ntpath
 import re
 import unicodedata
 from collections.abc import Mapping
 
 from ...io import PipelineError, artifact_path_parts, digest
+from .session_artifacts import (
+    SESSION_DOCUMENT_API,
+    embedded_virtual_component_under_root,
+    has_session_document_marker,
+    session_document_marker,
+)
 
 SELECTION_SCHEMA = "solidworks-to-urdf.selection/v1"
 SELECTION_SCOPE = "native_staged_folder_closure"
@@ -288,6 +295,10 @@ def seal_closure_selection(
     if not isinstance(imports, list) or any(not isinstance(item, Mapping) for item in imports):
         raise SelectionError("selection_closure_invalid", "Imported-source evidence must be a verbatim evidence list")
     import_targets: dict[str, set[str]] = {}
+    session_occurrences: set[tuple[str, str]] = set()
+    session_documents_by_instance: dict[str, set[str]] = {}
+    session_owner_by_instance: dict[str, str] = {}
+    session_slot_parents: dict[str, tuple[str, str]] = {}
     for item in imports:
         state = item.get("state")
         document_label = str(item.get("document") or "")
@@ -345,16 +356,157 @@ def seal_closure_selection(
                     "selection_closure_invalid",
                     "A cached materialization anchor does not corroborate its occurrence",
                 )
+            key = (owner.casefold(), item["instance"])
+            if key in session_occurrences:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "The same session document occurrence is recorded more than once",
+                    instance=item["instance"],
+                )
+            session_occurrences.add(key)
+            session_documents_by_instance.setdefault(item["instance"], set()).add(
+                ntpath.normcase(str(item.get("materialization")))
+            )
+            if item["instance"] in session_owner_by_instance and session_owner_by_instance[
+                item["instance"]
+            ] != owner:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "One session occurrence names multiple owners",
+                    instance=item["instance"],
+                )
+            session_owner_by_instance[item["instance"]] = owner
+            if anchor is not None:
+                session_slot_parents[item["instance"]] = (
+                    anchor,
+                    ntpath.normcase(document_label),
+                )
+            if len(session_documents_by_instance[item["instance"]]) != 1:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "One occurrence names multiple session documents",
+                    instance=item["instance"],
+                )
         else:
             raise SelectionError(
                 "selection_closure_invalid",
                 "An imported source is neither bound nor a recorded cached materialization",
             )
+    virtual_components = evidence.get("virtual_components", [])
+    if not isinstance(virtual_components, list) or any(
+        not isinstance(item, Mapping) for item in virtual_components
+    ):
+        raise SelectionError(
+            "selection_closure_invalid", "Embedded virtual components must be a verbatim evidence list"
+        )
+    virtual_owners: set[str] = set()
+    for item in virtual_components:
+        if (
+            item.get("state") != "embedded_virtual_component"
+            or item.get("binding") != "owner_embedded_geometry"
+            or item.get("kind") != "native_embedded_virtual_component"
+            or item.get("used_api") != SESSION_DOCUMENT_API
+            or item.get("is_virtual") is not True
+            or "author_imported_path" not in item
+            or item["author_imported_path"] is not None
+            or "author_imported_error" not in item
+            or item["author_imported_error"] is not None
+        ):
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An embedded virtual component must be owner-bound and cannot carry import metadata",
+            )
+        owner_label = str(item.get("owner") or "")
+        owner = folded_graph.get(owner_label.replace("\\", "/").casefold())
+        if owner is None or owner not in evidence_map:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An embedded virtual component names an owner outside the resolved graph",
+                path=owner_label,
+            )
+        document_label = item.get("document")
+        staged_label = (
+            folded_graph.get(document_label.replace("\\", "/").casefold())
+            if isinstance(document_label, str) and document_label
+            else None
+        )
+        if staged_label is not None and staged_label != owner:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An embedded virtual component document label names another staged owner",
+                path=str(document_label),
+            )
+        instance = item.get("instance")
+        configuration = item.get("configuration")
+        if (
+            not isinstance(instance, str)
+            or not instance.strip()
+            or not isinstance(configuration, str)
+            or not configuration.strip()
+        ):
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An embedded virtual component must record its occurrence and configuration",
+            )
+        anchor = item.get("owner_anchor")
+        if anchor is not None and (
+            not isinstance(anchor, str) or not anchor.strip() or not instance.startswith(anchor + "/")
+        ):
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An embedded virtual component anchor does not corroborate its occurrence",
+            )
+        owner_sha = item.get("owner_sha256")
+        if not isinstance(owner_sha, str) or owner_sha != files[owner]:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An embedded virtual component owner differs from the staged bytes",
+            )
+        session_document = item.get("session_document_path")
+        session_root = item.get("session_temp_root")
+        if not embedded_virtual_component_under_root(session_document, session_root):
+            raise SelectionError(
+                "selection_closure_invalid",
+                "An embedded virtual component is not an exact VC~~ document under its owned session root",
+                path=str(session_document),
+            )
+        key = (owner.casefold(), instance)
+        if key in session_occurrences:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "The same session document occurrence is recorded more than once",
+                instance=instance,
+            )
+        session_occurrences.add(key)
+        session_documents_by_instance.setdefault(instance, set()).add(
+            ntpath.normcase(str(session_document))
+        )
+        if instance in session_owner_by_instance and session_owner_by_instance[instance] != owner:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "One session occurrence names multiple owners",
+                instance=instance,
+            )
+        session_owner_by_instance[instance] = owner
+        if anchor is not None:
+            session_slot_parents[instance] = (
+                anchor,
+                ntpath.normcase(str(document_label)),
+            )
+        if len(session_documents_by_instance[instance]) != 1:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "One occurrence names multiple session documents",
+                instance=instance,
+            )
+        virtual_owners.add(owner)
     warnings = evidence.get("warnings")
     if warnings is not None and (
         not isinstance(warnings, list) or any(not isinstance(item, Mapping) for item in warnings)
     ):
         raise SelectionError("selection_closure_invalid", "Closure warnings must be a verbatim evidence list")
+    native_edge_instances: dict[str, tuple[str, str | None]] = {}
+    anchored_edges: dict[str, list[tuple[str, str, str]]] = {}
     for name, entry in evidence_map.items():
         edges_raw = entry.get("resolved_edges", [])
         if not isinstance(edges_raw, list) or any(not isinstance(item, Mapping) for item in edges_raw):
@@ -379,11 +531,46 @@ def seal_closure_selection(
                     "suppressed placements never contribute edges",
                     path=name,
                 )
+            anchor = item.get("owner_anchor")
+            edge_identity = (name.casefold(), anchor)
+            if item["instance"] in native_edge_instances:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "One native occurrence is recorded under multiple resolved edges",
+                    instance=item["instance"],
+                )
+            native_edge_instances[item["instance"]] = edge_identity
             lightweight = item.get("lightweight")
             if type(lightweight) is not bool or lightweight != (state in {1, 4}):
                 raise SelectionError(
                     "selection_closure_invalid",
                     "A resolved native edge is not coherent about its lightweight state",
+                    path=name,
+                )
+            defining_session_document = item.get("defining_session_document")
+            if anchor is None:
+                if defining_session_document is not None:
+                    raise SelectionError(
+                        "selection_closure_invalid",
+                        "A native edge carries a session document without an owner anchor",
+                        path=name,
+                    )
+            elif not (
+                item.get("kind") == "native_document"
+                and isinstance(anchor, str)
+                and anchor.strip()
+                and item["instance"].startswith(anchor + "/")
+                and isinstance(defining_session_document, str)
+                and defining_session_document
+                and (
+                    session_document_marker(defining_session_document)
+                    if has_session_document_marker(defining_session_document)
+                    else True
+                )
+            ):
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A nested native edge anchor lacks its session document or occurrence prefix",
                     path=name,
                 )
             target = canonical_target(item.get("resolved"))
@@ -395,17 +582,94 @@ def seal_closure_selection(
                     path=name,
                 )
             targets.add(target)
+            if anchor is not None:
+                anchored_edges.setdefault(anchor, []).append(
+                    (name.casefold(), target.casefold(), defining_session_document)
+                )
         if set(checked[name]["references"]) != targets | import_targets.get(name, set()):
             raise SelectionError(
                 "selection_closure_incoherent",
                 "The resolved graph references must equal the resolved native edges plus bound imported sources",
                 path=name,
             )
+    reachable_by_anchor: dict[str, set[str]] = {}
+    anchor_roots = set(anchored_edges) | {
+        anchor for anchor, _document in session_slot_parents.values()
+    }
+    for anchor in anchor_roots:
+        edges = anchored_edges.get(anchor, [])
+        parent_documents = session_documents_by_instance.get(anchor)
+        parent_owner = session_owner_by_instance.get(anchor)
+        if not parent_documents or parent_owner is None:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "A nested native edge names no admitted session parent occurrence",
+                instance=anchor,
+            )
+        reachable = {parent_owner.casefold()}
+        changed = True
+        while changed:
+            changed = False
+            for owner, target, _defining in edges:
+                if owner in reachable and target not in reachable:
+                    reachable.add(target)
+                    changed = True
+        for owner, _target, defining in edges:
+            if owner not in reachable:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A nested native edge is not connected to its session parent",
+                    instance=anchor,
+                    path=owner,
+                )
+            if has_session_document_marker(defining):
+                if ntpath.normcase(defining) not in parent_documents:
+                    raise SelectionError(
+                        "selection_closure_invalid",
+                        "A nested native edge does not use its parent session document",
+                        instance=anchor,
+                    )
+            elif folded_graph.get(defining.replace("\\", "/").casefold()) != owner:
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A nested native edge uses a defining document outside its resolved owner chain",
+                    instance=anchor,
+                    path=owner,
+                )
+        reachable_by_anchor[anchor] = reachable
+    for instance, (anchor, parent_document) in session_slot_parents.items():
+        owner = session_owner_by_instance.get(instance)
+        if owner is None or owner.casefold() not in reachable_by_anchor.get(anchor, set()):
+            raise SelectionError(
+                "selection_closure_invalid",
+                "A session slot anchor does not resolve through the admitted owner chain",
+                instance=instance,
+            )
+        if has_session_document_marker(parent_document):
+            if parent_document not in session_documents_by_instance.get(anchor, set()):
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A nested session slot does not name its admitted parent session document",
+                    instance=instance,
+                )
+        elif folded_graph.get(parent_document.replace("\\", "/").casefold()) != owner:
+            raise SelectionError(
+                "selection_closure_invalid",
+                "A nested session slot defining document does not match its ultimate owner",
+                instance=instance,
+            )
     reachable = reachable_closure(checked, main)
     missing = sorted(name for name in reachable if name not in checked)
     if missing:
         raise SelectionError(
             "selection_closure_incomplete", "A reachable document has no resolved observation", paths=missing
+        )
+    unreachable_virtual_owners = sorted(virtual_owners - reachable)
+    if unreachable_virtual_owners:
+        raise SelectionError(
+            "selection_closure_incomplete",
+            "An embedded virtual component owner is not reachable from the selected main",
+            paths=unreachable_virtual_owners,
         )
     selected = {name: files[name] for name in sorted(reachable)}
     manifest = {

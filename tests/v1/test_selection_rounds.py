@@ -210,6 +210,52 @@ class ClosureSealContractTests(unittest.TestCase):
         self.assertEqual(manifest["closure"]["imports"][1]["state"], "bound")
         self.assertEqual(manifest["closure"]["warnings"][0]["code"], "import_cached_materialization")
 
+    def test_embedded_virtual_component_survives_the_sealed_transport(self) -> None:
+        session_root = str(self.root / "swx21040")
+        session_document = session_root + "/VC~~/waist/Copy of 复件 (2) 零件10^waist.SLDPRT"
+        slot = {
+            "document": MAIN,
+            "owner": MAIN,
+            "owner_anchor": None,
+            "owner_sha256": self.upload[MAIN],
+            "instance": "waist-1/Copy of 复件 (2) 零件10^waist-1",
+            "state": "embedded_virtual_component",
+            "binding": "owner_embedded_geometry",
+            "kind": "native_embedded_virtual_component",
+            "session_document_path": session_document,
+            "session_temp_root": session_root,
+            "configuration": "默认",
+            "suppression_state": 2,
+            "is_virtual": True,
+            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+            "author_imported_path": None,
+            "author_imported_error": None,
+        }
+        evidence = self._evidence(virtual_components=[slot])
+        evidence["warnings"] = [
+            {
+                "code": "embedded_virtual_component_geometry",
+                "document": MAIN,
+                "instance": slot["instance"],
+                "requires_owner_binding": True,
+            }
+        ]
+        manifest = seal_closure_selection(self.upload, MAIN, evidence, reader_sha256="ab" * 32)
+        self.assertEqual(manifest["closure"]["virtual_components"], [slot])
+        self.assertEqual(
+            verify_selection(
+                manifest,
+                self.upload,
+                manifest["files"],
+                reader_sha256=manifest["reader_sha256"],
+            ),
+            manifest,
+        )
+        session, archive = self._staged_session()
+        self.assertTrue(session.accept_batch(archive))
+        sealed = session.seal_closure(evidence)
+        self.assertEqual(sealed["closure"]["virtual_components"], [slot])
+
     def _staged_session(self):
         session = StagedSelection(self.root / "stage", self.upload, MAIN, reader_sha256="ab" * 32)
         archive = self.root / "batch.zip"

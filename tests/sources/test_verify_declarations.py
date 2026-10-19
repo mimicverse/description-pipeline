@@ -1027,6 +1027,114 @@ class NativeDeclarationsTests(unittest.TestCase):
         candidate["source_selection"]["closure"]["imports"] = []
         self.assertIn("v14.imported_binding", self.errors(candidate))
 
+    def test_embedded_virtual_component_pid_binds_through_the_sealed_carrier(self):
+        """A virtual PID uses the VC~~ occurrence document and owner-bound carrier."""
+
+        session_root = r"C:\Users\operator\AppData\Local\Temp\swx21040"
+        selection_root = r"C:\Users\operator\AppData\Local\Temp\swx21041"
+        materialization = session_root + r"\VC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
+        selection_document = selection_root + r"\VC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
+        document = materialization.replace("/", "\\").strip().lower()
+        owner, occurrence = "module.SLDASM", "module-1/tool_part"
+        owner_sha = "a" * 64
+        api = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+        provenance = {
+            "state": "embedded_virtual_component",
+            "kind": "native_embedded_virtual_component",
+            "used_api": api,
+            "source_root": "C:\\locked-copy",
+            "native_document_path": materialization,
+            "materialization_path": materialization,
+            "session_document_path": materialization,
+            "session_temp_root": session_root,
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "is_virtual": True,
+            "owner": owner,
+            "owner_sha256": owner_sha,
+            "occurrence": occurrence,
+            "defining_anchor": None,
+            "document": None,
+        }
+        slot = {
+            "document": owner,
+            "owner": owner,
+            "instance": occurrence,
+            "owner_anchor": None,
+            "state": "embedded_virtual_component",
+            "binding": "owner_embedded_geometry",
+            "kind": "native_embedded_virtual_component",
+            "session_document_path": selection_document,
+            "session_temp_root": selection_root,
+            "owner_sha256": owner_sha,
+            "configuration": "Default",
+            "suppression_state": 2,
+            "is_virtual": True,
+            "used_api": api,
+            "author_imported_path": None,
+            "author_imported_error": None,
+        }
+        raw = fixture()
+        raw["files"] = {owner: owner_sha}
+        raw["source_selection"] = sealed_selection(
+            {owner: owner_sha},
+            owner,
+            edges={owner: []},
+            imports=[],
+            virtual_components=[slot],
+        )
+        row = raw["exporter"]["pid_bindings"][2]
+        item = next(entry for entry in raw["components"] if entry["name2"] == row["name2"])
+        self.assertEqual(item["name2"], occurrence)
+        row.update(document=document, source_provenance=copy.deepcopy(provenance))
+        item.update(document=document, source_provenance=copy.deepcopy(provenance))
+        errors = self.errors(raw)
+        self.assertNotIn("v14.imported_binding", errors)
+        self.assertNotIn("v14.pid_document_unread", errors)
+        self.assertNotIn("v14.pid_binding", errors)
+
+        cases = {
+            "outside_owned_temp": {"session_document_path": r"C:\elsewhere\VC~~\part.SLDPRT"},
+            "root_mismatch": {"session_temp_root": r"C:\Users\operator\AppData\Local\Temp\swx99999"},
+            "not_virtual": {"is_virtual": False},
+            "cached_conflict": {"state": "cached_materialization"},
+            "wrong_kind": {"kind": "native_import_materialization"},
+            "wrong_api": {"used_api": "basename_guess"},
+            "author_path": {"author_imported_path": r"D:\author\part.step"},
+            "author_path_missing": {"author_imported_path": None},
+            "api_path_fields_disagree": {
+                "materialization_path": r"C:\other\swx21040\VC~~\waist\other.SLDPRT"
+            },
+        }
+        for label, patch in cases.items():
+            with self.subTest(case=label):
+                candidate = copy.deepcopy(raw)
+                candidate["exporter"]["pid_bindings"][2]["source_provenance"].update(patch)
+                item = next(
+                    entry
+                    for entry in candidate["components"]
+                    if entry["name2"] == candidate["exporter"]["pid_bindings"][2]["name2"]
+                )
+                item["source_provenance"].update(patch)
+                if label == "author_path_missing":
+                    candidate["exporter"]["pid_bindings"][2]["source_provenance"].pop(
+                        "author_imported_path"
+                    )
+                    item["source_provenance"].pop("author_imported_path")
+                self.assertIn("v14.imported_binding", self.errors(candidate), patch)
+        candidate = copy.deepcopy(raw)
+        candidate["source_selection"]["closure"]["virtual_components"] = []
+        self.assertIn("v14.imported_binding", self.errors(candidate))
+        candidate = copy.deepcopy(raw)
+        candidate["exporter"]["pid_bindings"][2]["document"] = r"C:\other\part.SLDPRT"
+        item = next(
+            entry
+            for entry in candidate["components"]
+            if entry["name2"] == candidate["exporter"]["pid_bindings"][2]["name2"]
+        )
+        item["document"] = r"C:\other\part.SLDPRT"
+        self.assertIn("v14.imported_binding", self.errors(candidate))
+
     def test_unproven_absolute_document_stays_refused_without_provenance(self):
         """A provenance-less PID document must still be a confined package path."""
 

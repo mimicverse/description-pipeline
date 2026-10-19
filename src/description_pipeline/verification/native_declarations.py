@@ -15,6 +15,10 @@ import re
 
 import numpy as np
 
+from ..sources.solidworks.session_artifacts import (
+    SESSION_DOCUMENT_API,
+    session_materialization_under_root,
+)
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
@@ -84,7 +88,7 @@ def _pid_occurrence(row, components, raw):
             # package document: the PID document is the occurrence's own engine-resolved
             # session materialization, spelled exactly as the active walk records it, and
             # the delivered bytes binding lives in the sealed selection carrier.
-            from .native_discovery import _cached_materialization_reason, _session_temp_path  # noqa: PLC0415
+            from .native_discovery import _cached_materialization_reason  # noqa: PLC0415
 
             materialization = right.get("materialization_path")
             session_root = right.get("session_temp_root")
@@ -110,7 +114,7 @@ def _pid_occurrence(row, components, raw):
                 )
             _require(
                 isinstance(materialization, str)
-                and _session_temp_path(materialization, session_root)
+                and session_materialization_under_root(materialization, session_root)
                 and document == materialization.replace("/", "\\").strip().lower(),
                 "v14.imported_binding",
                 "the cached PID document is not the recorded session temp materialization",
@@ -138,6 +142,59 @@ def _pid_occurrence(row, components, raw):
                 component=row["name2"],
             )
             return component
+        if right.get("state") == "embedded_virtual_component":
+            from .native_discovery import (  # noqa: PLC0415
+                _embedded_virtual_component_reason,
+            )
+
+            session_document = right.get("session_document_path")
+            session_root = right.get("session_temp_root")
+            _require(
+                left.get("state") == "embedded_virtual_component"
+                and left.get("kind") == "native_embedded_virtual_component"
+                and left.get("used_api") == SESSION_DOCUMENT_API
+                and right.get("used_api") == SESSION_DOCUMENT_API
+                and left.get("session_document_path") == session_document
+                and left.get("native_document_path") == right.get("native_document_path")
+                and left.get("materialization_path") == right.get("materialization_path")
+                and left.get("session_temp_root") == session_root
+                and left.get("is_virtual") is True
+                and "author_imported_path" in left
+                and "author_imported_error" in left
+                and left.get("author_imported_path") is None
+                and left.get("author_imported_error") is None
+                and "author_imported_path" in right
+                and "author_imported_error" in right
+                and right.get("author_imported_path") is None
+                and right.get("author_imported_error") is None,
+                "v14.imported_binding",
+                "the PID and the active occurrence record different embedded virtual components",
+                component=row["name2"],
+            )
+            _require(
+                isinstance(session_document, str)
+                and ntpath.normcase(document) == ntpath.normcase(session_document),
+                "v14.imported_binding",
+                "the embedded virtual PID document is not the recorded VC~~ session document",
+                component=row["name2"],
+            )
+            carrier = raw.get("source_selection")
+            closure = carrier.get("closure") if isinstance(carrier, dict) else None
+            slots = [
+                item
+                for item in (closure.get("virtual_components") if isinstance(closure, dict) else None) or []
+                if isinstance(item, dict) and item.get("state") == "embedded_virtual_component"
+            ]
+            reason = _embedded_virtual_component_reason(
+                component, right, slots, set(), carrier, raw.get("files") or {}
+            )
+            _require(
+                reason is None,
+                "v14.imported_binding",
+                reason or "the virtual occurrence is not covered by the sealed selection carrier",
+                component=row["name2"],
+            )
+            return component
     # Non-cached documents must stay confined package paths, with or without provenance.
     _require(
         not PurePosixPath(document).is_absolute()
@@ -160,7 +217,7 @@ def _pid_occurrence(row, components, raw):
     _require(
         left.get("state") == "resolved"
         and left.get("kind") == "native_imported_document"
-        and left.get("used_api") == "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+        and left.get("used_api") == SESSION_DOCUMENT_API
         and left.get("document") == document
         and type(left.get("is_virtual")) is bool
         and isinstance(left.get("sha256"), str)

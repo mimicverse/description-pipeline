@@ -50,6 +50,12 @@ from ..interface_records import (
 )
 from ..io import PipelineError, confined, digest, parse_data, read_data
 from ..schemas import exporter_declaration_present
+from ..sources.solidworks.session_artifacts import (
+    SESSION_DOCUMENT_API,
+    embedded_virtual_component_under_root,
+    has_session_document_marker,
+    session_materialization_under_root,
+)
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -467,6 +473,12 @@ def _cached_materialization_reason(
 
     if not isinstance(carrier, dict) or not isinstance(carrier.get("closure"), dict):
         return "the sealed selection carrier is absent"
+    if (
+        provenance.get("state") != "cached_materialization"
+        or provenance.get("kind") != "native_import_materialization"
+        or provenance.get("used_api") != SESSION_DOCUMENT_API
+    ):
+        return "the occurrence is not an API-proven IC~~ native import materialization"
     owner = provenance.get("owner")
     owner_sha = provenance.get("owner_sha256")
     occurrence = provenance.get("occurrence")
@@ -489,7 +501,7 @@ def _cached_materialization_reason(
         return "the cached materialization owner bytes are unproven"
     if not (isinstance(materialization, str) and ntpath.isabs(materialization)):
         return "the cached materialization evidence carries no absolute session materialization"
-    if not _session_temp_path(materialization, temp_root):
+    if not session_materialization_under_root(materialization, temp_root):
         if not (isinstance(temp_root, str) and ntpath.isabs(temp_root)):
             return "the cached materialization evidence carries no owned session temp root"
         parts = materialization.replace("\\", "/").split("/")
@@ -498,8 +510,8 @@ def _cached_materialization_reason(
         return "the session materialization is outside its recorded owned session temp root"
     if author is not None and not isinstance(author, str):
         return "the cached materialization author metadata is unreadable"
-    if type(virtual) is not bool:
-        return "the cached materialization virtual state is unread"
+    if virtual is not False:
+        return "the cached materialization requires an explicit False IsVirtual reading"
     files = carrier.get("files")
     if not isinstance(files, dict) or files.get(owner) != owner_sha or native.get(owner) != owner_sha:
         return "the cached materialization owner bytes are not bound to the sealed selection"
@@ -524,7 +536,9 @@ def _cached_materialization_reason(
         slot_configuration = slot.get("configuration")
         if slot_configuration is not None and component.get("configuration") != slot_configuration:
             continue
-        if not _session_temp_path(slot.get("materialization"), slot.get("session_temp_root")):
+        if not session_materialization_under_root(
+            slot.get("materialization"), slot.get("session_temp_root")
+        ):
             continue
         if provenance.get("author_imported_in_source_root") is True:
             # In-root author sources are re-resolved by the engine to whichever root
@@ -575,20 +589,123 @@ def _cached_materialization_reason(
     return None
 
 
-def _session_temp_path(value: object, root: object) -> bool:
-    """True when ``value`` is an absolute session temp document under ``root``."""
+def _embedded_virtual_component_reason(
+    component: dict,
+    provenance: dict,
+    slots: list[dict],
+    used: set[int],
+    carrier: object,
+    native: dict,
+) -> str | None:
+    """Exact sealed-carrier evidence for one embedded virtual component.
 
-    if not (isinstance(value, str) and ntpath.isabs(value)):
-        return False
-    if not (isinstance(root, str) and ntpath.isabs(root)):
-        return False
-    if not any(part.casefold() == "ic~~" for part in value.replace("\\", "/").split("/") if part):
-        return False
-    try:
-        relative = ntpath.relpath(value, root)
-    except ValueError:
-        return False
-    return relative != ".." and not relative.startswith("..\\") and not ntpath.isabs(relative)
+    A ``VC~~`` document is not an imported source and never binds staged bytes.
+    Its geometry is stored inside the owning assembly.  The selection and
+    discovery sessions have different temporary roots, so identity is the
+    ultimate owner's frozen bytes plus the exact occurrence, defining anchor,
+    configuration, and each session's own ``VC~~`` document under its recorded
+    ``swxNNNN`` root.  Both the current API reading and the sealed slot must say
+    ``IsVirtual=True`` and carry no imported path.
+    """
+
+    if not isinstance(carrier, dict) or not isinstance(carrier.get("closure"), dict):
+        return "the sealed selection carrier is absent"
+    if (
+        provenance.get("state") != "embedded_virtual_component"
+        or provenance.get("kind") != "native_embedded_virtual_component"
+        or provenance.get("used_api") != SESSION_DOCUMENT_API
+    ):
+        return "the occurrence is not an API-proven embedded virtual component"
+    if provenance.get("is_virtual") is not True:
+        return "the embedded virtual component requires an explicit True IsVirtual reading"
+    if "author_imported_error" not in provenance or provenance["author_imported_error"] is not None:
+        return "the embedded virtual component imported-path absence is unproven"
+    if "author_imported_path" not in provenance or provenance["author_imported_path"] is not None:
+        return "a virtual component cannot carry an imported path"
+    owner = provenance.get("owner")
+    owner_sha = provenance.get("owner_sha256")
+    occurrence = provenance.get("occurrence")
+    anchor = provenance.get("defining_anchor")
+    session_document = provenance.get("session_document_path")
+    native_document = provenance.get("native_document_path")
+    materialization = provenance.get("materialization_path")
+    session_root = provenance.get("session_temp_root")
+    if not (isinstance(owner, str) and owner.strip()):
+        return "the embedded virtual component names no ultimate owner"
+    if not (isinstance(occurrence, str) and occurrence.strip()):
+        return "the embedded virtual component names no occurrence"
+    if anchor is not None and (not isinstance(anchor, str) or not anchor.strip()):
+        return "the embedded virtual component defining anchor is unreadable"
+    if not isinstance(owner_sha, str) or _HEX.match(owner_sha) is None:
+        return "the embedded virtual component owner bytes are unproven"
+    if not (
+        isinstance(session_document, str)
+        and isinstance(native_document, str)
+        and isinstance(materialization, str)
+        and ntpath.normcase(session_document)
+        == ntpath.normcase(native_document)
+        == ntpath.normcase(materialization)
+    ):
+        return "the embedded virtual component API path fields disagree"
+    if not embedded_virtual_component_under_root(session_document, session_root):
+        return "the embedded virtual component is not an exact VC~~ document under its owned session root"
+    document = component.get("document")
+    if (
+        not isinstance(document, str)
+        or not document.strip()
+        or ntpath.normcase(document) != ntpath.normcase(str(session_document))
+    ):
+        return "the embedded virtual component occurrence document differs from its VC~~ session document"
+    configuration = component.get("configuration")
+    if not isinstance(configuration, str) or not configuration.strip():
+        return "the embedded virtual component occurrence configuration is unread"
+    files = carrier.get("files")
+    if not isinstance(files, dict) or files.get(owner) != owner_sha or native.get(owner) != owner_sha:
+        return "the embedded virtual component owner bytes are not bound to the sealed selection"
+
+    def folded(value: object) -> str:
+        return str(value or "").replace("\\", "/").casefold()
+
+    matches = []
+    for index, slot in enumerate(slots):
+        if index in used:
+            continue
+        if (
+            slot.get("state") != "embedded_virtual_component"
+            or slot.get("binding") != "owner_embedded_geometry"
+            or slot.get("kind") != "native_embedded_virtual_component"
+            or slot.get("used_api") != SESSION_DOCUMENT_API
+            or slot.get("is_virtual") is not True
+            or "author_imported_path" not in slot
+            or slot["author_imported_path"] is not None
+            or "author_imported_error" not in slot
+            or slot["author_imported_error"] is not None
+        ):
+            continue
+        slot_owner = slot.get("owner")
+        if not isinstance(slot_owner, str) or folded(slot_owner) != folded(owner):
+            continue
+        if str(slot.get("instance") or "") != occurrence:
+            continue
+        if slot.get("owner_anchor") != anchor:
+            continue
+        if slot.get("owner_sha256") != owner_sha:
+            continue
+        if slot.get("configuration") != configuration:
+            continue
+        if slot.get("suppression_state") != component.get("suppression_state"):
+            continue
+        if not embedded_virtual_component_under_root(
+            slot.get("session_document_path"), slot.get("session_temp_root")
+        ):
+            continue
+        matches.append(index)
+    if not matches:
+        return "no sealed embedded virtual component matches this occurrence exactly"
+    if len(matches) > 1:
+        return "the sealed carrier records ambiguous embedded virtual components for this occurrence"
+    used.add(matches[0])
+    return None
 
 
 def _owned_relative_match(value: object, root: object, relative: str) -> bool:
@@ -2706,21 +2823,85 @@ def verify_discovery(package: Path) -> dict:
         raw_files = raw.get("files") or {}
         carrier = raw.get("source_selection")
         closure = carrier.get("closure") if isinstance(carrier, dict) else None
+        edge_anchors: dict[str, object] = {}
+        ambiguous_anchors: set[str] = set()
+        if isinstance(closure, dict):
+            for document in (closure.get("documents") or {}).values():
+                if not isinstance(document, dict):
+                    continue
+                for edge in document.get("resolved_edges") or []:
+                    if not isinstance(edge, dict) or edge.get("kind") != "native_document":
+                        continue
+                    instance = edge.get("instance")
+                    if not isinstance(instance, str) or not instance:
+                        continue
+                    anchor = edge.get("owner_anchor")
+                    if not isinstance(anchor, str) or not anchor:
+                        continue
+                    if instance in edge_anchors and edge_anchors[instance] != anchor:
+                        ambiguous_anchors.add(instance)
+                    edge_anchors[instance] = anchor
+        _require(
+            not ambiguous_anchors,
+            "discovery.imported_source_unbound",
+            "the sealed carrier records conflicting anchors for one occurrence",
+            {"instances": sorted(ambiguous_anchors)},
+        )
         cached_slots: list[dict] = []
+        virtual_slots: list[dict] = []
         if isinstance(closure, dict) and isinstance(closure.get("imports"), list):
             cached_slots = [
                 item
                 for item in closure["imports"]
                 if isinstance(item, dict) and item.get("state") == "cached_materialization"
             ]
+        if isinstance(closure, dict) and isinstance(closure.get("virtual_components"), list):
+            virtual_slots = [
+                item
+                for item in closure["virtual_components"]
+                if isinstance(item, dict) and item.get("state") == "embedded_virtual_component"
+            ]
         cached_used: set[int] = set()
+        virtual_used: set[int] = set()
         unbound: list[dict] = []
         observed = 0
+        current_instances: set[str] = set()
         for component in raw.get("components") or []:
             if not isinstance(component, dict):
                 continue
+            component_name = str(component.get("name2") or "")
+            if component_name:
+                current_instances.add(component_name)
+            if component_name in edge_anchors and component.get("defining_anchor") != edge_anchors[component_name]:
+                observed += 1
+                unbound.append(
+                    {
+                        "occurrence": component_name,
+                        "document": component.get("document"),
+                        "containing_document": None,
+                        "native_path": None,
+                        "imported_path": None,
+                        "state": None,
+                        "reason": "the current defining anchor differs from the sealed resolved edge",
+                    }
+                )
+                continue
             provenance = component.get("source_provenance")
+            document_has_session_marker = has_session_document_marker(component.get("document"))
             if provenance is None:
+                if document_has_session_marker:
+                    observed += 1
+                    unbound.append(
+                        {
+                            "occurrence": str(component.get("name2") or ""),
+                            "document": component.get("document"),
+                            "containing_document": None,
+                            "native_path": component.get("document"),
+                            "imported_path": None,
+                            "state": None,
+                            "reason": "a session-document occurrence carries no native API provenance",
+                        }
+                    )
                 continue
             observed += 1
             document = component.get("document")
@@ -2736,9 +2917,30 @@ def verify_discovery(package: Path) -> dict:
             if not isinstance(provenance, dict):
                 unbound.append({**entry, "state": None, "reason": "imported provenance is not an object"})
                 continue
+            if document_has_session_marker and provenance.get("state") not in {
+                "cached_materialization",
+                "embedded_virtual_component",
+            }:
+                unbound.append(
+                    {
+                        **entry,
+                        "state": provenance.get("state"),
+                        "reason": "a resolved document uses a reserved IC~~/VC~~ path segment",
+                    }
+                )
+                continue
             if provenance.get("state") == "cached_materialization":
                 reason = _cached_materialization_reason(
                     component, provenance, cached_slots, cached_used, carrier, native
+                )
+                if reason is not None:
+                    unbound.append(
+                        {**entry, "state": provenance.get("state"), "reason": reason, "error": provenance.get("error")}
+                    )
+                continue
+            if provenance.get("state") == "embedded_virtual_component":
+                reason = _embedded_virtual_component_reason(
+                    component, provenance, virtual_slots, virtual_used, carrier, native
                 )
                 if reason is not None:
                     unbound.append(
@@ -2752,7 +2954,7 @@ def verify_discovery(package: Path) -> dict:
                 reason = "imported provenance is not a native imported document"
             elif (
                 provenance.get("used_api")
-                != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+                != SESSION_DOCUMENT_API
             ):
                 reason = "imported provenance used an unexpected native API"
             elif provenance.get("document") != document:
@@ -2837,7 +3039,30 @@ def verify_discovery(package: Path) -> dict:
                     "unmatched_count": len(unmatched),
                 },
             )
-        return {"imported_occurrences": observed, "cached_materializations": len(cached_used)}
+        unmatched_virtual = [index for index in range(len(virtual_slots)) if index not in virtual_used]
+        if unmatched_virtual:
+            _require(
+                False,
+                "discovery.imported_source_unbound",
+                "the sealed carrier records embedded virtual components that no current occurrence proves",
+                {
+                    "unmatched": [virtual_slots[index] for index in unmatched_virtual[:20]],
+                    "unmatched_count": len(unmatched_virtual),
+                },
+            )
+        missing_edges = sorted(set(edge_anchors) - current_instances)
+        if missing_edges:
+            _require(
+                False,
+                "discovery.imported_source_unbound",
+                "the sealed carrier records native edges that no current occurrence proves",
+                {"missing": missing_edges[:20], "missing_count": len(missing_edges)},
+            )
+        return {
+            "imported_occurrences": observed,
+            "cached_materializations": len(cached_used),
+            "embedded_virtual_components": len(virtual_used),
+        }
 
     def identity():
         payload, definition = state["payload"], state["definition"]

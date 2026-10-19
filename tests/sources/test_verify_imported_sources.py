@@ -8,9 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from description_pipeline.sources.solidworks.selection import seal_closure_selection
 from description_pipeline.verification.native_discovery import DISCOVERY_SCHEMA, verify_discovery
 
-from .selection_support import sealed_selection
+from .selection_support import closure_evidence, sealed_selection
 from . import support
 
 ROOT = r"C:\description-v1-review\capture-session\input-copy"
@@ -23,6 +24,16 @@ CACHED_AUTHOR = r"D:\design-copy\change01\bracket_a.stp"
 CACHED_OWNER = "bracket_a.SLDASM"
 CACHED_OCCURRENCE = "bracket_a-21/bracket_a.stp-2"
 CACHED_API = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+VIRTUAL_OWNER = "waist.SLDASM"
+VIRTUAL_OCCURRENCE = "waist-1/Copy of 复件 (2) 零件10^waist-1"
+VIRTUAL_CAPTURE_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx21040"
+VIRTUAL_SELECTION_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx21041"
+VIRTUAL_CAPTURE_DOCUMENT = (
+    VIRTUAL_CAPTURE_ROOT + r"\VC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
+)
+VIRTUAL_SELECTION_DOCUMENT = (
+    VIRTUAL_SELECTION_ROOT + r"\VC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
+)
 
 
 def canonical(files):
@@ -129,6 +140,76 @@ def cached_carrier(owner_sha, imports=None):
         CACHED_OWNER,
         edges={CACHED_OWNER: []},
         imports=list(imports) if imports is not None else [cached_slot(owner_sha)],
+    )
+
+
+def virtual_provenance(owner_sha, **overrides):
+    provenance = {
+        "state": "embedded_virtual_component",
+        "kind": "native_embedded_virtual_component",
+        "source_root": ROOT,
+        "owner": VIRTUAL_OWNER,
+        "owner_sha256": owner_sha,
+        "occurrence": VIRTUAL_OCCURRENCE,
+        "defining_anchor": None,
+        "native_document_path": VIRTUAL_CAPTURE_DOCUMENT,
+        "session_document_path": VIRTUAL_CAPTURE_DOCUMENT,
+        "materialization_path": VIRTUAL_CAPTURE_DOCUMENT,
+        "session_temp_root": VIRTUAL_CAPTURE_ROOT,
+        "author_imported_path": None,
+        "author_imported_error": None,
+        "is_virtual": True,
+        "used_api": CACHED_API,
+        "error": None,
+    }
+    provenance.update(overrides)
+    return provenance
+
+
+def virtual_component(owner_sha, **overrides):
+    component = {
+        "name2": VIRTUAL_OCCURRENCE,
+        "document": VIRTUAL_CAPTURE_DOCUMENT,
+        "configuration": "默认",
+        "suppressed": False,
+        "lightweight": False,
+        "suppression_state": 2,
+        "source_provenance": virtual_provenance(owner_sha),
+    }
+    component.update(overrides)
+    return component
+
+
+def virtual_slot(owner_sha, occurrence=VIRTUAL_OCCURRENCE, configuration="默认"):
+    return {
+        "document": VIRTUAL_OWNER,
+        "owner": VIRTUAL_OWNER,
+        "instance": occurrence,
+        "owner_anchor": None,
+        "state": "embedded_virtual_component",
+        "binding": "owner_embedded_geometry",
+        "kind": "native_embedded_virtual_component",
+        "session_document_path": VIRTUAL_SELECTION_DOCUMENT,
+        "session_temp_root": VIRTUAL_SELECTION_ROOT,
+        "owner_sha256": owner_sha,
+        "configuration": configuration,
+        "suppression_state": 2,
+        "is_virtual": True,
+        "used_api": CACHED_API,
+        "author_imported_path": None,
+        "author_imported_error": None,
+    }
+
+
+def virtual_carrier(owner_sha, virtual_components=None):
+    return sealed_selection(
+        {VIRTUAL_OWNER: owner_sha},
+        VIRTUAL_OWNER,
+        edges={VIRTUAL_OWNER: []},
+        imports=[],
+        virtual_components=list(virtual_components)
+        if virtual_components is not None
+        else [virtual_slot(owner_sha)],
     )
 
 
@@ -338,7 +419,7 @@ class ImportedSourceTests(unittest.TestCase):
         self.assertEqual(sample["containing_document"], "module.SLDASM")
         self.assertIn("IC~~", sample["native_path"])
         self.assertIn("design-copy", sample["imported_path"])
-        self.assertIn("unread", sample["reason"])
+        self.assertIn("reserved IC~~/VC~~", sample["reason"])
 
     def test_all_unbound_occurrences_are_retained(self):
         contents = {"module.SLDASM": b"module bytes", "part.SLDPRT": b"part bytes"}
@@ -508,6 +589,359 @@ class ImportedSourceTests(unittest.TestCase):
             report = verify_discovery(package)
         error = self._unbound(report)
         self.assertEqual(error["detail"]["unmatched_count"], 1)
+
+    def test_embedded_virtual_component_is_accepted_through_the_sealed_carrier(self):
+        content = b"virtual owner bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {VIRTUAL_OWNER: content},
+                [virtual_component(sha)],
+                extra_raw={"source_selection": virtual_carrier(sha)},
+            )
+            report = verify_discovery(package)
+        check = self._check(report)
+        self.assertTrue(check["passed"], check["details"])
+        self.assertEqual(check["details"].get("embedded_virtual_components"), 1)
+        self.assertEqual(check["details"].get("cached_materializations"), 0)
+
+    def test_embedded_virtual_component_requires_exact_native_and_carrier_evidence(self):
+        content = b"virtual owner bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        ic_document = (
+            VIRTUAL_CAPTURE_ROOT
+            + r"\IC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
+        )
+        outside_document = r"C:\other\swx21040\VC~~\waist\part.SLDPRT"
+        wrong_root_document = (
+            r"C:\Users\operator\AppData\Local\Temp\not-a-session\VC~~\waist\part.SLDPRT"
+        )
+        mixed_document = (
+            VIRTUAL_CAPTURE_ROOT
+            + r"\VC~~\IC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
+        )
+        extra_directory_document = (
+            VIRTUAL_CAPTURE_ROOT
+            + r"\extra\VC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
+        )
+        cases = {
+            "absent_carrier": (virtual_component(sha), None, "carrier is absent"),
+            "false_virtual": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, is_virtual=False)),
+                virtual_carrier(sha),
+                "explicit True IsVirtual",
+            ),
+            "unknown_virtual": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, is_virtual=None)),
+                virtual_carrier(sha),
+                "explicit True IsVirtual",
+            ),
+            "wrong_kind": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, kind="native_import_materialization")),
+                virtual_carrier(sha),
+                "not an API-proven embedded virtual component",
+            ),
+            "wrong_api": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, used_api="basename_guess")),
+                virtual_carrier(sha),
+                "not an API-proven embedded virtual component",
+            ),
+            "ic_document": (
+                virtual_component(
+                    sha,
+                    document=ic_document,
+                    source_provenance=virtual_provenance(
+                        sha,
+                        native_document_path=ic_document,
+                        materialization_path=ic_document,
+                        session_document_path=ic_document,
+                    ),
+                ),
+                virtual_carrier(sha),
+                "not an exact VC~~",
+            ),
+            "outside_session_root": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha,
+                        native_document_path=outside_document,
+                        materialization_path=outside_document,
+                        session_document_path=outside_document,
+                    ),
+                ),
+                virtual_carrier(sha),
+                "not an exact VC~~",
+            ),
+            "missing_session_root": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, session_temp_root=None)),
+                virtual_carrier(sha),
+                "not an exact VC~~",
+            ),
+            "wrong_session_root_shape": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha,
+                        native_document_path=wrong_root_document,
+                        materialization_path=wrong_root_document,
+                        session_document_path=wrong_root_document,
+                        session_temp_root=r"C:\Users\operator\AppData\Local\Temp\not-a-session",
+                    ),
+                ),
+                virtual_carrier(sha),
+                "not an exact VC~~",
+            ),
+            "mixed_session_markers": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha,
+                        native_document_path=mixed_document,
+                        materialization_path=mixed_document,
+                        session_document_path=mixed_document,
+                    ),
+                ),
+                virtual_carrier(sha),
+                "not an exact VC~~",
+            ),
+            "marker_below_extra_directory": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha,
+                        native_document_path=extra_directory_document,
+                        materialization_path=extra_directory_document,
+                        session_document_path=extra_directory_document,
+                    ),
+                ),
+                virtual_carrier(sha),
+                "not an exact VC~~",
+            ),
+            "api_path_fields_disagree": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha,
+                        materialization_path=r"C:\other\swx21040\VC~~\waist\other.SLDPRT",
+                    ),
+                ),
+                virtual_carrier(sha),
+                "API path fields disagree",
+            ),
+            "missing_owner": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, owner=None)),
+                virtual_carrier(sha),
+                "names no ultimate owner",
+            ),
+            "owner_sha_mismatch": (
+                virtual_component(sha, source_provenance=virtual_provenance("f" * 64)),
+                virtual_carrier(sha),
+                "not bound to the sealed selection",
+            ),
+            "occurrence_mismatch": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, occurrence="other-1")),
+                virtual_carrier(sha),
+                "no sealed embedded virtual component matches",
+            ),
+            "configuration_mismatch": (
+                virtual_component(sha, configuration="Other"),
+                virtual_carrier(sha),
+                "no sealed embedded virtual component matches",
+            ),
+            "anchor_mismatch": (
+                virtual_component(sha, source_provenance=virtual_provenance(sha, defining_anchor="other-1")),
+                virtual_carrier(sha),
+                "no sealed embedded virtual component matches",
+            ),
+            "author_path_present": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha, author_imported_path=r"D:\author\Copy of 复件 (2) 零件10^waist.step"
+                    ),
+                ),
+                virtual_carrier(sha),
+                "cannot carry an imported path",
+            ),
+            "author_path_missing": (
+                virtual_component(
+                    sha,
+                    source_provenance={
+                        key: value
+                        for key, value in virtual_provenance(sha).items()
+                        if key != "author_imported_path"
+                    },
+                ),
+                virtual_carrier(sha),
+                "cannot carry an imported path",
+            ),
+            "author_path_unread": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha, author_imported_error="RuntimeError: GetImportedPath failed"
+                    ),
+                ),
+                virtual_carrier(sha),
+                "imported-path absence is unproven",
+            ),
+            "virtual_marked_as_import": (
+                virtual_component(
+                    sha,
+                    source_provenance=virtual_provenance(
+                        sha,
+                        state="cached_materialization",
+                        kind="native_import_materialization",
+                        is_virtual=False,
+                    ),
+                ),
+                virtual_carrier(sha),
+                "not a session temp materialization",
+            ),
+        }
+        for label, (component, carrier, token) in cases.items():
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    extra = {"source_selection": carrier} if carrier is not None else {}
+                    package = self._package(
+                        directory,
+                        {VIRTUAL_OWNER: content},
+                        [component],
+                        extra_raw=extra,
+                    )
+                    report = verify_discovery(package)
+                detail = self._unbound(report)["detail"]
+                reasons = [item["reason"] for item in detail["samples"]]
+                self.assertTrue(
+                    any(token in str(reason) for reason in reasons)
+                    or detail.get("unmatched_count"),
+                    (label, detail),
+                )
+
+    def test_virtual_component_without_provenance_is_rejected(self):
+        content = b"virtual owner bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        for document in (
+            VIRTUAL_CAPTURE_DOCUMENT,
+            VIRTUAL_CAPTURE_ROOT + r"\VC~~\IC~~\mixed.SLDPRT",
+        ):
+            with self.subTest(document=document):
+                component = {
+                    "name2": VIRTUAL_OCCURRENCE,
+                    "document": document,
+                    "configuration": "默认",
+                    "suppressed": False,
+                    "lightweight": False,
+                    "suppression_state": 2,
+                }
+                with tempfile.TemporaryDirectory() as directory:
+                    package = self._package(
+                        directory,
+                        {VIRTUAL_OWNER: content},
+                        [component],
+                        extra_raw={"source_selection": virtual_carrier(sha)},
+                    )
+                    report = verify_discovery(package)
+                detail = self._unbound(report)["detail"]
+                self.assertEqual(
+                    detail["samples"][0]["reason"],
+                    "a session-document occurrence carries no native API provenance",
+                )
+
+    def test_resolved_provenance_cannot_use_reserved_session_path(self):
+        document = "VC~~/IC~~/imported_part.step"
+        content = b"reserved path bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        component = {
+            "name2": "reserved-1",
+            "document": document,
+            "configuration": "Default",
+            "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
+            "source_provenance": accepted_provenance(document, sha),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {document: content},
+                [component],
+            )
+            report = verify_discovery(package)
+        detail = self._unbound(report)["detail"]
+        self.assertIn("reserved IC~~/VC~~", detail["samples"][0]["reason"])
+
+    def test_embedded_virtual_component_coverage_is_two_sided(self):
+        content = b"virtual owner bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        carrier = virtual_carrier(sha, virtual_components=[virtual_slot(sha), virtual_slot(sha, occurrence="other-1")])
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {VIRTUAL_OWNER: content},
+                [virtual_component(sha)],
+                extra_raw={"source_selection": carrier},
+            )
+            report = verify_discovery(package)
+        error = self._unbound(report)
+        self.assertEqual(error["detail"]["unmatched_count"], 1)
+
+    def test_nested_staged_child_must_keep_the_sealed_anchor(self):
+        owner_bytes, child_bytes = b"virtual owner bytes", b"staged child bytes"
+        owner_sha = hashlib.sha256(owner_bytes).hexdigest()
+        child_sha = hashlib.sha256(child_bytes).hexdigest()
+        nested_instance = VIRTUAL_OCCURRENCE + "/child-1"
+        child = {
+            "name2": nested_instance,
+            "document": "child.SLDPRT",
+            "configuration": "默认",
+            "suppressed": False,
+            "lightweight": False,
+            "suppression_state": 2,
+            "defining_anchor": VIRTUAL_OCCURRENCE,
+        }
+        files = {VIRTUAL_OWNER: owner_sha, "child.SLDPRT": child_sha}
+        evidence = closure_evidence(
+            files,
+            VIRTUAL_OWNER,
+            edges={VIRTUAL_OWNER: ["child.SLDPRT"], "child.SLDPRT": []},
+            virtual_components=[virtual_slot(owner_sha)],
+        )
+        edge = next(
+            row
+            for row in evidence["documents"][VIRTUAL_OWNER]["resolved_edges"]
+            if row["resolved"] == "child.SLDPRT"
+        )
+        edge.update(
+            instance=nested_instance,
+            owner_anchor=VIRTUAL_OCCURRENCE,
+            defining_session_document=VIRTUAL_SELECTION_DOCUMENT,
+        )
+        carrier = seal_closure_selection(files, VIRTUAL_OWNER, evidence, reader_sha256="ab" * 32)
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {VIRTUAL_OWNER: owner_bytes, "child.SLDPRT": child_bytes},
+                [virtual_component(owner_sha), child],
+                extra_raw={"source_selection": carrier},
+            )
+            report = verify_discovery(package)
+        self.assertTrue(self._check(report)["passed"], self._check(report)["details"])
+
+        broken = json.loads(json.dumps(child))
+        broken["defining_anchor"] = None
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {VIRTUAL_OWNER: owner_bytes, "child.SLDPRT": child_bytes},
+                [virtual_component(owner_sha), broken],
+                extra_raw={"source_selection": carrier},
+            )
+            report = verify_discovery(package)
+        error = self._unbound(report)
+        self.assertIn("defining anchor", error["detail"]["samples"][0]["reason"])
 
     def test_relocated_in_root_author_source_matches_by_relative_name_and_bytes(self):
         owner_bytes, np_bytes = b"cached HD bytes", b"NP bytes"
