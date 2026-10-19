@@ -1934,9 +1934,51 @@ class PlatformStore:
             raise PlatformStoreError("The native receipt's upload identity differs from the admitted request")
 
         cursor.execute(_READ_STAGE_RECORDS, (run_id,))
-        stage_rows = {row[0]: row[1] for row in cursor.fetchall()}
-        if stage_rows != {"freeze": "completed"}:
+        stage_rows = cursor.fetchall()
+        if len(stage_rows) != 1 or stage_rows[0][0] != "freeze" or stage_rows[0][1] != "completed":
             raise PlatformStoreError("The bound native recovery requires only the completed freeze stage")
+        freeze_checkpoint = stage_rows[0][3] if len(stage_rows[0]) > 3 else None
+        freeze_receipt = stage_rows[0][2]
+        if isinstance(freeze_receipt, str):
+            try:
+                freeze_receipt = json.loads(freeze_receipt)
+            except ValueError:
+                freeze_receipt = None
+        freeze_reused_from = stage_rows[0][4] if len(stage_rows[0]) > 4 else None
+        if (
+            not isinstance(freeze_receipt, dict)
+            or freeze_reused_from is not None
+            or not isinstance(freeze_checkpoint, str)
+            or not freeze_checkpoint
+        ):
+            raise PlatformStoreError("The completed freeze carries no directly owned sealed checkpoint")
+        try:
+            checkpoint_run, checkpoint_stage = parse_sealed_uri(freeze_checkpoint)
+        except PipelineError as error:
+            raise PlatformStoreError("The completed freeze carries no standard sealed checkpoint") from error
+        if checkpoint_run != run_id or checkpoint_stage != "freeze":
+            raise PlatformStoreError("The completed freeze checkpoint belongs to another run or stage")
+        self._verify_checkpoint_scope(
+            freeze_checkpoint,
+            run_id=run_id,
+            stage="freeze",
+            reused_from_run=None,
+        )
+        try:
+            definition, sealed_root = self._verify_sealed(freeze_checkpoint, freeze_receipt)
+        except PipelineError as error:
+            raise PlatformStoreError("The completed freeze sealed bytes cannot be verified") from error
+        _sealed_receipt(
+            freeze_receipt,
+            run_id=run_id,
+            stage="freeze",
+            state="completed",
+            checkpoint_uri=freeze_checkpoint,
+            definition=definition,
+            root=sealed_root,
+        )
+        if freeze_receipt.get("handoff_sha256") != baseline.get("handoff_sha256"):
+            raise PlatformStoreError("The completed freeze receipt differs from the admitted upload identity")
 
         cursor.execute(_READ_ADMITTED_FACTS, (dag_id, dag_run_id, dag_id, dag_run_id))
         facts = cursor.fetchall()

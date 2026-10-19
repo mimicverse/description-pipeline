@@ -922,6 +922,9 @@ class LifecycleTests(unittest.TestCase):
             '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
             '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
             '    [ "$PLATFORM_CONFIG_DIGEST" = "$EXPECTED_PLATFORM_CONFIG_DIGEST" ] || exit 82\n'
+            '    echo "reconcile_env stage=${RECONCILE_STAGE} reported=${RECONCILE_REPORTED_STAGE:-} '
+            'native=${RECONCILE_NATIVE_RUN_ID:-} op=${RECONCILE_ORPHAN_OPERATION_ID:-} '
+            'task=${RECONCILE_ORPHAN_TASK_ID:-} map=${RECONCILE_ORPHAN_MAP_INDEX:-}" >> "$ORDER_LOG"\n'
             '    echo "platform reconcile ${RECONCILE_RUN_ID}:${RECONCILE_STAGE}:${RECONCILE_OUTCOME}"'
             ' >> "$ORDER_LOG"\n'
             '    echo "reconciled=${RECONCILE_RUN_ID}:${RECONCILE_STAGE} outcome=${RECONCILE_OUTCOME}" ;;\n'
@@ -1079,6 +1082,44 @@ class LifecycleTests(unittest.TestCase):
                 "platform reconcile run-1:capture:completed",
                 order.read_text(encoding="utf-8").splitlines(),
             )
+
+    def test_reconcile_forwards_reported_stage_with_the_bound_native_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, _, order, control = self._admission_fixture(Path(tmp))
+            evidence = Path(tmp) / "native-receipt.json"
+            evidence.write_text("{}\n", encoding="utf-8")
+            invalid = run(
+                [
+                    "bash", str(control), "reconcile", "--config", str(config_path),
+                    "--run-id", "run-1", "--stage", "discover", "--outcome", "failed",
+                    "--evidence", str(evidence), "--reported-stage", "freeze",
+                ],
+                env,
+            )
+            self.assertEqual(invalid.returncode, 1, invalid.stdout + invalid.stderr)
+            self.assertIn("orphan recovery requires", invalid.stderr)
+            valid = run(
+                [
+                    "bash", str(control), "reconcile", "--config", str(config_path),
+                    "--run-id", "run-1", "--stage", "discover", "--outcome", "failed",
+                    "--evidence", str(evidence), "--native-receipt", str(evidence),
+                    "--native-run-id", "3324bcb0-085a-5f77-8edc-a4c1be2f1a5a",
+                    "--orphan-operation-id", "e88a68da-6bac-49c6-a325-8f2f979daf76",
+                    "--orphan-task-id", "discover", "--orphan-map-index", "-1",
+                    "--reported-stage", "freeze",
+                ],
+                env,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+            self.assertIn(
+                "reconcile_env stage=discover reported=freeze "
+                "native=3324bcb0-085a-5f77-8edc-a4c1be2f1a5a "
+                "op=e88a68da-6bac-49c6-a325-8f2f979daf76 task=discover map=-1",
+                order.read_text(encoding="utf-8"),
+            )
+            control_text = control.read_text(encoding="utf-8")
+            self.assertIn('reconcile_frame["reported_stage"] = reported_stage', control_text)
+            self.assertIn('"params_digest": io.digest(reconcile_frame)', control_text)
 
     def test_unpause_failure_does_not_start_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

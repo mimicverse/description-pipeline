@@ -197,28 +197,31 @@ class ReconcileRealPostgresTests(unittest.TestCase):
         from airflow.models.dagrun import DagRun
         from airflow.models.taskinstance import TaskInstance
         from airflow.settings import Session
+        from description_pipeline.delivery import BUNDLE_SCHEMA
+        from description_pipeline.io import read_data
         from description_pipeline.orchestration.airflow_client import native_run_id
         from description_pipeline.io import digest as pipeline_digest
+        from tests.v1.test_platform_store import build_sealed_delivery
 
         self.dag_run_id = f"portal-bound-discover-{uuid_module.uuid4().hex[:12]}"
         self.run_id = native_run_id(self.dag_run_id)
-        self.upload_files = {
-            "3.0 总装.SLDASM": "a" * 64,
-            "parts/bracket.SLDPRT": "b" * 64,
-        }
-        self.upload_sha = pipeline_digest(self.upload_files)
+        self.sealed_root = self.evidence / "store" / "sealed" / self.run_id / "freeze"
+        subject, artifacts, self.upload_sha, _native_handoff = build_sealed_delivery(self.sealed_root)
+        index = read_data(self.sealed_root / "input" / "handoff.json")
+        self.upload_files = dict(index["package_files"])
+        self.main_assembly = "cad/robot.SLDASM"
         self.store.open_admission(reason="bound native reconcile proof", actor="reconcile-test")
         self.store.admit_run(
             request_id=f"portal-{self.dag_run_id}",
             run_id=self.run_id,
             principal="cli_reconcile:tenant:operator",
             target_hardware="m3.0",
-            main_assembly="3.0 总装.SLDASM",
+            main_assembly=self.main_assembly,
             configuration={"purpose": "inspection_preview"},
             baseline={
                 "handoff_sha256": self.upload_sha,
                 "files": len(self.upload_files),
-                "bytes": 123,
+                "bytes": sum((self.sealed_root / "input" / name).stat().st_size for name in self.upload_files),
                 "folder": "M3.0.3_20261016",
             },
             dispatch={
@@ -232,16 +235,31 @@ class ReconcileRealPostgresTests(unittest.TestCase):
             },
         )
         self.store.start_run(self.run_id)
+        freeze_receipt = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": "solidworks-to-urdf",
+            "run_id": self.run_id,
+            "stage": "freeze",
+            "state": "frozen",
+            "passed": False,
+            "handoff_sha256": self.upload_sha,
+            "subject_sha256": subject,
+            "tool": read_data(self.sealed_root / "tool.json"),
+            "artifacts": artifacts,
+        }
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="freeze",
+            state="completed",
+            receipt=freeze_receipt,
+            checkpoint_uri=f"store://sealed/{self.run_id}/freeze",
+        )
         self.native_operation_id = str(uuid_module.uuid4())
         self.native_operation_key = f"{self.run_id}/native:0"
         with psycopg2.connect(REQUIRED["platform_dsn"]) as connection, connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE operation SET state = 'succeeded' WHERE operation_key = %s",
                 (f"portal-{self.dag_run_id}/freeze:0",),
-            )
-            cursor.execute(
-                "INSERT INTO stage (run_id, stage, state, receipt) VALUES (%s, 'freeze', 'completed', '{}'::jsonb)",
-                (self.run_id,),
             )
             cursor.execute(
                 "INSERT INTO operation"
@@ -297,7 +315,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                     "run_id": self.run_id,
                     "request": {
                         "run_id": self.run_id,
-                        "main_assembly": "3.0 总装.SLDASM",
+                        "main_assembly": self.main_assembly,
                         "upload_sha256": self.upload_sha,
                         "upload_files": self.upload_files,
                     },
@@ -314,7 +332,7 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                         "problems": [
                             {
                                 "code": "selection_open_errors",
-                                "document": "3.0 总装.SLDASM",
+                                "document": self.main_assembly,
                                 "message": "the staged main opened with CAD-reported errors",
                             }
                         ],
@@ -436,6 +454,29 @@ class ReconcileRealPostgresTests(unittest.TestCase):
                 reconcile=self.bound_reconcile,
             )
         self.assertEqual(self._bound_rows(), before, "a conflicting Airflow fact performs zero writes")
+
+    def test_bound_native_discover_refuses_missing_or_corrupt_freeze_bytes(self) -> None:
+        for name, mutate in (
+            ("missing", lambda: shutil.rmtree(self.sealed_root)),
+            (
+                "corrupt",
+                lambda: (self.sealed_root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(
+                    b"corrupt-sealed-bytes"
+                ),
+            ),
+        ):
+            with self.subTest(name=name):
+                self._prepare_bound_native_discover()
+                mutate()
+                before = self._bound_rows()
+                with self.assertRaisesRegex(Exception, "sealed bytes"):
+                    self.store.confirm_stage(
+                        run_id=self.run_id,
+                        stage="discover",
+                        state="failed",
+                        reconcile=self.bound_reconcile,
+                    )
+                self.assertEqual(self._bound_rows(), before, "unsealed or changed freeze performs zero writes")
 
     def test_freeze_intent_closes_atomically_and_replays_without_writes(self) -> None:
         self.store.confirm_stage(

@@ -2780,31 +2780,37 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
     def setUp(self) -> None:
         import uuid
 
+        from description_pipeline.delivery import BUNDLE_SCHEMA
+        from description_pipeline.io import read_data
         from description_pipeline.orchestration.airflow_client import native_run_id
+        from tests.v1.test_platform_store import build_sealed_delivery
 
         self.tmp = Path(tempfile.mkdtemp(prefix="bound-native-discover-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.world = FakeWorld()
-        self.store = PlatformStore(self.world.connect)
         self.run_id = BOUND_DISCOVER_RUN
         self.dag_run_id = BOUND_DISCOVER_DAG_RUN
         self.native_run = native_run_id(self.dag_run_id)
-        self.upload_files = {
-            "3.0 总装.SLDASM": "a" * 64,
-            "parts/bracket.SLDPRT": "b" * 64,
-        }
-        self.upload_sha = digest(self.upload_files)
+        self.sealed_root = self.tmp / self.run_id / "freeze"
+        subject, artifacts, self.upload_sha, _native_handoff = build_sealed_delivery(self.sealed_root)
+        index = read_data(self.sealed_root / "input" / "handoff.json")
+        self.upload_files = dict(index["package_files"])
+        self.main_assembly = "cad/robot.SLDASM"
+        self.store = PlatformStore(
+            self.world.connect,
+            sealed=lambda uri: self.tmp / uri.removeprefix("store://sealed/"),
+        )
         self.store.admit_run(
             request_id=f"portal-{self.dag_run_id}",
             run_id=self.run_id,
             principal="portal",
             target_hardware="m3.0",
-            main_assembly="3.0 总装.SLDASM",
+            main_assembly=self.main_assembly,
             configuration={"purpose": "inspection_preview"},
             baseline={
                 "handoff_sha256": self.upload_sha,
                 "files": len(self.upload_files),
-                "bytes": 123,
+                "bytes": sum((self.sealed_root / "input" / name).stat().st_size for name in self.upload_files),
                 "folder": "M3.0.3_20261016",
             },
             dispatch={
@@ -2818,12 +2824,24 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             },
         )
         self.store.start_run(self.run_id)
-        self.world.stages[(self.run_id, "freeze")] = (
-            "completed",
-            {"state": "frozen"},
-            "store://sealed/3324bcb0-085a-5f77-8edc-a4c1be2f1a5a/freeze",
-            None,
-            None,
+        freeze_receipt = {
+            "schema_version": BUNDLE_SCHEMA,
+            "pipeline_id": PIPELINE_ID,
+            "run_id": self.run_id,
+            "stage": "freeze",
+            "state": "frozen",
+            "passed": False,
+            "handoff_sha256": self.upload_sha,
+            "subject_sha256": subject,
+            "tool": read_data(self.sealed_root / "tool.json"),
+            "artifacts": artifacts,
+        }
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="freeze",
+            state="completed",
+            receipt=freeze_receipt,
+            checkpoint_uri=f"store://sealed/{self.run_id}/freeze",
         )
         self.native_id = str(uuid.uuid4())
         self.native_key = f"{self.run_id}/native:0"
@@ -2856,7 +2874,7 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
             "run_id": self.native_run,
             "request": {
                 "run_id": self.native_run,
-                "main_assembly": "3.0 总装.SLDASM",
+                "main_assembly": self.main_assembly,
                 "upload_sha256": self.upload_sha,
                 "upload_files": dict(self.upload_files),
             },
@@ -2873,7 +2891,7 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
                 "problems": [
                     {
                         "code": "selection_open_errors",
-                        "document": "3.0 总装.SLDASM",
+                        "document": self.main_assembly,
                         "message": "the staged main opened with CAD-reported errors",
                     }
                 ],
@@ -2975,11 +2993,58 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         )
         variants.append(
             (
+                "wrong_upload",
+                lambda d: (
+                    d["request"].__setitem__("upload_sha256", "f" * 64),
+                    d["selection"].__setitem__("upload_sha256", "f" * 64),
+                ),
+                "document",
+            )
+        )
+        variants.append(
+            (
+                "dag_run_success",
+                lambda: self.world.dag_runs.__setitem__((DAG_ID, self.dag_run_id), "success"),
+                "world",
+            )
+        )
+        variants.append(
+            (
+                "successor_executed",
+                lambda: self.world.task_instances.__setitem__(
+                    (DAG_ID, "capture", self.dag_run_id, -1), "success"
+                ),
+                "world",
+            )
+        )
+        variants.append(
+            (
+                "wrong_operation_uuid",
+                lambda: setattr(self, "native_id", "deadbeef-0000-4000-8000-000000000000"),
+                "world",
+            )
+        )
+        variants.append(
+            (
                 "discover_task_green",
                 lambda: self.world.task_instances.__setitem__(
                     (DAG_ID, "discover", self.dag_run_id, -1), "success"
                 ),
                 "world",
+            )
+        )
+        variants.append(
+            (
+                "sealed_freeze_missing",
+                lambda: shutil.rmtree(self.sealed_root),
+                "side_effect",
+            )
+        )
+        variants.append(
+            (
+                "sealed_freeze_corrupt",
+                lambda: (self.sealed_root / "input" / "cad" / "cad" / "robot.SLDASM").write_bytes(b"corrupt"),
+                "side_effect",
             )
         )
         for name, mutate, kind in variants:

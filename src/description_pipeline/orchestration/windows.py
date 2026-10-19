@@ -662,10 +662,6 @@ class Jobs:
             elif not reader_matches:
                 row["eligible"] = False
                 row["reason"] = "tool_changed"
-                row["message"] = (
-                    "The native dependency reader changed; start a new Linux admission "
-                    "from Freeze inputs; Windows cannot rerun Freeze"
-                )
                 row["recomputes"] = []
             if row.get("reason") == "tool_changed":
                 row["message"] = (
