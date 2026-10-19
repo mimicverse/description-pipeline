@@ -277,6 +277,66 @@ class CapturePlanTests(unittest.TestCase):
                 {},
             )
 
+    def test_a_missing_closure_binding_is_refused(self) -> None:
+        discovery = json.loads(
+            (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")
+        )
+        component = next(item for item in discovery["raw"]["components"] if item["instance_id"] == "arm-1")
+        session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1\\VC~~\\arm\\arm.SLDPRT"
+        component["document"] = session_path.replace("\\", "/").lower()
+        component["configuration"] = "Default"
+        component["source_provenance"] = {
+            "kind": "native_embedded_virtual_component",
+            "state": "embedded_virtual_component",
+            "is_virtual": True,
+            "occurrence": "arm-1",
+            "owner": MAIN,
+            "owner_sha256": "a" * 64,
+            "session_document_path": session_path,
+            "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
+            "native_document_path": session_path,
+            "materialization_path": session_path,
+            "native_api_pid": 1,
+            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "document": None,
+        }
+        entry = {
+            "instance": "arm-1",
+            "name": "arm-1",
+            "kind": "native_embedded_virtual_component",
+            "state": "embedded_virtual_component",
+            "is_virtual": True,
+            "owner": MAIN,
+            "owner_sha256": "a" * 64,
+            "configuration": "Default",
+            "binding": "owner_embedded_geometry",
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "owner_anchor": None,
+            "session_document_path": session_path,
+            "session_temp_root": "C:\\Users\\operator\\AppData\\Local\\Temp\\swx1",
+            "native_api_pid": 1,
+            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+        }
+        discovery["raw"]["source_selection"] = {"closure": {"virtual_components": [entry]}}
+        write_json(self.root / "discovery" / "native-discovery.json", discovery)
+        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
+        self._rewrite_plan(
+            lambda plan: (
+                plan.update(discovery_sha256=discovery_sha),
+                plan["objects"][1].pop("document"),
+            )
+        )
+        steps._consume_sealed_definition(self.root)
+        entry.pop("binding")
+        write_json(self.root / "discovery" / "native-discovery.json", discovery)
+        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
+        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
+        with self.assertRaisesRegex(PipelineError, "does not bind the embedded-virtual occurrence"):
+            steps._consume_sealed_definition(self.root)
+
     def test_a_plan_omitting_a_fake_virtual_document_is_refused(self) -> None:
         discovery = json.loads(
             (self.root / "discovery" / "native-discovery.json").read_text(encoding="utf-8")

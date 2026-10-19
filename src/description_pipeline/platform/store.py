@@ -30,7 +30,11 @@ from typing import Any
 from ..delivery import BUNDLE_SCHEMA, PIPELINE_ID, read_delivery_manifest
 from ..io import PipelineError, artifact_path_parts, canonical, confined, digest, file_digest, read_data
 from ..orchestration.airflow_client import JOB_SCHEMA, native_run_id
-from .native_recovery import validate_capture_failure_events, validate_native_discovery_completed
+from .native_recovery import (
+    validate_capture_failure_events,
+    validate_native_discovery_completed,
+    validate_native_failed_terminal,
+)
 from ..stages import (
     CONFIRMED_STAGE_PASSED,
     CONFIRMED_STAGE_STATES,
@@ -200,6 +204,10 @@ def load_native_failed_receipt(
         raise PlatformStoreError("The native receipt must carry exactly one terminal event row")
     if terminal[0].get("state") != "failed":
         raise PlatformStoreError("The native receipt's terminal event is not a failure")
+    try:
+        validate_native_failed_terminal(events)
+    except PipelineError as error:
+        raise PlatformStoreError(str(error)) from error
     reported_stage = reported_stage if reported_stage is not None else stage
     if reported_stage != stage and (stage, reported_stage) not in {
         ("discover", "freeze"),

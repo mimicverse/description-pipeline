@@ -573,13 +573,13 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 or entry.get("owner_sha256") != provenance.get("owner_sha256")
                 or entry.get("configuration") != component.get("configuration")
                 or entry.get("used_api") != provenance.get("used_api")
-                or not isinstance(entry.get("binding"), str)
-                or not entry["binding"]
+                or entry.get("binding") != "owner_embedded_geometry"
                 or "author_imported_path" not in entry
                 or "author_imported_error" not in entry
                 or "owner_anchor" not in entry
                 or entry.get("author_imported_path") != provenance.get("author_imported_path")
                 or entry.get("author_imported_error") != provenance.get("author_imported_error")
+                or entry.get("owner_anchor") != provenance.get("defining_anchor")
                 or not isinstance(root, str)
                 or not isinstance(path, str)
                 or type(pid) is not int

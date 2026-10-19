@@ -44,14 +44,7 @@ def validate_capture_failure_events(events: object) -> int:
 
     rows = [event for event in events or () if isinstance(event, dict)]
     discovery_index = validate_native_discovery_completed(rows)
-    failed = [
-        index
-        for index, event in enumerate(rows)
-        if event.get("state") in {"passed", "failed"}
-    ]
-    if len(failed) != 1:
-        raise PipelineError("The native capture failure must carry exactly one terminal event")
-    index = failed[0]
+    index = validate_native_failed_terminal(rows)
     if rows[index].get("state") != "failed" or rows[index].get("stage") != "capture":
         raise PipelineError("The native terminal event is not a capture failure")
     if index <= discovery_index:
@@ -59,6 +52,20 @@ def validate_capture_failure_events(events: object) -> int:
     if index != len(rows) - 1:
         raise PipelineError("The native capture failure is not the last event")
     return index
+
+
+def validate_native_failed_terminal(events: object) -> int:
+    """Require one failed terminal event at the end of the native event list."""
+
+    rows = [event for event in events or () if isinstance(event, dict)]
+    if any(event.get("state") == "passed" for event in rows):
+        raise PipelineError("The native failure carries a passed event")
+    failed = [index for index, event in enumerate(rows) if event.get("state") == "failed"]
+    if len(failed) != 1:
+        raise PipelineError("The native failure must carry exactly one failed terminal event")
+    if failed[0] != len(rows) - 1:
+        raise PipelineError("The native failed terminal event is not the last event")
+    return failed[0]
 
 
 def build_discovery_tree_from_prepared(

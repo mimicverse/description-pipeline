@@ -45,7 +45,7 @@ install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release
 start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
 orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N [--reported-stage STAGE]
-native capture recovery adds: --derived DIR --archive FILE (--reported-stage capture, --stage discover, --outcome failed)
+native capture recovery adds: --install-id ID --derived DIR --archive FILE (--reported-stage capture, --stage discover, --outcome failed)
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2

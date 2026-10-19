@@ -50,6 +50,7 @@ from description_pipeline.platform.native_recovery import (
     seal_discovery_stage,
     validate_capture_failure_events,
     validate_native_discovery_completed,
+    validate_native_failed_terminal,
 )
 from description_pipeline.delivery import (
     BUNDLE_SCHEMA,
@@ -1594,6 +1595,11 @@ def _converge_terminal_native_failure(
     stage = _failed_native_stage(job)
     if stage is None:
         log.warning("native terminal failure carries no executable stage run=%s", run_id)
+        return None
+    try:
+        validate_native_failed_terminal(job.get("events") or [])
+    except PipelineError as error:
+        log.warning("native terminal failure is not one terminal failed event run=%s error=%s", run_id, error)
         return None
     if stage == "capture":
         try:
