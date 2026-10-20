@@ -1635,6 +1635,60 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         lock.close()
 
+    def test_failure_receipt_and_cleanup_run_while_backup_holds_the_lock(
+        self,
+    ) -> None:
+        observed: list[str] = []
+        original_record = recovery.record_backup_failure
+
+        def observe_failure(args, error, claim):
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.acquire_maintenance_lock(
+                    Path(self.context.resolved["storage"]["state_root"])
+                )
+            observed.append(raised.exception.code)
+            return original_record(args, error, claim)
+
+        with (
+            mock.patch.object(
+                recovery,
+                "load_backup_context",
+                return_value=self.context,
+            ),
+            mock.patch.object(
+                recovery,
+                "_backup_command_claimed",
+                side_effect=recovery.RecoveryError(
+                    "fixture_failure",
+                    "failure after claim",
+                ),
+            ),
+            mock.patch.object(
+                recovery,
+                "record_backup_failure",
+                side_effect=observe_failure,
+            ),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery.backup_command(
+                config_path=self.context.config_path,
+                backup_id="failure-lock",
+                key_file=self.key,
+                out=self.root / "failure-lock",
+            )
+        self.assertEqual(
+            observed,
+            ["recovery_maintenance_not_exclusive"],
+        )
+        self.assertEqual(
+            raised.exception.backup_failure["maintenance_state"],
+            "not_started",
+        )
+        lock = recovery.acquire_maintenance_lock(
+            Path(self.context.resolved["storage"]["state_root"])
+        )
+        lock.close()
+
     def test_failure_reporting_survives_cleanup_error(self) -> None:
         out = self.root / "cleanup-failure"
         claim = recovery.claim_backup_output(out, "cleanup-failure")

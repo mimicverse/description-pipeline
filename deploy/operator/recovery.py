@@ -4050,6 +4050,28 @@ def backup_command(
         except BaseException as error:
             with contextlib.suppress(Exception):
                 error.backup_claim = claim
+            try:
+                failure = record_backup_failure(
+                    argparse.Namespace(
+                        out=out,
+                        backup_id=backup_id,
+                        config=config_path,
+                    ),
+                    error,
+                    claim,
+                )
+            except Exception as recording_error:
+                failure = {
+                    "maintenance_state": "unknown_or_stopped",
+                    "recovery_hint": (
+                        "inspect backup markers and run the controlled operatorctl "
+                        "start command"
+                    ),
+                    "receipt_written": False,
+                    "recording_error": str(recording_error),
+                }
+            with contextlib.suppress(Exception):
+                error.backup_failure = failure
             raise
     finally:
         lifecycle_lock.close()
@@ -7130,6 +7152,8 @@ def main(argv: list[str] | None = None) -> int:
                     "receipt_written": False,
                     "completion_preserved": True,
                 }
+            elif getattr(error, "backup_failure", None) is not None:
+                failure = error.backup_failure
             else:
                 try:
                     failure = record_backup_failure(

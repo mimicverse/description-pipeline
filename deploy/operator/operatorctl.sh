@@ -1178,6 +1178,7 @@ case "$ACTION" in
       # and admission stay untouched.  The channel is closed-window only: it refuses while
       # the admission is open.
       load_running_env
+      acquire_maintenance_lock "$STATE_ROOT"
       CANDIDATE_ID="$INSTALL_ID"
       RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
       [ -f "$RECEIPT_DIR/receipt.json" ] \

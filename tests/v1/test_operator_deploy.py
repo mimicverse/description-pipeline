@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -2883,6 +2884,84 @@ class InstallOrderingTests(unittest.TestCase):
                 before,
                 "no live DDL may run before the staged identity verifies",
             )
+
+    def test_candidate_reconcile_refuses_before_ddl_when_maintenance_lock_is_held(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(
+                Path(tmp),
+                fresh=False,
+                ready_after=1,
+                db_exists=True,
+            )
+            installed = self._install(release, control_env)
+            self.assertEqual(
+                installed.returncode,
+                0,
+                installed.stdout + installed.stderr,
+            )
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state,
+                "gen-1",
+                "PLATFORM_OPERATOR_DSN",
+            )
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            receipt_before = receipt_path.read_bytes()
+            ddl_before = order.read_text(encoding="utf-8").count(
+                "psql_platform_apply"
+            )
+            lock_dir = state / "locks"
+            lock_dir.mkdir(exist_ok=True)
+            lock_path = lock_dir / "maintenance.lock"
+            lock_path.write_text("external lifecycle owns this lock\n", encoding="utf-8")
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                refused = run(
+                    [
+                        "bash",
+                        str(release / "operator" / "operatorctl.sh"),
+                        "reconcile",
+                        "--config",
+                        str(release.parent / "platform.json"),
+                        "--install-id",
+                        "gen-2",
+                        "--run-id",
+                        "portal-1",
+                        "--stage",
+                        "freeze",
+                        "--outcome",
+                        "failed",
+                        "--evidence",
+                        "receipt.json",
+                    ],
+                    control_env,
+                )
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            self.assertNotEqual(
+                refused.returncode,
+                0,
+                refused.stdout + refused.stderr,
+            )
+            self.assertIn(
+                "another supported lifecycle operation owns the maintenance lock",
+                refused.stderr,
+            )
+            self.assertEqual(
+                order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                ddl_before,
+            )
+            self.assertEqual(receipt_path.read_bytes(), receipt_before)
 
     def test_maintenance_reconcile_refuses_an_undefined_candidate_value(self) -> None:
         """A candidate env that cannot define a value never falls back to the running generation."""
