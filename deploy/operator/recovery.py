@@ -8164,7 +8164,15 @@ def _verify_installed_wheel_members(
             if scheme == "scripts":
                 return venv / "bin" / relative
             if scheme == "headers":
-                return venv / "include" / "site" / "python3.12" / relative
+                distribution = parts[0].split("-", 1)[0]
+                return (
+                    venv
+                    / "include"
+                    / "site"
+                    / "python3.12"
+                    / distribution
+                    / relative
+                )
             return venv / relative
         return site_packages / name
 
@@ -8226,11 +8234,26 @@ def _verify_installed_wheel_members(
             f"installed wheel member {name}",
             "recovery_release_missing",
         )
-        require(
-            sha256_file(target) == hashlib.sha256(payload).hexdigest(),
-            "recovery_release_missing",
-            f"installed {label} member differs: {name}",
-        )
+        if ".data/scripts/" in name:
+            require(
+                os.access(target, os.X_OK)
+                and target.read_bytes().startswith(b"#!"),
+                "recovery_release_missing",
+                f"installed script member is not executable: {name}",
+            )
+            interpreter = target.read_bytes().splitlines()[0][2:].strip()
+            require(
+                Path(os.fsdecode(interpreter)).resolve()
+                == (venv / "bin" / "python").resolve(),
+                "recovery_release_missing",
+                f"installed script member has an unexpected interpreter: {name}",
+            )
+        else:
+            require(
+                sha256_file(target) == hashlib.sha256(payload).hexdigest(),
+                "recovery_release_missing",
+                f"installed {label} member differs: {name}",
+            )
     record_name = next(
         name for name in members if name.endswith(".dist-info/RECORD")
     )
@@ -8261,6 +8284,21 @@ def _verify_installed_wheel_members(
     for name, value in recorded.items():
         path = Path(name)
         target = path.resolve() if path.is_absolute() else (site_packages / path).resolve()
+        require(
+            target.is_file(),
+            "recovery_release_missing",
+            f"installed {label} RECORD names a missing file: {name}",
+        )
+        if value[0]:
+            encoded = base64.urlsafe_b64encode(
+                hashlib.sha256(target.read_bytes()).digest()
+            ).rstrip(b"=").decode("ascii")
+            require(
+                value[0] == f"sha256={encoded}"
+                and value[1] == str(target.stat().st_size),
+                "recovery_release_missing",
+                f"installed {label} generated file differs: {name}",
+            )
         recorded_by_target[target] = value
     for name, payload in members.items():
         if name.endswith(".dist-info/RECORD"):
@@ -8281,7 +8319,7 @@ def _verify_installed_wheel_members(
         encoded = base64.urlsafe_b64encode(
             hashlib.sha256(payload).digest()
         ).rstrip(b"=").decode("ascii")
-        if record[0]:
+        if record[0] and ".data/scripts/" not in name:
             require(
                 record[0] == f"sha256={encoded}"
                 and record[1] == str(len(payload)),
