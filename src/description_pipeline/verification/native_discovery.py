@@ -2199,18 +2199,6 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         str(component): str(body["name"]) for body in bodies for component in body["components"]
     }
     attached = _frame_attached_members(raw)
-    root_body = by_name["base_link"]
-    root_datum = _owned_datum(
-        raw,
-        root_body["frame"]["coordinate_system"],
-        _datum_owners(full_cluster["base_link"], attached),
-    )
-    base_frame = _frame(root_datum.get("array")) if root_datum else None
-    _require(
-        base_frame is not None,
-        "discovery.joint_rebuild",
-        "the base_link mechanical datum is unreadable",
-    )
     raw_mates = raw.get("mates") or []
     _members, pairs = _independent_clusters(raw)
     facts: list[dict] = []
@@ -2515,6 +2503,19 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             fact = facts[index]
             fact["entry"]["parent"] = current
             fact["entry"]["child"] = neighbour
+            parent = by_name[current]
+            parent_datum = _owned_datum(
+                raw,
+                parent["frame"]["coordinate_system"],
+                _datum_owners(full_cluster[current], attached),
+            )
+            parent_frame = _frame(parent_datum.get("array")) if parent_datum else None
+            _require(
+                parent_frame is not None,
+                "discovery.joint_rebuild",
+                "the parent body frame datum is unreadable",
+                {"body": current},
+            )
             child = by_name[neighbour]
             datum = _owned_datum(
                 raw,
@@ -2542,8 +2543,8 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 direction_decision = canonicalize_axis(
                     fact["entry"]["name"],
                     local,
+                    [value for row in parent_frame for value in row],
                     [value for row in frame for value in row],
-                    [value for row in base_frame for value in row],
                     joint_type=fact["entry"]["type"],
                 )
             except ValueError as error:

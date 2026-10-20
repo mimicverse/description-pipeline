@@ -803,8 +803,10 @@ class DiscoveryTests(unittest.TestCase):
             payload["mates"].extend(mates)
 
         result, _source, _output = self._prepare(mutate=mutate)
-        self.assertEqual(self._codes(result), ["discovery.frame_attachment"])
-        finding = result.findings[0]
+        codes = self._codes(result)
+        self.assertIn("discovery.frame_attachment", codes)
+        self.assertIn("direction.semantics_unresolved", codes)
+        finding = next(item for item in result.findings if item["code"] == "discovery.frame_attachment")
         self.assertIn("exactly one rigid cluster", finding["message"])
         self.assertEqual(finding["detail"]["components"], ["arm-1", "base-1"])
         self.assertEqual(len(finding["detail"]["clusters"]), 2)
@@ -824,8 +826,11 @@ class DiscoveryTests(unittest.TestCase):
 
             with self.subTest(component=component):
                 result, _source, _output = self._prepare(mutate=mutate)
-                self.assertEqual([item["code"] for item in result.findings], ["discovery.frame_attachment"])
-                self.assertIn("frozen top-scope identity", result.findings[0]["message"])
+                codes = [item["code"] for item in result.findings]
+                self.assertIn("discovery.frame_attachment", codes)
+                self.assertIn("direction.semantics_unresolved", codes)
+                finding = next(item for item in result.findings if item["code"] == "discovery.frame_attachment")
+                self.assertIn("frozen top-scope identity", finding["message"])
                 self.assertFalse(any("full rank" in item["message"] for item in result.findings))
 
     def test_frame_attachment_arity_and_endpoints_are_exact(self):

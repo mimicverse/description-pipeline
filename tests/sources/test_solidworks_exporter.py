@@ -276,7 +276,8 @@ class ExporterDiscoveryTests(unittest.TestCase):
             joints[0]["axis_reference"], {"kind": "reference_axis", "component": "", "feature_name": "a_hinge"}
         )
         self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
-        self.assertEqual(findings, [])
+        self.assertEqual([item["code"] for item in findings], ["direction.semantics_unresolved"])
+        self.assertFalse(findings[0]["blocking"])
 
     def test_equal_bounds_and_zero_drives_are_preserved_as_stage_warnings(self):
         for values, expected in (
@@ -288,9 +289,13 @@ class ExporterDiscoveryTests(unittest.TestCase):
             raw["exporter"]["raw_xml"] = wire_xml(values)
             _, joints, findings = self.derive(raw)
             self.assertEqual(joints[0]["limits"], values)
-            self.assertEqual([item["code"] for item in findings], [expected])
+            self.assertEqual(
+                [item["code"] for item in findings],
+                ["direction.semantics_unresolved", expected],
+            )
             self.assertFalse(findings[0]["blocking"])
-            self.assertIn("qualification_blocker", findings[0]["detail"])
+            self.assertFalse(findings[1]["blocking"])
+            self.assertIn("qualification_blocker", findings[1]["detail"])
 
     def test_exporter_zero_placeholder_without_native_range_blocks(self):
         raw = raw_record()
@@ -765,7 +770,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         xml = wire_xml(limits)
         raw["exporter"].update(raw_xml=xml, raw_xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
         bodies, joints, findings = self.derive(raw)
-        self.assertFalse(findings)
+        self.assertEqual([item["code"] for item in findings], ["direction.semantics_unresolved"])
         self.assertEqual(joints[0]["limits"], limits)
         self.assertEqual(joints[0]["axis"]["direction"], [0.0, 0.0, 1.0])
         # One clear schema shape: a delivery without interface datums has no interface frames.

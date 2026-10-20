@@ -2570,20 +2570,82 @@ def _body_datum(record: dict, body: dict) -> dict | None:
     return _datum(record, body["datum"], owners)
 
 
-def _base_frame_datum(record: dict, body: dict | None, findings: list[dict]) -> dict | None:
-    """Return the root body's unique readable datum used as the mechanical frame."""
+def _apply_mate_direction(record: dict, bodies: list[dict], joints: list[dict], findings: list[dict]) -> None:
+    """Record the CAD-first audit for mate-derived joints without changing values."""
 
-    datum = _body_datum(record, body) if body is not None else None
-    if datum is None or str(datum.get("name") or "") not in {"c_base", "c_base_link", "CS_base_link"}:
-        findings.append(
-            _finding(
-                "direction.reference_frame_missing",
-                "base_link",
-                "the positive-motion reference requires the root body's readable mechanical datum",
+    by_name = {str(body["name"]): body for body in bodies}
+    for joint in joints:
+        if "name" not in joint or joint.get("type") == "fixed":
+            continue
+        if joint.get("axis", {}).get("source") != "mate":
+            continue
+        parent = by_name.get(str(joint.get("parent")))
+        child = by_name.get(str(joint.get("child")))
+        parent_datum = _body_datum(record, parent) if parent else None
+        if parent_datum is None:
+            ownerless = [
+                item
+                for item in record.get("datums") or []
+                if isinstance(item, dict) and item.get("name") == "CS_base_link"
+            ]
+            if len(ownerless) == 1:
+                parent_datum = ownerless[0]
+        child_datum = _body_datum(record, child) if child else None
+        parent_array = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
+        child_array = _finite_vector(child_datum.get("array"), 16) if child_datum else None
+        local = _axis_in_child(joint, child_datum) if child_datum else None
+        if parent_array is None or child_array is None or local is None:
+            findings.append(
+                _finding(
+                    "direction.reference_frame_invalid",
+                    f"joint:{joint['name']}",
+                    "mate-derived joint has no readable parent/child datum or local axis",
+                )
             )
+            continue
+        try:
+            semantic = canonicalize_axis(
+                str(joint["name"]),
+                local,
+                parent_array,
+                child_array,
+                joint_type=str(joint["type"]),
+            )
+        except ValueError as error:
+            findings.append(
+                _finding(
+                    "direction.invalid",
+                    f"joint:{joint['name']}",
+                    "positive-motion semantics could not be evaluated",
+                    {"error": str(error)},
+                )
+            )
+            continue
+        joint["axis"].update(
+            base_direction=semantic["canonical_base_axis"],
+            raw_base_axis=semantic["raw_base_axis"],
+            canonical_base_axis=semantic["canonical_base_axis"],
+            delivered_local_axis=semantic["delivered_local_axis"],
+            status=semantic["status"],
+            direction_relation=semantic["status"],
+            sign=semantic["sign"],
+            motion=semantic["motion"],
+            classification_source=semantic["classification_source"],
+            alignment=semantic["alignment"],
+            reason=semantic["reason"],
+            rule_id=semantic["rule_id"],
+            rule_version=semantic["rule_version"],
         )
-        return None
-    return datum
+        if semantic["status"] != "verified":
+            findings.append(
+                _finding(
+                    "direction.semantics_unresolved",
+                    f"joint:{joint['name']}",
+                    "the authored CAD axis is preserved; its motion class is not proven",
+                    semantic,
+                    blocking=False,
+                )
+            )
 
 
 def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str, str], dict]:
@@ -2756,7 +2818,7 @@ def _exporter_constraint_checks(
                         )
                     )
 def _exporter_axis(
-    record: dict, declared: dict, body: dict, base_body: dict | None, findings: list[dict]
+    record: dict, declared: dict, body: dict, parent_body: dict | None, findings: list[dict]
 ) -> tuple[dict, dict | None]:
     obj = f"joint:{declared['name']}"
     selector = _exporter_reference(declared.get("axis_name"), findings, obj)
@@ -2848,14 +2910,14 @@ def _exporter_axis(
                 {"declared": signed, "native": direction},
             )
         )
-    base_datum = _base_frame_datum(record, base_body, findings)
-    base_transform = _finite_vector(base_datum.get("array"), 16) if base_datum else None
-    if base_transform is None:
+    parent_datum = _body_datum(record, parent_body) if parent_body is not None else None
+    parent_transform = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
+    if parent_transform is None:
         findings.append(
             _finding(
                 "direction.reference_frame_invalid",
                 obj,
-                "the CS_base_link mechanical reference frame is not a finite 4x4 transform",
+                "the parent body's local mechanical datum is not a finite 4x4 transform",
             )
         )
         return axis, selector
@@ -2863,8 +2925,8 @@ def _exporter_axis(
         semantic = canonicalize_axis(
             declared["name"],
             local,
+            parent_transform,
             transform,
-            base_transform,
             joint_type=declared["type"],
         )
     except ValueError as error:
@@ -2877,14 +2939,14 @@ def _exporter_axis(
             )
         )
         return axis, selector
-    if semantic["status"] != "canonical":
+    if semantic["status"] != "verified":
         findings.append(
             _finding(
                 "direction.semantics_unresolved",
                 obj,
-                "the joint axis cannot be assigned a canonical principal-motion sign",
+                "the authored CAD axis is preserved; its motion class is not proven",
                 semantic,
-                blocking=True,
+                blocking=False,
             )
         )
         delivered_local = local
@@ -2892,22 +2954,7 @@ def _exporter_axis(
     else:
         delivered_local = semantic["delivered_local_axis"]
         canonical_base = semantic["canonical_base_axis"]
-        canonical_assembly = [
-            semantic["sign"] * value
-            for value in signed
-        ]
-        if semantic["sign"] == -1:
-            findings.append(
-                _finding(
-                    "direction.sign_normalized",
-                    obj,
-                    "the CAD signed axis was reversed to satisfy the versioned positive-motion convention",
-                    semantic,
-                    blocking=False,
-                )
-            )
-    if semantic["status"] != "canonical":
-        canonical_assembly = signed
+    canonical_assembly = signed
     origin = [transform[3], transform[7], transform[11]]
     offset = _axis_offset(point, origin, direction)
     if offset > AXIS_OFFSET_TOL_M:
@@ -2931,6 +2978,7 @@ def _exporter_axis(
         motion=semantic["motion"],
         classification_source=semantic["classification_source"],
         alignment=semantic["alignment"],
+        reason=semantic["reason"],
         rule_id=semantic["rule_id"],
         rule_version=semantic["rule_version"],
     )
@@ -2997,7 +3045,6 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
         for item in record.get("components") or []
         if isinstance(item, dict) and isinstance(item.get("name2"), str)
     }
-    base_body = by_name.get(str(declaration.get("root")))
     joints = []
     for link in declaration["links"]:
         if link["parent"] is None:
@@ -3027,7 +3074,7 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
         _exporter_origin(declared, child, parent, record, findings)
         axis, selector = ({"point": None, "direction": None, "source": "exporter"}, None)
         if kind != "fixed":
-            axis, selector = _exporter_axis(record, declared, child, base_body, findings)
+            axis, selector = _exporter_axis(record, declared, child, parent, findings)
         limits = declared["limits"]
         limit_source = "declared_author" if isinstance(limits, dict) else None
         if kind != "fixed":
@@ -5206,6 +5253,7 @@ def _derive_carriers(
         findings,
         root=str(root["name"]) if root is not None else None,
     )
+    _apply_mate_direction(record, bodies, joints, findings)
     derived_names = {
         str(body.get("source_name") or body["name"]): body["name"] for body in bodies
     } | {

@@ -1,9 +1,10 @@
-"""Versioned positive-motion semantics for CAD joint axes.
+"""Versioned audit of CAD-authored joint axes.
 
-The CAD declaration supplies a signed child-frame vector.  The root datum is
-the mechanical reference frame; the rule only selects its sign from the
-declared or geometrically demonstrated roll/pitch/yaw class.  An oblique axis
-stays oblique: no component is snapped to a principal axis.
+The native signed ``<Axis>`` value is the starting fact. The parent body's
+datum is the local mechanical reference; the child datum carries the authored
+axis and the joint frame. This module verifies a declared motion token against
+that local evidence and reports unresolved semantics. It never substitutes a
+different principal axis or sign when the authored value is valid.
 """
 
 from __future__ import annotations
@@ -87,58 +88,56 @@ def _geometry_motion(base_axis: list[float], threshold: float) -> tuple[str | No
 def canonicalize_axis(
     native_name: str,
     local_axis,
+    parent_frame,
     child_frame,
-    base_frame,
     *,
     joint_type: str,
     threshold: float = _ALIGNMENT_THRESHOLD,
 ) -> dict:
-    """Derive the versioned canonical positive direction and its evidence."""
+    """Audit an authored child-frame axis against its parent-local semantics."""
 
     if joint_type not in {"revolute", "continuous", "prismatic"}:
         raise ValueError("positive motion semantics only apply to moving joints")
     local = _unit([float(value) for value in local_axis])
+    parent = _rotation(parent_frame)
     child = _rotation(child_frame)
-    base = _rotation(base_frame)
     assembly_axis = _unit(_matvec(child, local))
-    base_axis = _unit(_matvec(_transpose(base), assembly_axis))
-
-    named_motion = _motion_token(native_name)
-    if named_motion is not None:
-        motion = named_motion
-        classification_source = "name"
-        alignment = _dot(base_axis, _PRINCIPAL[motion])
-        if abs(alignment) <= 1e-9:
-            motion = None
-    else:
-        motion, alignment = _geometry_motion(base_axis, threshold)
-        classification_source = "geometry" if motion is not None else "unresolved"
-
-    if motion is None:
+    parent_axis = _unit(_matvec(_transpose(parent), assembly_axis))
+    declared_motion = _motion_token(native_name)
+    local_principal, local_projection = _geometry_motion(parent_axis, threshold)
+    if declared_motion is None:
         return {
-            "status": "unresolved",
-            "motion": motion,
-            "classification_source": classification_source,
-            "alignment": alignment,
-            "raw_base_axis": base_axis,
-            "canonical_base_axis": base_axis,
+            "status": "unverified",
+            "motion": None,
+            "declared_motion": None,
+            "local_principal": local_principal,
+            "classification_source": "unresolved",
+            "alignment": local_projection,
+            "raw_base_axis": parent_axis,
+            "canonical_base_axis": parent_axis,
             "delivered_local_axis": local,
             "sign": 1,
+            "reason": "no explicit CAD motion class",
             "rule_id": "direction.positive_semantics",
             "rule_version": "v3",
         }
 
-    sign = 1 if alignment >= 0.0 else -1
-    canonical_base = [sign * value for value in base_axis]
+    alignment = _dot(parent_axis, _PRINCIPAL[declared_motion])
+    verified = abs(alignment) >= threshold
     return {
-        "status": "canonical",
-        "motion": motion,
-        "classification_source": classification_source,
+        "status": "verified" if verified else "unverified",
+        "motion": declared_motion,
+        "declared_motion": declared_motion,
+        "local_principal": local_principal,
+        "classification_source": "name",
         "alignment": alignment,
-        "raw_base_axis": base_axis,
-        "canonical_base_axis": canonical_base,
-        "delivered_local_axis": [sign * value for value in local],
-        "sign": sign,
+        "raw_base_axis": parent_axis,
+        "canonical_base_axis": parent_axis,
+        "delivered_local_axis": local,
+        "sign": 1,
+        "reason": "declared motion matches the local mechanical axis"
+        if verified
+        else "declared motion does not match the local mechanical axis",
         "rule_id": "direction.positive_semantics",
         "rule_version": "v3",
     }

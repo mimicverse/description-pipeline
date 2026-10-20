@@ -614,24 +614,20 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             return cached
         if joint.get("type") == "fixed":
             return None
-        root = ((state.get("declaration") or {}).get("root") or {}).get("name")
-        root_frame_name = (state.get("frame_names") or {}).get(root)
+        parent = state.get("frames", {}).get(joint.get("parent_link"))
         child = state.get("frames", {}).get(joint.get("child_link"))
-        base = state.get("frames", {}).get(root)
         _require(
-            child is not None
-            and base is not None
-            and root_frame_name in {"c_base", "c_base_link", "CS_base_link", "base", "base_frame"},
+            parent is not None and child is not None,
             "v14.direction_frame_unread",
-            "positive motion needs readable child and root mechanical frames",
+            "positive motion needs readable parent and child mechanical frames",
             joint=name,
         )
         try:
             decision = canonicalize_axis(
                 name,
                 joint.get("axis"),
+                parent.reshape(16).tolist(),
                 child.reshape(16).tolist(),
-                base.reshape(16).tolist(),
                 joint_type=joint["type"],
             )
         except ValueError as error:
@@ -642,18 +638,12 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             ) from error
         state["directions"][name] = decision
         state["carried_axes"][name] = decision["delivered_local_axis"]
-        if decision["status"] != "canonical":
-            raise DeclarationError(
-                "v14.direction_unresolved",
-                "the joint has no canonical positive-motion sign",
-                {"joint": name, **decision},
-            )
-        elif decision["sign"] == -1:
+        if decision["status"] != "verified":
             diagnostics.append(
                 {
-                    "code": "direction.sign_normalized",
+                    "code": "direction.semantics_unresolved",
                     "blocking": False,
-                    "message": "the CAD signed axis was reversed to satisfy the positive-motion convention",
+                    "message": "the authored CAD axis is preserved; its motion class is not proven",
                     "detail": {"joint": name, **decision},
                 }
             )
@@ -1068,7 +1058,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             if set(sides) != {"left", "right"}:
                 continue
             left, right = sides["left"], sides["right"]
-            if left["status"] != "canonical" or right["status"] != "canonical":
+            if left["status"] != "verified" or right["status"] != "verified":
                 continue
             _require(
                 left["motion"] == right["motion"],

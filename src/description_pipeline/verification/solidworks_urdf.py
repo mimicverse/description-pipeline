@@ -2003,13 +2003,13 @@ def _value_warning_gate(root, source, model):
                 "original": provenance.get("raw_base_axis"),
                 "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
                 "rule_version": provenance.get("rule_version", "v3"),
-                "reason": provenance.get("direction_relation", provenance.get("status")),
+                "reason": provenance.get(
+                    "reason", provenance.get("direction_relation", provenance.get("status"))
+                ),
                 "sign": provenance.get("sign"),
                 "motion": provenance.get("motion"),
             }
-            if provenance.get("sign") == -1:
-                add("direction.sign_normalized", row)
-            elif provenance.get("status", provenance.get("direction_relation")) == "unresolved":
+            if provenance.get("status", provenance.get("direction_relation")) != "verified":
                 add("direction.semantics_unresolved", row)
     for frame in source.get("frames", []):
         source_name = str(frame.get("source_name") or "")
@@ -2190,8 +2190,7 @@ def _value_warning_gate(root, source, model):
             "Link, joint, and frame names are deterministic formatting of native CAD identities."
         ),
         "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
-        "direction.sign_normalized": "Joint axes were normalized to the versioned positive-motion convention.",
-        "direction.semantics_unresolved": "Joint axes lack a determinate canonical positive-motion sign.",
+        "direction.semantics_unresolved": "Authored CAD axes are preserved; functional positive motion is not proven.",
         "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
         "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
         "naming.derived_material": "Material names are derived from the owner link and native component identity.",

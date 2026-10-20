@@ -348,7 +348,7 @@ class ValueWarningTests(unittest.TestCase):
         )
         self.assertFalse(any(item["object_type"] == "frame" for item in formatted["objects"]))
 
-    def test_direction_rule_warning_is_rederived_for_a_reversed_axis(self):
+    def test_direction_rule_warning_preserves_an_unverified_authored_axis(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)
         source["joints"] = [
@@ -357,12 +357,13 @@ class ValueWarningTests(unittest.TestCase):
                 "source_name": "left_shoulder_pitch_joint",
                 "type": "revolute",
                 "axis_provenance": {
-                    "status": "canonical",
-                    "sign": -1,
+                    "status": "unverified",
+                    "sign": 1,
                     "motion": "pitch",
                     "raw_base_axis": [0.0, -0.9396926208, -0.3420201433],
                     "rule_id": "direction.positive_semantics",
                     "rule_version": "v3",
+                    "reason": "declared motion does not match the local mechanical axis",
                 },
             }
         ]
@@ -381,8 +382,8 @@ class ValueWarningTests(unittest.TestCase):
         )
         warnings.append(
             {
-                "code": "direction.sign_normalized",
-                "message": "Joint axes were normalized to the versioned positive-motion convention.",
+                "code": "direction.semantics_unresolved",
+                "message": "Authored CAD axes are preserved; functional positive motion is not proven.",
                 "objects": [
                     {
                         "object_type": "joint",
@@ -393,8 +394,8 @@ class ValueWarningTests(unittest.TestCase):
                         "original": [0.0, -0.9396926208, -0.3420201433],
                         "rule_id": "direction.positive_semantics",
                         "rule_version": "v3",
-                        "reason": "canonical",
-                        "sign": -1,
+                        "reason": "declared motion does not match the local mechanical axis",
+                        "sign": 1,
                         "motion": "pitch",
                     }
                 ],

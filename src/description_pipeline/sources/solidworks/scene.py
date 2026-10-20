@@ -916,13 +916,13 @@ def _value_warnings(
                 "original": provenance.get("raw_base_axis"),
                 "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
                 "rule_version": provenance.get("rule_version", "v3"),
-                "reason": provenance.get("direction_relation", provenance.get("status")),
+                "reason": provenance.get(
+                    "reason", provenance.get("direction_relation", provenance.get("status"))
+                ),
                 "sign": provenance.get("sign"),
                 "motion": provenance.get("motion"),
             }
-            if provenance.get("sign") == -1:
-                direction_changes.append(direction)
-            elif provenance.get("status", provenance.get("direction_relation")) == "unresolved":
+            if provenance.get("status", provenance.get("direction_relation")) != "verified":
                 direction_unresolved.append(direction)
         if source_joint.get("type") != "fixed" and not any(
             word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
@@ -1027,7 +1027,7 @@ def _value_warnings(
         warnings.append(
             {
                 "code": "direction.semantics_unresolved",
-                "message": "Joint axes lack a determinate canonical positive-motion sign.",
+                "message": "Authored CAD axes are preserved; functional positive motion is not proven.",
                 "objects": direction_unresolved,
             }
         )

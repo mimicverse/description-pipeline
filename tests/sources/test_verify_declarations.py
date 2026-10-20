@@ -1266,7 +1266,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw["mates"] = [lock("base_part", "module-1/tool_part")]
         report = verify_declarations(raw)
         self.assertTrue(report["passed"], report["errors"])
-        (warning,) = report["diagnostics"]
+        warning = next(item for item in report["diagnostics"] if item["code"] == "v14.saved_pose_restriction")
         self.assertEqual(warning["code"], "v14.saved_pose_restriction")
         self.assertFalse(warning["blocking"])
         self.assertEqual(warning["detail"]["joint"], "hinge")
