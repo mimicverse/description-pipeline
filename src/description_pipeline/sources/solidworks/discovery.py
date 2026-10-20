@@ -1878,7 +1878,24 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             continue
         native_direction = [float(value) for value in shaft]
         if sign == -1:
-            native_direction = [-value for value in native_direction]
+            # An author sign reversal is not applied until the direction rule
+            # and its evidence are approved.  Preserve the native shaft and
+            # report the unapplied sign instead of silently flipping it.
+            findings.append(
+                _finding(
+                    "discovery.direction_sign_unapproved",
+                    obj,
+                    "dp.joint.axis_sign=-1 is recorded but not applied; the direction rule is not approved",
+                    {
+                        "native_sign": sign,
+                        "native_shaft": native_direction,
+                        "applied": False,
+                        "rule_id": "direction.author_sign",
+                        "rule_version": "pending",
+                    },
+                    blocking=False,
+                )
+            )
         cylinder_entity = next(
             (
                 item

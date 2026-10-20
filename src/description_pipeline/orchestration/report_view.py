@@ -140,6 +140,7 @@ _INDEPENDENT_LABELS = {
     "source.coverage": "Native source coverage",
     "verification.complete": "Independent verification completion marker",
     "model.policy": "Model policy conformance",
+    "source.carrier_binding": "Raw carrier identity and topology binding",
     "physics.independent": "Independent physical recomputation",
     "frames.native": "Native coordinate systems",
     "frames.components": "Component coordinate systems",

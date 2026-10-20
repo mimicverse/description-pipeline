@@ -243,6 +243,25 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertEqual(preview["warnings"], [])
         self.assertEqual(preview["warnings_total"], 0)
 
+    def test_quality_diagnostic_without_explicit_nonblocking_flag_is_not_a_warning(self) -> None:
+        platform = self._registered_failed_verify(
+            passed=True,
+            state="completed",
+            diagnostics=[{"code": "quality.unknown_blocking", "message": "flag is missing"}],
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, DAG_RUN_ID)
+
+        self.assertEqual(preview["warnings"], [])
+        self.assertEqual(preview["warnings_total"], 0)
+
     def test_preview_limits_warnings_but_reports_the_full_total(self) -> None:
         diagnostics = [
             {

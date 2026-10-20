@@ -1721,6 +1721,26 @@ class DiscoveryTests(unittest.TestCase):
                 )
                 self.assertIn("discovery.joint_axis_sign_missing", self._codes(result))
 
+    def test_unapproved_negative_axis_sign_is_not_applied(self):
+        baseline, _source, baseline_output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        baseline_payload = json.loads((baseline_output / "discovery/native-discovery.json").read_text())
+        plus = rebuild_joint_facts(baseline_payload, baseline_output, purpose="engineering")[0]
+
+        result, _source, output = self._prepare(
+            mutate=lambda payload: payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ].update({"dp.joint.axis_sign": "-1"})
+        )
+        self.assertTrue(result.passed, result.findings)
+        self.assertIn(
+            "discovery.direction_sign_unapproved",
+            [finding["code"] for finding in result.findings],
+        )
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        minus = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertEqual(minus["axis"], plus["axis"])
+
     def test_native_limit_record_must_be_finite(self):
         def mutate(payload):
             payload["mates"][0]["limits"] = {"lower": -1.5, "upper": 1.5, "unit": "rad"}

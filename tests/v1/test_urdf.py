@@ -11,7 +11,7 @@ from xml.etree import ElementTree as ET
 from description_pipeline.backends.urdf import MESH_PART_TRIANGLE_LIMIT, generate_urdf
 from description_pipeline.io import PipelineError, file_digest, read_data
 from description_pipeline.model import Robot
-from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
+from description_pipeline.sources.solidworks.naming import material_name, mesh_path
 
 
 def _binary_stl(triangles: int) -> bytes:

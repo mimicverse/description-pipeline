@@ -91,6 +91,18 @@ class NativeLimitInventoryTests(unittest.TestCase):
                     invalid.update(update)
                     self.assertFalse(native_limit_inventory_complete([invalid]))
 
+    def test_non_applicable_fields_must_be_the_explicit_null(self) -> None:
+        for value in ("true", 1, 0, False, {}, [], "IUnknown.IsAdvancedMate"):
+            with self.subTest(is_advanced_mate=value):
+                mate = active_mate()
+                mate["is_advanced_mate"] = value
+                self.assertFalse(native_limit_inventory_complete([mate]))
+        for value in ("true", "", "IUnknown.IsAdvancedMate", False, {}):
+            with self.subTest(is_advanced_mate_api=value):
+                mate = active_mate()
+                mate["is_advanced_mate_api"] = value
+                self.assertFalse(native_limit_inventory_complete([mate]))
+
     def test_any_observed_limit_value_prevents_absence_proof(self) -> None:
         for key, value in (
             ("limits", {"lower": 0.0, "upper": 0.0, "unit": "rad"}),

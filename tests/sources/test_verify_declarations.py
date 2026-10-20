@@ -1167,6 +1167,21 @@ class NativeDeclarationsTests(unittest.TestCase):
                         "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
                     },
                 ),
+                *[
+                    (
+                        f"corrupted_non_applicable_{value!r}",
+                        {**complete_mate(), "is_advanced_mate": value},
+                    )
+                    for value in ("true", 1, {}, [])
+                ],
+                (
+                    "non_applicable_api_without_flag",
+                    {**complete_mate(), "is_advanced_mate_api": "IUnknown.IsAdvancedMate"},
+                ),
+                (
+                    "non_applicable_bool_false",
+                    {**complete_mate(), "is_advanced_mate": False},
+                ),
             ]
         )
         for label, mate in cases:

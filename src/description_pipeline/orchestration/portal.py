@@ -293,7 +293,9 @@ def _quality_warnings(report: dict | None) -> list[dict]:
 
     warnings: list[dict] = []
     for item in _registered_source_rows(report or {}, "diagnostics", code_required=True):
-        if item.get("blocking") is True:
+        if item.get("blocking") is not False:
+            # Only an explicit non-blocking diagnostic is a warning.  A
+            # missing or unknown flag must never be downgraded silently.
             continue
         warning = {
             "source": "quality",

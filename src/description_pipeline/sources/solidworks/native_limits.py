@@ -94,7 +94,10 @@ def native_limit_inventory_complete(mates) -> bool:
                 return False
             if mate["is_advanced_mate_api"] != _ADVANCED_MATE_APIS[mate_type]:
                 return False
-        elif flag is True:
+        elif flag is not None or mate["is_advanced_mate_api"] is not None:
+            # On a mate type that cannot carry an advanced limit, both fields
+            # must be the explicit non-applicable null.  A corrupted type
+            # (string, number, object, list) is not absence evidence.
             return False
     return True
 
