@@ -20,6 +20,8 @@
 #   orphan recovery: reconcile --run-id R --stage S --outcome failed --evidence FILE... \
 #     --native-receipt FILE --native-run-id UUID --orphan-operation-id OP \
 #     --orphan-task-id TASK --orphan-map-index N
+#   native capture recovery first reads the recorded operation/stage/owner result; a complete
+#   replay returns it without requiring the original receipt, derived directory or archive.
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
@@ -45,7 +47,8 @@ install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release
 start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
 orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N [--reported-stage STAGE]
-native capture recovery adds: --install-id ID --derived DIR --archive FILE (--reported-stage capture, --stage discover, --outcome failed)
+native capture recovery adds: --install-id ID [--derived DIR --archive FILE] (--reported-stage capture, --stage discover, --outcome failed)
+  a completed replay returns immediately; the input files are required only when the state-first read misses
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2
@@ -2100,30 +2103,31 @@ PY
         || die "orphan recovery requires --native-receipt, --native-run-id, --orphan-operation-id --orphan-task-id and --orphan-map-index together"
       [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
       [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
-      [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
     fi
-    if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]; then
-      [ -n "$NATIVE_DERIVED" ] && [ -n "$NATIVE_ARCHIVE" ] \
-        && [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] \
-        && [ "$REPORTED_STAGE" = "capture" ] \
-        && [ -n "$INSTALL_ID" ] \
+    if [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] && [ "$REPORTED_STAGE" = "capture" ]; then
+      [ -n "$INSTALL_ID" ] \
         && [ -n "$RUN_ID" ] && [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] \
         && [ -n "$ORPHAN_OPERATION_ID" ] && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
         || die "native capture recovery requires the complete discover/capture receipt and operation binding"
       [ "$NATIVE_RUN_ID" = "$RUN_ID" ] || die "the native receipt names another run"
-      [ -d "$NATIVE_DERIVED" ] || die "the derived prepared directory is missing: $NATIVE_DERIVED"
-      [ -f "$NATIVE_ARCHIVE" ] || die "the capture-request archive is missing: $NATIVE_ARCHIVE"
       (
         set -a
         . "$ENV_FILE"
         set +a
-        args=(--run-id "$RUN_ID" --job "$NATIVE_RECEIPT" --derived "$NATIVE_DERIVED" \
-          --archive "$NATIVE_ARCHIVE" --operation-id "$ORPHAN_OPERATION_ID" \
+        args=(--run-id "$RUN_ID" --job "$NATIVE_RECEIPT" --operation-id "$ORPHAN_OPERATION_ID" \
           --task-id "$ORPHAN_TASK_ID" --map-index "$ORPHAN_MAP_INDEX")
+        [ -z "$NATIVE_DERIVED" ] || args+=(--derived "$NATIVE_DERIVED")
+        [ -z "$NATIVE_ARCHIVE" ] || args+=(--archive "$NATIVE_ARCHIVE")
         for item in "${EVIDENCE[@]}"; do args+=(--evidence "$item"); done
         "$AIRFLOW_VENV/bin/python" "$HERE/reconcile-native-capture.py" "${args[@]}"
       )
       exit $?
+    fi
+    if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]; then
+      die "native capture recovery inputs require --stage discover --outcome failed --reported-stage capture"
+    fi
+    if [ -n "$ORPHAN_INPUTS" ]; then
+      [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
     fi
     # Every reconcile shape consumes the generation DSNs: read them back from the derived
     # environment file so the canonical action always runs against the controlled values.

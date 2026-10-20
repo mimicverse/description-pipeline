@@ -13,6 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "src" / "description_pipeline" / "orchestration" / "static"
 HEALTH = ROOT / "deploy" / "operator" / "health.sh"
+CONTROL = ROOT / "deploy" / "operator" / "operatorctl.sh"
 PROBE = HEALTH.read_text(encoding="utf-8").split("<<'ASSETS'\n", 1)[1].split("\nASSETS", 1)[0]
 
 
@@ -77,3 +78,17 @@ class BrowserAssetHealthTests(unittest.TestCase):
         result = self.probe("changed")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("three.module.min.js: served bytes differ", result.stdout)
+
+
+class NativeCaptureControlOrderingTests(unittest.TestCase):
+    def test_state_first_replay_is_delegated_before_optional_input_checks(self) -> None:
+        control = CONTROL.read_text(encoding="utf-8")
+        marker = 'if [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] && [ "$REPORTED_STAGE" = "capture" ]'
+        self.assertIn(marker, control)
+        branch = control.split(marker, 1)[1].split(
+            'if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]',
+            1,
+        )[0]
+        self.assertIn('"$HERE/reconcile-native-capture.py"', branch)
+        self.assertNotIn('-d "$NATIVE_DERIVED"', branch)
+        self.assertNotIn('-f "$NATIVE_ARCHIVE"', branch)
