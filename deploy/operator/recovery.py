@@ -886,6 +886,7 @@ def _git_environment() -> dict[str, str]:
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_TERMINAL_PROMPT": "0",
     }
@@ -894,6 +895,13 @@ def _git_environment() -> dict[str, str]:
 def _workspace_refs(
     repo: Path,
 ) -> tuple[str | None, dict[str, str], dict[str, str]]:
+    all_refs = _git_output(repo, "for-each-ref", "--format=%(refname)")
+    for refname in all_refs.splitlines():
+        require(
+            refname.startswith(("refs/heads/", "refs/tags/", "refs/remotes/")),
+            "recovery_workspace_mismatch",
+            f"workspace carries an unsupported ref: {refname}",
+        )
     head_symref = _git_optional_output(repo, "symbolic-ref", "-q", "HEAD")
     output = _git_output(
         repo,
@@ -8140,6 +8148,26 @@ def _verify_installed_wheel_members(
     require_airflow: bool = True,
 ) -> None:
     require_real_dir(site_packages, "installed site-packages", "recovery_release_missing")
+    venv = site_packages.parents[2]
+    def installed_path(name: str) -> Path:
+        parts = name.split("/")
+        if len(parts) >= 3 and parts[0].endswith(".data"):
+            scheme = parts[1]
+            relative = "/".join(parts[2:])
+            if scheme in {"purelib", "platlib"}:
+                return site_packages / relative
+            require(
+                scheme in {"scripts", "headers", "data"},
+                "recovery_release_missing",
+                f"wheel carries an unsupported data scheme: {name}",
+            )
+            if scheme == "scripts":
+                return venv / "bin" / relative
+            if scheme == "headers":
+                return venv / "include" / "site" / "python3.12" / relative
+            return venv / relative
+        return site_packages / name
+
     if require_package:
         require(
             "description_pipeline/__init__.py" in members
@@ -8187,11 +8215,11 @@ def _verify_installed_wheel_members(
     for name, payload in members.items():
         if name.endswith(".dist-info/RECORD"):
             continue
-        target = site_packages / name
+        target = installed_path(name)
         require(
-            target.is_relative_to(site_packages),
+            target.is_relative_to(venv),
             "recovery_target_path_unsafe",
-            f"installed wheel member escapes site-packages: {name}",
+            f"installed wheel member escapes its environment: {name}",
         )
         require_real_file(
             target,
@@ -8229,15 +8257,22 @@ def _verify_installed_wheel_members(
             f"installed {label} RECORD has duplicate or malformed rows",
         )
         recorded[row[0]] = (row[1], row[2])
+    recorded_by_target = {}
+    for name, value in recorded.items():
+        path = Path(name)
+        target = path.resolve() if path.is_absolute() else (site_packages / path).resolve()
+        recorded_by_target[target] = value
     for name, payload in members.items():
         if name.endswith(".dist-info/RECORD"):
+            record_target = site_packages / name
             require(
-                recorded.get(name) == ("", ""),
+                recorded_by_target.get(record_target.resolve()) == ("", ""),
                 "recovery_release_missing",
                 f"installed {label} RECORD is not self-referential",
             )
             continue
-        record = recorded.get(name)
+        target = installed_path(name)
+        record = recorded_by_target.get(target.resolve())
         require(
             record is not None,
             "recovery_release_missing",
@@ -8246,14 +8281,19 @@ def _verify_installed_wheel_members(
         encoded = base64.urlsafe_b64encode(
             hashlib.sha256(payload).digest()
         ).rstrip(b"=").decode("ascii")
-        require(
-            record[0] == f"sha256={encoded}"
-            and record[1] == str(len(payload)),
-            "recovery_release_missing",
-            f"installed {label} RECORD digest differs: {name}",
-        )
+        if record[0]:
+            require(
+                record[0] == f"sha256={encoded}"
+                and record[1] == str(len(payload)),
+                "recovery_release_missing",
+                f"installed {label} RECORD digest differs: {name}",
+            )
     require(
-        all(name in recorded for name in members),
+        all(
+            name.endswith(".dist-info/RECORD")
+            or recorded_by_target.get(installed_path(name).resolve()) is not None
+            for name in members
+        ),
         "recovery_release_missing",
         f"installed {label} RECORD does not cover its wheel files",
     )

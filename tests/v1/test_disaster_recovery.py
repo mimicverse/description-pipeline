@@ -1576,6 +1576,36 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 check=True,
             )
 
+    def test_workspace_verify_rejects_unsupported_refs(self) -> None:
+        repository, origin, head, tree = self.workspace_fixture()
+        write(repository / "tracked.txt", "stash-change\n", mode=0o644)
+        subprocess.run(
+            ["git", "-C", str(repository), "stash", "push", "-m", "fixture"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        row = {
+            "repository_slug": "owner/model",
+            "path": str(repository),
+            "origin": str(origin),
+            "head": head,
+            "tree": tree,
+            "head_symref": "refs/heads/main",
+            "refs": {
+                "refs/heads/main": head,
+                "refs/remotes/origin/main": head,
+            },
+            "symrefs": {},
+            "bases": ["main"],
+            "status": "clean",
+            "bundle_member": "reconstruct/workspaces/fixture.bundle",
+            "bundle_sha256": "0" * 64,
+        }
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery._workspace_verify(repository, row)
+        self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
+
     def test_release_runtime_preflight_rejects_external_venv(self) -> None:
         release_root = self.root / "release-preflight"
         extracted = self.root / "release-preflight-extracted"
