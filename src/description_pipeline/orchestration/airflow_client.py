@@ -478,7 +478,7 @@ class EndpointConfig:
     #: Linux-side routing: model-repository slug to local checkout, and the attempt store.
     repositories: dict[str, Path] = dataclass_field(default_factory=dict)
     store_root: Path | None = None
-    #: Linux-side derivation controls: controlled-record roots and the frozen-name registry.
+    #: Linux-side derivation controls: controlled-record roots and interface-name inputs.
     discovery: dict = dataclass_field(default_factory=dict)
     #: Configured publication targets: hardware identity to repository slug and base branch.
     targets: dict[str, dict] = dataclass_field(default_factory=dict)

@@ -5323,7 +5323,7 @@ def derive_native_package(
 def _derive_carriers(
     record: dict, identity: dict, settings: DiscoverySettings, findings: list[dict]
 ) -> tuple[list, list, list, dict]:
-    """Derive the in-memory source carriers: bodies, joints, frames and frozen names.
+    """Derive the in-memory source carriers: bodies, joints, frames and interface names.
 
     Shared by the discover stage and the capture-side definition rebuild; the
     carriers are always derived from the raw record alone, never read from a

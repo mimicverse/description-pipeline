@@ -3771,7 +3771,7 @@ def verify_discovery(package: Path) -> dict:
             _require(
                 datum_name == f"CS_{name}",
                 "discovery.names",
-                "a frozen name must still match its native CS_<link> datum",
+                "a body name must still match its native CS_<link> datum",
                 {"body": name, "datum": datum_name},
             )
             first = sorted(group)[0]
@@ -3782,7 +3782,7 @@ def verify_discovery(package: Path) -> dict:
                 _require(
                     str(frozen[identity]) == name,
                     "discovery.names",
-                    "a frozen published name was not preserved",
+                    "a delivered body name was not preserved",
                     {"identity": identity, "expected": frozen[identity], "observed": name},
                 )
             else:

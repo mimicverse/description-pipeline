@@ -893,7 +893,6 @@ def _value_warnings(
     sign_reversals = []
     preview_limits = []
     visuals = []
-    materials = []
     mesh_paths = []
     for body in bodies:
         if body.get("source_name") and body["source_name"] != body.get("name"):
@@ -1135,14 +1134,6 @@ def _value_warnings(
                 "code": "naming.content_addressed_mesh",
                 "message": "Mesh paths are derived from the current captured STL content digest.",
                 "objects": mesh_paths,
-            }
-        )
-    if materials:
-        warnings.append(
-            {
-                "code": "naming.derived_material",
-                "message": "Material names are derived from the owner link and native component identity.",
-                "objects": materials,
             }
         )
     material_fallbacks = []

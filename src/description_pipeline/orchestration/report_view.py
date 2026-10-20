@@ -103,7 +103,6 @@ _DISCOVERY_CODE_LABELS = {
 
 #: Readable names for verifier diagnostics carried on check details (recorded warnings).
 _DIAGNOSTIC_CODE_LABELS = {
-    "naming.derived_material": "Material name derived from CAD identity (diagnostic)",
     "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
     "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
