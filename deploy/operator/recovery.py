@@ -23,6 +23,9 @@ Commands:
 Only ``exact_path`` restoration is implemented.  The source and target must be
 different PostgreSQL clusters, while every archived absolute root retains its
 original absolute path on the target host.
+
+``--out`` must name a fresh, absent directory.  An existing directory is never
+silently reused or cleaned because its contents may be a successful backup.
 """
 
 from __future__ import annotations
@@ -31,6 +34,8 @@ import argparse
 import base64
 import configparser
 import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -104,6 +109,8 @@ BACKUP_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ROLE_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_$]{0,62}\Z")
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 MAINTENANCE_LOCK_KEY = 0x5256435956323031
+MAINTENANCE_LOCK_DIRNAME = "locks"
+MAINTENANCE_LOCK_FILENAME = "maintenance.lock"
 MAINTENANCE_UNITS = (
     "description-solidworks-tunnel",
     "description-airflow-dag-processor",
@@ -294,6 +301,32 @@ class CommandContext:
         )
 
 
+@dataclass
+class MaintenanceLock:
+    path: Path
+    owner_id: str
+    descriptor: int
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        with contextlib.suppress(OSError):
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(self.descriptor)
+        self.descriptor = -1
+
+
+@dataclass(frozen=True)
+class BackupOutputClaim:
+    out: Path
+    receipt_path: Path
+    backup_id: str
+    claim_id: str
+    out_device: int
+    out_inode: int
+
+
 def utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -447,6 +480,186 @@ def require_real_dir(path: Path, where: str, code: str) -> None:
         path.is_dir(),
         code,
         f"{where} is missing or not a real directory: {path}",
+    )
+
+
+def maintenance_lock_path(state_root: Path) -> Path:
+    root = Path(state_root)
+    require(
+        root.is_absolute() and root.is_dir(),
+        "recovery_maintenance_unavailable",
+        "the state root for the maintenance lock is missing",
+        {"state_root": str(root)},
+    )
+    require_no_links(root, "state root")
+    lock_dir = root / MAINTENANCE_LOCK_DIRNAME
+    if not lock_dir.exists():
+        ensure_parent = root
+        require_real_dir(ensure_parent, "state root", "recovery_maintenance_unavailable")
+        lock_dir.mkdir(mode=0o700)
+    require_real_dir(lock_dir, "maintenance lock directory", "recovery_maintenance_unavailable")
+    os.chmod(lock_dir, 0o700)
+    path = lock_dir / MAINTENANCE_LOCK_FILENAME
+    require_no_links(path, "maintenance lock")
+    return path
+
+
+def acquire_maintenance_lock(state_root: Path) -> MaintenanceLock:
+    path = maintenance_lock_path(state_root)
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(metadata.st_mode),
+            "recovery_maintenance_unavailable",
+            "the maintenance lock is not a regular file",
+            {"path": str(path)},
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            raise RecoveryError(
+                "recovery_maintenance_not_exclusive",
+                "another supported lifecycle operation owns the maintenance lock",
+                {"lock": str(path)},
+            ) from error
+        os.chmod(path, 0o600)
+        owner_id = os.urandom(32).hex()
+        payload = canonical_json(
+            {
+                "schema_version": "solidworks-to-urdf.maintenance-lock/v1",
+                "owner_id": owner_id,
+                "acquired_at": utc_now(),
+                "pid": os.getpid(),
+            }
+        )
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        return MaintenanceLock(
+            path=path,
+            owner_id=owner_id,
+            descriptor=descriptor,
+        )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+
+
+def claim_backup_output(out: Path, backup_id: str) -> BackupOutputClaim:
+    out = Path(out)
+    require(out.is_absolute(), "recovery_target_path_unsafe", "--out must be absolute")
+    require_no_links(out, "backup output")
+    try:
+        out.mkdir(parents=True, mode=0o700, exist_ok=False)
+    except FileExistsError as error:
+        raise RecoveryError(
+            "recovery_write_conflict",
+            f"backup output already exists and is not owned by this attempt: {out}",
+        ) from error
+    except OSError as error:
+        raise RecoveryError(
+            "recovery_write_failed",
+            f"cannot create the backup output: {error}",
+            {"out": str(out)},
+        ) from error
+    os.chmod(out, 0o700)
+    out_metadata = os.stat(out, follow_symlinks=False)
+    require(
+        stat.S_ISDIR(out_metadata.st_mode),
+        "recovery_target_path_unsafe",
+        "backup output is not a real directory",
+    )
+    claim_id = os.urandom(32).hex()
+    receipt_path = out / "receipt.json"
+    receipt = {
+        "schema_version": RECEIPT_SCHEMA,
+        "operation": "backup",
+        "backup_id": backup_id,
+        "status": "running",
+        "claim_id": claim_id,
+        "started_at": utc_now(),
+    }
+    payload = canonical_json(receipt)
+    try:
+        descriptor = os.open(
+            receipt_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(receipt_path, 0o600)
+        except BaseException:
+            receipt_path.unlink(missing_ok=True)
+            raise
+    except FileExistsError as error:
+        raise RecoveryError(
+            "recovery_write_conflict",
+            "another operation claimed the backup output",
+            {"out": str(out)},
+        ) from error
+    except OSError as error:
+        raise RecoveryError(
+            "recovery_write_failed",
+            f"cannot claim the backup receipt: {error}",
+            {"out": str(out)},
+        ) from error
+    return BackupOutputClaim(
+        out=out,
+        receipt_path=receipt_path,
+        backup_id=backup_id,
+        claim_id=claim_id,
+        out_device=out_metadata.st_dev,
+        out_inode=out_metadata.st_ino,
+    )
+
+
+def _claim_is_current(claim: BackupOutputClaim | None) -> bool:
+    if claim is None:
+        return False
+    try:
+        out_metadata = os.stat(claim.out, follow_symlinks=False)
+        receipt_metadata = os.stat(claim.receipt_path, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(out_metadata.st_mode)
+            or not stat.S_ISREG(receipt_metadata.st_mode)
+            or out_metadata.st_dev != claim.out_device
+            or out_metadata.st_ino != claim.out_inode
+        ):
+            return False
+        _, document = strict_json_file(claim.receipt_path, "backup receipt claim")
+        return (
+            isinstance(document, dict)
+            and document.get("schema_version") == RECEIPT_SCHEMA
+            and document.get("operation") == "backup"
+            and document.get("backup_id") == claim.backup_id
+            and document.get("claim_id") == claim.claim_id
+            and document.get("status") in {"running", "failed", "succeeded"}
+        )
+    except (OSError, RecoveryError):
+        return False
+
+
+def require_current_claim(claim: BackupOutputClaim | None) -> None:
+    require(
+        _claim_is_current(claim),
+        "recovery_write_conflict",
+        "the backup output claim is no longer owned by this attempt",
+        {"out": str(claim.out) if claim is not None else None},
     )
 
 
@@ -2156,6 +2369,7 @@ def verify_staged_source_members(
         "feishu_env": "config/state/feishu.env",
         "nginx": "config/state/nginx/nginx.conf",
         "airflow_cfg": "config/state/airflow-home/airflow.cfg",
+        "maintenance_lock": f"config/state/{MAINTENANCE_LOCK_DIRNAME}/{MAINTENANCE_LOCK_FILENAME}",
         "store_root": "state/runs",
         "handoff_root": "handoff",
         "artifact_root": "artifacts",
@@ -2709,6 +2923,10 @@ def copy_state_configuration(state_root: Path, install_id: str, staging: Path) -
         ("feishu.env", Path("feishu.env")),
         ("nginx/nginx.conf", Path("nginx/nginx.conf")),
         ("airflow-home/airflow.cfg", Path("airflow-home/airflow.cfg")),
+        (
+            Path(MAINTENANCE_LOCK_DIRNAME) / MAINTENANCE_LOCK_FILENAME,
+            Path(MAINTENANCE_LOCK_DIRNAME) / MAINTENANCE_LOCK_FILENAME,
+        ),
     )
     for source_relative, target_relative in file_map:
         source = state_root / source_relative
@@ -2898,6 +3116,14 @@ def backup_source_checks(context: BackupContext) -> list[dict]:
         {
             "name": "airflow_cfg",
             "path": str(state_root / "airflow-home" / "airflow.cfg"),
+        },
+        {
+            "name": "maintenance_lock",
+            "path": str(
+                state_root
+                / MAINTENANCE_LOCK_DIRNAME
+                / MAINTENANCE_LOCK_FILENAME
+            ),
         },
         {
             "name": "store_root",
@@ -3380,8 +3606,11 @@ def _run_maintenance_command(
     argv: list[str | Path],
     *,
     timeout: int,
+    env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess, dict]:
     command = [str(value) for value in argv]
+    child_env = os.environ.copy()
+    child_env.update(env or {})
     try:
         completed = subprocess.run(
             command,
@@ -3389,6 +3618,7 @@ def _run_maintenance_command(
             text=True,
             timeout=timeout,
             check=False,
+            env=child_env,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise RecoveryError(
@@ -3594,6 +3824,7 @@ def quiesce_maintenance(
     *,
     operatorctl_path: Path,
     timeout: int,
+    lock_owner: str = "",
 ) -> dict:
     _require_airflow_interpreter(context)
     operatorctl_path = Path(operatorctl_path).resolve()
@@ -3616,7 +3847,16 @@ def quiesce_maintenance(
         "--config",
         context.config_path,
     ]
-    _, drain_evidence = _run_maintenance_command(drain_argv, timeout=timeout)
+    inherited = (
+        {"OPERATORCTL_MAINTENANCE_LOCK_OWNER": lock_owner}
+        if lock_owner
+        else {}
+    )
+    _, drain_evidence = _run_maintenance_command(
+        drain_argv,
+        timeout=timeout,
+        env=inherited,
+    )
     _wait_database_quiescence(database, timeout=timeout)
     stop_argv = [
         bash,
@@ -3626,7 +3866,11 @@ def quiesce_maintenance(
         context.config_path,
         "--keep-database",
     ]
-    _, stop_evidence = _run_maintenance_command(stop_argv, timeout=timeout)
+    _, stop_evidence = _run_maintenance_command(
+        stop_argv,
+        timeout=timeout,
+        env=inherited,
+    )
     linux_states = _linux_unit_states(timeout=timeout)
     windows = context.resolved["windows"]
     instance = windows["instance"]
@@ -3754,28 +3998,6 @@ def backup_command(
         "recovery_key_unavailable",
         "external backup key must not be group/world accessible",
     )
-    if out.exists():
-        require(
-            out.is_dir() and not any(out.iterdir()),
-            "recovery_write_conflict",
-            f"backup output is not empty: {out}",
-        )
-    else:
-        out.mkdir(parents=True, mode=0o700)
-    os.chmod(out, 0o700)
-    receipt_path = out / "receipt.json"
-    if not receipt_path.exists():
-        write_json_once(
-            receipt_path,
-            {
-                "schema_version": RECEIPT_SCHEMA,
-                "operation": "backup",
-                "backup_id": backup_id,
-                "status": "running",
-                "started_at": utc_now(),
-            },
-        )
-
     context = load_backup_context(config_path)
     source_roots_for_key = [
         Path(context.resolved["storage"][name])
@@ -3796,6 +4018,40 @@ def backup_command(
             {"root": str(root)},
         )
 
+    lifecycle_lock = acquire_maintenance_lock(Path(context.resolved["storage"]["state_root"]))
+    claim = None
+    try:
+        claim = claim_backup_output(out, backup_id)
+        try:
+            return _backup_command_claimed(
+                context=context,
+                lifecycle_lock=lifecycle_lock,
+                claim=claim,
+                backup_id=backup_id,
+                key_file=key_file,
+                out=out,
+                operatorctl_path=operatorctl_path,
+            )
+        except BaseException as error:
+            with contextlib.suppress(Exception):
+                error.backup_claim = claim
+            raise
+    finally:
+        lifecycle_lock.close()
+
+
+def _backup_command_claimed(
+    *,
+    context: BackupContext,
+    lifecycle_lock: MaintenanceLock,
+    claim: BackupOutputClaim,
+    backup_id: str,
+    key_file: Path,
+    out: Path,
+    operatorctl_path: Path | None,
+) -> dict:
+    require_current_claim(claim)
+    receipt_path = claim.receipt_path
     postgres_root = context.postgres_root
     bin_dir = postgres_root / "root" / "usr" / "lib" / "postgresql" / POSTGRES_MAJOR / "bin"
     library_dir = postgres_root / "root" / "usr" / "lib" / "x86_64-linux-gnu"
@@ -3836,6 +4092,7 @@ def backup_command(
         database,
         operatorctl_path=operatorctl_path,
         timeout=3600,
+        lock_owner=lifecycle_lock.owner_id,
     )
     write_json_once(
         maintenance_stopped_path,
@@ -3851,6 +4108,7 @@ def backup_command(
     )
 
     staging = out / "backup"
+    require_current_claim(claim)
     try:
         backup.remove_private_staging(out)
     except SystemExit as error:
@@ -4156,6 +4414,12 @@ def backup_command(
 
     consistency = {
         **capture_result["consistency"],
+        "maintenance_lock": {
+            "kind": "exclusive-filesystem-lock",
+            "path": str(lifecycle_lock.path),
+            "owner_id": lifecycle_lock.owner_id,
+            "held": True,
+        },
         "source_inventory_before_sha256": hashlib.sha256(canonical_json(inventory_before)).hexdigest(),
         "source_inventory_after_sha256": hashlib.sha256(canonical_json(inventory_after)).hexdigest(),
         "source_inventory_equal": True,
@@ -4167,6 +4431,7 @@ def backup_command(
         "canonical_root_modes": canonical_root_modes,
     }
     archive_path = out / "recovery.tar.enc"
+    require_current_claim(claim)
     archive_sha = backup.seal(staging, key_file, archive_path)
     try:
         verify_manifest_source_binding(
@@ -4275,6 +4540,7 @@ def backup_command(
         "consistency": consistency,
     }
     validate_manifest(manifest, expected_manifest_sha=None)
+    require_current_claim(claim)
     manifest_path = out / "recovery-manifest.json"
     manifest_bytes = canonical_json(manifest)
     atomic_write(manifest_path, manifest_bytes)
@@ -4287,10 +4553,18 @@ def backup_command(
         out / "command-log.json",
         {"commands": commands},
     )
+    staging_removed = False
+    cleanup_error = None
+    try:
+        require_current_claim(claim)
+        staging_removed = backup.remove_private_staging(out)
+    except (SystemExit, OSError, RecoveryError) as error:
+        cleanup_error = str(error)
     final_receipt = {
         "schema_version": RECEIPT_SCHEMA,
         "operation": "backup",
         "backup_id": backup_id,
+        "claim_id": claim.claim_id,
         "status": "succeeded",
         "manifest_sha256": manifest_sha,
         "archive_sha256": archive_sha,
@@ -4303,8 +4577,11 @@ def backup_command(
         "exclusive_lock_key": consistency["exclusive_lock_key"],
         "admission_after": consistency["maintenance_after"]["admission"],
         "settled_after": consistency["maintenance_after"]["settled"],
+        "private_staging_removed": staging_removed,
+        "cleanup_error": cleanup_error,
         "completed_at": utc_now(),
     }
+    require_current_claim(claim)
     atomic_write(receipt_path, canonical_json(final_receipt))
     write_json_once(
         out / "maintenance-receipt.json",
@@ -4314,7 +4591,6 @@ def backup_command(
         out / "maintenance-receipt.sha256",
         f"{maintenance_member['sha256']}  maintenance-receipt.json\n".encode("ascii"),
     )
-    backup.remove_private_staging(out)
     return {
         "manifest": str(manifest_path),
         "manifest_sha256": manifest_sha,
@@ -4322,6 +4598,7 @@ def backup_command(
         "archive_sha256": archive_sha,
         "maintenance_receipt": str(out / "maintenance-receipt.json"),
         "maintenance_receipt_sha256": maintenance_member["sha256"],
+        "cleanup_warning": cleanup_error,
     }
 
 
@@ -5071,6 +5348,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
             "database_live_after_inventory_sha256",
             "maintenance_before",
             "maintenance_after",
+            "maintenance_lock",
             "exclusive_lock_key",
             "exclusive_lock_held",
             "source_inventory_before_sha256",
@@ -5155,6 +5433,21 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         and bool(HEX64.fullmatch(consistency["archive_member_verification"]["sha256"])),
         "recovery_manifest_invalid",
         "snapshot/file/role consistency contract is malformed",
+    )
+    maintenance_lock = _exact_keys(
+        consistency["maintenance_lock"],
+        {"kind", "path", "owner_id", "held"},
+        "consistency.maintenance_lock",
+    )
+    require(
+        maintenance_lock["kind"] == "exclusive-filesystem-lock"
+        and isinstance(maintenance_lock["path"], str)
+        and Path(maintenance_lock["path"]).is_absolute()
+        and isinstance(maintenance_lock["owner_id"], str)
+        and bool(HEX64.fullmatch(maintenance_lock["owner_id"]))
+        and maintenance_lock["held"] is True,
+        "recovery_manifest_invalid",
+        "maintenance lock evidence is malformed",
     )
     for phase in ("maintenance_before", "maintenance_after"):
         validate_maintenance_probe(
@@ -5702,6 +5995,29 @@ def verify_maintenance_archive_consistency(manifest: dict, extracted: Path) -> N
         and isinstance(platform["windows"].get("instance"), dict),
         "recovery_manifest_invalid",
         "archived platform Windows instance is malformed",
+    )
+    state_roots = [
+        root["path"]
+        for root in manifest["roots"]
+        if isinstance(root, dict) and root.get("name") == "state_root"
+    ]
+    expected_lock = (
+        Path(state_roots[0]) / MAINTENANCE_LOCK_DIRNAME / MAINTENANCE_LOCK_FILENAME
+        if len(state_roots) == 1 and isinstance(state_roots[0], str)
+        else None
+    )
+    archived_lock = _load_extracted_json(
+        extracted,
+        f"config/state/{MAINTENANCE_LOCK_DIRNAME}/{MAINTENANCE_LOCK_FILENAME}",
+        "archived maintenance lock owner",
+    )
+    require(
+        expected_lock is not None
+        and manifest["consistency"]["maintenance_lock"]["path"] == str(expected_lock)
+        and archived_lock.get("owner_id")
+        == manifest["consistency"]["maintenance_lock"]["owner_id"],
+        "recovery_manifest_invalid",
+        "maintenance lock evidence does not bind the archived state-root lock",
     )
     task_name = platform["windows"]["instance"].get("task_name")
     require(
@@ -6638,9 +6954,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def record_backup_failure(args: argparse.Namespace, error: BaseException) -> dict:
-    out = Path(args.out)
-    receipt_path = out / "receipt.json"
+def record_backup_failure(
+    args: argparse.Namespace,
+    error: BaseException,
+    claim: BackupOutputClaim | None = None,
+) -> dict:
+    if claim is None:
+        return {
+            "maintenance_state": "not_started",
+            "recovery_hint": None,
+            "receipt_written": False,
+            "ownership_verified": False,
+        }
+    if not _claim_is_current(claim) or claim.backup_id != args.backup_id:
+        return {
+            "maintenance_state": "unknown_or_stopped",
+            "recovery_hint": None,
+            "receipt_written": False,
+            "ownership_verified": False,
+        }
+    out = claim.out
+    receipt_path = claim.receipt_path
     pending_path = out / "maintenance-window.pending.json"
     stopped_path = out / "maintenance-window.stopped.json"
     marker_path = stopped_path if stopped_path.is_file() else pending_path
@@ -6676,11 +7010,27 @@ def record_backup_failure(args: argparse.Namespace, error: BaseException) -> dic
             "maintenance_state": maintenance_state,
             "recovery_hint": recovery_hint,
             "receipt_written": False,
+            "ownership_verified": True,
+        }
+    try:
+        _, current_receipt = strict_json_file(receipt_path, "backup receipt claim")
+    except RecoveryError:
+        return {
+            "maintenance_state": "unknown_or_stopped",
+            "recovery_hint": None,
+            "receipt_written": False,
+            "ownership_verified": False,
+        }
+    if current_receipt.get("status") == "succeeded":
+        return {
+            "maintenance_state": maintenance_state,
+            "recovery_hint": recovery_hint,
+            "receipt_written": False,
+            "ownership_verified": True,
+            "completion_preserved": True,
         }
     payload = {
-        "schema_version": RECEIPT_SCHEMA,
-        "operation": "backup",
-        "backup_id": args.backup_id,
+        **current_receipt,
         "status": "failed",
         "completed_at": utc_now(),
         "code": getattr(error, "code", "recovery_backup_failed"),
@@ -6692,29 +7042,34 @@ def record_backup_failure(args: argparse.Namespace, error: BaseException) -> dic
     }
     receipt_written = True
     try:
+        require_current_claim(claim)
         atomic_write(receipt_path, canonical_json(payload))
-    except OSError:
+    except (OSError, RecoveryError):
         receipt_written = False
     staging_removed = False
     try:
-        staging_removed = backup.remove_private_staging(out)
-    except (SystemExit, OSError):
+        if _claim_is_current(claim):
+            staging_removed = backup.remove_private_staging(out)
+    except (SystemExit, OSError, RecoveryError):
         staging_removed = False
     if receipt_written:
         payload["private_staging_removed"] = staging_removed
         try:
+            require_current_claim(claim)
             atomic_write(receipt_path, canonical_json(payload))
-        except OSError:
+        except (OSError, RecoveryError):
             receipt_written = False
     return {
         "maintenance_state": maintenance_state,
         "recovery_hint": recovery_hint,
         "receipt_written": receipt_written,
+        "ownership_verified": True,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    completed_backup = None
     try:
         if args.action == "snapshot-worker":
             return _snapshot_worker(args.request)
@@ -6726,11 +7081,17 @@ def main(argv: list[str] | None = None) -> int:
                 out=args.out,
                 operatorctl_path=args.operatorctl,
             )
+            completed_backup = result
             print(f"manifest={result['manifest']}")
             print(f"manifest_sha256={result['manifest_sha256']}")
             print(f"archive={result['archive']}")
             print(f"archive_sha256={result['archive_sha256']}")
             print("maintenance_state=stopped")
+            if result.get("cleanup_warning"):
+                print(
+                    f"recovery_cleanup_warning={result['cleanup_warning']}",
+                    file=sys.stderr,
+                )
         else:
             result = restore_command(
                 manifest_path=args.manifest,
@@ -6744,15 +7105,36 @@ def main(argv: list[str] | None = None) -> int:
     except (RecoveryError, SystemExit, Exception) as error:
         failure = None
         if args.action == "backup":
-            try:
-                failure = record_backup_failure(args, error)
-            except Exception as recording_error:
+            if completed_backup is not None:
                 failure = {
-                    "maintenance_state": "unknown_or_stopped",
-                    "recovery_hint": ("inspect backup markers and run the controlled operatorctl start command"),
+                    "maintenance_state": "stopped",
+                    "recovery_hint": (
+                        "backup completed; review the preserved output and start services "
+                        "only through operatorctl"
+                    ),
                     "receipt_written": False,
-                    "recording_error": str(recording_error),
+                    "completion_preserved": True,
                 }
+            else:
+                try:
+                    failure = record_backup_failure(
+                        args,
+                        error,
+                        getattr(error, "backup_claim", None),
+                    )
+                except Exception as recording_error:
+                    failure = {
+                        "maintenance_state": (
+                            "unknown_or_stopped"
+                            if getattr(error, "backup_claim", None) is not None
+                            else "not_started"
+                        ),
+                        "recovery_hint": (
+                            "inspect backup markers and run the controlled operatorctl start command"
+                        ),
+                        "receipt_written": False,
+                        "recording_error": str(recording_error),
+                    }
         print(
             f"recovery: {getattr(error, 'code', 'recovery_command_failed')}: {getattr(error, 'message', str(error))}",
             file=sys.stderr,

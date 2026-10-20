@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 import unittest
 import warnings
@@ -550,8 +551,10 @@ def fake_maintenance_state(
     *,
     operatorctl_path: Path,
     timeout: int,
+    lock_owner: str = "",
 ) -> dict:
     del database, timeout
+    assert lock_owner
     operatorctl_path = Path(operatorctl_path).resolve()
     probe = {
         "admission": {
@@ -1360,19 +1363,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker_name):
                 out = self.root / expected
-                out.mkdir()
-                write(
-                    out / "receipt.json",
-                    json.dumps(
-                        {
-                            "schema_version": recovery.RECEIPT_SCHEMA,
-                            "operation": "backup",
-                            "backup_id": "failed-window",
-                            "status": "running",
-                            "started_at": "2026-10-20T00:00:00Z",
-                        }
-                    ),
-                )
+                claim = recovery.claim_backup_output(out, "failed-window")
                 write(
                     out / marker_name,
                     json.dumps(
@@ -1393,6 +1384,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                         "fixture_failure",
                         "post-quiesce failure",
                     ),
+                    claim,
                 )
                 self.assertEqual(result["maintenance_state"], expected)
                 receipt = json.loads((out / "receipt.json").read_text(encoding="utf-8"))
@@ -1408,18 +1400,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         ):
             with self.subTest(error=type(error).__name__):
                 out = self.root / f"cli-failure-{index}"
-                out.mkdir()
-                write(
-                    out / "receipt.json",
-                    json.dumps(
-                        {
-                            "schema_version": recovery.RECEIPT_SCHEMA,
-                            "operation": "backup",
-                            "backup_id": "cli-failure",
-                            "status": "running",
-                        }
-                    ),
-                )
+                claim = recovery.claim_backup_output(out, "cli-failure")
                 write(
                     out / "maintenance-window.pending.json",
                     json.dumps(
@@ -1430,7 +1411,8 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     ),
                 )
 
-                def fail(_error=error, **_kwargs):
+                def fail(_error=error, _claim=claim, **_kwargs):
+                    _error.backup_claim = _claim
                     raise _error
 
                 stderr = io.StringIO()
@@ -1507,8 +1489,8 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         self.assertFalse((out / "receipt.json").exists())
 
-    def test_failure_reporting_survives_cleanup_error(self) -> None:
-        out = self.root / "cleanup-failure"
+    def test_early_invalid_backup_id_never_changes_an_existing_success(self) -> None:
+        out = self.root / "existing-success"
         out.mkdir()
         write(
             out / "receipt.json",
@@ -1516,11 +1498,148 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 {
                     "schema_version": recovery.RECEIPT_SCHEMA,
                     "operation": "backup",
-                    "backup_id": "cleanup-failure",
-                    "status": "running",
+                    "backup_id": "existing-success",
+                    "status": "succeeded",
+                    "claim_id": "a" * 64,
                 }
             ),
         )
+        write(out / "backup" / "source.txt", "preserve me\n")
+        before = {
+            path.relative_to(out).as_posix(): path.read_bytes()
+            for path in out.rglob("*")
+            if path.is_file()
+        }
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = recovery.main(
+                [
+                    "backup",
+                    "--config",
+                    str(self.context.config_path),
+                    "--backup-id",
+                    "INVALID/ID",
+                    "--key-file",
+                    str(self.key),
+                    "--out",
+                    str(out),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("maintenance_state=not_started", stderr.getvalue())
+        after = {
+            path.relative_to(out).as_posix(): path.read_bytes()
+            for path in out.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_symlink_output_is_refused_without_changing_the_target(self) -> None:
+        target = self.root / "symlink-target"
+        target.mkdir()
+        receipt = write(
+            target / "receipt.json",
+            json.dumps(
+                {
+                    "schema_version": recovery.RECEIPT_SCHEMA,
+                    "operation": "backup",
+                    "backup_id": "existing",
+                    "status": "succeeded",
+                }
+            ),
+        )
+        before = receipt.read_bytes()
+        out = self.root / "symlink-output"
+        out.symlink_to(target, target_is_directory=True)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = recovery.main(
+                [
+                    "backup",
+                    "--config",
+                    str(self.context.config_path),
+                    "--backup-id",
+                    "symlink-refused",
+                    "--key-file",
+                    str(self.key),
+                    "--out",
+                    str(out),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("maintenance_state=not_started", stderr.getvalue())
+        self.assertEqual(receipt.read_bytes(), before)
+
+    def test_concurrent_output_claim_has_one_winner(self) -> None:
+        out = self.root / "concurrent-output"
+        barrier = threading.Barrier(2)
+        outcomes: list[tuple[str, str]] = []
+
+        def attempt(backup_id: str) -> None:
+            barrier.wait()
+            try:
+                claim = recovery.claim_backup_output(out, backup_id)
+            except recovery.RecoveryError as error:
+                outcomes.append(("error", error.code))
+            else:
+                outcomes.append(("claim", claim.claim_id))
+
+        threads = [
+            threading.Thread(target=attempt, args=("concurrent-a",)),
+            threading.Thread(target=attempt, args=("concurrent-b",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(
+            sorted(kind for kind, _ in outcomes),
+            ["claim", "error"],
+        )
+        self.assertEqual(
+            next(value for kind, value in outcomes if kind == "error"),
+            "recovery_write_conflict",
+        )
+        receipt = json.loads((out / "receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            receipt["claim_id"],
+            next(value for kind, value in outcomes if kind == "claim"),
+        )
+
+    def test_backup_holds_the_shared_lifecycle_lock_through_quiescence(self) -> None:
+        observed: list[str] = []
+
+        def observe_lock(context, database, **kwargs):
+            state_root = Path(context.resolved["storage"]["state_root"])
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.acquire_maintenance_lock(state_root)
+            observed.append(raised.exception.code)
+            return fake_maintenance_state(
+                context,
+                database,
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            recovery,
+            "quiesce_maintenance",
+            side_effect=observe_lock,
+        ):
+            _, manifest = self.backup()
+        self.assertEqual(
+            observed,
+            ["recovery_maintenance_not_exclusive"],
+        )
+        lock_record = manifest["consistency"]["maintenance_lock"]
+        self.assertTrue(lock_record["held"])
+        lock = recovery.acquire_maintenance_lock(
+            Path(self.context.resolved["storage"]["state_root"])
+        )
+        lock.close()
+
+    def test_failure_reporting_survives_cleanup_error(self) -> None:
+        out = self.root / "cleanup-failure"
+        claim = recovery.claim_backup_output(out, "cleanup-failure")
         write(
             out / "maintenance-window.stopped.json",
             json.dumps(
@@ -1543,11 +1662,117 @@ class RecoveryControlFlowTests(unittest.TestCase):
             result = recovery.record_backup_failure(
                 args,
                 recovery.RecoveryError("fixture_failure", "later failure"),
+                claim,
             )
         self.assertEqual(result["maintenance_state"], "stopped")
         receipt = json.loads((out / "receipt.json").read_text(encoding="utf-8"))
         self.assertEqual(receipt["maintenance_state"], "stopped")
         self.assertFalse(receipt["private_staging_removed"])
+
+    def test_success_is_preserved_when_post_completion_cleanup_fails(self) -> None:
+        out = self.root / "success-cleanup"
+        claim = recovery.claim_backup_output(out, "success-cleanup")
+        write(
+            out / "maintenance-window.stopped.json",
+            json.dumps(
+                {
+                    "config": str(self.context.config_path),
+                    "operatorctl_path": str(
+                        Path(recovery.__file__).with_name("operatorctl.sh")
+                    ),
+                }
+            ),
+        )
+        succeeded = {
+            "schema_version": recovery.RECEIPT_SCHEMA,
+            "operation": "backup",
+            "backup_id": "success-cleanup",
+            "claim_id": claim.claim_id,
+            "status": "succeeded",
+        }
+        atomic = out / "receipt.json"
+        before = recovery.canonical_json(succeeded)
+        recovery.atomic_write(atomic, before)
+        args = argparse.Namespace(
+            out=out,
+            backup_id="success-cleanup",
+            config=self.context.config_path,
+        )
+        with mock.patch.object(
+            recovery.backup,
+            "remove_private_staging",
+            side_effect=OSError("cleanup failed"),
+        ):
+            result = recovery.record_backup_failure(
+                args,
+                recovery.RecoveryError("fixture_failure", "cleanup failed"),
+                claim,
+            )
+        self.assertEqual(result["maintenance_state"], "stopped")
+        self.assertTrue(result["recovery_hint"])
+        self.assertEqual(atomic.read_bytes(), before)
+
+    def test_backup_success_records_a_cleanup_warning_without_rewriting_result(
+        self,
+    ) -> None:
+        out = self.root / "cleanup-warning"
+        with (
+            mock.patch.object(
+                recovery,
+                "load_backup_context",
+                return_value=self.context,
+            ),
+            mock.patch.object(
+                recovery.backup,
+                "remove_private_staging",
+                side_effect=[False, OSError("cleanup failed")],
+            ),
+        ):
+            result = recovery.backup_command(
+                config_path=self.context.config_path,
+                backup_id="cleanup-warning",
+                key_file=self.key,
+                out=out,
+            )
+        receipt = json.loads((out / "receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "succeeded")
+        self.assertFalse(receipt["private_staging_removed"])
+        self.assertEqual(receipt["cleanup_error"], "cleanup failed")
+        self.assertEqual(result["cleanup_warning"], "cleanup failed")
+
+    def test_stdout_failure_after_success_does_not_report_not_started(self) -> None:
+        class BrokenStdout(io.StringIO):
+            def write(self, _value):
+                raise BrokenPipeError("consumer closed")
+
+        stderr = io.StringIO()
+        completed = {
+            "manifest": "/fixture/manifest.json",
+            "manifest_sha256": "a" * 64,
+            "archive": "/fixture/recovery.tar.enc",
+            "archive_sha256": "b" * 64,
+        }
+        with (
+            mock.patch.object(recovery, "backup_command", return_value=completed),
+            mock.patch.object(recovery.sys, "stdout", new=BrokenStdout()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = recovery.main(
+                [
+                    "backup",
+                    "--config",
+                    str(self.context.config_path),
+                    "--backup-id",
+                    "completed-output-failure",
+                    "--key-file",
+                    str(self.key),
+                    "--out",
+                    str(self.root / "completed-output-failure"),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("maintenance_state=stopped", stderr.getvalue())
+        self.assertNotIn("maintenance_state=not_started", stderr.getvalue())
 
     def test_successful_backup_cli_reports_stopped(self) -> None:
         stdout = io.StringIO()
@@ -1664,7 +1889,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 """\
                 #!/usr/bin/env bash
                 set -euo pipefail
-                printf '%s\\n' "$*" >> "$QUIESCE_LOG"
+                printf '%s|%s\\n' "$*" "${OPERATORCTL_MAINTENANCE_LOCK_OWNER:-}" >> "$QUIESCE_LOG"
                 """
             ),
             mode=0o700,
@@ -1732,13 +1957,15 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 },
                 operatorctl_path=operatorctl,
                 timeout=30,
+                lock_owner="a" * 64,
             )
         commands = log.read_text().splitlines()
         self.assertEqual(len(commands), 2)
         self.assertTrue(commands[0].startswith("drain --config "))
+        self.assertTrue(commands[0].endswith("|" + "a" * 64))
         self.assertNotIn("--keep-database", commands[0])
         self.assertTrue(commands[1].startswith("stop --config "))
-        self.assertTrue(commands[1].endswith(" --keep-database"))
+        self.assertTrue(commands[1].endswith(" --keep-database|" + "a" * 64))
         self.assertEqual(state["windows"]["state"], "Disabled")
         self.assertEqual(state["database_before"], probe)
 

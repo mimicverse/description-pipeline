@@ -77,6 +77,8 @@ ORPHAN_MAP_INDEX=""
 REPORTED_STAGE=""
 KEEP_ADMISSION_CLOSED=""
 KEEP_DATABASE=""
+MAINTENANCE_LOCK_FD=""
+MAINTENANCE_LOCK_PATH=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -211,6 +213,58 @@ load_generation_env() {
     [ -n "${!key:-}" ] \
       || die "generation environment $ENV_FILE does not define $key"
   done
+}
+
+acquire_maintenance_lock() {
+  local state_root="$1" lock_dir lock_path owner_document owner_id inherited_owner
+  [ -z "$MAINTENANCE_LOCK_PATH" ] || return 0
+  [ -d "$state_root" ] && [ ! -L "$state_root" ] \
+    || die "the state root for the maintenance lock is missing or a link: $state_root"
+  lock_dir="$state_root/locks"
+  mkdir -p "$lock_dir"
+  [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] \
+    || die "the maintenance lock directory is not a real directory: $lock_dir"
+  chmod 700 "$lock_dir"
+  lock_path="$lock_dir/maintenance.lock"
+  [ ! -L "$lock_path" ] || die "the maintenance lock is a link: $lock_path"
+  command -v flock >/dev/null 2>&1 || die "flock is required for the maintenance lifecycle"
+  inherited_owner="${OPERATORCTL_MAINTENANCE_LOCK_OWNER:-}"
+  if [ -n "$inherited_owner" ]; then
+    [ -f "$lock_path" ] || die "the inherited maintenance lock is missing: $lock_path"
+    owner_document="$(python3 - "$lock_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception as error:
+    raise SystemExit(f"cannot read the maintenance lock owner: {error}")
+if not isinstance(document, dict) or not isinstance(document.get("owner_id"), str):
+    raise SystemExit("the maintenance lock owner is malformed")
+print(document["owner_id"])
+PY
+)" || die "the inherited maintenance lock owner is unreadable"
+    [ "$owner_document" = "$inherited_owner" ] \
+      || die "the inherited maintenance lock owner does not match the held lock"
+    exec {MAINTENANCE_LOCK_FD}<>"$lock_path"
+    if flock -n "$MAINTENANCE_LOCK_FD"; then
+      exec {MAINTENANCE_LOCK_FD}>&-
+      MAINTENANCE_LOCK_FD=""
+      die "the inherited maintenance lock is not held by the caller"
+    fi
+    exec {MAINTENANCE_LOCK_FD}>&-
+    MAINTENANCE_LOCK_FD=""
+    MAINTENANCE_LOCK_PATH="$lock_path"
+    echo "maintenance_lock=inherited:$lock_path"
+    return 0
+  fi
+  exec {MAINTENANCE_LOCK_FD}>>"$lock_path"
+  flock -n "$MAINTENANCE_LOCK_FD" \
+    || die "another supported lifecycle operation owns the maintenance lock: $lock_path"
+  chmod 600 "$lock_path"
+  MAINTENANCE_LOCK_PATH="$lock_path"
+  echo "maintenance_lock=$lock_path"
 }
 
 # One env contract: platform_env and render_operator write every derived value through the
@@ -1085,6 +1139,8 @@ case "$ACTION" in
     [ -f "$START_STATE_ROOT/resolved.env" ] \
       || die "not installed: $START_STATE_ROOT/resolved.env is missing (run install first)"
     load_env_file "$START_STATE_ROOT/resolved.env"
+    STATE_ROOT="$START_STATE_ROOT"
+    acquire_maintenance_lock "$STATE_ROOT"
     ensure_postgres_ready
     platform_close_admission "start-window" "operatorctl start"
     load_active_env ;;
@@ -1238,6 +1294,11 @@ GUARD
     load_generation_env ;;
   *)
     usage ;;
+esac
+
+case "$ACTION" in
+  drain|stop|reconcile|stage|promote|rollback)
+    acquire_maintenance_lock "$STATE_ROOT" ;;
 esac
 
 case "$ACTION" in

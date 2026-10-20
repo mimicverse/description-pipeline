@@ -10,6 +10,7 @@ an entry point.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -150,6 +151,35 @@ class OperatorctlSurfaceTests(unittest.TestCase):
         self.assertNotIn("airflow_lifecycle stop\n", branch)
         self.assertIn("description-postgres.service", branch)
         self.assertIn("PostgreSQL remains active", branch)
+
+    def test_start_refuses_while_the_shared_maintenance_lock_is_held(self):
+        state_root = self.root / "state"
+        state_root.mkdir()
+        (state_root / "resolved.env").write_text("", encoding="utf-8")
+        lock_dir = state_root / "locks"
+        lock_dir.mkdir()
+        lock_path = lock_dir / "maintenance.lock"
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.maintenance-lock/v1",
+                    "owner_id": "a" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        descriptor = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = run(["start", "--config", str(self.config)])
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "another supported lifecycle operation owns the maintenance lock",
+            result.stderr,
+        )
 
     def test_invalid_config_fails_before_any_verb_behavior(self):
         bad = self.root / "bad.json"
