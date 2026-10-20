@@ -122,7 +122,7 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
                     relative = shape.get("mesh_name") or mesh_path(
                         str(shape.get("sha256") or file_digest(original)),
                         category=tag,
-                        semantic=output_name,
+                        namespace=name,
                     )
                     meshes = _export_mesh(original, destination, relative.removeprefix("../"))
                 else:

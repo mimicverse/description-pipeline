@@ -2020,12 +2020,14 @@ def _value_warning_gate(root, source, model):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.naming import (
+        asset_namespace,
         carrier_names_and_rules,
         material_name,
         mesh_path,
         visual_name,
     )
 
+    mesh_namespace = asset_namespace(Path(str(source.get("assembly") or "robot")).name)
     warnings = (model.get("provenance") or {}).get("value_warnings")
     _require(isinstance(warnings, list), "Non-native value provenance warnings are missing")
     actual: dict[str, list[dict]] = {}
@@ -2233,7 +2235,7 @@ def _value_warning_gate(root, source, model):
         _require(shape.get("sha256") == current_sha256, "Visual digest differs from capture evidence")
         _require(
             shape.get("mesh_name")
-            == mesh_path(current_sha256, semantic=visual_name(native_component, link=link["name"])),
+            == mesh_path(current_sha256, namespace=mesh_namespace),
             "Mesh path differs from content addressing",
         )
         _require(

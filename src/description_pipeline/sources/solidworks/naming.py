@@ -254,6 +254,20 @@ def robot_name(native_name: str) -> str:
     return token(source)
 
 
+def asset_namespace(native_name: str) -> str:
+    """Normalize a native top-assembly stem for content-addressed assets."""
+
+    stem = re.sub(r"\.(?:sldasm|sldprt)$", "", str(native_name), flags=re.IGNORECASE)
+    stem = stem.lower().replace(".", "")
+    normalized = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    normalized = re.sub(r"_+", "_", normalized)
+    if not normalized:
+        raise ValueError("native asset namespace has no ASCII token")
+    if normalized[0].isdigit():
+        normalized = "n_" + normalized
+    return normalized
+
+
 def _component_token(native_component_identity: str) -> str:
     leaf = str(native_component_identity).replace("\\", "/").rsplit("/", 1)[-1]
     try:
@@ -292,13 +306,15 @@ def material_name(native_component_identity: str, *, link: str = "link") -> str:
     return f"{token(link)}_{_component_token(identity)}_{digest}_material"
 
 
-def mesh_path(content_sha256: str, *, category: str = "visual", semantic: str = "asset") -> str:
+def mesh_path(content_sha256: str, *, category: str = "visual", namespace: str) -> str:
+    """One content-addressed mesh path under the native assembly namespace."""
+
     digest = str(content_sha256)
     if _SHA256.fullmatch(digest) is None:
         raise ValueError("mesh content identity is not a lowercase SHA-256")
     if category not in {"visual", "collision"}:
         raise ValueError("mesh category must be visual or collision")
-    return f"meshes/{category}/{token(semantic)}_{digest[:16]}.stl"
+    return f"meshes/{category}/{asset_namespace(namespace)}/native_{digest}.stl"
 
 
 def fallback_name(kind: str, native_identity: str, *, semantic: str | None = None) -> str:

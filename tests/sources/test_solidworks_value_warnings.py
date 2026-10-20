@@ -27,11 +27,12 @@ class ValueWarningTests(unittest.TestCase):
         (self.root / "evidence/geometry/mesh.stl").write_bytes(b"mesh")
         self.digest = hashlib.sha256(b"mesh").hexdigest()
         self.visual = visual_name("part-1", link="base_link")
-        self.mesh_name = mesh_path(self.digest, semantic=self.visual)
+        self.mesh_name = mesh_path(self.digest, namespace="M3.0.3_20261016.SLDASM")
         self.material = material_name("part-1", link="base_link")
         self.source = {
             "robot_name": "robot",
             "robot_name_source": "cad",
+            "assembly": "/source/M3.0.3_20261016.SLDASM",
             "bodies": [{"name": "base_link", "source_name": "CS_base_link"}],
             "joints": [],
         }

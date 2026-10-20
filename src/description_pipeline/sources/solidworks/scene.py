@@ -16,7 +16,7 @@ from typing import Any
 
 from .errors import ConfigError
 from .jsonio import read_json
-from .naming import material_name, mesh_path, visual_name
+from .naming import asset_namespace, material_name, mesh_path, visual_name
 from .native_limits import PREVIEW_POLICY_ID
 from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
@@ -519,6 +519,9 @@ def build_scene(
     bodies = list(cfg.get("bodies") or [])
     if not bodies:
         raise ConfigError("native discovery must define the rigid bodies")
+    mesh_namespace = asset_namespace(
+        Path(str(cfg.get("assembly") or cfg.get("robot_name") or "robot")).name
+    )
 
     # Recheck the mass-mode contract against actual readings: documented_table must
     # cover every included component; CAD readings remain unchanged but carry warnings.
@@ -634,7 +637,7 @@ def build_scene(
                 "sha256": entry.get("sha256"),
                 "mesh_name": mesh_path(
                     str(entry.get("sha256") or ""),
-                    semantic=visual_name(reading.name, link=name),
+                    namespace=mesh_namespace,
                 ),
                 "material": material_name(reading.name, link=name),
                 "scale": [1.0, 1.0, 1.0],

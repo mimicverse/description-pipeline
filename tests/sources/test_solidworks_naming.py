@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from description_pipeline.sources.solidworks.naming import (
+    asset_namespace,
     carrier_names,
     collision_name,
     deduplicate_names,
@@ -420,12 +421,19 @@ class NamingTests(unittest.TestCase):
         self.assertTrue(collision_name("waist-1/part-1", link="pelvis_link").endswith("_collision"))
         self.assertTrue(material_name("waist-1/part-1", link="pelvis_link").endswith("_material"))
         digest = "a" * 64
+        self.assertEqual(asset_namespace("M3.0.3_20261016.SLDASM"), "m303_20261016")
         self.assertEqual(
-            mesh_path(digest, semantic=first),
-            f"meshes/visual/{first}_{digest[:16]}.stl",
+            mesh_path(digest, namespace="M3.0.3_20261016.SLDASM"),
+            f"meshes/visual/m303_20261016/native_{digest}.stl",
         )
+        self.assertEqual(
+            mesh_path(digest, namespace="M3.0.3_20261016.SLDASM"),
+            mesh_path(digest, namespace="M3.0.3_20261016.SLDASM"),
+        )
+        with self.assertRaises(ValueError):
+            asset_namespace("")
         with self.assertRaisesRegex(ValueError, "SHA-256"):
-            mesh_path("not-a-digest")
+            mesh_path("not-a-digest", namespace="robot")
 
     def test_empty_or_non_ascii_names_fail_instead_of_guessing(self):
         with self.assertRaises(ValueError):
