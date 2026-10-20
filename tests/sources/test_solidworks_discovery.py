@@ -226,7 +226,7 @@ def record() -> dict:
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
-                "limits": None,
+                "limits": {"lower": -1.5, "upper": 1.5, "unit": "rad"},
                 "entities": [
                     {
                         "component": "base-1",
@@ -279,7 +279,6 @@ def record() -> dict:
             "mates": {
                 "shoulder_pitch_joint__coaxial": {
                     "dp.joint.axis_sign": "+1",
-                    "dp.joint.limits_record": "joints/arm.json#limits",
                     "dp.joint.drive_record": "joints/arm.json#drive",
                 }
             },
@@ -453,26 +452,14 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(joint["limits"], {"lower": -1.5, "upper": 1.5, "effort": 6.0, "velocity": 2.0})
         self.assertEqual(joint["axis_reference"]["component"], "base-1")
         self.assertEqual(joint["axis_reference"]["feature_name"], "Cyl1")
-        evidence = joint["limit_evidence"]
-        self.assertTrue(evidence["file"].startswith("records/"))
-        self.assertIn("limits", (output / evidence["file"]).read_text(encoding="utf-8"))
-        self.assertEqual(evidence["anchor"], '"limits"')
+        self.assertEqual(joint["limit_source"], "native")
+        self.assertIsNone(joint["limit_evidence"])
         budget = json.loads((output / payload["budget"]["package_file"]).read_text(encoding="utf-8"))
         self.assertEqual(budget["robot"]["expected_mass_kg"], [0.28, 0.32])
         self.assertEqual(budget["robot"]["expected_extent_m"], [0.35, 0.5])
         report = self._verify(output)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["joints"], 1)
-
-    def test_frozen_published_name_is_preserved(self):
-        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "arm_link"})
-        result, _source, output = self._prepare(settings=settings)
-        self.assertTrue(result.passed, result.findings)
-        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
-        names = [body["name"] for body in rebuild_rigid_bodies(payload)]
-        self.assertIn("arm_link", names)
-        self.assertEqual(payload["frozen_names"].get("arm-1"), "arm_link")
-        self.assertTrue(self._verify(output)["passed"])
 
     def test_duplicate_controlled_records_block_regardless_of_content_or_root_order(self):
         _source, records = self._native()
@@ -605,23 +592,6 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(budget_entry["robot"]["expected_mass_kg"], [0.28, 0.32])
         self.assertEqual((records / "budget.json").read_bytes(), replacement)
         self.assertTrue(self._verify(output)["passed"])
-
-    def test_one_record_cannot_change_between_keys_in_the_same_job(self):
-        def change_after_first_reference(content, path):
-            result = parse_data(content, path)
-            if path.name == "arm.json" and result["drive"]["effort"] == 6.0:
-                result["drive"]["effort"] = 7.0
-                path.write_text(json.dumps(result))
-                return parse_data(content, path)
-            return result
-
-        with (
-            mock.patch(
-                "description_pipeline.sources.solidworks.discovery.parse_data", side_effect=change_after_first_reference
-            ),
-            self.assertRaisesRegex(PipelineError, "changed between references"),
-        ):
-            self._prepare()
 
     def test_rigid_accessory_preserves_the_joint_between_solved_bodies(self):
         def mutate(payload):
@@ -1135,9 +1105,9 @@ class DiscoveryTests(unittest.TestCase):
         )
         item = next(finding for finding in findings if finding["code"] == "discovery.robot_name_missing")
         self.assertFalse(item["blocking"])
-        self.assertEqual(item["detail"], {"technical_name": "wire_test", "authored": False})
+        self.assertEqual(item["detail"], {"technical_name": "robot", "authored": False})
         self.assertIsNone(identity["robot_name"])
-        self.assertEqual(identity["robot_name_technical"], "wire_test")
+        self.assertEqual(identity["robot_name_technical"], "robot")
         self.assertFalse([finding for finding in findings if finding["blocking"]])
 
     def test_absent_identity_fields_use_a_technical_robot_name(self):
@@ -1164,7 +1134,7 @@ class DiscoveryTests(unittest.TestCase):
             native_files={"robot.SLDASM": "0" * 64},
         )
         self.assertIsNone(identity["robot_name"])
-        self.assertEqual(identity["robot_name_technical"], "wrist_drive_2")
+        self.assertEqual(identity["robot_name_technical"], "robot")
 
     def test_malformed_supplied_identity_still_blocks(self):
         complete = {
@@ -1228,19 +1198,21 @@ class DiscoveryTests(unittest.TestCase):
         codes = self._codes(result)
         self.assertIn("discovery.joint_unsupported_pattern", codes)
 
-    def test_missing_limits_and_drive_block(self):
+    def test_missing_native_limits_block_and_missing_drive_stays_unqualified(self):
         result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop(
-                "dp.joint.limits_record"
-            )
+            mutate=lambda payload: payload["mates"][0].update({"limits": None})
         )
         self.assertIn("discovery.joint_limits_missing", self._codes(result))
-        result, _source, _output = self._prepare(
+        result, _source, output = self._prepare(
             mutate=lambda payload: payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop(
                 "dp.joint.drive_record"
             )
         )
-        self.assertIn("discovery.joint_drive_missing", self._codes(result))
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertNotIn("effort", joint["limits"])
+        self.assertNotIn("velocity", joint["limits"])
 
     def test_missing_shaft_selector_blocks(self):
         def mutate(payload):
@@ -1263,14 +1235,13 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual([item["code"] for item in findings], ["discovery.design_budget_unspecified"])
         self.assertFalse(findings[0]["blocking"])
 
-    def test_unspecified_budget_does_not_replace_missing_inferred_joint_drive(self):
+    def test_unspecified_budget_does_not_create_joint_drive(self):
         def mutate(payload):
             payload["properties"]["document"].pop("dp.design_budget_record")
             payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop("dp.joint.drive_record")
 
         result, _source, output = self._prepare(mutate=mutate)
-        blockers = {item["code"] for item in result.findings if item["blocking"]}
-        self.assertEqual(blockers, {"discovery.joint_drive_missing", "discovery.tree_disconnected"})
+        self.assertTrue(result.passed, result.findings)
         budget = next(item for item in result.findings if item["code"] == "discovery.design_budget_unspecified")
         self.assertFalse(budget["blocking"])
         payload = json.loads((output / "discovery/native-discovery.json").read_text())
@@ -1556,11 +1527,6 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mismatch)
         self.assertIn("discovery.jcs_mismatch", self._codes(result))
 
-    def test_frozen_name_that_differs_from_native_blocks(self):
-        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "right_arm_link"})
-        result, _source, _output = self._prepare(settings=settings)
-        self.assertIn("discovery.name_frozen_mismatch", self._codes(result))
-
     def test_body_marker_is_not_an_accepted_membership_channel(self):
         def mutate(payload):
             payload["properties"]["components"] = {"arm-1": {"dp.body_marker": "left"}}
@@ -1589,19 +1555,25 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.datum_identity_duplicate", self._codes(result))
 
-    def test_interface_suffix_must_already_be_snake_case(self):
+    def test_interface_suffix_is_corrected_by_the_shared_naming_rule(self):
         def mutate(payload):
             payload["datums"].append({"name": "TCP_Tool", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)})
 
         result, _source, _output = self._prepare(mutate=mutate)
-        self.assertIn("discovery.interface_name_invalid", self._codes(result))
+        self.assertTrue(result.passed, result.findings)
+        finding = next(item for item in result.findings if item["code"] == "discovery.interface_name_invalid")
+        self.assertFalse(finding["blocking"])
+        self.assertEqual(finding["detail"]["output"], "tool")
 
-    def test_interface_frame_colliding_with_a_body_name_blocks(self):
+    def test_interface_frame_colliding_with_a_body_name_is_namespaced(self):
         def mutate(payload):
             payload["datums"].append({"name": "TCP_base_link", "owner": "base-1", "array": _translated(0.0, 0.0, 0.3)})
 
         result, _source, _output = self._prepare(mutate=mutate)
-        self.assertIn("discovery.interface_name_duplicate", self._codes(result))
+        self.assertTrue(result.passed, result.findings)
+        finding = next(item for item in result.findings if item["code"] == "discovery.interface_name_invalid")
+        self.assertFalse(finding["blocking"])
+        self.assertRegex(finding["detail"]["output"], r"^base_link_[0-9a-f]{16}_frame$")
 
     def test_two_owned_link_datums_need_an_explicit_body_datum(self):
         def mutate(payload):
@@ -1620,12 +1592,17 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertIn("discovery.joint_axis_sign_missing", self._codes(result))
 
-    def test_native_limits_conflicting_with_the_record_block(self):
+    def test_native_limits_override_the_saved_export_placeholder(self):
         def mutate(payload):
             payload["mates"][0]["limits"] = {"lower": -2.0, "upper": 2.0, "unit": "rad"}
 
-        result, _source, _output = self._prepare(mutate=mutate)
-        self.assertIn("discovery.joint_limits_conflict", self._codes(result))
+        result, _source, output = self._prepare(mutate=mutate)
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertEqual(joint["limits"]["lower"], -2.0)
+        self.assertEqual(joint["limits"]["upper"], 2.0)
+        self.assertEqual(joint["limit_source"], "native")
 
     def test_axis_sign_rejects_boolean_and_float_values(self):
         for value in (True, False, 1.0, -1.0):
@@ -1648,18 +1625,6 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.record_unreadable", self._codes(result))
         json.dumps(list(result.findings), allow_nan=False)
-
-    def test_frozen_names_do_not_mask_a_native_datum_rename_after_resealing(self):
-        settings = DiscoverySettings(record_roots=(self._native()[1],), frozen_names={"arm-1": "arm_link"})
-        result, _source, output = self._prepare(settings=settings)
-        self.assertTrue(result.passed, result.findings)
-        path = output / "discovery" / "native-discovery.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        next(datum for datum in payload["raw"]["datums"] if datum["name"] == "CS_arm_link")["name"] = "CS_renamed_link"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        report = self._verify(output)
-        self.assertTrue(next(check for check in report["checks"] if check["id"] == "discovery.binding")["passed"])
-        self.assertIn("discovery.names", [item["code"] for item in report["errors"]])
 
     def test_circle_edge_coincident_keeps_the_hinge(self):
         def mutate(payload):

@@ -13,16 +13,13 @@ from . import _paths  # noqa: F401
 from . import support  # noqa: E402
 from .selection_support import sealed_selection  # noqa: E402
 from .test_solidworks_discovery import IDENTITY, FakeBackend
-from description_pipeline.interface_records import PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
 from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
-    DiscoverySettings,
     _exporter_constraint_checks,
     _exporter_declaration,
     _exporter_joint_facts,
     _exporter_memberships,
     _exporter_native_pairs,
-    _exporter_preview_limits,
     prepare_native_package,
 )
 from description_pipeline.sources.solidworks.exporter import (
@@ -113,7 +110,7 @@ def wire_xml(limit_values=None) -> str:
 
 
 def raw_record() -> dict:
-    xml = wire_xml()
+    xml = wire_xml({"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
     files = {
         name: hashlib.sha256(b"native-file-test").hexdigest()
         for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
@@ -272,16 +269,8 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(
             joints[0]["axis_reference"], {"kind": "reference_axis", "component": "", "feature_name": "a_hinge"}
         )
-        self.assertEqual(joints[0]["limits"], dict.fromkeys(("lower", "upper", "effort", "velocity"), 0.0))
-        self.assertEqual(
-            {finding["code"] for finding in findings},
-            {"discovery.joint_limits_degenerate", "discovery.joint_drive_unspecified"},
-        )
-        self.assertFalse(any(item["blocking"] for item in findings))
-        self.assertEqual(
-            {item["detail"]["qualification_blocker"] for item in findings},
-            {"usable_joint_range", "usable_joint_drive"},
-        )
+        self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
+        self.assertEqual(findings, [])
 
     def test_equal_bounds_and_zero_drives_are_preserved_as_stage_warnings(self):
         for values, expected in (
@@ -297,52 +286,14 @@ class ExporterDiscoveryTests(unittest.TestCase):
             self.assertFalse(findings[0]["blocking"])
             self.assertIn("qualification_blocker", findings[0]["detail"])
 
-    def test_exporter_zero_placeholder_uses_policy_only_with_no_range_evidence(self):
+    def test_exporter_zero_placeholder_without_native_range_blocks(self):
         raw = raw_record()
-        raw["mates"] = [
-            {
-                "name": "observed_mate",
-                "type": "lock",
-                "suppressed": False,
-                "error_code": 0,
-                "limits": None,
-                "entities": [{"component": "base-1"}, {"component": "arm-1"}],
-            }
-        ]
-        settings = DiscoverySettings(purpose=PURPOSE_INSPECTION_PREVIEW)
-        declaration = decode_exporter_v14(raw["exporter"]["raw_xml"], 1.4)
-        findings = []
-        bodies, clusters = _exporter_memberships(raw, declaration, findings)
-        joints = _exporter_joint_facts(raw, declaration, bodies, findings)
-        _exporter_constraint_checks(
-            declaration,
-            clusters,
-            joints,
-            findings,
-            record=raw,
-            settings=settings,
-        )
-        radius = preview_revolute_window_rad()
-        self.assertEqual(joints[0]["limits"], {"lower": -radius, "upper": radius, "effort": 0.0, "velocity": 0.0})
-        self.assertEqual(joints[0]["limit_source"], "policy_preview_window")
-        self.assertEqual(
-            joints[0]["declared_limits"],
-            {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0},
-        )
-        self.assertIn("discovery.joint_limits_policy_preview", {item["code"] for item in findings})
-
-        native_limits = {"hinge": [{"lower": 0.0, "upper": 0.0, "unit": "rad"}]}
-        candidate = [dict(joints[0])]
-        candidate[0]["limits"] = dict.fromkeys(("lower", "upper", "effort", "velocity"), 0.0)
-        candidate[0].pop("limit_source")
-        _exporter_preview_limits(raw, candidate, native_limits, {"hinge": True}, [])
-        self.assertEqual(candidate[0]["limits"], joints[0]["declared_limits"])
-        self.assertNotIn("limit_source", candidate[0])
-
-        controlled = raw_record()
-        controlled["properties"] = {"mates": {"hinge__limit": {"dp.joint.limits_record": "range.json#hinge"}}}
-        _exporter_preview_limits(controlled, candidate, {"hinge": []}, {"hinge": True}, [])
-        self.assertNotIn("limit_source", candidate[0])
+        raw["exporter"]["raw_xml"] = wire_xml()
+        raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(raw["exporter"]["raw_xml"].encode()).hexdigest()
+        _bodies, joints, findings = self.derive(raw)
+        self.assertEqual(joints, [])
+        item = next(item for item in findings if item["code"] == "discovery.joint_limits_missing")
+        self.assertTrue(item["blocking"])
 
     def test_missing_nonfinite_negative_drive_and_reversed_bounds_still_block(self):
         for changes, code in (
@@ -670,9 +621,12 @@ class ExporterDiscoveryTests(unittest.TestCase):
         limits = {"unit": "rad", "lower": -2, "upper": 2}
         raw["mates"] = [
             {
-                "name": "cad_limit",
+                "name": "hinge__limit",
                 "scope": "",
                 "type": "limitangle",
+                "suppressed": False,
+                "is_advanced_mate": True,
+                "native_limit": {"type_index": 6},
                 "error_code": 0,
                 "entities": [{"component": "base-1"}, {"component": "arm-1"}],
                 "limits": limits,
@@ -680,11 +634,9 @@ class ExporterDiscoveryTests(unittest.TestCase):
         ]
         _, joints, findings = self.derive(raw)
         observed = next(item for item in findings if item["code"] == "discovery.joint_limits_conflict")
-        self.assertEqual(observed["detail"]["mate"], "cad_limit")
-        self.assertEqual(observed["detail"]["native"], limits)
-        self.assertEqual(observed["detail"]["declared"], joints[0]["limits"])
-        self.assertEqual(joints[0]["limits"]["lower"], 0)
-        self.assertEqual(joints[0]["limits"]["upper"], 0)
+        self.assertEqual(observed["detail"]["native"], [-2.0, 2.0])
+        self.assertEqual(observed["detail"]["declared"], (-1.0, 1.0))
+        self.assertEqual(joints, [])
         self.assertTrue(observed["blocking"])
 
     def test_structural_declaration_errors_remain_blocking(self):
@@ -762,9 +714,6 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertFalse(owner["blocking"])
         self.assertEqual(owner["detail"]["publication_blocker"], "owner")
         self.assertFalse([item for item in result.findings if item["blocking"]])
-        zero_findings = [item for item in result.findings if item["code"].startswith("discovery.joint_")]
-        self.assertEqual(len(zero_findings), 2)
-        self.assertTrue(all(not item["blocking"] and item["detail"]["qualification_blocker"] for item in zero_findings))
 
     def test_valid_declarations_generate_named_axis_input_without_stale_derived_values(self):
         raw = raw_record()

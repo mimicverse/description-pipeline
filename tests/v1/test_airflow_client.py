@@ -529,15 +529,12 @@ class ClientTests(unittest.TestCase):
             root = Path(tmp)
             records = root / "records"
             records.mkdir()
-            registry = root / "names.json"
-            registry.write_text("{}", encoding="utf-8")
             config = EndpointConfig(
                 base_url="http://127.0.0.1",
                 token=TOKEN,
-                discovery={"record_roots": [str(records)], "frozen_names_file": str(registry)},
+                discovery={"record_roots": [str(records)]},
             )
             self.assertEqual(config.discovery["record_roots"], (records,))
-            self.assertEqual(config.discovery["frozen_names_file"], registry)
             for bad in (
                 {"record_roots": ["relative/root"]},
                 {"record_roots": [str(root / "missing")]},
@@ -553,7 +550,7 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(EndpointProtocolError):
                 EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [str(link)]})
 
-    def test_discovery_paths_reject_root_and_dotdot_segments(self) -> None:
+    def test_discovery_record_paths_reject_root_and_dotdot_segments(self) -> None:
         """The handoff-root rule, applied to discovery paths on the raw spelling.
 
         ``Path`` collapses ``//`` before any parts check, so the guard judges the original
@@ -568,15 +565,12 @@ class ClientTests(unittest.TestCase):
             records.mkdir()
             nested = root / "sub"
             nested.mkdir()
-            registry = root / "names.json"
-            registry.write_text("{}", encoding="utf-8")
             config = EndpointConfig(
                 base_url="http://127.0.0.1",
                 token=TOKEN,
-                discovery={"record_roots": [str(records)], "frozen_names_file": str(registry)},
+                discovery={"record_roots": [str(records)]},
             )
             self.assertEqual(config.discovery["record_roots"], (records,))
-            self.assertEqual(config.discovery["frozen_names_file"], registry)
             for value in (
                 str(records / ".." / "records"),  # resolvable: previously accepted unnormalized
                 str(nested / ".." / "records"),
@@ -591,18 +585,6 @@ class ClientTests(unittest.TestCase):
                     with self.assertRaises(EndpointProtocolError) as caught:
                         EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"record_roots": [value]})
                     self.assertIn("discovery record root must be a dedicated absolute path", str(caught.exception))
-            for value in (
-                str(records / ".." / "names.json"),
-                str(records) + "//names.json",
-                "/",
-            ):
-                with self.subTest(registry=value):
-                    with self.assertRaises(EndpointProtocolError) as caught:
-                        EndpointConfig(base_url="http://127.0.0.1", token=TOKEN, discovery={"frozen_names_file": value})
-                    self.assertIn(
-                        "discovery frozen-name registry must be a dedicated absolute path",
-                        str(caught.exception),
-                    )
 
     def test_capture_archive_receipt_is_validated_exactly(self) -> None:
         from description_pipeline.orchestration.airflow_client import capture_archive_metadata

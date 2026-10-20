@@ -1761,23 +1761,11 @@ def _definition_settings(config: EndpointConfig, main_assembly: str, *, purpose:
     from description_pipeline.sources.solidworks.discovery import DiscoverySettings
 
     configuration = config.discovery
-    registry = configuration.get("frozen_names_file")
-    names: dict = {}
-    if registry:
-        try:
-            names = read_data(Path(str(registry)))
-        except (OSError, PipelineError) as error:
-            raise AirflowFailException(f"Frozen-name registry is not readable: {error}") from error
-    if not isinstance(names, dict) or any(
-        not isinstance(key, str) or not isinstance(value, str) for key, value in names.items()
-    ):
-        raise AirflowFailException("Frozen-name registry must map native identities to interface names")
     roots = configuration.get("record_roots", ())
     if not isinstance(roots, (list, tuple)):
         raise AirflowFailException("Controlled-record roots must be a list of paths")
     return DiscoverySettings(
         record_roots=tuple(Path(value) for value in roots),
-        frozen_names=names,
         main_assembly=main_assembly,
         purpose=str(purpose),
     )

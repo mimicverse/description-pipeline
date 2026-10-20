@@ -190,6 +190,28 @@ def native_record() -> dict:
                     },
                 ],
             },
+            {
+                "name": "shoulder_pitch_joint__limit",
+                "type": "limitangle",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": {"lower": -1.5, "upper": 1.5, "unit": "rad"},
+                "is_advanced_mate": True,
+                "native_limit": {"type_index": 6},
+                "entities": [
+                    {
+                        "component": "base-1",
+                        "feature": "LimitPlane1",
+                        "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                    },
+                    {
+                        "component": "arm-1",
+                        "feature": "LimitPlane2",
+                        "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                    },
+                ],
+            },
         ],
         "datums": [
             {"name": "CS_base_link", "owner": "base-1", "array": copy.deepcopy(IDENTITY)},
@@ -350,8 +372,8 @@ class OracleSemanticsTests(unittest.TestCase):
         passed, errors, _checks = self.check(package)
         self.assertTrue(passed, errors)
 
-    def test_unrecorded_inferred_joint_records_stay_rejected(self):
-        """Without an exporter declaration, missing controlled records still refuse."""
+    def test_unrecorded_controlled_joint_records_do_not_override_native_limits(self):
+        """Controlled records are optional once the native limit is directly observed."""
 
         package = self.baseline()
 
@@ -363,8 +385,7 @@ class OracleSemanticsTests(unittest.TestCase):
 
         self._native(package, strip_annotations)
         report = verify_discovery(package)
-        self.assertFalse(report["passed"])
-        self.assertTrue({"discovery.joints", "discovery.joint_rebuild"} & {item["code"] for item in report["errors"]})
+        self.assertTrue(report["passed"], report["errors"])
 
     def test_absent_exporter_state_keeps_the_mate_suite_and_skips_declarations(self) -> None:
         """Only a proven absent exporter state means the capture has no declarations.

@@ -41,13 +41,7 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 from ..delivery import read_delivery_manifest, read_source_record
-from ..interface_records import (
-    PREVIEW_RANGE_KEYS,
-    PREVIEW_RANGE_SCHEMA,
-    PURPOSE_INSPECTION_PREVIEW,
-    preview_revolute_window_rad,
-    validate_request_record,
-)
+from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data, read_data
 from ..schemas import exporter_declaration_present
 from ..sources.solidworks.session_artifacts import (
@@ -2131,7 +2125,7 @@ def rebuild_interface_frames(
 def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[dict]:
     """Rebuild the movable-joint carrier from the raw capture alone (IF-17, in memory).
 
-    ``record`` is the discovery payload (its ``raw`` block, ``frozen_names``,
+    ``record`` is the discovery payload (its ``raw`` block, derived interface names,
     ``namespace`` and controlled-record entries); ``package`` resolves the
     embedded record bytes and the sealed request states the purpose.  The
     reconstruction mirrors the documented rules on
@@ -2148,7 +2142,7 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
     payload = record if isinstance(record.get("raw"), dict) else {"raw": record}
     raw = payload["raw"]
     namespace = str(payload.get("namespace") or "dp")
-    frozen = payload.get("frozen_names") or {}
+    frozen = payload.get("derived_interface_names") or {}
     bodies = rebuild_rigid_bodies(raw)
     by_name = {str(body["name"]): body for body in bodies}
     _require("base_link" in by_name, "discovery.joint_rebuild", "no base_link body in the rebuilt carrier")
@@ -2306,7 +2300,6 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         limit_evidence = None
         limit_source = None
         native_limits = group["limits"]
-        limits_reference = properties.get(f"{namespace}.joint.limits_record")
         if joint_type == "continuous":
             _require(
                 not isinstance(native_limits, dict),
@@ -2324,68 +2317,47 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             )
             limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
             limit_source = "native"
-            if isinstance(limits_reference, str) and limits_reference.strip():
-                entry = _find_record_entry(payload, limits_reference)
-                value = _record_value(package, entry["entry"], entry["key"])
-                _require(
-                    _close([limits["lower"], limits["upper"]], [value.get("lower"), value.get("upper")], 1e-12),
-                    "discovery.joint_rebuild",
-                    "native mate limits and the controlled record disagree",
-                    {"pair": [left, right]},
-                )
-                limit_evidence = {
-                    "file": entry["entry"].get("package_file"),
-                    "sha256": entry["entry"].get("sha256"),
-                    "anchor": entry["entry"].get("anchor"),
-                }
-        elif isinstance(limits_reference, str) and limits_reference.strip():
-            entry = _find_record_entry(payload, limits_reference)
-            value = _record_value(package, entry["entry"], entry["key"])
-            limits = {"lower": float(value["lower"]), "upper": float(value["upper"])}
-            limit_evidence = {
-                "file": entry["entry"].get("package_file"),
-                "sha256": entry["entry"].get("sha256"),
-                "anchor": entry["entry"].get("anchor"),
-            }
-            limit_source = "controlled"
-        elif purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "revolute":
-            radius = preview_revolute_window_rad()
-            limits = {"lower": -radius, "upper": radius}
-            limit_source = "policy_preview_window"
-        elif purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
-            limits, limit_evidence = _declared_preview_range(
-                payload, package, properties, namespace, pair=(left, right), joint=name
-            )
-            limit_source = "declared_preview_window"
         else:
             raise _Failure(
                 "discovery.joint_rebuild",
-                "the joint has no native or controlled position range",
+                "the joint has no native position range",
                 {"pair": [left, right]},
             )
         drive_reference = properties.get(f"{namespace}.joint.drive_record")
+        drive = None
         if isinstance(drive_reference, str) and drive_reference.strip():
             entry = _find_record_entry(payload, drive_reference)
-            drive = _record_value(package, entry["entry"], entry["key"])
-            effort = float(drive["effort"])
-            velocity_limit = float(drive["velocity"])
+            value = _record_value(package, entry["entry"], entry["key"])
             _require(
-                math.isfinite(effort) and math.isfinite(velocity_limit) and effort > 0.0 and velocity_limit > 0.0,
+                isinstance(value, dict),
                 "discovery.joint_rebuild",
-                "drive record effort/velocity must be finite and positive",
+                "drive record must contain an object",
+                {"pair": [left, right]},
+            )
+            try:
+                effort = float(value["effort"])
+                velocity_limit = float(value["velocity"])
+            except (KeyError, TypeError, ValueError):
+                raise _Failure(
+                    "discovery.joint_rebuild",
+                    "drive record lacks finite effort/velocity",
+                    {"pair": [left, right]},
+                ) from None
+            _require(
+                math.isfinite(effort) and math.isfinite(velocity_limit) and effort >= 0.0 and velocity_limit >= 0.0,
+                "discovery.joint_rebuild",
+                "drive record effort/velocity must be finite and nonnegative",
                 {"pair": [left, right]},
             )
             limits = dict(limits or {})
             limits["effort"] = effort
             limits["velocity"] = velocity_limit
-        else:
-            _require(
-                purpose == PURPOSE_INSPECTION_PREVIEW,
-                "discovery.joint_rebuild",
-                "the joint has no controlled drive record",
-                {"pair": [left, right]},
-            )
-            drive = None
+            drive = {
+                "file": entry["entry"].get("package_file"),
+                "sha256": entry["entry"].get("sha256"),
+                "anchor": entry["entry"].get("anchor"),
+                "value": value,
+            }
         facts.append(
             {
                 "nodes": (left_body, right_body),
@@ -2397,6 +2369,7 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                     "type": joint_type,
                     "axis_reference": axis_reference,
                     "limits": limits,
+                    "drive": drive,
                     "limit_evidence": limit_evidence,
                     "limit_source": limit_source,
                 },
@@ -2581,95 +2554,6 @@ def _joint_properties(raw: dict, mates: list[dict]) -> tuple[dict, dict]:
             continue
         merged[key] = values[0][1]
     return merged, conflicts
-
-
-def _preview_number(value) -> float:
-    """A finite real declaration number; booleans are not numeric facts."""
-
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return math.nan
-    number = float(value)
-    return number if math.isfinite(number) else math.nan
-
-
-def _declared_preview_range(
-    payload: dict,
-    package: Path,
-    properties: dict,
-    namespace: str,
-    *,
-    pair: tuple[str, str],
-    joint: str,
-) -> tuple[dict, dict]:
-    """Resolve the bound finite preview declaration of one prismatic joint.
-
-    The resolved file's digest and the parsed exact semantics (joint, instance
-    among the pair's occurrences, configuration, unit, zero, direction, purpose
-    and a finite ordered range) are all required - a file that merely exists, or
-    an anchor substring that merely matches, never passes.  ``source_sha256`` is
-    not part of the shape: the controlled-record entry already owns and verifies
-    the resolved file digest.
-
-    The declared window is expressed in the declaration's own measure.  ``zero``
-    is the declared value that coincides with the joint's canonical zero and
-    ``direction`` (``+1``/``-1``) orients the declared positive sense against
-    the canonical positive axis, so the canonical window is
-    ``direction * (declared - zero)`` applied to both endpoints and ordered.
-    The mapping is always applied - a descriptor is never silently dropped.
-    """
-
-    reference = properties.get(f"{namespace}.joint.preview_range_record")
-    _require(
-        isinstance(reference, str) and reference.strip(),
-        "discovery.joint_preview_range_missing",
-        "a prismatic joint with a proven-missing engineering range requires a bound finite preview declaration",
-        {"pair": list(pair)},
-    )
-    entry = _find_record_entry(payload, reference)
-    value = _record_value(package, entry["entry"], entry["key"])
-    left, right = pair
-    numbers = isinstance(value, dict)
-    lower = _preview_number(value.get("lower")) if numbers else math.nan
-    upper = _preview_number(value.get("upper")) if numbers else math.nan
-    zero = _preview_number(value.get("zero")) if numbers else math.nan
-    direction = value.get("direction") if numbers else None
-    sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
-    first = sign * (lower - zero)
-    second = sign * (upper - zero)
-    configuration = str((payload.get("raw") or {}).get("saved_configuration") or "")
-    valid = (
-        isinstance(value, dict)
-        and set(value) == PREVIEW_RANGE_KEYS
-        and value.get("schema_version") == PREVIEW_RANGE_SCHEMA
-        and str(value.get("joint")) == joint
-        and str(value.get("instance")) in {str(left), str(right)}
-        and str(value.get("configuration")) == configuration
-        and value.get("unit") == "m"
-        and math.isfinite(sign)
-        and value.get("purpose") == PURPOSE_INSPECTION_PREVIEW
-        and math.isfinite(lower)
-        and math.isfinite(upper)
-        and math.isfinite(zero)
-        and lower < upper
-        # The canonical endpoints the mapping actually produces must stay finite
-        # and strictly ordered: an overflowing or collapsing transform is refused.
-        and math.isfinite(first)
-        and math.isfinite(second)
-        and first != second
-    )
-    _require(
-        valid,
-        "discovery.joint_preview_range_invalid",
-        "preview declaration does not bind this joint, an occurrence of its pair, configuration, unit, "
-        "zero, direction, purpose and a finite ordered range",
-        {"pair": list(pair)},
-    )
-    evidence = {
-        "file": entry["entry"].get("package_file"),
-        "sha256": entry["entry"].get("sha256"),
-        "anchor": entry["entry"].get("anchor"),
-    }
-    return {"lower": min(first, second), "upper": max(first, second)}, evidence
 
 
 def verify_discovery(package: Path) -> dict:
@@ -3667,8 +3551,8 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
-        frozen = payload.get("frozen_names") or {}
-        _require(isinstance(frozen, dict), "discovery.names", "frozen_names must be an object")
+        frozen = payload.get("derived_interface_names") or {}
+        _require(isinstance(frozen, dict), "discovery.names", "derived_interface_names must be an object")
         source = _carrier()
         bodies = source.get("bodies") or []
         joints = source.get("joints") or []
@@ -3775,21 +3659,18 @@ def verify_discovery(package: Path) -> dict:
             joint_identities[str(mates[0].get("name") or "")] = name
             matching = [joint for joint in joints if str(joint.get("name")) == name]
             _require(matching, "discovery.names", "a named mate group has no joint", {"group": name})
-        for identity, published in sorted(frozen.items()):
-            observed = identities.get(identity) or joint_identities.get(identity)
-            _require(
-                observed is not None,
-                "discovery.names",
-                "a frozen identity matches no body or joint",
-                {"identity": identity},
-            )
-            _require(
-                str(published) == observed,
-                "discovery.names",
-                "a frozen published name was not preserved",
-                {"identity": identity, "expected": published, "observed": observed},
-            )
-        return {"frozen": len(frozen)}
+        expected_names = {
+            str(body.get("source_name") or body["name"]): str(body["name"]) for body in bodies
+        } | {
+            str(joint.get("source_name") or joint["name"]): str(joint["name"]) for joint in joints
+        }
+        _require(
+            frozen == expected_names,
+            "discovery.names",
+            "the derived interface-name evidence differs from the native carriers",
+            {"expected": expected_names, "recorded": frozen},
+        )
+        return {"derived": len(frozen)}
 
     def joints():
         payload = state["payload"]
@@ -4016,57 +3897,13 @@ def verify_discovery(package: Path) -> dict:
                     "the joint limits differ from the native mate",
                     {"joint": joint.get("name")},
                 )
-                native_record = properties.get("dp.joint.limits_record")
-                if isinstance(native_record, str) and native_record.strip():
-                    entry = _find_record_entry(payload, native_record)
-                    value = _record_value(package, entry["entry"], entry["key"])
-                    _require(
-                        _close(
-                            [limits.get("lower"), limits.get("upper")],
-                            [value.get("lower"), value.get("upper")],
-                            1e-12,
-                        ),
-                        "discovery.joints",
-                        "native mate limits and the controlled record disagree",
-                        {"joint": joint.get("name")},
-                    )
             else:
-                reference_record = properties.get("dp.joint.limits_record")
                 _require(
-                    isinstance(reference_record, str) and reference_record.strip(),
+                    False,
                     "discovery.joints",
-                    "the joint has no native or controlled position range",
+                    "the joint has no native position range",
                     {"joint": joint.get("name")},
                 )
-                entry = _find_record_entry(payload, reference_record)
-                value = _record_value(package, entry["entry"], entry["key"])
-                _require(
-                    _close(
-                        [limits.get("lower"), limits.get("upper")],
-                        [value.get("lower"), value.get("upper")],
-                        1e-12,
-                    ),
-                    "discovery.joints",
-                    "the joint limits differ from the controlled record",
-                    {"joint": joint.get("name")},
-                )
-            drive_reference = properties.get("dp.joint.drive_record")
-            _require(
-                isinstance(drive_reference, str) and drive_reference.strip(),
-                "discovery.joints",
-                "the joint has no controlled drive record",
-                {"joint": joint.get("name")},
-            )
-            entry = _find_record_entry(payload, drive_reference)
-            value = _record_value(package, entry["entry"], entry["key"])
-            _require(
-                _close(
-                    [limits.get("effort"), limits.get("velocity")], [value.get("effort"), value.get("velocity")], 1e-12
-                ),
-                "discovery.joints",
-                "the joint drive differs from the controlled record",
-                {"joint": joint.get("name")},
-            )
             origin = [frame[0][3], frame[1][3], frame[2][3]]
             offset = _offset(group["point"], origin, native)
             _require(

@@ -148,9 +148,11 @@ class _MateSpecific:
             return self._entities(index)
         return self._entities[index]
 
+    @property
     def MinimumVariation(self):
         return self._value(self._lower)
 
+    @property
     def MaximumVariation(self):
         return self._value(self._upper)
 
@@ -581,6 +583,15 @@ def _mate(
     name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0, definition=None
 ):
     specific = _MateSpecific(mate_type, entities, lower=lower, upper=upper, count=count)
+    if definition is not None:
+        if mate_type == 5 and not hasattr(definition, "Distance"):
+            definition.Distance = 0.0
+            definition.MinimumDistance = lower
+            definition.MaximumDistance = upper
+        if mate_type == 6 and not hasattr(definition, "Angle"):
+            definition.Angle = 0.0
+            definition.MinimumAngle = lower
+            definition.MaximumAngle = upper
     return _Feature(
         name, f"Mate{mate_type}", specific=specific, suppressed=suppressed, error_code=error_code, definition=definition
     )
@@ -657,6 +668,7 @@ class MateRecordTests(unittest.TestCase):
                     "is_advanced_mate",
                     "is_advanced_mate_error",
                     "is_advanced_mate_api",
+                    "native_limit",
                     "entities",
                     "error_code",
                     "scope",

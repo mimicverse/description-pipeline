@@ -1575,6 +1575,7 @@ class StructuralQualityTests(unittest.TestCase):
             "type": "continuous",
             "axis": [0, 0, 1],
             "limits": {"effort": 1.0, "velocity": 2.0},
+            "limit_source": "native",
         }
         canonical_joint = {**authored, "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
         node = ET.fromstring(
@@ -1598,6 +1599,7 @@ class StructuralQualityTests(unittest.TestCase):
             "type": "continuous",
             "axis": [0, 0, 1],
             "limits": {"effort": 0.0, "velocity": 0.0},
+            "limit_source": "native",
         }
         canonical_joint = {**authored, "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
         node = ET.fromstring(

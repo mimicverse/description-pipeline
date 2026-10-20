@@ -75,6 +75,9 @@ def _native_record(*, with_arm: bool, with_joint: bool, files: dict[str, str]) -
         mates = support.native_hinge_mates(
             "base-1", "arm-1", left_point=(0.0, 0.0, 0.2), right_point=(0.0, 0.0, 0.0), radius=0.006
         )
+        mates[0]["limits"] = {"lower": -1.0, "upper": 1.0, "unit": "rad"}
+        mates[0]["is_advanced_mate"] = True
+        mates[0]["native_limit"] = {"type_index": 6}
         joint_claims = support.native_joint_claims()
     return support.native_record(
         hardware_id="freeze_fixture",

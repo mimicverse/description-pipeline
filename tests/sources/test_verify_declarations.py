@@ -19,7 +19,7 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
-from description_pipeline.interface_records import PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
+from description_pipeline.interface_records import PURPOSE_INSPECTION_PREVIEW
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.native_declarations import verify_declarations
@@ -420,6 +420,22 @@ def fixture():
                 )
 
     rewrite(raw, values)
+    raw["mates"] = [
+        {
+            "name": "hinge__limit",
+            "type": "limitangle",
+            "suppressed": False,
+            "error_code": 0,
+            "is_advanced_mate": True,
+            "is_advanced_mate_error": None,
+            "limits": {"lower": -1.5, "upper": 1.5, "unit": "rad"},
+            "native_limit": {"type_index": 6},
+            "entities": [
+                {"component": "base_part"},
+                {"component": "module-1/tool_part"},
+            ],
+        }
+    ]
     return raw
 
 
@@ -512,14 +528,14 @@ class DeclarationConsumerTests(unittest.TestCase):
         bodies = {body["name"]: body["components"] for body in returned["source"]["bodies"]}
         self.assertEqual(
             bodies,
-            {"base": ["base_part"], "tool": ["module-1/bracket", "module-1/tool_part"]},
+            {"base_link": ["base_part"], "tool_frame_link": ["module-1/bracket", "module-1/tool_part"]},
         )
         self.assertEqual(
             [
                 (joint["name"], joint["type"], joint["parent"], joint["child"])
                 for joint in returned["source"]["joints"]
             ],
-            [("hinge", "revolute", "base", "tool")],
+            [("hinge_joint", "revolute", "base_link", "tool_frame_link")],
         )
         self.assertEqual(returned["source"]["frames"], [])
 
@@ -568,9 +584,9 @@ class DeclarationConsumerTests(unittest.TestCase):
         self.assertEqual(
             frames,
             {
-                "tool_tcp": ("tool", "TCP_tool_tcp"),
-                "sensor_mount": ("tool", "SCS_sensor_mount"),
-                "base_mount": ("base", "TCP_base_mount"),
+                "tool_tcp": ("tool_frame_link", "TCP_tool_tcp"),
+                "sensor_mount": ("tool_frame_link", "SCS_sensor_mount"),
+                "base_mount": ("base_link", "TCP_base_mount"),
             },
         )
         # The frames become required gates: a model that drops or reparents an interface
@@ -600,7 +616,7 @@ class DeclarationConsumerTests(unittest.TestCase):
             ),
             (
                 "body name collision",
-                lambda raw: raw["datums"].append(self._interface("TCP_base", "module-1/tool_part")),
+                lambda raw: raw["datums"].append(self._interface("TCP_base_link", "module-1/tool_part")),
                 "collides with a body name",
             ),
         )
@@ -622,7 +638,7 @@ class DeclarationConsumerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             returned = solidworks_urdf._input(self._delivery(directory, inject), [])
         frames = {frame["name"]: frame["parent"] for frame in returned["source"]["frames"]}
-        self.assertEqual(frames, {"module_tcp": "tool"})
+        self.assertEqual(frames, {"module_tcp": "tool_frame_link"})
 
     def test_interface_expansion_refuses_cross_body_and_empty(self) -> None:
         raw = {
@@ -659,7 +675,7 @@ class DeclarationConsumerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             returned = solidworks_urdf._input(self._delivery(directory, inject), [])
         frames = {frame["name"]: frame["parent"] for frame in returned["source"]["frames"]}
-        self.assertEqual(frames, {"tool_tcp": "tool", "base_mount": "base"})
+        self.assertEqual(frames, {"tool_tcp": "tool_frame_link", "base_mount": "base_link"})
 
     def test_declaration_frame_gate_refuses_wrong_owner_referenced_configuration(self) -> None:
         def mismatch(raw):
@@ -732,19 +748,19 @@ class NativeDeclarationsTests(unittest.TestCase):
 
     def test_unresolved_internal_mates_do_not_refute_explicit_membership(self):
         raw = fixture()
-        raw["mates"] = [lock("module-1/tool_part", "module-1/bracket", kind="unread")]
+        raw["mates"].append(lock("module-1/tool_part", "module-1/bracket", kind="unread"))
         self.assertTrue(verify_declarations(raw)["passed"])
 
     def test_unique_complete_rigidity_completes_only_unclaimed_leaf(self):
         raw = fixture()
         raw["components"].append(component("cover"))
-        raw["mates"] = [lock("cover", "base_part")]
+        raw["mates"].append(lock("cover", "base_part"))
         report = verify_declarations(raw)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["completion"], {"cover": "base"})
         for patch in [{"error_code": 1}, {"type": "unread"}, {"type": "coincident"}]:
             candidate = copy.deepcopy(raw)
-            candidate["mates"][0].update(patch)
+            candidate["mates"][-1].update(patch)
             report = verify_declarations(candidate)
             self.assertTrue(report["passed"], report["errors"])
             self.assertEqual(report["completion"], {})
@@ -865,6 +881,7 @@ class NativeDeclarationsTests(unittest.TestCase):
 
         raw = fixture()
         rewrite(raw, write("0"))
+        raw["mates"][0]["limits"] = {"lower": 0.0, "upper": 0.0, "unit": "rad"}
         report = verify_declarations(raw)
         self.assertNotIn("v14.operating_parameters", {item["code"] for item in report["errors"]})
         warnings = [item for item in report["diagnostics"] if item["code"] == "v14.motion_unqualified"]
@@ -897,7 +914,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         rewrite(candidate, drop_effort)
         self.assertIn("v14.attribute_shape", self.errors(candidate))
 
-    def test_preview_policy_requires_zero_placeholder_and_no_range_evidence(self):
+    def test_zero_placeholder_without_native_range_is_rejected(self):
         def zero_limits(raw):
             def transform(root):
                 for item in root.iter():
@@ -912,41 +929,25 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw = zero_limits(fixture())
         raw["mates"] = [lock("base_part", "module-1/tool_part", kind="lock")]
         report = verify_declarations(raw, purpose=PURPOSE_INSPECTION_PREVIEW)
-        self.assertTrue(report["passed"], report["errors"])
-        radius = preview_revolute_window_rad()
-        carrier = report["carrier"]["joints"][0]
-        self.assertEqual(
-            carrier["limits"],
-            {"lower": -radius, "upper": radius, "effort": 0.0, "velocity": 0.0},
-        )
-        self.assertEqual(carrier["limit_source"], "policy_preview_window")
-        self.assertIn("v14.policy_preview_window", {item["code"] for item in report["diagnostics"]})
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_missing", {item["code"] for item in report["errors"]})
 
         native = copy.deepcopy(raw)
         native["mates"] = [
             {
                 **lock("base_part", "module-1/tool_part", kind="distance"),
                 "is_advanced_mate": True,
+                "native_limit": {"type_index": 5},
                 "limits": {"lower": 0.0, "upper": 0.0, "unit": "rad"},
+                "entities": [
+                    {"component": "base_part"},
+                    {"component": "module-1/tool_part"},
+                ],
             }
         ]
         native_report = verify_declarations(native, purpose=PURPOSE_INSPECTION_PREVIEW)
         self.assertTrue(native_report["passed"], native_report["errors"])
-        self.assertNotIn("limit_source", native_report["carrier"]["joints"][0])
-        self.assertNotIn("v14.policy_preview_window", {item["code"] for item in native_report["diagnostics"]})
-
-        controlled = copy.deepcopy(raw)
-        controlled["properties"] = {"mates": {"observed_mate": {"dp.joint.limits_record": "range.json#hinge"}}}
-        controlled_report = verify_declarations(controlled, purpose=PURPOSE_INSPECTION_PREVIEW)
-        self.assertFalse(controlled_report["passed"])
-        self.assertIn("v14.policy_preview_window_blocked", {item["code"] for item in controlled_report["errors"]})
-        self.assertNotIn("limit_source", controlled_report["carrier"]["joints"][0])
-
-        invalid_controlled = copy.deepcopy(raw)
-        invalid_controlled["properties"] = {"document": {"dp.joint.hinge.limits_record": None}}
-        invalid_report = verify_declarations(invalid_controlled, purpose=PURPOSE_INSPECTION_PREVIEW)
-        self.assertFalse(invalid_report["passed"])
-        self.assertNotIn("limit_source", invalid_report["carrier"]["joints"][0])
+        self.assertEqual(native_report["carrier"]["joints"][0]["limit_source"], "native")
 
         incomplete = copy.deepcopy(raw)
         incomplete["mates"] = [

@@ -128,15 +128,13 @@ def _replay_seeded_inputs(staging: Path) -> tuple[dict, dict]:
     # its inventory rows, so no inventory check is skipped.
     frozen = read_data(staging / "evidence" / "discovery.json")
     identity = frozen.get("identity") if isinstance(frozen.get("identity"), dict) else {}
-    derivation = frozen.get("derivation") if isinstance(frozen.get("derivation"), dict) else {}
-    frozen_names = derivation.get("frozen_names") if isinstance(derivation.get("frozen_names"), dict) else {}
     return {
         "source": {
             "robot_name": identity.get("robot_name")
-            or frozen_names.get("robot_name")
             or frozen.get("robot_name")
             or identity.get("robot_name_technical")
-            or "robot"
+            or "robot",
+            "robot_name_source": "cad" if identity.get("robot_name") else "cad_filename_derived",
         },
         "hardware_id": identity.get("hardware_id"),
         "provenance": {

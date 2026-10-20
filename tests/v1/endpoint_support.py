@@ -122,9 +122,6 @@ class EndpointFixture:
         self.reader_log: list = []
         self.selection_refusal = None
         self.evidence_kwargs = {"edges": self.documents}
-        #: A nonempty approved-name registry: the discovery contract must record
-        #: its digest instead of digest({}).
-        self.frozen_names = {"arm": "arm_link"}
 
     def write_config(self, **changes) -> None:
         write_json(self.path, {**self.config_data, **changes})
@@ -251,7 +248,7 @@ class EndpointFixture:
             expected_run_id=run_id,
             expected_selection=selection,
             expected_native_tool=TOOL,
-            settings=DiscoverySettings(record_roots=[self.records_dir()], frozen_names=dict(self.frozen_names)),
+            settings=DiscoverySettings(record_roots=[self.records_dir()]),
         )
         archive = self.root / f"capture-request-{run_id}.zip"
         record = {**copy.deepcopy(self.record), "source_selection": copy.deepcopy(selection)}

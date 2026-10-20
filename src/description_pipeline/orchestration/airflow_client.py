@@ -593,11 +593,11 @@ def _discovery_path(value, label: str) -> Path:
 
 
 def _linux_discovery(values) -> dict:
-    """Validate the Linux derivation settings: controlled-record roots and the registry."""
+    """Validate the Linux derivation settings: controlled-record roots."""
     if values in (None, "", {}):
         return {}
-    if not isinstance(values, dict) or not set(values) <= {"record_roots", "frozen_names_file"}:
-        raise EndpointProtocolError("discovery must carry only record_roots and frozen_names_file")
+    if not isinstance(values, dict) or not set(values) <= {"record_roots"}:
+        raise EndpointProtocolError("discovery must carry only record_roots")
     settings: dict = {}
     roots = values.get("record_roots", ())
     if not isinstance(roots, (list, tuple)):
@@ -609,11 +609,6 @@ def _linux_discovery(values) -> dict:
             raise EndpointProtocolError(f"discovery record root is not a directory: {candidate}")
         checked.append(candidate)
     settings["record_roots"] = tuple(checked)
-    if "frozen_names_file" in values:
-        registry = _discovery_path(values["frozen_names_file"], "frozen-name registry")
-        if not registry.is_file():
-            raise EndpointProtocolError(f"discovery frozen-name registry is not a file: {registry}")
-        settings["frozen_names_file"] = registry
     return settings
 
 

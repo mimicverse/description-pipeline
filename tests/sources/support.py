@@ -1204,7 +1204,6 @@ def compose_delivery_inputs(
             "derivation": {
                 "main_assembly": main_assembly,
                 "configuration": configuration,
-                "frozen_names": {},
                 "record_roots": [],
             },
             "identity": {
@@ -1337,6 +1336,41 @@ def native_hinge_mates(
             "entities": [plane(left, "Plane1", left_point, 1.0), plane(right, "Plane2", right_point, -1.0)],
         },
     ]
+
+
+def native_limit_mate(
+    left: str,
+    right: str,
+    *,
+    lower: float = -1.0,
+    upper: float = 1.0,
+    name: str = "hinge_joint",
+    point: Sequence[float] = (0.0, 0.0, 0.0),
+) -> dict:
+    """One enabled angular limit mate beside a hinge's solved constraint pair."""
+
+    return {
+        "name": f"{name}__limit",
+        "type": "limitangle",
+        "suppressed": False,
+        "error_code": 0,
+        "scope": "",
+        "limits": {"lower": float(lower), "upper": float(upper), "unit": "rad"},
+        "is_advanced_mate": True,
+        "native_limit": {"type_index": 6},
+        "entities": [
+            {
+                "component": str(left),
+                "feature": "LimitPlane1",
+                "plane": {"point": [float(value) for value in point], "normal": [0.0, 0.0, 1.0]},
+            },
+            {
+                "component": str(right),
+                "feature": "LimitPlane2",
+                "plane": {"point": [float(value) for value in point], "normal": [0.0, 0.0, 1.0]},
+            },
+        ],
+    }
 
 
 def native_lock(members: Sequence[str], *, name: str = "board_rigid") -> dict:
@@ -1544,7 +1578,6 @@ def stage_discovery_inputs(
             "derivation": {
                 "main_assembly": "robot.SLDASM",
                 "configuration": "Default",
-                "frozen_names": {},
                 "record_roots": [],
             },
             "identity": {

@@ -19,7 +19,6 @@ from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
 )
-from ..interface_records import PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
@@ -44,7 +43,7 @@ def _number(value):
 
 def _all_zero_limits(limits) -> bool:
     return isinstance(limits, dict) and all(
-        _number(limits.get(key)) is not None and float(limits[key]) == 0.0
+        _number(limits.get(key)) and float(limits[key]) == 0.0
         for key in ("lower", "upper", "effort", "velocity")
     )
 
@@ -625,11 +624,9 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             limits=limits,
             invalid=invalid,
         )
-        policy_preview = False
         native_limits = []
-        controlled_limits = []
-        native_complete = False
-        if purpose == PURPOSE_INSPECTION_PREVIEW and joint["type"] == "revolute" and _all_zero_limits(limits):
+        native_complete = True
+        if joint["type"] in {"revolute", "prismatic"}:
             child = joint["child_link"]
             child_tree = {child}
             parents = state.get("parents") or {}
@@ -641,7 +638,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     break
                 child_tree = expanded_tree
             members = state.get("members") or {}
-            related_mates = []
             leaves = state.get("leaves") or set()
 
             def owner_for(component: str) -> str | None:
@@ -649,20 +645,11 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 owners = [body for body, body_members in members.items() if expanded and expanded <= body_members]
                 return owners[0] if len(owners) == 1 else None
 
-            native_complete = True
             raw_mates = raw.get("mates")
             if not isinstance(raw_mates, list) or not raw_mates:
                 native_complete = False
                 raw_mates = []
             limit_types = {"distance", "angle", "limitdistance", "limitangle"}
-            mate_properties = (raw.get("properties") or {}).get("mates") or {}
-            document_properties = (raw.get("properties") or {}).get("document") or {}
-            global_controlled = any(
-                isinstance(values, dict) and "dp.joint.limits_record" in values
-                for values in mate_properties.values()
-            ) or any(
-                isinstance(key, str) and key.endswith(".limits_record") for key in document_properties
-            )
             for mate in raw_mates:
                 if not isinstance(mate, dict):
                     native_complete = False
@@ -681,7 +668,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         native_complete = False
                         continue
                     if flag is True:
-                        if isinstance(mate.get("limits"), dict):
+                        if isinstance(mate.get("native_limit"), dict) and isinstance(mate.get("limits"), dict):
                             range_candidate = True
                         else:
                             native_complete = False
@@ -696,7 +683,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                                     "limits": mate["limits"],
                                 }
                             )
-                if (
+                if range_candidate and (
                     "limits" not in mate
                     or type(mate.get("error_code")) is not int
                     or mate["error_code"] != 0
@@ -727,7 +714,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 if (owners[0] in child_tree) == (owners[1] in child_tree):
                     continue
                 mate_name = str(mate.get("name") or "")
-                related_mates.append(mate_name)
                 if range_candidate:
                     native_limits.append(
                         {
@@ -737,61 +723,52 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                             "limits": mate["limits"],
                         }
                     )
-            for mate_name in related_mates:
-                if "dp.joint.limits_record" in (mate_properties.get(mate_name) or {}):
-                    controlled_limits.append(
-                        {
-                            "mate": mate_name,
-                            "reference": (mate_properties.get(mate_name) or {})["dp.joint.limits_record"],
-                        }
-                    )
-            prefix = f"dp.joint.{name}."
-            for key, value in document_properties.items():
-                if isinstance(key, str) and key.startswith(prefix) and key.endswith(".limits_record"):
-                    controlled_limits.append({"document": key, "reference": value})
-            if global_controlled:
-                controlled_limits.append({"scope": "all_native_mates", "reference": "dp.joint.limits_record"})
             if not native_complete:
                 raise DeclarationError(
-                    "v14.policy_preview_window_blocked",
-                    "the native/controlled range observation is incomplete; the exporter zero placeholder cannot be "
-                    "relabelled",
-                    {"joint": name, "native": native_limits, "controlled": controlled_limits},
+                    "v14.native_limits_unreadable",
+                    "the native range observation is incomplete or unreadable",
+                    {"joint": name, "native": native_limits},
                 )
-            if controlled_limits:
-                raise DeclarationError(
-                    "v14.policy_preview_window_blocked",
-                    "a controlled range reference is present but has not been independently resolved",
-                    {"joint": name, "controlled": controlled_limits},
-                )
-            policy_preview = not native_limits
-        if policy_preview:
-            radius = preview_revolute_window_rad()
-            limits = {
-                "lower": -radius,
-                "upper": radius,
-                "effort": raw_limits.get("effort", 0.0),
-                "velocity": raw_limits.get("velocity", 0.0),
+        if joint["type"] in {"revolute", "prismatic"}:
+            ranges = {
+                (float(item["limits"]["lower"]), float(item["limits"]["upper"]))
+                for item in native_limits
+                if isinstance(item.get("limits"), dict)
             }
-            state.setdefault("effective_limits", {})[name] = dict(limits)
-            state.setdefault("effective_limit_sources", {})[name] = "policy_preview_window"
-            diagnostics.append(
-                {
-                    "code": "v14.policy_preview_window",
-                    "blocking": False,
-                    "message": (
-                        "the exporter zero placeholder is replaced by the inspection-preview "
-                        "policy window because no native or controlled range was observed"
-                    ),
-                    "detail": {
-                        "joint": name,
-                        "declared_limits": raw_limits,
-                        "limits": dict(limits),
-                        "native_limit_observations": len(native_limits),
-                        "controlled_limit_observations": len(controlled_limits),
-                    },
+            if len(ranges) > 1:
+                raise DeclarationError(
+                    "v14.native_limits_conflict",
+                    "native range observations disagree for one joint",
+                    {"joint": name, "ranges": sorted(ranges)},
+                )
+            if ranges:
+                lower, upper = next(iter(ranges))
+                if not _all_zero_limits(limits) and (
+                    abs(float(limits["lower"]) - lower) > 1e-12
+                    or abs(float(limits["upper"]) - upper) > 1e-12
+                ):
+                    raise DeclarationError(
+                        "v14.native_limits_conflict",
+                        "native range disagrees with the saved author declaration",
+                        {"joint": name, "native": [lower, upper], "declared": raw_limits},
+                    )
+                limits = {
+                    "lower": lower,
+                    "upper": upper,
+                    "effort": raw_limits.get("effort"),
+                    "velocity": raw_limits.get("velocity"),
                 }
-            )
+                state.setdefault("effective_limits", {})[name] = dict(limits)
+                state.setdefault("effective_limit_sources", {})[name] = "native"
+            elif _all_zero_limits(raw_limits):
+                raise DeclarationError(
+                    "v14.native_limits_missing",
+                    "the CAD has no active working range and the saved declaration is only a zero placeholder",
+                    {"joint": name, "declared": raw_limits},
+                )
+            else:
+                state.setdefault("effective_limits", {})[name] = dict(limits)
+                state.setdefault("effective_limit_sources", {})[name] = "declared_author"
         unqualified = [key for key in ("effort", "velocity") if limits.get(key) == 0]
         if joint["type"] in {"revolute", "prismatic"} and limits.get("lower") == limits.get("upper"):
             unqualified.append("degenerate_position_range")
@@ -807,7 +784,11 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     "detail": {"joint": name, "values": unqualified, "limits": dict(limits)},
                 }
             )
-        return {"limits": limits, "declared_limits": raw_limits}
+        return {
+            "limits": limits,
+            "declared_limits": raw_limits,
+            "limit_source": state.get("effective_limit_sources", {}).get(name, "declared_author"),
+        }
 
     def joint_geometry(name, joint):
         parent, child = joint["parent_link"], joint["child_link"]

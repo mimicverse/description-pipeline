@@ -5580,63 +5580,9 @@ class SolidWorksBackend(CadBackend):
                             }
                         )
                     limits = None
-                    try:
-                        lower = float(_method(specific, "MinimumVariation"))
-                        upper = float(_method(specific, "MaximumVariation"))
-                    except Exception as error:  # noqa: BLE001
-                        raise CadError(
-                            "cad_mate_limits_unreadable",
-                            "mate travel variation could not be read",
-                            {"mate": name, "type": mate_type, "error": str(error)},
-                        ) from error
-                    if not (math.isfinite(lower) and math.isfinite(upper)):
-                        raise CadError("cad_mate_limits_invalid", "mate travel variation is not finite", {"mate": name})
-                    if upper < lower:
-                        raise CadError(
-                            "cad_mate_limits_invalid",
-                            "mate travel range is inverted",
-                            {"mate": name, "lower": lower, "upper": upper},
-                        )
                     is_advanced_mate = None
                     is_advanced_mate_error = None
                     is_advanced_mate_api = None
-                    if type_index in {5, 6}:
-                        # The documented IsAdvancedMate flag is the authority for
-                        # whether Minimum/Maximum variation is an active limit
-                        # mate. Keep its read result explicit; a missing flag is
-                        # never promoted to a numeric range by inference.
-                        try:
-                            definition = _method(feature, "GetDefinition")
-                            if definition is None:
-                                is_advanced_mate_error = "mate definition is null"
-                            else:
-                                iid = IANGLEMATEFEATUREDATA_IID if type_index == 6 else IDISTANCEMATEFEATUREDATA_IID
-                                bound = _interface(definition, iid)
-                                value = _member(bound, "IsAdvancedMate")
-                                if type(value) is bool:
-                                    is_advanced_mate = value
-                                    is_advanced_mate_api = (
-                                        f"{'IAngle' if type_index == 6 else 'IDistance'}MateFeatureData.IsAdvancedMate"
-                                    )
-                                else:
-                                    is_advanced_mate_error = f"unexpected value: {value!r}"
-                        except Exception as error:  # noqa: BLE001
-                            is_advanced_mate_error = f"{type(error).__name__}: {error}"[:240]
-                    if type_index in {5, 6}:
-                        # Minimum/MaximumVariation is meaningful only when the
-                        # documented IsAdvancedMate flag says this is a limit
-                        # mate.  True preserves a zero-span native range;
-                        # false/null never invents one.
-                        if is_advanced_mate is True:
-                            unit = "m" if type_index == 5 else "rad"
-                            limits = {"lower": lower, "upper": upper, "unit": unit}
-                            mate_type = "limitdistance" if type_index == 5 else "limitangle"
-                    elif upper > lower + 1e-12:
-                        raise CadError(
-                            "cad_mate_limits_invalid",
-                            "a bounded range on an unsupported mate type cannot be observed",
-                            {"mate": name, "type": mate_type},
-                        )
                     try:
                         suppressed = _method(feature, "IsSuppressed")
                         if type(suppressed) is not bool:
@@ -5657,6 +5603,111 @@ class SolidWorksBackend(CadBackend):
                             "mate solve state could not be read; the constraint cannot be trusted",
                             {"mate": name, "error": str(error)},
                         ) from error
+                    variation_lower = None
+                    variation_upper = None
+                    try:
+                        variation_lower = float(_member(specific, "MinimumVariation"))
+                        variation_upper = float(_member(specific, "MaximumVariation"))
+                    except Exception as error:  # noqa: BLE001
+                        if type_index in {5, 6} and suppressed is False and error_code == 0:
+                            raise CadError(
+                                "cad_mate_limits_unreadable",
+                                "mate travel variation could not be read",
+                                {"mate": name, "type": mate_type, "error": str(error)},
+                            ) from error
+                    if variation_lower is not None and variation_upper is not None and (
+                        not math.isfinite(variation_lower)
+                        or not math.isfinite(variation_upper)
+                        or variation_upper < variation_lower
+                    ):
+                        raise CadError(
+                            "cad_mate_limits_invalid",
+                            "mate travel variation is not finite and ordered",
+                            {"mate": name, "lower": variation_lower, "upper": variation_upper},
+                        )
+                    if type_index not in {5, 6} and (
+                        variation_lower not in {None, 0.0} or variation_upper not in {None, 0.0}
+                    ):
+                        raise CadError(
+                            "cad_mate_limits_invalid",
+                            "a bounded range on an unsupported mate type cannot be observed",
+                            {"mate": name, "type": mate_type},
+                        )
+                    native_limit = None
+                    if type_index in {5, 6} and error_code == 0:
+                        interface_prefix = "IAngle" if type_index == 6 else "IDistance"
+                        unit = "rad" if type_index == 6 else "m"
+                        names = (
+                            ("Angle", "MinimumAngle", "MaximumAngle")
+                            if type_index == 6
+                            else ("Distance", "MinimumDistance", "MaximumDistance")
+                        )
+                        try:
+                            definition = _method(feature, "GetDefinition")
+                            if definition is None:
+                                is_advanced_mate_error = "mate definition is null"
+                            else:
+                                iid = IANGLEMATEFEATUREDATA_IID if type_index == 6 else IDISTANCEMATEFEATUREDATA_IID
+                                bound = _interface(definition, iid)
+                                value = _member(bound, "IsAdvancedMate")
+                                if type(value) is bool:
+                                    is_advanced_mate = value
+                                    is_advanced_mate_api = f"{interface_prefix}MateFeatureData.IsAdvancedMate"
+                                else:
+                                    is_advanced_mate_error = f"unexpected value: {value!r}"
+                                if is_advanced_mate is True:
+                                    values = {}
+                                    for key in names:
+                                        raw_value = _member(bound, key)
+                                        parsed = float(raw_value)
+                                        if not math.isfinite(parsed):
+                                            raise ValueError(f"{key} is not finite")
+                                        values[key] = parsed
+                                    values["MinimumVariation"] = variation_lower
+                                    values["MaximumVariation"] = variation_upper
+                                    nominal, minimum, maximum = (values[key] for key in names)
+                                    lower = nominal + values["MinimumVariation"]
+                                    upper = nominal + values["MaximumVariation"]
+                                    if (
+                                        abs(lower - minimum) > 1e-12
+                                        or abs(upper - maximum) > 1e-12
+                                        or upper < lower
+                                    ):
+                                        raise ValueError("native variation and absolute limits disagree")
+                                    limits = {"lower": minimum, "upper": maximum, "unit": unit}
+                                    mate_type = "limitdistance" if type_index == 5 else "limitangle"
+                                    native_limit = {
+                                        "type_index": type_index,
+                                        "definition_interface": f"{interface_prefix}MateFeatureData",
+                                        "definition_interface_iid": iid,
+                                        "nominal_dimension": {
+                                            "value": nominal,
+                                            "api": f"{interface_prefix}MateFeatureData.{names[0]}",
+                                            "unit": unit,
+                                        },
+                                        "minimum_variation": {
+                                            "value": values["MinimumVariation"],
+                                            "api": "IMate2.MinimumVariation",
+                                            "unit": unit,
+                                        },
+                                        "maximum_variation": {
+                                            "value": values["MaximumVariation"],
+                                            "api": "IMate2.MaximumVariation",
+                                            "unit": unit,
+                                        },
+                                        "minimum_limit": {
+                                            "value": minimum,
+                                            "api": f"{interface_prefix}MateFeatureData.{names[1]}",
+                                            "unit": unit,
+                                        },
+                                        "maximum_limit": {
+                                            "value": maximum,
+                                            "api": f"{interface_prefix}MateFeatureData.{names[2]}",
+                                            "unit": unit,
+                                        },
+                                    }
+                        except Exception as error:  # noqa: BLE001
+                            is_advanced_mate_error = f"{type(error).__name__}: {error}"[:240]
                     mate_record = {
                         "name": name,
                         "type": mate_type,
@@ -5665,6 +5716,7 @@ class SolidWorksBackend(CadBackend):
                         "is_advanced_mate": is_advanced_mate,
                         "is_advanced_mate_error": is_advanced_mate_error,
                         "is_advanced_mate_api": is_advanced_mate_api,
+                        "native_limit": native_limit,
                         "entities": entities,
                         "error_code": error_code,
                         "scope": prefix or "",

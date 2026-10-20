@@ -30,8 +30,6 @@ from ..interface_records import (
     CHECK_POLICY_V1,
     PURPOSE_INSPECTION_PREVIEW,
     QUALIFICATION_SCHEMA,
-    preview_revolute_window_rad,
-    preview_sampling_interval_fraction,
     qualification_facts,
     validate_qualification,
 )
@@ -306,11 +304,9 @@ def _input(root, diagnostics=None):
         )
         carrier = declarations["carrier"]
         bodies, joints = carrier["bodies"], carrier["joints"]
-        frozen = (discovery_record.get("derivation") or {}).get("frozen_names") or {}
-        body_names = {
-            str(body["name"]): str(frozen.get(f"exporter:{body['name']}", body["name"]))
-            for body in bodies
-        }
+        from ..sources.solidworks.naming import carrier_names
+
+        body_names, joint_names = carrier_names(bodies, joints, str(carrier["root"]))
         for body in bodies:
             source_name = str(body["name"])
             body["source_name"] = source_name
@@ -321,18 +317,7 @@ def _input(root, diagnostics=None):
             joint["source_name"] = source_name
             joint["parent"] = body_names.get(str(joint["parent"]), str(joint["parent"]))
             joint["child"] = body_names.get(str(joint["child"]), str(joint["child"]))
-            joint["name"] = str(frozen.get(f"joint:{source_name}", source_name))
-            sign = frozen.get(f"axis_sign:{source_name}")
-            if sign == -1:
-                if isinstance(joint.get("axis"), list):
-                    joint["axis"] = [-float(value) for value in joint["axis"]]
-                limits = joint.get("limits")
-                if isinstance(limits, dict) and "lower" in limits and "upper" in limits:
-                    joint["limits"] = {
-                        **limits,
-                        "lower": -float(limits["upper"]),
-                        "upper": -float(limits["lower"]),
-                    }
+            joint["name"] = joint_names[source_name]
             joint["id"] = joint["name"]
         carrier["root"] = body_names.get(str(carrier.get("root")), carrier.get("root"))
         # The native interface interpretation is shared across the two modes: each mode
@@ -356,10 +341,8 @@ def _input(root, diagnostics=None):
         "Handoff and source record disagree on the configuration",
     )
     raw_identity = (discovery_record.get("raw") or {}).get("identity") or {}
-    frozen = (discovery_record.get("derivation") or {}).get("frozen_names") or {}
     robot_name = (
         raw_identity.get("robot_name")
-        or frozen.get("robot_name")
         or discovery_record.get("robot_name")
         or discovery_record.get("robot_name_technical")
     )
@@ -409,11 +392,11 @@ def _input(root, diagnostics=None):
             "assembly": identity["main_assembly"],
             "configuration": identity["configuration"],
             "robot_name": robot_name,
+            "robot_name_source": "cad" if raw_identity.get("robot_name") else "cad_filename_derived",
             "bodies": bodies,
             "joints": joints,
             "frames": frames,
             "material_source": material_source,
-            "interface_names": dict(frozen),
             "documented_masses": declared.get("items") or {},
             "mass_evidence": declared.get("evidence"),
         },
@@ -973,12 +956,10 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics):
         _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
-    if authored.get("limit_source") == "policy_preview_window":
-        radius = preview_revolute_window_rad()
-        _require(
-            authored["type"] == "revolute" and limits.get("lower") == -radius and limits.get("upper") == radius,
-            "The inspection-preview window does not equal the frozen policy radius",
-        )
+    _require(
+        authored.get("limit_source") in {"native", "declared_author"},
+        "Moving joint limits are not bound to a CAD native or author declaration",
+    )
     unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
         unqualified.append("degenerate_position_range")
@@ -1059,7 +1040,7 @@ def _joint_sample(joint, sign):
         f"Joint {joint['name']} has no usable ordered limits",
     )
     middle = (float(lower) + float(upper)) / 2
-    quarter = (float(upper) - float(lower)) / 4 * preview_sampling_interval_fraction()
+    quarter = (float(upper) - float(lower)) / 4
     return middle + sign * quarter
 
 
@@ -1088,7 +1069,7 @@ def _joint_combined_sample(joint, sign):
     )
     lower, upper = float(lower), float(upper)
     middle = (lower + upper) / 2
-    quarter = (upper - lower) / 4 * preview_sampling_interval_fraction()
+    quarter = (upper - lower) / 4
     if quarter == 0:
         _require(lower <= 0.0 <= upper, f"Joint {joint['name']} has a zero-width range that excludes its zero")
         return 0.0
@@ -1781,7 +1762,7 @@ def _engineering_status(fact_id: str, object_id: str, joints: dict, preview: boo
         return "unqualified"
     joint = joints.get(object_id) or {}
     if fact_id == "engineering_position_range":
-        return "established" if joint.get("limit_source") in ("native", "controlled") else "unqualified"
+        return "established" if joint.get("limit_source") in ("native", "declared_author") else "unqualified"
     limits = joint.get("limits") or {}
     return "established" if "effort" in limits and "velocity" in limits else "unqualified"
 
@@ -1827,9 +1808,11 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     model_links = {link["name"]: link for link in model["links"]}
     model_joints = {joint["name"]: joint for joint in model["joints"]}
     axes = evidence.axes(root)
-    frozen = (evidence.discovery(root).get("derivation") or {}).get("frozen_names") or {}
+    joint_sources = {
+        str(joint.get("source_name") or joint["name"]): joint["name"] for joint in source["joints"]
+    }
     axis_map = {
-        str(frozen.get(f"joint:{row['joint']}", row["joint"])): row
+        joint_sources.get(str(row["joint"]), str(row["joint"])): row
         for row in axes
     }
     for authored in source["joints"]:
@@ -1922,6 +1905,8 @@ def _policy(source, model):
 def _value_warning_gate(root, source, model):
     """Re-derive every non-native value warning from source facts and the model."""
 
+    from ..sources.solidworks.naming import material_name, mesh_path, visual_name
+
     warnings = (model.get("provenance") or {}).get("value_warnings")
     _require(isinstance(warnings, list), "Non-native value provenance warnings are missing")
     actual: dict[str, list[dict]] = {}
@@ -1940,51 +1925,11 @@ def _value_warning_gate(root, source, model):
         actual.setdefault(item["code"], []).extend(item["objects"])
         actual_messages.setdefault(item["code"], []).append(item["message"])
 
-    names = source.get("interface_names") or {}
-    registry = {
-        "exporter": [key.removeprefix("exporter:") for key in names if key.startswith("exporter:")],
-        "joint": [key.removeprefix("joint:") for key in names if key.startswith("joint:")],
-        "visual": [key.removeprefix("visual:") for key in names if key.startswith("visual:")],
-        "material": [key.removeprefix("material:") for key in names if key.startswith("material:")],
-        "mesh": [key.removeprefix("mesh:") for key in names if key.startswith("mesh:")],
-        "axis_sign": [key.removeprefix("axis_sign:") for key in names if key.startswith("axis_sign:")],
-    }
     bodies = source.get("bodies") or []
     joints = source.get("joints") or []
     links = model.get("links") or []
     model_joints = model.get("joints") or []
-    body_sources = {str(body.get("source_name") or body["name"]): body["name"] for body in bodies}
-    joint_sources = {str(joint.get("source_name") or joint["name"]): joint["name"] for joint in joints}
-    if registry["exporter"]:
-        _require(set(registry["exporter"]) <= set(body_sources), "Registered link names name unknown bodies")
-    if registry["joint"]:
-        _require(set(registry["joint"]) <= set(joint_sources), "Registered joint names name unknown joints")
-    shapes = [shape for link in links for shape in link.get("visuals") or []]
-    if registry["visual"]:
-        _require(
-            len(registry["visual"]) == len(shapes)
-            and {names[f"visual:{key}"] for key in registry["visual"]} == {shape["name"] for shape in shapes},
-            "Registered visual names do not cover the model visuals",
-        )
-    if registry["material"]:
-        _require(
-            Counter(str(names[f"material:{key}"]) for key in registry["material"])
-            == Counter(str(shape.get("material")) for shape in shapes)
-            and all(shape.get("material") for shape in shapes),
-            "Registered material names do not cover the model visuals",
-        )
-    if registry["mesh"]:
-        _require(
-            Counter(str(names[f"mesh:{key}"]).removeprefix("../") for key in registry["mesh"])
-            == Counter(str(shape.get("mesh_name")) for shape in shapes)
-            and all(shape.get("mesh_name") for shape in shapes),
-            "Registered mesh paths do not cover the model visuals",
-        )
-    for key in registry["axis_sign"]:
-        _require(key in joint_sources, "Registered axis sign names an unknown joint")
-        _require(names[f"axis_sign:{key}"] in {-1, 1}, "Registered axis sign must be -1 or 1")
-    if "robot_name" in names:
-        _require(names["robot_name"] == source["robot_name"], "Registered robot name differs from the source")
+    shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
 
     expected: dict[str, list[dict]] = {}
 
@@ -1995,76 +1940,110 @@ def _value_warning_gate(root, source, model):
         source_name = str(body.get("source_name") or body["name"])
         if source_name != body["name"]:
             add(
-                "naming.registered_interface",
+                "naming.formatted_interface",
                 {
                     "object_type": "link",
                     "object": body["name"],
                     "field": "name",
                     "actual": body["name"],
-                    "source": f"registered interface name for {source_name}",
+                    "source": f"CAD datum formatting for {source_name}",
+                    "original": source_name,
+                    "rule_id": "naming.interface",
+                    "rule_version": "naming-v1",
+                    "reason": "CAD datum formatting",
                 },
             )
     for joint in joints:
         source_name = str(joint.get("source_name") or joint["name"])
         if source_name != joint["name"]:
             add(
-                "naming.registered_interface",
+                "naming.formatted_interface",
                 {
                     "object_type": "joint",
                     "object": joint["name"],
                     "field": "name",
                     "actual": joint["name"],
-                    "source": f"registered interface name for {source_name}",
+                    "source": f"CAD reference-axis formatting for {source_name}",
+                    "original": source_name,
+                    "rule_id": "naming.interface",
+                    "rule_version": "naming-v1",
+                    "reason": "CAD reference-axis formatting",
                 },
             )
-    if registry["visual"] or registry["material"]:
-        for link in links:
-            for shape in link.get("visuals") or []:
-                add(
-                    "naming.registered_interface",
-                    {
-                        "object_type": "visual",
-                        "object": shape["name"],
-                        "field": "name",
-                        "actual": shape["name"],
-                        "source": "registered display name",
-                    },
-                )
-                if shape.get("material"):
-                    add(
-                        "naming.registered_interface",
-                        {
-                            "object_type": "material",
-                            "object": f"{link['name']}:{shape['name']}",
-                            "field": "material",
-                            "actual": shape["material"],
-                            "source": "registered display material",
-                        },
-                    )
-    if registry["mesh"]:
-        for shape in shapes:
-            current_sha256 = file_digest(confined(root / "evidence", str(shape.get("filename") or "")))
-            _require(shape.get("sha256") == current_sha256, "Mesh alias current digest differs from capture evidence")
-            add(
-                "naming.historical_mesh_alias",
-                {
-                    "object_type": "visual",
-                    "object": shape["name"],
-                    "field": "mesh filename",
-                    "actual": shape["mesh_name"],
-                    "source": "registered historical mesh label",
-                    "current_sha256": current_sha256,
-                },
-            )
-    if "robot_name" in names:
+    for link, shape in shapes:
+        provenance = shape.get("provenance") if isinstance(shape.get("provenance"), dict) else {}
+        native_component = str(provenance.get("native_component") or "")
+        _require(native_component, "Visual carries no native component identity")
+        _require(
+            shape.get("name") == visual_name(native_component, link=link["name"]),
+            "Visual name differs from the CAD-derived rule",
+        )
+        current_sha256 = file_digest(confined(root / "evidence", str(shape.get("filename") or "")))
+        _require(shape.get("sha256") == current_sha256, "Visual digest differs from capture evidence")
+        _require(
+            shape.get("mesh_name")
+            == mesh_path(current_sha256, semantic=visual_name(native_component, link=link["name"])),
+            "Mesh path differs from content addressing",
+        )
+        _require(
+            shape.get("material") == material_name(native_component, link=link["name"]),
+            "Material name differs from the CAD-derived rule",
+        )
         add(
-            "naming.registered_robot_name",
+            "naming.derived_visual",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "field": "name",
+                "actual": shape["name"],
+                "source": "native component identity formatting",
+                "original": native_component,
+                "rule_id": "naming.visual",
+                "rule_version": "naming-v1",
+                "reason": "native component identity formatting",
+            },
+        )
+        add(
+            "naming.content_addressed_mesh",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "field": "mesh filename",
+                "actual": shape["mesh_name"],
+                "source": "current capture content addressing",
+                "original": current_sha256,
+                "rule_id": "naming.mesh",
+                "rule_version": "naming-v1",
+                "reason": "current capture content addressing",
+            },
+        )
+        add(
+            "naming.derived_material",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "field": "material",
+                "actual": shape["material"],
+                "source": "native component identity formatting",
+                "original": native_component,
+                "rule_id": "naming.material",
+                "rule_version": "naming-v1",
+                "reason": "native component identity formatting",
+            },
+        )
+    if source.get("robot_name_source") == "cad_filename_derived":
+        add(
+            "naming.formatted_robot_name",
             {
                 "object_type": "robot",
                 "object": source["robot_name"],
                 "field": "name",
                 "actual": source["robot_name"],
-                "source": "registered engineering identity",
+                "source": "native top assembly filename formatting",
+                "original": source["robot_name"],
+                "rule_id": "naming.robot",
+                "rule_version": "naming-v1",
+                "reason": "native top assembly filename formatting",
             },
         )
     for link in links:
@@ -2122,53 +2101,7 @@ def _value_warning_gate(root, source, model):
                     "source": "native_derived",
                 },
             )
-    model_joint_by_name = {str(joint["name"]): joint for joint in model_joints}
-    for joint in joints:
-        if joint.get("limit_source") == "policy_preview_window":
-            add(
-                "limits.policy_preview_window",
-                {
-                    "object_type": "joint",
-                    "object": joint["name"],
-                    "field": "limits",
-                    "actual": model_joint_by_name[joint["name"]].get("limits"),
-                    "source": "policy_preview_window",
-                },
-            )
-        if joint.get("limit_source") in {"controlled", "declared_preview_window"}:
-            code = (
-                "limits.controlled_record"
-                if joint["limit_source"] == "controlled"
-                else "limits.declared_preview_window"
-            )
-            add(
-                code,
-                {
-                    "object_type": "joint",
-                    "object": joint["name"],
-                    "field": "limits",
-                    "actual": model_joint_by_name[joint["name"]].get("limits"),
-                    "source": joint["limit_source"],
-                },
-            )
-        source_name = str(joint.get("source_name") or joint["name"])
-        sign = names.get(f"axis_sign:{source_name}")
-        if sign in {-1, 1}:
-            add(
-                "axis.registered_sign_mapping",
-                {
-                    "object_type": "joint",
-                    "object": joint["name"],
-                    "field": "axis/limits",
-                    "actual": {
-                        "sign": sign,
-                        "axis": model_joint_by_name[joint["name"]].get("axis"),
-                        "limits": model_joint_by_name[joint["name"]].get("limits"),
-                    },
-                    "source": "registered signed-axis convention",
-                },
-            )
-    for shape in shapes:
+    for _link, shape in shapes:
         fields = ["scale"]
         actual_value = {"scale": shape.get("scale")}
         if shape.get("rgba"):
@@ -2189,29 +2122,15 @@ def _value_warning_gate(root, source, model):
         return Counter(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows)
 
     messages = {
-        "axis.registered_sign_mapping": (
-            "Joint axes and position bounds use a controlled sign mapping relative to the native declaration."
-        ),
         "geometry.derived_from_native": (
             "Geometry, frame transforms and signed joint axes are derived from native evidence."
         ),
         "display.constant": "Display scale and material color are platform constants, not CAD readings.",
-        "limits.policy_preview_window": (
-            "Joint limits are inspection-preview policy values, not native or controlled engineering limits."
-        ),
-        "limits.controlled_record": "Joint limits come from a controlled external record, not a direct CAD reading.",
-        "limits.declared_preview_window": (
-            "Joint limits come from a declared inspection-preview window, not a mechanical or native limit."
-        ),
-        "naming.historical_mesh_alias": (
-            "Mesh paths use controlled historical labels; the manifest current SHA-256 is the content identity."
-        ),
-        "naming.registered_interface": (
-            "Delivered names or display values come from a registered naming mapping."
-        ),
-        "naming.registered_robot_name": (
-            "The robot name comes from the registered engineering identity because the CAD declaration is absent."
-        ),
+        "naming.formatted_interface": "Link and joint names are deterministic formatting of native CAD identities.",
+        "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
+        "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
+        "naming.derived_material": "Material names are derived from the owner link and native component identity.",
+        "naming.formatted_robot_name": "The robot name is formatted from the native top-assembly filename.",
         "physics.derived_from_native": (
             "Link mass properties are transformed, translated or recombined from native readings."
         ),

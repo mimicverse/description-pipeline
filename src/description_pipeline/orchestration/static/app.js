@@ -1547,12 +1547,8 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   const limits = jointRows(records ? records.joints : []);
   const fmt = (value, digits) => (Number.isFinite(value) ? value.toFixed(digits) : "not provided");
   const modelJoints = new Map(((data.robot && data.robot.joints) || []).map((joint) => [joint.name, joint]));
-  const windowLabel = "inspection/preview analysis window, not a mechanical limit";
   const absentDrive = "not provided (drive capability not established)";
-  const sourceLabel = (source) =>
-    source === "policy_preview_window" || source === "declared_preview_window"
-      ? `${source} (${windowLabel})`
-      : source || "not recorded";
+  const sourceLabel = (source) => source || "not recorded";
   fillPanelTable(
     $("panel-limits"),
     ["Joint", "Type", "Lower", "Upper", "Effort", "Velocity", "Axis (xyz)", "Limit source"],

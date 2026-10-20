@@ -69,6 +69,7 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.link_name_missing": "Rigid-body coordinate system is unidentified",
     "discovery.joint_unsupported_pattern": "Recorded constraints do not identify a one-DOF joint",
     "discovery.joint_axis_sign_missing": "dp.joint.axis_sign (+/-1) is missing",
+    "discovery.interface_name_invalid": "CAD interface name was normalized with a warning",
     "discovery.joint_axis_selector_missing": "No readable joint-axis selector",
     "discovery.mate_entities_unsupported": "Mate entity combination is not supported",
     "discovery.mate_geometry_mismatch": "Recorded mate geometry conflicts with the constraint",
@@ -91,6 +92,8 @@ _DISCOVERY_CODE_LABELS = {
 
 #: Readable names for verifier diagnostics carried on check details (recorded warnings).
 _DIAGNOSTIC_CODE_LABELS = {
+    "naming.derived_material": "Material name derived from CAD identity (diagnostic)",
+    "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
     "v14.mate_inference_unavailable": "Mate inference unavailable (diagnostic)",
     "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",
@@ -252,11 +255,9 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         }
     if name == "discovery.inputs":
         return {
-            "scope": "Frozen files and name registry",
-            "expected": "Frozen inventory agrees with the name registry",
-            "actual": (
-                f"Inventory {_short(details.get('files_sha256'))}; names {_short(details.get('frozen_names_sha256'))}"
-            ),
+            "scope": "Frozen files and derived interface names",
+            "expected": "Frozen inventory agrees with the CAD-derived interface names",
+            "actual": f"Inventory {_short(details.get('files_sha256'))}",
         }
     if name == "discovery.definition":
         findings = details.get("findings")

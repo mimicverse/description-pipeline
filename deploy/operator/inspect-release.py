@@ -33,7 +33,6 @@ print(
             "targets": sorted(config["pipeline"].get("targets", {})),
             "discovery_keys": sorted(config["pipeline"].get("discovery", {})),
             "discovery_record_roots_count": len(config["pipeline"].get("discovery", {}).get("record_roots", [])),
-            "frozen_names_configured": bool(config["pipeline"].get("discovery", {}).get("frozen_names_file")),
         },
         ensure_ascii=False,
     )

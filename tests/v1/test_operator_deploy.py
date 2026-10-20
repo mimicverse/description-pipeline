@@ -360,7 +360,7 @@ class RenderTests(unittest.TestCase):
             root = Path(tmp)
             state = root / "state"
             settings = root / "discovery.json"
-            expected = {"record_roots": [str(root / "records")], "frozen_names_file": str(root / "names.json")}
+            expected = {"record_roots": [str(root / "records")]}
             settings.write_text(json.dumps(expected))
             settings.chmod(0o600)
             rendered = render(state, DISCOVERY_SETTINGS_FILE=str(settings))
