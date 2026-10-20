@@ -470,6 +470,7 @@ def source_claims():
                 "child": "tool",
                 "axis": [0, 1, 0],
                 "limits": {"lower": -1.5, "upper": 1.5, "effort": 5, "velocity": 2},
+                "limit_source": "native",
                 "axis_reference": {"kind": "reference_axis", "component": "", "feature_name": "shaft"},
             }
         ],
@@ -757,6 +758,13 @@ class NativeDeclarationsTests(unittest.TestCase):
         report = verify_declarations(fixture(), source_claims())
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["members"]["tool"], ["module-1/bracket", "module-1/tool_part"])
+
+    def test_native_limit_entities_must_span_the_declared_joint_sides(self):
+        raw = fixture()
+        raw["mates"][0]["entities"][1]["component"] = "base_part"
+        report = verify_declarations(raw, source_claims())
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_unreadable", {item["code"] for item in report["errors"]})
 
     def test_unresolved_internal_mates_do_not_refute_explicit_membership(self):
         raw = fixture()

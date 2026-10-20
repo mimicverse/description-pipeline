@@ -19,7 +19,7 @@ from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
 )
-from ..sources.solidworks.native_limits import validate_native_limit
+from ..sources.solidworks.native_limits import validate_limit_entity_topology, validate_native_limit
 from ..sources.solidworks.direction import canonicalize_axis
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
@@ -722,6 +722,11 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         if unit != expected_unit:
                             native_complete = False
                             continue
+                        try:
+                            validate_limit_entity_topology(mate, owner_for, child_tree)
+                        except ValueError:
+                            native_complete = False
+                            continue
                         if isinstance(mate.get("native_limit"), dict) and isinstance(mate.get("limits"), dict):
                             range_candidate = True
                         else:
@@ -1034,6 +1039,14 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     "generated joint axis or operating values differ",
                     joint=name,
                 )
+                if saved["type"] in {"revolute", "prismatic"}:
+                    expected_source = state.get("effective_limit_sources", {}).get(name, "declared_author")
+                    _require(
+                        observed.get("limit_source", "declared_author") == expected_source,
+                        "v14.claims",
+                        "generated joint limit source differs from native evidence",
+                        joint=name,
+                    )
         return {"bodies": len(bodies), "joints": len(joints)}
 
     if check("declarations.binding", boundary) and check("declarations.topology", topology):

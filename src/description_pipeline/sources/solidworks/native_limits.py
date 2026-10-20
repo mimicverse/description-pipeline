@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 NATIVE_LIMIT_KEYS = frozenset(
     {
@@ -81,6 +81,35 @@ def _binding(entity, index: int) -> tuple[str, str | None, int | None]:
         feature if isinstance(feature, str) and feature else None,
         face_index if type(face_index) is int else None,
     )
+
+
+def validate_limit_entity_topology(
+    mate: Mapping,
+    owner_for: Callable[[str], str | None],
+    child_tree: set[str],
+) -> tuple[str, str]:
+    """Prove the two limit entities sit on opposite sides of the joint.
+
+    ``owner_for`` maps one raw component occurrence to exactly one declared
+    body; ``child_tree`` is the declared child body plus its descendants.  One
+    entity must be inside that subtree and the other outside it.  A syntactically
+    complete mate that connects two occurrences on the same side is not a limit
+    for this joint.
+    """
+
+    entities = mate.get("entities")
+    if not isinstance(entities, list) or len(entities) != 2:
+        raise ValueError("native limit must bind exactly two mate entities")
+    owners: list[str] = []
+    for entity in entities:
+        component = entity.get("component") if isinstance(entity, Mapping) else None
+        owner = owner_for(component) if isinstance(component, str) and component else None
+        if owner is None:
+            raise ValueError("native limit entity is not owned by exactly one declared body")
+        owners.append(owner)
+    if (owners[0] in child_tree) == (owners[1] in child_tree):
+        raise ValueError("native limit entities do not span the declared parent/child subtrees")
+    return owners[0], owners[1]
 
 
 def validate_native_limit(

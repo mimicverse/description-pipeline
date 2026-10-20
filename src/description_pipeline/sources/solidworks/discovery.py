@@ -74,7 +74,7 @@ from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
-from .native_limits import validate_native_limit
+from .native_limits import validate_limit_entity_topology, validate_native_limit
 from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
@@ -3039,6 +3039,30 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
         for item in record.get("components") or []
         if isinstance(item, dict) and isinstance(item.get("name2"), str)
     }
+    children: dict[str, set[str]] = {}
+    for link in declaration["links"]:
+        if link["parent"] is not None:
+            children.setdefault(str(link["parent"]), set()).add(str(link["name"]))
+    component_owners: dict[str, set[str]] = {}
+    for body in bodies:
+        for component in {*body.get("owners", []), *body.get("components", [])}:
+            component_owners.setdefault(str(component), set()).add(str(body["name"]))
+
+    def child_tree(root: str) -> set[str]:
+        result = {root}
+        frontier = [root]
+        while frontier:
+            current = frontier.pop()
+            for child in children.get(current, set()):
+                if child not in result:
+                    result.add(child)
+                    frontier.append(child)
+        return result
+
+    def owner_for(component: str) -> str | None:
+        owners = component_owners.get(component, set())
+        return next(iter(owners)) if len(owners) == 1 else None
+
     joints = []
     for link in declaration["links"]:
         if link["parent"] is None:
@@ -3065,6 +3089,7 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 )
             )
         child, parent = by_name[link["name"]], by_name[link["parent"]]
+        subtree = child_tree(str(child["name"]))
         _exporter_origin(declared, child, parent, record, findings)
         axis, selector = ({"point": None, "direction": None, "source": "exporter"}, None)
         if kind != "fixed":
@@ -3121,6 +3146,11 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                     continue
                 try:
                     lower, upper, unit = validate_native_limit(mate, component_records)
+                except ValueError as error:
+                    native_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
+                try:
+                    validate_limit_entity_topology(mate, owner_for, subtree)
                 except ValueError as error:
                     native_errors.append({"mate": mate.get("name"), "reason": str(error)})
                     continue

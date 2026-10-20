@@ -5,7 +5,10 @@ from __future__ import annotations
 import copy
 import unittest
 
-from description_pipeline.sources.solidworks.native_limits import validate_native_limit
+from description_pipeline.sources.solidworks.native_limits import (
+    validate_limit_entity_topology,
+    validate_native_limit,
+)
 
 from . import support
 
@@ -64,6 +67,18 @@ class NativeLimitValidationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "configuration"):
             validate_native_limit(mate, components)
+
+    def test_entities_must_span_parent_and_child_subtrees(self) -> None:
+        mate = support.native_limit_mate("base-1", "arm-1")
+        owners = {"base-1": "base", "arm-1": "arm"}
+        self.assertEqual(
+            validate_limit_entity_topology(mate, owners.get, {"arm"}),
+            ("base", "arm"),
+        )
+        same_side = copy.deepcopy(mate)
+        same_side["entities"][1]["component"] = "base-1"
+        with self.assertRaisesRegex(ValueError, "span"):
+            validate_limit_entity_topology(same_side, owners.get, {"arm"})
 
 
 if __name__ == "__main__":
