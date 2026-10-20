@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.native import SolidWorksBackend, normalize_document_path
@@ -19,24 +20,50 @@ CAPTURE_ROOT = normalize_document_path(os.path.abspath(PATH)).rsplit("\\", 2)[0]
 
 
 class _Configuration:
-    def __init__(self, name="默认"):
+    def __init__(self, name="默认", needs_rebuild=False):
         self.Name = name
+        self.NeedsRebuild = needs_rebuild
 
 
 class _ConfigurationManager:
-    def __init__(self, name="默认"):
-        self.ActiveConfiguration = _Configuration(name)
+    def __init__(self, name="默认", needs_rebuild=False):
+        self.ActiveConfiguration = _Configuration(name, needs_rebuild)
+
+
+class _Extension:
+    def __init__(self, doc):
+        self._doc = doc
+
+    @property
+    def NeedsRebuild2(self):
+        return self._doc.needs_rebuild2
 
 
 class _Doc:
     """Mimics the observed COM behaviour: ForceRebuild3 revokes later members."""
 
-    def __init__(self, path, *, revoke=False, configuration="默认"):
+    def __init__(
+        self,
+        path,
+        *,
+        revoke=False,
+        configuration="默认",
+        needs_rebuild2=0,
+        configuration_needs_rebuild=False,
+        read_only=True,
+    ):
         self._path = path
         self._revoked = False
         self._configuration = configuration
+        self._configuration_needs_rebuild = configuration_needs_rebuild
+        self._read_only = read_only
         self._revoke = revoke
+        self.needs_rebuild2 = needs_rebuild2
         self.rebuild_calls = 0
+
+    @property
+    def Extension(self):
+        return _Extension(self)
 
     @property
     def GetPathName(self):
@@ -50,16 +77,21 @@ class _Doc:
 
     @property
     def IsOpenedReadOnly(self):
-        return True
+        return self._read_only
 
     @property
     def ConfigurationManager(self):
-        return _ConfigurationManager(self._configuration)
+        return _ConfigurationManager(
+            self._configuration,
+            self._configuration_needs_rebuild,
+        )
 
     def ForceRebuild3(self, flag):
         self.rebuild_calls += 1
         if self._revoke:
             self._revoked = True
+        else:
+            self.needs_rebuild2 = 0
         return True
 
 
@@ -86,8 +118,12 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
     def test_rebuild_refreshes_the_document_handle_in_the_owned_session(self):
         refreshed = _Doc(PATH)
         backend = _Backend(lambda: refreshed)
-        doc = _Doc(PATH, revoke=True)
-        refreshed_doc, preparation = backend._rebuild_capture_copy(doc, PATH)
+        doc = _Doc(PATH, revoke=True, needs_rebuild2=1)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ):
+            refreshed_doc, preparation = backend._rebuild_capture_copy(doc, PATH)
         self.assertIs(refreshed_doc, refreshed)
         self.assertIsInstance(preparation, dict)
         self.assertEqual(doc.rebuild_calls, 1)
@@ -95,12 +131,21 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertEqual(preparation["document"], PATH)
         self.assertEqual(preparation["configuration"], "默认")
         self.assertIs(preparation["read_only"], True)
+        self.assertIs(preparation["rebuild_performed"], True)
+        self.assertEqual(preparation["needs_rebuild2_before"], 1)
+        self.assertEqual(preparation["needs_rebuild2_after"], 0)
         self.assertIs(preparation["save_flag_after"], False)
 
     def test_missing_document_after_rebuild_fails_closed_without_reopen(self):
         backend = _Backend(CadError("document_not_open", "gone"))
-        with self.assertRaises(CadError) as caught:
-            backend._rebuild_capture_copy(_Doc(PATH, revoke=True), PATH)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(
+                _Doc(PATH, revoke=True, needs_rebuild2=1),
+                PATH,
+            )
         self.assertEqual(caught.exception.code, "document_not_open")
         self.assertEqual(backend.refresh_calls, [PATH])
 
@@ -115,10 +160,119 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
 
     def test_configuration_change_across_rebuild_is_rejected(self):
         backend = _Backend(lambda: _Doc(PATH, configuration="Other"))
-        with self.assertRaises(CadError) as caught:
-            backend._rebuild_capture_copy(_Doc(PATH), PATH)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(
+                _Doc(PATH, needs_rebuild2=1),
+                PATH,
+            )
         self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
         self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_clean_saved_state_skips_rebuild_and_preserves_source(self):
+        backend = _Backend(lambda: self.fail("clean state must not refresh the handle"))
+        doc = _Doc(PATH, needs_rebuild2=0)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="b" * 64,
+        ) as digest:
+            prepared, evidence = backend._rebuild_capture_copy(doc, PATH)
+        self.assertIs(prepared, doc)
+        self.assertFalse(evidence["rebuild_performed"])
+        self.assertEqual(evidence["needs_rebuild2_before"], 0)
+        self.assertEqual(evidence["needs_rebuild2_after"], 0)
+        self.assertEqual(evidence["source_sha256_before"], "b" * 64)
+        self.assertEqual(evidence["source_sha256_after"], "b" * 64)
+        self.assertEqual(digest.call_count, 2)
+        self.assertEqual(doc.rebuild_calls, 0)
+        self.assertEqual(backend.refresh_calls, [])
+
+    def test_nonzero_rebuild_state_does_not_skip_the_rebuild(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        doc = _Doc(PATH, needs_rebuild2=2)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="c" * 64,
+        ):
+            _, evidence = backend._rebuild_capture_copy(doc, PATH)
+        self.assertTrue(evidence["rebuild_performed"])
+        self.assertEqual(evidence["needs_rebuild2_before"], 2)
+        self.assertEqual(evidence["needs_rebuild2_after"], 0)
+        self.assertEqual(doc.rebuild_calls, 1)
+        self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_unknown_rebuild_state_is_rejected_before_mutation(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        doc = _Doc(PATH, needs_rebuild2=None)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="d" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_state_unreadable")
+        self.assertEqual(doc.rebuild_calls, 0)
+        self.assertEqual(backend.refresh_calls, [])
+
+    def test_capture_copy_must_be_explicitly_read_only(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        doc = _Doc(PATH, needs_rebuild2=0, read_only=False)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="e" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_not_read_only")
+        self.assertEqual(doc.rebuild_calls, 0)
+
+    def test_clean_document_still_requires_a_rebuilt_configuration(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        doc = _Doc(
+            PATH,
+            needs_rebuild2=0,
+            configuration_needs_rebuild=True,
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="e" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(doc.rebuild_calls, 0)
+
+    def test_unreadable_source_digest_blocks_capture(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        doc = _Doc(PATH, needs_rebuild2=0)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            side_effect=OSError("unreadable"),
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_source_unreadable")
+        self.assertEqual(doc.rebuild_calls, 0)
+
+    def test_rebuild_must_end_fully_rebuilt(self):
+        backend = _Backend(lambda: _Doc(PATH, needs_rebuild2=1))
+        doc = _Doc(PATH, needs_rebuild2=1)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(doc.rebuild_calls, 1)
+        self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_rebuild_cannot_change_source_bytes(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        doc = _Doc(PATH, needs_rebuild2=1)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            side_effect=("1" * 64, "2" * 64),
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_source_changed")
 
 
 if __name__ == "__main__":

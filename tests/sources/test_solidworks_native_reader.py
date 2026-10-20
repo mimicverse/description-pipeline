@@ -314,11 +314,19 @@ class _PropertyManager:
 
 
 class _Extension:
-    def __init__(self, scopes, coordinate_systems=None, manager=_AUTO, scope_managers=None):
+    def __init__(
+        self,
+        scopes,
+        coordinate_systems=None,
+        manager=_AUTO,
+        scope_managers=None,
+        needs_rebuild2=0,
+    ):
         self._scopes = scopes
         self._coordinate_systems = dict(coordinate_systems or {})
         self._manager = manager
         self._scope_managers = dict(scope_managers or {})
+        self.NeedsRebuild2 = needs_rebuild2
 
     def CustomPropertyManager(self, scope):
         if scope in self._scope_managers:
@@ -348,7 +356,11 @@ class _ConfigurationManager:
             GetPathName=lambda: self._doc._path,
             GetChildren=lambda: list(self._doc.children_for(name)),
         )
-        return types.SimpleNamespace(Name=name, GetRootComponent3=lambda _visible: root)
+        return types.SimpleNamespace(
+            Name=name,
+            NeedsRebuild=False,
+            GetRootComponent3=lambda _visible: root,
+        )
 
 
 class _Doc:
@@ -371,6 +383,7 @@ class _Doc:
         doc_type=1,
         show_success=True,
         show_effect=True,
+        needs_rebuild2=0,
         custom_property_manager=_AUTO,
         scope_managers=None,
     ):
@@ -385,7 +398,13 @@ class _Doc:
         scopes = {"": dict(properties or {})}
         for name, values in (configuration_properties or {}).items():
             scopes[name] = dict(values)
-        self.Extension = _Extension(scopes, coordinate_systems, custom_property_manager, scope_managers)
+        self.Extension = _Extension(
+            scopes,
+            coordinate_systems,
+            custom_property_manager,
+            scope_managers,
+            needs_rebuild2,
+        )
         self.ConfigurationManager = _ConfigurationManager(self)
         self._first_feature = first_feature
 
@@ -409,6 +428,7 @@ class _Doc:
         return os.path.basename(self._path)
 
     def ForceRebuild3(self, _force):
+        self.Extension.NeedsRebuild2 = 0
         return True
 
     def GetType(self):
@@ -2462,7 +2482,12 @@ class CaptureSceneTests(unittest.TestCase):
                 def GetSaveFlag(self):
                     return False
 
-            first = RebuildableDoc(assembly, doc_type=2, children=[component])
+            first = RebuildableDoc(
+                assembly,
+                doc_type=2,
+                children=[component],
+                needs_rebuild2=1,
+            )
             refreshed = RebuildableDoc(assembly, doc_type=2, children=[component], configuration="Other")
 
             class ConfigChangingBackend(_CaptureBackend):

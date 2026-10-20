@@ -3614,26 +3614,118 @@ class SolidWorksBackend(CadBackend):
                 {"path": path, "document": document},
             )
         configuration = _active_configuration(doc)
-        before = bool(_member(doc, "GetSaveFlag"))
+        if not configuration:
+            raise CadError(
+                "cad_configuration_mismatch",
+                "Collected capture copy has no active configuration",
+                {"path": path},
+            )
+        state_before = _discovery_document_state(doc)
+        if state_before.get("read_only") is not True:
+            raise CadError(
+                "cad_capture_not_read_only",
+                "Collected capture copy must be explicitly read-only",
+                {"path": path, "state": state_before},
+            )
+        needs_rebuild = state_before.get("needs_rebuild2_value")
+        if type(needs_rebuild) is not int or needs_rebuild not in (0, 1, 2):
+            raise CadError(
+                "cad_rebuild_state_unreadable",
+                "Collected capture copy has no valid native rebuild state",
+                {"path": path, "state": state_before},
+            )
+        if type(state_before.get("configuration_needs_rebuild")) is not bool:
+            raise CadError(
+                "cad_rebuild_state_unreadable",
+                "Collected capture configuration has no valid rebuild state",
+                {"path": path, "state": state_before},
+            )
+        try:
+            source_sha256_before = _hash(path)
+        except OSError as error:
+            raise CadError(
+                "cad_capture_source_unreadable",
+                "Collected capture source digest could not be read",
+                {"path": path, "error": str(error)},
+            ) from error
+
+        rebuilt = needs_rebuild in (1, 2)
         # Reopened assemblies can have resolved solid components but an empty
-        # mass cache. Rebuild the owned read-only copy before ANY measurements,
-        # not just a failed mass reading. Never save the rebuilt document.
-        if not _member(doc, "ForceRebuild3", False):
-            raise CadError("cad_rebuild_failed", "Collected assembly did not rebuild successfully", {"path": path})
-        # Rebuild can replace model-document handles. Resolve the same open
-        # document once, verify the state, and hand the proven handle back with
-        # the serializable metadata so callers never re-acquire it.
-        doc = self._document_by_path(path)
+        # mass cache. A document explicitly marked as fully rebuilt already has
+        # the saved representation to capture: rebuilding it again changes
+        # native tessellation and physical read-back state. Rebuild only the
+        # documented non-zero states; never save either path.
+        if rebuilt:
+            if not _member(doc, "ForceRebuild3", False):
+                raise CadError(
+                    "cad_rebuild_failed",
+                    "Collected assembly did not rebuild successfully",
+                    {"path": path},
+                )
+            # Rebuild can replace model-document handles. Resolve the same open
+            # document once, verify the state, and hand the proven handle back
+            # with the serializable metadata so callers never re-acquire it.
+            doc = self._document_by_path(path)
+
+        state_after = _discovery_document_state(doc)
+        document_after = str(_member(doc, "GetPathName") or "")
+        if not document_after or not document_paths_match(document_after, path):
+            raise CadError(
+                "cad_document_identity",
+                "Capture preparation changed document identity",
+                {"path": path, "document": document_after},
+            )
         if _active_configuration(doc) != configuration:
-            raise CadError("cad_configuration_mismatch", "Capture rebuild changed the selected configuration")
+            raise CadError(
+                "cad_configuration_mismatch",
+                "Capture preparation changed the selected configuration",
+                {"expected": configuration, "actual": _active_configuration(doc)},
+            )
+        if (
+            state_after.get("needs_rebuild2_value") != 0
+            or state_after.get("configuration_needs_rebuild") is not False
+            or state_after.get("read_only") is not True
+        ):
+            raise CadError(
+                "cad_rebuild_incomplete",
+                "Capture preparation did not end in a fully rebuilt read-only state",
+                {"path": path, "rebuilt": rebuilt, "state": state_after},
+            )
+        try:
+            source_sha256_after = _hash(path)
+        except OSError as error:
+            raise CadError(
+                "cad_capture_source_unreadable",
+                "Prepared capture source digest could not be read",
+                {"path": path, "error": str(error)},
+            ) from error
+        if source_sha256_after != source_sha256_before:
+            raise CadError(
+                "cad_capture_source_changed",
+                "Capture preparation changed the collected source bytes",
+                {"path": path, "before": source_sha256_before, "after": source_sha256_after},
+            )
         return doc, {
-            "used_api": "IModelDoc2.ForceRebuild3(False)",
+            "used_api": (
+                "IModelDocExtension.NeedsRebuild2/"
+                "IConfiguration.NeedsRebuild/"
+                "IModelDoc2.ForceRebuild3(False)"
+                if rebuilt
+                else "IModelDocExtension.NeedsRebuild2/IConfiguration.NeedsRebuild"
+            ),
             "scope": "collected_copy_in_memory",
             "document": document,
             "configuration": configuration,
             "read_only": bool(_member(doc, "IsOpenedReadOnly")),
             "saved_to_disk": False,
-            "save_flag_before": before,
+            "rebuild_performed": rebuilt,
+            "needs_rebuild2_before": state_before.get("needs_rebuild2_value"),
+            "needs_rebuild2_after": state_after.get("needs_rebuild2_value"),
+            "configuration_needs_rebuild_before": state_before.get("configuration_needs_rebuild"),
+            "configuration_needs_rebuild_after": state_after.get("configuration_needs_rebuild"),
+            "source_sha256_before": source_sha256_before,
+            "source_sha256_after": source_sha256_after,
+            "save_flag_before": bool(state_before.get("save_flag")),
             "save_flag_after": bool(_member(doc, "GetSaveFlag")),
         }
 
