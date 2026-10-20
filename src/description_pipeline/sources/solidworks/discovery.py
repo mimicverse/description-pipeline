@@ -2754,6 +2754,17 @@ def _exporter_controlled_limit_reference(record: dict, joint_name: str) -> bool:
     return False
 
 
+def _exporter_any_controlled_limit_reference(record: dict) -> bool:
+    properties = record.get("properties") or {}
+    return any(
+        isinstance(key, str) and key.endswith(".limits_record")
+        for key in (properties.get("document") or {})
+    ) or any(
+        isinstance(values, dict) and f"{NAMESPACE}.joint.limits_record" in values
+        for values in (properties.get("mates") or {}).values()
+    )
+
+
 def _exporter_native_range_observation(
     record: dict,
     declaration: dict,
@@ -2814,6 +2825,8 @@ def _exporter_native_range_observation(
             or mate["error_code"] != 0
         ):
             complete = False
+        if not range_candidate and mate.get("limits") is None:
+            continue
         entities = mate.get("entities")
         if not isinstance(entities, list) or len(entities) != 2:
             if range_candidate:
@@ -2853,6 +2866,7 @@ def _exporter_preview_limits(
     """Use the policy window only for exporter zero placeholders with no range evidence."""
 
     radius = preview_revolute_window_rad()
+    any_controlled = _exporter_any_controlled_limit_reference(record)
     for joint in joints:
         declared = joint.get("limits")
         name = str(joint["name"])
@@ -2860,7 +2874,11 @@ def _exporter_preview_limits(
             continue
         if native_limits.get(name):
             continue
-        if not native_complete.get(name, False) or _exporter_controlled_limit_reference(record, name):
+        if (
+            not native_complete.get(name, False)
+            or any_controlled
+            or _exporter_controlled_limit_reference(record, name)
+        ):
             findings.append(
                 _finding(
                     "discovery.joint_limits_policy_blocked",

@@ -936,7 +936,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertNotIn("v14.policy_preview_window", {item["code"] for item in native_report["diagnostics"]})
 
         controlled = copy.deepcopy(raw)
-        controlled["properties"] = {"document": {"dp.joint.hinge.limits_record": "range.json#hinge"}}
+        controlled["properties"] = {"mates": {"observed_mate": {"dp.joint.limits_record": "range.json#hinge"}}}
         controlled_report = verify_declarations(controlled, purpose=PURPOSE_INSPECTION_PREVIEW)
         self.assertFalse(controlled_report["passed"])
         self.assertIn("v14.policy_preview_window_blocked", {item["code"] for item in controlled_report["errors"]})
@@ -952,9 +952,11 @@ class NativeDeclarationsTests(unittest.TestCase):
         incomplete["mates"] = [
             {
                 "name": "incomplete_limit_evidence",
-                "type": "concentric",
+                "type": "limitangle",
                 "suppressed": False,
                 "error_code": 0,
+                "is_advanced_mate": True,
+                "limits": {"lower": 0.0, "upper": 0.0, "unit": "rad"},
                 "entities": [{"component": "base_part"}],
             }
         ]

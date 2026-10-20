@@ -655,6 +655,14 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 native_complete = False
                 raw_mates = []
             limit_types = {"distance", "angle", "limitdistance", "limitangle"}
+            mate_properties = (raw.get("properties") or {}).get("mates") or {}
+            document_properties = (raw.get("properties") or {}).get("document") or {}
+            global_controlled = any(
+                isinstance(values, dict) and "dp.joint.limits_record" in values
+                for values in mate_properties.values()
+            ) or any(
+                isinstance(key, str) and key.endswith(".limits_record") for key in document_properties
+            )
             for mate in raw_mates:
                 if not isinstance(mate, dict):
                     native_complete = False
@@ -699,10 +707,12 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     native_limits.append(
                         {"mate": str(mate.get("name") or "unknown"), "type": mate_type, "limits": mate["limits"]}
                     )
-                if mate.get("limits") is None:
+                if not range_candidate and mate.get("limits") is None:
                     continue
                 entities = mate.get("entities")
                 if not isinstance(entities, list) or len(entities) != 2:
+                    if range_candidate:
+                        native_complete = False
                     continue
                 owners = []
                 for entity in entities:
@@ -727,8 +737,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                             "limits": mate["limits"],
                         }
                     )
-            mate_properties = (raw.get("properties") or {}).get("mates") or {}
-            document_properties = (raw.get("properties") or {}).get("document") or {}
             for mate_name in related_mates:
                 if "dp.joint.limits_record" in (mate_properties.get(mate_name) or {}):
                     controlled_limits.append(
@@ -741,6 +749,8 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             for key, value in document_properties.items():
                 if isinstance(key, str) and key.startswith(prefix) and key.endswith(".limits_record"):
                     controlled_limits.append({"document": key, "reference": value})
+            if global_controlled:
+                controlled_limits.append({"scope": "all_native_mates", "reference": "dp.joint.limits_record"})
             if not native_complete:
                 raise DeclarationError(
                     "v14.policy_preview_window_blocked",
