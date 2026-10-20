@@ -2923,6 +2923,41 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         self.assertEqual(captured["state"], expected["state"])
 
+    def test_windows_snapshot_refuses_a_tampered_member_before_acceptance(self) -> None:
+        staging = self.root / "windows-tampered-staging"
+        staging.mkdir()
+        _expected, _state = windows_recovery_fixture(self.context, staging)
+        bundle = staging / recovery.WINDOWS_BUNDLE_MEMBER
+        replacement = staging / "replacement.zip"
+        with zipfile.ZipFile(bundle) as source, zipfile.ZipFile(replacement, "w") as target:
+            for name in source.namelist():
+                payload = source.read(name)
+                if name == "token":
+                    payload = b"tampered-token\n"
+                target.writestr(name, payload)
+        replacement.replace(bundle)
+        with (
+            mock.patch.object(
+                recovery,
+                "_transfer_windows_recovery",
+                return_value={
+                    "passed": True,
+                    "verb": "recovery-snapshot",
+                    "task_state": "Disabled",
+                    "endpoint": "stopped",
+                    "cad_ownership": "free",
+                },
+            ),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            self.real_capture_windows_recovery(
+                self.context,
+                backup_id="windows-tampered",
+                staging=staging,
+                commands=[],
+            )
+        self.assertEqual(raised.exception.code, "windows_recovery_bundle_invalid")
+
     def test_windows_result_with_contradictory_exit_is_unknown(self) -> None:
         completed = subprocess.CompletedProcess(
             ["ssh", "windows-fixture"],

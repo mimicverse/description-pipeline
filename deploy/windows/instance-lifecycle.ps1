@@ -977,7 +977,11 @@ function Assert-RecoveryIdle($Identity) {
   try {
     $listeners = @(Get-NetTCPConnection -LocalPort ([int]$Identity.port) -State Listen -ErrorAction Stop)
   } catch {
-    DieUnknown 'windows_recovery_observer_failed' 'the endpoint listener state could not be observed'
+    if ([string]$_.Exception.Message -match '(?i)(No .*NetTCPConnection|ObjectNotFound|not found)') {
+      $listeners = @()
+    } else {
+      DieUnknown 'windows_recovery_observer_failed' 'the endpoint listener state could not be observed'
+    }
   }
   if ($listeners.Count -ne 0) {
     Die 'windows_listener_present' 'the endpoint port still has a listener'
@@ -1199,6 +1203,14 @@ function Restore-RecoveryFile([string]$Source, [string]$Target, $Acl, [string]$S
 }
 function Invoke-RecoverySnapshot($Binding) {
   if (-not $RecoveryDir) { Die 'recovery_dir_required' 'recovery-snapshot needs -RecoveryDir' }
+  if (-not (Test-Path -LiteralPath $RecoveryDir -PathType Container)) {
+    Die 'recovery_dir_required' 'the Windows recovery directory is missing'
+  }
+  $recoveryDirItem = Get-Item -LiteralPath $RecoveryDir -Force
+  if ($recoveryDirItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    Die 'windows_recovery_target_unsafe' 'the Windows recovery directory is a reparse point'
+  }
+  Set-PrivateRecoveryAcl $RecoveryDir
   foreach ($field in ('ssh_host','task_name','state_root','package_root','output_root','port')) {
     if (-not $Binding.$field) { Die 'binding_incomplete' ('the snapshot binding misses ' + $field) }
   }
@@ -1228,8 +1240,9 @@ function Invoke-RecoverySnapshot($Binding) {
       ($current.state | ConvertTo-Json -Depth 20 -Compress),
       (New-Object System.Text.UTF8Encoding($false)))
     Compress-Archive -Path (Join-Path $work '*') -DestinationPath $zip -CompressionLevel Optimal -Force
+    Set-PrivateRecoveryAcl $zip
   } finally {
-    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction Stop }
   }
   Emit @{
     passed=$true; verb='recovery-snapshot'; task_state=[string]$current.task_projection.state;
@@ -1243,6 +1256,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
   }
   $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-recovery-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $temp | Out-Null
+  $ownedTask = $false
   try {
     Set-PrivateRecoveryAcl $temp
     $extracted = Expand-RecoveryBundle $RecoveryBundle $temp
@@ -1290,6 +1304,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
             $existingProjection.semantic_sha256 -ne [string]$state.task.semantic_sha256) {
           Die 'windows_task_projection_mismatch' 'the existing task is not the archived managed task'
         }
+        $ownedTask = $true
         if ($existing[0].State -eq 'Running') { Stop-ScheduledTask -TaskName $existing[0].TaskName -TaskPath $existing[0].TaskPath }
         Disable-ScheduledTask -TaskName $existing[0].TaskName -TaskPath $existing[0].TaskPath -ErrorAction Stop | Out-Null
       }
@@ -1313,6 +1328,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
         }
         Register-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) `
           -Xml (Get-Content -LiteralPath (Join-Path $extracted.root 'task.xml') -Raw) -ErrorAction Stop | Out-Null
+        $ownedTask = $true
         Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null
       }
       Set-AclProjection (Join-Path $env:SystemRoot ('System32\Tasks\' + ([string]$Binding.task_path).TrimStart('\') + [string]$Binding.task_name)) $state.acl.task_file
@@ -1327,12 +1343,12 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       endpoint='stopped'; cad_ownership='free'; state_sha256=(Get-JsonSha256 $state)
     }
   } catch {
-    if (-not $VerifyOnly) {
+    if (-not $VerifyOnly -and $ownedTask) {
       try { Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null } catch { }
     }
     throw
   } finally {
-    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop }
   }
 }
 function Invoke-RecoveryResume($Binding) {

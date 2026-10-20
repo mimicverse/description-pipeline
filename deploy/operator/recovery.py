@@ -4193,7 +4193,22 @@ def _create_remote_dir(*, ssh_host: str, remote_dir: str, timeout: int, commands
     _require_windows_process(
         ssh_host=ssh_host,
         script=(
-            f"$ErrorActionPreference='Stop';New-Item -ItemType Directory -Path {quoted} -ErrorAction Stop | Out-Null"
+            "$ErrorActionPreference='Stop';"
+            f"$dir={quoted};"
+            "New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null;"
+            "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;"
+            "$security=New-Object System.Security.AccessControl.DirectorySecurity;"
+            "$security.SetAccessRuleProtection($true,$false);"
+            "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
+            "$sid,[System.Security.AccessControl.FileSystemRights]::FullControl,"
+            "([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor "
+            "[System.Security.AccessControl.InheritanceFlags]::ObjectInherit),"
+            "[System.Security.AccessControl.PropagationFlags]::None,"
+            "[System.Security.AccessControl.AccessControlType]::Allow);"
+            "$security.AddAccessRule($rule);"
+            "Set-Acl -LiteralPath $dir -AclObject $security -ErrorAction Stop;"
+            "$acl=Get-Acl -LiteralPath $dir -ErrorAction Stop;"
+            "if (-not $acl.AreAccessRulesProtected) { throw 'recovery directory ACL is not protected' }"
         ),
         timeout=timeout,
         commands=commands,
@@ -4241,6 +4256,51 @@ def _read_windows_state(bundle: Path) -> dict:
             "the Windows recovery state is not JSON",
         ) from error
     return _validate_windows_recovery_state(document)
+
+
+def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
+    expected_members = {row["member"]: row for row in state["members"]}
+    require(
+        set(expected_members) == {row["member"] for row in state["files"]},
+        "windows_recovery_bundle_invalid",
+        "Windows recovery members and file roles differ",
+    )
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            names = archive.namelist()
+            require(
+                len(names) == len(set(names))
+                and set(names) == set(expected_members) | {WINDOWS_STATE_MEMBER},
+                "windows_recovery_bundle_invalid",
+                "Windows recovery bundle has missing, extra or duplicate members",
+            )
+            for name in names:
+                info = archive.getinfo(name)
+                require(
+                    not info.is_dir()
+                    and not name.startswith("/")
+                    and "\\" not in name
+                    and "/" not in name
+                    and name not in {".", ".."},
+                    "windows_recovery_bundle_invalid",
+                    "Windows recovery bundle carries an unsafe member",
+                    {"member": name},
+                )
+            for name, row in expected_members.items():
+                payload = archive.read(name)
+                require(
+                    len(payload) == row["bytes"]
+                    and hashlib.sha256(payload).hexdigest() == row["sha256"],
+                    "windows_recovery_bundle_invalid",
+                    "Windows recovery member differs from its state",
+                    {"member": name},
+                )
+    except (OSError, zipfile.BadZipFile, KeyError) as error:
+        raise RecoveryError(
+            "windows_recovery_bundle_invalid",
+            "the Windows recovery bundle is unreadable",
+            {"error": str(error)},
+        ) from error
 
 
 def _validate_windows_recovery_state(document: object) -> dict:
@@ -4714,13 +4774,12 @@ def _transfer_windows_recovery(
                 )
             return document
         finally:
-            with contextlib.suppress(RecoveryError):
-                _remove_remote_dir(
-                    ssh_host=ssh_host,
-                    remote_dir=remote_dir,
-                    timeout=timeout,
-                    commands=commands,
-                )
+            _remove_remote_dir(
+                ssh_host=ssh_host,
+                remote_dir=remote_dir,
+                timeout=timeout,
+                commands=commands,
+            )
 
 
 def capture_windows_recovery(
@@ -4750,6 +4809,7 @@ def capture_windows_recovery(
         download_bundle=bundle,
     )
     state = _read_windows_state(bundle)
+    verify_windows_recovery_bundle_members(bundle, state)
     require(
         state["ssh_host"] == ssh_host
         and state["task"]["task_name"] == windows["instance"]["task_name"]
@@ -7387,46 +7447,7 @@ def verify_windows_recovery_archive(manifest: dict, extracted: Path) -> None:
         "windows_recovery_bundle_invalid",
         "embedded Windows recovery state differs from the manifest",
     )
-    expected_members = {row["member"]: row for row in state["members"]}
-    require(
-        set(expected_members) == {row["member"] for row in state["files"]},
-        "windows_recovery_bundle_invalid",
-        "Windows recovery members and file roles differ",
-    )
-    try:
-        with zipfile.ZipFile(bundle) as archive:
-            names = archive.namelist()
-            require(
-                len(names) == len(set(names)) and set(names) == set(expected_members) | {WINDOWS_STATE_MEMBER},
-                "windows_recovery_bundle_invalid",
-                "Windows recovery bundle has missing, extra or duplicate members",
-            )
-            for name in names:
-                info = archive.getinfo(name)
-                require(
-                    not info.is_dir()
-                    and not name.startswith("/")
-                    and "\\" not in name
-                    and "/" not in name
-                    and name not in {".", ".."},
-                    "windows_recovery_bundle_invalid",
-                    "Windows recovery bundle carries an unsafe member",
-                    {"member": name},
-                )
-            for name, row in expected_members.items():
-                payload = archive.read(name)
-                require(
-                    len(payload) == row["bytes"] and hashlib.sha256(payload).hexdigest() == row["sha256"],
-                    "windows_recovery_bundle_invalid",
-                    "Windows recovery member differs from its state",
-                    {"member": name},
-                )
-    except (OSError, zipfile.BadZipFile, KeyError) as error:
-        raise RecoveryError(
-            "windows_recovery_bundle_invalid",
-            "the archived Windows recovery bundle is unreadable",
-            {"error": str(error)},
-        ) from error
+    verify_windows_recovery_bundle_members(bundle, state)
 
 
 def verify_archive_consistency(manifest: dict, extracted: Path) -> None:
