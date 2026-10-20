@@ -8,7 +8,9 @@ from description_pipeline.sources.solidworks.naming import (
     carrier_names,
     collision_name,
     deduplicate_names,
+    disambiguated_frame_name,
     fallback_name,
+    frame_identity,
     fixed_joint_name,
     frame_name,
     joint_name,
@@ -53,6 +55,8 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(frame_name("SCS_camera_optical"), "camera_optical")
         self.assertEqual(frame_name("tool_mount"), "tool_mount")
         self.assertEqual(frame_name("tool_tcp"), "tool_tcp")
+        identity = frame_identity("arm-1", "TCP_Tool", "Default")
+        self.assertRegex(disambiguated_frame_name("tool_tcp", identity), r"^tool_[0-9a-f]{16}_tcp$")
         self.assertEqual(
             fixed_joint_name("left_upper_arm_link", "left_hand_link"),
             "left_upper_arm_link_to_left_hand_link_joint",

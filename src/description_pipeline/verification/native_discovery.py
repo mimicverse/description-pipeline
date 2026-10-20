@@ -1987,10 +1987,11 @@ def rebuild_interface_frames(
     side: every recognised datum (``CS_``/``TCP_``/``SCS_`` prefix) that is not a
     body's own link datum becomes a frame parented to the rigid body whose cluster
     owns it; the frozen top assembly's ownerless datums bind only to the proven
-    base body; the frame name is the datum suffix after the first underscore and
-    must already be exact snake_case.  A recognised interface that cannot be
-    attributed, a duplicate frame name or a body-name collision refuses instead of
-    guessing, and the saved derived carrier is never read.
+    base body; names are normalized by the shared rule and collisions are
+    disambiguated from stable native datum identity, never traversal order. A
+    recognised interface that cannot be attributed, a duplicate native identity or
+    an unresolvable collision refuses instead of guessing, and the saved derived
+    carrier is never read.
 
     ``bodies``/``base`` let the declaration domain supply its independently decoded
     tree (the same native interface interpretation, its own membership proof);
@@ -2059,21 +2060,27 @@ def rebuild_interface_frames(
         if not owned:
             link_datums.add(("", base_datum))
     body_names = {str(body["name"]) for body in bodies}
-    frames: list[dict] = []
-    seen: dict[str, str] = {}
-    datum_identities: set[tuple[str, str, str]] = set()
-    from ..sources.solidworks.naming import fallback_name, frame_name as format_frame_name
+    datum_identities: set[str] = set()
+    from ..sources.solidworks.naming import (
+        disambiguated_frame_name,
+        fallback_name,
+        frame_identity,
+        frame_name as format_frame_name,
+    )
 
+    candidates: list[dict] = []
     for datum in raw.get("datums") or []:
         if not isinstance(datum, dict):
             continue
         name = str(datum.get("name") or "")
         if not name.startswith(INTERFACE_PREFIXES):
             continue
-        owner = str(datum.get("owner") or "")
+        raw_owner = datum.get("owner")
+        owner = str(raw_owner or "")
         if (owner, name) in link_datums:
             continue
-        native_identity = (owner, name, str(datum.get("configuration") or ""))
+        configuration = str(datum.get("configuration") or "")
+        native_identity = frame_identity(owner, name, configuration)
         _require(
             native_identity not in datum_identities,
             "discovery.interface_frame_rebuild",
@@ -2082,7 +2089,7 @@ def rebuild_interface_frames(
         )
         datum_identities.add(native_identity)
         body_name = _body_of(owner)
-        if body_name is None and base is not None and owner == "":
+        if body_name is None and base is not None and raw_owner == "":
             body_name = str(base["name"])
         _require(
             body_name is not None,
@@ -2109,27 +2116,44 @@ def rebuild_interface_frames(
                 "interface datum belongs to another referenced configuration",
                 {"datum": name, "owner": owner, "configuration": carried, "referenced": expected},
             )
-        _prefix, _separator, native_suffix = name.partition("_")
         try:
-            suffix = format_frame_name(name)
+            base_name = format_frame_name(name)
         except ValueError:
-            suffix = fallback_name("frame", f"{name}|{owner}")
-        if suffix in seen or suffix in body_names:
-            suffix = fallback_name("frame", f"{name}|{owner}", semantic=body_name)
+            base_name = fallback_name("frame", native_identity)
+        candidates.append(
+            {
+                "body_name": body_name,
+                "name": name,
+                "identity": native_identity,
+                "base_name": base_name,
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate["base_name"]] = counts.get(candidate["base_name"], 0) + 1
+    frames: list[dict] = []
+    used: set[str] = set()
+    for candidate in sorted(candidates, key=lambda item: (item["identity"], item["name"])):
+        base_name = candidate["base_name"]
+        collided = counts[base_name] > 1 or base_name in body_names
+        frame_name = (
+            disambiguated_frame_name(base_name, candidate["identity"]) if collided else base_name
+        )
         _require(
-            suffix not in seen and suffix not in body_names,
+            frame_name not in used and frame_name not in body_names,
             "discovery.interface_frame_rebuild",
             "interface frame name collision cannot be resolved deterministically",
-            {"name": suffix},
+            {"name": frame_name},
         )
-        seen[suffix] = name
+        used.add(frame_name)
         frames.append(
             {
-                "id": suffix,
-                "name": suffix,
-                "parent": body_name,
-                "coordinate_system": name,
-                "source_name": native_suffix,
+                "id": frame_name,
+                "name": frame_name,
+                "parent": candidate["body_name"],
+                "coordinate_system": candidate["name"],
+                "source_name": candidate["name"],
             }
         )
     return frames
@@ -3982,7 +4006,12 @@ def verify_discovery(package: Path) -> dict:
         return {"bodies": len(bodies), "joints": len(source.get("joints") or [])}
 
     def frames():
-        from ..sources.solidworks.naming import fallback_name, frame_name as format_frame_name
+        from ..sources.solidworks.naming import (
+            disambiguated_frame_name,
+            fallback_name,
+            frame_identity,
+            frame_name as format_frame_name,
+        )
 
         payload = state["payload"]
         raw = payload["raw"]
@@ -4027,7 +4056,8 @@ def verify_discovery(package: Path) -> dict:
             )
             if frame_datum is not None:
                 link_datums.add((str(frame_datum.get("owner") or ""), str(frame_datum.get("name") or "")))
-        expected: dict[str, tuple[str, str]] = {}
+        candidates: list[dict] = []
+        identities: set[str] = set()
         for datum in raw.get("datums") or []:
             if not isinstance(datum, dict):
                 continue
@@ -4037,6 +4067,14 @@ def verify_discovery(package: Path) -> dict:
             # foreign datum that merely shares the name stays an interface and cannot vanish.
             if not name.startswith(INTERFACE_PREFIXES) or (owner, name) in link_datums:
                 continue
+            identity = frame_identity(owner, name, str(datum.get("configuration") or ""))
+            _require(
+                identity not in identities,
+                "discovery.frames",
+                "duplicate native interface datum identity",
+                {"datum": name, "owner": owner},
+            )
+            identities.add(identity)
             body = component_body.get(owner)
             _require(
                 body is not None,
@@ -4044,26 +4082,47 @@ def verify_discovery(package: Path) -> dict:
                 "a recognised interface datum is not owned by any body",
                 {"datum": name, "owner": owner},
             )
-            _prefix, _, _native_suffix = name.partition("_")
             try:
-                frame_name = format_frame_name(name)
+                base_name = format_frame_name(name)
             except ValueError:
-                frame_name = fallback_name("frame", f"{name}|{owner}")
-            if frame_name in expected or frame_name in {
-                str(item.get("name")) for item in source.get("bodies") or []
-            }:
-                frame_name = fallback_name("frame", f"{name}|{owner}", semantic=body)
+                base_name = fallback_name("frame", identity)
+            candidates.append(
+                {
+                    "body": body,
+                    "name": name,
+                    "identity": identity,
+                    "base_name": base_name,
+                }
+            )
+
+        body_names = {str(item.get("name")) for item in source.get("bodies") or []}
+        counts: dict[str, int] = {}
+        for candidate in candidates:
+            counts[candidate["base_name"]] = counts.get(candidate["base_name"], 0) + 1
+        expected: dict[str, tuple[str, str]] = {}
+        for candidate in sorted(candidates, key=lambda item: (item["identity"], item["name"])):
+            base_name = candidate["base_name"]
+            collided = counts[base_name] > 1 or base_name in body_names
+            frame_name = (
+                disambiguated_frame_name(base_name, candidate["identity"]) if collided else base_name
+            )
             _require(
-                frame_name not in expected,
+                frame_name not in expected and frame_name not in body_names,
                 "discovery.frames",
                 "two interface datums derive the same frame name",
-                {"datum": name},
+                {"datum": candidate["name"]},
             )
-            expected[frame_name] = (body, name)
+            expected[frame_name] = (candidate["body"], candidate["name"])
         observed: dict[str, tuple[str, str]] = {}
         for frame in source.get("frames") or []:
             name = str(frame.get("name"))
             _require(name not in observed, "discovery.frames", "a frame name repeats", {"frame": name})
+            _require(
+                str(frame.get("source_name")) == str(frame.get("coordinate_system")),
+                "discovery.frames",
+                "a frame does not retain its full native datum name",
+                {"frame": name},
+            )
             observed[name] = (str(frame.get("parent")), str(frame.get("coordinate_system")))
         _require(
             observed == expected,

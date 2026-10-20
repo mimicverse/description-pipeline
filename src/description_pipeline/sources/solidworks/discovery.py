@@ -109,10 +109,10 @@ _IDENTITY_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 _GIT_COMMIT = re.compile(r"\b[0-9a-f]{40}(?:[0-9a-f]{24})?\b")
 
 #: Datum name spaces the spec recognises: link frames, tool/sensor interfaces
-#: and joint frames.  A datum is ``<PREFIX>_<snake_case>``: the suffix must be
-#: exact snake_case before any transformation, so ``TCP_Tool`` blocks instead
-#: of silently becoming ``tcp_tool``.  Any owned ``CS_*`` datum that is not the
-#: body's link datum is a named interface frame.
+#: and joint frames. A datum is ``<PREFIX>_<semantic suffix>``; non-conforming
+#: suffixes are retained as source names, normalized by the shared rule and
+#: disambiguated from stable native identity. Any owned ``CS_*`` datum that is
+#: not the body's link datum is a named interface frame.
 INTERFACE_PREFIXES = ("CS_", "TCP_", "SCS_")
 JCS_PREFIX = "JCS_"
 _TOL = 1e-6
@@ -3224,22 +3224,33 @@ def _interface_frames(
     ):
         # The proven base's own CS_base_link sits at the frozen top assembly scope.
         link_datums.add(("", str(base.get("datum"))))
-    frames: list[dict] = []
-    seen: dict[str, str] = {}
     body_names = {str(body.get("name")) for body in bodies}
-    from .naming import fallback_name, frame_name as format_frame_name
+    from .naming import (
+        disambiguated_frame_name,
+        fallback_name,
+        frame_identity,
+        frame_name as format_frame_name,
+    )
 
+    candidates: list[dict] = []
+    identities: set[str] = set()
+    referenced_configurations = {
+        str(item.get("name2")): item.get("configuration")
+        for item in record.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
     for datum in record.get("datums") or []:
         if not isinstance(datum, dict):
             continue
         name = str(datum.get("name") or "")
         if not name.startswith(INTERFACE_PREFIXES):
             continue
-        owner = datum.get("owner")
-        if isinstance(owner, str) and (owner, name) in link_datums:
+        raw_owner = datum.get("owner")
+        owner = str(raw_owner or "")
+        if isinstance(raw_owner, str) and (raw_owner, name) in link_datums:
             continue
-        body = body_of_component.get(str(owner or ""))
-        if body is None and base is not None and owner == "":
+        body = body_of_component.get(owner)
+        if body is None and base is not None and raw_owner == "":
             # Only the proven base binds the frozen top assembly's own datums.
             body = base
         if body is None:
@@ -3248,55 +3259,115 @@ def _interface_frames(
                     "discovery.interface_unowned",
                     f"datum:{name}",
                     "recognised interface datum is not owned by any body",
-                    {"owner": str(owner or "")},
+                    {"owner": owner},
                 )
             )
             continue
-        _prefix, _, suffix = name.partition("_")
-        try:
-            frame_name = format_frame_name(name)
-        except ValueError:
-            frame_name = fallback_name("frame", f"{name}|{owner}")
-        if frame_name != suffix:
-            findings.append(
-                _finding(
-                    "discovery.interface_name_invalid",
-                    f"datum:{name}",
-                    "interface datum suffix is formatted by the shared naming rule",
-                    {"input": suffix, "output": frame_name},
-                    blocking=False,
-                )
-            )
-        if frame_name in seen or frame_name in body_names:
-            corrected = fallback_name("frame", f"{name}|{owner}", semantic=str(body["name"]))
-            if corrected in seen or corrected in body_names:
+        if "configuration" in datum:
+            carried = str(datum.get("configuration") or "")
+            if raw_owner == "":
+                expected = str(record.get("saved_configuration") or "")
+            else:
+                referenced = referenced_configurations.get(owner)
+                if not isinstance(referenced, str) or not referenced:
+                    findings.append(
+                        _finding(
+                            "discovery.interface_configuration_unread",
+                            f"datum:{name}",
+                            "interface datum names an owner with no recorded referenced configuration",
+                            {"owner": owner},
+                        )
+                    )
+                    continue
+                expected = referenced
+            if carried != expected:
                 findings.append(
                     _finding(
-                        "discovery.interface_name_duplicate",
+                        "discovery.interface_configuration_mismatch",
                         f"datum:{name}",
-                        "interface name collision cannot be resolved deterministically",
-                        {"name": frame_name, "candidate": corrected},
+                        "interface datum belongs to another referenced configuration",
+                        {"owner": owner, "configuration": carried, "referenced": expected},
                     )
                 )
                 continue
+        configuration = str(datum.get("configuration") or "")
+        native_identity = frame_identity(owner, name, configuration)
+        if native_identity in identities:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_duplicate",
+                    f"datum:{name}",
+                    "duplicate native interface datum identity",
+                    {"owner": owner, "configuration": configuration},
+                )
+            )
+            continue
+        identities.add(native_identity)
+        _prefix, _, native_suffix = name.partition("_")
+        try:
+            base_name = format_frame_name(name)
+        except ValueError:
+            base_name = fallback_name("frame", native_identity)
+        candidates.append(
+            {
+                "body": body,
+                "name": name,
+                "owner": owner,
+                "configuration": configuration,
+                "identity": native_identity,
+                "native_suffix": native_suffix,
+                "base_name": base_name,
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate["base_name"]] = counts.get(candidate["base_name"], 0) + 1
+    frames: list[dict] = []
+    used: set[str] = set()
+    for candidate in sorted(candidates, key=lambda item: (item["identity"], item["name"])):
+        base_name = candidate["base_name"]
+        collided = counts[base_name] > 1 or base_name in body_names
+        frame_name = (
+            disambiguated_frame_name(base_name, candidate["identity"]) if collided else base_name
+        )
+        if frame_name in used or frame_name in body_names:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_duplicate",
+                    f"datum:{candidate['name']}",
+                    "interface name collision cannot be resolved deterministically",
+                    {"name": frame_name, "input": candidate["name"]},
+                )
+            )
+            continue
+        if collided or base_name != candidate["native_suffix"]:
             findings.append(
                 _finding(
                     "discovery.interface_name_invalid",
-                    f"datum:{name}",
-                    "interface name collision was resolved by the shared naming rule",
-                    {"input": frame_name, "output": corrected},
+                    f"datum:{candidate['name']}",
+                    "interface datum name was normalized or disambiguated by the shared naming rule",
+                    {
+                        "input": candidate["name"],
+                        "normalized": base_name,
+                        "output": frame_name,
+                        "owner": candidate["owner"],
+                        "configuration": candidate["configuration"],
+                        "collision": collided,
+                        "rule_id": "naming.frame",
+                        "rule_version": "naming-v1",
+                    },
                     blocking=False,
                 )
             )
-            frame_name = corrected
-        seen[frame_name] = name
+        used.add(frame_name)
         frames.append(
             {
                 "id": frame_name,
                 "name": frame_name,
-                "parent": body["name"],
-                "coordinate_system": name,
-                "source_name": suffix,
+                "parent": candidate["body"]["name"],
+                "coordinate_system": candidate["name"],
+                "source_name": candidate["name"],
             }
         )
     return frames

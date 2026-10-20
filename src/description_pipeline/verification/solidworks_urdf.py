@@ -1989,7 +1989,8 @@ def _value_warning_gate(root, source, model):
             )
     for frame in source.get("frames", []):
         source_name = str(frame.get("source_name") or "")
-        if source_name and source_name != frame["name"]:
+        native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
+        if source_name and native_suffix != frame["name"]:
             add(
                 "naming.formatted_interface",
                 {

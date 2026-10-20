@@ -27,7 +27,9 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     _budgets,
     _clusters,
     _component_frames,
+    _Clusters,
     _identity,
+    _interface_frames,
     _mate_rows,
     _unit,
     SubmissionIdentity,
@@ -749,7 +751,7 @@ class DiscoveryTests(unittest.TestCase):
                 "name": "tool_flange_frame",
                 "parent": "base_link",
                 "coordinate_system": "SCS_tool_flange",
-                "source_name": "tool_flange",
+                "source_name": "SCS_tool_flange",
             },
         )
         joints = rebuild_joint_facts(payload, output, purpose="engineering")
@@ -1576,6 +1578,88 @@ class DiscoveryTests(unittest.TestCase):
         finding = next(item for item in result.findings if item["code"] == "discovery.interface_name_invalid")
         self.assertFalse(finding["blocking"])
         self.assertEqual(finding["detail"]["output"], "base_link_tcp")
+
+    def test_interface_frame_collision_is_independent_of_datum_order(self):
+        bodies = [
+            {
+                "name": "arm_link",
+                "owners": ["arm-1"],
+                "datum": "CS_arm_link",
+                "datum_owner": "arm-1",
+            }
+        ]
+        clusters = _Clusters(members={"arm_link": ["arm-1"]}, of={"arm-1": "arm_link"}, pairs={})
+
+        def mapping(order):
+            record = {
+                "datums": [
+                    {"name": name, "owner": "arm-1"}
+                    for name in order
+                ]
+            }
+            findings: list[dict] = []
+            frames = _interface_frames(record, clusters, bodies, None, findings)
+            self.assertFalse([item for item in findings if item["blocking"]], findings)
+            self.assertEqual(
+                {item["name"]: item["source_name"] for item in frames},
+                {
+                    item["name"]: item["coordinate_system"]
+                    for item in frames
+                },
+            )
+            return {item["coordinate_system"]: item["name"] for item in frames}
+
+        first = mapping(["TCP_Tool", "CS_tool_tcp"])
+        reordered = mapping(["CS_tool_tcp", "TCP_Tool"])
+        self.assertEqual(first, reordered)
+        self.assertEqual(len(set(first.values())), 2)
+        self.assertTrue(all(name.endswith("_tcp") for name in first.values()))
+
+    def test_interface_frame_collision_replays_after_datum_reordering(self):
+        def prepared(order):
+            def mutate(payload):
+                for name in order:
+                    payload["datums"].append(
+                        {"name": name, "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)}
+                    )
+
+            result, _source, output = self._prepare(mutate=mutate)
+            self.assertTrue(result.passed, result.findings)
+            self.assertTrue(self._verify(output)["passed"])
+            payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+            return {
+                frame["coordinate_system"]: frame["name"]
+                for frame in rebuild_interface_frames(payload)
+                if frame["coordinate_system"] in {"TCP_Tool", "SCS_tool_tcp"}
+            }
+
+        first = prepared(["TCP_Tool", "SCS_tool_tcp"])
+        reordered = prepared(["SCS_tool_tcp", "TCP_Tool"])
+        self.assertEqual(first, reordered)
+        self.assertEqual(len(set(first.values())), 2)
+        self.assertTrue(all(name.endswith("_tcp") for name in first.values()))
+
+    def test_duplicate_interface_frame_identity_blocks_before_generation(self):
+        def mutate(payload):
+            datum = {"name": "TCP_Tool", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)}
+            payload["datums"].extend([copy.deepcopy(datum), copy.deepcopy(datum)])
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.interface_name_duplicate", self._codes(result))
+
+    def test_interface_frame_configuration_mismatch_blocks_before_generation(self):
+        def mutate(payload):
+            payload["datums"].append(
+                {
+                    "name": "TCP_Tool",
+                    "owner": "arm-1",
+                    "configuration": "Other",
+                    "array": _translated(0.0, 0.0, 0.3),
+                }
+            )
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.interface_configuration_mismatch", self._codes(result))
 
     def test_two_owned_link_datums_need_an_explicit_body_datum(self):
         def mutate(payload):

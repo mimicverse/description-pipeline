@@ -914,7 +914,8 @@ def _value_warnings(
             )
     for frame in cfg.get("frames") or []:
         source_name = str(frame.get("source_name") or "")
-        if source_name and source_name != frame.get("name"):
+        native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
+        if source_name and native_suffix != frame.get("name"):
             mappings.append(
                 {
                     "object_type": "frame",

@@ -100,6 +100,21 @@ def frame_name(native_name: str) -> str:
     return name + "_frame"
 
 
+def frame_identity(owner: str, name: str, configuration: str = "") -> str:
+    """Stable native identity for one interface datum."""
+
+    return "\x00".join((str(owner), str(name), str(configuration)))
+
+
+def disambiguated_frame_name(base_name: str, native_identity: str) -> str:
+    """Add a stable identity without discarding the frame's purpose suffix."""
+
+    role = next((suffix for suffix in _FRAME_SUFFIXES if base_name.endswith(suffix)), "")
+    stem = base_name[: -len(role)] if role else base_name
+    digest = hashlib.sha256(str(native_identity).encode("utf-8")).hexdigest()[:16]
+    return f"{stem}_{digest}{role}"
+
+
 def robot_name(native_name: str) -> str:
     """Format the native top-assembly name as the model identity."""
 
