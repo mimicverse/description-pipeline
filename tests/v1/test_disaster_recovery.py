@@ -672,16 +672,20 @@ def runtime_wheel_payloads(source_sha: str = "b" * 64) -> dict[str, bytes]:
     return {
         "description_pipeline/__init__.py": b'VERSION = "1.0.0-test"',
         "description_pipeline/tool-release.json": json.dumps(
-            {"source_sha256": source_sha, "version": "1.0.0-test"},
+            {"source_sha256": source_sha, "version": "1.0.0"},
             separators=(",", ":"),
         ).encode(),
-        "mimicverse_description-1.0.0-test.dist-info/METADATA": (
-            b"Metadata-Version: 2.1 Name: mimicverse-description Version: 1.0.0-test"
+        "mimicverse_description-1.0.0.dist-info/METADATA": (
+            b"Metadata-Version: 2.1\nName: mimicverse-description\nVersion: 1.0.0\n"
         ),
-        "mimicverse_description-1.0.0-test.dist-info/RECORD": (
+        "apache_airflow-3.3.2.dist-info/METADATA": (
+            b"Metadata-Version: 2.1\nName: apache-airflow\nVersion: 3.3.2\n"
+        ),
+        "mimicverse_description-1.0.0.dist-info/RECORD": (
             b"description_pipeline/__init__.py,,\n"
             b"description_pipeline/tool-release.json,,\n"
-            b"mimicverse_description-1.0.0-test.dist-info/METADATA,,\n"
+            b"mimicverse_description-1.0.0.dist-info/METADATA,,\n"
+            b"apache_airflow-3.3.2.dist-info/METADATA,,\n"
         ),
     }
 
@@ -699,24 +703,15 @@ def write_runtime_wheel(path: Path, source_sha: str = "b" * 64) -> dict[str, byt
 def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
     site = venv / "lib" / "python3.12" / "site-packages"
     package = site / "description_pipeline"
-    identity = json.dumps(
-        {
-            "version": "1.0.0-test",
-            "source_sha256": source_sha,
-            "file": str(package),
-        },
-        separators=(",", ":"),
-    )
     lines = [
         "#!/bin/sh",
         "set -eu",
-        'mkdir -p "$AIRFLOW_VENV/bin"',
-        f'mkdir -p "{package}" "{site / "mimicverse_description-1.0.0-test.dist-info"}" "{site / "airflow"}"',
-        'cat > "$AIRFLOW_VENV/bin/python" <<\'PY\'',
-        "#!/bin/sh",
-        f"printf '%s\\n' '{identity}'",
-        "PY",
-        'chmod +x "$AIRFLOW_VENV/bin/python"',
+        ': "${AIRFLOW_PYTHON:=python3.12}"',
+        '"$AIRFLOW_PYTHON" -m venv "$AIRFLOW_VENV"',
+        f'mkdir -p "{package}"',
+        f'mkdir -p "{site / "mimicverse_description-1.0.0.dist-info"}"',
+        f'mkdir -p "{site / "apache_airflow-3.3.2.dist-info"}"',
+        f'mkdir -p "{site / "airflow"}"',
     ]
     for name, payload in runtime_wheel_payloads(source_sha).items():
         target = site / name
@@ -726,9 +721,13 @@ def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
         )
     lines.extend(
         [
-            f"printf '%s' '' > {str(site / 'airflow' / '__init__.py')!r}",
-            f"printf '%s' '#!/bin/sh' > {str(venv / 'bin' / 'airflow')!r}",
+            f"printf '%s' '# airflow' > {str(site / 'airflow' / '__init__.py')!r}",
+            f"printf '%s\\n' '#!/bin/sh' > {str(venv / 'bin' / 'airflow')!r}",
+            f"printf '%s\\n' 'echo 3.3.2' >> {str(venv / 'bin' / 'airflow')!r}",
             f"chmod +x {str(venv / 'bin' / 'airflow')!r}",
+            f"printf '%s\\n' '#!/bin/sh' > {str(venv / 'bin' / 'description')!r}",
+            f"printf '%s\\n' 'echo 1.0.0' >> {str(venv / 'bin' / 'description')!r}",
+            f"chmod +x {str(venv / 'bin' / 'description')!r}",
             "",
         ]
     )
@@ -828,26 +827,36 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     linux_name = "description-1.0.0-test-linux-cp312-x86_64.zip"
     linux_path = release_root / linux_name
     with zipfile.ZipFile(linux_path, "w") as archive:
+        lock_bytes = (
+            f"mimicverse-description==1.0.0-test --hash=sha256:{hashlib.sha256(wheel_bytes).hexdigest()}\n"
+        ).encode()
         archive.writestr(
             "files.json",
             json.dumps(
                 {
                     "README.md": hashlib.sha256(readme_bytes).hexdigest(),
                     f"wheels/{wheel_name}": hashlib.sha256(wheel_bytes).hexdigest(),
+                    "requirements.lock": hashlib.sha256(lock_bytes).hexdigest(),
                 }
             ),
         )
         archive.writestr("README.md", readme_bytes)
         archive.writestr(f"wheels/{wheel_name}", wheel_bytes)
+        archive.writestr("requirements.lock", lock_bytes)
     linux_path.chmod(0o600)
     deployment_name = "description-1.0.0-test-deployment.zip"
     deployment_path = release_root / deployment_name
     installer = runtime_installer(release_root / ("airflow-venv-" + install_id))
+    linux_lock = b"linux-lock\n"
+    windows_lock = b"windows-lock\n"
     with zipfile.ZipFile(deployment_path, "w") as archive:
         archive.writestr("deploy/airflow/install.sh", installer)
+        archive.writestr("requirements/linux-py312.lock", linux_lock)
+        archive.writestr("requirements/windows-py312.lock", windows_lock)
     deployment_path.chmod(0o600)
     release_document = {
-        "version": "1.0.0-test",
+        "schema_version": "solidworks-to-urdf.release/v1",
+        "version": "1.0.0",
         "source_commit": "a" * 40,
         "source_sha256": "b" * 64,
         "artifacts": [
@@ -861,6 +870,21 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
                 (wheel_name, release_root / wheel_name),
             )
         ],
+        "package_files": {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in runtime_wheel_payloads().items()
+            if name.startswith("description_pipeline/")
+            and name != "description_pipeline/tool-release.json"
+        },
+        "deployment_files": {
+            "deploy/airflow/install.sh": hashlib.sha256(installer.encode()).hexdigest(),
+            "requirements/linux-py312.lock": hashlib.sha256(linux_lock).hexdigest(),
+            "requirements/windows-py312.lock": hashlib.sha256(windows_lock).hexdigest(),
+        },
+        "runtime_locks": {
+            "linux": hashlib.sha256(linux_lock).hexdigest(),
+            "windows": hashlib.sha256(windows_lock).hexdigest(),
+        },
     }
     write(release_root / "release.json", json.dumps(release_document))
     dsn = f"postgresql://solidworks@/airflow_meta?host={socket_dir}&port=55432"
@@ -908,7 +932,12 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
             "install_id": install_id,
             "resolved": resolved,
         },
-        release_document=release_document,
+        release_document={
+            "version": release_document["version"],
+            "source_commit": release_document["source_commit"],
+            "source_sha256": release_document["source_sha256"],
+            "artifacts": release_document["artifacts"],
+        },
         derived_env={
             "POSTGRES_ROOT": str(postgres_root),
             "POSTGRES_MAJOR": "14",
@@ -1557,25 +1586,59 @@ class RecoveryControlFlowTests(unittest.TestCase):
         wheel_bytes = wheel_path.read_bytes()
         linux_zip = release_files / "artifacts" / "description-1.0.0-test-linux-cp312-x86_64.zip"
         with zipfile.ZipFile(linux_zip, "w") as archive:
+            lock_bytes = (
+                f"mimicverse-description==1.0.0-test --hash=sha256:{hashlib.sha256(wheel_bytes).hexdigest()}\n"
+            ).encode()
             archive.writestr(
                 "files.json",
                 json.dumps(
                     {
                         "README.md": hashlib.sha256(readme).hexdigest(),
                         f"wheels/{wheel_path.name}": hashlib.sha256(wheel_bytes).hexdigest(),
+                        "requirements.lock": hashlib.sha256(lock_bytes).hexdigest(),
                     }
                 ),
             )
             archive.writestr("README.md", readme)
             archive.writestr(f"wheels/{wheel_path.name}", wheel_bytes)
+            archive.writestr("requirements.lock", lock_bytes)
         deployment_zip = release_files / "artifacts" / "description-1.0.0-test-deployment.zip"
         installer = runtime_installer(release_root / "airflow-venv")
+        linux_lock = b"linux-lock\n"
+        windows_lock = b"windows-lock\n"
         with zipfile.ZipFile(deployment_zip, "w") as archive:
             archive.writestr("deploy/airflow/install.sh", installer)
-        write(release_files / "release.json", "{}\n")
+            archive.writestr("requirements/linux-py312.lock", linux_lock)
+            archive.writestr("requirements/windows-py312.lock", windows_lock)
+        write(
+            release_files / "release.json",
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.release/v1",
+                    "version": "1.0.0",
+                    "source_commit": "a" * 40,
+                    "source_sha256": "b" * 64,
+                    "package_files": {
+                        name: hashlib.sha256(payload).hexdigest()
+                        for name, payload in runtime_wheel_payloads().items()
+                        if name.startswith("description_pipeline/")
+                        and name != "description_pipeline/tool-release.json"
+                    },
+                    "deployment_files": {
+                        "deploy/airflow/install.sh": hashlib.sha256(installer.encode()).hexdigest(),
+                        "requirements/linux-py312.lock": hashlib.sha256(linux_lock).hexdigest(),
+                        "requirements/windows-py312.lock": hashlib.sha256(windows_lock).hexdigest(),
+                    },
+                    "runtime_locks": {
+                        "linux": hashlib.sha256(linux_lock).hexdigest(),
+                        "windows": hashlib.sha256(windows_lock).hexdigest(),
+                    },
+                }
+            ),
+        )
         manifest = {
             "release": {
-                "version": "1.0.0-test",
+                "version": "1.0.0",
                 "source_sha256": "b" * 64,
                 "artifacts": [
                     {
@@ -1599,7 +1662,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             status_dir=status_dir,
             verify_only=False,
         )
-        self.assertEqual(result["identity"]["version"], "1.0.0-test")
+        self.assertEqual(result["identity"]["version"], "1.0.0")
         self.assertTrue((release_root / "airflow-venv" / "bin" / "python").is_file())
         verified = recovery.rehydrate_release_runtime(
             manifest=manifest,
@@ -1608,7 +1671,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             status_dir=status_dir,
             verify_only=True,
         )
-        self.assertEqual(verified["identity"]["version"], "1.0.0-test")
+        self.assertEqual(verified["identity"]["version"], "1.0.0")
         installed_package = (
             release_root
             / "airflow-venv"

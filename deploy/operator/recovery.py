@@ -7733,9 +7733,15 @@ def validate_release_runtime_target(
             "recovered release root",
             "recovery_release_missing",
         )
+        python = venv / "bin" / "python"
+        require(
+            python.is_file() and os.access(python, os.X_OK),
+            "recovery_release_missing",
+            "recovered Airflow interpreter is missing or not executable",
+        )
         require_real_file(
-            venv / "bin" / "python",
-            "recovered Airflow interpreter",
+            venv / "pyvenv.cfg",
+            "recovered virtual environment marker",
             "recovery_release_missing",
         )
     else:
@@ -7975,6 +7981,37 @@ def _read_rehydrate_env(path: Path) -> dict[str, str]:
     return values
 
 
+def _release_contract(extracted: Path) -> dict:
+    path = extracted / "release" / "release.json"
+    _, document = strict_json_file(path, "archived release identity")
+    require(
+        isinstance(document, dict)
+        and document.get("schema_version") == "solidworks-to-urdf.release/v1"
+        and isinstance(document.get("version"), str)
+        and isinstance(document.get("source_sha256"), str)
+        and bool(HEX64.fullmatch(document["source_sha256"])),
+        "recovery_release_missing",
+        "archived release identity is malformed",
+    )
+    for key in ("package_files", "deployment_files", "runtime_locks"):
+        rows = document.get(key)
+        require(
+            isinstance(rows, dict)
+            and all(
+                isinstance(name, str)
+                and bool(name)
+                and isinstance(digest, str)
+                and bool(HEX64.fullmatch(digest))
+                for name, digest in rows.items()
+            ),
+            "recovery_release_missing",
+            f"archived release identity has no valid {key}",
+        )
+        for name in rows:
+            confined_member(name, f"release.{key}.{name}")
+    return document
+
+
 def _wheel_members(archive: zipfile.ZipFile, where: str) -> dict[str, bytes]:
     members: dict[str, bytes] = {}
     for info in archive.infolist():
@@ -7990,6 +8027,9 @@ def _verify_installed_wheel_members(
     members: dict[str, bytes],
     site_packages: Path,
     label: str,
+    expected_package: dict[str, str] | None = None,
+    expected_version: str | None = None,
+    expected_source_sha256: str | None = None,
 ) -> None:
     require_real_dir(site_packages, "installed site-packages", "recovery_release_missing")
     require(
@@ -7998,6 +8038,35 @@ def _verify_installed_wheel_members(
         "recovery_release_missing",
         f"{label} does not carry the package or its RECORD",
     )
+    package_members = {
+        name: hashlib.sha256(payload).hexdigest()
+        for name, payload in members.items()
+        if name.startswith("description_pipeline/")
+        and name != "description_pipeline/tool-release.json"
+    }
+    if expected_package is not None:
+        require(
+            package_members == expected_package,
+            "recovery_release_missing",
+            f"{label} package inventory differs from release.json",
+        )
+    if expected_version is not None or expected_source_sha256 is not None:
+        try:
+            tool_release = json.loads(
+                members["description_pipeline/tool-release.json"].decode("utf-8")
+            )
+        except (KeyError, UnicodeDecodeError, ValueError) as error:
+            raise RecoveryError(
+                "recovery_release_missing",
+                f"{label} has no valid tool-release.json",
+            ) from error
+        require(
+            isinstance(tool_release, dict)
+            and tool_release.get("version") == expected_version
+            and tool_release.get("source_sha256") == expected_source_sha256,
+            "recovery_release_missing",
+            f"{label} tool-release identity differs from release.json",
+        )
     for name, payload in members.items():
         if name.endswith(".dist-info/RECORD"):
             continue
@@ -8059,9 +8128,21 @@ def _verify_installed_wheel_members(
         "installed Airflow package entry",
         "recovery_release_missing",
     )
+    require(
+        (site_packages / "airflow" / "__init__.py").stat().st_size > 0,
+        "recovery_release_missing",
+        "installed Airflow package entry is empty",
+    )
 
 
-def _verify_installed_wheel(wheel: Path, site_packages: Path) -> None:
+def _verify_installed_wheel(
+    wheel: Path,
+    site_packages: Path,
+    *,
+    expected_package: dict[str, str] | None = None,
+    expected_version: str | None = None,
+    expected_source_sha256: str | None = None,
+) -> None:
     require_real_file(wheel, "recovered release wheel", "recovery_release_missing")
     try:
         with zipfile.ZipFile(wheel) as archive:
@@ -8071,7 +8152,14 @@ def _verify_installed_wheel(wheel: Path, site_packages: Path) -> None:
             "recovery_release_missing",
             f"release wheel is invalid: {wheel.name}",
         ) from error
-    _verify_installed_wheel_members(members, site_packages, wheel.name)
+    _verify_installed_wheel_members(
+        members,
+        site_packages,
+        wheel.name,
+        expected_package=expected_package,
+        expected_version=expected_version,
+        expected_source_sha256=expected_source_sha256,
+    )
 
 
 def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
@@ -8088,11 +8176,43 @@ def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
                 if re.fullmatch(r"wheels/[^/]+\.whl", name)
             ]
             require(
-                bool(wheels),
+                bool(wheels) and "requirements.lock" in role.namelist(),
                 "recovery_release_missing",
-                "recovered Linux role archive carries no wheels",
+                "recovered Linux role archive carries no wheelhouse lock",
+            )
+            lock_lines = [
+                line.strip()
+                for line in role.read("requirements.lock").decode("utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            require(
+                len(lock_lines) == len(wheels)
+                and all(
+                    "==" in line and "--hash=sha256:" in line
+                    for line in lock_lines
+                ),
+                "recovery_release_missing",
+                "recovered Linux wheelhouse lock is incomplete",
             )
             for name in wheels:
+                wheel_name = name.removeprefix("wheels/").lower()
+                require(
+                    any(
+                        wheel_name.startswith(
+                            line.split("--hash=", 1)[0].split("==", 1)[0]
+                            .lower()
+                            .replace("-", "_")
+                            + "-"
+                        )
+                        and line.split("--hash=", 1)[0]
+                        .split("==", 1)[1]
+                        .split()[0]
+                        in wheel_name
+                        for line in lock_lines
+                    ),
+                    "recovery_release_missing",
+                    f"recovered lock does not bind wheel: {name}",
+                )
                 payload = role.read(name)
                 with zipfile.ZipFile(io.BytesIO(payload)) as wheel:
                     members = _wheel_members(wheel, f"role wheel {name}")
@@ -8108,11 +8228,45 @@ def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
         ) from error
 
 
+def _verify_deployment_files(
+    release: dict,
+    deployment_dir: Path,
+) -> None:
+    expected = release["deployment_files"]
+    actual = {
+        path.relative_to(deployment_dir).as_posix(): sha256_file(path)
+        for path in deployment_dir.rglob("*")
+        if path.is_file()
+    }
+    require(
+        actual == expected,
+        "recovery_release_missing",
+        "restored deployment files differ from release.json",
+        {
+            "missing": sorted(set(expected) - set(actual))[:20],
+            "extra": sorted(set(actual) - set(expected))[:20],
+        },
+    )
+    for platform in ("linux", "windows"):
+        lock_path = deployment_dir / "requirements" / f"{platform}-py312.lock"
+        require_real_file(
+            lock_path,
+            f"deployment {platform} runtime lock",
+            "recovery_release_missing",
+        )
+        require(
+            sha256_file(lock_path) == release["runtime_locks"].get(platform),
+            "recovery_release_missing",
+            f"deployment {platform} runtime lock differs from release.json",
+        )
+
+
 def verify_release_runtime(
     *,
     manifest: dict,
     extracted: Path,
     release_root: Path,
+    deployment_dir: Path | None = None,
 ) -> dict:
     install_id = manifest["maintenance"]["receipt"]["identity"]["install_id"]
     operator_env = extracted / "config" / "state" / "derived" / install_id / "operator.env"
@@ -8140,15 +8294,23 @@ def verify_release_runtime(
         "recovery_release_missing",
         "recovered Airflow interpreter is missing or not executable",
     )
+    require_real_file(
+        venv / "pyvenv.cfg",
+        "recovered virtual environment marker",
+        "recovery_release_missing",
+    )
     completed = subprocess.run(
         [
             str(python),
+            "-I",
+            "-B",
             "-c",
             (
                 "import json, pathlib, importlib.metadata as m;"
                 "r=pathlib.Path(__import__('description_pipeline').__file__).resolve().parent;"
                 "i=json.loads((r/'tool-release.json').read_text());"
                 "print(json.dumps({'version':m.version('mimicverse-description'),"
+                "'airflow_version':m.version('apache-airflow'),"
                 "'source_sha256':i.get('source_sha256'),'file':str(r)}))"
             ),
         ],
@@ -8170,10 +8332,49 @@ def verify_release_runtime(
     release = manifest["release"]
     require(
         identity.get("version") == release["version"]
+        and isinstance(identity.get("airflow_version"), str)
+        and bool(identity["airflow_version"])
         and identity.get("source_sha256") == release["source_sha256"]
         and Path(identity.get("file", "")).is_relative_to(venv),
         "recovery_release_missing",
         "recovered package identity differs from the release",
+    )
+    probe = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-B",
+            "-c",
+            (
+                "import json, sys;"
+                "print(json.dumps({'executable':sys.executable,"
+                "'prefix':sys.prefix,'base_prefix':sys.base_prefix,"
+                "'version':[sys.version_info.major,sys.version_info.minor]}))"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    try:
+        runtime_identity = json.loads(probe.stdout)
+    except ValueError as error:
+        raise RecoveryError(
+            "recovery_release_missing",
+            "recovered interpreter identity is not JSON",
+        ) from error
+    require(
+        probe.returncode == 0
+        and Path(runtime_identity.get("executable", "")).resolve()
+        == python.resolve()
+        and Path(runtime_identity.get("prefix", "")).resolve()
+        == venv.resolve()
+        and Path(runtime_identity.get("base_prefix", "")).resolve()
+        != venv.resolve()
+        and runtime_identity.get("version") == [3, 12],
+        "recovery_release_missing",
+        "recovered interpreter is not the expected CPython 3.12 environment",
     )
     package = Path(identity["file"]).resolve()
     require(
@@ -8186,6 +8387,7 @@ def verify_release_runtime(
         "recovery_release_missing",
         "recovered package directory is outside its virtual environment",
     )
+    release_contract = _release_contract(extracted)
     artifacts = _release_artifacts(manifest)
     _, linux_name, wheel_name = _release_role_archives(artifacts)
     wheel = release_root / "artifacts" / wheel_name
@@ -8195,7 +8397,13 @@ def verify_release_runtime(
         "recovery_release_missing",
         "recovered release wheel digest differs",
     )
-    _verify_installed_wheel(wheel, package.parent)
+    _verify_installed_wheel(
+        wheel,
+        package.parent,
+        expected_package=release_contract["package_files"],
+        expected_version=release_contract["version"],
+        expected_source_sha256=release_contract["source_sha256"],
+    )
     linux_zip = release_root / "artifacts" / linux_name
     _verify_release_archive(linux_zip, artifacts[linux_name]["sha256"])
     _verify_installed_role_wheels(linux_zip, package.parent)
@@ -8205,6 +8413,47 @@ def verify_release_runtime(
         "recovery_release_missing",
         "recovered Airflow entry point is missing or not executable",
     )
+    require(
+        (venv / "bin" / "description").is_file()
+        and os.access(venv / "bin" / "description", os.X_OK),
+        "recovery_release_missing",
+        "recovered description entry point is missing or not executable",
+    )
+    pip_check = subprocess.run(
+        [str(python), "-m", "pip", "check"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    require(
+        pip_check.returncode == 0,
+        "recovery_release_missing",
+        "recovered Python environment fails pip check",
+        {"stderr": pip_check.stderr[-2000:]},
+    )
+    for entry in ("airflow", "description"):
+        entry_probe = subprocess.run(
+            [str(venv / "bin" / entry), "version"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            entry_probe.returncode == 0 and bool(entry_probe.stdout.strip()),
+            "recovery_release_missing",
+            f"recovered {entry} entry point does not execute",
+            {"stderr": entry_probe.stderr[-2000:]},
+        )
+    require(
+        release_contract["version"] == release["version"]
+        and release_contract["source_sha256"] == release["source_sha256"],
+        "recovery_release_missing",
+        "archived release contract differs from the recovery manifest",
+    )
+    if deployment_dir is not None:
+        _verify_deployment_files(release_contract, deployment_dir)
     return {"install_id": install_id, "venv": str(venv), "identity": identity}
 
 
@@ -8256,11 +8505,23 @@ def rehydrate_release_runtime(
             "release",
         )
     if verify_only:
-        return verify_release_runtime(
-            manifest=manifest,
-            extracted=extracted,
-            release_root=release_root,
-        )
+        with tempfile.TemporaryDirectory(
+            prefix="release-verify-",
+            dir=status_dir,
+        ) as verify_root:
+            deployment_dir, _, _ = _extract_release_archives(
+                release_root=release_root,
+                artifacts=artifacts,
+                deployment_name=deployment_name,
+                linux_name=linux_name,
+                destination=Path(verify_root),
+            )
+            return verify_release_runtime(
+                manifest=manifest,
+                extracted=extracted,
+                release_root=release_root,
+                deployment_dir=deployment_dir,
+            )
     staging = status_dir / "release-rehydrate"
     staging.mkdir(mode=0o700)
     deployment_dir, linux_dir, _ = _extract_release_archives(
@@ -8294,6 +8555,11 @@ def rehydrate_release_runtime(
         "recovery_release_missing",
         "recovered release wheel digest differs",
     )
+    require(
+        sys.version_info[:2] == (3, 12),
+        "recovery_release_missing",
+        "release runtime rehydration requires the CPython 3.12 controller",
+    )
     env = os.environ.copy()
     env.update(
         {
@@ -8325,6 +8591,7 @@ def rehydrate_release_runtime(
         manifest=manifest,
         extracted=extracted,
         release_root=release_root,
+        deployment_dir=deployment_dir,
     )
 
 
