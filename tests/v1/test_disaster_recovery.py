@@ -153,6 +153,11 @@ if query:
             "databases": [],
             "roles": ["solidworks"],
         }
+    elif (
+        "current_setting('server_version_num')" in query
+        and "database_oid" not in query
+    ):
+        payload = {"server_version_num": "140024"}
     elif "left(rolname, 3) <> 'pg_'" in query:
         payload = [
             "solidworks",
@@ -1134,6 +1139,28 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertTrue(
             any(candidate.name == "pg-restore-complete" for candidate in self.root.rglob("pg-restore-complete"))
         )
+        verify_status = self.root / "verify-status"
+        verified = recovery.restore_command(
+            manifest_path=manifest_path,
+            key=self.key,
+            target_plan_path=plan,
+            status_dir=verify_status,
+            verify_only=True,
+        )
+        self.assertEqual(verified["status"], "succeeded")
+        self.assertEqual(verified["operation"], "verify-only")
+        self.assertFalse((verify_status / "recovery-marker.json").exists())
+        restored_file = Path(roots["handoff_root"]) / "request.json"
+        restored_file.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.restore_command(
+                manifest_path=manifest_path,
+                key=self.key,
+                target_plan_path=plan,
+                status_dir=self.root / "verify-tampered",
+                verify_only=True,
+            )
+        self.assertEqual(restored_file.read_text(), "tampered\n")
 
     def test_manifest_digest_mismatch_fails_before_target_mutation(self) -> None:
         out, manifest = self.backup()

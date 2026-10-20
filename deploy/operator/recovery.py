@@ -5807,6 +5807,58 @@ def target_empty_cluster(
     return controls
 
 
+def target_restored_cluster(
+    context: CommandContext,
+    postgres: dict,
+    manifest: dict,
+) -> dict:
+    socket_dir = Path(postgres["socket_dir"])
+    data_dir = Path(postgres["data_dir"])
+    require_real_dir(socket_dir, "target PostgreSQL socket directory", "recovery_target_plan_invalid")
+    require_real_dir(data_dir, "target PostgreSQL data directory", "recovery_target_plan_invalid")
+    version_file = data_dir / "PG_VERSION"
+    require_real_file(
+        version_file,
+        "target PG_VERSION",
+        "recovery_postgres_version_mismatch",
+    )
+    require(
+        version_file.read_text(encoding="ascii").strip() == POSTGRES_MAJOR,
+        "recovery_postgres_version_mismatch",
+        "target data directory is not PostgreSQL 14",
+    )
+    require(
+        postgres_major(Path(postgres["bin_dir"]), context) == POSTGRES_MAJOR,
+        "recovery_postgres_version_mismatch",
+        "target PostgreSQL tools are not major 14",
+    )
+    controls = pg_control(data_dir, context)
+    require(
+        controls["system_identifier"] != manifest["database"]["authority"]["system_identifier"],
+        "recovery_target_same_authority",
+        "target cluster is the backup source cluster",
+    )
+    status = psql_json(
+        context,
+        socket_dir=socket_dir,
+        port=postgres["port"],
+        user=postgres["bootstrap_role"],
+        database="postgres",
+        query=(
+            "SELECT json_build_object("
+            "'server_version_num', current_setting('server_version_num'))"
+        ),
+    )
+    require(
+        isinstance(status, dict)
+        and isinstance(status.get("server_version_num"), str)
+        and status["server_version_num"].startswith(POSTGRES_MAJOR),
+        "recovery_postgres_version_mismatch",
+        "target server is not PostgreSQL 14",
+    )
+    return controls
+
+
 def quote_ident(value: str) -> str:
     require(
         isinstance(value, str) and bool(ROLE_NAME.fullmatch(value)),
@@ -6768,6 +6820,7 @@ def restore_command(
     key: Path,
     target_plan_path: Path,
     status_dir: Path,
+    verify_only: bool = False,
 ) -> dict:
     manifest_path = Path(manifest_path)
     key = Path(key)
@@ -6791,7 +6844,7 @@ def restore_command(
 
     receipt = {
         "schema_version": RECEIPT_SCHEMA,
-        "operation": "restore",
+        "operation": "verify-only" if verify_only else "restore",
         "status": "running",
         "started_at": utc_now(),
         "manifest": str(manifest_path),
@@ -6849,8 +6902,11 @@ def restore_command(
             Path(postgres["library_dir"]),
             commands,
         )
-        target_empty_cluster(pg, postgres, manifest)
-        validate_target_filesystem(manifest, plan)
+        if verify_only:
+            target_restored_cluster(pg, postgres, manifest)
+        else:
+            target_empty_cluster(pg, postgres, manifest)
+            validate_target_filesystem(manifest, plan)
         verify_checkpoint_index(
             _load_extracted_json(
                 extracted,
@@ -6868,23 +6924,24 @@ def restore_command(
         )
         write_status(status_dir, receipt)
 
-        mutated = True
-        restore_roles(
-            context=pg,
-            postgres=postgres,
-            extracted=extracted,
-            status_dir=status_dir,
-        )
-        restore_database(
-            context=pg,
-            postgres=postgres,
-            extracted=extracted,
-        )
-        apply_database_acl(
-            context=pg,
-            postgres=postgres,
-            extracted=extracted,
-        )
+        if not verify_only:
+            mutated = True
+            restore_roles(
+                context=pg,
+                postgres=postgres,
+                extracted=extracted,
+                status_dir=status_dir,
+            )
+            restore_database(
+                context=pg,
+                postgres=postgres,
+                extracted=extracted,
+            )
+            apply_database_acl(
+                context=pg,
+                postgres=postgres,
+                extracted=extracted,
+            )
         readback_roles(
             context=pg,
             postgres=postgres,
@@ -6895,8 +6952,9 @@ def restore_command(
             postgres=postgres,
             extracted=extracted,
         )
-        restore_directories(manifest, plan, extracted)
-        restore_exact_files(manifest, extracted)
+        if not verify_only:
+            restore_directories(manifest, plan, extracted)
+            restore_exact_files(manifest, extracted)
         verify_restored_files(manifest, plan)
         verify_checkpoint_index(
             _load_extracted_json(
@@ -6919,18 +6977,21 @@ def restore_command(
             postgres=postgres,
             extracted=extracted,
         )
-        marker = {
-            "schema_version": MARKER_SCHEMA,
-            "manifest_sha256": manifest_sha,
-            "target_plan_sha256": plan_sha,
-            "release": {
-                key_name: manifest["release"][key_name] for key_name in ("version", "source_commit", "source_sha256")
-            },
-            "mode": "exact_path",
-            "verdict": "recovery-verified",
-            "created_at": utc_now(),
-        }
-        write_json_once(status_dir / "recovery-marker.json", marker)
+        marker = None
+        if not verify_only:
+            marker = {
+                "schema_version": MARKER_SCHEMA,
+                "manifest_sha256": manifest_sha,
+                "target_plan_sha256": plan_sha,
+                "release": {
+                    key_name: manifest["release"][key_name]
+                    for key_name in ("version", "source_commit", "source_sha256")
+                },
+                "mode": "exact_path",
+                "verdict": "recovery-verified",
+                "created_at": utc_now(),
+            }
+            write_json_once(status_dir / "recovery-marker.json", marker)
         write_json_once(
             status_dir / "command-log.json",
             {"commands": commands},
@@ -6940,7 +7001,7 @@ def restore_command(
             "status": "succeeded",
             "phase": "verified",
             "completed_at": utc_now(),
-            "marker": str(status_dir / "recovery-marker.json"),
+            "marker": str(status_dir / "recovery-marker.json") if marker is not None else None,
         }
         write_status(status_dir, success)
         return success
@@ -6986,6 +7047,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore_parser.add_argument("--key", type=Path, required=True)
     restore_parser.add_argument("--target-plan", type=Path, required=True)
     restore_parser.add_argument("--status-dir", type=Path, required=True)
+    verify_parser = subparsers.add_parser("verify-only")
+    verify_parser.add_argument("--manifest", type=Path, required=True)
+    verify_parser.add_argument("--key", type=Path, required=True)
+    verify_parser.add_argument("--target-plan", type=Path, required=True)
+    verify_parser.add_argument("--status-dir", type=Path, required=True)
     worker_parser = subparsers.add_parser("snapshot-worker")
     worker_parser.add_argument("--request", type=Path, required=True)
     return parser
@@ -7135,6 +7201,7 @@ def main(argv: list[str] | None = None) -> int:
                 key=args.key,
                 target_plan_path=args.target_plan,
                 status_dir=args.status_dir,
+                verify_only=args.action == "verify-only",
             )
             print(f"status={result['status']}")
             print(f"receipt={args.status_dir / 'receipt.json'}")
