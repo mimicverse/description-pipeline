@@ -244,8 +244,13 @@ class ValueWarningTests(unittest.TestCase):
             "direction_relation": "author_sign_applied",
             "rule_id": "direction.native_axis_sign",
             "rule_version": "v1",
+            "native_sign": -1,
+            "sign_reversal": True,
+            "sign_warning": "discovery.direction_sign_reversed",
             "native_direction": [0.0, 0.0, 1.0],
             "direction": [0.0, 0.0, -1.0],
+            "original_frame": "assembly",
+            "output_frame": "assembly",
         }
         source["joints"] = [
             {
@@ -255,9 +260,12 @@ class ValueWarningTests(unittest.TestCase):
                 "parent": "base_link",
                 "child": "base_link",
                 "axis": [0.0, 0.0, -1.0],
+                "limits": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
+                "drive": {"effort": 1.0, "velocity": 2.0},
                 "axis_provenance": provenance,
             }
         ]
+        carrier = {"joints": [{"name": "arm_joint", "axis_sign": -1}]}
         model = copy.deepcopy(self.model)
         model["joints"] = [{"name": "arm_joint", "axis": [0.0, 0.0, -1.0]}]
         warnings = model["provenance"]["value_warnings"]
@@ -283,10 +291,10 @@ class ValueWarningTests(unittest.TestCase):
         )
         warnings.append(
             {
-                "code": "direction.sign_reparameterized",
+                "code": "direction.author_sign_applied",
                 "message": (
-                    "CAD author axis signs select the positive direction; q and ranges are "
-                    "reparameterized with object-level provenance."
+                    "CAD author axis_sign selects the positive direction of the undirected "
+                    "shaft; q and ranges remain in author q."
                 ),
                 "objects": [
                     {
@@ -298,8 +306,28 @@ class ValueWarningTests(unittest.TestCase):
                         "original": [0.0, 0.0, 1.0],
                         "rule_id": "direction.native_axis_sign",
                         "rule_version": "v1",
-                        "reason": "CAD author sign reversal; q and ranges are reparameterized",
+                        "reason": (
+                            "CAD author axis_sign selects the positive direction of the "
+                            "undirected shaft; q and ranges remain in author q"
+                        ),
+                        "native_joint_identity": "arm_joint",
+                        "native_sign": -1,
+                        "sign_reversal": True,
+                        "sign_warning": "discovery.direction_sign_reversed",
+                        "original_axis_assembly": [0.0, 0.0, 1.0],
                         "output_axis_assembly": [0.0, 0.0, -1.0],
+                        "actual_child_axis": [0.0, 0.0, -1.0],
+                        "original_frame": "assembly",
+                        "output_frame": "assembly",
+                        "model_frame": "child",
+                        "q_sign": 1,
+                        "range_transform": "not_applied",
+                        "limits_before": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
+                        "limits_after": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
+                        "drive_before": {"effort": 1.0, "velocity": 2.0},
+                        "drive_after": {"effort": 1.0, "velocity": 2.0},
+                        "warning_does_not_authorize": True,
+                        "warning_does_not_replace_evidence": True,
                     }
                 ],
             }
@@ -334,16 +362,18 @@ class ValueWarningTests(unittest.TestCase):
                 "source": "native_derived",
             }
         )
-        result = _value_warning_gate(self.root, source, model)
-        self.assertIn("direction.sign_reparameterized", result["codes"])
+        result = _value_warning_gate(self.root, source, model, carrier)
+        self.assertIn("direction.author_sign_applied", result["codes"])
         tampered = copy.deepcopy(model)
-        next(
+        tampered["provenance"]["value_warnings"] = [
             item
             for item in tampered["provenance"]["value_warnings"]
-            if item["code"] == "direction.sign_reparameterized"
-        )["objects"][0]["original"] = [0.0, 0.0, -1.0]
+            if item["code"] != "direction.author_sign_applied"
+        ]
+        tampered_source = copy.deepcopy(source)
+        tampered_source["joints"][0].pop("axis_provenance")
         with self.assertRaises(PipelineError):
-            _value_warning_gate(self.root, source, tampered)
+            _value_warning_gate(self.root, tampered_source, tampered, carrier)
 
     def test_carrier_binding_rejects_tampered_names_members_and_topology(self):
         carrier = {

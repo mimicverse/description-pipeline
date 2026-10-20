@@ -1741,7 +1741,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(
             reversal["detail"]["native_identity"], "mate:shoulder_pitch_joint__coaxial"
         )
-        self.assertEqual(reversal["detail"]["before_after"]["q_sign"], -1)
+        self.assertEqual(reversal["detail"]["before_after"]["q_sign"], 1)
+        self.assertEqual(reversal["detail"]["before_after"]["range_transform"], "not_applied")
         self.assertTrue(reversal["detail"]["warning_does_not_replace_evidence"])
         payload = json.loads((output / "discovery/native-discovery.json").read_text())
         minus = rebuild_joint_facts(payload, output, purpose="engineering")[0]

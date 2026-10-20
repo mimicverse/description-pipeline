@@ -919,16 +919,24 @@ class PublishTests(unittest.TestCase):
                     "id": "provenance.value_warnings",
                     "state": "passed",
                     "details": {
-                        "codes": ["direction.sign_reparameterized"],
+                        "codes": ["direction.author_sign_applied"],
                         "objects": 1,
                         "direction_sign_warnings": [
                             {
                                 "object": "arm_joint",
-                                "original": [0, 0, 1],
-                                "actual": [0, 0, -1],
+                                "native_sign": -1,
+                                "original_axis_assembly": [0, 0, 1],
+                                "output_axis_assembly": [0, 0, -1],
+                                "actual_child_axis": [0, 0, -1],
+                                "original_frame": "assembly",
+                                "output_frame": "assembly",
+                                "model_frame": "child",
+                                "q_sign": 1,
+                                "range_transform": "not_applied",
                                 "rule_id": "direction.native_axis_sign",
                                 "rule_version": "v1",
-                                "reason": "CAD author sign reversal; q and ranges are reparameterized",
+                                "reason": "author sign selects the undirected positive direction",
+                                "warning_does_not_replace_evidence": True,
                             }
                         ],
                     },
@@ -937,8 +945,9 @@ class PublishTests(unittest.TestCase):
             "qualifications": [],
         }
         body = urdf_pr._body("subject", "commit", report, "engineering")
-        self.assertIn("- direction sign `arm_joint`", body)
-        self.assertIn("`[0,0,1]` -> `[0,0,-1]`", body)
+        self.assertIn("- direction author sign `arm_joint`", body)
+        self.assertIn("assembly `[0,0,1]` -> assembly `[0,0,-1]`", body)
+        self.assertIn("child `[0,0,-1]`", body)
         self.assertIn("direction.native_axis_sign/v1", body)
 
 

@@ -70,8 +70,8 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.joint_unsupported_pattern": "Recorded constraints do not identify a one-DOF joint",
     "discovery.joint_axis_sign_missing": "dp.joint.axis_sign (+/-1) is missing",
     "discovery.direction_sign_reversed": "CAD author axis sign is applied; q and ranges are reparameterized",
-    "direction.sign_reparameterized": (
-        "CAD author axis sign selects the positive direction; linked fields are reparameterized"
+    "direction.author_sign_applied": (
+        "CAD author axis_sign selects the undirected shaft positive direction; q and ranges stay in author q"
     ),
     "discovery.interface_name_invalid": "CAD interface name was normalized with a warning",
     "discovery.interface_motion_unresolved": "CAD joint motion is unclassified; a neutral name is retained",

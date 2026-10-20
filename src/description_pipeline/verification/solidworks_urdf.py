@@ -307,7 +307,7 @@ def _input(root, diagnostics=None):
         bodies, joints = carrier["bodies"], carrier["joints"]
         from ..sources.solidworks.naming import carrier_names
 
-        carrier_snapshot = _carrier_snapshot(carrier["root"], bodies, joints)
+        carrier_snapshot = _carrier_snapshot(carrier["root"], bodies, joints, raw)
         body_names, joint_names = carrier_names(bodies, joints, str(carrier["root"]))
         for body in bodies:
             source_name = str(body["name"])
@@ -331,7 +331,7 @@ def _input(root, diagnostics=None):
         bodies = rebuild_rigid_bodies(discovery_record)
         joints = rebuild_joint_facts(discovery_record, root, purpose=_request_purpose(root))
         rebuild_root = next((str(body["name"]) for body in bodies if str(body["name"]) == "base_link"), None)
-        carrier_snapshot = _carrier_snapshot(rebuild_root, bodies, joints)
+        carrier_snapshot = _carrier_snapshot(rebuild_root, bodies, joints, raw)
         frames = rebuild_interface_frames(discovery_record)
     source = read_source_record(root)
     handoff = evidence.handoff(root)
@@ -409,9 +409,21 @@ def _input(root, diagnostics=None):
     }
 
 
-def _carrier_snapshot(root, bodies, joints) -> dict:
+def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
     """Freeze the raw-decoded carrier names, members and native topology."""
 
+    signs: dict[str, int] = {}
+    if isinstance(raw, dict):
+        properties = (raw.get("properties") or {}).get("mates") or {}
+        for joint in joints:
+            mate = joint.get("mate")
+            if not isinstance(mate, str):
+                continue
+            value = (properties.get(mate) or {}).get("dp.joint.axis_sign")
+            if value in (1, "1", "+1"):
+                signs[str(joint["name"])] = 1
+            elif value in (-1, "-1"):
+                signs[str(joint["name"])] = -1
     return {
         "root": None if root is None else str(root),
         "bodies": [
@@ -428,6 +440,7 @@ def _carrier_snapshot(root, bodies, joints) -> dict:
                 "type": joint.get("type"),
                 "parent": str(joint.get("parent") or ""),
                 "child": str(joint.get("child") or ""),
+                "axis_sign": signs.get(str(joint["name"])),
             }
             for joint in joints
         ],
@@ -1827,7 +1840,10 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     source = definition["source"]
     gates.add("model.policy", lambda: _policy(source, model))
     gates.add("source.carrier_binding", lambda: _carrier_binding(source, definition.get("carrier")))
-    gates.add("provenance.value_warnings", lambda: _value_warning_gate(root, source, model))
+    gates.add(
+        "provenance.value_warnings",
+        lambda: _value_warning_gate(root, source, model, definition.get("carrier")),
+    )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
         "frames.native",
@@ -2016,7 +2032,7 @@ def _carrier_binding(source, carrier):
     return {"bodies": len(native), "joints": len(delivered)}
 
 
-def _value_warning_gate(root, source, model):
+def _value_warning_gate(root, source, model, carrier=None):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.naming import (
@@ -2048,6 +2064,10 @@ def _value_warning_gate(root, source, model):
 
     bodies = source.get("bodies") or []
     joints = source.get("joints") or []
+    carrier_signs = {
+        str(row["name"]): row.get("axis_sign")
+        for row in (carrier or {}).get("joints") or []
+    }
     links = model.get("links") or []
     model_joints = model.get("joints") or []
     shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
@@ -2165,40 +2185,70 @@ def _value_warning_gate(root, source, model):
                 },
             )
         provenance = joint.get("axis_provenance")
-        if isinstance(provenance, dict):
-            model_joint = next(
-                (item for item in model_joints if item.get("name") == joint.get("name")),
-                None,
+        native_name = str(joint.get("source_name") or joint["name"])
+        model_joint = next(
+            (item for item in model_joints if item.get("name") == joint.get("name")),
+            None,
+        )
+        if carrier_signs.get(native_name) == -1:
+            _require(isinstance(provenance, dict), "Author axis_sign reversal has no source provenance")
+            _require(
+                provenance.get("native_sign") == -1
+                and provenance.get("sign_reversal") is True
+                and provenance.get("sign_warning") == "discovery.direction_sign_reversed",
+                "Author axis_sign reversal provenance is missing or inconsistent",
             )
             _require(model_joint is not None, "A canonical joint is missing from the model")
             native_axis = provenance.get("native_direction")
             output_axis = provenance.get("direction")
-            if (
-                provenance.get("direction_relation") == "author_sign_applied"
-                and isinstance(native_axis, list)
+            _require(
+                isinstance(native_axis, list)
                 and isinstance(output_axis, list)
                 and len(native_axis) == 3
                 and len(output_axis) == 3
                 and all(
                     abs(float(before) + float(after)) <= 1e-12
                     for before, after in zip(native_axis, output_axis, strict=True)
-                )
-            ):
-                add(
-                    "direction.sign_reparameterized",
-                    {
-                        "object_type": "joint",
-                        "object": joint["name"],
-                        "field": "axis",
-                        "actual": model_joint.get("axis"),
-                        "source": "CAD author dp.joint.axis_sign",
-                        "original": native_axis,
-                        "rule_id": provenance.get("rule_id", "direction.native_axis_sign"),
-                        "rule_version": provenance.get("rule_version", "v1"),
-                        "reason": "CAD author sign reversal; q and ranges are reparameterized",
-                        "output_axis_assembly": output_axis,
-                    },
-                )
+                ),
+                "Author axis_sign reversal does not reverse the native shaft",
+            )
+            add(
+                "direction.author_sign_applied",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "axis",
+                    "actual": model_joint.get("axis"),
+                    "source": "CAD author dp.joint.axis_sign",
+                    "original": native_axis,
+                    "rule_id": provenance.get("rule_id", "direction.native_axis_sign"),
+                    "rule_version": provenance.get("rule_version", "v1"),
+                    "reason": (
+                        "CAD author axis_sign selects the positive direction of the "
+                        "undirected shaft; q and ranges remain in author q"
+                    ),
+                    "native_joint_identity": native_name,
+                    "native_sign": provenance.get("native_sign"),
+                    "sign_reversal": provenance.get("sign_reversal"),
+                    "sign_warning": provenance.get("sign_warning"),
+                    "original_axis_assembly": native_axis,
+                    "output_axis_assembly": output_axis,
+                    "actual_child_axis": model_joint.get("axis"),
+                    "original_frame": provenance.get("original_frame", "assembly"),
+                    "output_frame": provenance.get("output_frame", "assembly"),
+                    "model_frame": "child",
+                    "q_sign": 1,
+                    "range_transform": "not_applied",
+                    "limits_before": joint.get("limits"),
+                    "limits_after": joint.get("limits"),
+                    "drive_before": joint.get("drive"),
+                    "drive_after": joint.get("drive"),
+                    "warning_does_not_authorize": True,
+                    "warning_does_not_replace_evidence": True,
+                },
+            )
+        if isinstance(provenance, dict):
+            _require(model_joint is not None, "A canonical joint is missing from the model")
             row = {
                 "object_type": "joint",
                 "object": joint["name"],
@@ -2413,9 +2463,9 @@ def _value_warning_gate(root, source, model):
         ),
         "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
         "direction.semantics_unresolved": "Authored CAD axes are preserved; functional positive motion is not proven.",
-        "direction.sign_reparameterized": (
-            "CAD author axis signs select the positive direction; q and ranges are "
-            "reparameterized with object-level provenance."
+        "direction.author_sign_applied": (
+            "CAD author axis_sign selects the positive direction of the undirected "
+            "shaft; q and ranges remain in author q."
         ),
         "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
         "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
@@ -2451,13 +2501,21 @@ def _value_warning_gate(root, source, model):
         "direction_sign_warnings": [
             {
                 "object": row.get("object"),
-                "original": row.get("original"),
-                "actual": row.get("actual"),
+                "native_sign": row.get("native_sign"),
+                "original_axis_assembly": row.get("original_axis_assembly"),
+                "output_axis_assembly": row.get("output_axis_assembly"),
+                "actual_child_axis": row.get("actual_child_axis"),
+                "original_frame": row.get("original_frame"),
+                "output_frame": row.get("output_frame"),
+                "model_frame": row.get("model_frame"),
+                "q_sign": row.get("q_sign"),
+                "range_transform": row.get("range_transform"),
                 "rule_id": row.get("rule_id"),
                 "rule_version": row.get("rule_version"),
                 "reason": row.get("reason"),
+                "warning_does_not_replace_evidence": row.get("warning_does_not_replace_evidence"),
             }
-            for row in expected.get("direction.sign_reparameterized", [])
+            for row in expected.get("direction.author_sign_applied", [])
         ],
     }
 

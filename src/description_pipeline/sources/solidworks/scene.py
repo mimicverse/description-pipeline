@@ -940,8 +940,28 @@ def _value_warnings(
                         "original": native_axis,
                         "rule_id": provenance.get("rule_id", "direction.native_axis_sign"),
                         "rule_version": provenance.get("rule_version", "v1"),
-                        "reason": "CAD author sign reversal; q and ranges are reparameterized",
+                        "reason": (
+                            "CAD author axis_sign selects the positive direction of the "
+                            "undirected shaft; q and ranges remain in author q"
+                        ),
+                        "native_joint_identity": source_name,
+                        "native_sign": provenance.get("native_sign"),
+                        "sign_reversal": provenance.get("sign_reversal"),
+                        "sign_warning": provenance.get("sign_warning"),
+                        "original_axis_assembly": native_axis,
                         "output_axis_assembly": output_axis,
+                        "actual_child_axis": joint["axis"],
+                        "original_frame": provenance.get("original_frame", "assembly"),
+                        "output_frame": provenance.get("output_frame", "assembly"),
+                        "model_frame": "child",
+                        "q_sign": 1,
+                        "range_transform": "not_applied",
+                        "limits_before": source_joint.get("limits"),
+                        "limits_after": source_joint.get("limits"),
+                        "drive_before": source_joint.get("drive"),
+                        "drive_after": source_joint.get("drive"),
+                        "warning_does_not_authorize": True,
+                        "warning_does_not_replace_evidence": True,
                     }
                 )
             direction = {
@@ -1079,10 +1099,10 @@ def _value_warnings(
     if sign_reversals:
         warnings.append(
             {
-                "code": "direction.sign_reparameterized",
+                "code": "direction.author_sign_applied",
                 "message": (
-                    "CAD author axis signs select the positive direction; q and ranges are "
-                    "reparameterized with object-level provenance."
+                    "CAD author axis_sign selects the positive direction of the undirected "
+                    "shaft; q and ranges remain in author q."
                 ),
                 "objects": sign_reversals,
             }
