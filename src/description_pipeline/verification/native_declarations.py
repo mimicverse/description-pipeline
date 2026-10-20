@@ -20,10 +20,13 @@ from ..sources.solidworks.session_artifacts import (
     session_materialization_under_root,
 )
 from ..sources.solidworks.native_limits import validate_native_limit
+from ..sources.solidworks.direction import canonicalize_axis, transform_limits
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
 SCHEMA = "solidworks-to-urdf.native-declarations-verification/v1"
+
+
 def _require(condition, code, message, **detail):
     if not condition:
         raise DeclarationError(code, message, detail)
@@ -356,6 +359,8 @@ def _complete_membership(raw, components, members, leaves):
 def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str | None = None) -> dict:
     """Audit raw native declaration evidence and, optionally, generated source claims."""
     checks, errors, diagnostics, state = [], [], [], {}
+    state["directions"] = {}
+    state["carried_axes"] = {}
 
     def check(identifier, callback):
         try:
@@ -603,9 +608,61 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         )
         return {}
 
+    def positive_direction(name, joint):
+        cached = state["directions"].get(name)
+        if cached is not None:
+            return cached
+        if joint.get("type") == "fixed":
+            return None
+        root = ((state.get("declaration") or {}).get("root") or {}).get("name")
+        child = state.get("frames", {}).get(joint.get("child_link"))
+        base = state.get("frames", {}).get(root)
+        _require(
+            child is not None and base is not None,
+            "v14.direction_frame_unread",
+            "positive motion needs readable child and CS_base_link frames",
+            joint=name,
+        )
+        try:
+            decision = canonicalize_axis(
+                name,
+                joint.get("axis"),
+                child.reshape(16).tolist(),
+                base.reshape(16).tolist(),
+                joint_type=joint["type"],
+            )
+        except ValueError as error:
+            raise DeclarationError(
+                "v14.direction_invalid",
+                "positive-motion semantics could not be evaluated",
+                {"joint": name, "error": str(error)},
+            ) from error
+        state["directions"][name] = decision
+        state["carried_axes"][name] = decision["delivered_local_axis"]
+        if decision["status"] != "canonical":
+            diagnostics.append(
+                {
+                    "code": "direction.semantics_unresolved",
+                    "blocking": False,
+                    "message": "the joint axis cannot be assigned a canonical principal-motion sign",
+                    "detail": {"joint": name, **decision},
+                }
+            )
+        elif decision["sign"] == -1:
+            diagnostics.append(
+                {
+                    "code": "direction.sign_normalized",
+                    "blocking": False,
+                    "message": "the CAD signed axis was reversed to satisfy the positive-motion convention",
+                    "detail": {"joint": name, **decision},
+                }
+            )
+        return decision
+
     def joint_limits(name, joint):
         if joint["type"] == "fixed":
             return {"type": "fixed"}
+        positive = positive_direction(name, joint)
         limits = joint.get("limit")
         _require(isinstance(limits, dict), "v14.limits", "moving joint has no authored limit record", joint=name)
         raw_limits = dict(limits)
@@ -776,6 +833,9 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             else:
                 state.setdefault("effective_limits", {})[name] = dict(limits)
                 state.setdefault("effective_limit_sources", {})[name] = "declared_author"
+        limits = transform_limits(limits, 1 if positive is None else int(positive["sign"]))
+        if name in state.get("effective_limits", {}):
+            state["effective_limits"][name] = dict(limits)
         unqualified = [key for key in ("effort", "velocity") if limits.get(key) == 0]
         if joint["type"] in {"revolute", "prismatic"} and limits.get("lower") == limits.get("upper"):
             unqualified.append("degenerate_position_range")
@@ -829,11 +889,17 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             for key, value in state["components"].items()
             if value["suppressed"] is False
         }
+        positive = positive_direction(name, joint)
+        carried = state["carried_axes"][name]
         details = _axis(
-            {"axis_reference": reference, "axis": joint.get("axis")}, candidates[0], components, state["frames"][child]
+            {"axis_reference": reference, "axis": carried}, candidates[0], components, state["frames"][child]
         )
         state.setdefault("axes", {})[name] = reference
-        return {**details, "origin_customized": origin["customized"]}
+        return {
+            **details,
+            "origin_customized": origin["customized"],
+            "direction": positive,
+        }
 
     def pose_diagnostics():
         from .native_discovery import _frames
@@ -973,7 +1039,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     limits = {key: limits[key] for key in ("effort", "velocity")}
                 _require(
                     observed.get("limits") == limits
-                    and observed.get("axis") == saved["axis"]
+                    and observed.get("axis") == state.get("carried_axes", {}).get(name)
                     and observed.get("axis_reference") == state["axes"].get(name),
                     "v14.claims",
                     "generated joint axis or operating values differ",
@@ -1030,7 +1096,8 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     "type": joint["type"],
                     "parent": joint["parent_link"],
                     "child": joint["child_link"],
-                    "axis": joint.get("axis"),
+                    "axis": (state.get("carried_axes") or {}).get(name),
+                    "axis_provenance": (state.get("directions") or {}).get(name),
                     "axis_reference": (state.get("axes") or {}).get(name),
                     "limits": (
                         {key: joint["limit"][key] for key in ("effort", "velocity")}

@@ -830,7 +830,13 @@ def _build_joints(
                 for key in (
                     "source",
                     "native_direction",
+                    "assembly_direction",
+                    "delivered_local_axis",
                     "direction_relation",
+                    "sign",
+                    "motion",
+                    "classification_source",
+                    "alignment",
                     "rule_id",
                     "rule_version",
                 ):
@@ -860,6 +866,8 @@ def _value_warnings(
     warnings: list[dict[str, Any]] = []
     mappings = []
     motion_unresolved = []
+    direction_changes = []
+    direction_unresolved = []
     visuals = []
     materials = []
     mesh_paths = []
@@ -896,6 +904,25 @@ def _value_warnings(
                     "reason": "CAD reference-axis formatting",
                 }
             )
+        provenance = source_joint.get("axis_provenance")
+        if isinstance(provenance, dict):
+            direction = {
+                "object_type": "joint",
+                "object": joint["name"],
+                "field": "axis",
+                "actual": joint["axis"],
+                "source": "CAD signed axis and versioned positive-motion rule",
+                "original": provenance.get("raw_base_axis"),
+                "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
+                "rule_version": provenance.get("rule_version", "v3"),
+                "reason": provenance.get("direction_relation", provenance.get("status")),
+                "sign": provenance.get("sign"),
+                "motion": provenance.get("motion"),
+            }
+            if provenance.get("sign") == -1:
+                direction_changes.append(direction)
+            elif provenance.get("status", provenance.get("direction_relation")) == "unresolved":
+                direction_unresolved.append(direction)
         if source_joint.get("type") != "fixed" and not any(
             word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
         ):
@@ -985,6 +1012,22 @@ def _value_warnings(
                 "code": "naming.motion_unresolved",
                 "message": "Joint names without a CAD motion classification retain a neutral name.",
                 "objects": motion_unresolved,
+            }
+        )
+    if direction_changes:
+        warnings.append(
+            {
+                "code": "direction.sign_normalized",
+                "message": "Joint axes were normalized to the versioned positive-motion convention.",
+                "objects": direction_changes,
+            }
+        )
+    if direction_unresolved:
+        warnings.append(
+            {
+                "code": "direction.semantics_unresolved",
+                "message": "Joint axes lack a determinate canonical positive-motion sign.",
+                "objects": direction_unresolved,
             }
         )
     if visuals:

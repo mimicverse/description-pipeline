@@ -348,6 +348,61 @@ class ValueWarningTests(unittest.TestCase):
         )
         self.assertFalse(any(item["object_type"] == "frame" for item in formatted["objects"]))
 
+    def test_direction_rule_warning_is_rederived_for_a_reversed_axis(self):
+        source = copy.deepcopy(self.source)
+        model = copy.deepcopy(self.model)
+        source["joints"] = [
+            {
+                "name": "left_shoulder_pitch_joint",
+                "source_name": "left_shoulder_pitch_joint",
+                "type": "revolute",
+                "axis_provenance": {
+                    "status": "canonical",
+                    "sign": -1,
+                    "motion": "pitch",
+                    "raw_base_axis": [0.0, -0.9396926208, -0.3420201433],
+                    "rule_id": "direction.positive_semantics",
+                    "rule_version": "v3",
+                },
+            }
+        ]
+        model["joints"] = [{"name": "left_shoulder_pitch_joint", "axis": [0.0, 0.0, 1.0]}]
+        warnings = model["provenance"]["value_warnings"]
+        next(
+            item for item in warnings if item["code"] == "geometry.derived_from_native"
+        )["objects"].append(
+            {
+                "object_type": "joint",
+                "object": "left_shoulder_pitch_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        warnings.append(
+            {
+                "code": "direction.sign_normalized",
+                "message": "Joint axes were normalized to the versioned positive-motion convention.",
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "left_shoulder_pitch_joint",
+                        "field": "axis",
+                        "actual": [0.0, 0.0, 1.0],
+                        "source": "CAD signed axis and versioned positive-motion rule",
+                        "original": [0.0, -0.9396926208, -0.3420201433],
+                        "rule_id": "direction.positive_semantics",
+                        "rule_version": "v3",
+                        "reason": "canonical",
+                        "sign": -1,
+                        "motion": "pitch",
+                    }
+                ],
+            }
+        )
+        result = _value_warning_gate(self.root, source, model)
+        self.assertEqual(result["objects"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1987,6 +1987,30 @@ def _value_warning_gate(root, source, model):
                     "reason": "motion classification unavailable",
                 },
             )
+        provenance = joint.get("axis_provenance")
+        if isinstance(provenance, dict):
+            model_joint = next(
+                (item for item in model_joints if item.get("name") == joint.get("name")),
+                None,
+            )
+            _require(model_joint is not None, "A canonical joint is missing from the model")
+            row = {
+                "object_type": "joint",
+                "object": joint["name"],
+                "field": "axis",
+                "actual": model_joint.get("axis"),
+                "source": "CAD signed axis and versioned positive-motion rule",
+                "original": provenance.get("raw_base_axis"),
+                "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
+                "rule_version": provenance.get("rule_version", "v3"),
+                "reason": provenance.get("direction_relation", provenance.get("status")),
+                "sign": provenance.get("sign"),
+                "motion": provenance.get("motion"),
+            }
+            if provenance.get("sign") == -1:
+                add("direction.sign_normalized", row)
+            elif provenance.get("status", provenance.get("direction_relation")) == "unresolved":
+                add("direction.semantics_unresolved", row)
     for frame in source.get("frames", []):
         source_name = str(frame.get("source_name") or "")
         native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
@@ -2166,6 +2190,8 @@ def _value_warning_gate(root, source, model):
             "Link, joint, and frame names are deterministic formatting of native CAD identities."
         ),
         "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
+        "direction.sign_normalized": "Joint axes were normalized to the versioned positive-motion convention.",
+        "direction.semantics_unresolved": "Joint axes lack a determinate canonical positive-motion sign.",
         "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
         "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
         "naming.derived_material": "Material names are derived from the owner link and native component identity.",
