@@ -766,10 +766,43 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("v14.native_limits_unreadable", {item["code"] for item in report["errors"]})
 
+    def test_unrelated_same_side_native_limit_does_not_poison_a_joint(self):
+        raw = fixture()
+        unrelated = copy.deepcopy(raw["mates"][0])
+        unrelated["name"] = "internal_tool_limit"
+        unrelated["entities"][0]["component"] = "module-1/tool_part"
+        unrelated["entities"][1]["component"] = "module-1/bracket"
+        raw["mates"].append(unrelated)
+        report = verify_declarations(raw, source_claims())
+        self.assertTrue(report["passed"], report["errors"])
+
+    def test_assembly_frame_limit_binds_the_declared_root(self):
+        raw = fixture()
+        raw["mates"][0]["entities"][0].update({"component": "", "assembly_frame": True})
+        report = verify_declarations(raw, source_claims())
+        self.assertTrue(report["passed"], report["errors"])
+
     def test_continuous_joint_with_native_position_limit_is_rejected(self):
         raw = fixture()
         raw["exporter"]["raw_xml"] = raw["exporter"]["raw_xml"].replace(">revolute<", ">continuous<")
         raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(raw["exporter"]["raw_xml"].encode()).hexdigest()
+        report = verify_declarations(raw, source_claims())
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_unexpected", {item["code"] for item in report["errors"]})
+
+    def test_continuous_crossing_native_limit_with_another_name_is_rejected(self):
+        raw = fixture()
+        raw["exporter"]["raw_xml"] = raw["exporter"]["raw_xml"].replace(">revolute<", ">continuous<")
+        root = ET.fromstring(raw["exporter"]["raw_xml"])
+        for item in root.iter():
+            if item.get(Z_TAG + "Id") in {"joint_limit_LowerAttribute", "joint_limit_UpperAttribute"}:
+                value = item.find(NS_TAG + "Value")
+                value.attrib.clear()
+                value.set("{http://www.w3.org/2001/XMLSchema-instance}nil", "true")
+                value.text = None
+        raw["exporter"]["raw_xml"] = ET.tostring(root, encoding="unicode")
+        raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(raw["exporter"]["raw_xml"].encode()).hexdigest()
+        raw["mates"][0]["name"] = "other__limit"
         report = verify_declarations(raw, source_claims())
         self.assertFalse(report["passed"])
         self.assertIn("v14.native_limits_unexpected", {item["code"] for item in report["errors"]})

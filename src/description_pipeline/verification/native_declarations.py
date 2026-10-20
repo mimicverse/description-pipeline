@@ -19,7 +19,7 @@ from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
 )
-from ..sources.solidworks.native_limits import validate_limit_entity_topology, validate_native_limit
+from ..sources.solidworks.native_limits import limit_mate_scope, validate_native_limit
 from ..sources.solidworks.direction import canonicalize_axis
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
@@ -689,7 +689,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         )
         native_limits = []
         native_complete = True
-        if joint["type"] in {"revolute", "prismatic"}:
+        if joint["type"] in {"revolute", "prismatic", "continuous"}:
             child = joint["child_link"]
             child_tree = {child}
             parents = state.get("parents") or {}
@@ -708,10 +708,29 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 owners = [body for body, body_members in members.items() if expanded and expanded <= body_members]
                 return owners[0] if len(owners) == 1 else None
 
+            parents = state.get("parents") or {}
+            roots = [link for link, parent in parents.items() if parent is None]
+            root_name = roots[0] if len(roots) == 1 else None
+            root_frame = state.get("frame_names", {}).get(root_name) if root_name is not None else None
+            ownerless_root = (
+                [
+                    datum
+                    for datum in raw.get("datums") or []
+                    if isinstance(datum, dict)
+                    and str(datum.get("name")) == root_frame
+                    and datum.get("owner") == ""
+                ]
+                if root_frame
+                else []
+            )
+            assembly_owner = root_name if root_name is not None and len(ownerless_root) == 1 else None
+
             raw_mates = raw.get("mates")
-            if not isinstance(raw_mates, list) or not raw_mates:
+            if not isinstance(raw_mates, list):
                 native_complete = False
                 raw_mates = []
+            elif joint["type"] != "continuous" and not raw_mates:
+                native_complete = False
             limit_types = {"distance", "angle", "limitdistance", "limitangle"}
             for mate in raw_mates:
                 if not isinstance(mate, dict):
@@ -724,82 +743,57 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 if suppressed:
                     continue
                 mate_type = str(mate.get("type") or "").strip().lower()
-                range_candidate = False
-                if mate_type in limit_types:
-                    flag = mate.get("is_advanced_mate")
-                    if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
-                        native_complete = False
-                        continue
-                    if flag is True:
-                        try:
-                            lower, upper, unit = validate_native_limit(mate, state.get("components"))
-                        except ValueError:
-                            native_complete = False
-                            continue
-                        expected_unit = "m" if joint["type"] == "prismatic" else "rad"
-                        if unit != expected_unit:
-                            native_complete = False
-                            continue
-                        try:
-                            validate_limit_entity_topology(mate, owner_for, child_tree)
-                        except ValueError:
-                            native_complete = False
-                            continue
-                        if isinstance(mate.get("native_limit"), dict) and isinstance(mate.get("limits"), dict):
-                            range_candidate = True
-                        else:
-                            native_complete = False
-                    elif mate_type in {"limitangle", "limitdistance"} or mate.get("limits") is not None:
-                        native_complete = False
-                        if isinstance(mate.get("limits"), dict):
-                            native_limits.append(
-                                {
-                                    "mate": str(mate.get("name") or "unknown"),
-                                    "type": mate_type,
-                                    "is_advanced_mate": flag,
-                                    "limits": mate["limits"],
-                                }
-                            )
-                if range_candidate and (
-                    "limits" not in mate
-                    or type(mate.get("error_code")) is not int
-                    or mate["error_code"] != 0
-                ):
+                if mate_type not in limit_types:
+                    continue
+                scope = limit_mate_scope(
+                    mate,
+                    owner_for,
+                    child_tree,
+                    name,
+                    assembly_owner=assembly_owner,
+                )
+                if scope == "unrelated":
+                    continue
+                if scope in {"claimed_unreadable", "claimed_same_side"}:
                     native_complete = False
-                if isinstance(mate.get("limits"), dict) and not range_candidate:
+                    continue
+                flag = mate.get("is_advanced_mate")
+                if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
                     native_complete = False
-                    native_limits.append(
-                        {"mate": str(mate.get("name") or "unknown"), "type": mate_type, "limits": mate["limits"]}
-                    )
-                if not range_candidate and mate.get("limits") is None:
                     continue
-                entities = mate.get("entities")
-                if not isinstance(entities, list) or len(entities) != 2:
-                    if range_candidate:
+                if flag is not True:
+                    if mate.get("limits") is not None:
                         native_complete = False
                     continue
-                owners = []
-                for entity in entities:
-                    component = entity.get("component") if isinstance(entity, dict) else None
-                    owner = owner_for(component) if isinstance(component, str) and component else None
-                    if owner is None:
-                        native_complete = False
-                        break
-                    owners.append(owner)
-                if len(owners) != 2:
+                if mate_type not in {"limitangle", "limitdistance"}:
+                    native_complete = False
                     continue
-                if (owners[0] in child_tree) == (owners[1] in child_tree):
-                    continue
-                mate_name = str(mate.get("name") or "")
-                if range_candidate:
-                    native_limits.append(
-                        {
-                            "mate": mate_name,
-                            "type": mate_type,
-                            "is_advanced_mate": mate.get("is_advanced_mate"),
-                            "limits": {"lower": lower, "upper": upper, "unit": unit},
-                        }
+                if joint["type"] == "continuous":
+                    raise DeclarationError(
+                        "v14.native_limits_unexpected",
+                        "a continuous joint has native position-limit evidence",
+                        {"joint": name, "mate": mate.get("name")},
                     )
+                try:
+                    lower, upper, unit = validate_native_limit(mate, state.get("components"))
+                except ValueError:
+                    native_complete = False
+                    continue
+                expected_unit = "m" if joint["type"] == "prismatic" else "rad"
+                if unit != expected_unit:
+                    native_complete = False
+                    continue
+                if mate.get("error_code") != 0 or not isinstance(mate.get("limits"), dict):
+                    native_complete = False
+                    continue
+                native_limits.append(
+                    {
+                        "mate": str(mate.get("name") or "unknown"),
+                        "type": mate_type,
+                        "is_advanced_mate": flag,
+                        "limits": {"lower": lower, "upper": upper, "unit": unit},
+                    }
+                )
             if not native_complete:
                 raise DeclarationError(
                     "v14.native_limits_unreadable",

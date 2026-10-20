@@ -83,10 +83,61 @@ def _binding(entity, index: int) -> tuple[str, str | None, int | None]:
     )
 
 
+def limit_entity_owners(
+    mate: Mapping,
+    owner_for: Callable[[str], str | None],
+    *,
+    assembly_owner: str | None = None,
+) -> tuple[str, str] | None:
+    """Resolve both mate entities to declared bodies, or return ``None``."""
+
+    entities = mate.get("entities")
+    if not isinstance(entities, list) or len(entities) != 2:
+        return None
+    owners: list[str] = []
+    for entity in entities:
+        component = entity.get("component") if isinstance(entity, Mapping) else None
+        if component == "":
+            owner = assembly_owner if entity.get("assembly_frame") is True else None
+        else:
+            owner = owner_for(component) if isinstance(component, str) and component else None
+        if owner is None:
+            return None
+        owners.append(owner)
+    return owners[0], owners[1]
+
+
+def limit_mate_scope(
+    mate: Mapping,
+    owner_for: Callable[[str], str | None],
+    child_tree: set[str],
+    joint_name: str,
+    *,
+    assembly_owner: str | None = None,
+) -> str:
+    """Classify a limit candidate before validating its units or evidence.
+
+    ``claimed_unreadable`` and ``claimed_same_side`` belong to the named joint
+    and must fail closed.  ``crossing`` is relevant by native entity boundary,
+    even when its mate name differs.  ``unrelated`` belongs to another cut and
+    must not poison this joint.
+    """
+
+    name_match = str(mate.get("name") or "").split("__", 1)[0] == str(joint_name)
+    owners = limit_entity_owners(mate, owner_for, assembly_owner=assembly_owner)
+    if owners is None:
+        return "claimed_unreadable" if name_match else "unrelated"
+    if (owners[0] in child_tree) != (owners[1] in child_tree):
+        return "crossing"
+    return "claimed_same_side" if name_match else "unrelated"
+
+
 def validate_limit_entity_topology(
     mate: Mapping,
     owner_for: Callable[[str], str | None],
     child_tree: set[str],
+    *,
+    assembly_owner: str | None = None,
 ) -> tuple[str, str]:
     """Prove the two limit entities sit on opposite sides of the joint.
 
@@ -97,16 +148,9 @@ def validate_limit_entity_topology(
     for this joint.
     """
 
-    entities = mate.get("entities")
-    if not isinstance(entities, list) or len(entities) != 2:
-        raise ValueError("native limit must bind exactly two mate entities")
-    owners: list[str] = []
-    for entity in entities:
-        component = entity.get("component") if isinstance(entity, Mapping) else None
-        owner = owner_for(component) if isinstance(component, str) and component else None
-        if owner is None:
-            raise ValueError("native limit entity is not owned by exactly one declared body")
-        owners.append(owner)
+    owners = limit_entity_owners(mate, owner_for, assembly_owner=assembly_owner)
+    if owners is None:
+        raise ValueError("native limit entity is not owned by exactly one declared body")
     if (owners[0] in child_tree) == (owners[1] in child_tree):
         raise ValueError("native limit entities do not span the declared parent/child subtrees")
     return owners[0], owners[1]

@@ -74,7 +74,7 @@ from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
-from .native_limits import validate_limit_entity_topology, validate_native_limit
+from .native_limits import limit_mate_scope, validate_native_limit
 from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
@@ -3063,6 +3063,20 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
         owners = component_owners.get(component, set())
         return next(iter(owners)) if len(owners) == 1 else None
 
+    root_name = str(declaration.get("root") or "")
+    root_body = by_name.get(root_name)
+    root_datum = str(root_body.get("datum") or "") if root_body is not None else ""
+    ownerless_root = (
+        [
+            item
+            for item in record.get("datums") or []
+            if isinstance(item, dict) and str(item.get("name")) == root_datum and item.get("owner") == ""
+        ]
+        if root_name and root_datum
+        else []
+    )
+    assembly_owner = root_name if len(ownerless_root) == 1 else None
+
     joints = []
     for link in declaration["links"]:
         if link["parent"] is None:
@@ -3119,12 +3133,27 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
             for mate in record.get("mates") or []:
                 if not isinstance(mate, dict):
                     continue
-                if str(mate.get("name") or "").split("__", 1)[0] != str(declared["name"]):
+                mate_kind = str(mate.get("type") or "").strip().lower()
+                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
                     continue
                 if mate.get("suppressed") is True:
                     continue
-                mate_kind = str(mate.get("type") or "").strip().lower()
-                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                scope = limit_mate_scope(
+                    mate,
+                    owner_for,
+                    subtree,
+                    str(declared["name"]),
+                    assembly_owner=assembly_owner,
+                )
+                if scope == "unrelated":
+                    continue
+                if scope in {"claimed_unreadable", "claimed_same_side"}:
+                    native_errors.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": "native limit entities do not span the declared parent/child subtrees",
+                        }
+                    )
                     continue
                 if mate.get("suppressed") is not False or mate.get("error_code") != 0:
                     native_errors.append(
@@ -3138,6 +3167,10 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                     )
                     continue
                 if flag is not True:
+                    if mate.get("limits") is not None:
+                        native_errors.append(
+                            {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
+                        )
                     continue
                 if mate_kind not in {"limitdistance", "limitangle"}:
                     native_errors.append(
@@ -3146,11 +3179,6 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                     continue
                 try:
                     lower, upper, unit = validate_native_limit(mate, component_records)
-                except ValueError as error:
-                    native_errors.append({"mate": mate.get("name"), "reason": str(error)})
-                    continue
-                try:
-                    validate_limit_entity_topology(mate, owner_for, subtree)
                 except ValueError as error:
                     native_errors.append({"mate": mate.get("name"), "reason": str(error)})
                     continue

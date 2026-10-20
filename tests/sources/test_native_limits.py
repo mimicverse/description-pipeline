@@ -6,6 +6,7 @@ import copy
 import unittest
 
 from description_pipeline.sources.solidworks.native_limits import (
+    limit_mate_scope,
     validate_limit_entity_topology,
     validate_native_limit,
 )
@@ -79,6 +80,36 @@ class NativeLimitValidationTests(unittest.TestCase):
         same_side["entities"][1]["component"] = "base-1"
         with self.assertRaisesRegex(ValueError, "span"):
             validate_limit_entity_topology(same_side, owners.get, {"arm"})
+
+    def test_unrelated_mate_from_another_dimension_is_ignored(self) -> None:
+        angle = support.native_limit_mate("base-1", "arm-1")
+        distance = support.native_limit_mate("base-1", "base-2")
+        owners = {"base-1": "base", "arm-1": "arm", "base-2": "base"}
+        self.assertEqual(limit_mate_scope(angle, owners.get, {"arm"}, "hinge"), "crossing")
+        self.assertEqual(limit_mate_scope(distance, owners.get, {"arm"}, "hinge"), "unrelated")
+
+    def test_assembly_frame_binds_only_with_an_explicit_root(self) -> None:
+        mate = support.native_limit_mate("", "arm-1")
+        mate["entities"][0]["assembly_frame"] = True
+        owners = {"arm-1": "arm"}
+        self.assertEqual(validate_native_limit(mate), (-1.0, 1.0, "rad"))
+        self.assertEqual(
+            limit_mate_scope(mate, owners.get, {"arm"}, "hinge_joint", assembly_owner="base"),
+            "crossing",
+        )
+        self.assertEqual(
+            limit_mate_scope(mate, owners.get, {"arm"}, "hinge_joint"),
+            "claimed_unreadable",
+        )
+        self.assertEqual(
+            validate_limit_entity_topology(
+                mate,
+                owners.get,
+                {"arm"},
+                assembly_owner="base",
+            ),
+            ("base", "arm"),
+        )
 
 
 if __name__ == "__main__":
