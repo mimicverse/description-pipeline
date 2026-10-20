@@ -389,14 +389,14 @@ def _finite_limit(value) -> bool:
 
 
 def _valid_limits(limits) -> bool:
-    """A bounded range: finite, matching-unit, strictly ordered lower < upper."""
+    """A range: finite, matching-unit, ordered lower <= upper; zero span is native."""
     if not isinstance(limits, dict):
         return False
     lower, upper = limits.get("lower"), limits.get("upper")
     return (
         _finite_limit(lower)
         and _finite_limit(upper)
-        and float(lower) < float(upper)
+        and float(lower) <= float(upper)
         and limits.get("unit") in {"m", "rad"}
     )
 
@@ -2190,6 +2190,15 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
     bodies = rebuild_rigid_bodies(raw)
     by_name = {str(body["name"]): body for body in bodies}
     _require("base_link" in by_name, "discovery.joint_rebuild", "no base_link body in the rebuilt carrier")
+    base_datum = str(by_name["base_link"]["frame"]["coordinate_system"])
+    ownerless_base = [
+        datum
+        for datum in raw.get("datums") or []
+        if isinstance(datum, dict)
+        and str(datum.get("name") or "") == base_datum
+        and datum.get("owner") == ""
+    ]
+    assembly_owner = "base_link" if len(ownerless_base) == 1 else None
     by_material, _by_component = _cluster_bindings(raw)
     full_cluster = {
         str(body["name"]): by_material.get(frozenset(body["components"]), frozenset(body["components"]))
@@ -2399,7 +2408,7 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "native limit unit does not match the joint type",
                 {"pair": [left, right], "unit": unit, "expected": expected_unit},
             )
-            owners = limit_entity_owners(mate_item, owner_for)
+            owners = limit_entity_owners(mate_item, owner_for, assembly_owner=assembly_owner)
             _require(
                 owners is not None and set(owners) == {left_body, right_body},
                 "discovery.joint_limits_unreadable",
@@ -3418,7 +3427,7 @@ def verify_discovery(package: Path) -> dict:
                 _require(
                     _valid_limits(limits) and limits.get("unit") == unit,
                     "discovery.graph",
-                    f"a {kind} mate must carry finite lower < upper bounds in {unit}",
+                    f"a {kind} mate must carry finite ordered bounds in {unit}",
                     {"mate": mate.get("name"), "limits": limits},
                 )
             elif limits is not None:

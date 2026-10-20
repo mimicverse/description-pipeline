@@ -19,6 +19,22 @@ NATIVE_LIMIT_KEYS = frozenset(
 )
 
 _VALUE_KEYS = frozenset({"value", "api", "unit"})
+_ADVANCED_MATE_APIS = {
+    "distance": "IDistanceMateFeatureData.IsAdvancedMate",
+    "angle": "IAngleMateFeatureData.IsAdvancedMate",
+    "limitdistance": "IDistanceMateFeatureData.IsAdvancedMate",
+    "limitangle": "IAngleMateFeatureData.IsAdvancedMate",
+}
+_POSITION_LIMIT_TYPES = frozenset({"limitdistance", "limitangle"})
+_REQUIRED_ACTIVE_MATE_KEYS = frozenset(
+    {
+        "limits",
+        "native_limit",
+        "is_advanced_mate",
+        "is_advanced_mate_error",
+        "is_advanced_mate_api",
+    }
+)
 _LIMIT_TYPES = {
     5: {
         "kind": "limitdistance",
@@ -56,16 +72,30 @@ def native_limit_inventory_complete(mates) -> bool:
             return False
         if mate["suppressed"]:
             continue
-        if mate.get("error_code") != 0:
+        if not set(mate) >= _REQUIRED_ACTIVE_MATE_KEYS:
             return False
-        if mate.get("native_limit") is not None or mate.get("limits") is not None:
+        if type(mate.get("error_code")) is not int or mate["error_code"] != 0:
             return False
-        mate_type = str(mate.get("type") or "").lower()
-        if mate_type in {"distance", "angle", "limitangle", "limitdistance"}:
-            if type(mate.get("is_advanced_mate")) is not bool or mate.get("is_advanced_mate_error") is not None:
+        if mate["native_limit"] is not None or mate["limits"] is not None:
+            return False
+        if not isinstance(mate.get("type"), str) or not mate["type"].strip():
+            return False
+        mate_type = mate["type"].strip().lower()
+        if mate["is_advanced_mate_error"] is not None:
+            return False
+        flag = mate["is_advanced_mate"]
+        if mate_type in _POSITION_LIMIT_TYPES:
+            # An active position-limit type must either be enabled (so the
+            # inventory proves a range) or claim false, which conflicts with
+            # its native type. Neither state proves that no limit is enabled.
+            return False
+        if mate_type in _ADVANCED_MATE_APIS:
+            if type(flag) is not bool or flag is True:
                 return False
-            if mate["is_advanced_mate"] is True:
+            if mate["is_advanced_mate_api"] != _ADVANCED_MATE_APIS[mate_type]:
                 return False
+        elif flag is True:
+            return False
     return True
 
 

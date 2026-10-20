@@ -1025,7 +1025,16 @@ class NativeDeclarationsTests(unittest.TestCase):
             return raw
 
         raw = zero_limits(fixture())
-        raw["mates"] = [lock("base_part", "module-1/tool_part", kind="lock")]
+        raw["mates"] = [
+            {
+                **lock("base_part", "module-1/tool_part", kind="lock"),
+                "limits": None,
+                "native_limit": None,
+                "is_advanced_mate": None,
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": None,
+            }
+        ]
         report = verify_declarations(raw, purpose=PURPOSE_INSPECTION_PREVIEW)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["carrier"]["joints"][0]["limit_source"], "preview_policy")
@@ -1111,6 +1120,66 @@ class NativeDeclarationsTests(unittest.TestCase):
             "v14.native_limits_unreadable",
             {item["code"] for item in incomplete_report["errors"]},
         )
+
+    def test_preview_policy_rejects_incomplete_or_conflicting_mate_inventory(self):
+        def complete_mate():
+            return {
+                **lock("base_part", "module-1/tool_part"),
+                "limits": None,
+                "native_limit": None,
+                "is_advanced_mate": None,
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": None,
+            }
+
+        raw = zero_limit_values(fixture())
+        raw["mates"] = [complete_mate()]
+        report = verify_declarations(raw, preview_claims(), purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertEqual(report["carrier"]["joints"][0]["limit_source"], "preview_policy")
+
+        cases = []
+        for key in ("limits", "native_limit"):
+            mate = complete_mate()
+            mate.pop(key)
+            cases.append((f"missing_{key}", mate))
+        for value in (False, 0.0):
+            mate = complete_mate()
+            mate["error_code"] = value
+            cases.append((f"error_code_{value!r}", mate))
+        cases.extend(
+            [
+                (
+                    "disabled_limit_type",
+                    {
+                        **complete_mate(),
+                        "type": "limitangle",
+                        "is_advanced_mate": False,
+                        "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                    },
+                ),
+                (
+                    "type_api_mismatch",
+                    {
+                        **complete_mate(),
+                        "type": "limitdistance",
+                        "is_advanced_mate": False,
+                        "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                    },
+                ),
+            ]
+        )
+        for label, mate in cases:
+            with self.subTest(case=label):
+                candidate = copy.deepcopy(raw)
+                candidate["mates"] = [mate]
+                rejected = verify_declarations(
+                    candidate,
+                    preview_claims(),
+                    purpose=PURPOSE_INSPECTION_PREVIEW,
+                )
+                self.assertFalse(rejected["passed"])
+                self.assertIn("v14.native_limits_missing", {item["code"] for item in rejected["errors"]})
 
     def test_valid_author_range_takes_precedence_over_preview_policy(self):
         raw = fixture()
