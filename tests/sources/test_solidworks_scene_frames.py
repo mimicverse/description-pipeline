@@ -94,9 +94,24 @@ class DerivedJointFrameTests(unittest.TestCase):
             with self.subTest(matrix=matrix):
                 reconstructed = _rpy_matrix(rpy_from_matrix(matrix))
                 error = max(
-                    abs(reconstructed[row][column] - matrix[row][column])
-                    for row in range(3)
-                    for column in range(3)
+                    abs(reconstructed[row][column] - matrix[row][column]) for row in range(3) for column in range(3)
+                )
+                self.assertLess(error, 1e-6)
+
+    def test_gimbal_branch_uses_projected_cosine_without_raising_tolerance(self):
+        matrices = []
+        for pitch in (math.pi / 2 - 9e-7, -math.pi / 2 + 9e-7):
+            for roll in (-2.5, 0.0, 2.5):
+                for yaw in (-2.2, -0.7, 1.4):
+                    matrices.append(_rpy_matrix((roll, pitch, yaw)))
+        for offset in (1e-7, 1e-9, 1e-10, 0.0, -1e-10, -1e-9, -1e-7):
+            for yaw in (-2.2, -0.7, 1.4):
+                matrices.append(_rpy_matrix((0.4, math.pi / 2 + offset, yaw)))
+        for matrix in matrices:
+            with self.subTest(matrix=matrix):
+                reconstructed = _rpy_matrix(rpy_from_matrix(matrix))
+                error = max(
+                    abs(reconstructed[row][column] - matrix[row][column]) for row in range(3) for column in range(3)
                 )
                 self.assertLess(error, 1e-6)
 
