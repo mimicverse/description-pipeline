@@ -3319,8 +3319,12 @@ def verify_discovery(package: Path) -> dict:
         technical_name = authored["robot_name"]
         label_source = "authored_robot_name"
         if technical_name is None:
-            label_source = "hardware_id" if hardware is not None else "technical_default"
-            technical_name = re.sub(r"[^0-9A-Za-z]+", "_", hardware or "robot").strip("_").lower()
+            technical_name = claimed.get("robot_name_technical")
+            if isinstance(technical_name, str) and _SNAKE.fullmatch(technical_name):
+                label_source = "cad_filename_derived"
+            else:
+                label_source = "hardware_id" if hardware is not None else "technical_default"
+                technical_name = re.sub(r"[^0-9A-Za-z]+", "_", hardware or "robot").strip("_").lower()
         _require(
             (definition.get("source") or {}).get("robot_name") == technical_name,
             "discovery.identity",

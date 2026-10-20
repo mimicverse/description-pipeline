@@ -447,16 +447,10 @@ def _direct_link_reads(
         )
     links = record.get("links")
     expected = {str(body.get("name") or body.get("id") or "") for body in bodies}
-    record_names = {
-        str(body.get("name") or body.get("id") or ""): str(
-            body.get("source_name") or body.get("name") or body.get("id") or ""
-        )
-        for body in bodies
-    }
-    if not isinstance(links, dict) or set(links) != set(record_names.values()):
+    if not isinstance(links, dict) or set(links) != expected:
         raise ConfigError(
             "the link group record does not cover exactly the configured bodies",
-            {"expected": sorted(record_names.values()), "recorded": sorted(links or [])},
+            {"expected": sorted(expected), "recorded": sorted(links or [])},
         )
     meta = {
         "assembly": str(record.get("assembly") or ""),
@@ -466,7 +460,7 @@ def _direct_link_reads(
     }
     reads: dict[str, dict[str, Any]] = {}
     for name in sorted(expected):
-        entry = links[record_names[name]]
+        entry = links[name]
         selection = entry.get("selection") if isinstance(entry, dict) else None
         rows = entry.get("reads") if isinstance(entry, dict) else None
         if (

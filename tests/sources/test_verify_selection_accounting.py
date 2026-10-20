@@ -21,6 +21,7 @@ from .test_solidworks_closure import (  # noqa: E402
 from description_pipeline.io import PipelineError  # noqa: E402
 from description_pipeline.sources.solidworks.closure import derive_mass_closure  # noqa: E402
 from description_pipeline.verification.solidworks_physics import (  # noqa: E402
+    _direct_link_sum,
     _derive_closure,
     _unassigned_mass_rows,
 )
@@ -153,6 +154,19 @@ class ProducerVerifierSelectionTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+
+    def test_direct_link_sum_uses_the_configured_body_name_after_native_renaming(self):
+        read = {
+            "mass_kg": 1.0,
+            "com_m": [0.0, 0.0, 0.0],
+            "inertia_tensor_about_com": [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]],
+        }
+        record = {"links": {"base_link": {"reads": [read, copy.deepcopy(read)]}}}
+        source = {"bodies": [{"name": "base_link", "source_name": "CAD_base_body"}]}
+        mass, center, inertia = _direct_link_sum(record, source)
+        self.assertEqual(mass, 1.0)
+        self.assertEqual(center.tolist(), [0.0, 0.0, 0.0])
+        self.assertEqual(inertia.tolist(), [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]])
 
     def _payloads(self):
         native = json.loads((self.root / "raw/mass_closure.json").read_text(encoding="utf-8"))
