@@ -3016,7 +3016,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             state["files"].append(
                 {
                     **token,
-                    "role": "endpoint_token_alias",
+                    "role": "cad_ownership",
                 }
             )
             payloads = {name: source.read(name) for name in source.namelist()}

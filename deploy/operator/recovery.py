@@ -4261,8 +4261,11 @@ def _read_windows_state(bundle: Path) -> dict:
 def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
     expected_members = {row["member"]: row for row in state["members"]}
     member_names = [row["member"] for row in state["members"]]
+    file_members = [row["member"] for row in state["files"]]
     require(
         len(member_names) == len(set(member_names))
+        and len(file_members) == len(set(file_members))
+        and len(file_members) == len(member_names)
         and set(expected_members) == {row["member"] for row in state["files"]},
         "windows_recovery_bundle_invalid",
         "Windows recovery members and file roles differ",
@@ -4634,6 +4637,21 @@ def _validate_windows_recovery_state(document: object) -> dict:
         },
         "windows_recovery_state_invalid",
         "Windows recovery contains an unsupported file role",
+    )
+    expected_role_members = {
+        "task_xml": "task.xml",
+        "endpoint_config": "endpoint.json",
+        "endpoint_token": "token",
+        "install_id": "install-id",
+        "cad_ownership": "cad-ownership.json",
+    }
+    require(
+        all(
+            expected_role_members.get(row["role"]) == row["member"]
+            for row in files
+        ),
+        "windows_recovery_state_invalid",
+        "Windows recovery file roles and members differ",
     )
     members = state["members"]
     require(isinstance(members, list) and bool(members), "windows_recovery_state_invalid", "Windows members are empty")
