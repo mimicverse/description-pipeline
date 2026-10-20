@@ -561,6 +561,16 @@ class DiscoveryTransferTests(unittest.TestCase):
         without_robot = replace(prepared, package=partial, prepared_sha256=digest(inventory(partial)))
         with self.assertRaisesRegex(PipelineError, "lacks required generated members"):
             self._seal_capture_request(without_robot)
+        without_source = self._path("without-source")
+        shutil.copytree(prepared.package, without_source)
+        (without_source / "source.json").unlink()
+        missing_identity = replace(
+            prepared,
+            package=without_source,
+            prepared_sha256=digest(inventory(without_source)),
+        )
+        with self.assertRaisesRegex(PipelineError, "lacks required generated members"):
+            self._seal_capture_request(missing_identity)
 
     def test_capture_request_enforces_the_size_limit(self) -> None:
         prepared = self._prepared()
