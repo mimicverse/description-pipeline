@@ -45,6 +45,7 @@ REQUIRED_CONTROL_GATES = (
     "bundle.subject",
     "input.valid",
     "source.native_discovery",
+    "source.carrier_binding",
     "frames.native",
     "urdf.syntax_names",
     "joints.shoulder_pitch_joint",

@@ -1874,11 +1874,12 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     from .solidworks_physics import verify_physics
 
     source = definition["source"]
+    carrier = source.get("carrier")
     gates.add("model.policy", lambda: _policy(source, model))
-    gates.add("source.carrier_binding", lambda: _carrier_binding(source, definition.get("carrier")))
+    gates.add("source.carrier_binding", lambda: _carrier_binding(source, carrier))
     gates.add(
         "provenance.value_warnings",
-        lambda: _value_warning_gate(root, source, model, definition.get("carrier")),
+        lambda: _value_warning_gate(root, source, model, carrier),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
