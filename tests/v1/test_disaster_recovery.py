@@ -18,6 +18,7 @@ import threading
 import textwrap
 import unittest
 import warnings
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -66,7 +67,12 @@ def option(name):
 query = option("-c")
 file_arg = option("-f")
 socket_dir = option("-h") or ""
+data_dir = pathlib.Path(socket_dir).parent / "data" if socket_dir else pathlib.Path("/fixture/data")
 target = "target" in socket_dir
+identity = {
+    "data_directory": str(data_dir),
+    "system_identifier": "2222222222" if target else "1111111111",
+}
 roles = [
     {
         "name": name,
@@ -151,11 +157,7 @@ if query:
     if "'databases'" in query and "'roles'" in query:
         payload = {
             "server_version_num": "140024",
-            "data_directory": os.environ.get("RECOVERY_EXPECTED_DATA_DIR", ""),
-            "system_identifier": os.environ.get(
-                "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER",
-                "",
-            ),
+            **identity,
             "databases": [],
             "roles": ["solidworks"],
         }
@@ -165,11 +167,7 @@ if query:
     ):
         payload = {
             "server_version_num": "140024",
-            "data_directory": os.environ.get("RECOVERY_EXPECTED_DATA_DIR", ""),
-            "system_identifier": os.environ.get(
-                "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER",
-                "",
-            ),
+            **identity,
         }
     elif "left(rolname, 3) <> 'pg_'" in query:
         payload = [
@@ -755,16 +753,63 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     write(artifact_root / "artifact.bin", b"artifact")
     write(spec_root / "spec.md", "specification\n")
     release_bytes = b"portable-wheel\n"
-    write(release_root / "dist.whl", release_bytes)
+    wheel_name = "mimicverse_description-1.0.0-test-py3-none-any.whl"
+    write(release_root / wheel_name, release_bytes)
+    readme_bytes = b"runtime-role\n"
+    linux_name = "description-1.0.0-test-linux-cp312-x86_64.zip"
+    linux_path = release_root / linux_name
+    with zipfile.ZipFile(linux_path, "w") as archive:
+        archive.writestr(
+            "files.json",
+            json.dumps({"README.md": hashlib.sha256(readme_bytes).hexdigest()}),
+        )
+        archive.writestr("README.md", readme_bytes)
+    linux_path.chmod(0o600)
+    deployment_name = "description-1.0.0-test-deployment.zip"
+    deployment_path = release_root / deployment_name
+    fake_identity = json.dumps(
+        {
+            "version": "1.0.0-test",
+            "source_sha256": "b" * 64,
+            "file": str(
+                release_root
+                / ("airflow-venv-" + install_id)
+                / "lib"
+                / "description_pipeline"
+            ),
+        },
+        separators=(",", ":"),
+    )
+    installer = "\n".join(
+        (
+            "#!/bin/sh",
+            "set -eu",
+            'mkdir -p "$AIRFLOW_VENV/bin"',
+            'cat > "$AIRFLOW_VENV/bin/python" <<\'PY\'',
+            "#!/bin/sh",
+            f"printf '%s\\n' '{fake_identity}'",
+            "PY",
+            'chmod +x "$AIRFLOW_VENV/bin/python"',
+            "",
+        )
+    )
+    with zipfile.ZipFile(deployment_path, "w") as archive:
+        archive.writestr("deploy/airflow/install.sh", installer)
+    deployment_path.chmod(0o600)
     release_document = {
         "version": "1.0.0-test",
         "source_commit": "a" * 40,
         "source_sha256": "b" * 64,
         "artifacts": [
             {
-                "name": "dist.whl",
-                "sha256": hashlib.sha256(release_bytes).hexdigest(),
+                "name": name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
+            for name, path in (
+                (deployment_name, deployment_path),
+                (linux_name, linux_path),
+                (wheel_name, release_root / wheel_name),
+            )
         ],
     }
     write(release_root / "release.json", json.dumps(release_document))
@@ -1114,6 +1159,104 @@ class RecoveryControlFlowTests(unittest.TestCase):
         if source.exists():
             os.replace(source, saved)
 
+    def workspace_fixture(self) -> tuple[Path, Path, str, str]:
+        origin = self.root / "workspace-origin.git"
+        repository = self.root / "workspace-source"
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(origin)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(repository)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "config", "user.name", "Recovery Fixture"],
+            check=True,
+        )
+        write(repository / "tracked.txt", "restored\n", mode=0o644)
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "tracked.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-m", "fixture"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "remote", "add", "origin", str(origin)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "push", "-u", "origin", "main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        head = subprocess.check_output(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        tree = subprocess.check_output(
+            ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+            text=True,
+        ).strip()
+        return repository, origin, head, tree
+
+    def workspace_bundle(self) -> tuple[Path, Path, dict]:
+        repository, origin, head, tree = self.workspace_fixture()
+        context = copy.deepcopy(self.context)
+        context.workspace_plan = {
+            "schema_version": "solidworks-to-urdf.workspace-rehydrate/v1",
+            "repositories": [
+                {
+                    "repository_slug": "owner/model",
+                    "path": str(repository),
+                    "origin": str(origin),
+                    "head": head,
+                    "tree": tree,
+                    "bases": ["main"],
+                    "status": "clean",
+                }
+            ],
+        }
+        staging = self.root / "workspace-capture"
+        (staging / "reconstruct").mkdir(parents=True)
+        recovery.capture_workspace_bundles(context, staging)
+        plan = json.loads(
+            (staging / "reconstruct" / "workspace-plan.json").read_text()
+        )
+        target = self.root / "workspace-targets" / "workspace-source"
+        plan["repositories"][0]["path"] = str(target)
+        (staging / "reconstruct" / "workspace-plan.json").write_text(
+            recovery.canonical_json(plan).decode(),
+            encoding="utf-8",
+        )
+        extracted = self.root / "workspace-extracted"
+        shutil.copytree(staging / "reconstruct", extracted / "reconstruct")
+        manifest = {
+            "reconstructibles": {
+                "workspace_root": {
+                    "path": str(self.root / "workspace-targets"),
+                    "plan_member": "reconstruct/workspace-plan.json",
+                    "recipe": "git-origin-head-clean",
+                }
+            }
+        }
+        return extracted, origin, manifest
+
     def test_backup_and_restore_control_flow(self) -> None:
         out, manifest = self.backup()
         self.assertEqual(manifest["schema_version"], recovery.MANIFEST_SCHEMA)
@@ -1132,7 +1275,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
         manifest_path = out / "recovery-manifest.json"
         manifest_bytes = manifest_path.read_bytes()
         manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan = self.target_plan(manifest_sha, roots)
         status_dir = self.root / "status"
         result = recovery.restore_command(
@@ -1195,12 +1342,158 @@ class RecoveryControlFlowTests(unittest.TestCase):
             )
         self.assertEqual(restored_file.read_text(), "tampered\n")
 
+    def test_workspace_bundle_roundtrip_is_offline_and_verified(self) -> None:
+        extracted, origin, manifest = self.workspace_bundle()
+        origin.rename(self.root / "workspace-origin-unavailable.git")
+        recovery.restore_workspaces(manifest, extracted, verify_only=False)
+        target = self.root / "workspace-targets" / "workspace-source"
+        self.assertEqual((target / "tracked.txt").read_text(), "restored\n")
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(target), "remote", "get-url", "origin"],
+                text=True,
+            ).strip(),
+            str(origin),
+        )
+        before = subprocess.check_output(
+            ["git", "-C", str(target), "status", "--porcelain=v2"],
+            text=True,
+        )
+        recovery.restore_workspaces(manifest, extracted, verify_only=True)
+        after = subprocess.check_output(
+            ["git", "-C", str(target), "status", "--porcelain=v2"],
+            text=True,
+        )
+        self.assertEqual(before, after)
+
+    def test_workspace_restore_refuses_a_preexisting_target(self) -> None:
+        extracted, _, manifest = self.workspace_bundle()
+        target = self.root / "workspace-targets" / "workspace-source"
+        target.mkdir(parents=True)
+        write(target / "occupied", "do not replace\n")
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.restore_workspaces(manifest, extracted, verify_only=False)
+        self.assertEqual(raised.exception.code, "recovery_target_not_empty")
+
+    def test_release_runtime_rehydrates_from_offline_role_archives(self) -> None:
+        release_root = self.root / "runtime-release"
+        extracted = self.root / "runtime-extracted"
+        status_dir = self.root / "runtime-status"
+        status_dir.mkdir()
+        operator_env = (
+            extracted
+            / "config"
+            / "state"
+            / "derived"
+            / "install-a"
+            / "operator.env"
+        )
+        write(
+            operator_env,
+            "\n".join(
+                (
+                    f"AIRFLOW_VENV={release_root / 'airflow-venv'}",
+                    f"AIRFLOW_HOME={self.root / 'airflow-home'}",
+                    "",
+                )
+            ),
+        )
+        wheel = b"offline-wheel\n"
+        readme = b"offline-role\n"
+        release_files = extracted / "release"
+        (release_files / "artifacts").mkdir(parents=True)
+        linux_zip = release_files / "artifacts" / "description-1.0.0-test-linux-cp312-x86_64.zip"
+        with zipfile.ZipFile(linux_zip, "w") as archive:
+            archive.writestr("files.json", json.dumps({"README.md": hashlib.sha256(readme).hexdigest()}))
+            archive.writestr("README.md", readme)
+        deployment_zip = release_files / "artifacts" / "description-1.0.0-test-deployment.zip"
+        fake_identity = json.dumps(
+            {
+                "version": "1.0.0-test",
+                "source_sha256": "b" * 64,
+                "file": str(
+                    release_root
+                    / "airflow-venv"
+                    / "lib"
+                    / "description_pipeline"
+                ),
+            },
+            separators=(",", ":"),
+        )
+        installer = "\n".join(
+            (
+                "#!/bin/sh",
+                "set -eu",
+                'mkdir -p "$AIRFLOW_VENV/bin"',
+                'cat > "$AIRFLOW_VENV/bin/python" <<\'PY\'',
+                "#!/bin/sh",
+                f"printf '%s\\n' '{fake_identity}'",
+                "PY",
+                'chmod +x "$AIRFLOW_VENV/bin/python"',
+                "",
+            )
+        )
+        with zipfile.ZipFile(deployment_zip, "w") as archive:
+            archive.writestr("deploy/airflow/install.sh", installer)
+        wheel_path = release_files / "artifacts" / "mimicverse_description-1.0.0-test-py3-none-any.whl"
+        wheel_path.write_bytes(wheel)
+        write(release_files / "release.json", "{}\n")
+        manifest = {
+            "release": {
+                "version": "1.0.0-test",
+                "source_sha256": "b" * 64,
+                "artifacts": [
+                    {
+                        "name": name,
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    }
+                    for name, path in (
+                        (deployment_zip.name, deployment_zip),
+                        (linux_zip.name, linux_zip),
+                        (wheel_path.name, wheel_path),
+                    )
+                ],
+            },
+            "maintenance": {"receipt": {"identity": {"install_id": "install-a"}}},
+            "members": [],
+        }
+        result = recovery.rehydrate_release_runtime(
+            manifest=manifest,
+            plan={"roots": {"release_root": str(release_root)}},
+            extracted=extracted,
+            status_dir=status_dir,
+            verify_only=False,
+        )
+        self.assertEqual(result["identity"]["version"], "1.0.0-test")
+        self.assertTrue((release_root / "airflow-venv" / "bin" / "python").is_file())
+        verified = recovery.rehydrate_release_runtime(
+            manifest=manifest,
+            plan={"roots": {"release_root": str(release_root)}},
+            extracted=extracted,
+            status_dir=status_dir,
+            verify_only=True,
+        )
+        self.assertEqual(verified["identity"]["version"], "1.0.0-test")
+
+    def test_release_archive_rejects_path_traversal(self) -> None:
+        archive = self.root / "unsafe-release.zip"
+        destination = self.root / "unsafe-release"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("../escape.txt", "escape\n")
+        with self.assertRaises(recovery.RecoveryError):
+            recovery._extract_zip_archive(archive, destination)
+        self.assertFalse((self.root / "escape.txt").exists())
+
     def test_manifest_digest_mismatch_fails_before_target_mutation(self) -> None:
         out, manifest = self.backup()
         self.isolate_source()
         sidecar = out / "recovery-manifest.sha256"
         write(sidecar, "0" * 64 + "  recovery-manifest.json\n")
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan = self.target_plan("0" * 64, roots)
         status_dir = self.root / "status-failed"
         with self.assertRaises(recovery.RecoveryError) as raised:
@@ -1221,7 +1514,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         Path(roots["handoff_root"]).mkdir(parents=True)
         write(Path(roots["handoff_root"]) / "occupied", "do not replace\n")
         plan = self.target_plan(manifest_sha, roots)
@@ -1243,7 +1540,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan = self.target_plan(manifest_sha, roots)
         wrong = write(self.root / "wrong.key", os.urandom(32).hex() + "\n")
         wrong.chmod(0o600)
@@ -2145,7 +2446,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
         archive.write_bytes(damaged)
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan = self.target_plan(manifest_sha, roots)
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery.restore_command(
@@ -2169,7 +2474,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
             out / "recovery-manifest.sha256",
             f"{manifest_sha}  recovery-manifest.json\n",
         )
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan = self.target_plan(manifest_sha, roots)
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery.restore_command(
@@ -2185,7 +2494,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan = self.target_plan(manifest_sha, roots)
         document = json.loads(plan.read_text())
         document["mode"] = "relocated"
@@ -2204,7 +2517,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan = self.target_plan(manifest_sha, roots)
         with (
             mock.patch.object(
@@ -2230,7 +2547,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {row["name"]: row["path"] for row in manifest["roots"]}
+        roots = {
+            row["name"]: row["path"]
+            for row in manifest["roots"]
+            if "reconstructible_runtime" not in row
+        }
         plan_path = self.target_plan(manifest_sha, roots)
         plan = json.loads(plan_path.read_text())
         target_bin = Path(plan["postgres"]["bin_dir"])

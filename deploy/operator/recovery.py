@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import configparser
 import contextlib
 import errno
@@ -50,6 +51,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -847,6 +849,11 @@ def _git_output(repo: Path, *args: str) -> str:
             ["git", "-C", str(repo), *args],
             text=True,
             stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            },
         ).strip()
     except (OSError, subprocess.CalledProcessError) as error:
         raise RecoveryError(
@@ -888,6 +895,7 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
                 "path": str(path),
                 "origin": origin,
                 "head": head,
+                "tree": _git_output(path, "rev-parse", "HEAD^{tree}"),
                 "bases": sorted(set(bases)),
                 "status": "clean",
             }
@@ -896,6 +904,117 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
         "schema_version": "solidworks-to-urdf.workspace-rehydrate/v1",
         "repositories": rows,
     }
+
+
+def capture_workspace_bundles(
+    context: BackupContext,
+    staging: Path,
+) -> None:
+    plan = copy.deepcopy(context.workspace_plan)
+    bundle_root = staging / "reconstruct" / "workspaces"
+    bundle_root.mkdir(parents=True, mode=0o700)
+    for index, row in enumerate(plan["repositories"]):
+        require(
+            isinstance(row, dict)
+            and isinstance(row.get("repository_slug"), str)
+            and isinstance(row.get("path"), str)
+            and isinstance(row.get("origin"), str)
+            and isinstance(row.get("head"), str)
+            and isinstance(row.get("tree"), str)
+            and bool(GIT_OBJECT.fullmatch(row["head"]))
+            and bool(GIT_OBJECT.fullmatch(row["tree"])),
+            "recovery_manifest_invalid",
+            "workspace reconstruction row is malformed",
+        )
+        repository = Path(row["path"])
+        bundle = bundle_root / f"{index:04d}.bundle"
+        try:
+            require_no_links(repository, f"workspace checkout {row['repository_slug']}")
+            require_real_dir(
+                repository,
+                f"workspace checkout {row['repository_slug']}",
+                "recovery_release_missing",
+            )
+            require(
+                _git_output(repository, "rev-parse", "HEAD") == row["head"]
+                and _git_output(repository, "rev-parse", "HEAD^{tree}") == row["tree"],
+                "recovery_source_changed",
+                f"workspace identity changed before capture: {row['repository_slug']}",
+            )
+            completed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "bundle",
+                    "create",
+                    "--version=2",
+                    str(bundle),
+                    "HEAD",
+                    "--all",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.strip()[-2000:])
+            with tempfile.TemporaryDirectory(
+                prefix="bundle-verify-",
+                dir=staging / "reconstruct",
+            ) as verify_root:
+                init = subprocess.run(
+                    ["git", "init", "--bare", verify_root],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                if init.returncode != 0:
+                    raise RuntimeError(init.stderr.strip()[-2000:])
+                verified = subprocess.run(
+                    ["git", "bundle", "verify", str(bundle)],
+                    cwd=verify_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                if verified.returncode != 0:
+                    raise RuntimeError(verified.stderr.strip()[-2000:])
+            heads = subprocess.run(
+                ["git", "bundle", "list-heads", str(bundle)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if heads.returncode != 0 or row["head"] not in {
+                line.split(maxsplit=1)[0] for line in heads.stdout.splitlines() if line.strip()
+            }:
+                raise RuntimeError(heads.stderr.strip()[-2000:] or "recorded HEAD is absent from bundle")
+            require(
+                _git_output(repository, "rev-parse", "HEAD") == row["head"]
+                and _git_output(repository, "rev-parse", "HEAD^{tree}") == row["tree"]
+                and _git_output(repository, "status", "--porcelain=v2", "--untracked-files=all") == "",
+                "recovery_source_changed",
+                f"workspace identity changed during capture: {row['repository_slug']}",
+            )
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+            raise RecoveryError(
+                "recovery_workspace_bundle_failed",
+                f"cannot create offline Git bundle for {row['repository_slug']}",
+                {"repository": row["repository_slug"], "error": str(error)},
+            ) from error
+        row["bundle_member"] = (
+            f"reconstruct/workspaces/{bundle.name}"
+        )
+        row["bundle_sha256"] = sha256_file(bundle)
+    write_json_once(
+        staging / "reconstruct" / "workspace-plan.json",
+        plan,
+    )
 
 
 def parse_pg_dsn(dsn: str, where: str) -> dict:
@@ -977,7 +1096,6 @@ def psql(
     query: str | None = None,
     file: Path | None = None,
     password: str | None = None,
-    env: dict[str, str] | None = None,
 ) -> str:
     argv = [
         context.bin_dir / "psql",
@@ -1000,10 +1118,10 @@ def psql(
         argv.extend(["-c", query])
     if file is not None:
         argv.extend(["-f", file])
-    command_env = dict(env or {})
-    if password is not None:
-        command_env["PGPASSWORD"] = password
-    completed = context.run(argv, env=command_env)
+    completed = context.run(
+        argv,
+        env={"PGPASSWORD": password} if password is not None else None,
+    )
     return completed.stdout.strip()
 
 
@@ -1016,7 +1134,6 @@ def psql_json(
     database: str,
     query: str,
     password: str | None = None,
-    env: dict[str, str] | None = None,
 ) -> object:
     output = psql(
         context,
@@ -1026,7 +1143,6 @@ def psql_json(
         database=database,
         query=query,
         password=password,
-        env=env,
     )
     try:
         return json.loads(output)
@@ -3076,7 +3192,14 @@ def root_contract(context: BackupContext, release_root_record: dict) -> list[dic
             "class": "artifact",
             "required": True,
         },
-        release_root_record,
+        {
+            **{
+                key: value
+                for key, value in release_root_record.items()
+                if key != "artifacts"
+            },
+            "reconstructible_runtime": "offline-release-artifacts",
+        },
     ]
     for index, root in enumerate(resolved["specifications"]["record_roots"]):
         roots.append(
@@ -4386,7 +4509,7 @@ def _backup_command_claimed(
 
     reconstruct_dir = staging / "reconstruct"
     reconstruct_dir.mkdir(mode=0o700)
-    write_json_once(reconstruct_dir / "workspace-plan.json", context.workspace_plan)
+    capture_workspace_bundles(context, staging)
 
     inventory_root = staging / "inventory"
     inventory_root.mkdir(mode=0o700, exist_ok=True)
@@ -5793,10 +5916,6 @@ def target_empty_cluster(
             "'roles', (SELECT COALESCE(json_agg(rolname ORDER BY rolname), "
             "'[]'::json) FROM pg_roles WHERE left(rolname, 3) <> 'pg_'))"
         ),
-        env={
-            "RECOVERY_EXPECTED_DATA_DIR": str(data_dir.resolve()),
-            "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER": controls["system_identifier"],
-        },
     )
     require(
         isinstance(status, dict)
@@ -5877,10 +5996,6 @@ def target_restored_cluster(
             "'system_identifier', "
             "(SELECT system_identifier::text FROM pg_control_system()))"
         ),
-        env={
-            "RECOVERY_EXPECTED_DATA_DIR": str(data_dir.resolve()),
-            "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER": controls["system_identifier"],
-        },
     )
     require(
         isinstance(status, dict)
@@ -6765,11 +6880,665 @@ def restore_exact_files(
             partial.unlink(missing_ok=True)
 
 
+def _workspace_plan(manifest: dict, extracted: Path) -> tuple[Path, dict]:
+    workspace = _exact_keys(
+        manifest["reconstructibles"]["workspace_root"],
+        {"path", "plan_member", "recipe"},
+        "reconstructibles.workspace_root",
+    )
+    require(
+        workspace["recipe"] == "git-origin-head-clean"
+        and workspace["plan_member"] == "reconstruct/workspace-plan.json",
+        "recovery_manifest_invalid",
+        "workspace reconstruction recipe is unsupported",
+    )
+    plan_member = confined_member(
+        workspace["plan_member"],
+        "reconstructibles.workspace_root.plan_member",
+    )
+    plan = _load_extracted_json(
+        extracted,
+        plan_member,
+        "workspace reconstruction plan",
+    )
+    require(
+        isinstance(plan, dict)
+        and plan.get("schema_version") == "solidworks-to-urdf.workspace-rehydrate/v1"
+        and isinstance(plan.get("repositories"), list),
+        "recovery_manifest_invalid",
+        "workspace reconstruction plan is malformed",
+    )
+    root = absolute_text(workspace["path"], "workspace_root")
+    return root, plan
+
+
+def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
+    require(
+        isinstance(row, dict)
+        and set(row)
+        == {
+            "repository_slug",
+            "path",
+            "origin",
+            "head",
+            "tree",
+            "bases",
+            "status",
+            "bundle_member",
+            "bundle_sha256",
+        }
+        and isinstance(row["repository_slug"], str)
+        and bool(row["repository_slug"])
+        and isinstance(row["origin"], str)
+        and bool(row["origin"])
+        and isinstance(row["head"], str)
+        and bool(GIT_OBJECT.fullmatch(row["head"]))
+        and isinstance(row["tree"], str)
+        and bool(GIT_OBJECT.fullmatch(row["tree"]))
+        and isinstance(row["bases"], list)
+        and all(isinstance(value, str) and bool(value) for value in row["bases"])
+        and row["status"] == "clean"
+        and isinstance(row["bundle_member"], str)
+        and isinstance(row["bundle_sha256"], str)
+        and bool(HEX64.fullmatch(row["bundle_sha256"])),
+        "recovery_manifest_invalid",
+        "workspace reconstruction row is malformed",
+    )
+    target = absolute_text(row["path"], f"workspace target {row['repository_slug']}")
+    require(
+        target != root and target.is_relative_to(root),
+        "recovery_target_path_unsafe",
+        f"workspace target lies outside its root: {target}",
+    )
+    confined_member(row["bundle_member"], f"workspace bundle {row['repository_slug']}")
+    return target, row
+
+
+def _workspace_verify(path: Path, row: dict) -> None:
+    require_real_dir(path, f"workspace checkout {row['repository_slug']}", "recovery_workspace_missing")
+    require(
+        path.joinpath(".git").exists(),
+        "recovery_workspace_missing",
+        f"workspace checkout is not a Git repository: {path}",
+    )
+    environment = {
+        **os.environ,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    try:
+        origin = subprocess.check_output(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            text=True,
+            stderr=subprocess.PIPE,
+            env=environment,
+        ).strip()
+        head = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.PIPE,
+            env=environment,
+        ).strip()
+        tree = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD^{tree}"],
+            text=True,
+            stderr=subprocess.PIPE,
+            env=environment,
+        ).strip()
+        status = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(path),
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+            ],
+            text=True,
+            stderr=subprocess.PIPE,
+            env=environment,
+        ).strip()
+        object_format = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "--show-object-format"],
+            text=True,
+            stderr=subprocess.PIPE,
+            env=environment,
+        ).strip()
+        for args in (
+            ("diff-index", "--cached", "--quiet", "HEAD", "--"),
+            ("diff-files", "--quiet"),
+        ):
+            completed = subprocess.run(
+                ["git", "-C", str(path), *args],
+                text=True,
+                capture_output=True,
+                env=environment,
+                check=False,
+            )
+            require(
+                completed.returncode == 0,
+                "recovery_workspace_mismatch",
+                f"workspace has a dirty index or worktree: {path}",
+                {"git": args, "stderr": completed.stderr[-2000:]},
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RecoveryError(
+            "recovery_workspace_missing",
+            f"cannot inspect workspace checkout: {path}",
+        ) from error
+    require(
+        origin == row["origin"]
+        and head == row["head"]
+        and tree == row["tree"]
+        and object_format == "sha1"
+        and status == "",
+        "recovery_workspace_mismatch",
+        f"workspace checkout differs from the reconstruction plan: {path}",
+        {
+            "origin": origin,
+            "head": head,
+            "tree": tree,
+            "object_format": object_format,
+            "status": status.splitlines()[:20],
+        },
+    )
+
+
+def validate_workspace_targets(
+    manifest: dict,
+    extracted: Path,
+    *,
+    verify_only: bool,
+) -> None:
+    root, plan = _workspace_plan(manifest, extracted)
+    require(
+        not is_link(root),
+        "recovery_target_path_unsafe",
+        f"workspace root is a link: {root}",
+    )
+    seen = set()
+    for raw in plan["repositories"]:
+        target, row = _workspace_row(root, raw)
+        require(
+            target not in seen,
+            "recovery_manifest_invalid",
+            f"duplicate workspace target: {target}",
+        )
+        seen.add(target)
+        require_no_links(target.parent, "workspace target parent")
+        if verify_only:
+            _workspace_verify(target, row)
+        else:
+            require(
+                not path_exists(target),
+                "recovery_target_not_empty",
+                f"workspace target already exists: {target}",
+            )
+
+
+def restore_workspaces(manifest: dict, extracted: Path, *, verify_only: bool) -> None:
+    root, plan = _workspace_plan(manifest, extracted)
+    require(
+        not is_link(root),
+        "recovery_target_path_unsafe",
+        f"workspace root is a link: {root}",
+    )
+    seen = set()
+    for raw in plan["repositories"]:
+        target, row = _workspace_row(root, raw)
+        require(
+            target not in seen,
+            "recovery_manifest_invalid",
+            f"duplicate workspace target: {target}",
+        )
+        seen.add(target)
+        if verify_only:
+            _workspace_verify(target, row)
+            continue
+        bundle = extracted / confined_member(row["bundle_member"])
+        require_real_file(
+            bundle,
+            f"workspace bundle {row['repository_slug']}",
+            "recovery_workspace_missing",
+        )
+        require(
+            sha256_file(bundle) == row["bundle_sha256"],
+            "recovery_workspace_mismatch",
+            f"workspace bundle digest differs: {row['repository_slug']}",
+        )
+        require(
+            not path_exists(target),
+            "recovery_target_not_empty",
+            f"workspace target already exists: {target}",
+        )
+        require_no_links(target.parent, "workspace target parent")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        partial = target.parent / f".{target.name}.{os.getpid()}.partial"
+        require(
+            not path_exists(partial),
+            "recovery_target_not_empty",
+            f"workspace partial target already exists: {partial}",
+        )
+        try:
+            clone = subprocess.run(
+                ["git", "clone", "--no-checkout", str(bundle), str(partial)],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+            require(
+                clone.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot clone workspace bundle: {row['repository_slug']}",
+                {"stderr": clone.stderr[-2000:]},
+            )
+            checkout = subprocess.run(
+                ["git", "-C", str(partial), "checkout", "--detach", row["head"]],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            require(
+                checkout.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot checkout workspace HEAD: {row['repository_slug']}",
+                {"stderr": checkout.stderr[-2000:]},
+            )
+            origin = subprocess.run(
+                ["git", "-C", str(partial), "remote", "set-url", "origin", row["origin"]],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                origin.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot bind workspace origin: {row['repository_slug']}",
+                {"stderr": origin.stderr[-2000:]},
+            )
+            _workspace_verify(partial, row)
+            os.replace(partial, target)
+            _workspace_verify(target, row)
+        except (OSError, subprocess.SubprocessError, RecoveryError) as error:
+            if path_exists(partial):
+                backup._remove_staging_tree(partial)
+            raise RecoveryError(
+                "recovery_workspace_failed",
+                f"workspace reconstruction failed: {row['repository_slug']}",
+            ) from error
+
+
+def _release_artifacts(manifest: dict) -> dict[str, dict]:
+    rows = manifest["release"].get("artifacts")
+    require(
+        isinstance(rows, list)
+        and all(
+            isinstance(row, dict)
+            and isinstance(row.get("name"), str)
+            and isinstance(row.get("sha256"), str)
+            and bool(HEX64.fullmatch(row["sha256"]))
+            for row in rows
+        ),
+        "recovery_manifest_invalid",
+        "release artifact list is malformed",
+    )
+    return {row["name"]: row for row in rows}
+
+
+def _release_role_archives(
+    artifacts: dict[str, dict],
+) -> tuple[str, str, str]:
+    deployment = sorted(
+        name
+        for name in artifacts
+        if re.fullmatch(r"description-.*-deployment\.zip", name)
+    )
+    linux = sorted(
+        name
+        for name in artifacts
+        if re.fullmatch(r"description-.*-linux-cp312-x86_64\.zip", name)
+    )
+    wheel = sorted(
+        name
+        for name in artifacts
+        if re.fullmatch(r"mimicverse_description-.*\.whl", name)
+    )
+    require(
+        len(deployment) == 1 and len(linux) == 1 and len(wheel) == 1,
+        "recovery_release_missing",
+        "release does not carry exactly one deployment, Linux role, and package artifact",
+        {"deployment": deployment, "linux": linux, "wheel": wheel},
+    )
+    return deployment[0], linux[0], wheel[0]
+
+
+def _verify_release_archive(path: Path, expected_sha: str) -> None:
+    require_real_file(path, "release role archive", "recovery_release_missing")
+    require(
+        sha256_file(path) == expected_sha,
+        "recovery_release_missing",
+        f"release role archive digest differs: {path.name}",
+    )
+
+
+def _extract_zip_archive(archive: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, mode=0o700)
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            names: set[str] = set()
+            folded: set[str] = set()
+            for info in bundle.infolist():
+                raw_name = info.filename
+                is_directory = raw_name.endswith("/") or info.is_dir()
+                normalized = raw_name.rstrip("/") if is_directory else raw_name
+                name = confined_member(normalized, f"release archive member {raw_name!r}")
+                require(
+                    name not in names and name.casefold() not in folded,
+                    "recovery_release_missing",
+                    f"release archive has duplicate or casefolded members: {name}",
+                )
+                names.add(name)
+                folded.add(name.casefold())
+                file_type = (info.external_attr >> 16) & 0o170000
+                require(
+                    not stat.S_ISLNK(file_type),
+                    "recovery_release_missing",
+                    f"release archive contains a link: {name}",
+                )
+                target = destination.joinpath(*name.split("/"))
+                require(
+                    target.is_relative_to(destination),
+                    "recovery_release_missing",
+                    f"release archive member escapes its root: {name}",
+                )
+                require_no_links(target.parent, "release archive member parent")
+                if is_directory:
+                    target.mkdir(mode=0o700, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                require(
+                    not path_exists(target),
+                    "recovery_release_missing",
+                    f"release archive member collides with a file: {name}",
+                )
+                with bundle.open(info) as source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+                mode = (info.external_attr >> 16) & 0o777
+                target.chmod(mode or 0o600)
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise RecoveryError(
+            "recovery_release_missing",
+            f"release archive is invalid: {archive.name}",
+        ) from error
+
+
+def _extract_release_archives(
+    *,
+    release_root: Path,
+    artifacts: dict[str, dict],
+    deployment_name: str,
+    linux_name: str,
+    destination: Path,
+) -> tuple[Path, Path, Path]:
+    artifact_root = release_root / "artifacts"
+    deployment_zip = artifact_root / deployment_name
+    linux_zip = artifact_root / linux_name
+    _verify_release_archive(deployment_zip, artifacts[deployment_name]["sha256"])
+    _verify_release_archive(linux_zip, artifacts[linux_name]["sha256"])
+    deployment_dir = destination / "deployment"
+    linux_dir = destination / "linux"
+    _extract_zip_archive(deployment_zip, deployment_dir)
+    _extract_zip_archive(linux_zip, linux_dir)
+    files_json = linux_dir / "files.json"
+    require_real_file(files_json, "Linux role files.json", "recovery_release_missing")
+    try:
+        rows = json.loads(files_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RecoveryError("recovery_release_missing", "Linux role files.json is malformed") from error
+    require(
+        isinstance(rows, dict) and all(
+            isinstance(name, str)
+            and isinstance(digest, str)
+            and bool(HEX64.fullmatch(digest))
+            for name, digest in rows.items()
+        ),
+        "recovery_release_missing",
+        "Linux role files.json is malformed",
+    )
+    actual = {
+        path.relative_to(linux_dir).as_posix(): sha256_file(path)
+        for path in linux_dir.rglob("*")
+        if path.is_file() and path != files_json
+    }
+    require(
+        actual == rows,
+        "recovery_release_missing",
+        "Linux role archive members differ from files.json",
+    )
+    return deployment_dir, linux_dir, rows
+
+
+def _read_rehydrate_env(path: Path) -> dict[str, str]:
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        require(
+            key not in values,
+            "recovery_release_missing",
+            f"recovery environment repeats {key}",
+        )
+        try:
+            values[key] = render_operator.decode_env_value(raw)
+        except (TypeError, ValueError) as error:
+            raise RecoveryError(
+                "recovery_release_missing",
+                f"cannot decode recovery environment value {key}",
+            ) from error
+    return values
+
+
+def verify_release_runtime(
+    *,
+    manifest: dict,
+    extracted: Path,
+    release_root: Path,
+) -> dict:
+    install_id = manifest["maintenance"]["receipt"]["identity"]["install_id"]
+    operator_env = extracted / "config" / "state" / "derived" / install_id / "operator.env"
+    require_real_file(operator_env, "recovered operator environment", "recovery_release_missing")
+    values = _read_rehydrate_env(operator_env)
+    require(
+        isinstance(values.get("AIRFLOW_VENV"), str)
+        and bool(values["AIRFLOW_VENV"])
+        and isinstance(values.get("AIRFLOW_HOME"), str)
+        and bool(values["AIRFLOW_HOME"]),
+        "recovery_release_missing",
+        "recovered operator environment lacks the Airflow runtime paths",
+    )
+    venv = Path(values.get("AIRFLOW_VENV", ""))
+    require(
+        venv.is_absolute()
+        and
+        venv.is_relative_to(release_root) and venv.is_dir(),
+        "recovery_release_missing",
+        "recovered Airflow environment is outside its release root",
+    )
+    python = venv / "bin" / "python"
+    require_real_file(python, "recovered Airflow interpreter", "recovery_release_missing")
+    completed = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import json, pathlib, importlib.metadata as m;"
+                "r=pathlib.Path(__import__('description_pipeline').__file__).resolve().parent;"
+                "i=json.loads((r/'tool-release.json').read_text());"
+                "print(json.dumps({'version':m.version('mimicverse-description'),"
+                "'source_sha256':i.get('source_sha256'),'file':str(r)}))"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    require(
+        completed.returncode == 0,
+        "recovery_release_missing",
+        "recovered Airflow package identity is unreadable",
+        {"stderr": completed.stderr[-2000:]},
+    )
+    try:
+        identity = json.loads(completed.stdout)
+    except ValueError as error:
+        raise RecoveryError("recovery_release_missing", "recovered package identity is not JSON") from error
+    release = manifest["release"]
+    require(
+        identity.get("version") == release["version"]
+        and identity.get("source_sha256") == release["source_sha256"]
+        and Path(identity.get("file", "")).is_relative_to(venv),
+        "recovery_release_missing",
+        "recovered package identity differs from the release",
+    )
+    return {"install_id": install_id, "venv": str(venv), "identity": identity}
+
+
+def rehydrate_release_runtime(
+    *,
+    manifest: dict,
+    plan: dict,
+    extracted: Path,
+    status_dir: Path,
+    verify_only: bool,
+) -> dict:
+    artifacts = _release_artifacts(manifest)
+    roles = _release_role_archives(artifacts)
+    deployment_name, linux_name, wheel_name = roles
+    if "release_root" in plan["roots"]:
+        release_root = Path(plan["roots"]["release_root"])
+    else:
+        release_root = Path(manifest["reconstructibles"]["release_root"]["path"])
+    require(
+        release_root.is_absolute(),
+        "recovery_release_missing",
+        "recovered release root is not an absolute path",
+    )
+    if verify_only:
+        require_real_dir(
+            release_root,
+            "recovered release root",
+            "recovery_release_missing",
+        )
+    else:
+        require_no_links(release_root.parent, "recovered release root parent")
+        release_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        require_real_dir(
+            release_root,
+            "recovered release root",
+            "recovery_release_missing",
+        )
+        os.chmod(release_root, 0o700)
+        archived_release = extracted / "release"
+        require_real_dir(
+            archived_release,
+            "archived release tree",
+            "recovery_release_missing",
+        )
+        copy_extracted_directory(
+            archived_release,
+            release_root,
+            manifest["members"],
+            "release",
+        )
+    if verify_only:
+        return verify_release_runtime(
+            manifest=manifest,
+            extracted=extracted,
+            release_root=release_root,
+        )
+    staging = status_dir / "release-rehydrate"
+    staging.mkdir(mode=0o700)
+    deployment_dir, linux_dir, _ = _extract_release_archives(
+        release_root=release_root,
+        artifacts=artifacts,
+        deployment_name=deployment_name,
+        linux_name=linux_name,
+        destination=staging,
+    )
+    install_id = manifest["maintenance"]["receipt"]["identity"]["install_id"]
+    operator_env = extracted / "config" / "state" / "derived" / install_id / "operator.env"
+    values = _read_rehydrate_env(operator_env)
+    require(
+        isinstance(values.get("AIRFLOW_VENV"), str)
+        and isinstance(values.get("AIRFLOW_HOME"), str),
+        "recovery_release_missing",
+        "recovered operator environment lacks the Airflow runtime paths",
+    )
+    airflow_venv = Path(values["AIRFLOW_VENV"])
+    require(
+        airflow_venv.is_absolute()
+        and airflow_venv.is_relative_to(release_root)
+        and not path_exists(airflow_venv),
+        "recovery_target_not_empty",
+        "release runtime target is not a fresh path",
+    )
+    wheel = release_root / "artifacts" / wheel_name
+    require_real_file(wheel, "recovered release wheel", "recovery_release_missing")
+    require(
+        sha256_file(wheel) == artifacts[wheel_name]["sha256"],
+        "recovery_release_missing",
+        "recovered release wheel digest differs",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "AIRFLOW_VENV": str(airflow_venv),
+            "AIRFLOW_HOME": values["AIRFLOW_HOME"],
+            "PIPELINE_WHEEL": str(wheel),
+            "AIRFLOW_PYTHON": sys.executable,
+            "PIP_NO_INDEX": "1",
+            "PIP_FIND_LINKS": str(linux_dir / "wheels"),
+        }
+    )
+    install = deployment_dir / "deploy" / "airflow" / "install.sh"
+    require_real_file(install, "release Airflow installer", "recovery_release_missing")
+    completed = subprocess.run(
+        ["bash", str(install), "--stage"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=3600,
+        check=False,
+    )
+    require(
+        completed.returncode == 0,
+        "recovery_release_missing",
+        "release Airflow runtime installation failed",
+        {"stderr": completed.stderr[-3000:]},
+    )
+    return verify_release_runtime(
+        manifest=manifest,
+        extracted=extracted,
+        release_root=release_root,
+    )
+
+
 def verify_restored_files(manifest: dict, plan: dict) -> None:
     members_by_name = {row["member"]: row for row in manifest["members"]}
     exact_file_targets = {Path(row["path"]) for row in [*manifest["files"], *manifest["secrets"]]}
-    directory_targets = {Path(plan["roots"][root["name"]]) for root in manifest["roots"]}
+    directory_targets = {
+        Path(plan["roots"][root["name"]])
+        for root in manifest["roots"]
+        if "reconstructible_runtime" not in root
+    }
     for root in manifest["roots"]:
+        if "reconstructible_runtime" in root:
+            continue
         target = Path(plan["roots"][root["name"]])
         require_real_dir(target, f"restored root {root['name']}", "recovery_member_hash_mismatch")
         root_member = next(
@@ -6951,6 +7720,11 @@ def restore_command(
             status_dir,
         )
         verify_archive_consistency(manifest, extracted)
+        validate_workspace_targets(
+            manifest,
+            extracted,
+            verify_only=verify_only,
+        )
         postgres = plan["postgres"]
         pg = command_context(
             Path(postgres["bin_dir"]),
@@ -7010,6 +7784,18 @@ def restore_command(
         if not verify_only:
             restore_directories(manifest, plan, extracted)
             restore_exact_files(manifest, extracted)
+        rehydrate_release_runtime(
+            manifest=manifest,
+            plan=plan,
+            extracted=extracted,
+            status_dir=status_dir,
+            verify_only=verify_only,
+        )
+        restore_workspaces(
+            manifest,
+            extracted,
+            verify_only=verify_only,
+        )
         verify_restored_files(manifest, plan)
         verify_checkpoint_index(
             _load_extracted_json(
