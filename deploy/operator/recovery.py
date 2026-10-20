@@ -35,9 +35,11 @@ import base64
 import copy
 import configparser
 import contextlib
+import csv
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -862,6 +864,56 @@ def _git_output(repo: Path, *args: str) -> str:
         ) from error
 
 
+def _git_optional_output(repo: Path, *args: str) -> str | None:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
+        check=False,
+    )
+    if completed.returncode == 1:
+        return None
+    require(
+        completed.returncode == 0,
+        "recovery_release_missing",
+        f"cannot read workspace ref identity for {repo}",
+        {"stderr": completed.stderr[-2000:]},
+    )
+    return completed.stdout.strip()
+
+
+def _workspace_refs(repo: Path) -> tuple[str | None, dict[str, str]]:
+    head_symref = _git_optional_output(repo, "symbolic-ref", "-q", "HEAD")
+    output = _git_output(
+        repo,
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/heads",
+        "refs/tags",
+        "refs/remotes",
+    )
+    refs = {}
+    for line in output.splitlines():
+        if not line:
+            continue
+        name, separator, object_id = line.rpartition(" ")
+        require(
+            bool(separator)
+            and bool(name)
+            and bool(GIT_OBJECT.fullmatch(object_id))
+            and name not in refs,
+            "recovery_release_missing",
+            f"workspace ref identity is malformed for {repo}",
+        )
+        refs[name] = object_id
+    return head_symref, refs
+
+
 def workspace_reconstructible_plan(resolved: dict) -> dict:
     repositories = resolved["derived"]["repositories"]
     rows = []
@@ -878,6 +930,7 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
             slug,
         )
         head = _git_output(path, "rev-parse", "HEAD")
+        head_symref, refs = _workspace_refs(path)
         status = _git_output(path, "status", "--porcelain=v1")
         expected = resolved["targets"]
         bases = [target["base"] for target in expected.values() if target["repository_slug"] == slug]
@@ -892,17 +945,19 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
             f"workspace checkout is dirty: {path}",
             {"status": status.splitlines()[:20]},
         )
-        rows.append(
-            {
-                "repository_slug": slug,
-                "path": str(path),
-                "origin": origin,
-                "head": head,
-                "tree": _git_output(path, "rev-parse", "HEAD^{tree}"),
-                "bases": sorted(set(bases)),
-                "status": "clean",
-            }
-        )
+        row = {
+            "repository_slug": slug,
+            "path": str(path),
+            "origin": origin,
+            "head": head,
+            "tree": _git_output(path, "rev-parse", "HEAD^{tree}"),
+            "head_symref": head_symref,
+            "refs": refs,
+            "bases": sorted(set(bases)),
+            "status": "clean",
+        }
+        _workspace_verify(path, row)
+        rows.append(row)
     return {
         "schema_version": "solidworks-to-urdf.workspace-rehydrate/v2",
         "repositories": rows,
@@ -927,18 +982,27 @@ def _safe_workspace_origin(value: str, slug: str) -> str:
             "recovery_release_missing",
             f"workspace origin carries unsupported authority for {slug}",
         )
+        origin_slug = parsed.path.strip("/")
     elif value.startswith("git@"):
         require(
             re.fullmatch(r"git@[A-Za-z0-9._-]+:[^\s]+", value) is not None,
             "recovery_release_missing",
             f"workspace origin is not a safe SSH remote for {slug}",
         )
+        origin_slug = value.split(":", 1)[1].strip("/")
     else:
         require(
             Path(value).is_absolute() and ".." not in Path(value).parts,
             "recovery_release_missing",
             f"workspace origin is not an absolute local remote for {slug}",
         )
+        return value
+    origin_slug = origin_slug.removesuffix(".git")
+    require(
+        origin_slug == slug,
+        "recovery_release_missing",
+        f"workspace origin authority differs from {slug}",
+    )
     return value
 
 
@@ -971,6 +1035,7 @@ def capture_workspace_bundles(
                 f"workspace checkout {row['repository_slug']}",
                 "recovery_release_missing",
             )
+            _workspace_verify(repository, row)
             require(
                 _git_output(repository, "rev-parse", "HEAD") == row["head"]
                 and _git_output(repository, "rev-parse", "HEAD^{tree}") == row["tree"],
@@ -1037,6 +1102,7 @@ def capture_workspace_bundles(
                 "recovery_source_changed",
                 f"workspace identity changed during capture: {row['repository_slug']}",
             )
+            _workspace_verify(repository, row)
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             raise RecoveryError(
                 "recovery_workspace_bundle_failed",
@@ -6967,10 +7033,7 @@ def _workspace_plan(manifest: dict, extracted: Path) -> tuple[Path, dict]:
 
 
 def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
-    require(
-        isinstance(row, dict)
-        and set(row)
-        == {
+    base_keys = {
             "repository_slug",
             "path",
             "origin",
@@ -6981,6 +7044,10 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
             "bundle_member",
             "bundle_sha256",
         }
+    extended_keys = base_keys | {"head_symref", "refs"}
+    require(
+        isinstance(row, dict)
+        and set(row) in (base_keys, extended_keys)
         and isinstance(row["repository_slug"], str)
         and bool(row["repository_slug"])
         and isinstance(row["origin"], str)
@@ -6998,6 +7065,30 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
         "recovery_manifest_invalid",
         "workspace reconstruction row is malformed",
     )
+    if "refs" in row:
+        require(
+            isinstance(row["head_symref"], (str, type(None)))
+            and (
+                row["head_symref"] is None
+                or row["head_symref"].startswith("refs/heads/")
+            )
+            and isinstance(row["refs"], dict)
+            and all(
+                isinstance(name, str)
+                and bool(name)
+                and isinstance(object_id, str)
+                and bool(GIT_OBJECT.fullmatch(object_id))
+                for name, object_id in row["refs"].items()
+            ),
+            "recovery_manifest_invalid",
+            "workspace ref identity is malformed",
+        )
+        if row["head_symref"] is not None:
+            require(
+                row["refs"].get(row["head_symref"]) == row["head"],
+                "recovery_manifest_invalid",
+                "workspace symbolic HEAD is not bound to the recorded head",
+            )
     _safe_workspace_origin(row["origin"], row["repository_slug"])
     target = absolute_text(row["path"], f"workspace target {row['repository_slug']}")
     require(
@@ -7011,13 +7102,22 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
 
 def _workspace_verify(path: Path, row: dict) -> None:
     require_real_dir(path, f"workspace checkout {row['repository_slug']}", "recovery_workspace_missing")
+    git_path = path / ".git"
     require(
-        path.joinpath(".git").exists() and not is_link(path.joinpath(".git")),
+        git_path.is_dir() and not is_link(git_path),
         "recovery_workspace_missing",
-        f"workspace checkout has no real Git directory: {path}",
+        f"workspace checkout has no self-contained Git directory: {path}",
+    )
+    require(
+        not path_exists(git_path / "info" / "attributes"),
+        "recovery_workspace_mismatch",
+        "workspace checkout carries local attribute overrides",
     )
     environment = {
         **os.environ,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_TERMINAL_PROMPT": "0",
     }
@@ -7083,6 +7183,68 @@ def _workspace_verify(path: Path, row: dict) -> None:
         )
         expected[relative] = (int(mode_text, 8), object_id)
 
+    try:
+        index_output = subprocess.check_output(
+            ["git", "-C", str(path), "ls-files", "--stage", "-z"],
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        cached_check = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "diff-index",
+                "--cached",
+                "--quiet",
+                "HEAD",
+                "--",
+            ],
+            capture_output=True,
+            env=environment,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RecoveryError(
+            "recovery_workspace_missing",
+            f"cannot inspect workspace index: {path}",
+        ) from error
+    require(
+        cached_check.returncode == 0,
+        "recovery_workspace_mismatch",
+        f"workspace index differs from HEAD: {path}",
+    )
+    indexed: dict[str, tuple[int, str]] = {}
+    for record in index_output.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_relative = record.split(b"\t", 1)
+        fields = metadata.decode("ascii").split()
+        require(
+            len(fields) == 3 and fields[2] == "0",
+            "recovery_workspace_mismatch",
+            f"workspace index carries an unsupported entry: {raw_relative!r}",
+        )
+        mode_text, object_id, _stage = fields
+        relative = os.fsdecode(raw_relative)
+        require(
+            relative not in indexed
+            and bool(re.fullmatch(r"[0-7]{6}", mode_text))
+            and bool(GIT_OBJECT.fullmatch(object_id)),
+            "recovery_workspace_mismatch",
+            f"workspace index has an invalid entry: {relative}",
+        )
+        indexed[relative] = (int(mode_text, 8), object_id)
+    require(
+        indexed == expected,
+        "recovery_workspace_mismatch",
+        f"workspace index differs from the HEAD tree: {path}",
+        {
+            "missing": sorted(set(expected) - set(indexed))[:20],
+            "extra": sorted(set(indexed) - set(expected))[:20],
+        },
+    )
+
     attribute_input = b"\0".join(
         os.fsencode(relative) for relative in sorted(expected)
     ) + b"\0"
@@ -7093,6 +7255,8 @@ def _workspace_verify(path: Path, row: dict) -> None:
                 "-C",
                 str(path),
                 "check-attr",
+            "--cached",
+            "--source=HEAD",
                 "-z",
                 "filter",
                 "working-tree-encoding",
@@ -7173,6 +7337,11 @@ def _workspace_verify(path: Path, row: dict) -> None:
             "recovery_workspace_mismatch",
             f"workspace tracked mode differs: {relative}",
         )
+        require(
+            stat.S_IMODE(metadata.st_mode) == (0o755 if mode == 0o100755 else 0o644),
+            "recovery_workspace_mismatch",
+            f"workspace tracked permissions differ: {relative}",
+        )
         digest = hashlib.sha1()
         digest.update(f"blob {metadata.st_size}\0".encode("ascii"))
         with target.open("rb") as stream:
@@ -7197,6 +7366,20 @@ def _workspace_verify(path: Path, row: dict) -> None:
             "object_format": object_format,
         },
     )
+    if "refs" in row:
+        actual_head_symref, actual_refs = _workspace_refs(path)
+        require(
+            actual_head_symref == row["head_symref"]
+            and actual_refs == row["refs"],
+            "recovery_workspace_mismatch",
+            f"workspace refs differ from the reconstruction plan: {path}",
+            {
+                "expected_head": row["head_symref"],
+                "actual_head": actual_head_symref,
+                "missing_refs": sorted(set(row["refs"]) - set(actual_refs))[:20],
+                "extra_refs": sorted(set(actual_refs) - set(row["refs"]))[:20],
+            },
+        )
 
 
 def validate_workspace_targets(
@@ -7224,11 +7407,281 @@ def validate_workspace_targets(
         if verify_only:
             _workspace_verify(target, row)
         else:
+            bundle = extracted / confined_member(row["bundle_member"])
+            require_real_file(
+                bundle,
+                f"workspace bundle {row['repository_slug']}",
+                "recovery_workspace_missing",
+            )
+            require(
+                sha256_file(bundle) == row["bundle_sha256"],
+                "recovery_workspace_mismatch",
+                f"workspace bundle digest differs: {row['repository_slug']}",
+            )
             require(
                 not path_exists(target),
                 "recovery_target_not_empty",
                 f"workspace target already exists: {target}",
             )
+            with tempfile.TemporaryDirectory(
+                prefix="workspace-preflight-",
+                dir=extracted,
+            ) as temporary:
+                _materialize_workspace(bundle, Path(temporary) / "checkout", row)
+
+
+def _workspace_umask() -> None:
+    os.umask(0o022)
+
+
+def _apply_workspace_modes(path: Path) -> None:
+    output = subprocess.check_output(
+        ["git", "-C", str(path), "ls-tree", "-r", "-z", "HEAD"],
+        stderr=subprocess.PIPE,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+    )
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_relative = record.split(b"\t", 1)
+        mode_text, object_type, _object_id = metadata.decode("ascii").split()
+        require(
+            object_type == "blob" and mode_text in {"100644", "100755"},
+            "recovery_workspace_mismatch",
+            f"workspace bundle carries an unsupported tree entry: {raw_relative!r}",
+        )
+        target = path / os.fsdecode(raw_relative)
+        require_real_file(
+            target,
+            f"materialized workspace file {raw_relative!r}",
+            "recovery_workspace_failed",
+        )
+        target.chmod(0o755 if mode_text == "100755" else 0o644)
+
+
+def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
+    require(
+        not path_exists(target),
+        "recovery_target_not_empty",
+        f"workspace target already exists: {target}",
+    )
+    require_no_links(target.parent, "workspace target parent")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    clone = subprocess.run(
+        ["git", "clone", "--no-checkout", str(bundle), str(target)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+        preexec_fn=_workspace_umask,
+    )
+    require(
+        clone.returncode == 0,
+        "recovery_workspace_failed",
+        f"cannot clone workspace bundle: {row['repository_slug']}",
+        {"stderr": clone.stderr[-2000:]},
+    )
+    if "refs" in row:
+        current_refs = set(
+            subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads",
+                    "refs/tags",
+                    "refs/remotes",
+                ],
+                text=True,
+                stderr=subprocess.PIPE,
+            ).splitlines()
+        )
+        for name in sorted(current_refs - set(row["refs"])):
+            remove = subprocess.run(
+                ["git", "-C", str(target), "update-ref", "-d", name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                remove.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot remove an unplanned workspace ref: {name}",
+                {"stderr": remove.stderr[-2000:]},
+            )
+        for name, object_id in sorted(row["refs"].items()):
+            update = subprocess.run(
+                ["git", "-C", str(target), "update-ref", name, object_id],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                update.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot restore workspace ref {name}",
+                {"stderr": update.stderr[-2000:]},
+            )
+        if row["head_symref"] is not None:
+            symbolic = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "symbolic-ref",
+                    "HEAD",
+                    row["head_symref"],
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                symbolic.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot restore symbolic workspace HEAD: {row['repository_slug']}",
+                {"stderr": symbolic.stderr[-2000:]},
+            )
+    checkout_target = row.get("head_symref") or row["head"]
+    if checkout_target.startswith("refs/heads/"):
+        checkout_target = checkout_target.removeprefix("refs/heads/")
+    checkout_args = (
+        ["git", "-C", str(target), "checkout", "-f", checkout_target]
+        if row.get("head_symref")
+        else ["git", "-C", str(target), "checkout", "--detach", checkout_target]
+    )
+    checkout = subprocess.run(
+        checkout_args,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        preexec_fn=_workspace_umask,
+    )
+    require(
+        checkout.returncode == 0,
+        "recovery_workspace_failed",
+        f"cannot checkout workspace HEAD: {row['repository_slug']}",
+        {"stderr": checkout.stderr[-2000:]},
+    )
+    _apply_workspace_modes(target)
+    if "refs" in row:
+        current_refs = set(
+            subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads",
+                    "refs/tags",
+                    "refs/remotes",
+                ],
+                text=True,
+                stderr=subprocess.PIPE,
+            ).splitlines()
+        )
+        for name in sorted(current_refs - set(row["refs"])):
+            remove = subprocess.run(
+                ["git", "-C", str(target), "update-ref", "-d", name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                remove.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot remove an unplanned workspace ref: {name}",
+                {"stderr": remove.stderr[-2000:]},
+            )
+    origin = subprocess.run(
+        ["git", "-C", str(target), "remote", "set-url", "origin", row["origin"]],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    require(
+        origin.returncode == 0,
+        "recovery_workspace_failed",
+        f"cannot bind workspace origin: {row['repository_slug']}",
+        {"stderr": origin.stderr[-2000:]},
+    )
+    if "refs" in row:
+        current_refs = set(
+            subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads",
+                    "refs/tags",
+                    "refs/remotes",
+                ],
+                text=True,
+                stderr=subprocess.PIPE,
+            ).splitlines()
+        )
+        for name in sorted(current_refs - set(row["refs"])):
+            remove = subprocess.run(
+                ["git", "-C", str(target), "update-ref", "-d", name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                remove.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot remove an unplanned workspace ref: {name}",
+                {"stderr": remove.stderr[-2000:]},
+            )
+        for name, object_id in sorted(row["refs"].items()):
+            update = subprocess.run(
+                ["git", "-C", str(target), "update-ref", name, object_id],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                update.returncode == 0,
+                "recovery_workspace_failed",
+                f"cannot restore workspace ref {name}",
+                {"stderr": update.stderr[-2000:]},
+            )
+        if "refs/remotes/origin/HEAD" not in row["refs"]:
+            remove = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "update-ref",
+                    "--no-deref",
+                    "-d",
+                    "refs/remotes/origin/HEAD",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            require(
+                remove.returncode == 0,
+                "recovery_workspace_failed",
+                "cannot remove unplanned origin HEAD",
+                {"stderr": remove.stderr[-2000:]},
+            )
+    _workspace_verify(target, row)
 
 
 def validate_release_runtime_target(
@@ -7339,46 +7792,7 @@ def restore_workspaces(manifest: dict, extracted: Path, *, verify_only: bool) ->
             f"workspace partial target already exists: {partial}",
         )
         try:
-            clone = subprocess.run(
-                ["git", "clone", "--no-checkout", str(bundle), str(partial)],
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False,
-            )
-            require(
-                clone.returncode == 0,
-                "recovery_workspace_failed",
-                f"cannot clone workspace bundle: {row['repository_slug']}",
-                {"stderr": clone.stderr[-2000:]},
-            )
-            checkout = subprocess.run(
-                ["git", "-C", str(partial), "checkout", "--detach", row["head"]],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-            require(
-                checkout.returncode == 0,
-                "recovery_workspace_failed",
-                f"cannot checkout workspace HEAD: {row['repository_slug']}",
-                {"stderr": checkout.stderr[-2000:]},
-            )
-            origin = subprocess.run(
-                ["git", "-C", str(partial), "remote", "set-url", "origin", row["origin"]],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            require(
-                origin.returncode == 0,
-                "recovery_workspace_failed",
-                f"cannot bind workspace origin: {row['repository_slug']}",
-                {"stderr": origin.stderr[-2000:]},
-            )
-            _workspace_verify(partial, row)
+            _materialize_workspace(bundle, partial, row)
             os.replace(partial, target)
             _workspace_verify(target, row)
         except (OSError, subprocess.SubprocessError, RecoveryError) as error:
@@ -7561,30 +7975,32 @@ def _read_rehydrate_env(path: Path) -> dict[str, str]:
     return values
 
 
-def _verify_installed_wheel(wheel: Path, site_packages: Path) -> None:
-    require_real_file(wheel, "recovered release wheel", "recovery_release_missing")
+def _wheel_members(archive: zipfile.ZipFile, where: str) -> dict[str, bytes]:
+    members: dict[str, bytes] = {}
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        name = confined_member(info.filename, f"{where} member {info.filename!r}")
+        with archive.open(info) as stream:
+            members[name] = stream.read()
+    return members
+
+
+def _verify_installed_wheel_members(
+    members: dict[str, bytes],
+    site_packages: Path,
+    label: str,
+) -> None:
     require_real_dir(site_packages, "installed site-packages", "recovery_release_missing")
-    try:
-        with zipfile.ZipFile(wheel) as archive:
-            members: dict[str, bytes] = {}
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
-                name = confined_member(info.filename, f"wheel member {info.filename!r}")
-                with archive.open(info) as stream:
-                    members[name] = stream.read()
-    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
-        raise RecoveryError(
-            "recovery_release_missing",
-            f"release wheel is invalid: {wheel.name}",
-        ) from error
     require(
         "description_pipeline/__init__.py" in members
         and any(name.endswith(".dist-info/RECORD") for name in members),
         "recovery_release_missing",
-        "release wheel does not carry the package or its RECORD",
+        f"{label} does not carry the package or its RECORD",
     )
     for name, payload in members.items():
+        if name.endswith(".dist-info/RECORD"):
+            continue
         target = site_packages / name
         require(
             target.is_relative_to(site_packages),
@@ -7599,8 +8015,40 @@ def _verify_installed_wheel(wheel: Path, site_packages: Path) -> None:
         require(
             sha256_file(target) == hashlib.sha256(payload).hexdigest(),
             "recovery_release_missing",
-            f"installed wheel member differs: {name}",
+            f"installed {label} member differs: {name}",
         )
+    record_name = next(
+        name for name in members if name.endswith(".dist-info/RECORD")
+    )
+    record_target = site_packages / record_name
+    require_real_file(
+        record_target,
+        f"installed {label} RECORD",
+        "recovery_release_missing",
+    )
+    try:
+        record_rows = list(
+            csv.reader(record_target.read_text(encoding="utf-8").splitlines())
+        )
+    except (OSError, csv.Error, UnicodeDecodeError) as error:
+        raise RecoveryError(
+            "recovery_release_missing",
+            f"installed {label} RECORD is invalid",
+        ) from error
+    recorded = {
+        row[0]
+        for row in record_rows
+        if row and row[0] and not row[0].startswith("#")
+    }
+    require(
+        all(
+            name in recorded
+            for name in members
+            if not name.endswith(".dist-info/RECORD")
+        ),
+        "recovery_release_missing",
+        f"installed {label} RECORD does not cover its wheel files",
+    )
     require_real_dir(
         site_packages / "airflow",
         "installed Airflow package",
@@ -7611,6 +8059,53 @@ def _verify_installed_wheel(wheel: Path, site_packages: Path) -> None:
         "installed Airflow package entry",
         "recovery_release_missing",
     )
+
+
+def _verify_installed_wheel(wheel: Path, site_packages: Path) -> None:
+    require_real_file(wheel, "recovered release wheel", "recovery_release_missing")
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members = _wheel_members(archive, f"wheel {wheel.name}")
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise RecoveryError(
+            "recovery_release_missing",
+            f"release wheel is invalid: {wheel.name}",
+        ) from error
+    _verify_installed_wheel_members(members, site_packages, wheel.name)
+
+
+def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
+    require_real_file(
+        linux_zip,
+        "recovered Linux role archive",
+        "recovery_release_missing",
+    )
+    try:
+        with zipfile.ZipFile(linux_zip) as role:
+            wheels = [
+                name
+                for name in role.namelist()
+                if re.fullmatch(r"wheels/[^/]+\.whl", name)
+            ]
+            require(
+                bool(wheels),
+                "recovery_release_missing",
+                "recovered Linux role archive carries no wheels",
+            )
+            for name in wheels:
+                payload = role.read(name)
+                with zipfile.ZipFile(io.BytesIO(payload)) as wheel:
+                    members = _wheel_members(wheel, f"role wheel {name}")
+                _verify_installed_wheel_members(
+                    members,
+                    site_packages,
+                    name,
+                )
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise RecoveryError(
+            "recovery_release_missing",
+            f"recovered Linux role archive is invalid: {linux_zip.name}",
+        ) from error
 
 
 def verify_release_runtime(
@@ -7692,7 +8187,7 @@ def verify_release_runtime(
         "recovered package directory is outside its virtual environment",
     )
     artifacts = _release_artifacts(manifest)
-    _, _, wheel_name = _release_role_archives(artifacts)
+    _, linux_name, wheel_name = _release_role_archives(artifacts)
     wheel = release_root / "artifacts" / wheel_name
     require_real_file(wheel, "recovered release wheel", "recovery_release_missing")
     require(
@@ -7701,6 +8196,9 @@ def verify_release_runtime(
         "recovered release wheel digest differs",
     )
     _verify_installed_wheel(wheel, package.parent)
+    linux_zip = release_root / "artifacts" / linux_name
+    _verify_release_archive(linux_zip, artifacts[linux_name]["sha256"])
+    _verify_installed_role_wheels(linux_zip, package.parent)
     require(
         (venv / "bin" / "airflow").is_file()
         and os.access(venv / "bin" / "airflow", os.X_OK),

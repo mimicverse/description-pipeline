@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import copy
 import hashlib
@@ -678,8 +679,9 @@ def runtime_wheel_payloads(source_sha: str = "b" * 64) -> dict[str, bytes]:
             b"Metadata-Version: 2.1 Name: mimicverse-description Version: 1.0.0-test"
         ),
         "mimicverse_description-1.0.0-test.dist-info/RECORD": (
-            b"description_pipeline/__init__.py,, description_pipeline/tool-release.json,"
-            b"mimicverse_description-1.0.0-test.dist-info/METADATA,"
+            b"description_pipeline/__init__.py,,\n"
+            b"description_pipeline/tool-release.json,,\n"
+            b"mimicverse_description-1.0.0-test.dist-info/METADATA,,\n"
         ),
     }
 
@@ -718,8 +720,9 @@ def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
     ]
     for name, payload in runtime_wheel_payloads(source_sha).items():
         target = site / name
+        encoded = base64.b64encode(payload).decode("ascii")
         lines.append(
-            f"printf '%s' {payload.decode()!r} > {str(target)!r}"
+            f"printf '%s' '{encoded}' | base64 -d > {str(target)!r}"
         )
     lines.extend(
         [
@@ -818,16 +821,24 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     write(artifact_root / "artifact.bin", b"artifact")
     write(spec_root / "spec.md", "specification\n")
     wheel_name = "mimicverse_description-1.0.0-test-py3-none-any.whl"
-    write_runtime_wheel(release_root / wheel_name)
+    wheel_path = release_root / wheel_name
+    write_runtime_wheel(wheel_path)
+    wheel_bytes = wheel_path.read_bytes()
     readme_bytes = b"runtime-role\n"
     linux_name = "description-1.0.0-test-linux-cp312-x86_64.zip"
     linux_path = release_root / linux_name
     with zipfile.ZipFile(linux_path, "w") as archive:
         archive.writestr(
             "files.json",
-            json.dumps({"README.md": hashlib.sha256(readme_bytes).hexdigest()}),
+            json.dumps(
+                {
+                    "README.md": hashlib.sha256(readme_bytes).hexdigest(),
+                    f"wheels/{wheel_name}": hashlib.sha256(wheel_bytes).hexdigest(),
+                }
+            ),
         )
         archive.writestr("README.md", readme_bytes)
+        archive.writestr(f"wheels/{wheel_name}", wheel_bytes)
     linux_path.chmod(0o600)
     deployment_name = "description-1.0.0-test-deployment.zip"
     deployment_path = release_root / deployment_name
@@ -1266,6 +1277,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     "origin": str(origin),
                     "head": head,
                     "tree": tree,
+                    "head_symref": "refs/heads/main",
+                    "refs": {
+                        "refs/heads/main": head,
+                        "refs/remotes/origin/main": head,
+                    },
                     "bases": ["main"],
                     "status": "clean",
                 }
@@ -1453,6 +1469,30 @@ class RecoveryControlFlowTests(unittest.TestCase):
             recovery._workspace_verify(repository, row)
         self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
 
+    def test_workspace_verify_detects_a_staged_change(self) -> None:
+        repository, origin, head, tree = self.workspace_fixture()
+        head_bytes = (repository / "tracked.txt").read_bytes()
+        write(repository / "tracked.txt", "staged-change\n", mode=0o644)
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "tracked.txt"],
+            check=True,
+        )
+        (repository / "tracked.txt").write_bytes(head_bytes)
+        row = {
+            "repository_slug": "owner/model",
+            "path": str(repository),
+            "origin": str(origin),
+            "head": head,
+            "tree": tree,
+            "bases": ["main"],
+            "status": "clean",
+            "bundle_member": "reconstruct/workspaces/fixture.bundle",
+            "bundle_sha256": "0" * 64,
+        }
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery._workspace_verify(repository, row)
+        self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
+
     def test_release_runtime_preflight_rejects_external_venv(self) -> None:
         release_root = self.root / "release-preflight"
         extracted = self.root / "release-preflight-extracted"
@@ -1512,16 +1552,26 @@ class RecoveryControlFlowTests(unittest.TestCase):
         readme = b"offline-role\n"
         release_files = extracted / "release"
         (release_files / "artifacts").mkdir(parents=True)
+        wheel_path = release_files / "artifacts" / "mimicverse_description-1.0.0-test-py3-none-any.whl"
+        write_runtime_wheel(wheel_path)
+        wheel_bytes = wheel_path.read_bytes()
         linux_zip = release_files / "artifacts" / "description-1.0.0-test-linux-cp312-x86_64.zip"
         with zipfile.ZipFile(linux_zip, "w") as archive:
-            archive.writestr("files.json", json.dumps({"README.md": hashlib.sha256(readme).hexdigest()}))
+            archive.writestr(
+                "files.json",
+                json.dumps(
+                    {
+                        "README.md": hashlib.sha256(readme).hexdigest(),
+                        f"wheels/{wheel_path.name}": hashlib.sha256(wheel_bytes).hexdigest(),
+                    }
+                ),
+            )
             archive.writestr("README.md", readme)
+            archive.writestr(f"wheels/{wheel_path.name}", wheel_bytes)
         deployment_zip = release_files / "artifacts" / "description-1.0.0-test-deployment.zip"
         installer = runtime_installer(release_root / "airflow-venv")
         with zipfile.ZipFile(deployment_zip, "w") as archive:
             archive.writestr("deploy/airflow/install.sh", installer)
-        wheel_path = release_files / "artifacts" / "mimicverse_description-1.0.0-test-py3-none-any.whl"
-        write_runtime_wheel(wheel_path)
         write(release_files / "release.json", "{}\n")
         manifest = {
             "release": {
@@ -1559,6 +1609,24 @@ class RecoveryControlFlowTests(unittest.TestCase):
             verify_only=True,
         )
         self.assertEqual(verified["identity"]["version"], "1.0.0-test")
+        installed_package = (
+            release_root
+            / "airflow-venv"
+            / "lib"
+            / "python3.12"
+            / "site-packages"
+            / "description_pipeline"
+        )
+        write(installed_package / "__init__.py", "fake\n", mode=0o644)
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.rehydrate_release_runtime(
+                manifest=manifest,
+                plan={"roots": {"release_root": str(release_root)}},
+                extracted=extracted,
+                status_dir=status_dir,
+                verify_only=True,
+            )
+        self.assertEqual(raised.exception.code, "recovery_release_missing")
 
     def test_release_archive_rejects_path_traversal(self) -> None:
         archive = self.root / "unsafe-release.zip"
