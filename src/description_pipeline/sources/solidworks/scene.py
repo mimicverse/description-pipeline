@@ -97,7 +97,10 @@ def rpy_from_matrix(matrix: Matrix3) -> Vector3:
     if _is_identity(matrix):
         return (0.0, 0.0, 0.0)
     pitch = math.asin(max(-1.0, min(1.0, -matrix[2][0])))
-    if abs(math.cos(pitch)) > 1e-9:
+    # Near pitch +/-90 degrees, tiny matrix noise moves roll and yaw far while
+    # preserving their sum/difference. Use the stable canonical branch before
+    # that amplification can exceed the URDF frame tolerance.
+    if abs(math.cos(pitch)) > 1e-6:
         roll = math.atan2(matrix[2][1], matrix[2][2])
         yaw = math.atan2(matrix[1][0], matrix[0][0])
     else:  # gimbal lock: pick roll = 0 and put the rotation in yaw

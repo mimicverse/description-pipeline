@@ -436,10 +436,57 @@ _PLAN_KEYS = frozenset(
 def _require_plan_against_capture(staging: Path, plan: dict) -> None:
     """The planned selectors, datums and evidence items must match the actual capture."""
 
+    from .sources.solidworks.discovery import native_component_identity
+
     evidence = staging / "evidence"
     captured = read_data(evidence / "raw" / "mass_properties.json")
     captured_names = {str(name) for name in (captured or {})}
-    if not {str(item["name"]) for item in plan["objects"]} <= captured_names:
+    discovery = read_data(evidence / "discovery.json")
+    raw_discovery = discovery.get("raw") if isinstance(discovery, dict) else None
+    native_components = raw_discovery.get("components") if isinstance(raw_discovery, dict) else None
+    if not isinstance(native_components, list) or any(
+        not isinstance(item, dict) for item in native_components
+    ):
+        raise PipelineError("The capture carries no valid sealed native component inventory")
+    all_native_list = [native_component_identity(item) for item in native_components]
+    if len(set(all_native_list)) != len(all_native_list):
+        raise PipelineError("The capture repeats a sealed native instance identity")
+    all_native_names = set(all_native_list)
+    active_native = [item for item in native_components if not item.get("suppressed")]
+    planned_list = [str(item["name"]) for item in plan["objects"]]
+    native_list = [native_component_identity(item) for item in active_native]
+    if len(set(planned_list)) != len(planned_list) or len(set(native_list)) != len(native_list):
+        raise PipelineError("The capture repeats a sealed native instance identity")
+    planned_names = set(planned_list)
+    native_names = set(native_list)
+    native_documents = {
+        native_component_identity(item): str(item.get("document") or "") for item in active_native
+    }
+    container_names = {
+        name
+        for name in native_names
+        if native_documents[name].lower().endswith(".sldasm")
+        or any(other != name and other.startswith(name + "/") for other in all_native_names)
+    }
+    planned_mass_names = {
+        name for name in native_names if name not in container_names
+    }
+    scene = read_data(evidence / "raw" / "scene_raw.json")
+    scene_components = scene.get("components") if isinstance(scene, dict) else None
+    if not isinstance(scene_components, list) or any(
+        not isinstance(item, dict) for item in scene_components
+    ):
+        raise PipelineError("The capture scene has no valid native component inventory")
+    scene_list = [str(item.get("name")) for item in scene_components]
+    if len(set(scene_list)) != len(scene_list):
+        raise PipelineError("The capture scene repeats a native component identity")
+    scene_types = {str(item.get("name")): item.get("document_type") for item in scene_components}
+    if (
+        planned_names != native_names
+        or captured_names != planned_mass_names
+        or set(scene_types) != planned_mass_names
+        or any(kind != "part" for kind in scene_types.values())
+    ):
         raise PipelineError("The capture did not read every planned native instance")
     if plan["datums"]:
         systems = read_data(evidence / "raw" / "coordinate_systems.json")
@@ -488,6 +535,7 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         PLAN_FILE,
         PLAN_SCHEMA,
         SOURCE_FILE,
+        native_component_identity,
         sealed_cached_import_materialization,
         sealed_embedded_virtual_document,
     )
@@ -541,18 +589,16 @@ def _consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         raise PipelineError("The sealed capture plan configuration disagrees with the recorded saved configuration")
     if plan.get("run_id") != payload.get("run_id"):
         raise PipelineError("The sealed capture plan names another run than the sealed discovery")
+    component_rows = [item for item in (record.get("components") or []) if isinstance(item, dict)]
+    component_names = [native_component_identity(item) for item in component_rows]
+    if len(set(component_names)) != len(component_names):
+        raise PipelineError("The sealed capture plan repeats a native object selector")
     raw_documents = {
-        str(item.get("instance_id") or item.get("name2")): str(item.get("document") or "").replace("\\", "/")
-        for item in (record.get("components") or [])
-        if isinstance(item, dict)
-        and not item.get("suppressed")
-        and isinstance(item.get("instance_id") or item.get("name2"), str)
+        name: str(item.get("document") or "").replace("\\", "/")
+        for name, item in zip(component_names, component_rows, strict=True)
+        if not item.get("suppressed")
     }
-    raw_components = {
-        str(item.get("instance_id") or item.get("name2")): item
-        for item in (record.get("components") or [])
-        if isinstance(item, dict) and isinstance(item.get("instance_id") or item.get("name2"), str)
-    }
+    raw_components = dict(zip(component_names, component_rows, strict=True))
     registered = set(raw_documents)
     objects = plan.get("objects")
     if not isinstance(objects, list) or not objects:
