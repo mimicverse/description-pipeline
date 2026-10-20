@@ -1,0 +1,63 @@
+"""Versioned positive-motion rules for CAD joint axes."""
+
+from __future__ import annotations
+
+import unittest
+
+from description_pipeline.sources.solidworks.direction import canonicalize_axis, transform_limits
+
+
+IDENTITY = [
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+]
+
+
+class DirectionTests(unittest.TestCase):
+    def test_named_pitch_uses_the_positive_base_axis_for_both_sides(self):
+        right = canonicalize_axis("r_shoulder_pitch", [0, 1, 0], IDENTITY, IDENTITY, joint_type="revolute")
+        left = canonicalize_axis("l_shoulder_pitch", [0, -1, 0], IDENTITY, IDENTITY, joint_type="revolute")
+        self.assertEqual(right["motion"], "pitch")
+        self.assertEqual(right["sign"], 1)
+        self.assertEqual(right["canonical_base_axis"], [0.0, 1.0, 0.0])
+        self.assertEqual(left["motion"], "pitch")
+        self.assertEqual(left["sign"], -1)
+        self.assertEqual(left["canonical_base_axis"], [0.0, 1.0, 0.0])
+        self.assertEqual(left["delivered_local_axis"], [0.0, 1.0, 0.0])
+
+    def test_unnamed_axis_uses_only_a_confident_geometric_class(self):
+        result = canonicalize_axis("waist", [0.6, 0.8, 0], IDENTITY, IDENTITY, joint_type="revolute")
+        self.assertEqual(result["motion"], "pitch")
+        self.assertEqual(result["classification_source"], "geometry")
+        self.assertEqual(result["canonical_base_axis"], [0.6, 0.8, 0.0])
+
+    def test_a_named_axis_that_is_orthogonal_to_its_class_fails_closed(self):
+        result = canonicalize_axis("r_wrist_pitch", [1, 0, 0], IDENTITY, IDENTITY, joint_type="revolute")
+        self.assertEqual(result["status"], "unresolved")
+        self.assertEqual(result["delivered_local_axis"], [1.0, 0.0, 0.0])
+        self.assertEqual(result["sign"], 1)
+
+    def test_limits_follow_a_reversed_axis(self):
+        self.assertEqual(transform_limits({"lower": -2.0, "upper": 1.0}, -1), {"lower": -1.0, "upper": 2.0})
+        self.assertEqual(
+            transform_limits({"lower": -2.0, "upper": 1.0, "effort": 4.0, "velocity": 3.0}, 1),
+            {"lower": -2.0, "upper": 1.0, "effort": 4.0, "velocity": 3.0},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
