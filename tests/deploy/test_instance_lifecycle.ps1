@@ -60,6 +60,20 @@ Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfi
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
 Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
   $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
+Check 'wording.windows_recovery_schema' ($source.Contains('recovery-snapshot') -and
+  $source.Contains('recovery-restore') -and $source.Contains('recovery-verify') -and
+  $source.Contains('solidworks-to-urdf.windows-recovery/v1'))
+Check 'wording.windows_recovery_acl' ($source.Contains('Get-AclProjection') -and
+  $source.Contains('Set-AclProjection') -and $source.Contains('AreAccessRulesProtected'))
+Check 'wording.windows_recovery_identity' ($source.Contains('config_digest') -and
+  $source.Contains('release_identity_sha256') -and $source.Contains('install_id') -and
+  $source.Contains('script_sha256'))
+Check 'wording.windows_recovery_no_cad_inference' ($source.Contains('cad_session_facts') -and
+  $source.Contains('external_session_detected'))
+$restoreStart = $source.IndexOf('function Invoke-RecoveryRestore')
+$resumeStart = $source.IndexOf('function Invoke-RecoveryResume')
+Check 'wording.windows_restore_never_starts' ($restoreStart -ge 0 -and $resumeStart -gt $restoreStart -and
+  (-not $source.Substring($restoreStart, $resumeStart - $restoreStart).Contains('Start-ScheduledTask')))
 if ($StaticOnly) {
   Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
   exit ([int]($script:failures.Count -gt 0))
@@ -72,7 +86,38 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
   'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
+$seams += 'Get-AclProjection', 'Set-AclProjection', 'Get-TaskProjection', 'Get-RecoveryCurrentState',
+  'Invoke-RecoverySnapshot', 'Invoke-RecoveryRestore', 'Invoke-RecoveryResume'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
+$releaseHash = Get-ReleaseIdentitySha256 @{
+  version='1.2.3'
+  source_commit='a' * 40
+  source_sha256='b' * 64
+  role='native'
+}
+Check 'windows_recovery.release_hash' ($releaseHash -eq 'd429e65c8f58a11d51d12ab6a83219568c3505e0698a34a52afd9668f47691c5')
+$recoveryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-recovery-' + [guid]::NewGuid().ToString('N'))
+$recoverySource = Join-Path $recoveryRoot 'source'
+$null = New-Item -ItemType Directory -Path $recoverySource -Force
+$taskText = '<Task />'
+[System.IO.File]::WriteAllText((Join-Path $recoverySource 'task.xml'), $taskText, (New-Object System.Text.UTF8Encoding($false)))
+$taskBytes = [System.Text.Encoding]::UTF8.GetBytes($taskText)
+$recoveryState = [ordered]@{
+  schema_version='solidworks-to-urdf.windows-recovery/v1'
+  members=@([ordered]@{member='task.xml';bytes=$taskBytes.Length;sha256=(Get-BytesSha256 $taskBytes)})
+}
+[System.IO.File]::WriteAllText(
+  (Join-Path $recoverySource 'windows-state.json'),
+  ($recoveryState | ConvertTo-Json -Depth 8 -Compress),
+  (New-Object System.Text.UTF8Encoding($false)))
+$recoveryBundle = Join-Path $recoveryRoot 'recovery.zip'
+Compress-Archive -Path (Join-Path $recoverySource '*') -DestinationPath $recoveryBundle
+$recoveryRead = Read-RecoveryBundle $recoveryBundle
+Check 'windows_recovery.bundle_schema' ($recoveryRead.schema_version -eq 'solidworks-to-urdf.windows-recovery/v1')
+$recoveryExpanded = Expand-RecoveryBundle $recoveryBundle $recoveryRoot
+Check 'windows_recovery.bundle_member' ((Get-FileHash -LiteralPath (Join-Path $recoveryExpanded.root 'task.xml') -Algorithm SHA256).Hash.ToLower() -eq
+  [string]$recoveryRead.members[0].sha256)
+Remove-Item -LiteralPath $recoveryRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # ---- strict JSON boundary on the bound CPython 3.12 (PowerShell 5.1-compatible path) --------
 $scanPython = Get-EndpointConfigScanPython

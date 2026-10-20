@@ -27,9 +27,7 @@ from cryptography.fernet import Fernet
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
-DEPLOY = Path(
-    os.environ.get("DESCRIPTION_DEPLOY_DIR", REPOSITORY / "deploy" / "operator")
-)
+DEPLOY = Path(os.environ.get("DESCRIPTION_DEPLOY_DIR", REPOSITORY / "deploy" / "operator"))
 sys.path.insert(0, str(DEPLOY))
 sys.path.insert(0, str(HERE))
 
@@ -43,6 +41,187 @@ def write(path: Path, payload: str | bytes, mode: int = 0o600) -> Path:
     path.write_bytes(payload.encode() if isinstance(payload, str) else payload)
     path.chmod(mode)
     return path
+
+
+def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
+    task_xml = b"<Task><RegistrationInfo><URI>\\fixture-endpoint</URI></RegistrationInfo></Task>"
+    config = b'{"schema_version":"solidworks-to-urdf.endpoint/v1"}\n'
+    token = b"t" * 64 + b"\n"
+    install_id = b"win-" + b"1" * 32 + b"\n"
+    generation = "C:/description/lifecycle/win-11111111111111111111111111111111/generation"
+    paths = {
+        "endpoint_config": generation + "/endpoint.json",
+        "endpoint_token": "C:/description/state/endpoint.token",
+        "install_id": "C:/description/state/install-id",
+    }
+    payloads = {
+        "task.xml": task_xml,
+        "endpoint.json": config,
+        "token": token,
+        "install-id": install_id,
+    }
+    hashes = {name: hashlib.sha256(payload).hexdigest() for name, payload in payloads.items()}
+    files = [
+        {
+            "role": "task_xml",
+            "path": "C:/Windows/System32/Tasks/fixture-endpoint",
+            "member": "task.xml",
+            "bytes": len(task_xml),
+            "sha256": hashes["task.xml"],
+        },
+        {
+            "role": "endpoint_config",
+            "path": paths["endpoint_config"],
+            "member": "endpoint.json",
+            "bytes": len(config),
+            "sha256": hashes["endpoint.json"],
+        },
+        {
+            "role": "endpoint_token",
+            "path": paths["endpoint_token"],
+            "member": "token",
+            "bytes": len(token),
+            "sha256": hashes["token"],
+        },
+        {
+            "role": "install_id",
+            "path": paths["install_id"],
+            "member": "install-id",
+            "bytes": len(install_id),
+            "sha256": hashes["install-id"],
+        },
+    ]
+
+    def acl_projection(seed: str) -> dict:
+        return {
+            "owner_sid": "S-1-5-21-1",
+            "group_sid": "S-1-5-18",
+            "protected": True,
+            "sddl": "O:S-1-5-21-1G:S-1-5-18D:P(A;;FA;;;S-1-5-21-1)",
+            "rules": [
+                {
+                    "sid": "S-1-5-21-1",
+                    "access_type": "Allow",
+                    "rights": 2032127,
+                    "inherited": False,
+                    "inheritance": 0,
+                    "propagation": 0,
+                }
+            ],
+            "projection_sha256": seed * 64,
+        }
+
+    acl = {
+        "task_file": acl_projection("a"),
+        "endpoint_config": acl_projection("b"),
+        "endpoint_token": acl_projection("c"),
+        "install_id": acl_projection("d"),
+        "cad_ownership": None,
+    }
+    state = {
+        "schema_version": recovery.WINDOWS_RECOVERY_SCHEMA,
+        "ssh_host": "windows-fixture",
+        "task": {
+            "task_path": "\\",
+            "task_name": "description-e2e-endpoint",
+            "state": "Disabled",
+            "xml_sha256": hashes["task.xml"],
+            "semantic_sha256": "e" * 64,
+            "principal": {
+                "user": "fixture-endpoint",
+                "sid": "S-1-5-21-1",
+                "logon_type": "InteractiveToken",
+                "run_level": "HighestAvailable",
+                "group_id": "",
+            },
+            "action": {
+                "execute": generation + "/runtime/Scripts/description.exe",
+                "arguments": 'serve --config "' + generation + '/endpoint.json"',
+                "working_directory": "C:/description/state",
+            },
+            "settings": {"multiple_instances": "IgnoreNew"},
+            "triggers_sha256": "f" * 64,
+            "security_descriptor_sha256": "1" * 64,
+        },
+        "identity": {
+            "operator_sid": "S-1-5-21-1",
+            "endpoint_root": generation,
+            "config_path": paths["endpoint_config"],
+            "config_sha256": hashes["endpoint.json"],
+            "config_digest": "2" * 64,
+            "package_root": "C:/description/packages",
+            "output_root": "C:/description/results",
+            "state_root": "C:/description/state",
+            "port": 8765,
+            "token_path": paths["endpoint_token"],
+            "token_sha256": hashes["token"],
+            "install_id_path": paths["install_id"],
+            "install_id": "win-" + "1" * 32,
+            "release_identity_sha256": "3" * 64,
+            "user_environment": {
+                "DESCRIPTION_ENDPOINT_ROOT": generation,
+                "DESCRIPTION_CAD_OWNERSHIP_FILE": "C:/description/state/cad-ownership.json",
+            },
+        },
+        "files": files,
+        "acl": acl,
+        "cad": {
+            "ownership_path": "C:/description/state/cad-ownership.json",
+            "ownership_sha256": None,
+            "ledger_present": False,
+            "lease_path": "C:/description/state/cad-ownership.json.lease",
+            "lease_held": False,
+            "external_detected": False,
+            "problems": [],
+        },
+        "members": [{"member": row["member"], "bytes": row["bytes"], "sha256": row["sha256"]} for row in files],
+    }
+    bundle = staging / recovery.WINDOWS_BUNDLE_MEMBER
+    bundle.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(recovery.WINDOWS_STATE_MEMBER, recovery.canonical_json(state))
+        for name, payload in payloads.items():
+            archive.writestr(name, payload)
+    block = {
+        "schema_version": recovery.WINDOWS_RECOVERY_SCHEMA,
+        "bundle": {
+            "member": recovery.WINDOWS_BUNDLE_MEMBER,
+            "bytes": bundle.stat().st_size,
+            "sha256": recovery.sha256_file(bundle),
+        },
+        "state_sha256": recovery._digest_document(state),
+        "state": state,
+    }
+    return block, state
+
+
+def fake_capture_windows_recovery(context, *, backup_id, staging, commands):
+    del backup_id, commands
+    block, _state = windows_recovery_fixture(context, staging)
+    return block
+
+
+def fake_restore_windows_recovery(
+    *,
+    manifest,
+    plan,
+    extracted,
+    status_dir,
+    verify_only,
+    commands,
+    timeout=3600,
+):
+    del plan, extracted, verify_only, commands, timeout
+    document = {
+        "passed": True,
+        "verb": "recovery-restore",
+        "task_state": "Disabled",
+        "endpoint": "stopped",
+        "cad_ownership": "free",
+        "state_sha256": manifest["windows"]["state_sha256"],
+    }
+    write(status_dir / "windows-recovery.json", json.dumps(document))
+    return document
 
 
 def permission(path: Path) -> int:
@@ -766,7 +945,14 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
         json.dumps(
             {
                 "windows": {
-                    "instance": {"task_name": task_name},
+                    "ssh_host": "windows-fixture",
+                    "endpoint_port": 8765,
+                    "instance": {
+                        "task_name": task_name,
+                        "package_root": "C:/description/packages",
+                        "output_root": "C:/description/results",
+                        "state_root": "C:/description/state",
+                    },
                 }
             }
         )
@@ -917,7 +1103,13 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
         "windows": {
             "token_file": str(endpoint_token),
             "ssh_host": "windows-fixture",
-            "instance": {"task_name": task_name},
+            "endpoint_port": 8765,
+            "instance": {
+                "task_name": task_name,
+                "package_root": "C:/description/packages",
+                "output_root": "C:/description/results",
+                "state_root": "C:/description/state",
+            },
         },
         "auth": {"feishu_secret_file": str(feishu_secret)},
         "specifications": {"record_roots": [str(spec_root)]},
@@ -994,6 +1186,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.key = write(self.root / "external.key", os.urandom(32).hex() + "\n")
         self.key.chmod(0o600)
         self.real_quiesce_maintenance = recovery.quiesce_maintenance
+        self.real_capture_windows_recovery = recovery.capture_windows_recovery
         maintenance_quiesce = mock.patch.object(
             recovery,
             "quiesce_maintenance",
@@ -1006,6 +1199,21 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         maintenance_quiesce.start()
         maintenance_finalize.start()
+        windows_capture = mock.patch.object(
+            recovery,
+            "capture_windows_recovery",
+            side_effect=fake_capture_windows_recovery,
+        )
+        self.real_restore_windows_recovery = recovery.restore_windows_recovery
+        windows_restore = mock.patch.object(
+            recovery,
+            "restore_windows_recovery",
+            side_effect=fake_restore_windows_recovery,
+        )
+        windows_capture.start()
+        windows_restore.start()
+        self.addCleanup(windows_restore.stop)
+        self.addCleanup(windows_capture.stop)
         self.addCleanup(maintenance_finalize.stop)
         self.addCleanup(maintenance_quiesce.stop)
 
@@ -1026,6 +1234,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 out=out,
             )
         manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.windows_target = recovery._windows_target_from_state(manifest["windows"]["state"])
         return out, manifest
 
     def test_bounded_stdout_kills_writer_at_limit(self) -> None:
@@ -1230,6 +1439,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                         "bootstrap_role": "solidworks",
                     },
                     "roots": roots,
+                    "windows": self.windows_target,
                 },
                 indent=2,
             ),
@@ -1324,9 +1534,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         staging = self.root / "workspace-capture"
         (staging / "reconstruct").mkdir(parents=True)
         recovery.capture_workspace_bundles(context, staging)
-        plan = json.loads(
-            (staging / "reconstruct" / "workspace-plan.json").read_text()
-        )
+        plan = json.loads((staging / "reconstruct" / "workspace-plan.json").read_text())
         target = self.root / "workspace-targets" / "workspace-source"
         plan["repositories"][0]["path"] = str(target)
         (staging / "reconstruct" / "workspace-plan.json").write_text(
@@ -1364,11 +1572,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         manifest_path = out / "recovery-manifest.json"
         manifest_bytes = manifest_path.read_bytes()
         manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan = self.target_plan(manifest_sha, roots)
         status_dir = self.root / "status"
         result = recovery.restore_command(
@@ -1644,14 +1848,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         extracted = self.root / "runtime-extracted"
         status_dir = self.root / "runtime-status"
         status_dir.mkdir()
-        operator_env = (
-            extracted
-            / "config"
-            / "state"
-            / "derived"
-            / "install-a"
-            / "operator.env"
-        )
+        operator_env = extracted / "config" / "state" / "derived" / "install-a" / "operator.env"
         write(
             operator_env,
             "\n".join(
@@ -1789,11 +1986,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         sidecar = out / "recovery-manifest.sha256"
         write(sidecar, "0" * 64 + "  recovery-manifest.json\n")
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan = self.target_plan("0" * 64, roots)
         status_dir = self.root / "status-failed"
         with self.assertRaises(recovery.RecoveryError) as raised:
@@ -1814,11 +2007,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         Path(roots["handoff_root"]).mkdir(parents=True)
         write(Path(roots["handoff_root"]) / "occupied", "do not replace\n")
         plan = self.target_plan(manifest_sha, roots)
@@ -1840,11 +2029,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan = self.target_plan(manifest_sha, roots)
         wrong = write(self.root / "wrong.key", os.urandom(32).hex() + "\n")
         wrong.chmod(0o600)
@@ -1880,6 +2065,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             '{"schema_version":"x","schema_version":"y",'
             '"backup_id":"b","created_at":"t","source_code":{},'
             '"release":{},"database":{},"roles":{},"airflow":{},'
+            '"windows":{},'
             '"files":[],"roots":[],"members":[],"references":[],'
             '"reconstructibles":{},"secrets":[],"archive":{},'
             '"producer":{}}'
@@ -2164,11 +2350,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ),
         )
         write(out / "backup" / "source.txt", "preserve me\n")
-        before = {
-            path.relative_to(out).as_posix(): path.read_bytes()
-            for path in out.rglob("*")
-            if path.is_file()
-        }
+        before = {path.relative_to(out).as_posix(): path.read_bytes() for path in out.rglob("*") if path.is_file()}
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = recovery.main(
@@ -2186,11 +2368,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn("maintenance_state=not_started", stderr.getvalue())
-        after = {
-            path.relative_to(out).as_posix(): path.read_bytes()
-            for path in out.rglob("*")
-            if path.is_file()
-        }
+        after = {path.relative_to(out).as_posix(): path.read_bytes() for path in out.rglob("*") if path.is_file()}
         self.assertEqual(after, before)
 
     def test_symlink_output_is_refused_without_changing_the_target(self) -> None:
@@ -2291,9 +2469,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         lock_record = manifest["consistency"]["maintenance_lock"]
         self.assertTrue(lock_record["held"])
-        lock = recovery.acquire_maintenance_lock(
-            Path(self.context.resolved["storage"]["state_root"])
-        )
+        lock = recovery.acquire_maintenance_lock(Path(self.context.resolved["storage"]["state_root"]))
         lock.close()
 
     def test_failure_receipt_and_cleanup_run_while_backup_holds_the_lock(
@@ -2304,9 +2480,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
         def observe_failure(args, error, claim):
             with self.assertRaises(recovery.RecoveryError) as raised:
-                recovery.acquire_maintenance_lock(
-                    Path(self.context.resolved["storage"]["state_root"])
-                )
+                recovery.acquire_maintenance_lock(Path(self.context.resolved["storage"]["state_root"]))
             observed.append(raised.exception.code)
             return original_record(args, error, claim)
 
@@ -2345,9 +2519,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             raised.exception.backup_failure["maintenance_state"],
             "not_started",
         )
-        lock = recovery.acquire_maintenance_lock(
-            Path(self.context.resolved["storage"]["state_root"])
-        )
+        lock = recovery.acquire_maintenance_lock(Path(self.context.resolved["storage"]["state_root"]))
         lock.close()
 
     def test_failure_reporting_survives_cleanup_error(self) -> None:
@@ -2390,9 +2562,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             json.dumps(
                 {
                     "config": str(self.context.config_path),
-                    "operatorctl_path": str(
-                        Path(recovery.__file__).with_name("operatorctl.sh")
-                    ),
+                    "operatorctl_path": str(Path(recovery.__file__).with_name("operatorctl.sh")),
                 }
             ),
         )
@@ -2587,6 +2757,191 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         self.assertEqual(raised.exception.detail["state"], "Running")
 
+    def test_windows_target_plan_must_equal_the_archived_identity(self) -> None:
+        out, manifest = self.backup()
+        del out
+        manifest_path = self.root / "recovery" / "recovery-manifest.json"
+        manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
+        plan_path = self.target_plan(manifest_sha, roots)
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["windows"]["principal_sid"] = "S-1-5-21-9"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.validate_target_plan(plan, manifest, manifest_sha)
+        self.assertEqual(raised.exception.code, "recovery_target_plan_invalid")
+
+    def test_windows_state_refuses_unknown_cad_ownership(self) -> None:
+        _out, manifest = self.backup()
+        state = copy.deepcopy(manifest["windows"]["state"])
+        state["cad"]["lease_held"] = True
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery._validate_windows_recovery_state(state)
+        self.assertEqual(raised.exception.code, "windows_cad_ownership_unknown")
+
+    def test_windows_state_negative_boundary_matrix(self) -> None:
+        _out, manifest = self.backup()
+        cases = (
+            (
+                "started",
+                lambda state: state["task"].update(state="Running"),
+                "windows_task_not_disabled",
+            ),
+            (
+                "principal",
+                lambda state: state["identity"].update(operator_sid="S-1-5-21-9"),
+                "windows_operator_principal_mismatch",
+            ),
+            (
+                "logon",
+                lambda state: state["task"]["principal"].update(logon_type="Password"),
+                "windows_logon_type_unsupported",
+            ),
+            (
+                "token",
+                lambda state: state["identity"].update(token_sha256="short"),
+                "windows_recovery_state_invalid",
+            ),
+            (
+                "acl",
+                lambda state: state["acl"]["task_file"].pop("owner_sid"),
+                "recovery_manifest_invalid",
+            ),
+            (
+                "path",
+                lambda state: state["identity"].update(config_path="C:/../escape"),
+                "windows_recovery_state_invalid",
+            ),
+        )
+        for name, mutate, code in cases:
+            with self.subTest(name=name):
+                changed = copy.deepcopy(manifest["windows"]["state"])
+                mutate(changed)
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    recovery._validate_windows_recovery_state(changed)
+                self.assertEqual(raised.exception.code, code)
+
+    def test_windows_restore_never_accepts_a_started_task(self) -> None:
+        out, manifest = self.backup()
+        manifest_path = out / "recovery-manifest.json"
+        manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
+        plan_path = self.target_plan(manifest_sha, roots)
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        status_dir = self.root / "windows-restore-status"
+        status_dir.mkdir()
+        extracted, temporary = recovery.prepare_extraction(
+            manifest,
+            manifest_path,
+            self.key,
+            status_dir,
+        )
+        self.addCleanup(temporary.cleanup)
+        with (
+            mock.patch.object(
+                recovery,
+                "_transfer_windows_recovery",
+                return_value={
+                    "passed": True,
+                    "verb": "recovery-restore",
+                    "task_state": "Running",
+                    "endpoint": "stopped",
+                    "cad_ownership": "free",
+                    "state_sha256": manifest["windows"]["state_sha256"],
+                },
+            ),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            self.real_restore_windows_recovery(
+                manifest=manifest,
+                plan=plan,
+                extracted=extracted,
+                status_dir=status_dir,
+                verify_only=False,
+                commands=[],
+            )
+        self.assertEqual(raised.exception.code, "windows_recovery_verification_failed")
+
+    def test_windows_bundle_refuses_an_extra_member(self) -> None:
+        _out, manifest = self.backup()
+        status_dir = self.root / "windows-extra-status"
+        status_dir.mkdir()
+        extracted, temporary = recovery.prepare_extraction(
+            manifest,
+            self.root / "recovery" / "recovery-manifest.json",
+            self.key,
+            status_dir,
+        )
+        self.addCleanup(temporary.cleanup)
+        bundle = extracted / manifest["windows"]["bundle"]["member"]
+        with zipfile.ZipFile(bundle, "a", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("extra.bin", b"unexpected")
+        manifest["windows"]["bundle"]["bytes"] = bundle.stat().st_size
+        manifest["windows"]["bundle"]["sha256"] = recovery.sha256_file(bundle)
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.verify_windows_recovery_archive(manifest, extracted)
+        self.assertEqual(raised.exception.code, "windows_recovery_bundle_invalid")
+
+    def test_windows_restore_binding_carries_only_hashes_and_paths(self) -> None:
+        _out, manifest = self.backup()
+        target = recovery._windows_target_from_state(manifest["windows"]["state"])
+        binding = recovery._windows_restore_binding(
+            ssh_host=target["ssh_host"],
+            target=target,
+            remote_bundle="C:/description/state/recovery/recovery.zip",
+            bundle_sha256=manifest["windows"]["bundle"]["sha256"],
+        )
+        encoded = recovery.canonical_json(binding)
+        self.assertNotIn(b"t" * 64, encoded)
+        self.assertNotIn(b'"token"', encoded)
+        self.assertIn(b'"token_sha256"', encoded)
+
+    def test_windows_snapshot_orchestration_binds_the_downloaded_state(self) -> None:
+        staging = self.root / "windows-snapshot-staging"
+        staging.mkdir()
+        expected, _state = windows_recovery_fixture(self.context, staging)
+        with mock.patch.object(
+            recovery,
+            "_transfer_windows_recovery",
+            return_value={
+                "passed": True,
+                "verb": "recovery-snapshot",
+                "task_state": "Disabled",
+                "endpoint": "stopped",
+                "cad_ownership": "free",
+            },
+        ):
+            captured = self.real_capture_windows_recovery(
+                self.context,
+                backup_id="windows-snapshot",
+                staging=staging,
+                commands=[],
+            )
+        self.assertEqual(
+            captured["bundle"]["sha256"],
+            expected["bundle"]["sha256"],
+        )
+        self.assertEqual(captured["state"], expected["state"])
+
+    def test_windows_result_with_contradictory_exit_is_unknown(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["ssh", "windows-fixture"],
+            0,
+            json.dumps({"passed": False, "code": "windows_task_not_disabled"}) + "\n",
+            "",
+        )
+        with (
+            mock.patch.object(recovery, "_run_windows_powershell", return_value=completed),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._run_windows_recovery_json(
+                ssh_host="windows-fixture",
+                script="fixture",
+                timeout=5,
+                commands=[],
+            )
+        self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+
     def test_backup_requires_airflow_venv_interpreter(self) -> None:
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery._require_airflow_interpreter(self.context)
@@ -2636,9 +2991,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             "stdout_sha256": hashlib.sha256(b"").hexdigest(),
             "stderr_sha256": hashlib.sha256(b"").hexdigest(),
         }
-        lock = recovery.acquire_maintenance_lock(
-            Path(self.context.resolved["storage"]["state_root"])
-        )
+        lock = recovery.acquire_maintenance_lock(Path(self.context.resolved["storage"]["state_root"]))
         try:
             with (
                 mock.patch.dict(os.environ, {"QUIESCE_LOG": str(log)}),
@@ -2655,10 +3008,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 mock.patch.object(
                     recovery,
                     "_linux_unit_states",
-                    return_value=[
-                        {"unit": unit, "active_state": "inactive"}
-                        for unit in recovery.MAINTENANCE_UNITS
-                    ],
+                    return_value=[{"unit": unit, "active_state": "inactive"} for unit in recovery.MAINTENANCE_UNITS],
                 ),
                 mock.patch.object(
                     recovery,
@@ -2689,9 +3039,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             self.assertTrue(commands[0].endswith(inherited))
             self.assertNotIn("--keep-database", commands[0])
             self.assertTrue(commands[1].startswith("stop --config "))
-            self.assertTrue(
-                commands[1].endswith(" --keep-database" + inherited)
-            )
+            self.assertTrue(commands[1].endswith(" --keep-database" + inherited))
             self.assertEqual(state["windows"]["state"], "Disabled")
             self.assertEqual(state["database_before"], probe)
         finally:
@@ -2746,11 +3094,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         archive.write_bytes(damaged)
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan = self.target_plan(manifest_sha, roots)
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery.restore_command(
@@ -2774,11 +3118,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             out / "recovery-manifest.sha256",
             f"{manifest_sha}  recovery-manifest.json\n",
         )
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan = self.target_plan(manifest_sha, roots)
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery.restore_command(
@@ -2794,11 +3134,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan = self.target_plan(manifest_sha, roots)
         document = json.loads(plan.read_text())
         document["mode"] = "relocated"
@@ -2817,11 +3153,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan = self.target_plan(manifest_sha, roots)
         with (
             mock.patch.object(
@@ -2847,11 +3179,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.isolate_source()
         manifest_path = out / "recovery-manifest.json"
         manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        roots = {
-            row["name"]: row["path"]
-            for row in manifest["roots"]
-            if "reconstructible_runtime" not in row
-        }
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
         plan_path = self.target_plan(manifest_sha, roots)
         plan = json.loads(plan_path.read_text())
         target_bin = Path(plan["postgres"]["bin_dir"])

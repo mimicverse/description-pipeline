@@ -283,7 +283,7 @@ def platform_fixture(
     identity_path.write_text(
         json.dumps(
             {
-                "install_id": "ep-1",
+                "install_id": "win-" + "1" * 32,
                 "config_digest": "d" * 64,
                 "release": {
                     "version": release_document["version"],
@@ -697,7 +697,7 @@ class LifecycleTests(unittest.TestCase):
         op = release / "deploy" / "operator"
         op.mkdir(parents=True)
         (release / "release.json").write_text("{}\n", encoding="utf-8")
-        for name in ("airflow", "platform"):
+        for name in ("airflow", "platform", "windows"):
             os.symlink(OPERATOR.parent / name, release / "deploy" / name)
         for item in OPERATOR.iterdir():
             if item.name in {"operatorctl.sh", "health_gate.sh", "health.sh"}:
@@ -784,6 +784,13 @@ class LifecycleTests(unittest.TestCase):
             '      printf "%s|%s\\n" "$(stat -c %s "$FIXTURE_REMOTE_ARCHIVE")" \\\n'
             '        "$(sha256sum "$FIXTURE_REMOTE_ARCHIVE" | cut -d" " -f1)"\n'
             '    else echo absent; fi ;;\n'
+            "  *\"-Verb resume\"*)\n"
+            '    if [ "${FIXTURE_RESUME_RC:-0}" = "0" ]; then\n'
+            "      echo '{\"passed\":true,\"verb\":\"resume\"}'\n"
+            '    else\n'
+            "      echo '{\"passed\":false,\"verb\":\"resume\",\"code\":\"settle-timeout\",\"message\":\"refused\"}'\n"
+            '      exit "${FIXTURE_RESUME_RC}"\n'
+            '    fi ;;\n'
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
@@ -952,7 +959,7 @@ class LifecycleTests(unittest.TestCase):
             "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
             "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
-            "install": {"config_digest": "d" * 64, "install_id": "ep-1"},
+            "install": {"config_digest": "d" * 64, "install_id": "win-" + "1" * 32},
             "endpoint": {"port": 9765},
             "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
             "jobs": {"active": 0, "queued": 0, "unresolved": 0},
@@ -1002,14 +1009,19 @@ class LifecycleTests(unittest.TestCase):
                 ingress = lines.index(
                     "systemctl --user enable --now description-portal.service description-operator-proxy.service"
                 )
-                self.assertLess(
-                    max(i for i, line in enumerate(lines) if line.startswith("dag_state_check ")),
-                    ingress,
-                )
                 ready = lines.index(
                     "systemctl --user is-active --quiet description-portal.service description-operator-proxy.service"
                 )
                 self.assertLess(ingress, ready)
+                resume = next(i for i, line in enumerate(lines) if "-Verb resume" in line)
+                self.assertLess(ready, resume, "the Windows endpoint resumes after Linux services are active")
+                self.assertLess(
+                    resume,
+                    min(i for i, line in enumerate(lines) if line.startswith("dag_state_check ")),
+                    "DAG state checks run only after the Windows endpoint has resumed",
+                )
+                unpause = lines.index("airflow dags unpause solidworks_to_urdf")
+                self.assertLess(resume, unpause, "the Windows endpoint resumes before DAG scheduling is enabled")
                 probe = lines.index("health-gate probe")
                 self.assertLess(ready, probe, "the Linux health gate runs after the ingress is ready")
                 self.assertLess(probe, lines.index("platform open_admission"), "the open waits for a passed gate")
@@ -1021,16 +1033,13 @@ class LifecycleTests(unittest.TestCase):
             result = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("platform admission stays closed", result.stderr)
-            # The DAG scheduling unpause already happened (a recorded fact); the PLATFORM gate
-            # is closed through the controlled start precondition and never reopens.
+            # The controlled start precondition closes the platform gate before services are
+            # launched; an ingress failure has no scheduling or Windows-resume side effect.
             order_text = order.read_text()
             self.assertIn("platform close_admission", order_text)
             lines = order_text.splitlines()
-            self.assertLess(
-                lines.index("platform close_admission"),
-                lines.index("airflow dags unpause solidworks_to_urdf"),
-                "the start window closes the leftover gate before scheduling changes",
-            )
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", order_text)
+            self.assertFalse([line for line in lines if "-Verb resume" in line])
             self.assertNotIn("is-active", order_text)
             self.assertNotIn("health-gate probe", order_text)
             self.assertNotIn("platform open_admission", order_text)
@@ -1188,14 +1197,37 @@ class LifecycleTests(unittest.TestCase):
         )
         self.assertNotEqual(classic["params_digest"], reported["params_digest"])
 
-    def test_unpause_failure_does_not_start_ingress(self) -> None:
+    def test_resume_failure_keeps_scheduling_and_admission_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
+            env["FIXTURE_RESUME_RC"] = "1"
+            result = run(["bash", str(control), "start", "--config", str(config_path)], env)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                "the Windows endpoint did not resume under the active install identity; admission stays closed",
+                result.stderr,
+            )
+            self.assertEqual(admission.read_text().strip(), "true")
+            lines = order.read_text().splitlines()
+            ingress = lines.index(
+                "systemctl --user is-active --quiet description-portal.service description-operator-proxy.service"
+            )
+            resume = next(i for i, line in enumerate(lines) if "-Verb resume" in line)
+            self.assertLess(ingress, resume)
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", lines)
+            self.assertNotIn("health-gate probe", lines)
+            self.assertNotIn("platform open_admission", lines)
+
+    def test_unpause_failure_keeps_admission_closed_after_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, admission, order, control = self._admission_fixture(Path(tmp), unpause_rc=7)
             result = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
             self.assertEqual(admission.read_text().strip(), "true")
-            self.assertNotIn("description-portal.service", order.read_text())
-            self.assertNotIn("description-operator-proxy.service", order.read_text())
+            lines = order.read_text().splitlines()
+            self.assertTrue([line for line in lines if "-Verb resume" in line])
+            self.assertNotIn("health-gate probe", lines)
+            self.assertNotIn("platform open_admission", lines)
 
     def test_start_keep_admission_closed_starts_the_services_without_opening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -739,7 +739,8 @@ instance_lifecycle_health() {
   local dir="$OPERATOR_STATE/promotions/$generation"
   local binding="$dir/windows-health-binding.json" output="$dir/windows-health.out"
   mkdir -p "$dir"
-  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" <<'PY' || return 1
+  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
+    "$HERE/../windows/instance-lifecycle.ps1" <<'PY' || return 1
 import json
 import sys
 from pathlib import Path
@@ -857,6 +858,110 @@ PY
   fi
   if [ "$parse_rc" != "0" ]; then
     echo "instance_lifecycle: the health outcome is unreadable; see $output" >&2
+    return 2
+  fi
+  echo "$output"
+}
+
+instance_lifecycle_resume() {
+  local generation="$1" identity_file="$2"
+  local stamp dir binding output remote remote_script remote_binding
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dir="$OPERATOR_STATE/health-gate/windows-resume-$generation-$stamp"
+  binding="$dir/windows-resume-binding.json"
+  output="$dir/windows-resume.out"
+  mkdir -p "$dir"
+  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
+    "$HERE/../windows/instance-lifecycle.ps1" <<'PY' || return 1
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+config_path, identity_path, out_path = map(Path, sys.argv[1:4])
+generation, script_path = sys.argv[4], Path(sys.argv[5])
+config = json.loads(config_path.read_text(encoding="utf-8"))
+identity = json.loads(identity_path.read_text(encoding="utf-8"))
+windows = config["windows"]
+instance = windows["instance"]
+end = identity.get("ends", {}).get("windows")
+if not isinstance(end, dict) or not isinstance(end.get("release"), dict):
+    raise SystemExit("operatorctl: the active install record carries no Windows identity")
+release = end["release"]
+if release.get("role") != "native":
+    raise SystemExit("operatorctl: the active Windows identity is not the native role")
+if not all(isinstance(release.get(key), str) and release[key] for key in ("version", "source_commit", "source_sha256")):
+    raise SystemExit("operatorctl: the active Windows release identity is incomplete")
+if not isinstance(end.get("install_id"), str) or not re.fullmatch(r"win-[0-9a-f]{32}", end["install_id"]):
+    raise SystemExit("operatorctl: the active Windows install identity is malformed")
+if not isinstance(end.get("config_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", end["config_digest"]):
+    raise SystemExit("operatorctl: the active Windows config digest is malformed")
+triple = "\n".join(
+    str(release.get(key) or "") for key in ("version", "source_commit", "source_sha256", "role")
+)
+document = {
+    "schema_version": "solidworks-to-urdf.windows-recovery/v1",
+    "ssh_host": windows["ssh_host"],
+    "task_name": instance["task_name"],
+    "state_root": instance["state_root"],
+    "package_root": instance["package_root"],
+    "output_root": instance["output_root"],
+    "port": windows["endpoint_port"],
+    "generation": str(generation),
+    "version": release["version"],
+    "source_commit": release["source_commit"],
+    "source_sha256": release["source_sha256"],
+    "install_id": end["install_id"],
+    "config_digest": end["config_digest"],
+    "release_identity_sha256": hashlib.sha256(triple.encode("utf-8")).hexdigest(),
+    "script_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
+}
+out_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_root"].rstrip("/") + "/instance-promotions/windows-resume-" + sys.argv[2])' \
+    "$binding" "$generation-$stamp")"
+  remote_script="$remote/instance-lifecycle.ps1"
+  remote_binding="$remote/windows-resume-binding.json"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST" \
+    "powershell.exe -NoProfile -NonInteractive -EncodedCommand $(python3 - "$remote" <<'PY'
+import base64
+import sys
+
+path = sys.argv[1].replace("/", "\\").replace("'", "''")
+script = "$ErrorActionPreference='Stop';New-Item -ItemType Directory -Path '" + path + "' -ErrorAction Stop | Out-Null"
+print(base64.b64encode(script.encode("utf-16le")).decode("ascii"))
+PY
+)" || { echo "instance_lifecycle_resume: could not create $remote" >&2; return 1; }
+  scp -q -p -o BatchMode=yes -o StrictHostKeyChecking=yes \
+    "$HERE/../windows/instance-lifecycle.ps1" "$binding" \
+    "$SOLIDWORKS_SSH_HOST:\"$remote/\"" \
+    || { echo "instance_lifecycle_resume: could not transfer the resume binding" >&2; return 1; }
+  local remote_rc=0
+  : > "$output"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST" \
+    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote_script\" -Verb resume -Binding \"$remote_binding\"" \
+    > "$output" || remote_rc=$?
+  local parse_rc=0
+  python3 - "$output" "$remote_rc" <<'PY' || parse_rc=$?
+import json
+import sys
+
+try:
+    document = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(3)
+remote_rc = int(sys.argv[2])
+if remote_rc == 0 and document.get("passed") is True and document.get("verb") == "resume":
+    raise SystemExit(0)
+code = document.get("code")
+if remote_rc == 1 and document.get("passed") is False and isinstance(code, str) and code:
+    print(code, file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(3)
+PY
+  if [ "$parse_rc" != "0" ]; then
+    echo "instance_lifecycle_resume: the Windows resume outcome is not proven; see $output" >&2
     return 2
   fi
   echo "$output"
@@ -1438,13 +1543,15 @@ case "$ACTION" in
     # unpause and the platform open are the two state transitions of a plain start, and the
     # flagged start skips both (services up, admission closed; a later plain start re-verifies
     # and opens).  A failure above this point never opens anything.
-    if [ -z "$KEEP_ADMISSION_CLOSED" ]; then
-      airflow_unpause_dag
-    fi
     systemctl --user enable --now description-portal.service description-operator-proxy.service \
       || die "ingress services failed to start; the platform admission stays closed"
     systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
       || die "ingress services are not active; the platform admission stays closed"
+    instance_lifecycle_resume "$ACTIVE_ID" "$STATE_ROOT/install-record.json" \
+      || die "the Windows endpoint did not resume under the active install identity; admission stays closed"
+    if [ -z "$KEEP_ADMISSION_CLOSED" ]; then
+      airflow_unpause_dag
+    fi
     if [ -n "$KEEP_ADMISSION_CLOSED" ]; then
       # Identical checks and services, but nothing is opened (never open-then-close): the
       # start-window close above is the only admission transition that was written.

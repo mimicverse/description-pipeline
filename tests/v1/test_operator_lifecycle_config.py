@@ -165,6 +165,29 @@ class OperatorctlSurfaceTests(unittest.TestCase):
         self.assertIn("description-postgres.service", branch)
         self.assertIn("PostgreSQL remains active", branch)
 
+    def test_start_resumes_windows_after_linux_and_before_admission(self):
+        source = CONTROL.read_text(encoding="utf-8")
+        start_branch = source.rsplit("  start)\n", 1)[1].split("  drain)\n", 1)[0]
+        linux_services = start_branch.index("systemctl --user enable --now")
+        windows_resume = start_branch.index('instance_lifecycle_resume "$ACTIVE_ID" "$STATE_ROOT/install-record.json"')
+        dag_unpause = start_branch.index("airflow_unpause_dag")
+        admission_open = start_branch.index("platform_open_admission")
+        self.assertLess(linux_services, windows_resume)
+        self.assertLess(windows_resume, dag_unpause)
+        self.assertLess(dag_unpause, admission_open)
+
+    def test_private_windows_resume_uses_authenticated_identity_and_health(self):
+        source = CONTROL.read_text(encoding="utf-8")
+        resume = source.split("instance_lifecycle_resume() {", 1)[1].split("\n# The Windows end of the unified", 1)[0]
+        self.assertIn('"release_identity_sha256": hashlib.sha256', resume)
+        self.assertIn('"install_id": end["install_id"]', resume)
+        self.assertIn('"config_digest": end["config_digest"]', resume)
+        self.assertIn('"script_sha256": hashlib.sha256', resume)
+        self.assertIn("-o StrictHostKeyChecking=yes", resume)
+        self.assertIn("-Verb resume -Binding", resume)
+        self.assertNotIn("endpoint.token", resume)
+        self.assertNotIn("password", resume.lower())
+
     def test_start_refuses_while_the_shared_maintenance_lock_is_held(self):
         state_root = self.root / "state"
         state_root.mkdir()
