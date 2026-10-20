@@ -69,7 +69,7 @@ class ValueWarningTests(unittest.TestCase):
                                 "object": "base_link",
                                 "field": "name",
                                 "actual": "base_link",
-                                "source": "CAD datum formatting for CS_base_link",
+                                "source": "CAD-derived interface naming for CS_base_link",
                                 "original": "CS_base_link",
                                 "rule_id": "naming.interface",
                                 "rule_version": "naming-v1",

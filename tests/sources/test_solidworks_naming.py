@@ -33,12 +33,88 @@ class NamingTests(unittest.TestCase):
         joints = [
             {
                 "name": "l_ankle",
-                "axis_reference": {"feature_name": "a_l_ankle"},
+                "type": "revolute",
+                "parent": "manual_root",
+                "child": "manual_left",
             }
         ]
         body_names, joint_names = carrier_names(bodies, joints, "manual_root")
-        self.assertEqual(body_names, {"manual_root": "base_link", "manual_left": "left_ankle_link"})
-        self.assertEqual(joint_names, {"l_ankle": "left_ankle_joint"})
+        self.assertEqual(body_names, {"manual_root": "base_link", "manual_left": "left_foot_link"})
+        self.assertEqual(joint_names, {"l_ankle": "left_ankle_pitch_joint"})
+
+    def test_joint_centric_aliases_use_child_topology_but_physical_names_are_preserved(self):
+        bodies = [
+            {"name": "base", "frame": {"coordinate_system": "CS_base_link"}},
+            {"name": "upper", "frame": {"coordinate_system": "c_r_shoulder_roll"}},
+            {"name": "forearm", "frame": {"coordinate_system": "c_r_elbow"}},
+            {"name": "hand", "frame": {"coordinate_system": "c_r_wrist_pitch"}},
+            {"name": "sensor", "frame": {"coordinate_system": "CS_sensor_housing_link"}},
+        ]
+        joints = [
+            {"name": "r_shoulder_roll", "type": "revolute", "parent": "base", "child": "upper"},
+            {"name": "r_shoulder_yaw", "type": "revolute", "parent": "upper", "child": "sensor"},
+            {"name": "r_elbow", "type": "revolute", "parent": "base", "child": "forearm"},
+            {"name": "r_wrist_pitch", "type": "revolute", "parent": "forearm", "child": "hand"},
+        ]
+        body_names, joint_names = carrier_names(bodies, joints, "base")
+        self.assertEqual(body_names["upper"], "right_upper_arm_link")
+        self.assertEqual(body_names["forearm"], "right_forearm_link")
+        self.assertEqual(body_names["hand"], "right_hand_link")
+        self.assertEqual(body_names["sensor"], "sensor_housing_link")
+        self.assertEqual(joint_names["r_shoulder_roll"], "right_shoulder_roll_joint")
+        self.assertEqual(joint_names["r_elbow"], "right_elbow_pitch_joint")
+        self.assertEqual(joint_names["r_wrist_pitch"], "right_wrist_pitch_joint")
+
+    def test_leg_waist_and_head_topology_produce_the_manual_segments(self):
+        bodies = [
+            {"name": "base", "frame": {"coordinate_system": "CS_base_link"}},
+            {"name": "waist", "frame": {"coordinate_system": "c_waist"}},
+            {"name": "thigh_yaw", "frame": {"coordinate_system": "c_r_thigh_yaw"}},
+            {"name": "thigh_pitch", "frame": {"coordinate_system": "c_r_thigh_pitch"}},
+            {"name": "thigh_roll", "frame": {"coordinate_system": "c_r_thigh_roll"}},
+            {"name": "knee", "frame": {"coordinate_system": "c_r_knee"}},
+            {"name": "ankle", "frame": {"coordinate_system": "c_r_ankle"}},
+            {"name": "head_yaw", "frame": {"coordinate_system": "c_head_yaw"}},
+            {"name": "head_pitch", "frame": {"coordinate_system": "c_head_pitch"}},
+        ]
+        joints = [
+            {"name": "waist", "type": "revolute", "parent": "base", "child": "waist"},
+            {"name": "r_thigh_yaw", "type": "revolute", "parent": "waist", "child": "thigh_yaw"},
+            {"name": "r_thigh_pitch", "type": "revolute", "parent": "thigh_yaw", "child": "thigh_pitch"},
+            {"name": "r_thigh_roll", "type": "revolute", "parent": "thigh_pitch", "child": "thigh_roll"},
+            {"name": "r_knee", "type": "revolute", "parent": "thigh_roll", "child": "knee"},
+            {"name": "r_ankle", "type": "revolute", "parent": "knee", "child": "ankle"},
+            {"name": "head_yaw", "type": "revolute", "parent": "base", "child": "head_yaw"},
+            {"name": "head_pitch", "type": "revolute", "parent": "head_yaw", "child": "head_pitch"},
+        ]
+        body_names, joint_names = carrier_names(bodies, joints, "base")
+        self.assertEqual(
+            body_names,
+            {
+                "base": "base_link",
+                "waist": "pelvis_link",
+                "thigh_yaw": "right_hip_yaw_link",
+                "thigh_pitch": "right_thigh_link",
+                "thigh_roll": "right_hip_roll_link",
+                "knee": "right_shank_link",
+                "ankle": "right_foot_link",
+                "head_yaw": "neck_yaw_link",
+                "head_pitch": "head_link",
+            },
+        )
+        self.assertEqual(
+            joint_names,
+            {
+                "waist": "waist_pitch_joint",
+                "r_thigh_yaw": "right_hip_yaw_joint",
+                "r_thigh_pitch": "right_hip_pitch_joint",
+                "r_thigh_roll": "right_hip_roll_joint",
+                "r_knee": "right_knee_pitch_joint",
+                "r_ankle": "right_ankle_pitch_joint",
+                "head_yaw": "neck_yaw_joint",
+                "head_pitch": "neck_pitch_joint",
+            },
+        )
 
     def test_native_generic_names_are_formatted_once(self):
         self.assertEqual(token(" R_Shoulder Roll "), "right_shoulder_roll")

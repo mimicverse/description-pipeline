@@ -1967,6 +1967,7 @@ def _value_warning_gate(root, source, model):
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
         if source_name != body["name"]:
+            rule = body.get("name_rule") if isinstance(body.get("name_rule"), dict) else {}
             add(
                 "naming.formatted_interface",
                 {
@@ -1974,16 +1975,17 @@ def _value_warning_gate(root, source, model):
                     "object": body["name"],
                     "field": "name",
                     "actual": body["name"],
-                    "source": f"CAD datum formatting for {source_name}",
+                    "source": f"CAD-derived interface naming for {source_name}",
                     "original": source_name,
-                    "rule_id": "naming.interface",
-                    "rule_version": "naming-v1",
-                    "reason": "CAD datum formatting",
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD datum formatting"),
                 },
             )
     for joint in joints:
         source_name = str(joint.get("source_name") or joint["name"])
         if source_name != joint["name"]:
+            rule = joint.get("name_rule") if isinstance(joint.get("name_rule"), dict) else {}
             add(
                 "naming.formatted_interface",
                 {
@@ -1991,11 +1993,11 @@ def _value_warning_gate(root, source, model):
                     "object": joint["name"],
                     "field": "name",
                     "actual": joint["name"],
-                    "source": f"CAD reference-axis formatting for {source_name}",
+                    "source": f"CAD-derived interface naming for {source_name}",
                     "original": source_name,
-                    "rule_id": "naming.interface",
-                    "rule_version": "naming-v1",
-                    "reason": "CAD reference-axis formatting",
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD reference-axis formatting"),
                 },
             )
         if joint.get("type") != "fixed" and not any(

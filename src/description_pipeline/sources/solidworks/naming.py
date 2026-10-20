@@ -36,6 +36,39 @@ _VOCABULARY = (
 )
 _VOCABULARY_RE = re.compile("|".join(re.escape(source) for source, _ in _VOCABULARY))
 
+#: Functional joint roles and the child segment selected by their outgoing
+#: moving-joint topology.  The role is a native CAD name; the topology proves
+#: which physical segment follows it.
+_SEGMENT_BY_ROLE = {
+    "elbow": ("forearm", ("wrist_pitch",)),
+    "wrist_pitch": ("hand", ()),
+    "shoulder_roll": ("upper_arm", ("shoulder_yaw",)),
+    "waist": ("pelvis", ("thigh_yaw",)),
+    "thigh_yaw": ("hip_yaw", ("thigh_pitch",)),
+    "thigh_pitch": ("thigh", ("thigh_roll",)),
+    "thigh_roll": ("hip_roll", ("knee",)),
+    "knee": ("shank", ("ankle",)),
+    "ankle": ("foot", ()),
+    "head_yaw": ("neck_yaw", ("head_pitch",)),
+    "head_pitch": ("head", ()),
+}
+
+_JOINT_BY_ROLE = {
+    "elbow": "elbow_pitch",
+    "waist": "waist_pitch",
+    "thigh_yaw": "hip_yaw",
+    "thigh_pitch": "hip_pitch",
+    "thigh_roll": "hip_roll",
+    "knee": "knee_pitch",
+    "ankle": "ankle_pitch",
+    "head_yaw": "neck_yaw",
+    "head_pitch": "neck_pitch",
+}
+
+_ROLE_VOCABULARY = frozenset(_SEGMENT_BY_ROLE) | frozenset(
+    role for _segment, outgoing in _SEGMENT_BY_ROLE.values() for role in outgoing
+)
+
 
 def token(value: str) -> str:
     """Normalize one native name into the single output snake_case vocabulary."""
@@ -73,6 +106,65 @@ def joint_name(native_name: str) -> str:
     name = token(source)
     stem = name[: -len("_joint")] if name.endswith("_joint") else name
     return stem + "_joint"
+
+
+def _role_token(native_name: str) -> tuple[str, str] | None:
+    """Return ``(side_prefix, role)`` for a recognised native joint role."""
+
+    source = re.sub(r"^(?:c_|cs_)", "", str(native_name), flags=re.IGNORECASE)
+    try:
+        name = token(source)
+    except ValueError:
+        return None
+    side = ""
+    for prefix in ("left_", "right_"):
+        if name.startswith(prefix):
+            side = prefix
+            name = name[len(prefix) :]
+            break
+    for role in sorted(_ROLE_VOCABULARY, key=len, reverse=True):
+        if name == role or name.endswith("_" + role):
+            return side, role
+    return None
+
+
+def _segment_for(role: str, outgoing_roles: list[str | None]) -> str | None:
+    segment, expected = _SEGMENT_BY_ROLE[role]
+    if not expected:
+        return segment if not outgoing_roles else None
+    if role == "waist":
+        return segment if outgoing_roles and set(outgoing_roles) == set(expected) else None
+    return segment if outgoing_roles == list(expected) else None
+
+
+def role_link_name(native_joint: str, outgoing_roles: list[str | None]) -> str | None:
+    """Return the semantic child segment for a native joint role, if proven."""
+
+    parsed = _role_token(native_joint)
+    if parsed is None or parsed[1] not in _SEGMENT_BY_ROLE:
+        return None
+    side, role = parsed
+    segment = _segment_for(role, outgoing_roles)
+    return f"{side}{segment}_link" if segment is not None else None
+
+
+def role_joint_name(native_joint: str, outgoing_roles: list[str | None]) -> str | None:
+    """Return the semantic joint name for a native function role, if proven."""
+
+    parsed = _role_token(native_joint)
+    if parsed is None or parsed[1] not in _JOINT_BY_ROLE:
+        return None
+    side, role = parsed
+    if _segment_for(role, outgoing_roles) is None:
+        return None
+    return f"{side}{_JOINT_BY_ROLE[role]}_joint"
+
+
+def joint_role(native_joint: str) -> str | None:
+    """Return the recognised function role of a native joint name."""
+
+    parsed = _role_token(native_joint)
+    return parsed[1] if parsed is not None else None
 
 
 def fixed_joint_name(parent: str, child: str) -> str:
@@ -233,7 +325,27 @@ def deduplicate_names(
 
 
 def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, str]]:
-    """Canonical link/joint names from native datums and reference axes."""
+    """Canonical link/joint names from native identities and joint topology.
+
+    A semantic segment rename is allowed only when the body datum is the
+    incoming joint's own alias and the child-side topology proves the segment.
+    An independently compliant physical datum (for example
+    ``CS_sensor_housing_link``) is preserved unchanged.
+    """
+
+    incoming: dict[str, dict] = {}
+    outgoing: dict[str, list[str | None]] = {}
+    for joint in joints:
+        if joint.get("type") == "fixed":
+            continue
+        parent = str(joint.get("parent") or "")
+        child = str(joint.get("child") or "")
+        parsed = _role_token(str(joint.get("name") or ""))
+        role = parsed[1] if parsed is not None else None
+        if parent:
+            outgoing.setdefault(parent, []).append(role)
+        if child:
+            incoming[child] = joint
 
     body_names: dict[str, str] = {}
     for body in bodies:
@@ -241,31 +353,53 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
         frame = body.get("frame") if isinstance(body.get("frame"), dict) else {}
         datum = str(frame.get("coordinate_system") or body.get("datum") or native)
         semantic = re.sub(r"^(?:c_|cs_)", "", datum, flags=re.IGNORECASE)
-        try:
-            body_names[native] = link_name(semantic, root=native == root or token(semantic) == "base_link")
-        except ValueError:
-            body_names[native] = neutral_link_name(f"{native}|{datum}", root=native == root)
+        target: str | None = None
+        if native == str(root) or semantic.lower() in {"base_link", "cs_base_link"}:
+            target = "base_link"
+        else:
+            joint = incoming.get(native)
+            if joint is not None:
+                joint_source = str(joint.get("name") or "")
+                parsed = _role_token(joint_source)
+                try:
+                    datum_token = token(semantic)
+                    joint_token = token(joint_source)
+                except ValueError:
+                    datum_token = joint_token = None
+                if datum_token == joint_token:
+                    target = role_link_name(joint_source, outgoing.get(native, []))
+            if target is None:
+                try:
+                    target = link_name(semantic)
+                except ValueError:
+                    target = neutral_link_name(f"{native}|{datum}", root=False)
+        body_names[native] = target
     root_key = str(root)
     reserved = {root_key: "base_link"} if root_key in body_names else {}
     body_names = deduplicate_names(body_names, "link", reserved=reserved)
+
     joint_names: dict[str, str] = {}
     for joint in joints:
+        if "name" not in joint:
+            continue
         native = str(joint["name"])
+        target: str | None = None
         try:
             if joint.get("type") == "fixed":
-                joint_names[native] = fixed_joint_name(
-                    body_names.get(str(joint.get("parent")), str(joint.get("parent") or "parent")),
-                    body_names.get(str(joint.get("child")), str(joint.get("child") or "child")),
-                )
+                parent = body_names.get(str(joint.get("parent")), str(joint.get("parent") or "parent"))
+                child = body_names.get(str(joint.get("child")), str(joint.get("child") or "child"))
+                target = fixed_joint_name(parent, child)
             else:
-                joint_names[native] = joint_name(native)
+                child = str(joint.get("child") or "")
+                target = role_joint_name(native, outgoing.get(child, []))
+                if target is None:
+                    target = joint_name(native)
         except ValueError:
             parent = body_names.get(str(joint.get("parent")), str(joint.get("parent") or "parent"))
             child = body_names.get(str(joint.get("child")), str(joint.get("child") or "child"))
             try:
-                joint_names[native] = neutral_joint_name(
-                    parent, child, fixed=joint.get("type") == "fixed"
-                )
+                target = neutral_joint_name(parent, child, fixed=joint.get("type") == "fixed")
             except ValueError:
-                joint_names[native] = fallback_name("joint", native, semantic="joint")
+                target = fallback_name("joint", native, semantic="joint")
+        joint_names[native] = target
     return body_names, deduplicate_names(joint_names, "joint")

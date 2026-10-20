@@ -2457,97 +2457,141 @@ def _apply_cad_names(
 ) -> None:
     """Derive output names from CAD datums/reference axes through one rule."""
 
-    from .naming import joint_name as format_joint_name
-    from .naming import link_name as format_link_name
-    from .naming import fallback_name
-    from .naming import fixed_joint_name
-    from .naming import deduplicate_names, neutral_joint_name, neutral_link_name
+    from .naming import (
+        carrier_names,
+        joint_name as format_joint_name,
+        link_name as format_link_name,
+        joint_role,
+        role_joint_name,
+        role_link_name,
+        token,
+    )
 
-    body_names: dict[str, str] = {}
+    body_names, joint_names = carrier_names(bodies, joints, str(root) if root is not None else "")
+    incoming = {
+        str(joint.get("child")): joint
+        for joint in joints
+        if joint.get("type") != "fixed" and joint.get("child")
+    }
+    outgoing: dict[str, list[str | None]] = {}
+    for joint in joints:
+        if joint.get("type") == "fixed":
+            continue
+        parent = str(joint.get("parent") or "")
+        if parent:
+            outgoing.setdefault(parent, []).append(joint_role(str(joint.get("name") or "")))
+
     for body in bodies:
         native = str(body["name"])
         datum = str(body.get("datum") or "")
         semantic = datum or native
+        joint = incoming.get(native)
+        role_target = (
+            role_link_name(str(joint.get("name") or ""), outgoing.get(native, []))
+            if joint is not None
+            else None
+        )
+        if joint is not None and role_target == body_names[native]:
+            try:
+                alias_semantic = re.sub(r"^(?:c_|cs_)", "", semantic, flags=re.IGNORECASE)
+                alias = token(alias_semantic) == token(str(joint.get("name") or ""))
+            except ValueError:
+                alias = False
+            if alias:
+                body["name_rule"] = {
+                    "rule_id": "naming.role_segment",
+                    "rule_version": "naming-v1",
+                    "reason": "joint-centric datum plus child-side moving-joint topology",
+                }
+                findings.append(
+                    _finding(
+                        "discovery.interface_role_convention",
+                        f"body:{native}",
+                        "the link name follows the versioned joint-role and child-topology convention",
+                        {
+                            "datum": datum,
+                            "native": native,
+                            "output": body_names[native],
+                            "rule_id": "naming.role_segment",
+                            "rule_version": "naming-v1",
+                        },
+                        blocking=False,
+                    )
+                )
+                continue
         try:
-            target = format_link_name(semantic, root=semantic == "base_link")
+            datum_target = format_link_name(semantic, root=semantic == "base_link")
         except ValueError:
-            target = neutral_link_name(f"{native}|{datum}", root=semantic.lower() in {"base_link", "cs_base_link"})
+            datum_target = None
+        if datum_target != body_names[native]:
             findings.append(
                 _finding(
                     "discovery.interface_name_invalid",
                     f"body:{native}",
-                    "the native datum cannot produce a valid output link name; a neutral semantic fallback is used",
-                    {"datum": datum, "name": native, "output": target},
+                    "the native datum cannot produce a unique valid output link name; "
+                    "a neutral or deterministic fallback is used",
+                    {"datum": datum, "name": native, "output": body_names[native]},
                     blocking=False,
                 )
             )
-        body_names[native] = target
-    original_links = dict(body_names)
-    root_key = str(root) if root is not None else None
-    reserved_links = {root_key: "base_link"} if root_key in body_names else {}
-    body_names = deduplicate_names(body_names, "link", reserved=reserved_links)
-    for native, corrected in body_names.items():
-        if corrected != original_links[native]:
-            findings.append(
-                _finding(
-                    "discovery.interface_name_invalid",
-                    f"body:{native}",
-                    "link name collision is resolved by the shared deterministic fallback",
-                    {"input": native, "output": corrected},
-                    blocking=False,
-                )
-            )
-    joint_names: dict[str, str] = {}
+
     for joint in joints:
         if "name" not in joint:
             continue
         native = str(joint["name"])
-        try:
-            if joint.get("type") == "fixed":
-                parent = body_names.get(str(joint.get("parent")), str(joint.get("parent") or "parent"))
-                child = body_names.get(str(joint.get("child")), str(joint.get("child") or "child"))
-                joint_names[native] = fixed_joint_name(parent, child)
-            else:
-                joint_names[native] = format_joint_name(native)
-                if not any(word in {"roll", "pitch", "yaw"} for word in joint_names[native].split("_")):
-                    findings.append(
-                        _finding(
-                            "discovery.interface_motion_unresolved",
-                            f"joint:{native}",
-                            "the CAD name does not classify a motion; a neutral joint name is retained",
-                            {"native": native, "output": joint_names[native]},
-                            blocking=False,
-                        )
-                    )
-        except ValueError:
-            parent = body_names.get(str(joint.get("parent")), str(joint.get("parent") or "parent"))
-            child = body_names.get(str(joint.get("child")), str(joint.get("child") or "child"))
-            try:
-                joint_names[native] = neutral_joint_name(
-                    parent, child, fixed=joint.get("type") == "fixed"
+        child = str(joint.get("child") or "")
+        role_target = (
+            role_joint_name(native, outgoing.get(child, []))
+            if joint.get("type") != "fixed"
+            else None
+        )
+        if role_target == joint_names[native]:
+            joint["name_rule"] = {
+                "rule_id": "naming.role_joint",
+                "rule_version": "naming-v1",
+                "reason": "native joint function plus child-side moving-joint topology",
+            }
+            findings.append(
+                _finding(
+                    "discovery.interface_role_convention",
+                    f"joint:{native}",
+                    "the joint name follows the versioned joint-role and child-topology convention",
+                    {
+                        "native": native,
+                        "output": joint_names[native],
+                        "rule_id": "naming.role_joint",
+                        "rule_version": "naming-v1",
+                    },
+                    blocking=False,
                 )
-            except ValueError:
-                joint_names[native] = fallback_name("joint", native, semantic="joint")
+            )
+            continue
+        try:
+            datum_target = (
+                format_joint_name(native) if joint.get("type") != "fixed" else joint_names[native]
+            )
+        except ValueError:
+            datum_target = None
+        if datum_target != joint_names[native]:
             findings.append(
                 _finding(
                     "discovery.interface_name_invalid",
                     f"joint:{native}",
-                    "the native joint name cannot produce a valid output joint name; "
-                    "a neutral semantic fallback is used",
+                    "the native joint name cannot produce a unique valid output joint name; "
+                    "a neutral or deterministic fallback is used",
                     {"name": native, "output": joint_names[native]},
                     blocking=False,
                 )
             )
-    original_joints = dict(joint_names)
-    joint_names = deduplicate_names(joint_names, "joint")
-    for native, corrected in joint_names.items():
-        if corrected != original_joints[native]:
+        if joint.get("type") != "fixed" and not any(
+            word in {"roll", "pitch", "yaw"} for word in joint_names[native].split("_")
+        ):
             findings.append(
                 _finding(
-                    "discovery.interface_name_invalid",
+                    "discovery.interface_motion_unresolved",
                     f"joint:{native}",
-                    "joint name collision is resolved by the shared deterministic fallback",
-                    {"input": native, "output": corrected},
+                    "the CAD name does not classify a motion; a neutral joint name is retained",
+                    {"native": native, "output": joint_names[native]},
                     blocking=False,
                 )
             )
@@ -5446,6 +5490,8 @@ def source_definition(
             "axis_provenance": joint.get("axis") if isinstance(joint.get("axis"), dict) else None,
             "axis_reference": joint["axis_reference"],
         }
+        if isinstance(joint.get("name_rule"), dict):
+            entry["name_rule"] = dict(joint["name_rule"])
         if isinstance(joint.get("preview_policy"), dict):
             entry["limits"] = {
                 key: float(value)
@@ -5533,6 +5579,11 @@ def source_definition(
                 "id": body["name"],
                 "name": body["name"],
                 "source_name": body.get("source_name", body["name"]),
+                **(
+                    {"name_rule": dict(body["name_rule"])}
+                    if isinstance(body.get("name_rule"), dict)
+                    else {}
+                ),
                 "components": body["components"],
                 "frame": {"coordinate_system": body["datum"]},
             }

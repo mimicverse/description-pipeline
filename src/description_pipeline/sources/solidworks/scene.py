@@ -878,17 +878,18 @@ def _value_warnings(
     mesh_paths = []
     for body in bodies:
         if body.get("source_name") and body["source_name"] != body.get("name"):
+            rule = body.get("name_rule") if isinstance(body.get("name_rule"), dict) else {}
             mappings.append(
                 {
                     "object_type": "link",
                     "object": body["name"],
                     "field": "name",
                     "actual": body["name"],
-                    "source": f"CAD datum formatting for {body['source_name']}",
+                    "source": f"CAD-derived interface naming for {body['source_name']}",
                     "original": body["source_name"],
-                    "rule_id": "naming.interface",
-                    "rule_version": "naming-v1",
-                    "reason": "CAD datum formatting",
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD datum formatting"),
                 }
             )
     source_joints = cfg.get("joints") or []
@@ -896,17 +897,18 @@ def _value_warnings(
         source_joint = source_joints[index] if index < len(source_joints) else {}
         source_name = str(source_joint.get("source_name") or source_joint.get("name") or joint["name"])
         if source_name != joint["name"]:
+            rule = source_joint.get("name_rule") if isinstance(source_joint.get("name_rule"), dict) else {}
             mappings.append(
                 {
                     "object_type": "joint",
                     "object": joint["name"],
                     "field": "name",
                     "actual": joint["name"],
-                    "source": f"CAD reference-axis formatting for {source_name}",
+                    "source": f"CAD-derived interface naming for {source_name}",
                     "original": source_name,
-                    "rule_id": "naming.interface",
-                    "rule_version": "naming-v1",
-                    "reason": "CAD reference-axis formatting",
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD reference-axis formatting"),
                 }
             )
         provenance = source_joint.get("axis_provenance")
