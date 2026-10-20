@@ -4260,11 +4260,23 @@ def _read_windows_state(bundle: Path) -> dict:
 
 def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
     expected_members = {row["member"]: row for row in state["members"]}
+    member_names = [row["member"] for row in state["members"]]
     require(
-        set(expected_members) == {row["member"] for row in state["files"]},
+        len(member_names) == len(set(member_names))
+        and set(expected_members) == {row["member"] for row in state["files"]},
         "windows_recovery_bundle_invalid",
         "Windows recovery members and file roles differ",
     )
+    for row in state["files"]:
+        member = expected_members.get(row["member"])
+        require(
+            member is not None
+            and row["bytes"] == member["bytes"]
+            and row["sha256"] == member["sha256"],
+            "windows_recovery_bundle_invalid",
+            "Windows recovery file bytes and digest differ from members",
+            {"member": row["member"]},
+        )
     try:
         with zipfile.ZipFile(bundle) as archive:
             names = archive.namelist()

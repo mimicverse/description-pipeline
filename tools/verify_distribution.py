@@ -162,7 +162,10 @@ def verify_release(directory, identity):
             lock = f"requirements/{platform}-py312.lock"
             if (identity.get("runtime_locks") or {}).get(platform) != members.get(lock):
                 raise PipelineError(f"Deployment lock {lock} is not this release's lock")
-            source_locks[platform] = archive.read(lock)
+            if platform == "linux" and "deploy/airflow/requirements.lock" in payloads:
+                source_locks[platform] = payloads["deploy/airflow/requirements.lock"]
+            else:
+                source_locks[platform] = archive.read(lock)
     product = canonicalize_name("mimicverse-description")
     roles = {
         f"description-{version}-linux-cp312-x86_64.zip": "linux",
