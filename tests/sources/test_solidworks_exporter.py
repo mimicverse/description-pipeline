@@ -13,13 +13,16 @@ from . import _paths  # noqa: F401
 from . import support  # noqa: E402
 from .selection_support import sealed_selection  # noqa: E402
 from .test_solidworks_discovery import IDENTITY, FakeBackend
+from description_pipeline.interface_records import PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
 from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
+    DiscoverySettings,
     _exporter_constraint_checks,
     _exporter_declaration,
     _exporter_joint_facts,
     _exporter_memberships,
     _exporter_native_pairs,
+    _exporter_preview_limits,
     prepare_native_package,
 )
 from description_pipeline.sources.solidworks.exporter import (
@@ -293,6 +296,53 @@ class ExporterDiscoveryTests(unittest.TestCase):
             self.assertEqual([item["code"] for item in findings], [expected])
             self.assertFalse(findings[0]["blocking"])
             self.assertIn("qualification_blocker", findings[0]["detail"])
+
+    def test_exporter_zero_placeholder_uses_policy_only_with_no_range_evidence(self):
+        raw = raw_record()
+        raw["mates"] = [
+            {
+                "name": "observed_mate",
+                "type": "lock",
+                "suppressed": False,
+                "error_code": 0,
+                "limits": None,
+                "entities": [{"component": "base-1"}, {"component": "arm-1"}],
+            }
+        ]
+        settings = DiscoverySettings(purpose=PURPOSE_INSPECTION_PREVIEW)
+        declaration = decode_exporter_v14(raw["exporter"]["raw_xml"], 1.4)
+        findings = []
+        bodies, clusters = _exporter_memberships(raw, declaration, findings)
+        joints = _exporter_joint_facts(raw, declaration, bodies, findings)
+        _exporter_constraint_checks(
+            declaration,
+            clusters,
+            joints,
+            findings,
+            record=raw,
+            settings=settings,
+        )
+        radius = preview_revolute_window_rad()
+        self.assertEqual(joints[0]["limits"], {"lower": -radius, "upper": radius, "effort": 0.0, "velocity": 0.0})
+        self.assertEqual(joints[0]["limit_source"], "policy_preview_window")
+        self.assertEqual(
+            joints[0]["declared_limits"],
+            {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0},
+        )
+        self.assertIn("discovery.joint_limits_policy_preview", {item["code"] for item in findings})
+
+        native_limits = {"hinge": [{"lower": 0.0, "upper": 0.0, "unit": "rad"}]}
+        candidate = [dict(joints[0])]
+        candidate[0]["limits"] = dict.fromkeys(("lower", "upper", "effort", "velocity"), 0.0)
+        candidate[0].pop("limit_source")
+        _exporter_preview_limits(raw, candidate, native_limits, {"hinge": True}, [])
+        self.assertEqual(candidate[0]["limits"], joints[0]["declared_limits"])
+        self.assertNotIn("limit_source", candidate[0])
+
+        controlled = raw_record()
+        controlled["properties"] = {"mates": {"hinge__limit": {"dp.joint.limits_record": "range.json#hinge"}}}
+        _exporter_preview_limits(controlled, candidate, {"hinge": []}, {"hinge": True}, [])
+        self.assertNotIn("limit_source", candidate[0])
 
     def test_missing_nonfinite_negative_drive_and_reversed_bounds_still_block(self):
         for changes, code in (

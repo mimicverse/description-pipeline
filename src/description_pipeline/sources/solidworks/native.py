@@ -48,6 +48,11 @@ ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
 #: dump line 87); its documented LockRotation property is the native evidence
 #: for "Lock rotation" on a concentric mate.
 ICONCENTRICMATEFEATUREDATA_IID = "{D9E1EBDD-2E8B-424F-9401-0A3C8ED7FAAD}"
+#: IAngleMateFeatureData / IDistanceMateFeatureData (offline SolidWorks 2026
+#: typelib owners: indices 391 and 390); IsAdvancedMate distinguishes a limit
+#: mate from a standard angle/distance mate.
+IANGLEMATEFEATUREDATA_IID = "{EF4303D7-B4FD-46E7-AD34-D942C420E096}"
+IDISTANCEMATEFEATUREDATA_IID = "{943EED8D-E13B-4459-BD59-EBCC3F60B915}"
 IMASSPROPERTY2_IID = "{5E4EAE4A-65E6-4CF0-AD72-55EDEF5EB96A}"
 IMASSPROPERTYOVERRIDEOPTIONS_IID = "{82E1635E-B650-4C8B-84C8-D5FFBF660E49}"
 ICUSTOMPROPERTYMANAGER_IID = "{F1938D94-0D1F-4E88-9874-164B1E6568F1}"
@@ -5592,16 +5597,46 @@ class SolidWorksBackend(CadBackend):
                             "mate travel range is inverted",
                             {"mate": name, "lower": lower, "upper": upper},
                         )
-                    if upper > lower + 1e-12:
-                        unit = "m" if type_index == 5 else "rad" if type_index == 6 else None
-                        if unit is None:
-                            raise CadError(
-                                "cad_mate_limits_invalid",
-                                "a bounded range on an unsupported mate type cannot be observed",
-                                {"mate": name, "type": mate_type},
-                            )
-                        limits = {"lower": lower, "upper": upper, "unit": unit}
-                        mate_type = "limitdistance" if type_index == 5 else "limitangle"
+                    is_advanced_mate = None
+                    is_advanced_mate_error = None
+                    is_advanced_mate_api = None
+                    if type_index in {5, 6}:
+                        # The documented IsAdvancedMate flag is the authority for
+                        # whether Minimum/Maximum variation is an active limit
+                        # mate. Keep its read result explicit; a missing flag is
+                        # never promoted to a numeric range by inference.
+                        try:
+                            definition = _method(feature, "GetDefinition")
+                            if definition is None:
+                                is_advanced_mate_error = "mate definition is null"
+                            else:
+                                iid = IANGLEMATEFEATUREDATA_IID if type_index == 6 else IDISTANCEMATEFEATUREDATA_IID
+                                bound = _interface(definition, iid)
+                                value = _member(bound, "IsAdvancedMate")
+                                if type(value) is bool:
+                                    is_advanced_mate = value
+                                    is_advanced_mate_api = (
+                                        f"{'IAngle' if type_index == 6 else 'IDistance'}MateFeatureData.IsAdvancedMate"
+                                    )
+                                else:
+                                    is_advanced_mate_error = f"unexpected value: {value!r}"
+                        except Exception as error:  # noqa: BLE001
+                            is_advanced_mate_error = f"{type(error).__name__}: {error}"[:240]
+                    if type_index in {5, 6}:
+                        # Minimum/MaximumVariation is meaningful only when the
+                        # documented IsAdvancedMate flag says this is a limit
+                        # mate.  True preserves a zero-span native range;
+                        # false/null never invents one.
+                        if is_advanced_mate is True:
+                            unit = "m" if type_index == 5 else "rad"
+                            limits = {"lower": lower, "upper": upper, "unit": unit}
+                            mate_type = "limitdistance" if type_index == 5 else "limitangle"
+                    elif upper > lower + 1e-12:
+                        raise CadError(
+                            "cad_mate_limits_invalid",
+                            "a bounded range on an unsupported mate type cannot be observed",
+                            {"mate": name, "type": mate_type},
+                        )
                     try:
                         suppressed = _method(feature, "IsSuppressed")
                         if type(suppressed) is not bool:
@@ -5627,6 +5662,9 @@ class SolidWorksBackend(CadBackend):
                         "type": mate_type,
                         "suppressed": suppressed,
                         "limits": limits,
+                        "is_advanced_mate": is_advanced_mate,
+                        "is_advanced_mate_error": is_advanced_mate_error,
+                        "is_advanced_mate_api": is_advanced_mate_api,
                         "entities": entities,
                         "error_code": error_code,
                         "scope": prefix or "",

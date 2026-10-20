@@ -298,7 +298,7 @@ def _input(root, diagnostics=None):
         # swallowed into zero objects.
         from .native_declarations import verify_declarations
 
-        declarations = verify_declarations(raw)
+        declarations = verify_declarations(raw, purpose=_request_purpose(root))
         _require(
             declarations["passed"],
             f"the discovery record declaration gate failed: {declarations['errors'][:1]}",

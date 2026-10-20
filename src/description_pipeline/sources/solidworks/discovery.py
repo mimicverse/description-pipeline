@@ -2632,8 +2632,16 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
 
 
 def _exporter_constraint_checks(
-    declaration: dict, clusters: _Clusters, joints: list[dict], findings: list[dict]
+    declaration: dict,
+    clusters: _Clusters,
+    joints: list[dict],
+    findings: list[dict],
+    *,
+    record: dict | None = None,
+    settings: DiscoverySettings | None = None,
 ) -> None:
+    native_limits: dict[str, list[dict]] = {str(joint["name"]): [] for joint in joints}
+    native_complete: dict[str, bool] = {str(joint["name"]): True for joint in joints}
     descendants: dict[str, set[str]] = {link["name"]: {link["name"]} for link in declaration["links"]}
     for link in reversed(declaration["links"]):
         if link["parent"] is not None:
@@ -2693,6 +2701,7 @@ def _exporter_constraint_checks(
                 limits = constraint["limits"]
                 if not isinstance(limits, dict):
                     continue
+                native_limits[str(joint["name"])].append(limits)
                 expected = "m" if joint["type"] == "prismatic" else "rad"
                 declared = joint.get("limits") or {}
                 if limits.get("unit") != expected or any(
@@ -2706,6 +2715,189 @@ def _exporter_constraint_checks(
                             {**detail, "native": limits, "declared": declared},
                         )
                     )
+    if record is not None and settings is not None and settings.purpose == PURPOSE_INSPECTION_PREVIEW:
+        native_complete = {
+            str(joint["name"]): _exporter_native_range_observation(
+                record,
+                declaration,
+                descendants,
+                clusters,
+                joint,
+                native_limits[str(joint["name"])],
+            )
+            for joint in joints
+        }
+        _exporter_preview_limits(record, joints, native_limits, native_complete, findings)
+
+
+def _exporter_all_zero_limits(limits: Any) -> bool:
+    return isinstance(limits, dict) and all(
+        type(limits.get(key)) in (int, float) and float(limits[key]) == 0.0
+        for key in ("lower", "upper", "effort", "velocity")
+    )
+
+
+def _exporter_controlled_limit_reference(record: dict, joint_name: str) -> bool:
+    properties = record.get("properties") or {}
+    document = properties.get("document") or {}
+    prefix = f"{NAMESPACE}.joint.{joint_name}."
+    if any(isinstance(key, str) and key.startswith(prefix) and key.endswith(".limits_record") for key in document):
+        return True
+    for name, values in (properties.get("mates") or {}).items():
+        if (
+            isinstance(name, str)
+            and name.split("__", 1)[0] == joint_name
+            and isinstance(values, dict)
+            and f"{NAMESPACE}.joint.limits_record" in values
+        ):
+            return True
+    return False
+
+
+def _exporter_native_range_observation(
+    record: dict,
+    declaration: dict,
+    descendants: dict[str, set[str]],
+    clusters: _Clusters,
+    joint: dict,
+    native_limits: list[dict],
+) -> bool:
+    """Whether every relevant active mate has a complete, bindable limit observation."""
+
+    child_tree = descendants[str(joint["child"])]
+    raw_mates = record.get("mates")
+    if not isinstance(raw_mates, list) or not raw_mates:
+        return False
+    complete = True
+    limit_types = {"distance", "angle", "limitdistance", "limitangle"}
+    for mate in raw_mates:
+        if not isinstance(mate, dict):
+            complete = False
+            continue
+        if (
+            str(mate.get("type") or "").strip().lower() in limit_types
+            and (
+                type(mate.get("is_advanced_mate")) is not bool
+                or mate.get("is_advanced_mate_error") is not None
+            )
+        ):
+            complete = False
+    for index, mate in enumerate(raw_mates):
+        if not isinstance(mate, dict):
+            complete = False
+            continue
+        suppressed = mate.get("suppressed")
+        if type(suppressed) is not bool:
+            complete = False
+            continue
+        if suppressed:
+            continue
+        mate_type = str(mate.get("type") or "").strip().lower()
+        range_candidate = False
+        if mate_type in {"distance", "angle", "limitdistance", "limitangle"}:
+            flag = mate.get("is_advanced_mate")
+            if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
+                complete = False
+                continue
+            if flag is True:
+                if isinstance(mate.get("limits"), dict):
+                    range_candidate = True
+                else:
+                    complete = False
+            elif mate.get("limits") is not None:
+                complete = False
+        elif mate.get("limits") is not None:
+            complete = False
+        if (
+            "limits" not in mate
+            or type(mate.get("error_code")) is not int
+            or mate["error_code"] != 0
+        ):
+            complete = False
+        entities = mate.get("entities")
+        if not isinstance(entities, list) or len(entities) != 2:
+            if range_candidate:
+                complete = False
+            continue
+        owners = []
+        for entity in entities:
+            component = entity.get("component") if isinstance(entity, dict) else None
+            owner = declaration["root"] if component == "" else clusters.of.get(component)
+            if not isinstance(component, str) or owner is None:
+                complete = False
+                break
+            owners.append(owner)
+        if len(owners) != 2:
+            continue
+        if (owners[0] in child_tree) == (owners[1] in child_tree):
+            continue
+        if range_candidate:
+            native_limits.append(
+                {
+                    "mate": str(mate.get("name") or index),
+                    "type": mate_type,
+                    "is_advanced_mate": mate.get("is_advanced_mate"),
+                    "limits": mate.get("limits"),
+                }
+            )
+    return complete
+
+
+def _exporter_preview_limits(
+    record: dict,
+    joints: list[dict],
+    native_limits: dict[str, list[dict]],
+    native_complete: dict[str, bool],
+    findings: list[dict],
+) -> None:
+    """Use the policy window only for exporter zero placeholders with no range evidence."""
+
+    radius = preview_revolute_window_rad()
+    for joint in joints:
+        declared = joint.get("limits")
+        name = str(joint["name"])
+        if joint.get("type") != "revolute" or not _exporter_all_zero_limits(declared):
+            continue
+        if native_limits.get(name):
+            continue
+        if not native_complete.get(name, False) or _exporter_controlled_limit_reference(record, name):
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_policy_blocked",
+                    f"joint:{name}",
+                    "the exporter zero placeholder is retained because the native or controlled "
+                    "range observation is incomplete, unreadable, or not provably absent",
+                    {
+                        "native_limit_observations": native_limits.get(name, []),
+                        "native_observation_complete": native_complete.get(name, False),
+                        "controlled_limit_reference": _exporter_controlled_limit_reference(record, name),
+                    },
+                )
+            )
+            continue
+        raw_limits = {str(key): float(value) for key, value in declared.items()}
+        joint["declared_limits"] = raw_limits
+        joint["limits"] = {
+            "lower": -radius,
+            "upper": radius,
+            "effort": raw_limits.get("effort", 0.0),
+            "velocity": raw_limits.get("velocity", 0.0),
+        }
+        joint["limit_source"] = "policy_preview_window"
+        findings.append(
+            _finding(
+                "discovery.joint_limits_policy_preview",
+                f"joint:{name}",
+                "the exporter zero placeholder is replaced only for inspection preview after "
+                "the native/controlled range observation proved no usable range",
+                {
+                    "declared": raw_limits,
+                    "limits": {"lower": -radius, "upper": radius},
+                    "native_limit_observations": len(native_limits.get(name, [])),
+                },
+                blocking=False,
+            )
+        )
 
 
 def _exporter_axis(record: dict, declared: dict, body: dict, findings: list[dict]) -> tuple[dict, dict | None]:
@@ -4843,7 +5035,14 @@ def _derive_carriers(
                         "the declared root link must be named base_link",
                     )
                 )
-            _exporter_constraint_checks(declaration, clusters, joints, findings)
+            _exporter_constraint_checks(
+                declaration,
+                clusters,
+                joints,
+                findings,
+                record=record,
+                settings=settings,
+            )
             frames = _interface_frames(record, clusters, bodies, root, findings)
             for body in bodies:
                 if settings.frozen_names.get(body["identity"], body["name"]) != body["name"]:
@@ -5013,10 +5212,14 @@ def source_definition(
                 )
             }
             entry["limit_evidence"] = {
-                "file": DISCOVERY_FILE,
+                "file": discovery_name,
                 "sha256": discovery_sha256,
                 "anchor": raw["exporter"]["raw_xml_sha256"],
             }
+            if isinstance(joint.get("declared_limits"), dict):
+                entry["limit_evidence"].update(
+                    {f"declared_{key}": str(value) for key, value in joint["declared_limits"].items()}
+                )
         elif joint["type"] == "continuous":
             if joint.get("drive") is not None:
                 entry["limits"] = {

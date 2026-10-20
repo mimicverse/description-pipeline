@@ -26,7 +26,7 @@
 | `dp.change_summary` | 本版工程变更或首版范围 |
 | `dp.control.system`、`dp.control.reference` | 原件控制系统及可重新取得的固定记录 |
 | `dp.delivery_configuration` | 明确指定已保存交付配置；属性省略时须由原生记录证明保存配置，存在时须与实际配置一致，未知或冲突拒绝 |
-| `dp.robot_name` | 模型名；省略时由确认的产品标识按固定规则生成 |
+| `dp.robot_name` | 顶层装配的模型名；确证缺失时由已明确登记的工程交付标识按[固定命名规则](contracts.md#naming)生成并注明来源，不能从文件名或发布目标猜测 |
 | `dp.design_budget_record` | 可选独立质量与外形预算引用 |
 
 工程修订之间的衔接由受控工程变更记录表达，发布的 commit/主体衔接由平台负责，不要求工程师维护流水线分支状态。

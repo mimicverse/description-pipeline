@@ -4278,7 +4278,10 @@ def verify_discovery(package: Path) -> dict:
 
         # Declaration/exporter packages are the declaration-gate domain (sealed declaration
         # record, four-state + fixed-key binding); they have no geometric carrier to rebuild.
-        report = verify_declarations(state["payload"]["raw"])
+        report = verify_declarations(
+            state["payload"]["raw"],
+            purpose=str(state["request"]["purpose"]),
+        )
         _require(
             report["passed"],
             "discovery.declarations",

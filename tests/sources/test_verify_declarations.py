@@ -19,6 +19,7 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
+from description_pipeline.interface_records import PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.native_declarations import verify_declarations
@@ -895,6 +896,71 @@ class NativeDeclarationsTests(unittest.TestCase):
 
         rewrite(candidate, drop_effort)
         self.assertIn("v14.attribute_shape", self.errors(candidate))
+
+    def test_preview_policy_requires_zero_placeholder_and_no_range_evidence(self):
+        def zero_limits(raw):
+            def transform(root):
+                for item in root.iter():
+                    if (item.get(Z_TAG + "Id") or "").startswith("joint_limit_") and item.find(
+                        NS_TAG + "Value"
+                    ) is not None:
+                        item.find(NS_TAG + "Value").text = "0"
+
+            rewrite(raw, transform)
+            return raw
+
+        raw = zero_limits(fixture())
+        raw["mates"] = [lock("base_part", "module-1/tool_part", kind="lock")]
+        report = verify_declarations(raw, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(report["passed"], report["errors"])
+        radius = preview_revolute_window_rad()
+        carrier = report["carrier"]["joints"][0]
+        self.assertEqual(
+            carrier["limits"],
+            {"lower": -radius, "upper": radius, "effort": 0.0, "velocity": 0.0},
+        )
+        self.assertEqual(carrier["limit_source"], "policy_preview_window")
+        self.assertIn("v14.policy_preview_window", {item["code"] for item in report["diagnostics"]})
+
+        native = copy.deepcopy(raw)
+        native["mates"] = [
+            {
+                **lock("base_part", "module-1/tool_part", kind="distance"),
+                "is_advanced_mate": True,
+                "limits": {"lower": 0.0, "upper": 0.0, "unit": "rad"},
+            }
+        ]
+        native_report = verify_declarations(native, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(native_report["passed"], native_report["errors"])
+        self.assertNotIn("limit_source", native_report["carrier"]["joints"][0])
+        self.assertNotIn("v14.policy_preview_window", {item["code"] for item in native_report["diagnostics"]})
+
+        controlled = copy.deepcopy(raw)
+        controlled["properties"] = {"document": {"dp.joint.hinge.limits_record": "range.json#hinge"}}
+        controlled_report = verify_declarations(controlled, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertFalse(controlled_report["passed"])
+        self.assertIn("v14.policy_preview_window_blocked", {item["code"] for item in controlled_report["errors"]})
+        self.assertNotIn("limit_source", controlled_report["carrier"]["joints"][0])
+
+        invalid_controlled = copy.deepcopy(raw)
+        invalid_controlled["properties"] = {"document": {"dp.joint.hinge.limits_record": None}}
+        invalid_report = verify_declarations(invalid_controlled, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertFalse(invalid_report["passed"])
+        self.assertNotIn("limit_source", invalid_report["carrier"]["joints"][0])
+
+        incomplete = copy.deepcopy(raw)
+        incomplete["mates"] = [
+            {
+                "name": "incomplete_limit_evidence",
+                "type": "concentric",
+                "suppressed": False,
+                "error_code": 0,
+                "entities": [{"component": "base_part"}],
+            }
+        ]
+        incomplete_report = verify_declarations(incomplete, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertFalse(incomplete_report["passed"])
+        self.assertNotIn("limit_source", incomplete_report["carrier"]["joints"][0])
 
     def test_boundary_tristate_exact_hash_document_configuration_and_pid(self):
         for change, code in [

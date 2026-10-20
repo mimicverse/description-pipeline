@@ -19,6 +19,7 @@ from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
 )
+from ..interface_records import PURPOSE_INSPECTION_PREVIEW, preview_revolute_window_rad
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
@@ -39,6 +40,13 @@ def _selector(value):
 
 def _number(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def _all_zero_limits(limits) -> bool:
+    return isinstance(limits, dict) and all(
+        _number(limits.get(key)) is not None and float(limits[key]) == 0.0
+        for key in ("lower", "upper", "effort", "velocity")
+    )
 
 
 def _leaves(components):
@@ -348,7 +356,7 @@ def _complete_membership(raw, components, members, leaves):
     return added, proofs, conflicts
 
 
-def verify_declarations(raw: dict, source: dict | None = None) -> dict:
+def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str | None = None) -> dict:
     """Audit raw native declaration evidence and, optionally, generated source claims."""
     checks, errors, diagnostics, state = [], [], [], {}
 
@@ -603,6 +611,7 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             return {"type": "fixed"}
         limits = joint.get("limit")
         _require(isinstance(limits, dict), "v14.limits", "moving joint has no authored limit record", joint=name)
+        raw_limits = dict(limits)
         invalid = [key for key in ("effort", "velocity") if not (_number(limits.get(key)) and limits[key] >= 0)]
         if joint["type"] in {"revolute", "prismatic"} and not (
             _number(limits.get("lower")) and _number(limits.get("upper")) and limits["lower"] <= limits["upper"]
@@ -616,8 +625,165 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             limits=limits,
             invalid=invalid,
         )
-        unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
-        if joint["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
+        policy_preview = False
+        native_limits = []
+        controlled_limits = []
+        native_complete = False
+        if purpose == PURPOSE_INSPECTION_PREVIEW and joint["type"] == "revolute" and _all_zero_limits(limits):
+            child = joint["child_link"]
+            child_tree = {child}
+            parents = state.get("parents") or {}
+            while True:
+                expanded_tree = child_tree | {
+                    candidate for candidate, parent in parents.items() if parent in child_tree
+                }
+                if expanded_tree == child_tree:
+                    break
+                child_tree = expanded_tree
+            members = state.get("members") or {}
+            related_mates = []
+            leaves = state.get("leaves") or set()
+
+            def owner_for(component: str) -> str | None:
+                expanded = _expanded(component, leaves)
+                owners = [body for body, body_members in members.items() if expanded and expanded <= body_members]
+                return owners[0] if len(owners) == 1 else None
+
+            native_complete = True
+            raw_mates = raw.get("mates")
+            if not isinstance(raw_mates, list) or not raw_mates:
+                native_complete = False
+                raw_mates = []
+            limit_types = {"distance", "angle", "limitdistance", "limitangle"}
+            for mate in raw_mates:
+                if not isinstance(mate, dict):
+                    native_complete = False
+                    continue
+                suppressed = mate.get("suppressed")
+                if type(suppressed) is not bool:
+                    native_complete = False
+                    continue
+                if suppressed:
+                    continue
+                mate_type = str(mate.get("type") or "").strip().lower()
+                range_candidate = False
+                if mate_type in limit_types:
+                    flag = mate.get("is_advanced_mate")
+                    if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
+                        native_complete = False
+                        continue
+                    if flag is True:
+                        if isinstance(mate.get("limits"), dict):
+                            range_candidate = True
+                        else:
+                            native_complete = False
+                    elif mate_type in {"limitangle", "limitdistance"} or mate.get("limits") is not None:
+                        native_complete = False
+                        if isinstance(mate.get("limits"), dict):
+                            native_limits.append(
+                                {
+                                    "mate": str(mate.get("name") or "unknown"),
+                                    "type": mate_type,
+                                    "is_advanced_mate": flag,
+                                    "limits": mate["limits"],
+                                }
+                            )
+                if (
+                    "limits" not in mate
+                    or type(mate.get("error_code")) is not int
+                    or mate["error_code"] != 0
+                ):
+                    native_complete = False
+                if isinstance(mate.get("limits"), dict) and not range_candidate:
+                    native_complete = False
+                    native_limits.append(
+                        {"mate": str(mate.get("name") or "unknown"), "type": mate_type, "limits": mate["limits"]}
+                    )
+                if mate.get("limits") is None:
+                    continue
+                entities = mate.get("entities")
+                if not isinstance(entities, list) or len(entities) != 2:
+                    continue
+                owners = []
+                for entity in entities:
+                    component = entity.get("component") if isinstance(entity, dict) else None
+                    owner = owner_for(component) if isinstance(component, str) and component else None
+                    if owner is None:
+                        native_complete = False
+                        break
+                    owners.append(owner)
+                if len(owners) != 2:
+                    continue
+                if (owners[0] in child_tree) == (owners[1] in child_tree):
+                    continue
+                mate_name = str(mate.get("name") or "")
+                related_mates.append(mate_name)
+                if range_candidate:
+                    native_limits.append(
+                        {
+                            "mate": mate_name,
+                            "type": mate_type,
+                            "is_advanced_mate": mate.get("is_advanced_mate"),
+                            "limits": mate["limits"],
+                        }
+                    )
+            mate_properties = (raw.get("properties") or {}).get("mates") or {}
+            document_properties = (raw.get("properties") or {}).get("document") or {}
+            for mate_name in related_mates:
+                if "dp.joint.limits_record" in (mate_properties.get(mate_name) or {}):
+                    controlled_limits.append(
+                        {
+                            "mate": mate_name,
+                            "reference": (mate_properties.get(mate_name) or {})["dp.joint.limits_record"],
+                        }
+                    )
+            prefix = f"dp.joint.{name}."
+            for key, value in document_properties.items():
+                if isinstance(key, str) and key.startswith(prefix) and key.endswith(".limits_record"):
+                    controlled_limits.append({"document": key, "reference": value})
+            if not native_complete:
+                raise DeclarationError(
+                    "v14.policy_preview_window_blocked",
+                    "the native/controlled range observation is incomplete; the exporter zero placeholder cannot be "
+                    "relabelled",
+                    {"joint": name, "native": native_limits, "controlled": controlled_limits},
+                )
+            if controlled_limits:
+                raise DeclarationError(
+                    "v14.policy_preview_window_blocked",
+                    "a controlled range reference is present but has not been independently resolved",
+                    {"joint": name, "controlled": controlled_limits},
+                )
+            policy_preview = not native_limits
+        if policy_preview:
+            radius = preview_revolute_window_rad()
+            limits = {
+                "lower": -radius,
+                "upper": radius,
+                "effort": raw_limits.get("effort", 0.0),
+                "velocity": raw_limits.get("velocity", 0.0),
+            }
+            state.setdefault("effective_limits", {})[name] = dict(limits)
+            state.setdefault("effective_limit_sources", {})[name] = "policy_preview_window"
+            diagnostics.append(
+                {
+                    "code": "v14.policy_preview_window",
+                    "blocking": False,
+                    "message": (
+                        "the exporter zero placeholder is replaced by the inspection-preview "
+                        "policy window because no native or controlled range was observed"
+                    ),
+                    "detail": {
+                        "joint": name,
+                        "declared_limits": raw_limits,
+                        "limits": dict(limits),
+                        "native_limit_observations": len(native_limits),
+                        "controlled_limit_observations": len(controlled_limits),
+                    },
+                }
+            )
+        unqualified = [key for key in ("effort", "velocity") if limits.get(key) == 0]
+        if joint["type"] in {"revolute", "prismatic"} and limits.get("lower") == limits.get("upper"):
             unqualified.append("degenerate_position_range")
         if unqualified:
             diagnostics.append(
@@ -625,14 +791,13 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                     "code": "v14.motion_unqualified",
                     "blocking": False,
                     "message": (
-                        "authored motion/drive values are zero or degenerate; consumers import the "
-                        "zero-range joint as unlimited while effort/velocity are dropped, so motion is "
-                        "unqualified and not robot-ready"
+                        "the exporter declaration's motion/drive values are zero or degenerate; consumers "
+                        "may import a zero-range joint as unlimited, so motion is unqualified and not robot-ready"
                     ),
                     "detail": {"joint": name, "values": unqualified, "limits": dict(limits)},
                 }
             )
-        return {"limits": limits}
+        return {"limits": limits, "declared_limits": raw_limits}
 
     def joint_geometry(name, joint):
         parent, child = joint["parent_link"], joint["child_link"]
@@ -805,7 +970,7 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 joint=name,
             )
             if saved["type"] != "fixed":
-                limits = saved["limit"]
+                limits = state.get("effective_limits", {}).get(name, saved["limit"])
                 if saved["type"] == "continuous":
                     limits = {key: limits[key] for key in ("effort", "velocity")}
                 _require(
@@ -872,7 +1037,12 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                     "limits": (
                         {key: joint["limit"][key] for key in ("effort", "velocity")}
                         if joint["type"] == "continuous" and isinstance(joint.get("limit"), dict)
-                        else joint.get("limit")
+                        else state.get("effective_limits", {}).get(name, joint.get("limit"))
+                    ),
+                    **(
+                        {"limit_source": state["effective_limit_sources"][name]}
+                        if name in state.get("effective_limit_sources", {})
+                        else {}
                     ),
                 }
                 for name, joint in sorted((state.get("joints") or {}).items())

@@ -606,9 +606,31 @@ class MateRecordTests(unittest.TestCase):
             component = _Component("base-1", base)
             plane_entity = _MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))
             cylinder_entity = _MateEntity(component, "Cylinder1", _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 2.0), 0.02))
-            travel = _mate("travel_limit", 5, [plane_entity], lower=0.0, upper=0.03)
-            swing = _mate("swing_limit", 6, [cylinder_entity], lower=-0.1, upper=0.2, suppressed=True)
-            open_distance = _mate("travel_open", 5, [plane_entity], lower=0.0, upper=0.0)
+            travel = _mate(
+                "travel_limit",
+                5,
+                [plane_entity],
+                lower=0.0,
+                upper=0.03,
+                definition=types.SimpleNamespace(IsAdvancedMate=True),
+            )
+            swing = _mate(
+                "swing_limit",
+                6,
+                [cylinder_entity],
+                lower=-0.1,
+                upper=0.2,
+                suppressed=True,
+                definition=types.SimpleNamespace(IsAdvancedMate=True),
+            )
+            open_distance = _mate(
+                "travel_open",
+                5,
+                [plane_entity],
+                lower=0.0,
+                upper=0.0,
+                definition=types.SimpleNamespace(IsAdvancedMate=False),
+            )
             locked = _mate("locked_seat", 16, [plane_entity], suppressed=True)
             broken = _mate("broken_solve", 0, [plane_entity], error_code=3)
             travel._next_sub = swing
@@ -627,7 +649,19 @@ class MateRecordTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(mates["travel_limit"]),
-                {"name", "type", "suppressed", "limits", "entities", "error_code", "scope", "configuration"},
+                {
+                    "name",
+                    "type",
+                    "suppressed",
+                    "limits",
+                    "is_advanced_mate",
+                    "is_advanced_mate_error",
+                    "is_advanced_mate_api",
+                    "entities",
+                    "error_code",
+                    "scope",
+                    "configuration",
+                },
             )
             self.assertEqual({mate["configuration"] for mate in mates.values()}, {"Default"})
             self.assertEqual(mates["travel_limit"]["type"], "limitdistance")
@@ -649,6 +683,50 @@ class MateRecordTests(unittest.TestCase):
             self.assertIs(mates["locked_seat"]["suppressed"], True)
             self.assertEqual(mates["broken_solve"]["type"], "coincident")
             self.assertEqual(mates["broken_solve"]["error_code"], 3)
+
+    def test_limit_mate_flag_is_authoritative_for_zero_and_standard_mates(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            plane_entity = _MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))
+            zero = _mate(
+                "zero_limit",
+                5,
+                [plane_entity],
+                lower=0.0,
+                upper=0.0,
+                definition=types.SimpleNamespace(IsAdvancedMate=True),
+            )
+            standard = _mate(
+                "standard_distance",
+                5,
+                [plane_entity],
+                lower=-1.0,
+                upper=2.0,
+                definition=types.SimpleNamespace(IsAdvancedMate=False),
+            )
+            unknown = _mate("unknown_state", 6, [plane_entity], lower=0.0, upper=0.0)
+            zero._next_sub = standard
+            standard._next_sub = unknown
+            group = _Feature("MateGroup", "MateGroup", first_sub=zero)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            mates = {mate["name"]: mate for mate in _read(root, _App({assembly: doc}))["mates"]}
+
+            self.assertEqual(mates["zero_limit"]["limits"], {"lower": 0.0, "upper": 0.0, "unit": "m"})
+            self.assertIs(mates["zero_limit"]["is_advanced_mate"], True)
+            self.assertEqual(
+                mates["zero_limit"]["is_advanced_mate_api"],
+                "IDistanceMateFeatureData.IsAdvancedMate",
+            )
+            self.assertIsNone(mates["standard_distance"]["limits"])
+            self.assertIs(mates["standard_distance"]["is_advanced_mate"], False)
+            self.assertEqual(mates["standard_distance"]["type"], "distance")
+            self.assertIsNone(mates["unknown_state"]["limits"])
+            self.assertIsNone(mates["unknown_state"]["is_advanced_mate"])
+            self.assertTrue(mates["unknown_state"]["is_advanced_mate_error"])
 
     def test_concentric_mate_records_the_native_lock_rotation_flag(self) -> None:
         with TemporaryDirectory() as tmp:
