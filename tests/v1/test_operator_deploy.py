@@ -2176,6 +2176,11 @@ class InstallOrderingTests(unittest.TestCase):
             "    esac\n"
             '    if [ -n "$PROJECTION_FILE" ] && [ -f "$PROJECTION_FILE" ]; then cat "$PROJECTION_FILE"; fi\n'
             '    exit "${PROJECTION_RC:-0}" ;;\n'
+            "  *-c*description_pipeline.orchestration.portal*description_pipeline.orchestration.feishu_auth*)\n"
+            '    echo "module_check" >> "$ORDER_LOG"\n'
+            '    exit "${MODULE_CHECK_RC:-0}" ;;\n'
+            "  *.py|*.py\\ *)\n"
+            '    exec python3 "$@" ;;\n'
             "esac\n"
             'script="$(cat)"\n'
             'case "$script" in\n'
@@ -4634,6 +4639,7 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(rolled["rollback-linux"], "completed")
             # The accepted remote switch is actually restored: exactly one bound rollback call.
             lines = Path(tmp, "order.log").read_text(encoding="utf-8").splitlines()
+            self.assertIn("module_check", lines)
             rollback_calls = [line for line in lines if line.startswith("ssh ") and "-Verb rollback" in line]
             self.assertEqual(len(rollback_calls), 1, lines[-8:])
             self.assertIn("previous-0001", rollback_calls[0])
