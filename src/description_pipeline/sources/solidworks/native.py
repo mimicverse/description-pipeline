@@ -380,6 +380,52 @@ def _active_configuration(doc):
     return str(name) if name else None
 
 
+def _capture_document_identity(doc, path, phase, state=None):
+    """Read and preserve capture identity without leaking a raw COM failure."""
+
+    detail = {"path": str(path), "phase": phase}
+    if state is not None:
+        detail["state"] = state
+    try:
+        document = str(_member(doc, "GetPathName") or "")
+    except Exception as error:  # noqa: BLE001 - raw COM failures need stable evidence
+        detail["error"] = f"{type(error).__name__}: {error}"[:300]
+        if state is None:
+            detail["state"] = _discovery_document_state(doc)
+        raise CadError(
+            "cad_document_identity",
+            "Capture document path could not be read",
+            detail,
+        ) from error
+    if not document or not document_paths_match(document, path):
+        detail["document"] = document
+        raise CadError(
+            "cad_document_identity",
+            "Capture document has no matching path identity",
+            detail,
+        )
+    try:
+        configuration = _active_configuration(doc)
+    except Exception as error:  # noqa: BLE001 - raw COM failures need stable evidence
+        detail["document"] = document
+        detail["error"] = f"{type(error).__name__}: {error}"[:300]
+        if state is None:
+            detail["state"] = _discovery_document_state(doc)
+        raise CadError(
+            "cad_configuration_mismatch",
+            "Capture document configuration could not be read",
+            detail,
+        ) from error
+    if not configuration:
+        detail["document"] = document
+        raise CadError(
+            "cad_configuration_mismatch",
+            "Capture document has no active configuration",
+            detail,
+        )
+    return document, configuration
+
+
 def _discovery_document_state(doc):
     """Observe saved/rebuild status; never refresh or rewrite engineering data."""
 
@@ -3606,20 +3652,7 @@ class SolidWorksBackend(CadBackend):
         normalized = normalize_document_path(os.path.abspath(path))
         if not any(normalized.startswith(root + "\\") for root in self._capture_roots):
             raise CadError("cad_rebuild_scope", "Only a collected capture copy may be rebuilt")
-        document = str(_member(doc, "GetPathName") or "")
-        if not document or not document_paths_match(document, path):
-            raise CadError(
-                "cad_document_identity",
-                "Collected capture document has no matching path identity",
-                {"path": path, "document": document},
-            )
-        configuration = _active_configuration(doc)
-        if not configuration:
-            raise CadError(
-                "cad_configuration_mismatch",
-                "Collected capture copy has no active configuration",
-                {"path": path},
-            )
+        document, configuration = _capture_document_identity(doc, path, "before")
         state_before = _discovery_document_state(doc)
         if state_before.get("read_only") is not True:
             raise CadError(
@@ -3656,30 +3689,66 @@ class SolidWorksBackend(CadBackend):
         # native tessellation and physical read-back state. Rebuild only the
         # documented non-zero states; never save either path.
         if rebuilt:
-            if not _member(doc, "ForceRebuild3", False):
+            try:
+                rebuild_result = _member(doc, "ForceRebuild3", False)
+            except Exception as error:  # noqa: BLE001 - raw COM failures need stable evidence
+                raise CadError(
+                    "cad_rebuild_failed",
+                    "Collected assembly rebuild raised a native error",
+                    {
+                        "path": path,
+                        "phase": "rebuild",
+                        "error": f"{type(error).__name__}: {error}"[:300],
+                        "state": state_before,
+                    },
+                ) from error
+            if rebuild_result is not True:
                 raise CadError(
                     "cad_rebuild_failed",
                     "Collected assembly did not rebuild successfully",
-                    {"path": path},
+                    {
+                        "path": path,
+                        "phase": "rebuild",
+                        "result": rebuild_result,
+                        "state": state_before,
+                    },
                 )
             # Rebuild can replace model-document handles. Resolve the same open
             # document once, verify the state, and hand the proven handle back
             # with the serializable metadata so callers never re-acquire it.
-            doc = self._document_by_path(path)
+            try:
+                doc = self._document_by_path(path)
+            except CadError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                raise CadError(
+                    "cad_capture_refresh_failed",
+                    "Rebuilt capture document could not be resolved",
+                    {
+                        "path": path,
+                        "phase": "refresh",
+                        "error": f"{type(error).__name__}: {error}"[:300],
+                    },
+                ) from error
 
         state_after = _discovery_document_state(doc)
-        document_after = str(_member(doc, "GetPathName") or "")
-        if not document_after or not document_paths_match(document_after, path):
-            raise CadError(
-                "cad_document_identity",
-                "Capture preparation changed document identity",
-                {"path": path, "document": document_after},
-            )
-        if _active_configuration(doc) != configuration:
+        _, configuration_after = _capture_document_identity(
+            doc,
+            path,
+            "after",
+            state=state_after,
+        )
+        if configuration_after != configuration:
             raise CadError(
                 "cad_configuration_mismatch",
                 "Capture preparation changed the selected configuration",
-                {"expected": configuration, "actual": _active_configuration(doc)},
+                {
+                    "path": path,
+                    "phase": "after",
+                    "expected": configuration,
+                    "actual": configuration_after,
+                    "state": state_after,
+                },
             )
         if (
             state_after.get("needs_rebuild2_value") != 0
@@ -3716,7 +3785,7 @@ class SolidWorksBackend(CadBackend):
             "scope": "collected_copy_in_memory",
             "document": document,
             "configuration": configuration,
-            "read_only": bool(_member(doc, "IsOpenedReadOnly")),
+            "read_only": True,
             "saved_to_disk": False,
             "rebuild_performed": rebuilt,
             "needs_rebuild2_before": state_before.get("needs_rebuild2_value"),
@@ -3725,8 +3794,10 @@ class SolidWorksBackend(CadBackend):
             "configuration_needs_rebuild_after": state_after.get("configuration_needs_rebuild"),
             "source_sha256_before": source_sha256_before,
             "source_sha256_after": source_sha256_after,
-            "save_flag_before": bool(state_before.get("save_flag")),
-            "save_flag_after": bool(_member(doc, "GetSaveFlag")),
+            "save_flag_before": state_before.get("save_flag"),
+            "save_flag_after": state_after.get("save_flag"),
+            "state_before": state_before,
+            "state_after": state_after,
         }
 
     def _leaf_mass_failure(self, name, occurrence, referenced, error, extra=None):

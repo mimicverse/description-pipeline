@@ -138,6 +138,8 @@ class SessionTests(unittest.TestCase):
         ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(doc, doc.GetPathName)
         self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+        self.assertEqual(caught.exception.detail["path"], doc.GetPathName)
+        self.assertIs(caught.exception.detail["result"], False)
         self.assertEqual(refreshed, [doc.GetPathName])
 
     def test_loaded_references_must_also_be_read_only(self):

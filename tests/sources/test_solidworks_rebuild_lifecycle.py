@@ -71,7 +71,6 @@ class _Doc:
             raise AttributeError("<unknown>.GetPathName")
         return self._path
 
-    @property
     def GetSaveFlag(self):
         return False
 
@@ -112,6 +111,23 @@ class _Backend(SolidWorksBackend):
 
     def open_document(self, path):
         raise AssertionError("OpenDoc6 must never be used after a rebuild")
+
+
+class _UnreadablePathDoc(_Doc):
+    @property
+    def GetPathName(self):
+        raise RuntimeError("path unreadable")
+
+
+class _UnreadableConfigurationDoc(_Doc):
+    @property
+    def ConfigurationManager(self):
+        raise RuntimeError("configuration manager unreadable")
+
+
+class _RaisingRebuildDoc(_Doc):
+    def ForceRebuild3(self, flag):
+        raise RuntimeError("rebuild native failure")
 
 
 class RebuildDocumentLifecycleTests(unittest.TestCase):
@@ -158,6 +174,29 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertEqual(doc.rebuild_calls, 0)
         self.assertEqual(backend.refresh_calls, [])
 
+    def test_unreadable_pre_path_preserves_capture_evidence(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        with self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(_UnreadablePathDoc(PATH), PATH)
+        self.assertEqual(caught.exception.code, "cad_document_identity")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertEqual(caught.exception.detail["phase"], "before")
+        self.assertIn("state", caught.exception.detail)
+        self.assertIn("RuntimeError: path unreadable", caught.exception.detail["error"])
+
+    def test_unreadable_pre_configuration_preserves_capture_evidence(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        with self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(_UnreadableConfigurationDoc(PATH), PATH)
+        self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertEqual(caught.exception.detail["phase"], "before")
+        self.assertIn("state", caught.exception.detail)
+        self.assertIn(
+            "RuntimeError: configuration manager unreadable",
+            caught.exception.detail["error"],
+        )
+
     def test_configuration_change_across_rebuild_is_rejected(self):
         backend = _Backend(lambda: _Doc(PATH, configuration="Other"))
         with patch(
@@ -169,6 +208,41 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
                 PATH,
             )
         self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
+        self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_unreadable_post_configuration_preserves_state_and_phase(self):
+        refreshed = _UnreadableConfigurationDoc(PATH)
+        backend = _Backend(lambda: refreshed)
+        doc = _Doc(PATH, needs_rebuild2=1)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_configuration_mismatch")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertEqual(caught.exception.detail["phase"], "after")
+        self.assertIn("state", caught.exception.detail)
+        self.assertIn(
+            "RuntimeError: configuration manager unreadable",
+            caught.exception.detail["error"],
+        )
+        self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_unreadable_post_path_preserves_state_and_phase(self):
+        refreshed = _UnreadablePathDoc(PATH)
+        backend = _Backend(lambda: refreshed)
+        doc = _Doc(PATH, needs_rebuild2=1)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_document_identity")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertEqual(caught.exception.detail["phase"], "after")
+        self.assertIn("state", caught.exception.detail)
+        self.assertIn("RuntimeError: path unreadable", caught.exception.detail["error"])
         self.assertEqual(backend.refresh_calls, [PATH])
 
     def test_clean_saved_state_skips_rebuild_and_preserves_source(self):
@@ -262,6 +336,38 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             backend._rebuild_capture_copy(doc, PATH)
         self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
         self.assertEqual(doc.rebuild_calls, 1)
+        self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_native_rebuild_exception_preserves_phase_and_state(self):
+        backend = _Backend(lambda: _Doc(PATH))
+        doc = _RaisingRebuildDoc(PATH, needs_rebuild2=1)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertEqual(caught.exception.detail["phase"], "rebuild")
+        self.assertIn("state", caught.exception.detail)
+        self.assertIn("RuntimeError: rebuild native failure", caught.exception.detail["error"])
+        self.assertEqual(backend.refresh_calls, [])
+
+    def test_native_refresh_exception_preserves_phase_and_error(self):
+        backend = _Backend(RuntimeError("document lookup failed"))
+        doc = _Doc(PATH, needs_rebuild2=1)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(caught.exception.code, "cad_capture_refresh_failed")
+        self.assertEqual(caught.exception.detail["path"], PATH)
+        self.assertEqual(caught.exception.detail["phase"], "refresh")
+        self.assertIn(
+            "RuntimeError: document lookup failed",
+            caught.exception.detail["error"],
+        )
         self.assertEqual(backend.refresh_calls, [PATH])
 
     def test_rebuild_cannot_change_source_bytes(self):
