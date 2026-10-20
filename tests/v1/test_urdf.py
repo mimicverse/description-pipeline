@@ -135,8 +135,7 @@ class UrdfWriterTests(unittest.TestCase):
             destination = root / "delivery"
             output = generate_urdf(robot, source, destination, name="fixture_arm")
             node = next(link for link in ET.parse(output).getroot().findall("link") if link.get("name") == "base_link")
-            name = visual_name("geometry/big.stl", link="base_link")
-            expected = "../" + mesh_path(file_digest(source / "geometry/big.stl"), semantic=name)
+            expected = "../" + mesh_path(file_digest(source / "geometry/big.stl"), namespace="fixture_arm")
             self.assertEqual(
                 [visual.find("geometry/mesh").get("filename") for visual in node.findall("visual")],
                 [expected],
@@ -160,8 +159,7 @@ class UrdfWriterTests(unittest.TestCase):
             links = {link.get("name"): link for link in ET.parse(output).getroot().findall("link")}
             base = links["base_link"]
             visuals = base.findall("visual")
-            name = visual_name("geometry/big.stl", link="base_link")
-            stem = mesh_path(file_digest(source_file), semantic=name)[:-4]
+            stem = mesh_path(file_digest(source_file), namespace="fixture_arm")[:-4]
             expected_names = [
                 f"../{stem}_part_0.stl",
                 f"../{stem}_part_1.stl",
