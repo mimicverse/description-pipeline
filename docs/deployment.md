@@ -90,17 +90,11 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 ## 安装 Windows 执行端
 
+本次发行支持已完成受控初始化的 Windows 端点升级：目标已有专用执行账户、受管 Scheduled Task、目录及 ACL、端点配置、令牌和安装身份。全新 Windows 主机初始化及 Session 0 broker 不在本次支持范围，不能用依赖安装成功或手工启动端点代替完整初始化资格。既有端点的任务、配置、令牌、ACL 和安装身份恢复仍须实际验证。
+
 内嵌虚拟组件随同版原生端点与 Linux 验证器部署，不增加服务、环境变量或配置字段。Windows 读取受控会话中的组件及所属装配绑定，Linux 按封存契约独立验证；不得将 `VC~~` 临时文档复制成上传来源或配置额外搜索目录。
 
-校验 Windows 离线运行档案与发行清单摘要，提取到独立发行目录并安装其 hash-locked 依赖：
-
-```powershell
-py -3.12 -m venv C:\description\runtime
-C:\description\runtime\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
-C:\description\runtime\Scripts\description.exe doctor
-```
-
-`doctor` 验证安装身份、最小角色依赖及 SolidWorks/COM 就绪；实际作业仍须检查文件和会话。为端点生成独立随机令牌，以受控方式在 Linux 保存副本。原生端点只绑定 loopback：
+校验 Windows 离线运行档案与发行清单摘要，由受支持的 `stage` 在新安装代目录建立运行环境并安装 hash-locked 依赖，再通过 `promote` 切换既有受管任务。禁止向活动运行目录直接安装依赖或手工替换代码。`doctor` 验证安装身份、最小角色依赖及 SolidWorks/COM 就绪；实际作业仍须检查文件和会话。端点令牌的两端副本受控保存，原生端点只绑定 loopback：
 
 ```json
 {
@@ -114,13 +108,7 @@ C:\description\runtime\Scripts\description.exe doctor
 }
 ```
 
-在专用登录桌面启动：
-
-```powershell
-C:\description\runtime\Scripts\description.exe serve --config C:\description\endpoint.json
-```
-
-验收后以同一账户的登录 Scheduled Task 启动同一命令，保持桌面登录和主机唤醒。每个执行端只使用安装记录绑定的配置和 state root，执行期间无独立 CAD 活动；就绪检查发现外部会话时显示不可执行原因，不能关闭该会话。保持时钟同步、桌面有效和磁盘容量充足，系统更新/重启使用同一排空流程。所有启动与清理入口共用资源域，遵守[CAD 所有权契约](contracts.md#resources)。
+由既有受管 Scheduled Task 在专用账户的交互桌面启动安装记录绑定的入口，保持桌面登录和主机唤醒。每个执行端只使用安装记录绑定的配置和 state root，执行期间无独立 CAD 活动；就绪检查发现外部会话时显示不可执行原因，不能关闭该会话。保持时钟同步、桌面有效和磁盘容量充足，系统更新/重启使用同一排空流程。所有启动与清理入口共用资源域，遵守[CAD 所有权契约](contracts.md#resources)。
 
 ## 安装 Linux 平台
 
