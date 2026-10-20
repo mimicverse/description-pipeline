@@ -880,16 +880,23 @@ def _git_optional_output(repo: Path, *args: str) -> str | None:
 
 
 def _git_environment() -> dict[str, str]:
-    return {
-        **os.environ,
-        "GIT_ATTR_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_NO_LAZY_FETCH": "1",
-        "GIT_NO_REPLACE_OBJECTS": "1",
-        "GIT_OPTIONAL_LOCKS": "0",
-        "GIT_TERMINAL_PROMPT": "0",
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
     }
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
 
 
 def _workspace_refs(
@@ -1075,6 +1082,7 @@ def capture_workspace_bundles(
                 text=True,
                 timeout=600,
                 check=False,
+                env=_git_environment(),
             )
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr.strip()[-2000:])
@@ -1088,6 +1096,7 @@ def capture_workspace_bundles(
                     text=True,
                     timeout=30,
                     check=False,
+                    env=_git_environment(),
                 )
                 if init.returncode != 0:
                     raise RuntimeError(init.stderr.strip()[-2000:])
@@ -1098,6 +1107,7 @@ def capture_workspace_bundles(
                     text=True,
                     timeout=120,
                     check=False,
+                    env=_git_environment(),
                 )
                 if verified.returncode != 0:
                     raise RuntimeError(verified.stderr.strip()[-2000:])
@@ -1107,6 +1117,7 @@ def capture_workspace_bundles(
                 text=True,
                 timeout=120,
                 check=False,
+                env=_git_environment(),
             )
             listed_heads = {
                 line.split(maxsplit=1)[1]
@@ -7787,6 +7798,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 text=True,
                 timeout=30,
                 check=False,
+                env=_git_environment(),
             )
             require(
                 remove.returncode == 0,
