@@ -1606,6 +1606,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             payload["identity"] = copy.deepcopy(raw["identity"])
             robot["hardware_id"] = None
             robot["source"]["robot_name"] = "robot"
+            payload["identity"]["robot_name_technical"] = "robot"
             reseal()
             unsealed = verify_discovery(package)
             self.assertTrue(unsealed["passed"], unsealed["errors"])
@@ -1615,6 +1616,16 @@ class NativeDeclarationsTests(unittest.TestCase):
                 ["discovery.publication_metadata_incomplete", "discovery.revision_absent"],
             )
             self.assertTrue(all(item["blocking"] is False for item in unsealed["diagnostics"]))
+            payload["identity"]["robot_name_technical"] = "fabricated_name"
+            robot["source"]["robot_name"] = "fabricated_name"
+            reseal()
+            self.assertIn(
+                "discovery.identity",
+                {item["code"] for item in verify_discovery(package)["errors"]},
+            )
+            payload["identity"]["robot_name_technical"] = "robot"
+            robot["source"]["robot_name"] = "robot"
+            reseal()
             for mutate in (
                 lambda: payload["identity"].update(hardware_id="fabricated"),
                 lambda: raw["identity"].update(owner=42),
@@ -1630,6 +1641,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                 payload["identity"] = copy.deepcopy(raw["identity"])
                 robot["hardware_id"] = None
                 robot["source"]["robot_name"] = "robot"
+                payload["identity"]["robot_name_technical"] = "robot"
             raw["identity"] = authored
             payload["identity"] = copy.deepcopy(authored)
             robot["hardware_id"] = "fixture"

@@ -16,7 +16,14 @@ from typing import Any
 
 from .errors import ConfigError
 from .jsonio import read_json
-from .naming import asset_namespace, material_name, mesh_path, visual_name
+from .naming import (
+    DISPLAY_MATERIAL_FALLBACK_NAME,
+    DISPLAY_MATERIAL_FALLBACK_RGBA,
+    DISPLAY_MATERIAL_FALLBACK_RULE,
+    asset_namespace,
+    mesh_path,
+    visual_name,
+)
 from .native_limits import PREVIEW_POLICY_ID
 from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
@@ -624,6 +631,15 @@ def build_scene(
             entry = geometry_by_component.get(reading.name)
             if entry is None:
                 continue
+            if "rgba" in entry or "material" in entry:
+                raise ConfigError(
+                    "This capture schema has no independently verified CAD appearance record",
+                    {
+                        "component": reading.name,
+                        "material": entry.get("material"),
+                        "rgba": entry.get("rgba"),
+                    },
+                )
             visual = {
                 "kind": "mesh",
                 "name": visual_name(reading.name, link=name),
@@ -633,12 +649,17 @@ def build_scene(
                     str(entry.get("sha256") or ""),
                     namespace=mesh_namespace,
                 ),
-                "material": material_name(reading.name, link=name),
+                "material": DISPLAY_MATERIAL_FALLBACK_NAME,
                 "scale": [1.0, 1.0, 1.0],
                 "xyz": list(reading.relative_translation),
                 "rpy": list(rpy_from_matrix(reading.relative_rotation)),
-                "provenance": {"native_component": reading.name},
+                "provenance": {
+                    "native_component": reading.name,
+                    "material_source": "platform_display_fallback",
+                    **DISPLAY_MATERIAL_FALLBACK_RULE,
+                },
             }
+            visual["rgba"] = list(DISPLAY_MATERIAL_FALLBACK_RGBA)
             visuals.append(visual)
         links.append(
             {
@@ -1054,20 +1075,6 @@ def _value_warnings(
                     "reason": "current capture content addressing",
                 }
             )
-            if visual.get("material"):
-                materials.append(
-                    {
-                        "object_type": "visual",
-                        "object": visual["name"],
-                        "field": "material",
-                        "actual": visual["material"],
-                        "source": "native component identity formatting",
-                        "original": visual.get("provenance", {}).get("native_component"),
-                        "rule_id": "naming.material",
-                        "rule_version": "naming-v1",
-                        "reason": "native component identity formatting",
-                    }
-                )
     if mappings:
         warnings.append(
             {
@@ -1136,6 +1143,39 @@ def _value_warnings(
                 "code": "naming.derived_material",
                 "message": "Material names are derived from the owner link and native component identity.",
                 "objects": materials,
+            }
+        )
+    material_fallbacks = []
+    for link in links:
+        for visual in link.get("visuals") or []:
+            provenance = visual.get("provenance") or {}
+            if provenance.get("material_source") != "platform_display_fallback":
+                continue
+            material_fallbacks.append(
+                {
+                    "object_type": "visual",
+                    "object": visual["name"],
+                    "field": "material",
+                    "actual": {
+                        "name": visual.get("material"),
+                        "rgba": visual.get("rgba"),
+                    },
+                    "source": "platform display fallback; CAD appearance unobserved",
+                    "original": None,
+                    "rule_id": provenance.get("rule_id"),
+                    "rule_version": provenance.get("rule_version"),
+                    "reason": provenance.get("reason"),
+                }
+            )
+    if material_fallbacks:
+        warnings.append(
+            {
+                "code": "display.material_fallback",
+                "message": (
+                    "CAD appearance is unavailable; a platform display fallback is used "
+                    "without material semantics."
+                ),
+                "objects": material_fallbacks,
             }
         )
     if cfg.get("robot_name_source") == "cad_filename_derived":

@@ -44,6 +44,7 @@ from ..delivery import read_delivery_manifest, read_source_record
 from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data, read_data
 from ..sources.solidworks.direction import canonicalize_axis
+from ..sources.solidworks.naming import robot_name as format_robot_name
 from ..schemas import exporter_declaration_present
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
@@ -3319,12 +3320,21 @@ def verify_discovery(package: Path) -> dict:
         technical_name = authored["robot_name"]
         label_source = "authored_robot_name"
         if technical_name is None:
-            technical_name = claimed.get("robot_name_technical")
-            if isinstance(technical_name, str) and _SNAKE.fullmatch(technical_name):
-                label_source = "cad_filename_derived"
-            else:
-                label_source = "hardware_id" if hardware is not None else "technical_default"
-                technical_name = re.sub(r"[^0-9A-Za-z]+", "_", hardware or "robot").strip("_").lower()
+            main_assembly = str(selection["main_assembly"])
+            technical_name = format_robot_name(PurePosixPath(main_assembly.replace("\\", "/")).name)
+            label_source = "cad_filename_derived"
+            _require(
+                claimed.get("robot_name_technical") == technical_name,
+                "discovery.identity",
+                "the generated technical robot label differs from the frozen CAD filename rule",
+                {"expected": technical_name, "claimed": claimed.get("robot_name_technical")},
+            )
+        else:
+            _require(
+                claimed.get("robot_name_technical") is None,
+                "discovery.identity",
+                "an authored robot name must not claim a second technical label",
+            )
         _require(
             (definition.get("source") or {}).get("robot_name") == technical_name,
             "discovery.identity",

@@ -13,7 +13,13 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from description_pipeline.io import PipelineError
-from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
+from description_pipeline.sources.solidworks.naming import (
+    DISPLAY_MATERIAL_FALLBACK_NAME,
+    DISPLAY_MATERIAL_FALLBACK_RGBA,
+    DISPLAY_MATERIAL_FALLBACK_RULE,
+    mesh_path,
+    visual_name,
+)
 from description_pipeline.sources.solidworks.scene import _value_warnings
 from description_pipeline.verification.solidworks_urdf import (
     _carrier_binding,
@@ -33,7 +39,7 @@ class ValueWarningTests(unittest.TestCase):
         self.digest = hashlib.sha256(b"mesh").hexdigest()
         self.visual = visual_name("part-1", link="base_link")
         self.mesh_name = mesh_path(self.digest, namespace="M3.0.3_20261016.SLDASM")
-        self.material = material_name("part-1", link="base_link")
+        self.material = DISPLAY_MATERIAL_FALLBACK_NAME
         self.source = {
             "robot_name": "robot",
             "robot_name_source": "cad",
@@ -54,8 +60,13 @@ class ValueWarningTests(unittest.TestCase):
                             "sha256": self.digest,
                             "mesh_name": self.mesh_name,
                             "material": self.material,
+                            "rgba": list(DISPLAY_MATERIAL_FALLBACK_RGBA),
                             "scale": [1.0, 1.0, 1.0],
-                            "provenance": {"native_component": "part-1"},
+                            "provenance": {
+                                "native_component": "part-1",
+                                "material_source": "platform_display_fallback",
+                                **DISPLAY_MATERIAL_FALLBACK_RULE,
+                            },
                         }
                     ],
                 }
@@ -118,19 +129,22 @@ class ValueWarningTests(unittest.TestCase):
                         ],
                     },
                     {
-                        "code": "naming.derived_material",
-                        "message": "Material names are derived from the owner link and native component identity.",
+                        "code": "display.material_fallback",
+                        "message": (
+                            "CAD appearance is unavailable; a platform display fallback is used "
+                            "without material semantics."
+                        ),
                         "objects": [
                             {
                                 "object_type": "visual",
                                 "object": self.visual,
                                 "field": "material",
-                                "actual": self.material,
-                                "source": "native component identity formatting",
-                                "original": "part-1",
-                                "rule_id": "naming.material",
-                                "rule_version": "naming-v1",
-                                "reason": "native component identity formatting",
+                                "actual": {"name": self.material, "rgba": list(DISPLAY_MATERIAL_FALLBACK_RGBA)},
+                                "source": "platform display fallback; CAD appearance unobserved",
+                                "original": None,
+                                "rule_id": DISPLAY_MATERIAL_FALLBACK_RULE["rule_id"],
+                                "rule_version": DISPLAY_MATERIAL_FALLBACK_RULE["rule_version"],
+                                "reason": DISPLAY_MATERIAL_FALLBACK_RULE["reason"],
                             }
                         ],
                     },
@@ -182,8 +196,11 @@ class ValueWarningTests(unittest.TestCase):
                             {
                                 "object_type": "visual",
                                 "object": self.visual,
-                                "fields": ["scale"],
-                                "actual": {"scale": [1.0, 1.0, 1.0]},
+                                "fields": ["scale", "material.rgba"],
+                                "actual": {
+                                    "scale": [1.0, 1.0, 1.0],
+                                    "rgba": list(DISPLAY_MATERIAL_FALLBACK_RGBA),
+                                },
                                 "source": "display constant",
                             }
                         ],

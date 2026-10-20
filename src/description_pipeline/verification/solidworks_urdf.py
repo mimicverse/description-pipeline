@@ -305,10 +305,14 @@ def _input(root, diagnostics=None):
         )
         carrier = declarations["carrier"]
         bodies, joints = carrier["bodies"], carrier["joints"]
-        from ..sources.solidworks.naming import carrier_names
+        from ..sources.solidworks.naming import carrier_names_and_rules
 
         carrier_snapshot = _carrier_snapshot(carrier["root"], bodies, joints, raw)
-        body_names, joint_names = carrier_names(bodies, joints, str(carrier["root"]))
+        body_names, joint_names, _body_rules, _joint_rules = carrier_names_and_rules(
+            bodies,
+            joints,
+            str(carrier["root"]),
+        )
         for body in bodies:
             source_name = str(body["name"])
             body["source_name"] = source_name
@@ -1913,10 +1917,30 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     joint_sources = {
         str(joint.get("source_name") or joint["name"]): joint["name"] for joint in source["joints"]
     }
-    axis_map = {
-        joint_sources.get(str(row["joint"]), str(row["joint"])): row
-        for row in axes
-    }
+    selector_sources = {}
+    for joint in source["joints"]:
+        selector = joint.get("axis_reference")
+        if not isinstance(selector, dict):
+            continue
+        key = (
+            str(selector.get("kind") or ""),
+            str(selector.get("component") or ""),
+            str(selector.get("feature_name") or ""),
+        )
+        _require(key not in selector_sources, "Native axis selectors are not unique")
+        selector_sources[key] = joint["name"]
+    axis_map = {}
+    for row in axes:
+        selector = row.get("selector") if isinstance(row.get("selector"), dict) else {}
+        key = (
+            str(selector.get("kind") or ""),
+            str(selector.get("component") or ""),
+            str(selector.get("feature_name") or ""),
+        )
+        name = joint_sources.get(str(row.get("joint"))) or selector_sources.get(key)
+        _require(isinstance(name, str) and name, "Native axis row has no unique joint binding")
+        _require(name not in axis_map, "Native axis rows repeat one joint binding")
+        axis_map[name] = row
     preview = _request_purpose(root) == PURPOSE_INSPECTION_PREVIEW
     for authored in source["joints"]:
         name = authored["name"]
@@ -2073,9 +2097,11 @@ def _value_warning_gate(root, source, model, carrier=None):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.naming import (
+        DISPLAY_MATERIAL_FALLBACK_NAME,
+        DISPLAY_MATERIAL_FALLBACK_RGBA,
+        DISPLAY_MATERIAL_FALLBACK_RULE,
         asset_namespace,
         carrier_names_and_rules,
-        material_name,
         mesh_path,
         visual_name,
     )
@@ -2141,6 +2167,13 @@ def _value_warning_gate(root, source, model, carrier=None):
             "child": output_to_native.get(
                 str(joint.get("child") or ""), str(joint.get("child") or "")
             ),
+            "axis": {
+                "assembly_direction": (
+                    (joint.get("axis_provenance") or {}).get("assembly_direction")
+                    if isinstance(joint.get("axis_provenance"), dict)
+                    else None
+                )
+            },
         }
         for joint in joints
     ]
@@ -2360,9 +2393,16 @@ def _value_warning_gate(root, source, model, carrier=None):
             == mesh_path(current_sha256, namespace=mesh_namespace),
             "Mesh path differs from content addressing",
         )
+        material_source = provenance.get("material_source")
         _require(
-            shape.get("material") == material_name(native_component, link=link["name"]),
-            "Material name differs from the CAD-derived rule",
+            material_source == "platform_display_fallback",
+            "The capture schema carries no independently verified CAD appearance",
+        )
+        _require(
+            shape.get("material") == DISPLAY_MATERIAL_FALLBACK_NAME
+            and shape.get("rgba") == list(DISPLAY_MATERIAL_FALLBACK_RGBA)
+            and all(provenance.get(key) == value for key, value in DISPLAY_MATERIAL_FALLBACK_RULE.items()),
+            "Display material fallback differs from its versioned platform rule",
         )
         add(
             "naming.derived_visual",
@@ -2393,17 +2433,17 @@ def _value_warning_gate(root, source, model, carrier=None):
             },
         )
         add(
-            "naming.derived_material",
+            "display.material_fallback",
             {
                 "object_type": "visual",
                 "object": shape["name"],
                 "field": "material",
-                "actual": shape["material"],
-                "source": "native component identity formatting",
-                "original": native_component,
-                "rule_id": "naming.material",
-                "rule_version": "naming-v1",
-                "reason": "native component identity formatting",
+                "actual": {"name": shape["material"], "rgba": shape["rgba"]},
+                "source": "platform display fallback; CAD appearance unobserved",
+                "original": None,
+                "rule_id": provenance.get("rule_id"),
+                "rule_version": provenance.get("rule_version"),
+                "reason": provenance.get("reason"),
             },
         )
     if source.get("robot_name_source") == "cad_filename_derived":
@@ -2502,6 +2542,9 @@ def _value_warning_gate(root, source, model, carrier=None):
             "Geometry, frame transforms and signed joint axes are derived from native evidence."
         ),
         "display.constant": "Display scale and material color are platform constants, not CAD readings.",
+        "display.material_fallback": (
+            "CAD appearance is unavailable; a platform display fallback is used without material semantics."
+        ),
         "naming.formatted_interface": (
             "Link, joint, and frame names are deterministic formatting of native CAD identities."
         ),

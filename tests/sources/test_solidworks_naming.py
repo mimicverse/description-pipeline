@@ -7,6 +7,7 @@ import unittest
 from description_pipeline.sources.solidworks.naming import (
     asset_namespace,
     carrier_names,
+    carrier_names_and_rules,
     collision_name,
     deduplicate_names,
     disambiguated_frame_name,
@@ -27,6 +28,56 @@ from description_pipeline.sources.solidworks.naming import (
 
 
 class NamingTests(unittest.TestCase):
+    def test_functional_pitch_names_require_topology_and_parallel_cad_axes(self):
+        joints = [
+            {"name": "waist", "type": "revolute", "parent": "base", "child": "pelvis",
+             "axis": {"assembly_direction": [1.0, 0.0, 0.0]}},
+            {"name": "r_thigh_yaw", "type": "revolute", "parent": "pelvis", "child": "r_thigh_yaw_body"},
+            {"name": "l_thigh_yaw", "type": "revolute", "parent": "pelvis", "child": "l_thigh_yaw_body"},
+            {"name": "r_thigh_pitch", "type": "revolute", "parent": "r_thigh_yaw_body", "child": "r_thigh",
+             "axis": {"assembly_direction": [1.0, 0.0, 0.0]}},
+            {"name": "l_thigh_pitch", "type": "revolute", "parent": "l_thigh_yaw_body", "child": "l_thigh",
+             "axis": {"assembly_direction": [-1.0, 0.0, 0.0]}},
+            {"name": "r_thigh_roll", "type": "revolute", "parent": "r_thigh", "child": "r_thigh_roll_body"},
+            {"name": "l_thigh_roll", "type": "revolute", "parent": "l_thigh", "child": "l_thigh_roll_body"},
+            {"name": "r_knee", "type": "revolute", "parent": "r_thigh_roll_body", "child": "r_shank",
+             "axis": {"assembly_direction": [1.0, 0.0, 0.0]}},
+            {"name": "l_knee", "type": "revolute", "parent": "l_thigh_roll_body", "child": "l_shank",
+             "axis": {"assembly_direction": [-1.0, 0.0, 0.0]}},
+            {"name": "r_ankle", "type": "revolute", "parent": "r_shank", "child": "r_foot",
+             "axis": {"assembly_direction": [-1.0, 0.0, 0.0]}},
+            {"name": "l_ankle", "type": "revolute", "parent": "l_shank", "child": "l_foot",
+             "axis": {"assembly_direction": [1.0, 0.0, 0.0]}},
+            {"name": "r_elbow", "type": "revolute", "parent": "r_shoulder", "child": "r_forearm",
+             "axis": {"assembly_direction": [0.0, 1.0, 0.0]}},
+            {"name": "l_elbow", "type": "revolute", "parent": "l_shoulder", "child": "l_forearm",
+             "axis": {"assembly_direction": [0.0, -1.0, 0.0]}},
+            {"name": "r_wrist_pitch", "type": "revolute", "parent": "r_forearm", "child": "r_hand",
+             "axis": {"assembly_direction": [0.0, 1.0, 0.0]}},
+            {"name": "l_wrist_pitch", "type": "revolute", "parent": "l_forearm", "child": "l_hand",
+             "axis": {"assembly_direction": [0.0, -1.0, 0.0]}},
+        ]
+        bodies = [
+            {"name": name}
+            for name in {
+                "base",
+                *(str(value) for joint in joints for value in (joint["parent"], joint["child"])),
+            }
+        ]
+        _bodies, names, _body_rules, rules = carrier_names_and_rules(bodies, joints, "base")
+        self.assertEqual(names["waist"], "waist_pitch_joint")
+        self.assertEqual(names["r_knee"], "right_knee_pitch_joint")
+        self.assertEqual(names["r_ankle"], "right_ankle_pitch_joint")
+        self.assertEqual(names["l_elbow"], "left_elbow_pitch_joint")
+        self.assertEqual(rules["r_ankle"]["rule_id"], "naming.functional_motion")
+        next(joint for joint in joints if joint["name"] == "r_ankle")["axis"]["assembly_direction"] = [
+            0.0,
+            1.0,
+            0.0,
+        ]
+        _bodies, names, _body_rules, _rules = carrier_names_and_rules(bodies, joints, "base")
+        self.assertEqual(names["r_ankle"], "right_ankle_joint")
+
     def test_links_and_joints_come_from_native_datum_and_axis_semantics(self):
         bodies = [
             {

@@ -643,6 +643,22 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 "positive-motion semantics could not be evaluated",
                 {"joint": name, "error": str(error)},
             ) from error
+        local = np.asarray(joint.get("axis"), dtype=float)
+        if local.shape != (3,) or not np.isfinite(local).all() or not np.any(local):
+            raise DeclarationError(
+                "v14.direction_invalid",
+                "the declared child-frame axis is not a usable vector",
+                {"joint": name, "axis": joint.get("axis")},
+            )
+        assembly = np.asarray(child, dtype=float)[:3, :3] @ local
+        norm = float(np.linalg.norm(assembly))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            raise DeclarationError(
+                "v14.direction_invalid",
+                "the declared axis collapses in the assembly frame",
+                {"joint": name, "axis": joint.get("axis")},
+            )
+        decision["assembly_direction"] = (assembly / norm).tolist()
         state["directions"][name] = decision
         state["carried_axes"][name] = decision["delivered_local_axis"]
         if decision["status"] != "local_class_aligned":

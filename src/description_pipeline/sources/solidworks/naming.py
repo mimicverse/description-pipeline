@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import unicodedata
 
@@ -71,6 +72,34 @@ _ROLE_JOINT_RULE = {
     "rule_id": "naming.role_joint",
     "rule_version": "naming-v1",
     "reason": "native joint function plus child-side moving-joint topology",
+}
+
+_FUNCTIONAL_MOTION_RULE = {
+    "rule_id": "naming.functional_motion",
+    "rule_version": "v1",
+    "reason": "native role, child topology and parallel signed CAD axes prove pitch motion",
+}
+
+_FUNCTIONAL_PITCH_REFERENCES = {
+    "elbow": ("same_side", "wrist_pitch"),
+    "knee": ("same_side", "thigh_pitch"),
+    "ankle": ("same_side", "thigh_pitch"),
+    "waist": ("both_sides", "thigh_pitch"),
+}
+
+_FUNCTIONAL_JOINT_BY_ROLE = {
+    "elbow": "elbow_pitch",
+    "knee": "knee_pitch",
+    "ankle": "ankle_pitch",
+    "waist": "waist_pitch",
+}
+
+DISPLAY_MATERIAL_FALLBACK_NAME = "display_fallback_gray"
+DISPLAY_MATERIAL_FALLBACK_RGBA = (0.7, 0.7, 0.7, 1.0)
+DISPLAY_MATERIAL_FALLBACK_RULE = {
+    "rule_id": "display.material_fallback",
+    "rule_version": "display-material-v1",
+    "reason": "platform readability fallback when CAD appearance is unavailable",
 }
 
 _ROLE_VOCABULARY = frozenset(_SEGMENT_BY_ROLE) | frozenset(
@@ -192,6 +221,72 @@ def role_joint_name(
     if _segment_for(role, outgoing, side=side) is None:
         return None
     return f"{side}{_JOINT_BY_ROLE[role]}_joint"
+
+
+def _axis_unit(joint: dict) -> tuple[float, float, float] | None:
+    axis = joint.get("axis")
+    provenance = joint.get("axis_provenance")
+    values = axis.get("assembly_direction") if isinstance(axis, dict) else None
+    if values is None and isinstance(provenance, dict):
+        values = provenance.get("assembly_direction")
+    if not isinstance(values, (list, tuple)) or len(values) != 3:
+        return None
+    try:
+        vector = tuple(float(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+    length = sum(value * value for value in vector) ** 0.5
+    if not all(math.isfinite(value) for value in vector) or length <= 1e-12:
+        return None
+    return tuple(value / length for value in vector)
+
+
+def _functional_pitch_proof(
+    native_joint: str,
+    outgoing: list[tuple[str, str] | None],
+    by_role_side: dict[tuple[str, str], list[dict]],
+) -> dict | None:
+    parsed = _role_token(native_joint)
+    if parsed is None or parsed[1] not in _FUNCTIONAL_PITCH_REFERENCES:
+        return None
+    side, role = parsed
+    if _segment_for(role, outgoing, side=side) is None:
+        return None
+    current = by_role_side.get((side, role))
+    if current is None or len(current) != 1:
+        return None
+    joint_axis = _axis_unit(current[0])
+    if joint_axis is None:
+        return None
+    scope, reference_role = _FUNCTIONAL_PITCH_REFERENCES[role]
+    sides = ("left_", "right_") if scope == "both_sides" else (side,)
+    references = []
+    for reference_side in sides:
+        matches = by_role_side.get((reference_side, reference_role))
+        if matches is None or len(matches) != 1:
+            return None
+        reference_axis = _axis_unit(matches[0])
+        if reference_axis is None:
+            return None
+        alignment = abs(sum(left * right for left, right in zip(joint_axis, reference_axis, strict=True)))
+        if alignment < 1.0 - 1e-8:
+            return None
+        references.append(
+            {
+                "native": str(matches[0].get("name") or ""),
+                "role": reference_role,
+                "assembly_direction": list(reference_axis),
+                "abs_dot": alignment,
+            }
+        )
+    return {
+        **_FUNCTIONAL_MOTION_RULE,
+        "role": role,
+        "side": side,
+        "joint_assembly_direction": list(joint_axis),
+        "references": references,
+        "tolerance": 1e-8,
+    }
 
 
 def joint_role(native_joint: str) -> str | None:
@@ -398,7 +493,11 @@ def carrier_names_and_rules(
 
     incoming: dict[str, dict] = {}
     outgoing: dict[str, list[str | None]] = {}
+    by_role_side: dict[tuple[str, str], list[dict]] = {}
     for joint in joints:
+        parsed_role = _role_token(str(joint.get("name") or ""))
+        if parsed_role is not None:
+            by_role_side.setdefault(parsed_role, []).append(joint)
         if joint.get("type") == "fixed":
             continue
         parent = str(joint.get("parent") or "")
@@ -449,6 +548,7 @@ def carrier_names_and_rules(
 
     joint_names: dict[str, str] = {}
     semantic_joints: dict[str, str] = {}
+    functional_rules: dict[str, dict] = {}
     for joint in joints:
         if "name" not in joint:
             continue
@@ -462,6 +562,10 @@ def carrier_names_and_rules(
             else:
                 child = str(joint.get("child") or "")
                 target = role_joint_name(native, outgoing.get(child, []))
+                functional = _functional_pitch_proof(native, outgoing.get(child, []), by_role_side)
+                if target is None and functional is not None:
+                    target = f"{functional['side']}{_FUNCTIONAL_JOINT_BY_ROLE[functional['role']]}_joint"
+                    functional_rules[native] = functional
                 if target is not None:
                     semantic_joints[native] = target
                 if target is None:
@@ -481,7 +585,7 @@ def carrier_names_and_rules(
         if body_names.get(native) == target
     }
     joint_rules = {
-        native: dict(_ROLE_JOINT_RULE)
+        native: dict(functional_rules.get(native) or _ROLE_JOINT_RULE)
         for native, target in semantic_joints.items()
         if joint_names.get(native) == target
     }
