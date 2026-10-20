@@ -94,6 +94,7 @@ _DISCOVERY_CODE_LABELS = {
 _DIAGNOSTIC_CODE_LABELS = {
     "naming.derived_material": "Material name derived from CAD identity (diagnostic)",
     "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
+    "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
     "v14.mate_inference_unavailable": "Mate inference unavailable (diagnostic)",
     "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",

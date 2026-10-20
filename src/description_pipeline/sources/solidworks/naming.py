@@ -33,20 +33,16 @@ _VOCABULARY = (
     ("\u9888", "neck"),
     ("\u8170", "waist"),
 )
-_MOTION_DEFAULTS = {
-    "elbow": "pitch",
-    "knee": "pitch",
-    "ankle": "pitch",
-    "waist": "pitch",
-}
+_VOCABULARY_RE = re.compile("|".join(re.escape(source) for source, _ in _VOCABULARY))
 
 
 def token(value: str) -> str:
     """Normalize one native name into the single output snake_case vocabulary."""
 
     text = str(value)
-    for source, replacement in _VOCABULARY:
-        text = text.replace(source, replacement)
+    text = _VOCABULARY_RE.sub(lambda match: f"_{dict(_VOCABULARY)[match.group(0)]}_", text)
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", text)
     normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
     normalized = re.sub(r"_+", "_", normalized)
@@ -75,12 +71,6 @@ def joint_name(native_name: str) -> str:
     source = re.sub(r"^(?:a_|axis_)", "", str(native_name), flags=re.IGNORECASE)
     name = token(source)
     stem = name[: -len("_joint")] if name.endswith("_joint") else name
-    words = stem.split("_")
-    if not any(word in {"roll", "pitch", "yaw"} for word in words):
-        for word in reversed(words):
-            if word in _MOTION_DEFAULTS:
-                stem += "_" + _MOTION_DEFAULTS[word]
-                break
     return stem + "_joint"
 
 
@@ -172,14 +162,21 @@ def neutral_joint_name(parent: str, child: str, *, fixed: bool = False) -> str:
     return f"{token(child)}_joint"
 
 
-def deduplicate_names(names: dict[str, str], kind: str) -> dict[str, str]:
+def deduplicate_names(
+    names: dict[str, str],
+    kind: str,
+    *,
+    reserved: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Make a stable semantic fallback for duplicate normalized names."""
 
     if kind not in {"link", "joint"}:
         raise ValueError("unknown interface name kind")
-    result: dict[str, str] = {}
-    used: set[str] = set()
+    result: dict[str, str] = dict(reserved or {})
+    used: set[str] = set(result.values())
     for native in sorted(names):
+        if native in result:
+            continue
         target = names[native]
         if target not in used:
             result[native] = target
@@ -213,6 +210,9 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
             body_names[native] = link_name(semantic, root=native == root or token(semantic) == "base_link")
         except ValueError:
             body_names[native] = neutral_link_name(f"{native}|{datum}", root=native == root)
+    root_key = str(root)
+    reserved = {root_key: "base_link"} if root_key in body_names else {}
+    body_names = deduplicate_names(body_names, "link", reserved=reserved)
     joint_names: dict[str, str] = {}
     for joint in joints:
         native = str(joint["name"])
@@ -233,4 +233,4 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
                 )
             except ValueError:
                 joint_names[native] = fallback_name("joint", native, semantic="joint")
-    return deduplicate_names(body_names, "link"), deduplicate_names(joint_names, "joint")
+    return body_names, deduplicate_names(joint_names, "joint")

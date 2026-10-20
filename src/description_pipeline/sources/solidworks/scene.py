@@ -859,6 +859,7 @@ def _value_warnings(
 
     warnings: list[dict[str, Any]] = []
     mappings = []
+    motion_unresolved = []
     visuals = []
     materials = []
     mesh_paths = []
@@ -893,6 +894,22 @@ def _value_warnings(
                     "rule_id": "naming.interface",
                     "rule_version": "naming-v1",
                     "reason": "CAD reference-axis formatting",
+                }
+            )
+        if source_joint.get("type") != "fixed" and not any(
+            word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
+        ):
+            motion_unresolved.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "name",
+                    "actual": joint["name"],
+                    "source": "neutral joint naming",
+                    "original": source_name,
+                    "rule_id": "naming.joint_motion",
+                    "rule_version": "naming-v1",
+                    "reason": "motion classification unavailable",
                 }
             )
     for link in links:
@@ -943,6 +960,14 @@ def _value_warnings(
                 "code": "naming.formatted_interface",
                 "message": "Link and joint names are deterministic formatting of native CAD identities.",
                 "objects": mappings,
+            }
+        )
+    if motion_unresolved:
+        warnings.append(
+            {
+                "code": "naming.motion_unresolved",
+                "message": "Joint names without a CAD motion classification retain a neutral name.",
+                "objects": motion_unresolved,
             }
         )
     if visuals:

@@ -2375,6 +2375,8 @@ def _apply_cad_names(
     joints: list[dict],
     clusters: _Clusters,
     findings: list[dict],
+    *,
+    root: str | None = None,
 ) -> None:
     """Derive output names from CAD datums/reference axes through one rule."""
 
@@ -2403,6 +2405,21 @@ def _apply_cad_names(
                 )
             )
         body_names[native] = target
+    original_links = dict(body_names)
+    root_key = str(root) if root is not None else None
+    reserved_links = {root_key: "base_link"} if root_key in body_names else {}
+    body_names = deduplicate_names(body_names, "link", reserved=reserved_links)
+    for native, corrected in body_names.items():
+        if corrected != original_links[native]:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_invalid",
+                    f"body:{native}",
+                    "link name collision is resolved by the shared deterministic fallback",
+                    {"input": native, "output": corrected},
+                    blocking=False,
+                )
+            )
     joint_names: dict[str, str] = {}
     for joint in joints:
         if "name" not in joint:
@@ -2415,6 +2432,16 @@ def _apply_cad_names(
                 joint_names[native] = fixed_joint_name(parent, child)
             else:
                 joint_names[native] = format_joint_name(native)
+                if not any(word in {"roll", "pitch", "yaw"} for word in joint_names[native].split("_")):
+                    findings.append(
+                        _finding(
+                            "discovery.interface_motion_unresolved",
+                            f"joint:{native}",
+                            "the CAD name does not classify a motion; a neutral joint name is retained",
+                            {"native": native, "output": joint_names[native]},
+                            blocking=False,
+                        )
+                    )
         except ValueError:
             parent = body_names.get(str(joint.get("parent")), str(joint.get("parent") or "parent"))
             child = body_names.get(str(joint.get("child")), str(joint.get("child") or "child"))
@@ -2431,19 +2458,6 @@ def _apply_cad_names(
                     "the native joint name cannot produce a valid output joint name; "
                     "a neutral semantic fallback is used",
                     {"name": native, "output": joint_names[native]},
-                    blocking=False,
-                )
-            )
-    original_links = dict(body_names)
-    body_names = deduplicate_names(body_names, "link")
-    for native, corrected in body_names.items():
-        if corrected != original_links[native]:
-            findings.append(
-                _finding(
-                    "discovery.interface_name_invalid",
-                    f"body:{native}",
-                    "link name collision is resolved by the shared deterministic fallback",
-                    {"input": native, "output": corrected},
                     blocking=False,
                 )
             )
@@ -4840,7 +4854,7 @@ def _derive_carriers(
                 record=record,
                 settings=settings,
             )
-            _apply_cad_names(bodies, joints, clusters, findings)
+            _apply_cad_names(bodies, joints, clusters, findings, root=str(root["name"]))
             derived_names = {
                 str(body.get("source_name") or body["name"]): body["name"] for body in bodies
             } | {
@@ -4881,7 +4895,13 @@ def _derive_carriers(
     _frame_attachment_findings(record, clusters, bodies, findings)
     _orient(joints, bodies, by_root, root, findings)
     derived_names = _joint_names(joints, findings)
-    _apply_cad_names(bodies, joints, clusters, findings)
+    _apply_cad_names(
+        bodies,
+        joints,
+        clusters,
+        findings,
+        root=str(root["name"]) if root is not None else None,
+    )
     derived_names = {
         str(body.get("source_name") or body["name"]): body["name"] for body in bodies
     } | {

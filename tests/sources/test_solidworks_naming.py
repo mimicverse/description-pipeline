@@ -35,14 +35,17 @@ class NamingTests(unittest.TestCase):
         ]
         body_names, joint_names = carrier_names(bodies, joints, "manual_root")
         self.assertEqual(body_names, {"manual_root": "base_link", "manual_left": "left_ankle_link"})
-        self.assertEqual(joint_names, {"l_ankle": "left_ankle_pitch_joint"})
+        self.assertEqual(joint_names, {"l_ankle": "left_ankle_joint"})
 
     def test_native_generic_names_are_formatted_once(self):
         self.assertEqual(token(" R_Shoulder Roll "), "right_shoulder_roll")
+        self.assertEqual(token("LeftShoulderPitch"), "left_shoulder_pitch")
         self.assertEqual(link_name("r_shoulder_roll"), "right_shoulder_roll_link")
         self.assertEqual(link_name("CS_R_Shoulder_Roll"), "right_shoulder_roll_link")
         self.assertEqual(joint_name("r_shoulder_roll"), "right_shoulder_roll_joint")
         self.assertEqual(joint_name("a_r_shoulder_roll"), "right_shoulder_roll_joint")
+        self.assertEqual(joint_name("LeftShoulderPitch"), "left_shoulder_pitch_joint")
+        self.assertEqual(joint_name("左髋关节"), "left_hip_joint")
         self.assertEqual(
             fixed_joint_name("left_upper_arm_link", "left_hand_link"),
             "left_upper_arm_link_to_left_hand_link_joint",
@@ -72,6 +75,16 @@ class NamingTests(unittest.TestCase):
         joints = [{"name": "tool_mount", "type": "fixed", "parent": "base", "child": "tool"}]
         _links, names = carrier_names(bodies, joints, "base")
         self.assertEqual(names["tool_mount"], "base_link_to_tool_link_joint")
+
+    def test_real_root_reserves_base_link_before_collision_resolution(self):
+        bodies = [
+            {"name": "a", "frame": {"coordinate_system": "CS_base_link"}},
+            {"name": "root", "frame": {"coordinate_system": "CS_base_link"}},
+        ]
+        names, _joints = carrier_names(bodies, [], "root")
+        self.assertEqual(names["root"], "base_link")
+        self.assertTrue(names["a"].startswith("body_"))
+        self.assertTrue(names["a"].endswith("_link"))
 
     def test_normalization_is_idempotent(self):
         self.assertEqual(link_name(link_name("r_upper_arm")), link_name("r_upper_arm"))

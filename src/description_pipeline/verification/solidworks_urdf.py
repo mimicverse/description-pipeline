@@ -1970,6 +1970,23 @@ def _value_warning_gate(root, source, model):
                     "reason": "CAD reference-axis formatting",
                 },
             )
+        if joint.get("type") != "fixed" and not any(
+            word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
+        ):
+            add(
+                "naming.motion_unresolved",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "name",
+                    "actual": joint["name"],
+                    "source": "neutral joint naming",
+                    "original": source_name,
+                    "rule_id": "naming.joint_motion",
+                    "rule_version": "naming-v1",
+                    "reason": "motion classification unavailable",
+                },
+            )
     for link, shape in shapes:
         provenance = shape.get("provenance") if isinstance(shape.get("provenance"), dict) else {}
         native_component = str(provenance.get("native_component") or "")
@@ -2127,6 +2144,7 @@ def _value_warning_gate(root, source, model):
         ),
         "display.constant": "Display scale and material color are platform constants, not CAD readings.",
         "naming.formatted_interface": "Link and joint names are deterministic formatting of native CAD identities.",
+        "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
         "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
         "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
         "naming.derived_material": "Material names are derived from the owner link and native component identity.",
