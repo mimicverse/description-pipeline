@@ -6731,6 +6731,20 @@ def verify_restored_files(manifest: dict, plan: dict) -> None:
     for root in manifest["roots"]:
         target = Path(plan["roots"][root["name"]])
         require_real_dir(target, f"restored root {root['name']}", "recovery_member_hash_mismatch")
+        root_member = next(
+            (
+                row
+                for row in manifest["members"]
+                if row["member"] == root["archive"] and row["type"] == "directory"
+            ),
+            None,
+        )
+        require(
+            isinstance(root_member, dict)
+            and stat.S_IMODE(target.stat().st_mode) == root_member["mode"],
+            "recovery_member_hash_mismatch",
+            f"restored root mode differs: {root['name']}",
+        )
         expected = [
             row
             for row in manifest["members"]
@@ -7016,7 +7030,11 @@ def restore_command(
             "cause": getattr(error, "message", str(error)),
             "detail": getattr(error, "detail", {}),
             "admission": "closed",
-            "retry": "discard and recreate an empty target; partial targets are not reusable",
+            "retry": (
+                "fix the verification failure and rerun verify-only"
+                if verify_only
+                else "discard and recreate an empty target; partial targets are not reusable"
+            ),
             "command_log": commands,
         }
         write_status(status_dir, failed)

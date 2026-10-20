@@ -1150,6 +1150,24 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertEqual(verified["status"], "succeeded")
         self.assertEqual(verified["operation"], "verify-only")
         self.assertFalse((verify_status / "recovery-marker.json").exists())
+        state_root = Path(roots["state_root"])
+        original_state_mode = permission(state_root)
+        state_root.chmod(0o777)
+        try:
+            with self.assertRaises(recovery.RecoveryError) as mode_refused:
+                recovery.restore_command(
+                    manifest_path=manifest_path,
+                    key=self.key,
+                    target_plan_path=plan,
+                    status_dir=self.root / "verify-mode-tampered",
+                    verify_only=True,
+                )
+        finally:
+            state_root.chmod(original_state_mode)
+        self.assertEqual(
+            mode_refused.exception.code,
+            "recovery_member_hash_mismatch",
+        )
         restored_file = Path(roots["handoff_root"]) / "request.json"
         restored_file.write_text("tampered\n", encoding="utf-8")
         with self.assertRaises(recovery.RecoveryError):
