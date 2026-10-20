@@ -5,7 +5,8 @@
 #   start     enable/start PostgreSQL, Airflow, tunnel, portal and the HTTPS proxy
 #             (start --keep-admission-closed: services up, the platform admission stays closed)
 #   drain     close submissions and DAG admission, keep in-flight, return active/unresolved
-#   stop      disable/stop them in reverse order (only when drained and settled)
+#   stop      disable/stop them in reverse order (only when drained and settled);
+#             --keep-database stops the supported writers while retaining PostgreSQL
 #   status    systemctl --user is-active for every managed unit
 #   health    deploy/operator/health.sh (static checks plus live service/HTTP checks)
 #   reconcile confirm and register external outcomes; never repeats unknown side effects
@@ -45,6 +46,7 @@ usage() {
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
 start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
+stop inputs: [--keep-database] (supported writers stop; the managed database stays active)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
 orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N [--reported-stage STAGE]
 native capture recovery adds: --install-id ID [--derived DIR --archive FILE] (--reported-stage capture, --stage discover, --outcome failed)
@@ -74,6 +76,7 @@ ORPHAN_TASK_ID=""
 ORPHAN_MAP_INDEX=""
 REPORTED_STAGE=""
 KEEP_ADMISSION_CLOSED=""
+KEEP_DATABASE=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -95,6 +98,7 @@ while [ $# -gt 0 ]; do
     --archive) NATIVE_ARCHIVE="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
     --keep-admission-closed) KEEP_ADMISSION_CLOSED=1; shift ;;
+    --keep-database) KEEP_DATABASE=1; shift ;;
     *) usage ;;
   esac
 done
@@ -106,6 +110,10 @@ esac
 # Only start owns this switch; every other verb refuses it here, before any side effect runs.
 if [ -n "$KEEP_ADMISSION_CLOSED" ] && [ "$ACTION" != "start" ]; then
   echo "operatorctl: --keep-admission-closed is only accepted by start" >&2
+  exit 2
+fi
+if [ -n "$KEEP_DATABASE" ] && [ "$ACTION" != "stop" ]; then
+  echo "operatorctl: --keep-database is only accepted by stop" >&2
   exit 2
 fi
 
@@ -1402,7 +1410,15 @@ case "$ACTION" in
     systemctl --user disable --now description-operator-proxy.service description-portal.service || true
     ADMISSION_RC=0
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf || ADMISSION_RC=$?
-    airflow_lifecycle stop
+    if [ -n "$KEEP_DATABASE" ]; then
+      airflow_lifecycle stop-executors
+      state="$(systemctl --user is-active description-postgres.service 2>/dev/null || true)"
+      [ "$state" = "active" ] \
+        || die "the managed PostgreSQL unit is ${state:-unknown}; --keep-database refused"
+      echo "stop complete: supported writers are stopped; PostgreSQL remains active"
+    else
+      airflow_lifecycle stop
+    fi
     exit "$ADMISSION_RC"
     ;;
   status)

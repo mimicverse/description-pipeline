@@ -36,9 +36,7 @@ ALL_VERBS = (
     "promote",
     "rollback",
 )
-OPERATIONAL_VERBS = tuple(
-    verb for verb in ALL_VERBS if verb not in {"validate", "install"}
-)
+OPERATIONAL_VERBS = tuple(verb for verb in ALL_VERBS if verb not in {"validate", "install"})
 
 
 def run(args: list[str]) -> subprocess.CompletedProcess:
@@ -118,6 +116,41 @@ class OperatorctlSurfaceTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("not installed", result.stderr)
 
+    def test_keep_database_is_a_stop_only_maintenance_switch(self):
+        accepted = run(
+            [
+                "stop",
+                "--config",
+                str(self.config),
+                "--keep-database",
+            ]
+        )
+        self.assertEqual(accepted.returncode, 1)
+        self.assertIn("not installed", accepted.stderr)
+        for verb in ("start", "drain", "promote"):
+            with self.subTest(verb):
+                refused = run(
+                    [
+                        verb,
+                        "--config",
+                        str(self.config),
+                        "--keep-database",
+                    ]
+                )
+                self.assertEqual(refused.returncode, 2)
+                self.assertIn("only accepted by stop", refused.stderr)
+
+    def test_keep_database_stop_branch_retains_postgres(self):
+        source = CONTROL.read_text(encoding="utf-8")
+        branch = source.split('if [ -n "$KEEP_DATABASE" ]; then', 1)[1].split(
+            "else",
+            1,
+        )[0]
+        self.assertIn("airflow_lifecycle stop-executors", branch)
+        self.assertNotIn("airflow_lifecycle stop\n", branch)
+        self.assertIn("description-postgres.service", branch)
+        self.assertIn("PostgreSQL remains active", branch)
+
     def test_invalid_config_fails_before_any_verb_behavior(self):
         bad = self.root / "bad.json"
         document = platform_document(self.root)
@@ -140,6 +173,7 @@ class OperatorctlSurfaceTests(unittest.TestCase):
         missing = run(["install", "--config", str(self.root / "missing.json")])
         self.assertEqual(missing.returncode, 1)
         self.assertIn("config file not found", missing.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
