@@ -89,7 +89,7 @@ def _locked_pins(data: bytes) -> dict:
         key = canonicalize_name(name)
         if key in pins:
             raise PipelineError(f"Dependency lock repeats {key}")
-        pins[key] = version.strip()
+        pins[key] = version.strip().split()[0]
     return pins
 
 

@@ -93,7 +93,8 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
     ]
 
     def acl_projection(seed: str) -> dict:
-        return {
+        del seed
+        projection = {
             "owner_sid": "S-1-5-21-1",
             "group_sid": "S-1-5-18",
             "protected": True,
@@ -108,8 +109,9 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
                     "propagation": 0,
                 }
             ],
-            "projection_sha256": seed * 64,
         }
+        projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
+        return projection
 
     acl = {
         "task_file": acl_projection("a"),
@@ -2814,6 +2816,16 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "recovery_manifest_invalid",
             ),
             (
+                "acl_rule",
+                lambda state: state["acl"]["roots"]["state_root"].update(rules=[1]),
+                "recovery_manifest_invalid",
+            ),
+            (
+                "acl_digest",
+                lambda state: state["acl"]["roots"]["package_root"].update(sddl="D:FA"),
+                "windows_recovery_state_invalid",
+            ),
+            (
                 "path",
                 lambda state: state["identity"].update(config_path="C:/../escape"),
                 "windows_recovery_state_invalid",
@@ -3008,7 +3020,39 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 staging=staging,
                 commands=[],
             )
-        self.assertEqual(raised.exception.code, "windows_recovery_bundle_invalid")
+        self.assertEqual(raised.exception.code, "windows_recovery_state_invalid")
+
+    def test_windows_bundle_binds_install_id_contents_to_identity(self) -> None:
+        staging = self.root / "windows-install-id-staging"
+        staging.mkdir()
+        windows_recovery_fixture(self.context, staging)
+        bundle = staging / recovery.WINDOWS_BUNDLE_MEMBER
+        replacement = staging / "replacement.zip"
+        changed_install_id = b"win-" + b"2" * 32 + b"\n"
+        changed_sha256 = hashlib.sha256(changed_install_id).hexdigest()
+        with zipfile.ZipFile(bundle) as source:
+            state = json.loads(source.read(recovery.WINDOWS_STATE_MEMBER))
+            install_file = next(row for row in state["files"] if row["role"] == "install_id")
+            install_member = next(row for row in state["members"] if row["member"] == install_file["member"])
+            install_file["bytes"] = len(changed_install_id)
+            install_file["sha256"] = changed_sha256
+            install_member["bytes"] = len(changed_install_id)
+            install_member["sha256"] = changed_sha256
+            payloads = {name: source.read(name) for name in source.namelist()}
+        payloads["install-id"] = changed_install_id
+        payloads[recovery.WINDOWS_STATE_MEMBER] = json.dumps(
+            state,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        with zipfile.ZipFile(replacement, "w") as target:
+            for name, payload in payloads.items():
+                target.writestr(name, payload)
+        replacement.replace(bundle)
+        state = recovery._read_windows_state(bundle)
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.verify_windows_recovery_bundle_members(bundle, state)
+        self.assertEqual(raised.exception.code, "windows_recovery_state_invalid")
 
     def test_windows_snapshot_refuses_files_member_aliases(self) -> None:
         staging = self.root / "windows-member-alias-staging"
@@ -3076,6 +3120,113 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 expected_verb="recovery-snapshot",
             )
         self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+
+    def test_windows_failure_receipt_must_name_the_expected_verb(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["ssh", "windows-fixture"],
+            1,
+            json.dumps(
+                {
+                    "passed": False,
+                    "code": "windows_task_not_disabled",
+                    "verb": "health",
+                }
+            )
+            + "\n",
+            "",
+        )
+        with (
+            mock.patch.object(recovery, "_run_windows_powershell", return_value=completed),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._run_windows_recovery_json(
+                ssh_host="windows-fixture",
+                script="fixture",
+                timeout=5,
+                commands=[],
+                expected_verb="recovery-snapshot",
+            )
+        self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+
+    def test_windows_failure_receipt_with_expected_verb_is_definite(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["ssh", "windows-fixture"],
+            1,
+            json.dumps(
+                {
+                    "passed": False,
+                    "code": "windows_task_not_disabled",
+                    "verb": "recovery-snapshot",
+                }
+            )
+            + "\n",
+            "",
+        )
+        with (
+            mock.patch.object(recovery, "_run_windows_powershell", return_value=completed),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._run_windows_recovery_json(
+                ssh_host="windows-fixture",
+                script="fixture",
+                timeout=5,
+                commands=[],
+                expected_verb="recovery-snapshot",
+            )
+        self.assertEqual(raised.exception.code, "windows_task_not_disabled")
+
+    def test_windows_remote_dir_is_not_removed_before_creation_is_owned(self) -> None:
+        script = write(self.root / "instance-lifecycle.ps1", "fixture\n")
+        with (
+            mock.patch.object(
+                recovery,
+                "_create_remote_dir",
+                side_effect=recovery.RecoveryError(
+                    "windows_recovery_transport_unknown",
+                    "fixture creation failed",
+                ),
+            ),
+            mock.patch.object(recovery, "_remove_remote_dir") as remove,
+            self.assertRaises(recovery.RecoveryError),
+        ):
+            recovery._transfer_windows_recovery(
+                ssh_host="windows-fixture",
+                remote_dir="C:/description/state/recovery/fixture",
+                script=script,
+                binding_document={},
+                operation="recovery-snapshot",
+                commands=[],
+                timeout=5,
+            )
+        remove.assert_not_called()
+
+    def test_windows_remote_dir_cleanup_reuses_the_creation_ownership_token(self) -> None:
+        script = write(self.root / "instance-lifecycle.ps1", "fixture\n")
+        with (
+            mock.patch.object(recovery, "_create_remote_dir") as create,
+            mock.patch.object(
+                recovery,
+                "_windows_scp",
+                side_effect=recovery.RecoveryError(
+                    "windows_recovery_transport_unknown",
+                    "fixture upload failed",
+                ),
+            ),
+            mock.patch.object(recovery, "_remove_remote_dir") as remove,
+            self.assertRaises(recovery.RecoveryError),
+        ):
+            recovery._transfer_windows_recovery(
+                ssh_host="windows-fixture",
+                remote_dir="C:/description/state/recovery/fixture",
+                script=script,
+                binding_document={},
+                operation="recovery-snapshot",
+                commands=[],
+                timeout=5,
+            )
+        ownership_token = create.call_args.kwargs["ownership_token"]
+        self.assertRegex(ownership_token, r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(remove.call_args.kwargs["ownership_token"], ownership_token)
 
     def test_backup_requires_airflow_venv_interpreter(self) -> None:
         with self.assertRaises(recovery.RecoveryError) as raised:

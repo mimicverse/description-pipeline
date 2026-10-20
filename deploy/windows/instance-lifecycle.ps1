@@ -59,6 +59,13 @@ function Write-Utf8NoBom([string]$path, [string]$text) {
   # BOM, which every strict UTF-8 JSON consumer rejects.
   [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
+function Read-Utf8Text([string]$Path) {
+  # PowerShell 5.1's default Get-Content encoding follows the active ANSI code page.  Task XML
+  # is written as strict UTF-8 without a BOM, so registration must decode the bytes explicitly.
+  return [System.IO.File]::ReadAllText(
+    $Path,
+    (New-Object System.Text.UTF8Encoding($false,$true)))
+}
 function Write-Receipt([string]$path, [hashtable]$payload) {
   $parent = Split-Path -Parent $path
   if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
@@ -528,7 +535,7 @@ function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$
     $restore.stopped = $true
   } catch { if (-not $restore.error) { $restore.error = 'stop: ' + $_.Exception.Message } }
   try {
-    Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $previous 'task.xml') -Raw) -Force | Out-Null
+    Register-ScheduledTask -TaskName $binding.task_name -Xml (Read-Utf8Text (Join-Path $previous 'task.xml')) -Force | Out-Null
     $restore.restored = $true
   } catch { if (-not $restore.error) { $restore.error = 'restore: ' + $_.Exception.Message } }
   $previousGeneration = ''
@@ -702,8 +709,30 @@ function Get-AclProjection([string]$Path) {
     sddl = [string]$acl.GetSecurityDescriptorSddlForm($sections)
     rules = $rules
   }
-  $projection['projection_sha256'] = Get-JsonSha256 $projection
+  $projection['projection_sha256'] = Get-AclProjectionSha256 $projection
   return $projection
+}
+function Get-AclProjectionSha256($Projection) {
+  # ACL projections cross PowerShell and Python canonical JSON transports.  Serialize a
+  # dedicated fixed-order document rather than the surrounding object's incidental key order.
+  $rules = @($Projection.rules | ForEach-Object {
+    [ordered]@{
+      sid = [string]$_.sid
+      access_type = [string]$_.access_type
+      rights = [long]$_.rights
+      inherited = [bool]$_.inherited
+      inheritance = [int]$_.inheritance
+      propagation = [int]$_.propagation
+    }
+  })
+  $canonical = [ordered]@{
+    owner_sid = [string]$Projection.owner_sid
+    group_sid = [string]$Projection.group_sid
+    protected = [bool]$Projection.protected
+    sddl = [string]$Projection.sddl
+    rules = $rules
+  }
+  return Get-TextSha256 ($canonical | ConvertTo-Json -Depth 8 -Compress)
 }
 function Set-AclProjection([string]$Path, $Projection) {
   $sections = [System.Security.AccessControl.AccessControlSections]::All
@@ -850,6 +879,7 @@ function Get-RecoveryFileRow([string]$Role, [string]$Path, [string]$Member) {
 }
 function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
   $configPath = Action-Config $Task
+  Assert-NoReparseAncestor $configPath
   $configDocument = Read-Json $configPath
   $execute = [string]$Task.Actions[0].Execute
   $scripts = Split-Path -Parent $execute
@@ -857,6 +887,9 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
   $generation = Split-Path -Parent $runtime
   $stateRoot = [string]$configDocument.state_root
   $lifecycleRoot = Join-Path $stateRoot 'lifecycle'
+  foreach ($path in @($configPath, $execute, $generation, $stateRoot, $lifecycleRoot)) {
+    Assert-NoReparseAncestor $path
+  }
   if ((Normalize-PathIdentity $execute) -ne
       (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\description.exe')) -or
       -not (Normalize-PathIdentity $generation).StartsWith(
@@ -893,6 +926,7 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
   $probe = ($output | Select-Object -Last 1) | ConvertFrom-Json
   $stateRoot = [string]$probe.state_root
   $installIdPath = Join-Path $stateRoot 'install-id'
+  Assert-NoReparseAncestor $installIdPath
   if (-not (Test-Path -LiteralPath $installIdPath)) {
     Die 'windows_install_id_mismatch' 'the endpoint state root has no install identity'
   }
@@ -912,6 +946,14 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
   }
   $ownershipPin = Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE'
   $endpointPin = Get-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT'
+  foreach ($path in @(
+      ([string]$configDocument.token_file),
+      ([string]$probe.package_root),
+      ([string]$probe.output_root),
+      ([string]$probe.state_root),
+      $generation)) {
+    Assert-NoReparseAncestor $path
+  }
   if ((Normalize-PathIdentity $ownershipPin) -ne
       (Normalize-PathIdentity (Domain-OwnershipPath $stateRoot)) -or
       (Normalize-PathIdentity $endpointPin) -ne (Normalize-PathIdentity $generation)) {
@@ -942,6 +984,8 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
 function Get-RecoveryCadState($Identity) {
   $ownershipPath = Join-Path ([string]$Identity.state_root) 'cad-ownership.json'
   $leasePath = $ownershipPath + '.lease'
+  Assert-NoReparseAncestor $ownershipPath
+  Assert-NoReparseAncestor $leasePath
   $ledgerPresent = Test-Path -LiteralPath $ownershipPath
   $ledgerSha = $null
   if ($ledgerPresent) {
@@ -1044,6 +1088,19 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
   $cad = Get-RecoveryCadState $identity
   Assert-RecoveryStopped $taskProjection $identity $cad
   $taskFile = Get-TaskFilePath $task
+  foreach ($path in @(
+      $taskFile,
+      ([string]$identity.config_path),
+      ([string]$identity.token_path),
+      ([string]$identity.install_id_path),
+      ([string]$identity.package_root),
+      ([string]$identity.output_root),
+      ([string]$identity.state_root),
+      ([string]$identity.endpoint_root),
+      ([string]$cad.ownership_path),
+      ([string]$cad.lease_path))) {
+    Assert-NoReparseAncestor $path
+  }
   $taskXmlEncoding = New-Object System.Text.UTF8Encoding($false)
   $taskXmlText = [string]$taskProjection.xml
   $taskXmlBytes = $taskXmlEncoding.GetBytes($taskXmlText)
@@ -1285,11 +1342,26 @@ function Invoke-RecoverySnapshot($Binding) {
 }
 function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
   if (-not $RecoveryBundle) { Die 'recovery_bundle_required' 'recovery restore needs -RecoveryBundle' }
+  Assert-NoReparseAncestor $RecoveryBundle
+  if (-not (Test-Path -LiteralPath $RecoveryBundle -PathType Leaf)) {
+    Die 'windows_recovery_bundle_invalid' 'the transferred Windows recovery bundle is missing'
+  }
+  $recoveryBundleItem = Get-Item -LiteralPath $RecoveryBundle -Force -ErrorAction Stop
+  if ($recoveryBundleItem.PSIsContainer -or
+      ($recoveryBundleItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    Die 'windows_recovery_bundle_invalid' 'the transferred Windows recovery bundle is not a regular file'
+  }
   if ((Sha256 $RecoveryBundle) -ne [string]$Binding.recovery_bundle_sha256) {
     Die 'windows_recovery_bundle_invalid' 'the transferred Windows recovery bundle hash differs'
   }
   $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-recovery-' + [guid]::NewGuid().ToString('N'))
+  Assert-NoReparseAncestor $temp
   New-Item -ItemType Directory -Path $temp | Out-Null
+  $tempItem = Get-Item -LiteralPath $temp -Force -ErrorAction Stop
+  if (-not $tempItem.PSIsContainer -or
+      ($tempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    Die 'windows_recovery_target_unsafe' 'the Windows recovery temporary directory is not a regular directory'
+  }
   $ownedTask = $false
   $registeringTask = $false
   $state = $null
@@ -1367,9 +1439,10 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
         if (-not (Test-Path -LiteralPath $taskFolder -PathType Container)) {
           Die 'windows_endpoint_not_provisioned' 'the existing Task Scheduler folder is missing'
         }
+        Assert-NoReparseAncestor (Join-Path $taskFolder ([string]$Binding.task_name))
         $registeringTask = $true
         Register-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) `
-          -Xml (Get-Content -LiteralPath (Join-Path $extracted.root 'task.xml') -Raw) -ErrorAction Stop | Out-Null
+          -Xml (Read-Utf8Text (Join-Path $extracted.root 'task.xml')) -ErrorAction Stop | Out-Null
         $registeringTask = $false
         $ownedTask = $true
         Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null
@@ -1678,7 +1751,7 @@ if ($Verb -eq 'rollback') {
   $servingConfig = Action-Config $task
   $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $servingConfig)
   Stop-Endpoint $binding
-  Register-ScheduledTask -TaskName $binding.task_name -Xml (Get-Content -LiteralPath (Join-Path $Previous 'task.xml') -Raw) -Force | Out-Null
+  Register-ScheduledTask -TaskName $binding.task_name -Xml (Read-Utf8Text (Join-Path $Previous 'task.xml')) -Force | Out-Null
   # The restored task names the previous generation's own configuration; that file is the one
   # the recorded endpoint-before.json replaces - the candidate generation stays untouched.
   $restored = Get-ScheduledTask -TaskName $binding.task_name

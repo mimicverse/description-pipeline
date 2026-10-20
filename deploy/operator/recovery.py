@@ -43,6 +43,7 @@ import io
 import json
 import os
 import re
+import secrets
 import selectors
 import shlex
 import shutil
@@ -4108,7 +4109,13 @@ def _run_windows_recovery_json(
     ):
         return document
     code = document.get("code")
-    if completed.returncode == 1 and document.get("passed") is False and isinstance(code, str) and code:
+    if (
+        completed.returncode == 1
+        and document.get("passed") is False
+        and document.get("verb") == expected_verb
+        and isinstance(code, str)
+        and code
+    ):
         raise RecoveryError(
             code,
             str(document.get("message") or "Windows recovery refused the operation"),
@@ -4195,14 +4202,50 @@ def _windows_scp(
     return destination
 
 
-def _create_remote_dir(*, ssh_host: str, remote_dir: str, timeout: int, commands: list[dict]) -> None:
+WINDOWS_REMOTE_OWNERSHIP_MEMBER = ".recovery-owner"
+
+
+def _create_remote_dir(
+    *,
+    ssh_host: str,
+    remote_dir: str,
+    ownership_token: str,
+    timeout: int,
+    commands: list[dict],
+) -> None:
+    require(
+        bool(HEX64.fullmatch(ownership_token)),
+        "windows_recovery_transport_unknown",
+        "the Windows recovery ownership token is malformed",
+    )
     quoted = _powershell_quote(remote_dir.replace("/", "\\"))
+    quoted_token = _powershell_quote(ownership_token)
     _require_windows_process(
         ssh_host=ssh_host,
         script=(
             "$ErrorActionPreference='Stop';"
             f"$dir={quoted};"
-            "New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null;"
+            f"$token={quoted_token};"
+            "$full=[System.IO.Path]::GetFullPath($dir);"
+            "if (Test-Path -LiteralPath $full) { throw 'the recovery directory already exists' };"
+            "$current=$full;"
+            "while ($current) {"
+            "  if (Test-Path -LiteralPath $current) {"
+            "    $item=Get-Item -LiteralPath $current -Force -ErrorAction Stop;"
+            "    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {"
+            "      throw ('the recovery directory crosses a reparse point: ' + $current)"
+            "    }"
+            "  };"
+            "  $parent=[System.IO.Path]::GetDirectoryName($current);"
+            "  if (-not $parent -or $parent -eq $current) { break };"
+            "  $current=$parent"
+            "};"
+            "$created=$false;"
+            "try {"
+            "  New-Item -ItemType Directory -Path $full -ErrorAction Stop | Out-Null;"
+            "  $created=$true;"
+            f"  $marker=Join-Path $full {_powershell_quote(WINDOWS_REMOTE_OWNERSHIP_MEMBER)};"
+            "  [System.IO.File]::WriteAllText($marker,$token,(New-Object System.Text.UTF8Encoding($false)));"
             "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;"
             "$security=New-Object System.Security.AccessControl.DirectorySecurity;"
             "$security.SetAccessRuleProtection($true,$false);"
@@ -4213,9 +4256,26 @@ def _create_remote_dir(*, ssh_host: str, remote_dir: str, timeout: int, commands
             "[System.Security.AccessControl.PropagationFlags]::None,"
             "[System.Security.AccessControl.AccessControlType]::Allow);"
             "$security.AddAccessRule($rule);"
-            "Set-Acl -LiteralPath $dir -AclObject $security -ErrorAction Stop;"
-            "$acl=Get-Acl -LiteralPath $dir -ErrorAction Stop;"
-            "if (-not $acl.AreAccessRulesProtected) { throw 'recovery directory ACL is not protected' }"
+            "  Set-Acl -LiteralPath $full -AclObject $security -ErrorAction Stop;"
+            "  $acl=Get-Acl -LiteralPath $full -ErrorAction Stop;"
+            "  if (-not $acl.AreAccessRulesProtected) { throw 'recovery directory ACL is not protected' };"
+            "  $leaf=Get-Item -LiteralPath $full -Force -ErrorAction Stop;"
+            "  if ($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {"
+            "    throw 'the recovery directory became a reparse point'"
+            "  }"
+            "} catch {"
+            "  if ($created -and (Test-Path -LiteralPath $full)) {"
+            f"    $marker=Join-Path $full {_powershell_quote(WINDOWS_REMOTE_OWNERSHIP_MEMBER)};"
+            "    if (Test-Path -LiteralPath $marker -PathType Leaf) {"
+            "      $observed=[System.IO.File]::ReadAllText("
+            "        $marker,(New-Object System.Text.UTF8Encoding($false)));"
+            "      if ($observed -ceq $token) {"
+            "        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue"
+            "      }"
+            "    }"
+            "  };"
+            "  throw"
+            "}"
         ),
         timeout=timeout,
         commands=commands,
@@ -4223,14 +4283,56 @@ def _create_remote_dir(*, ssh_host: str, remote_dir: str, timeout: int, commands
     )
 
 
-def _remove_remote_dir(*, ssh_host: str, remote_dir: str, timeout: int, commands: list[dict]) -> None:
+def _remove_remote_dir(
+    *,
+    ssh_host: str,
+    remote_dir: str,
+    ownership_token: str,
+    timeout: int,
+    commands: list[dict],
+) -> None:
+    require(
+        bool(HEX64.fullmatch(ownership_token)),
+        "windows_recovery_transport_unknown",
+        "the Windows recovery ownership token is malformed",
+    )
     quoted = _powershell_quote(remote_dir.replace("/", "\\"))
+    quoted_token = _powershell_quote(ownership_token)
     _require_windows_process(
         ssh_host=ssh_host,
         script=(
             "$ErrorActionPreference='Stop';"
-            f"if (Test-Path -LiteralPath {quoted}) {{ "
-            f"Remove-Item -LiteralPath {quoted} -Recurse -Force -ErrorAction Stop }}"
+            f"$dir={quoted};"
+            f"$token={quoted_token};"
+            "$full=[System.IO.Path]::GetFullPath($dir);"
+            "$current=$full;"
+            "while ($current) {"
+            "  if (Test-Path -LiteralPath $current) {"
+            "    $item=Get-Item -LiteralPath $current -Force -ErrorAction Stop;"
+            "    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {"
+            "      throw ('the recovery directory crosses a reparse point: ' + $current)"
+            "    }"
+            "  };"
+            "  $parent=[System.IO.Path]::GetDirectoryName($current);"
+            "  if (-not $parent -or $parent -eq $current) { break };"
+            "  $current=$parent"
+            "};"
+            "if (-not (Test-Path -LiteralPath $full)) { exit 0 };"
+            "$leaf=Get-Item -LiteralPath $full -Force -ErrorAction Stop;"
+            "if (-not $leaf.PSIsContainer -or "
+            "($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {"
+            "  throw 'the recovery directory is not a regular directory'"
+            "};"
+            f"$marker=Join-Path $full {_powershell_quote(WINDOWS_REMOTE_OWNERSHIP_MEMBER)};"
+            "if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {"
+            "  throw 'the recovery directory ownership marker is missing'"
+            "};"
+            "$owned=[System.IO.File]::ReadAllText("
+            "  $marker,(New-Object System.Text.UTF8Encoding($false)));"
+            "if ($owned -cne $token) {"
+            "  throw 'the recovery directory ownership marker differs'"
+            "};"
+            "Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop"
         ),
         timeout=timeout,
         commands=commands,
@@ -4267,6 +4369,7 @@ def _read_windows_state(bundle: Path) -> dict:
 
 def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
     expected_members = {row["member"]: row for row in state["members"]}
+    roles_by_member = {row["member"]: row["role"] for row in state["files"]}
     member_names = [row["member"] for row in state["members"]]
     file_members = [row["member"] for row in state["files"]]
     require(
@@ -4317,12 +4420,95 @@ def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
                     "Windows recovery member differs from its state",
                     {"member": name},
                 )
+                if roles_by_member[name] == "install_id":
+                    try:
+                        install_id = payload.decode("ascii").rstrip("\r\n")
+                    except UnicodeDecodeError as error:
+                        raise RecoveryError(
+                            "windows_recovery_bundle_invalid",
+                            "the Windows install identity is not ASCII",
+                        ) from error
+                    require(
+                        install_id == state["identity"]["install_id"],
+                        "windows_recovery_state_invalid",
+                        "the Windows install identity file and state differ",
+                    )
     except (OSError, zipfile.BadZipFile, KeyError) as error:
         raise RecoveryError(
             "windows_recovery_bundle_invalid",
             "the Windows recovery bundle is unreadable",
             {"error": str(error)},
         ) from error
+
+
+def _windows_acl_projection_sha256(projection: dict) -> str:
+    document = {
+        "owner_sid": projection["owner_sid"],
+        "group_sid": projection["group_sid"],
+        "protected": projection["protected"],
+        "sddl": projection["sddl"],
+        "rules": [
+            {
+                "sid": rule["sid"],
+                "access_type": rule["access_type"],
+                "rights": rule["rights"],
+                "inherited": rule["inherited"],
+                "inheritance": rule["inheritance"],
+                "propagation": rule["propagation"],
+            }
+            for rule in projection["rules"]
+        ],
+    }
+    payload = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_windows_acl_projection(value: object, label: str) -> None:
+    projection = _exact_keys(
+        value,
+        {"owner_sid", "group_sid", "protected", "sddl", "rules", "projection_sha256"},
+        label,
+    )
+    require(
+        isinstance(projection["owner_sid"], str)
+        and projection["owner_sid"].startswith("S-1-")
+        and isinstance(projection["group_sid"], str)
+        and projection["group_sid"].startswith("S-1-")
+        and type(projection["protected"]) is bool
+        and isinstance(projection["sddl"], str)
+        and bool(projection["sddl"])
+        and isinstance(projection["rules"], list)
+        and isinstance(projection["projection_sha256"], str)
+        and bool(HEX64.fullmatch(projection["projection_sha256"])),
+        "windows_recovery_state_invalid",
+        f"{label} is malformed",
+    )
+    for index, rule in enumerate(projection["rules"]):
+        exact = _exact_keys(
+            rule,
+            {"sid", "access_type", "rights", "inherited", "inheritance", "propagation"},
+            f"{label}.rules[{index}]",
+        )
+        require(
+            isinstance(exact["sid"], str)
+            and exact["sid"].startswith("S-1-")
+            and exact["access_type"] in {"Allow", "Deny"}
+            and type(exact["rights"]) is int
+            and type(exact["inherited"]) is bool
+            and type(exact["inheritance"]) is int
+            and type(exact["propagation"]) is int,
+            "windows_recovery_state_invalid",
+            f"{label}.rules[{index}] is malformed",
+        )
+    require(
+        projection["projection_sha256"] == _windows_acl_projection_sha256(projection),
+        "windows_recovery_state_invalid",
+        f"{label} digest differs from its contents",
+    )
 
 
 def _validate_windows_recovery_state(document: object) -> dict:
@@ -4532,26 +4718,9 @@ def _validate_windows_recovery_state(document: object) -> dict:
     for name, value in acl.items():
         if name == "roots":
             for root_name, projection in roots_acl.items():
-                require(
-                    isinstance(projection, dict)
-                    and set(projection)
-                    == {"owner_sid", "group_sid", "protected", "sddl", "rules", "projection_sha256"},
-                    "windows_recovery_state_invalid",
-                    f"Windows root ACL projection {root_name} is malformed",
-                )
-                require(
-                    isinstance(projection["owner_sid"], str)
-                    and projection["owner_sid"].startswith("S-1-")
-                    and isinstance(projection["group_sid"], str)
-                    and projection["group_sid"].startswith("S-1-")
-                    and type(projection["protected"]) is bool
-                    and isinstance(projection["sddl"], str)
-                    and bool(projection["sddl"])
-                    and isinstance(projection["rules"], list)
-                    and isinstance(projection["projection_sha256"], str)
-                    and bool(HEX64.fullmatch(projection["projection_sha256"])),
-                    "windows_recovery_state_invalid",
-                    f"Windows root ACL projection {root_name} is malformed",
+                _validate_windows_acl_projection(
+                    projection,
+                    f"windows state acl.roots.{root_name}",
                 )
             continue
         if value is None:
@@ -4561,42 +4730,10 @@ def _validate_windows_recovery_state(document: object) -> dict:
                 "only an absent CAD ledger may have a null ACL",
             )
             continue
-        projection = _exact_keys(
+        _validate_windows_acl_projection(
             value,
-            {"owner_sid", "group_sid", "protected", "sddl", "rules", "projection_sha256"},
             f"windows state acl.{name}",
         )
-        require(
-            isinstance(projection["owner_sid"], str)
-            and projection["owner_sid"].startswith("S-1-")
-            and isinstance(projection["group_sid"], str)
-            and projection["group_sid"].startswith("S-1-")
-            and type(projection["protected"]) is bool
-            and isinstance(projection["sddl"], str)
-            and bool(projection["sddl"])
-            and isinstance(projection["rules"], list)
-            and isinstance(projection["projection_sha256"], str)
-            and bool(HEX64.fullmatch(projection["projection_sha256"])),
-            "windows_recovery_state_invalid",
-            f"Windows ACL projection {name} is malformed",
-        )
-        for index, rule in enumerate(projection["rules"]):
-            exact = _exact_keys(
-                rule,
-                {"sid", "access_type", "rights", "inherited", "inheritance", "propagation"},
-                f"windows state acl.{name}.rules[{index}]",
-            )
-            require(
-                isinstance(exact["sid"], str)
-                and exact["sid"].startswith("S-1-")
-                and exact["access_type"] in {"Allow", "Deny"}
-                and type(exact["rights"]) is int
-                and type(exact["inherited"]) is bool
-                and type(exact["inheritance"]) is int
-                and type(exact["propagation"]) is int,
-                "windows_recovery_state_invalid",
-                f"Windows ACL rule {name}[{index}] is malformed",
-            )
     cad = _exact_keys(
         state["cad"],
         {
@@ -4703,6 +4840,30 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows_recovery_state_invalid",
         "Windows task XML file and task projection differ",
     )
+    files_by_role = {row["role"]: row for row in files}
+    require(
+        files_by_role["endpoint_config"]["path"] == identity["config_path"]
+        and files_by_role["endpoint_config"]["sha256"] == identity["config_sha256"]
+        and files_by_role["endpoint_token"]["path"] == identity["token_path"]
+        and files_by_role["endpoint_token"]["sha256"] == identity["token_sha256"]
+        and files_by_role["install_id"]["path"] == identity["install_id_path"],
+        "windows_recovery_state_invalid",
+        "Windows recovery file roles differ from the endpoint identity",
+    )
+    if cad["ledger_present"]:
+        require(
+            files_by_role.get("cad_ownership", {}).get("path") == cad["ownership_path"]
+            and files_by_role.get("cad_ownership", {}).get("sha256") == cad["ownership_sha256"]
+            and acl["cad_ownership"] is not None,
+            "windows_recovery_state_invalid",
+            "Windows CAD ownership file and ledger identity differ",
+        )
+    else:
+        require(
+            "cad_ownership" not in files_by_role and acl["cad_ownership"] is None,
+            "windows_recovery_state_invalid",
+            "an absent Windows CAD ledger must not carry a recovery file",
+        )
     members = state["members"]
     require(isinstance(members, list) and bool(members), "windows_recovery_state_invalid", "Windows members are empty")
     for index, row in enumerate(members):
@@ -4810,13 +4971,17 @@ def _transfer_windows_recovery(
         uploads = [script, binding]
         if upload_bundle is not None:
             uploads.append(upload_bundle)
+        ownership_token = secrets.token_hex(32)
+        remote_dir_owned = False
         try:
             _create_remote_dir(
                 ssh_host=ssh_host,
                 remote_dir=remote_dir,
+                ownership_token=ownership_token,
                 timeout=timeout,
                 commands=commands,
             )
+            remote_dir_owned = True
             _windows_scp(
                 ssh_host=ssh_host,
                 sources=uploads,
@@ -4872,12 +5037,14 @@ def _transfer_windows_recovery(
                 )
             return document
         finally:
-            _remove_remote_dir(
-                ssh_host=ssh_host,
-                remote_dir=remote_dir,
-                timeout=timeout,
-                commands=commands,
-            )
+            if remote_dir_owned:
+                _remove_remote_dir(
+                    ssh_host=ssh_host,
+                    remote_dir=remote_dir,
+                    ownership_token=ownership_token,
+                    timeout=timeout,
+                    commands=commands,
+                )
 
 
 def capture_windows_recovery(
