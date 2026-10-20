@@ -80,6 +80,29 @@ INPUT_WARNINGS = {
         }
     ],
 }
+PREVIEW_LIMIT_WARNING = {
+    "code": "limits.preview_policy",
+    "object": "joint:r_elbow",
+    "blocking": False,
+    "message": "inspection preview uses a versioned full-turn rotation window",
+    "detail": {
+        "objects": [
+            {
+                "object": "joint:r_elbow",
+                "object_type": "joint",
+                "field": "limits",
+                "source": "preview_policy",
+            }
+        ]
+    },
+}
+BLOCKING_QUALITY_DIAGNOSTIC = {
+    "code": "quality.required_failure",
+    "object": "joint:r_elbow",
+    "blocking": True,
+    "message": "a blocking quality diagnostic is never a warning",
+    "detail": {"field": "limits"},
+}
 
 
 class _PermissiveAirflow:
@@ -99,7 +122,13 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="diagnostic-preview-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def _registered_failed_verify(self, *, passed: bool = False) -> RegisteredPlatform:
+    def _registered_failed_verify(
+        self,
+        *,
+        passed: bool = False,
+        diagnostics: list[dict] | None = None,
+        state: str = "failed",
+    ) -> RegisteredPlatform:
         """The registered state a failing verify stage leaves: sealed members, failed receipt."""
         platform = RegisteredPlatform(self.tmp / "platform")
         platform.admit(RUN)
@@ -113,6 +142,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "passed": passed,
                 "subject_sha256": hashlib.sha256(URDF).hexdigest(),
                 "checks": FAILING_CHECKS,
+                "diagnostics": diagnostics or [],
             },
         )
         (tree / "input").mkdir()
@@ -126,7 +156,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         platform.stage(
             RUN,
             "verify",
-            state="failed",
+            state=state,
             receipt={
                 "subject_sha256": hashlib.sha256(URDF).hexdigest(),
                 "artifacts": members,
@@ -136,6 +166,115 @@ class DiagnosticPreviewTests(unittest.TestCase):
         return platform
 
     # ------------------------------------------------------------------ portal
+    def test_verified_preview_includes_registered_quality_warnings(self) -> None:
+        platform = self._registered_failed_verify(
+            passed=True,
+            state="completed",
+            diagnostics=[PREVIEW_LIMIT_WARNING],
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, DAG_RUN_ID)
+
+        self.assertIs(preview["verified"], True)
+        self.assertEqual(preview["warnings_total"], 1)
+        self.assertEqual(preview["warnings"][0]["source"], "quality")
+        self.assertEqual(preview["warnings"][0]["code"], "limits.preview_policy")
+        self.assertEqual(preview["warnings"][0]["object"], "joint:r_elbow")
+        self.assertEqual(preview["warnings"][0]["detail"], PREVIEW_LIMIT_WARNING["detail"])
+
+    def test_failed_preview_merges_and_deduplicates_quality_warnings(self) -> None:
+        duplicate = {
+            "code": INPUT_WARNINGS["warnings"][0]["code"],
+            "blocking": False,
+            "message": INPUT_WARNINGS["warnings"][0]["message"],
+            "detail": INPUT_WARNINGS["warnings"][0]["detail"],
+        }
+        platform = self._registered_failed_verify(
+            diagnostics=[PREVIEW_LIMIT_WARNING, duplicate, BLOCKING_QUALITY_DIAGNOSTIC]
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, DAG_RUN_ID)
+
+        self.assertEqual(
+            [row["code"] for row in preview["warnings"]],
+            [
+                "discovery.exporter_membership_uncovered",
+                "input.coordinate_systems_unverified",
+                "limits.preview_policy",
+            ],
+        )
+        self.assertEqual(preview["warnings_total"], 3)
+        self.assertEqual(
+            sum(row["code"] == "input.coordinate_systems_unverified" for row in preview["warnings"]),
+            1,
+        )
+        self.assertNotIn(BLOCKING_QUALITY_DIAGNOSTIC["code"], {row["code"] for row in preview["warnings"]})
+
+    def test_blocking_quality_diagnostics_are_not_preview_warnings(self) -> None:
+        platform = self._registered_failed_verify(
+            passed=True,
+            state="completed",
+            diagnostics=[BLOCKING_QUALITY_DIAGNOSTIC],
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, DAG_RUN_ID)
+
+        self.assertEqual(preview["warnings"], [])
+        self.assertEqual(preview["warnings_total"], 0)
+
+    def test_preview_limits_warnings_but_reports_the_full_total(self) -> None:
+        diagnostics = [
+            {
+                "code": f"quality.warning_{index:02d}",
+                "blocking": False,
+                "message": f"warning {index}",
+            }
+            for index in range(portal_module._PREVIEW_LIMIT + 1)
+        ]
+        platform = self._registered_failed_verify(
+            passed=True,
+            state="completed",
+            diagnostics=diagnostics,
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, DAG_RUN_ID)
+
+        self.assertEqual(len(preview["warnings"]), portal_module._PREVIEW_LIMIT)
+        self.assertEqual(preview["warnings_total"], portal_module._PREVIEW_LIMIT + 1)
+        self.assertEqual(preview["warnings"][0]["code"], "quality.warning_00")
+        self.assertEqual(
+            preview["warnings"][-1]["code"],
+            f"quality.warning_{portal_module._PREVIEW_LIMIT - 1:02d}",
+        )
+
     def test_portal_serves_the_retained_diagnostic_through_the_single_interface(self) -> None:
         platform = self._registered_failed_verify()
         app = portal_module.PortalApp(
@@ -162,8 +301,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertEqual(
             [(row["source"], row["code"]) for row in preview["warnings"]],
             [
-                ("input", "input.coordinate_systems_unverified"),
                 ("discovery", "discovery.exporter_membership_uncovered"),
+                ("input", "input.coordinate_systems_unverified"),
             ],
         )
         self.assertEqual(preview["warnings_total"], 2)

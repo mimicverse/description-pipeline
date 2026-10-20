@@ -288,6 +288,60 @@ def _delivery_warnings(members: dict) -> list[dict]:
     return warnings
 
 
+def _quality_warnings(report: dict | None) -> list[dict]:
+    """The displayable non-blocking diagnostics of the registered quality report."""
+
+    warnings: list[dict] = []
+    for item in _registered_source_rows(report or {}, "diagnostics", code_required=True):
+        if item.get("blocking") is True:
+            continue
+        warning = {
+            "source": "quality",
+            "code": str(item["code"]),
+            "object": str(item.get("object") or ""),
+            "message": str(item.get("message") or ""),
+            "detail": item.get("detail"),
+        }
+        for key in ("blocking", "objects"):
+            if key in item:
+                warning[key] = item[key]
+        warnings.append(warning)
+    return warnings
+
+
+def _canonical_warning_value(value: object) -> str:
+    """One stable comparison form for a JSON-shaped warning field."""
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _preview_warnings(*groups: list[dict]) -> list[dict]:
+    """Merge warning rows by display identity, then order them deterministically."""
+
+    unique: dict[tuple[str, str, str, str, str], dict] = {}
+    for row in (item for group in groups for item in group):
+        key = (
+            str(row.get("code") or ""),
+            str(row.get("object") or ""),
+            str(row.get("message") or ""),
+            _canonical_warning_value(row.get("detail")),
+            _canonical_warning_value(row.get("objects")),
+        )
+        unique.setdefault(key, row)
+
+    def order(row: dict) -> tuple[str, str, str, str, str, str]:
+        return (
+            str(row.get("code") or ""),
+            str(row.get("object") or ""),
+            str(row.get("message") or ""),
+            _canonical_warning_value(row.get("detail")),
+            _canonical_warning_value(row.get("objects")),
+            str(row.get("source") or ""),
+        )
+
+    return sorted(unique.values(), key=order)
+
+
 #: Readable labels for the automatically retained structural-team reports.
 _STRUCTURAL_REPORT_LABELS = {
     "reports/structural-team.md": "Structural-team report (readable Markdown)",
@@ -3108,27 +3162,38 @@ class PortalApp:
             "verified": verified,
             "state": "verified" if verified else "unverified",
         }
-        if not verified:
-            quality_member = members.get("reports/quality.json")
-            report = (
-                _parse_registered_json(self._registered_member_bytes("reports/quality.json", quality_member))
-                if isinstance(quality_member, dict)
-                else {}
+        quality_member = members.get("reports/quality.json")
+        quality = (
+            _parse_registered_json(self._registered_member_bytes("reports/quality.json", quality_member))
+            if isinstance(quality_member, dict)
+            else None
+        )
+        if verified:
+            warnings = _preview_warnings(_quality_warnings(quality))
+            payload.update(
+                {
+                    "warnings": warnings[:_PREVIEW_LIMIT],
+                    "warnings_total": len(warnings),
+                }
             )
-            if report.get("passed") is True:
+        else:
+            if quality is not None and quality.get("passed") is True:
                 # A failed-verify registration whose report claims success contradicts
                 # the registered stage outcome: the diagnostic is refused, while the
                 # failed products stay registered and downloadable.
                 raise PortalError(
                     HTTPStatus.BAD_GATEWAY, "Registered diagnostic report conflicts with the failed-stage registration"
                 )
-            failing = _failing_checks(report)
-            warnings = _delivery_warnings(
-                {
-                    path: self._registered_member_bytes(path, member)
-                    for path, member in members.items()
-                    if path in {"input/handoff.json", "evidence/discovery.json"}
-                }
+            failing = _failing_checks(quality or {})
+            warnings = _preview_warnings(
+                _quality_warnings(quality),
+                _delivery_warnings(
+                    {
+                        path: self._registered_member_bytes(path, member)
+                        for path, member in members.items()
+                        if path in {"input/handoff.json", "evidence/discovery.json"}
+                    }
+                ),
             )
             payload.update(
                 {
