@@ -3379,6 +3379,117 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         )
         self.assertEqual(self.world.operations[self.native_key][1], "cancelled")
 
+    def test_a_running_native_owner_closes_as_unknown_with_its_stage_evidence(self) -> None:
+        for confirmed_stage, stage_state in (
+            ("discover", "unresolved"),
+            ("discover", "cancelled"),
+            ("capture", "unresolved"),
+            ("capture", "cancelled"),
+        ):
+            with self.subTest(confirmed_stage=confirmed_stage, stage_state=stage_state):
+                self.setUp()
+                receipt = {
+                    "schema_version": "solidworks-to-urdf.bundle/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": self.run_id,
+                    "stage": confirmed_stage,
+                    "state": stage_state,
+                    "passed": False,
+                }
+                self.store.confirm_stage(
+                    run_id=self.run_id,
+                    stage=confirmed_stage,
+                    state=stage_state,
+                    receipt=receipt,
+                )
+                self.assertEqual(
+                    self.world.operations[self.native_key][1],
+                    "unresolved",
+                    "a running native side effect has no endpoint cancellation proof",
+                )
+                closures = [
+                    json.loads(payload) if isinstance(payload, str) else payload
+                    for _run_id, _seq, kind, _stage, operation_id, payload in self.world.events
+                    if kind == "native" and operation_id == self.native_id
+                ]
+                self.assertEqual(len(closures), 1)
+                self.assertEqual(closures[0]["stage"], confirmed_stage)
+                self.assertEqual(closures[0]["stage_state"], stage_state)
+                self.assertEqual(closures[0]["from_state"], "running")
+                self.assertEqual(closures[0]["to_state"], "unresolved")
+                self.assertEqual(closures[0]["receipt_sha256"], digest(receipt))
+                self.assertEqual(
+                    (closures[0]["dag_id"], closures[0]["task_id"], closures[0]["map_index"]),
+                    (DAG_ID, "discover", -1),
+                )
+
+    def test_an_unbound_running_native_owner_refuses_the_stage_closure(self) -> None:
+        self.world.operation_bindings.pop(self.native_id)
+        before = self.world.snapshot_state()
+        with self.assertRaisesRegex(
+            PlatformStoreError,
+            "bound native operation lacks its Airflow task binding",
+        ):
+            self.store.confirm_stage(
+                run_id=self.run_id,
+                stage="capture",
+                state="unresolved",
+                receipt={
+                    "schema_version": "solidworks-to-urdf.bundle/v1",
+                    "pipeline_id": PIPELINE_ID,
+                    "run_id": self.run_id,
+                    "stage": "capture",
+                    "state": "unresolved",
+                    "passed": False,
+                },
+            )
+        self.assertEqual(self.world.snapshot_state(), before, "the refused transaction preserves every original row")
+        self.assertEqual(self.world.operations[self.native_key][1], "running")
+
+    def test_unknown_native_closure_leaves_unrelated_running_operations_untouched(self) -> None:
+        same_stage_key = f"{self.run_id}/cache-release:9"
+        same_stage_id = "unrelated-same-stage"
+        self.world.operations[same_stage_key] = (
+            same_stage_id,
+            "running",
+            same_stage_key,
+            "1" * 64,
+            self.run_id,
+            "discover",
+            "cache_release",
+        )
+        self.world.operation_bindings[same_stage_id] = (DAG_ID, self.dag_run_id, None, None)
+        other_stage_key = f"{self.run_id}/native:1"
+        other_stage_id = "unrelated-other-stage"
+        self.world.operations[other_stage_key] = (
+            other_stage_id,
+            "running",
+            other_stage_key,
+            "2" * 64,
+            self.run_id,
+            "capture",
+            "native",
+        )
+        self.world.operation_bindings[other_stage_id] = (DAG_ID, self.dag_run_id, "capture", -1)
+
+        self.store.confirm_stage(
+            run_id=self.run_id,
+            stage="discover",
+            state="unresolved",
+            receipt={
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "pipeline_id": PIPELINE_ID,
+                "run_id": self.run_id,
+                "stage": "discover",
+                "state": "unresolved",
+                "passed": False,
+            },
+        )
+
+        self.assertEqual(self.world.operations[self.native_key][1], "unresolved")
+        self.assertEqual(self.world.operations[same_stage_key][1], "running")
+        self.assertEqual(self.world.operations[other_stage_key][1], "running")
+
     def test_native_success_settles_the_owner_before_capture_import(self) -> None:
         job = dict(self.document)
         job["status"] = "native_complete"
@@ -3525,6 +3636,38 @@ class ReportedFreezeActualDiscoverReconcileTests(unittest.TestCase):
         before = self.world.snapshot_state()
         self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
         self.assertEqual(self.world.snapshot_state(), before, "the repeated maintenance settlement is a no-op")
+
+    def test_completed_native_capture_recovery_is_a_state_first_noop(self) -> None:
+        self._prepare_capture_failure()
+        reconcile = self._capture_reconcile()
+        self.store.confirm_stage(run_id=self.run_id, stage="discover", state="failed", reconcile=reconcile)
+
+        before = self.world.snapshot_state()
+        result = self.store.completed_native_capture_recovery(
+            run_id=self.run_id,
+            operation_key=reconcile["operation_key"],
+            params_digest=reconcile["params_digest"],
+            owner_operation_id=self.native_id,
+        )
+
+        self.assertEqual(result["operation"]["state"], "succeeded")
+        self.assertEqual(result["stages"]["freeze"]["state"], "completed")
+        self.assertEqual(result["stages"]["discover"]["state"], "completed")
+        self.assertEqual(result["stages"]["capture"]["state"], "failed")
+        self.assertEqual(self.world.snapshot_state(), before, "the state-first read changes nothing")
+
+        stages = self.world.stages
+        capture = stages[(self.run_id, "capture")]
+        stages[(self.run_id, "capture")] = ("running", *capture[1:])
+        before = self.world.snapshot_state()
+        with self.assertRaisesRegex(PlatformStoreError, "terminal stage projection"):
+            self.store.completed_native_capture_recovery(
+                run_id=self.run_id,
+                operation_key=reconcile["operation_key"],
+                params_digest=reconcile["params_digest"],
+                owner_operation_id=self.native_id,
+            )
+        self.assertEqual(self.world.snapshot_state(), before)
 
     def test_capture_settlement_refuses_a_foreign_owner_binding(self) -> None:
         self._prepare_capture_failure()

@@ -268,14 +268,14 @@ def build_discovery_tree_from_prepared(
                 relative = "evidence/capture-plan.json"
             elif name == "discovery/native-discovery.json":
                 relative = "evidence/discovery.json"
+            elif name.startswith("discovery/"):
+                relative = f"evidence/discovery/{name.removeprefix('discovery/')}"
             elif name in native_names:
                 relative = f"input/cad/{name}"
             elif name.startswith("records/"):
                 relative = f"input/{name}"
             else:
-                relative = name if name.startswith("discovery/") else None
-                if relative is None:
-                    raise PipelineError(f"The prepared package carries an unknown member class: {name!r}")
+                raise PipelineError(f"The prepared package carries an unknown member class: {name!r}")
             target = confined(tree, relative, exists=False)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
