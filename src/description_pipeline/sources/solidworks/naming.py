@@ -54,13 +54,9 @@ _SEGMENT_BY_ROLE = {
 }
 
 _JOINT_BY_ROLE = {
-    "elbow": "elbow_pitch",
-    "waist": "waist_pitch",
     "thigh_yaw": "hip_yaw",
     "thigh_pitch": "hip_pitch",
     "thigh_roll": "hip_roll",
-    "knee": "knee_pitch",
-    "ankle": "ankle_pitch",
     "head_yaw": "neck_yaw",
     "head_pitch": "neck_pitch",
 }
@@ -128,34 +124,54 @@ def _role_token(native_name: str) -> tuple[str, str] | None:
     return None
 
 
-def _segment_for(role: str, outgoing_roles: list[str | None]) -> str | None:
+def _segment_for(
+    role: str,
+    outgoing: list[tuple[str, str] | None],
+    *,
+    side: str,
+) -> str | None:
+    entries = [entry for entry in outgoing if entry is not None]
     segment, expected = _SEGMENT_BY_ROLE[role]
     if not expected:
-        return segment if not outgoing_roles else None
+        return segment if not entries else None
     if role == "waist":
-        return segment if outgoing_roles and set(outgoing_roles) == set(expected) else None
-    return segment if outgoing_roles == list(expected) else None
+        return (
+            segment
+            if entries and all(item_role in expected for _item_side, item_role in entries)
+            else None
+        )
+    if len(entries) != len(expected) or [item_role for _item_side, item_role in entries] != list(expected):
+        return None
+    if any(item_side != side for item_side, _item_role in entries):
+        return None
+    return segment
 
 
-def role_link_name(native_joint: str, outgoing_roles: list[str | None]) -> str | None:
+def role_link_name(
+    native_joint: str,
+    outgoing: list[tuple[str, str] | None],
+) -> str | None:
     """Return the semantic child segment for a native joint role, if proven."""
 
     parsed = _role_token(native_joint)
     if parsed is None or parsed[1] not in _SEGMENT_BY_ROLE:
         return None
     side, role = parsed
-    segment = _segment_for(role, outgoing_roles)
+    segment = _segment_for(role, outgoing, side=side)
     return f"{side}{segment}_link" if segment is not None else None
 
 
-def role_joint_name(native_joint: str, outgoing_roles: list[str | None]) -> str | None:
+def role_joint_name(
+    native_joint: str,
+    outgoing: list[tuple[str, str] | None],
+) -> str | None:
     """Return the semantic joint name for a native function role, if proven."""
 
     parsed = _role_token(native_joint)
     if parsed is None or parsed[1] not in _JOINT_BY_ROLE:
         return None
     side, role = parsed
-    if _segment_for(role, outgoing_roles) is None:
+    if _segment_for(role, outgoing, side=side) is None:
         return None
     return f"{side}{_JOINT_BY_ROLE[role]}_joint"
 
@@ -165,6 +181,12 @@ def joint_role(native_joint: str) -> str | None:
 
     parsed = _role_token(native_joint)
     return parsed[1] if parsed is not None else None
+
+
+def joint_role_pair(native_joint: str) -> tuple[str, str] | None:
+    """Return the native joint's ``(side, role)`` pair."""
+
+    return _role_token(native_joint)
 
 
 def fixed_joint_name(parent: str, child: str) -> str:
@@ -341,9 +363,8 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
         parent = str(joint.get("parent") or "")
         child = str(joint.get("child") or "")
         parsed = _role_token(str(joint.get("name") or ""))
-        role = parsed[1] if parsed is not None else None
         if parent:
-            outgoing.setdefault(parent, []).append(role)
+            outgoing.setdefault(parent, []).append(parsed)
         if child:
             incoming[child] = joint
 
@@ -361,12 +382,16 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
             if joint is not None:
                 joint_source = str(joint.get("name") or "")
                 parsed = _role_token(joint_source)
+                material = body.get("components")
+                if not isinstance(material, list):
+                    material = body.get("owners")
+                has_material = isinstance(material, list) and bool(material)
                 try:
                     datum_token = token(semantic)
                     joint_token = token(joint_source)
                 except ValueError:
                     datum_token = joint_token = None
-                if datum_token == joint_token:
+                if datum_token == joint_token and has_material:
                     target = role_link_name(joint_source, outgoing.get(native, []))
             if target is None:
                 try:

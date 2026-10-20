@@ -121,19 +121,17 @@ def canonicalize_axis(
         }
 
     alignment = _dot(parent_axis, _PRINCIPAL[declared_motion])
-    verified = abs(alignment) >= threshold
     return {
-        "status": "local_class_aligned" if verified else "unverified",
+        "status": "unverified",
         "motion": declared_motion,
         "declared_motion": declared_motion,
         "local_principal": local_principal,
-        "classification_source": "name_local_axis_alignment",
+        "classification_source": "name_local_axis_diagnostic",
         "alignment": alignment,
         "parent_axis": parent_axis,
         "delivered_local_axis": local,
-        "reason": "declared motion matches the local mechanical axis"
-        if verified
-        else "declared motion does not match the local mechanical axis",
+        "reason": "declared motion token and local principal are diagnostic; "
+        "author positive semantics are not established",
         "rule_id": "direction.positive_semantics",
         "rule_version": "v3",
     }

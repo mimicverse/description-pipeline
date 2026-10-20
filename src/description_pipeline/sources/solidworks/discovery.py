@@ -2461,7 +2461,7 @@ def _apply_cad_names(
         carrier_names,
         joint_name as format_joint_name,
         link_name as format_link_name,
-        joint_role,
+        joint_role_pair,
         role_joint_name,
         role_link_name,
         token,
@@ -2479,7 +2479,7 @@ def _apply_cad_names(
             continue
         parent = str(joint.get("parent") or "")
         if parent:
-            outgoing.setdefault(parent, []).append(joint_role(str(joint.get("name") or "")))
+            outgoing.setdefault(parent, []).append(joint_role_pair(str(joint.get("name") or "")))
 
     for body in bodies:
         native = str(body["name"])
