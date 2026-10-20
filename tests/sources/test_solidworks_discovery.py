@@ -595,6 +595,22 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual((records / "budget.json").read_bytes(), replacement)
         self.assertTrue(self._verify(output)["passed"])
 
+    def test_source_revision_records_must_bind_embedded_records(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        self.assertTrue(payload["records"])
+        source_path = output / "source.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        self.assertTrue(source["identity"]["records"])
+        source["identity"]["records"] = []
+        source["source_revision_id"] = digest(source["identity"])
+        source_path.write_text(json.dumps(source), encoding="utf-8")
+        delivery = self._deliver(output)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.record_binding", {item["code"] for item in report["errors"]}, report["errors"])
+
     def test_rigid_accessory_preserves_the_joint_between_solved_bodies(self):
         def mutate(payload):
             accessory = copy.deepcopy(payload["components"][0])

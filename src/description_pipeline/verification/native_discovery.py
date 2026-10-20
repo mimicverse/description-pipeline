@@ -2792,6 +2792,16 @@ def verify_discovery(package: Path) -> dict:
             "the discovery record does not match the delivery manifest subject",
         )
         source = read_source_record(package)
+        expected_records = _source_record_identity(payload.get("records"))
+        _require(
+            source["identity"]["records"] == expected_records,
+            "discovery.record_binding",
+            "source revision record references do not match embedded controlled records",
+            {
+                "expected": expected_records,
+                "actual": source["identity"]["records"],
+            },
+        )
         request = _sealed_request(package)
         _require(
             request["main_assembly"] == source["selection"]["main_assembly"],
@@ -4438,6 +4448,29 @@ def _find_record_entry(payload: dict, reference: str) -> dict:
         "the referenced controlled record was not embedded in the package",
         {"reference": reference},
     )
+
+
+def _source_record_identity(records) -> list[dict]:
+    """Rebuild the source-revision record references from embedded evidence."""
+
+    bindings: dict[str, str] = {}
+    for entry in records or []:
+        _require(isinstance(entry, dict), "discovery.record", "embedded record entry is not an object")
+        reference = str(entry.get("reference") or "")
+        checksum = str(entry.get("sha256") or "")
+        _require(
+            bool(reference) and bool(checksum),
+            "discovery.record",
+            "embedded record lacks its reference or content digest",
+        )
+        _require(
+            reference not in bindings,
+            "discovery.record",
+            "embedded record reference is duplicated",
+            {"reference": reference},
+        )
+        bindings[reference] = checksum
+    return [{"reference": reference, "file_sha256": bindings[reference]} for reference in sorted(bindings)]
 
 
 # ---------------------------------------------------------------------------
