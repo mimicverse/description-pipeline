@@ -656,6 +656,24 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         limits = joint.get("limit")
         _require(isinstance(limits, dict), "v14.limits", "moving joint has no authored limit record", joint=name)
         raw_limits = dict(limits)
+        if joint["type"] == "continuous":
+            if any(raw_limits.get(key) is not None for key in ("lower", "upper")):
+                raise DeclarationError(
+                    "v14.native_limits_unexpected",
+                    "a continuous joint declares position limits",
+                    {"joint": name, "limits": raw_limits},
+                )
+            for mate in raw.get("mates") or []:
+                if not isinstance(mate, dict) or str(mate.get("name") or "").split("__", 1)[0] != name:
+                    continue
+                if mate.get("suppressed") is True:
+                    continue
+                if mate.get("is_advanced_mate") is True or mate.get("native_limit") is not None:
+                    raise DeclarationError(
+                        "v14.native_limits_unexpected",
+                        "a continuous joint has native position-limit evidence",
+                        {"joint": name, "mate": mate.get("name")},
+                    )
         invalid = [key for key in ("effort", "velocity") if not (_number(limits.get(key)) and limits[key] >= 0)]
         if joint["type"] in {"revolute", "prismatic"} and not (
             _number(limits.get("lower")) and _number(limits.get("upper")) and limits["lower"] <= limits["upper"]

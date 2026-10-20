@@ -766,6 +766,14 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("v14.native_limits_unreadable", {item["code"] for item in report["errors"]})
 
+    def test_continuous_joint_with_native_position_limit_is_rejected(self):
+        raw = fixture()
+        raw["exporter"]["raw_xml"] = raw["exporter"]["raw_xml"].replace(">revolute<", ">continuous<")
+        raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(raw["exporter"]["raw_xml"].encode()).hexdigest()
+        report = verify_declarations(raw, source_claims())
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_unexpected", {item["code"] for item in report["errors"]})
+
     def test_unresolved_internal_mates_do_not_refute_explicit_membership(self):
         raw = fixture()
         raw["mates"].append(lock("module-1/tool_part", "module-1/bracket", kind="unread"))
