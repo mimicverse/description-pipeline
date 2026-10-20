@@ -50,6 +50,7 @@ def permission(path: Path) -> int:
 PSQL = r"""#!/usr/bin/env python3
 import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
@@ -150,6 +151,11 @@ if query:
     if "'databases'" in query and "'roles'" in query:
         payload = {
             "server_version_num": "140024",
+            "data_directory": os.environ.get("RECOVERY_EXPECTED_DATA_DIR", ""),
+            "system_identifier": os.environ.get(
+                "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER",
+                "",
+            ),
             "databases": [],
             "roles": ["solidworks"],
         }
@@ -157,7 +163,14 @@ if query:
         "current_setting('server_version_num')" in query
         and "database_oid" not in query
     ):
-        payload = {"server_version_num": "140024"}
+        payload = {
+            "server_version_num": "140024",
+            "data_directory": os.environ.get("RECOVERY_EXPECTED_DATA_DIR", ""),
+            "system_identifier": os.environ.get(
+                "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER",
+                "",
+            ),
+        }
     elif "left(rolname, 3) <> 'pg_'" in query:
         payload = [
             "solidworks",
@@ -1015,6 +1028,8 @@ class RecoveryControlFlowTests(unittest.TestCase):
             self.assertIn("left(rolname, 3) <> 'pg_'", kwargs["query"])
             return {
                 "server_version_num": "140024",
+                "data_directory": str(data_dir.resolve()),
+                "system_identifier": "987654321",
                 "databases": [],
                 "roles": ["solidworks", "pga_extra"],
             }

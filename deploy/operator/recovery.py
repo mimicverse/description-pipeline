@@ -977,6 +977,7 @@ def psql(
     query: str | None = None,
     file: Path | None = None,
     password: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> str:
     argv = [
         context.bin_dir / "psql",
@@ -999,8 +1000,10 @@ def psql(
         argv.extend(["-c", query])
     if file is not None:
         argv.extend(["-f", file])
-    password_env = {"PGPASSWORD": password} if password is not None else {}
-    completed = context.run(argv, env=password_env)
+    command_env = dict(env or {})
+    if password is not None:
+        command_env["PGPASSWORD"] = password
+    completed = context.run(argv, env=command_env)
     return completed.stdout.strip()
 
 
@@ -1013,6 +1016,7 @@ def psql_json(
     database: str,
     query: str,
     password: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> object:
     output = psql(
         context,
@@ -1022,6 +1026,7 @@ def psql_json(
         database=database,
         query=query,
         password=password,
+        env=env,
     )
     try:
         return json.loads(output)
@@ -5779,12 +5784,19 @@ def target_empty_cluster(
         query=(
             "SELECT json_build_object("
             "'server_version_num', current_setting('server_version_num'),"
+            "'data_directory', current_setting('data_directory'),"
+            "'system_identifier', "
+            "(SELECT system_identifier::text FROM pg_control_system()),"
             "'databases', (SELECT COALESCE(json_agg(datname ORDER BY datname), "
             "'[]'::json) FROM pg_database WHERE datname NOT IN "
             "('postgres','template0','template1')),"
             "'roles', (SELECT COALESCE(json_agg(rolname ORDER BY rolname), "
             "'[]'::json) FROM pg_roles WHERE left(rolname, 3) <> 'pg_'))"
         ),
+        env={
+            "RECOVERY_EXPECTED_DATA_DIR": str(data_dir.resolve()),
+            "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER": controls["system_identifier"],
+        },
     )
     require(
         isinstance(status, dict)
@@ -5792,6 +5804,20 @@ def target_empty_cluster(
         and status["server_version_num"].startswith(POSTGRES_MAJOR),
         "recovery_postgres_version_mismatch",
         "target server is not PostgreSQL 14",
+    )
+    require(
+        isinstance(status.get("data_directory"), str)
+        and Path(status["data_directory"]).resolve() == data_dir.resolve()
+        and isinstance(status.get("system_identifier"), str)
+        and status["system_identifier"] == controls["system_identifier"],
+        "recovery_target_same_authority",
+        "the connected server is not the declared target cluster",
+        {
+            "expected_data_directory": str(data_dir.resolve()),
+            "actual_data_directory": status.get("data_directory"),
+            "expected_system_identifier": controls["system_identifier"],
+            "actual_system_identifier": status.get("system_identifier"),
+        },
     )
     require(
         status.get("databases") == [],
@@ -5846,8 +5872,15 @@ def target_restored_cluster(
         database="postgres",
         query=(
             "SELECT json_build_object("
-            "'server_version_num', current_setting('server_version_num'))"
+            "'server_version_num', current_setting('server_version_num'),"
+            "'data_directory', current_setting('data_directory'),"
+            "'system_identifier', "
+            "(SELECT system_identifier::text FROM pg_control_system()))"
         ),
+        env={
+            "RECOVERY_EXPECTED_DATA_DIR": str(data_dir.resolve()),
+            "RECOVERY_EXPECTED_SYSTEM_IDENTIFIER": controls["system_identifier"],
+        },
     )
     require(
         isinstance(status, dict)
@@ -5855,6 +5888,14 @@ def target_restored_cluster(
         and status["server_version_num"].startswith(POSTGRES_MAJOR),
         "recovery_postgres_version_mismatch",
         "target server is not PostgreSQL 14",
+    )
+    require(
+        isinstance(status.get("data_directory"), str)
+        and Path(status["data_directory"]).resolve() == data_dir.resolve()
+        and isinstance(status.get("system_identifier"), str)
+        and status["system_identifier"] == controls["system_identifier"],
+        "recovery_target_same_authority",
+        "the connected server is not the declared target cluster",
     )
     return controls
 
