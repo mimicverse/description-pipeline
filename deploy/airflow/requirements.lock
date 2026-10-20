@@ -34,7 +34,7 @@ click==8.5.0 --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3
 colorlog==6.12.0 --hash=sha256:30d392604e9110045a2c2aeefc27d7a017abbab63f3a8aee594eac0801df784e  # colorlog-6.12.0-py3-none-any.whl
 cron_descriptor==2.1.0 --hash=sha256:e280efae0e375e2cbc62846f833888f12c7921d2d11ab0dca598f94c51af8639  # cron_descriptor-2.1.0-py3-none-any.whl
 croniter==6.2.4 --hash=sha256:8ef3d544107a5c05a150a2d78f8bf5a8eb9c5c4d93405a736b824109574e3f4d  # croniter-6.2.4-py3-none-any.whl
-cryptography==50.0.1 --hash=sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a  # cryptography-50.0.1-cp311-abi3-manylinux_2_34_x86_64.whl
+cryptography==50.0.1 --hash=sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a --hash=sha256:51593d180cf6d179bde5c5d065bed81386b1f381656ae7d042b7ffc87a9895ad  # cryptography-50.0.1 ABI3 Linux wheels
 Deprecated==1.3.1 --hash=sha256:597bfef186b6f60181535a29fbe44865ce137a5079f295b479886c82729d5f3f  # deprecated-1.3.1-py2.py3-none-any.whl
 dill==0.4.1 --hash=sha256:1e1ce33e978ae97fcfcff5638477032b801c46c7c65cf717f95fbc2248f79a9d  # dill-0.4.1-py3-none-any.whl
 dnspython==2.8.0 --hash=sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af  # dnspython-2.8.0-py3-none-any.whl
