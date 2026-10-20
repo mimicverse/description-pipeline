@@ -19,6 +19,7 @@ from description_pipeline.sources.solidworks.naming import (
     mesh_path,
     neutral_link_name,
     robot_name,
+    role_link_name,
     token,
     visual_name,
 )
@@ -128,7 +129,7 @@ class NamingTests(unittest.TestCase):
             body_names,
             {
                 "base": "base_link",
-                "waist": "pelvis_link",
+                "waist": "waist_link",
                 "thigh_yaw": "right_hip_yaw_link",
                 "thigh_pitch": "right_thigh_link",
                 "thigh_roll": "right_hip_roll_link",
@@ -151,6 +152,174 @@ class NamingTests(unittest.TestCase):
                 "head_pitch": "neck_pitch_joint",
             },
         )
+
+    def test_waist_requires_one_thigh_yaw_per_side(self):
+        def names(outgoing):
+            bodies = [
+                {"name": "base", "frame": {"coordinate_system": "CS_base_link"}, "components": ["base"]},
+                {"name": "waist", "frame": {"coordinate_system": "c_waist"}, "components": ["waist"]},
+                *[
+                    {
+                        "name": f"leg{index}",
+                        "frame": {"coordinate_system": f"c_{side}thigh_yaw"},
+                        "components": [f"leg{index}"],
+                    }
+                    for index, side in enumerate(outgoing)
+                ],
+            ]
+            joints = [
+                {"name": "waist", "type": "revolute", "parent": "base", "child": "waist"},
+                *[
+                    {
+                        "name": f"{side}thigh_yaw",
+                        "type": "revolute",
+                        "parent": "waist",
+                        "child": f"leg{index}",
+                    }
+                    for index, side in enumerate(outgoing)
+                ],
+            ]
+            return carrier_names(bodies, joints, "base")[0]["waist"]
+
+        self.assertEqual(names(["r_", "l_"]), "pelvis_link")
+        self.assertEqual(names(["r_"]), "waist_link")
+        self.assertEqual(names(["r_", "r_"]), "waist_link")
+
+    def test_elbow_child_topology_must_share_the_joint_side(self):
+        bodies = [
+            {"name": "base", "frame": {"coordinate_system": "c_base_link"}, "components": ["base"]},
+            {"name": "forearm", "frame": {"coordinate_system": "c_r_elbow"}, "components": ["forearm"]},
+            {"name": "hand", "frame": {"coordinate_system": "c_l_wrist_pitch"}, "components": ["hand"]},
+        ]
+        joints = [
+            {"name": "r_elbow", "type": "revolute", "parent": "base", "child": "forearm"},
+            {"name": "l_wrist_pitch", "type": "revolute", "parent": "forearm", "child": "hand"},
+        ]
+        body_names, joint_names = carrier_names(bodies, joints, "base")
+        self.assertEqual(body_names["forearm"], "right_elbow_link")
+        self.assertEqual(joint_names["r_elbow"], "right_elbow_joint")
+
+    def test_unknown_topology_and_qualified_names_never_prove_a_role(self):
+        self.assertIsNone(role_link_name("r_ankle", [None]))
+        self.assertEqual(role_link_name("r_ankle", []), "right_foot_link")
+        self.assertIsNone(role_link_name("r_sensor_elbow", [("right_", "wrist_pitch")]))
+        self.assertEqual(
+            role_link_name("r_elbow", [("right_", "wrist_pitch")]),
+            "right_forearm_link",
+        )
+
+    def test_full_humanoid_topology_is_closed_and_exactly_named(self):
+        bodies = [{"name": "base", "frame": {"coordinate_system": "CS_base_link"}, "components": ["base"]}]
+        joints = []
+
+        def add_body(native, datum=None):
+            bodies.append(
+                {
+                    "name": native,
+                    "frame": {"coordinate_system": datum or f"c_{native}"},
+                    "components": [native],
+                }
+            )
+
+        def add_joint(native, parent, child):
+            joints.append({"name": native, "type": "revolute", "parent": parent, "child": child})
+
+        add_body("waist")
+        add_joint("waist", "base", "waist")
+        for side in ("r", "l"):
+            add_body(f"{side}_shoulder_pitch")
+            add_joint(f"{side}_shoulder_pitch", "base", f"{side}_shoulder_pitch")
+            for native, parent in (
+                ("shoulder_roll", "shoulder_pitch"),
+                ("shoulder_yaw", "shoulder_roll"),
+                ("elbow", "shoulder_yaw"),
+                ("wrist_pitch", "elbow"),
+            ):
+                add_body(f"{side}_{native}")
+                add_joint(f"{side}_{native}", f"{side}_{parent}", f"{side}_{native}")
+            add_body(f"{side}_thigh_yaw")
+            add_joint(f"{side}_thigh_yaw", "waist", f"{side}_thigh_yaw")
+            for native, parent in (
+                ("thigh_pitch", "thigh_yaw"),
+                ("thigh_roll", "thigh_pitch"),
+                ("knee", "thigh_roll"),
+                ("ankle", "knee"),
+            ):
+                add_body(f"{side}_{native}")
+                add_joint(f"{side}_{native}", f"{side}_{parent}", f"{side}_{native}")
+        add_body("head_yaw")
+        add_joint("head_yaw", "base", "head_yaw")
+        add_body("head_pitch")
+        add_joint("head_pitch", "head_yaw", "head_pitch")
+        add_body("sensor", "CS_sensor_housing_link")
+
+        body_names, joint_names = carrier_names(bodies, joints, "base")
+
+        self.assertEqual(
+            set(body_names.values()),
+            {
+                "base_link",
+                "pelvis_link",
+                "neck_yaw_link",
+                "head_link",
+                "sensor_housing_link",
+                "right_shoulder_pitch_link",
+                "right_upper_arm_link",
+                "right_shoulder_yaw_link",
+                "right_forearm_link",
+                "right_hand_link",
+                "left_shoulder_pitch_link",
+                "left_upper_arm_link",
+                "left_shoulder_yaw_link",
+                "left_forearm_link",
+                "left_hand_link",
+                "right_hip_yaw_link",
+                "right_thigh_link",
+                "right_hip_roll_link",
+                "right_shank_link",
+                "right_foot_link",
+                "left_hip_yaw_link",
+                "left_thigh_link",
+                "left_hip_roll_link",
+                "left_shank_link",
+                "left_foot_link",
+            },
+        )
+        self.assertEqual(
+            set(joint_names.values()),
+            {
+                "waist_joint",
+                "neck_yaw_joint",
+                "neck_pitch_joint",
+                "right_shoulder_pitch_joint",
+                "right_shoulder_roll_joint",
+                "right_shoulder_yaw_joint",
+                "right_elbow_joint",
+                "right_wrist_pitch_joint",
+                "left_shoulder_pitch_joint",
+                "left_shoulder_roll_joint",
+                "left_shoulder_yaw_joint",
+                "left_elbow_joint",
+                "left_wrist_pitch_joint",
+                "right_hip_yaw_joint",
+                "right_hip_pitch_joint",
+                "right_hip_roll_joint",
+                "right_knee_joint",
+                "right_ankle_joint",
+                "left_hip_yaw_joint",
+                "left_hip_pitch_joint",
+                "left_hip_roll_joint",
+                "left_knee_joint",
+                "left_ankle_joint",
+            },
+        )
+        self.assertEqual(len(body_names), 25)
+        self.assertEqual(len(joint_names), 23)
+        self.assertEqual(len(set(body_names.values())), 25)
+        self.assertEqual(len(set(joint_names.values())), 23)
+        for joint in joints:
+            self.assertIn(body_names[joint["parent"]], body_names.values())
+            self.assertIn(body_names[joint["child"]], body_names.values())
 
     def test_native_generic_names_are_formatted_once(self):
         self.assertEqual(token(" R_Shoulder Roll "), "right_shoulder_roll")

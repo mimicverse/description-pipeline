@@ -1933,7 +1933,12 @@ def _policy(source, model):
 def _value_warning_gate(root, source, model):
     """Re-derive every non-native value warning from source facts and the model."""
 
-    from ..sources.solidworks.naming import material_name, mesh_path, visual_name
+    from ..sources.solidworks.naming import (
+        carrier_names_and_rules,
+        material_name,
+        mesh_path,
+        visual_name,
+    )
 
     warnings = (model.get("provenance") or {}).get("value_warnings")
     _require(isinstance(warnings, list), "Non-native value provenance warnings are missing")
@@ -1959,6 +1964,60 @@ def _value_warning_gate(root, source, model):
     model_joints = model.get("joints") or []
     shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
 
+    # Re-derive the canonical names and their provenance from the native
+    # topology.  A source record's own name_rule claim is never trusted: the
+    # delivered names must be exactly what the shared pure rule emits, and the
+    # warning metadata is computed from the same rule, not copied from source.
+    output_to_native = {
+        str(body["name"]): str(body.get("source_name") or body["name"]) for body in bodies
+    }
+    native_bodies = [
+        {
+            "name": str(body.get("source_name") or body["name"]),
+            "frame": body.get("frame") or {},
+            "components": body.get("components"),
+            "owners": body.get("owners"),
+            "datum": body.get("datum"),
+        }
+        for body in bodies
+    ]
+    native_joints = [
+        {
+            "name": str(joint.get("source_name") or joint["name"]),
+            "type": joint.get("type"),
+            "parent": output_to_native.get(
+                str(joint.get("parent") or ""), str(joint.get("parent") or "")
+            ),
+            "child": output_to_native.get(
+                str(joint.get("child") or ""), str(joint.get("child") or "")
+            ),
+        }
+        for joint in joints
+    ]
+    native_root = next(
+        (
+            str(body.get("source_name") or body["name"])
+            for body in bodies
+            if body.get("name") == "base_link"
+        ),
+        "",
+    )
+    rederived_bodies, rederived_joints, body_rules, joint_rules = carrier_names_and_rules(
+        native_bodies, native_joints, native_root
+    )
+    for body in bodies:
+        native = str(body.get("source_name") or body["name"])
+        _require(
+            rederived_bodies.get(native) == body.get("name"),
+            "A link name is not the deterministic CAD-derived rule output",
+        )
+    for joint in joints:
+        native = str(joint.get("source_name") or joint["name"])
+        _require(
+            rederived_joints.get(native) == joint.get("name"),
+            "A joint name is not the deterministic CAD-derived rule output",
+        )
+
     expected: dict[str, list[dict]] = {}
 
     def add(code, value):
@@ -1967,7 +2026,7 @@ def _value_warning_gate(root, source, model):
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
         if source_name != body["name"]:
-            rule = body.get("name_rule") if isinstance(body.get("name_rule"), dict) else {}
+            rule = body_rules.get(source_name) or {}
             add(
                 "naming.formatted_interface",
                 {
@@ -1985,7 +2044,7 @@ def _value_warning_gate(root, source, model):
     for joint in joints:
         source_name = str(joint.get("source_name") or joint["name"])
         if source_name != joint["name"]:
-            rule = joint.get("name_rule") if isinstance(joint.get("name_rule"), dict) else {}
+            rule = joint_rules.get(source_name) or {}
             add(
                 "naming.formatted_interface",
                 {

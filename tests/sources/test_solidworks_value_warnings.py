@@ -221,6 +221,22 @@ class ValueWarningTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "digest"):
             _value_warning_gate(self.root, self.source, model)
 
+    def test_source_name_rule_claims_are_re_derived_not_trusted(self):
+        source = copy.deepcopy(self.source)
+        source["bodies"][0]["name_rule"] = {
+            "rule_id": "naming.fabricated",
+            "rule_version": "forged-v9",
+            "reason": "manual export",
+        }
+        model = copy.deepcopy(self.model)
+        model["provenance"]["value_warnings"][0]["objects"][0].update(
+            rule_id="naming.fabricated",
+            rule_version="forged-v9",
+            reason="manual export",
+        )
+        with self.assertRaises(PipelineError):
+            _value_warning_gate(self.root, source, model)
+
     def test_frame_warning_and_robot_source_name_are_rederived(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)

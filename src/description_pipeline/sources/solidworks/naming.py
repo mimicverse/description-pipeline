@@ -61,6 +61,18 @@ _JOINT_BY_ROLE = {
     "head_pitch": "neck_pitch",
 }
 
+_ROLE_SEGMENT_RULE = {
+    "rule_id": "naming.role_segment",
+    "rule_version": "naming-v1",
+    "reason": "joint-centric datum plus child-side moving-joint topology",
+}
+
+_ROLE_JOINT_RULE = {
+    "rule_id": "naming.role_joint",
+    "rule_version": "naming-v1",
+    "reason": "native joint function plus child-side moving-joint topology",
+}
+
 _ROLE_VOCABULARY = frozenset(_SEGMENT_BY_ROLE) | frozenset(
     role for _segment, outgoing in _SEGMENT_BY_ROLE.values() for role in outgoing
 )
@@ -119,7 +131,7 @@ def _role_token(native_name: str) -> tuple[str, str] | None:
             name = name[len(prefix) :]
             break
     for role in sorted(_ROLE_VOCABULARY, key=len, reverse=True):
-        if name == role or name.endswith("_" + role):
+        if name == role:
             return side, role
     return None
 
@@ -130,16 +142,22 @@ def _segment_for(
     *,
     side: str,
 ) -> str | None:
-    entries = [entry for entry in outgoing if entry is not None]
+    # An unrecognised outgoing joint is unknown topology, never absence: it
+    # cannot strengthen any segment proof (including a terminal role).
+    if any(entry is None for entry in outgoing):
+        return None
+    entries = list(outgoing)
     segment, expected = _SEGMENT_BY_ROLE[role]
     if not expected:
         return segment if not entries else None
     if role == "waist":
-        return (
-            segment
-            if entries and all(item_role in expected for _item_side, item_role in entries)
-            else None
-        )
+        # A pelvis rename requires a proven leg on both sides: exactly two
+        # thigh_yaw joints, one left and one right.  A single leg or a
+        # duplicated same-side entry never proves the segment.
+        sides = sorted(item_side for item_side, item_role in entries if item_role == "thigh_yaw")
+        if len(entries) != 2 or len(sides) != 2 or sides != ["left_", "right_"]:
+            return None
+        return segment
     if len(entries) != len(expected) or [item_role for _item_side, item_role in entries] != list(expected):
         return None
     if any(item_side != side for item_side, _item_role in entries):
@@ -346,13 +364,20 @@ def deduplicate_names(
     return result
 
 
-def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, str]]:
+def carrier_names_and_rules(
+    bodies, joints, root: str
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict], dict[str, dict]]:
     """Canonical link/joint names from native identities and joint topology.
 
     A semantic segment rename is allowed only when the body datum is the
     incoming joint's own alias and the child-side topology proves the segment.
     An independently compliant physical datum (for example
     ``CS_sensor_housing_link``) is preserved unchanged.
+
+    The returned rule dictionaries are the versioned provenance of every
+    semantic rename that survived collision disambiguation.  Producer and
+    verifier both consume this function so the delivered warning metadata is
+    re-derived from native topology instead of being trusted from the source.
     """
 
     incoming: dict[str, dict] = {}
@@ -369,6 +394,7 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
             incoming[child] = joint
 
     body_names: dict[str, str] = {}
+    semantic_links: dict[str, str] = {}
     for body in bodies:
         native = str(body["name"])
         frame = body.get("frame") if isinstance(body.get("frame"), dict) else {}
@@ -393,6 +419,8 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
                     datum_token = joint_token = None
                 if datum_token == joint_token and has_material:
                     target = role_link_name(joint_source, outgoing.get(native, []))
+                    if target is not None:
+                        semantic_links[native] = target
             if target is None:
                 try:
                     target = link_name(semantic)
@@ -404,6 +432,7 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
     body_names = deduplicate_names(body_names, "link", reserved=reserved)
 
     joint_names: dict[str, str] = {}
+    semantic_joints: dict[str, str] = {}
     for joint in joints:
         if "name" not in joint:
             continue
@@ -417,6 +446,8 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
             else:
                 child = str(joint.get("child") or "")
                 target = role_joint_name(native, outgoing.get(child, []))
+                if target is not None:
+                    semantic_joints[native] = target
                 if target is None:
                     target = joint_name(native)
         except ValueError:
@@ -427,4 +458,24 @@ def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, 
             except ValueError:
                 target = fallback_name("joint", native, semantic="joint")
         joint_names[native] = target
-    return body_names, deduplicate_names(joint_names, "joint")
+    joint_names = deduplicate_names(joint_names, "joint")
+    body_rules = {
+        native: dict(_ROLE_SEGMENT_RULE)
+        for native, target in semantic_links.items()
+        if body_names.get(native) == target
+    }
+    joint_rules = {
+        native: dict(_ROLE_JOINT_RULE)
+        for native, target in semantic_joints.items()
+        if joint_names.get(native) == target
+    }
+    return body_names, joint_names, body_rules, joint_rules
+
+
+def carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Return only the canonical carrier names (see ``carrier_names_and_rules``)."""
+
+    body_names, joint_names, _body_rules, _joint_rules = carrier_names_and_rules(
+        bodies, joints, root
+    )
+    return body_names, joint_names

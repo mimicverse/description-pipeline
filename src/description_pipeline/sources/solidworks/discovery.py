@@ -2458,67 +2458,38 @@ def _apply_cad_names(
     """Derive output names from CAD datums/reference axes through one rule."""
 
     from .naming import (
-        carrier_names,
+        carrier_names_and_rules,
         joint_name as format_joint_name,
         link_name as format_link_name,
-        joint_role_pair,
-        role_joint_name,
-        role_link_name,
-        token,
     )
 
-    body_names, joint_names = carrier_names(bodies, joints, str(root) if root is not None else "")
-    incoming = {
-        str(joint.get("child")): joint
-        for joint in joints
-        if joint.get("type") != "fixed" and joint.get("child")
-    }
-    outgoing: dict[str, list[str | None]] = {}
-    for joint in joints:
-        if joint.get("type") == "fixed":
-            continue
-        parent = str(joint.get("parent") or "")
-        if parent:
-            outgoing.setdefault(parent, []).append(joint_role_pair(str(joint.get("name") or "")))
+    body_names, joint_names, body_rules, joint_rules = carrier_names_and_rules(
+        bodies, joints, str(root) if root is not None else ""
+    )
 
     for body in bodies:
         native = str(body["name"])
         datum = str(body.get("datum") or "")
         semantic = datum or native
-        joint = incoming.get(native)
-        role_target = (
-            role_link_name(str(joint.get("name") or ""), outgoing.get(native, []))
-            if joint is not None
-            else None
-        )
-        if joint is not None and role_target == body_names[native]:
-            try:
-                alias_semantic = re.sub(r"^(?:c_|cs_)", "", semantic, flags=re.IGNORECASE)
-                alias = token(alias_semantic) == token(str(joint.get("name") or ""))
-            except ValueError:
-                alias = False
-            if alias:
-                body["name_rule"] = {
-                    "rule_id": "naming.role_segment",
-                    "rule_version": "naming-v1",
-                    "reason": "joint-centric datum plus child-side moving-joint topology",
-                }
-                findings.append(
-                    _finding(
-                        "discovery.interface_role_convention",
-                        f"body:{native}",
-                        "the link name follows the versioned joint-role and child-topology convention",
-                        {
-                            "datum": datum,
-                            "native": native,
-                            "output": body_names[native],
-                            "rule_id": "naming.role_segment",
-                            "rule_version": "naming-v1",
-                        },
-                        blocking=False,
-                    )
+        rule = body_rules.get(native)
+        if rule is not None:
+            body["name_rule"] = dict(rule)
+            findings.append(
+                _finding(
+                    "discovery.interface_role_convention",
+                    f"body:{native}",
+                    "the link name follows the versioned joint-role and child-topology convention",
+                    {
+                        "datum": datum,
+                        "native": native,
+                        "output": body_names[native],
+                        "rule_id": rule["rule_id"],
+                        "rule_version": rule["rule_version"],
+                    },
+                    blocking=False,
                 )
-                continue
+            )
+            continue
         try:
             datum_target = format_link_name(semantic, root=semantic == "base_link")
         except ValueError:
@@ -2539,18 +2510,9 @@ def _apply_cad_names(
         if "name" not in joint:
             continue
         native = str(joint["name"])
-        child = str(joint.get("child") or "")
-        role_target = (
-            role_joint_name(native, outgoing.get(child, []))
-            if joint.get("type") != "fixed"
-            else None
-        )
-        if role_target == joint_names[native]:
-            joint["name_rule"] = {
-                "rule_id": "naming.role_joint",
-                "rule_version": "naming-v1",
-                "reason": "native joint function plus child-side moving-joint topology",
-            }
+        rule = joint_rules.get(native)
+        if rule is not None:
+            joint["name_rule"] = dict(rule)
             findings.append(
                 _finding(
                     "discovery.interface_role_convention",
@@ -2559,8 +2521,8 @@ def _apply_cad_names(
                     {
                         "native": native,
                         "output": joint_names[native],
-                        "rule_id": "naming.role_joint",
-                        "rule_version": "naming-v1",
+                        "rule_id": rule["rule_id"],
+                        "rule_version": rule["rule_version"],
                     },
                     blocking=False,
                 )
