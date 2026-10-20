@@ -875,6 +875,7 @@ def _value_warnings(
     mappings = []
     motion_unresolved = []
     direction_unresolved = []
+    sign_reversals = []
     preview_limits = []
     visuals = []
     materials = []
@@ -916,6 +917,33 @@ def _value_warnings(
             )
         provenance = source_joint.get("axis_provenance")
         if isinstance(provenance, dict):
+            native_axis = provenance.get("native_direction")
+            output_axis = provenance.get("direction")
+            if (
+                provenance.get("direction_relation") == "author_sign_applied"
+                and isinstance(native_axis, list)
+                and isinstance(output_axis, list)
+                and len(native_axis) == 3
+                and len(output_axis) == 3
+                and all(
+                    abs(float(before) + float(after)) <= 1e-12
+                    for before, after in zip(native_axis, output_axis, strict=True)
+                )
+            ):
+                sign_reversals.append(
+                    {
+                        "object_type": "joint",
+                        "object": joint["name"],
+                        "field": "axis",
+                        "actual": joint["axis"],
+                        "source": "CAD author dp.joint.axis_sign",
+                        "original": native_axis,
+                        "rule_id": provenance.get("rule_id", "direction.native_axis_sign"),
+                        "rule_version": provenance.get("rule_version", "v1"),
+                        "reason": "CAD author sign reversal; q and ranges are reparameterized",
+                        "output_axis_assembly": output_axis,
+                    }
+                )
             direction = {
                 "object_type": "joint",
                 "object": joint["name"],
@@ -1046,6 +1074,17 @@ def _value_warnings(
                 "code": "direction.semantics_unresolved",
                 "message": "Authored CAD axes are preserved; functional positive motion is not proven.",
                 "objects": direction_unresolved,
+            }
+        )
+    if sign_reversals:
+        warnings.append(
+            {
+                "code": "direction.sign_reparameterized",
+                "message": (
+                    "CAD author axis signs select the positive direction; q and ranges are "
+                    "reparameterized with object-level provenance."
+                ),
+                "objects": sign_reversals,
             }
         )
     if preview_limits:

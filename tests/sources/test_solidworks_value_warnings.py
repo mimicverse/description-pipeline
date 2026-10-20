@@ -238,6 +238,113 @@ class ValueWarningTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             _value_warning_gate(self.root, source, model)
 
+    def test_author_sign_reversal_warning_is_derived_and_field_level(self):
+        source = copy.deepcopy(self.source)
+        provenance = {
+            "direction_relation": "author_sign_applied",
+            "rule_id": "direction.native_axis_sign",
+            "rule_version": "v1",
+            "native_direction": [0.0, 0.0, 1.0],
+            "direction": [0.0, 0.0, -1.0],
+        }
+        source["joints"] = [
+            {
+                "name": "arm_joint",
+                "source_name": "arm_joint",
+                "type": "revolute",
+                "parent": "base_link",
+                "child": "base_link",
+                "axis": [0.0, 0.0, -1.0],
+                "axis_provenance": provenance,
+            }
+        ]
+        model = copy.deepcopy(self.model)
+        model["joints"] = [{"name": "arm_joint", "axis": [0.0, 0.0, -1.0]}]
+        warnings = model["provenance"]["value_warnings"]
+        warnings.append(
+            {
+                "code": "direction.semantics_unresolved",
+                "message": "Authored CAD axes are preserved; functional positive motion is not proven.",
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "arm_joint",
+                        "field": "axis",
+                        "actual": [0.0, 0.0, -1.0],
+                        "source": "CAD signed axis and versioned positive-motion rule",
+                        "original": None,
+                        "rule_id": "direction.native_axis_sign",
+                        "rule_version": "v1",
+                        "reason": "author_sign_applied",
+                        "motion": None,
+                    }
+                ],
+            }
+        )
+        warnings.append(
+            {
+                "code": "direction.sign_reparameterized",
+                "message": (
+                    "CAD author axis signs select the positive direction; q and ranges are "
+                    "reparameterized with object-level provenance."
+                ),
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "arm_joint",
+                        "field": "axis",
+                        "actual": [0.0, 0.0, -1.0],
+                        "source": "CAD author dp.joint.axis_sign",
+                        "original": [0.0, 0.0, 1.0],
+                        "rule_id": "direction.native_axis_sign",
+                        "rule_version": "v1",
+                        "reason": "CAD author sign reversal; q and ranges are reparameterized",
+                        "output_axis_assembly": [0.0, 0.0, -1.0],
+                    }
+                ],
+            }
+        )
+        warnings.append(
+            {
+                "code": "naming.motion_unresolved",
+                "message": "Joint names without a CAD motion classification retain a neutral name.",
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "arm_joint",
+                        "field": "name",
+                        "actual": "arm_joint",
+                        "source": "neutral joint naming",
+                        "original": "arm_joint",
+                        "rule_id": "naming.joint_motion",
+                        "rule_version": "naming-v1",
+                        "reason": "motion classification unavailable",
+                    }
+                ],
+            }
+        )
+        next(
+            item for item in warnings if item["code"] == "geometry.derived_from_native"
+        )["objects"].append(
+            {
+                "object_type": "joint",
+                "object": "arm_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        result = _value_warning_gate(self.root, source, model)
+        self.assertIn("direction.sign_reparameterized", result["codes"])
+        tampered = copy.deepcopy(model)
+        next(
+            item
+            for item in tampered["provenance"]["value_warnings"]
+            if item["code"] == "direction.sign_reparameterized"
+        )["objects"][0]["original"] = [0.0, 0.0, -1.0]
+        with self.assertRaises(PipelineError):
+            _value_warning_gate(self.root, source, tampered)
+
     def test_carrier_binding_rejects_tampered_names_members_and_topology(self):
         carrier = {
             "root": "CS_base_link",

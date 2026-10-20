@@ -69,6 +69,10 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.link_name_missing": "Rigid-body coordinate system is unidentified",
     "discovery.joint_unsupported_pattern": "Recorded constraints do not identify a one-DOF joint",
     "discovery.joint_axis_sign_missing": "dp.joint.axis_sign (+/-1) is missing",
+    "discovery.direction_sign_reversed": "CAD author axis sign is applied; q and ranges are reparameterized",
+    "direction.sign_reparameterized": (
+        "CAD author axis sign selects the positive direction; linked fields are reparameterized"
+    ),
     "discovery.interface_name_invalid": "CAD interface name was normalized with a warning",
     "discovery.interface_motion_unresolved": "CAD joint motion is unclassified; a neutral name is retained",
     "direction.semantics_unresolved": "Authored CAD axis is preserved; functional positive motion is not proven",

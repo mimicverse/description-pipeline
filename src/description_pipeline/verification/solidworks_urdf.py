@@ -2171,6 +2171,34 @@ def _value_warning_gate(root, source, model):
                 None,
             )
             _require(model_joint is not None, "A canonical joint is missing from the model")
+            native_axis = provenance.get("native_direction")
+            output_axis = provenance.get("direction")
+            if (
+                provenance.get("direction_relation") == "author_sign_applied"
+                and isinstance(native_axis, list)
+                and isinstance(output_axis, list)
+                and len(native_axis) == 3
+                and len(output_axis) == 3
+                and all(
+                    abs(float(before) + float(after)) <= 1e-12
+                    for before, after in zip(native_axis, output_axis, strict=True)
+                )
+            ):
+                add(
+                    "direction.sign_reparameterized",
+                    {
+                        "object_type": "joint",
+                        "object": joint["name"],
+                        "field": "axis",
+                        "actual": model_joint.get("axis"),
+                        "source": "CAD author dp.joint.axis_sign",
+                        "original": native_axis,
+                        "rule_id": provenance.get("rule_id", "direction.native_axis_sign"),
+                        "rule_version": provenance.get("rule_version", "v1"),
+                        "reason": "CAD author sign reversal; q and ranges are reparameterized",
+                        "output_axis_assembly": output_axis,
+                    },
+                )
             row = {
                 "object_type": "joint",
                 "object": joint["name"],
@@ -2385,6 +2413,10 @@ def _value_warning_gate(root, source, model):
         ),
         "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
         "direction.semantics_unresolved": "Authored CAD axes are preserved; functional positive motion is not proven.",
+        "direction.sign_reparameterized": (
+            "CAD author axis signs select the positive direction; q and ranges are "
+            "reparameterized with object-level provenance."
+        ),
         "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
         "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
         "naming.derived_material": "Material names are derived from the owner link and native component identity.",
@@ -2398,7 +2430,11 @@ def _value_warning_gate(root, source, model):
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
     }
-    _require(set(actual) == set(expected), "Non-native value provenance warning classes differ from the delivery")
+    _require(
+        set(actual) == set(expected),
+        "Non-native value provenance warning classes differ from the delivery: "
+        f"actual={sorted(actual)} expected={sorted(expected)}",
+    )
     _require(
         {code: Counter(values) for code, values in actual_messages.items()}
         == {code: Counter([messages[code]]) for code in expected},
@@ -2412,6 +2448,17 @@ def _value_warning_gate(root, source, model):
     return {
         "codes": sorted(actual),
         "objects": sum(len(rows) for rows in actual.values()),
+        "direction_sign_warnings": [
+            {
+                "object": row.get("object"),
+                "original": row.get("original"),
+                "actual": row.get("actual"),
+                "rule_id": row.get("rule_id"),
+                "rule_version": row.get("rule_version"),
+                "reason": row.get("reason"),
+            }
+            for row in expected.get("direction.sign_reparameterized", [])
+        ],
     }
 
 

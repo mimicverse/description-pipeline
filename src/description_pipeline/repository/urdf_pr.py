@@ -513,12 +513,21 @@ def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
         if isinstance(provenance, dict) and provenance.get("codes")
         else ""
     )
+    sign_lines = "".join(
+        f"- direction sign `{row.get('object')}`: "
+        f"`{json.dumps(row.get('original'), separators=(',', ':'))}` -> "
+        f"`{json.dumps(row.get('actual'), separators=(',', ':'))}` "
+        f"({row.get('rule_id')}/{row.get('rule_version')}); {row.get('reason')}\n"
+        for row in (provenance.get("direction_sign_warnings") or [])
+        if isinstance(row, dict)
+    )
     return (
         f"Automatic SolidWorks-to-URDF publication.\n\n"
         f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
         f"- purpose: `{purpose}`\n"
         f"- verifier: recomputed, passed ({len(checks)} checks)\n"
         f"{provenance_line}"
+        f"{sign_lines}"
         f"{qualification_lines}"
     )
 

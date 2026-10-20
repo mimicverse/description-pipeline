@@ -912,6 +912,35 @@ class PublishTests(unittest.TestCase):
             qualification_lines(forward),
         )
 
+    def test_pr_body_carries_object_level_author_sign_warning(self) -> None:
+        report = {
+            "checks": [
+                {
+                    "id": "provenance.value_warnings",
+                    "state": "passed",
+                    "details": {
+                        "codes": ["direction.sign_reparameterized"],
+                        "objects": 1,
+                        "direction_sign_warnings": [
+                            {
+                                "object": "arm_joint",
+                                "original": [0, 0, 1],
+                                "actual": [0, 0, -1],
+                                "rule_id": "direction.native_axis_sign",
+                                "rule_version": "v1",
+                                "reason": "CAD author sign reversal; q and ranges are reparameterized",
+                            }
+                        ],
+                    },
+                }
+            ],
+            "qualifications": [],
+        }
+        body = urdf_pr._body("subject", "commit", report, "engineering")
+        self.assertIn("- direction sign `arm_joint`", body)
+        self.assertIn("`[0,0,1]` -> `[0,0,-1]`", body)
+        self.assertIn("direction.native_axis_sign/v1", body)
+
 
 if __name__ == "__main__":
     unittest.main()

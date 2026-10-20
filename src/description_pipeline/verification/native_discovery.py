@@ -2314,8 +2314,10 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             {"pair": [left, right], "value": sign_value},
         )
         native_direction = [float(value) for value in shaft]
-        # The author sign stays unapplied until an approved direction rule
-        # carries the required object-level warning and linked-field record.
+        # dp.joint.axis_sign is the CAD author's direction declaration on the
+        # undirected geometric axis; the producer records the reversal warning.
+        if sign == -1:
+            native_direction = [-value for value in native_direction]
         cylinder = next(
             (
                 item
@@ -3991,9 +3993,10 @@ def verify_discovery(package: Path) -> dict:
                 {"value": sign_value},
             )
             native = [float(value) for value in shaft]
-            # A sign reversal stays unapplied until the direction rule and its
-            # evidence are approved; the rebuild preserves the native shaft so
-            # producer and verifier cannot silently disagree.
+            # The same CAD author declaration is applied here so producer and
+            # verifier cannot silently disagree.
+            if sign_value in (-1, "-1"):
+                native = [-value for value in native]
             local = _local_axis(frame, native)
             norm = math.sqrt(sum(value * value for value in local))
             _require(norm > 0, "discovery.joints", "the child frame collapses the joint axis")

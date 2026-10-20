@@ -1878,20 +1878,47 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             continue
         native_direction = [float(value) for value in shaft]
         if sign == -1:
-            # An author sign reversal is not applied until the direction rule
-            # and its evidence are approved.  Preserve the native shaft and
-            # report the unapplied sign instead of silently flipping it.
+            # dp.joint.axis_sign is the CAD author's direction declaration on
+            # the undirected geometric axis.  Apply it, but never silently:
+            # record the object-level reversal and its linked fields.
+            native_direction = [-value for value in native_direction]
             findings.append(
                 _finding(
-                    "discovery.direction_sign_unapproved",
+                    "discovery.direction_sign_reversed",
                     obj,
-                    "dp.joint.axis_sign=-1 is recorded but not applied; the direction rule is not approved",
+                    "dp.joint.axis_sign=-1 selects the CAD author positive direction",
                     {
-                        "native_sign": sign,
-                        "native_shaft": native_direction,
-                        "applied": False,
-                        "rule_id": "direction.author_sign",
-                        "rule_version": "pending",
+                        "native_identity": obj,
+                        "original_axis_assembly": [float(value) for value in shaft],
+                        "output_axis_assembly": native_direction,
+                        "original_frame": "assembly",
+                        "output_frame": "assembly; the joint record transforms it to the child frame",
+                        "reason": "CAD author dp.joint.axis_sign=-1",
+                        "rule_id": "direction.native_axis_sign",
+                        "rule_version": "v1",
+                        "applicability_evidence": {
+                            "property": f"{NAMESPACE}.joint.axis_sign",
+                            "value": sign,
+                            "joint_type": joint_type,
+                            "native_shaft": [float(value) for value in shaft],
+                        },
+                        "before_after": {
+                            "q_sign": -1,
+                            "axis": {
+                                "before": [float(value) for value in shaft],
+                                "after": native_direction,
+                            },
+                            "limits": "unchanged; pure coordinate reparameterization",
+                            "drive": "unchanged; non-negative magnitude fields are not negated",
+                        },
+                        "delivery_surfaces": {
+                            "report": "quality diagnostics",
+                            "urdf_source_record": "axis provenance",
+                            "preview": "quality diagnostics",
+                            "pr": "fixed-head evidence",
+                        },
+                        "warning_does_not_authorize": True,
+                        "warning_does_not_replace_evidence": True,
                     },
                     blocking=False,
                 )
@@ -2111,6 +2138,11 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     "source": "mate",
                     "native_direction": [float(value) for value in shaft],
                     "direction_relation": "author_sign_applied",
+                    "native_sign": sign,
+                    "sign_reversal": sign == -1,
+                    "sign_warning": "discovery.direction_sign_reversed" if sign == -1 else None,
+                    "original_frame": "assembly",
+                    "output_frame": "assembly",
                     "rule_id": "direction.native_axis_sign",
                     "rule_version": "v1",
                 },
