@@ -19,6 +19,7 @@ from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
 )
+from ..sources.solidworks.native_limits import validate_native_limit
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
@@ -665,6 +666,15 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         native_complete = False
                         continue
                     if flag is True:
+                        try:
+                            lower, upper, unit = validate_native_limit(mate, state.get("components"))
+                        except ValueError:
+                            native_complete = False
+                            continue
+                        expected_unit = "m" if joint["type"] == "prismatic" else "rad"
+                        if unit != expected_unit:
+                            native_complete = False
+                            continue
                         if isinstance(mate.get("native_limit"), dict) and isinstance(mate.get("limits"), dict):
                             range_candidate = True
                         else:
@@ -717,7 +727,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                             "mate": mate_name,
                             "type": mate_type,
                             "is_advanced_mate": mate.get("is_advanced_mate"),
-                            "limits": mate["limits"],
+                            "limits": {"lower": lower, "upper": upper, "unit": unit},
                         }
                     )
             if not native_complete:

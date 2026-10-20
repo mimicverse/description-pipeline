@@ -1338,6 +1338,47 @@ def native_hinge_mates(
     ]
 
 
+def native_limit_observation(
+    type_index: int,
+    *,
+    nominal: float,
+    lower: float,
+    upper: float,
+) -> dict:
+    """One complete raw native-limit record for a limit angle/distance mate."""
+
+    if type_index == 6:
+        unit = "rad"
+        interface = "IAngleMateFeatureData"
+        iid = "{EF4303D7-B4FD-46E7-AD34-D942C420E096}"
+        nominative, minimum, maximum = "Angle", "MinimumAngle", "MaximumAngle"
+    elif type_index == 5:
+        unit = "m"
+        interface = "IDistanceMateFeatureData"
+        iid = "{943EED8D-E13B-4459-BD59-EBCC3F60B915}"
+        nominative, minimum, maximum = "Distance", "MinimumDistance", "MaximumDistance"
+    else:
+        raise ValueError("unsupported native limit type")
+    return {
+        "type_index": type_index,
+        "definition_interface": interface,
+        "definition_interface_iid": iid,
+        "nominal_dimension": {"value": float(nominal), "api": f"{interface}.{nominative}", "unit": unit},
+        "minimum_variation": {
+            "value": float(lower) - nominal,
+            "api": "IMate2.MinimumVariation",
+            "unit": unit,
+        },
+        "maximum_variation": {
+            "value": float(upper) - nominal,
+            "api": "IMate2.MaximumVariation",
+            "unit": unit,
+        },
+        "minimum_limit": {"value": float(lower), "api": f"{interface}.{minimum}", "unit": unit},
+        "maximum_limit": {"value": float(upper), "api": f"{interface}.{maximum}", "unit": unit},
+    }
+
+
 def native_limit_mate(
     left: str,
     right: str,
@@ -1349,6 +1390,7 @@ def native_limit_mate(
 ) -> dict:
     """One enabled angular limit mate beside a hinge's solved constraint pair."""
 
+    native_limit = native_limit_observation(6, nominal=0.0, lower=lower, upper=upper)
     return {
         "name": f"{name}__limit",
         "type": "limitangle",
@@ -1357,16 +1399,26 @@ def native_limit_mate(
         "scope": "",
         "limits": {"lower": float(lower), "upper": float(upper), "unit": "rad"},
         "is_advanced_mate": True,
-        "native_limit": {"type_index": 6},
+        "is_advanced_mate_error": None,
+        "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+        "native_limit": native_limit,
         "entities": [
             {
+                "entity_index": 0,
                 "component": str(left),
+                "reference_configuration": "Default",
                 "feature": "LimitPlane1",
+                "face_index": None,
+                "mate_entity_reference": {"error": None, "geometry": None},
                 "plane": {"point": [float(value) for value in point], "normal": [0.0, 0.0, 1.0]},
             },
             {
+                "entity_index": 1,
                 "component": str(right),
+                "reference_configuration": "Default",
                 "feature": "LimitPlane2",
+                "face_index": None,
+                "mate_entity_reference": {"error": None, "geometry": None},
                 "plane": {"point": [float(value) for value in point], "normal": [0.0, 0.0, 1.0]},
             },
         ],

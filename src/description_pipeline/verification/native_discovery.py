@@ -51,6 +51,7 @@ from ..sources.solidworks.session_artifacts import (
     session_materialization_under_root,
     session_root_pid,
 )
+from ..sources.solidworks.native_limits import validate_native_limit
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -2178,6 +2179,11 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
 
     payload = record if isinstance(record.get("raw"), dict) else {"raw": record}
     raw = payload["raw"]
+    component_records = {
+        str(item.get("name2")): item
+        for item in raw.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
     namespace = str(payload.get("namespace") or "dp")
     frozen = payload.get("derived_interface_names") or {}
     bodies = rebuild_rigid_bodies(raw)
@@ -2337,6 +2343,59 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         limit_evidence = None
         limit_source = None
         native_limits = group["limits"]
+        validated_native = set()
+        for mate_item in mates:
+            mate_kind = str(mate_item.get("type") or "").strip().lower()
+            if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                continue
+            if mate_item.get("suppressed") is True:
+                continue
+            _require(
+                mate_item.get("suppressed") is False and mate_item.get("error_code") == 0,
+                "discovery.joint_limits_unreadable",
+                "native limit suppression or solve state is not clean",
+                {"pair": [left, right], "mate": mate_item.get("name")},
+            )
+            flag = mate_item.get("is_advanced_mate")
+            _require(
+                type(flag) is bool and mate_item.get("is_advanced_mate_error") is None,
+                "discovery.joint_limits_unreadable",
+                "IsAdvancedMate is missing or unreadable",
+                {"pair": [left, right], "mate": mate_item.get("name")},
+            )
+            if flag is not True:
+                continue
+            _require(
+                mate_kind in {"limitdistance", "limitangle"},
+                "discovery.joint_limits_unreadable",
+                "advanced flag is attached to a standard mate",
+                {"pair": [left, right], "mate": mate_item.get("name")},
+            )
+            try:
+                lower, upper, unit = validate_native_limit(mate_item, component_records)
+            except ValueError as error:
+                raise _Failure(
+                    "discovery.joint_limits_unreadable",
+                    str(error),
+                    {"pair": [left, right], "mate": mate_item.get("name")},
+                ) from error
+            expected_unit = "m" if joint_type == "prismatic" else "rad"
+            _require(
+                unit == expected_unit,
+                "discovery.joint_limits_unreadable",
+                "native limit unit does not match the joint type",
+                {"pair": [left, right], "unit": unit, "expected": expected_unit},
+            )
+            validated_native.add((lower, upper, unit))
+        _require(
+            len(validated_native) <= 1,
+            "discovery.joint_limits_conflict",
+            "native position-limit observations disagree for one joint",
+            {"pair": [left, right], "ranges": sorted(validated_native)},
+        )
+        if validated_native:
+            lower, upper, unit = next(iter(validated_native))
+            native_limits = {"lower": lower, "upper": upper, "unit": unit}
         if joint_type == "continuous":
             _require(
                 not isinstance(native_limits, dict),

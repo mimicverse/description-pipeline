@@ -632,9 +632,26 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 "type": "limitangle",
                 "suppressed": False,
                 "is_advanced_mate": True,
-                "native_limit": {"type_index": 6},
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                "native_limit": support.native_limit_observation(6, nominal=0.0, lower=-2.0, upper=2.0),
                 "error_code": 0,
-                "entities": [{"component": "base-1"}, {"component": "arm-1"}],
+                "entities": [
+                    {
+                        "entity_index": 0,
+                        "component": "base-1",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane1",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                    },
+                    {
+                        "entity_index": 1,
+                        "component": "arm-1",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane2",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                    },
+                ],
                 "limits": limits,
             }
         ]

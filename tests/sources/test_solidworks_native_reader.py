@@ -669,6 +669,7 @@ class MateRecordTests(unittest.TestCase):
                     "is_advanced_mate_error",
                     "is_advanced_mate_api",
                     "native_limit",
+                    "entity_count",
                     "entities",
                     "error_code",
                     "scope",
@@ -685,10 +686,11 @@ class MateRecordTests(unittest.TestCase):
             self.assertEqual(entity["component"], "base-1")
             self.assertEqual(entity["feature"], "Plane1")
             self.assertEqual(entity["plane"], PLANE_XY)
-            self.assertEqual(mates["swing_limit"]["type"], "limitangle")
-            self.assertEqual(mates["swing_limit"]["limits"], {"lower": -0.1, "upper": 0.2, "unit": "rad"})
+            self.assertEqual(mates["swing_limit"]["type"], "angle")
+            self.assertIsNone(mates["swing_limit"]["limits"])
+            self.assertIsNone(mates["swing_limit"]["native_limit"])
             self.assertIs(mates["swing_limit"]["suppressed"], True)
-            self.assertEqual(mates["swing_limit"]["entities"][0]["cylinder"], CYLINDER_Z)
+            self.assertEqual(mates["swing_limit"]["entities"], [])
             self.assertEqual(mates["travel_open"]["type"], "distance")
             self.assertIsNone(mates["travel_open"]["limits"])
             self.assertEqual(mates["locked_seat"]["type"], "lock")
@@ -739,6 +741,32 @@ class MateRecordTests(unittest.TestCase):
             self.assertIsNone(mates["unknown_state"]["limits"])
             self.assertIsNone(mates["unknown_state"]["is_advanced_mate"])
             self.assertTrue(mates["unknown_state"]["is_advanced_mate_error"])
+
+    def test_limit_mate_composes_nominal_and_variation_into_absolute_bounds(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            plane_entity = _MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))
+            definition = types.SimpleNamespace(
+                IsAdvancedMate=True,
+                Distance=0.05,
+                MinimumDistance=0.04,
+                MaximumDistance=0.07,
+            )
+            specific = _MateSpecific(5, [plane_entity], lower=-0.01, upper=0.02)
+            feature = _Feature("travel_limit", "MateDistance", specific=specific, definition=definition)
+            group = _Feature("MateGroup", "MateGroup", first_sub=feature)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            mate = _read(root, _App({assembly: doc}))["mates"][0]
+
+            self.assertEqual(mate["limits"], {"lower": 0.04, "upper": 0.07, "unit": "m"})
+            self.assertEqual(mate["native_limit"]["nominal_dimension"]["value"], 0.05)
+            self.assertEqual(mate["native_limit"]["minimum_variation"]["value"], -0.01)
+            self.assertEqual(mate["native_limit"]["maximum_variation"]["value"], 0.02)
+            self.assertEqual(mate["entities"][0]["reference_configuration"], "Default")
 
     def test_concentric_mate_records_the_native_lock_rotation_flag(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1125,7 +1153,11 @@ class ProducerContextTests(unittest.TestCase):
             arm_component = _Component("arm-1", arm_path, doc=arm_doc)
             sub_doc = _Doc(sub_path, first_feature=None, children=[arm_component])
             sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc)
-            scoped_reference = types.SimpleNamespace(Name2="sub-1/arm-1", GetPathName=arm_component.GetPathName)
+            scoped_reference = types.SimpleNamespace(
+                Name2="sub-1/arm-1",
+                GetPathName=arm_component.GetPathName,
+                ReferencedConfiguration="Default",
+            )
             descendant_reference = _mate(
                 "top_descendant",
                 0,
@@ -1152,7 +1184,11 @@ class ProducerContextTests(unittest.TestCase):
             arm_component = _Component("arm-1", arm_path, doc=arm_doc)
             sub_doc = _Doc(sub_path, first_feature=None, children=[arm_component])
             sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc)
-            leaf_reference = types.SimpleNamespace(Name2="arm-1", GetPathName=arm_component.GetPathName)
+            leaf_reference = types.SimpleNamespace(
+                Name2="arm-1",
+                GetPathName=arm_component.GetPathName,
+                ReferencedConfiguration="Default",
+            )
             leaf_mate = _mate(
                 "ambiguous_descendant",
                 0,
@@ -2852,7 +2888,18 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "cylinder", "mate_entity_reference"})
+            self.assertEqual(
+                set(geometry),
+                {
+                    "component",
+                    "entity_index",
+                    "feature",
+                    "face_index",
+                    "reference_configuration",
+                    "cylinder",
+                    "mate_entity_reference",
+                },
+            )
             self.assertEqual(
                 geometry["cylinder"],
                 {"point": [0.1, 0.2, 0.3], "direction": [0.0, 1.0, 0.0], "radius": 0.05},
@@ -2870,7 +2917,18 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "circle", "mate_entity_reference"})
+            self.assertEqual(
+                set(geometry),
+                {
+                    "component",
+                    "entity_index",
+                    "feature",
+                    "face_index",
+                    "reference_configuration",
+                    "circle",
+                    "mate_entity_reference",
+                },
+            )
             self.assertEqual(
                 geometry["circle"],
                 {"center": [1.0, 2.0, 3.0], "normal": [0.0, 0.0, -1.0], "radius": 0.25},
@@ -2900,7 +2958,18 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "point", "mate_entity_reference"})
+            self.assertEqual(
+                set(geometry),
+                {
+                    "component",
+                    "entity_index",
+                    "feature",
+                    "face_index",
+                    "reference_configuration",
+                    "point",
+                    "mate_entity_reference",
+                },
+            )
             self.assertEqual(geometry["point"], [1.0, 2.0, 3.0])
 
     def test_nonfinite_entity_geometry_blocks(self) -> None:
@@ -3056,7 +3125,11 @@ class MateFailureTests(unittest.TestCase):
 
     def test_ambiguous_or_unreadable_entity_scope_blocks(self) -> None:
         def wrong_component(component):
-            reference = types.SimpleNamespace(Name2="ghost-1", GetPathName=component.GetPathName)
+            reference = types.SimpleNamespace(
+                Name2="ghost-1",
+                GetPathName=component.GetPathName,
+                ReferencedConfiguration="Default",
+            )
             return _mate("seat", 0, [_MateEntity(reference, "Plane1")])
 
         error = self._error(wrong_component)

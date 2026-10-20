@@ -5539,13 +5539,36 @@ class SolidWorksBackend(CadBackend):
                             "cad_mate_unreadable", "mate type could not be read", {"mate": name, "error": str(error)}
                         ) from error
                     mate_type = _SW_MATE_TYPES.get(type_index, f"unknown-{type_index}")
+                    try:
+                        suppressed = _method(feature, "IsSuppressed")
+                        if type(suppressed) is not bool:
+                            raise ValueError("mate suppression state is not a native boolean")
+                    except Exception as error:  # noqa: BLE001
+                        raise CadError(
+                            "cad_mate_unreadable",
+                            "mate suppression state could not be read",
+                            {"mate": name, "error": str(error)},
+                        ) from error
+                    try:
+                        error_code = _method(feature, "GetErrorCode")
+                        if type(error_code) is not int:
+                            raise ValueError("mate solve state is not a native integer")
+                    except Exception as error:  # noqa: BLE001
+                        raise CadError(
+                            "cad_mate_unreadable",
+                            "mate solve state could not be read; the constraint cannot be trusted",
+                            {"mate": name, "error": str(error)},
+                        ) from error
                     entities = []
                     for entity_index in range(entity_count):
+                        if suppressed:
+                            continue
                         try:
                             entity = _dynamic(_method(specific, "MateEntity", entity_index))
                             reference = _component(_member(entity, "ReferenceComponent"))
                             reference_full = str(_method(reference, "GetPathName") or "")
                             reference_name = str(_member(reference, "Name2") or "")
+                            reference_configuration = str(_member(reference, "ReferencedConfiguration") or "")
                             reference_path = _relative_document(reference_full, source_root)
                             # An entity may lie on the owning assembly's own reference
                             # geometry (assembly planes/axes): it has no component
@@ -5570,8 +5593,10 @@ class SolidWorksBackend(CadBackend):
                             ) from error
                         entities.append(
                             {
+                                "entity_index": entity_index,
                                 "reference_name": reference_name,
                                 "reference_document": reference_path,
+                                "reference_configuration": reference_configuration,
                                 "assembly_frame": bool(assembly_frame),
                                 "feature": _feature_name(target),
                                 "face_index": None,
@@ -5583,38 +5608,19 @@ class SolidWorksBackend(CadBackend):
                     is_advanced_mate = None
                     is_advanced_mate_error = None
                     is_advanced_mate_api = None
-                    try:
-                        suppressed = _method(feature, "IsSuppressed")
-                        if type(suppressed) is not bool:
-                            raise ValueError("mate suppression state is not a native boolean")
-                    except Exception as error:  # noqa: BLE001
-                        raise CadError(
-                            "cad_mate_unreadable",
-                            "mate suppression state could not be read",
-                            {"mate": name, "error": str(error)},
-                        ) from error
-                    try:
-                        error_code = _method(feature, "GetErrorCode")
-                        if type(error_code) is not int:
-                            raise ValueError("mate solve state is not a native integer")
-                    except Exception as error:  # noqa: BLE001
-                        raise CadError(
-                            "cad_mate_unreadable",
-                            "mate solve state could not be read; the constraint cannot be trusted",
-                            {"mate": name, "error": str(error)},
-                        ) from error
                     variation_lower = None
                     variation_upper = None
-                    try:
-                        variation_lower = float(_member(specific, "MinimumVariation"))
-                        variation_upper = float(_member(specific, "MaximumVariation"))
-                    except Exception as error:  # noqa: BLE001
-                        if type_index in {5, 6} and suppressed is False and error_code == 0:
-                            raise CadError(
-                                "cad_mate_limits_unreadable",
-                                "mate travel variation could not be read",
-                                {"mate": name, "type": mate_type, "error": str(error)},
-                            ) from error
+                    if suppressed is False and error_code == 0:
+                        try:
+                            variation_lower = float(_member(specific, "MinimumVariation"))
+                            variation_upper = float(_member(specific, "MaximumVariation"))
+                        except Exception as error:  # noqa: BLE001
+                            if type_index in {5, 6}:
+                                raise CadError(
+                                    "cad_mate_limits_unreadable",
+                                    "mate travel variation could not be read",
+                                    {"mate": name, "type": mate_type, "error": str(error)},
+                                ) from error
                     if variation_lower is not None and variation_upper is not None and (
                         not math.isfinite(variation_lower)
                         or not math.isfinite(variation_upper)
@@ -5634,7 +5640,7 @@ class SolidWorksBackend(CadBackend):
                             {"mate": name, "type": mate_type},
                         )
                     native_limit = None
-                    if type_index in {5, 6} and error_code == 0:
+                    if suppressed is False and type_index in {5, 6} and error_code == 0:
                         interface_prefix = "IAngle" if type_index == 6 else "IDistance"
                         unit = "rad" if type_index == 6 else "m"
                         names = (
@@ -5717,6 +5723,7 @@ class SolidWorksBackend(CadBackend):
                         "is_advanced_mate_error": is_advanced_mate_error,
                         "is_advanced_mate_api": is_advanced_mate_api,
                         "native_limit": native_limit,
+                        "entity_count": entity_count,
                         "entities": entities,
                         "error_code": error_code,
                         "scope": prefix or "",

@@ -428,11 +428,24 @@ def fixture():
             "error_code": 0,
             "is_advanced_mate": True,
             "is_advanced_mate_error": None,
+            "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
             "limits": {"lower": -1.5, "upper": 1.5, "unit": "rad"},
-            "native_limit": {"type_index": 6},
+            "native_limit": support.native_limit_observation(6, nominal=0.0, lower=-1.5, upper=1.5),
             "entities": [
-                {"component": "base_part"},
-                {"component": "module-1/tool_part"},
+                {
+                    "entity_index": 0,
+                    "component": "base_part",
+                    "reference_configuration": "Default",
+                    "feature": "LimitPlane1",
+                    "mate_entity_reference": {"error": None, "geometry": None},
+                },
+                {
+                    "entity_index": 1,
+                    "component": "module-1/tool_part",
+                    "reference_configuration": "Default",
+                    "feature": "LimitPlane2",
+                    "mate_entity_reference": {"error": None, "geometry": None},
+                },
             ],
         }
     ]
@@ -664,6 +677,10 @@ class DeclarationConsumerTests(unittest.TestCase):
                 for item in collection:
                     if item["name2"] == "module-1/tool_part":
                         item["configuration"] = "ToolR2"
+            for mate in raw["mates"]:
+                for entity in mate.get("entities") or []:
+                    if entity.get("component") == "module-1/tool_part":
+                        entity["reference_configuration"] = "ToolR2"
             raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part", "ToolR2"))
             raw["datums"].append(self._interface("TCP_base_mount", "base_part", "Default"))
 
@@ -877,6 +894,9 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw = fixture()
         rewrite(raw, write("0"))
         raw["mates"][0]["limits"] = {"lower": 0.0, "upper": 0.0, "unit": "rad"}
+        raw["mates"][0]["native_limit"] = support.native_limit_observation(
+            6, nominal=0.0, lower=0.0, upper=0.0
+        )
         report = verify_declarations(raw)
         self.assertNotIn("v14.operating_parameters", {item["code"] for item in report["errors"]})
         warnings = [item for item in report["diagnostics"] if item["code"] == "v14.motion_unqualified"]
@@ -931,12 +951,27 @@ class NativeDeclarationsTests(unittest.TestCase):
         native["mates"] = [
             {
                 **lock("base_part", "module-1/tool_part", kind="distance"),
+                "type": "limitangle",
                 "is_advanced_mate": True,
-                "native_limit": {"type_index": 5},
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                "native_limit": support.native_limit_observation(6, nominal=0.0, lower=0.0, upper=0.0),
                 "limits": {"lower": 0.0, "upper": 0.0, "unit": "rad"},
                 "entities": [
-                    {"component": "base_part"},
-                    {"component": "module-1/tool_part"},
+                    {
+                        "entity_index": 0,
+                        "component": "base_part",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane1",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                    },
+                    {
+                        "entity_index": 1,
+                        "component": "module-1/tool_part",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane2",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                    },
                 ],
             }
         ]

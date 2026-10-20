@@ -74,6 +74,7 @@ from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
+from .native_limits import validate_native_limit
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
 from .session_artifacts import session_materialization_under_root, session_root_pid
@@ -1743,6 +1744,11 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
     mate_properties = (record.get("properties") or {}).get("mates") or {}
     document_properties = (record.get("properties") or {}).get("document") or {}
     raw_mates = record.get("mates") or []
+    component_records = {
+        str(item.get("name2")): item
+        for item in record.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
     joints: list[dict] = []
     for (left, right), group in sorted(clusters.pairs.items()):
         if left not in clusters.of or right not in clusters.of or clusters.of[left] == clusters.of[right]:
@@ -1895,6 +1901,70 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         limit_evidence = None
         limit_source = None
         native = group["limits"]
+        native_limit_values = set()
+        native_limit_errors = []
+        for mate_item in mates:
+            mate_kind = str(mate_item.get("type") or "").strip().lower()
+            if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                continue
+            if mate_item.get("suppressed") is True:
+                continue
+            if mate_item.get("suppressed") is not False or mate_item.get("error_code") != 0:
+                native_limit_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "suppression or solve state is not clean"}
+                )
+                continue
+            flag = mate_item.get("is_advanced_mate")
+            if type(flag) is not bool or mate_item.get("is_advanced_mate_error") is not None:
+                native_limit_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                )
+                continue
+            if flag is not True:
+                continue
+            if mate_kind not in {"limitdistance", "limitangle"}:
+                native_limit_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "advanced flag on a standard mate"}
+                )
+                continue
+            try:
+                lower, upper, unit = validate_native_limit(mate_item, component_records)
+            except ValueError as error:
+                native_limit_errors.append({"mate": mate_item.get("name"), "reason": str(error)})
+                continue
+            expected_unit = "m" if joint_type == "prismatic" else "rad"
+            if unit != expected_unit:
+                native_limit_errors.append(
+                    {
+                        "mate": mate_item.get("name"),
+                        "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
+                    }
+                )
+                continue
+            native_limit_values.add((lower, upper, unit))
+        if native_limit_errors:
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_unreadable",
+                    obj,
+                    "native position-limit evidence is incomplete or unreadable",
+                    {"errors": native_limit_errors},
+                )
+            )
+            continue
+        if len(native_limit_values) > 1:
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_conflict",
+                    obj,
+                    "native position-limit observations disagree for one joint",
+                    {"ranges": sorted(native_limit_values)},
+                )
+            )
+            continue
+        if native_limit_values:
+            lower, upper, unit = next(iter(native_limit_values))
+            native = {"lower": lower, "upper": upper, "unit": unit}
         if joint_type == "continuous":
             if isinstance(native, dict):
                 findings.append(
@@ -2836,6 +2906,11 @@ def _exporter_origin(declared: dict, child: dict, parent: dict, record: dict, fi
 
 def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], findings: list[dict]) -> list[dict]:
     by_name = {body["name"]: body for body in bodies}
+    component_records = {
+        str(item.get("name2")): item
+        for item in record.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
     joints = []
     for link in declaration["links"]:
         if link["parent"] is None:
@@ -2886,26 +2961,62 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                         limits,
                     )
                 )
-            native_ranges = [
-                mate
-                for mate in record.get("mates") or []
-                if isinstance(mate, dict)
-                and str(mate.get("name") or "").split("__", 1)[0] == str(declared["name"])
-                and mate.get("suppressed") is False
-                and mate.get("error_code") == 0
-                and mate.get("is_advanced_mate") is True
-            ]
-            native_values = {
-                (
-                    float(mate["limits"]["lower"]),
-                    float(mate["limits"]["upper"]),
+            native_values = set()
+            native_errors = []
+            for mate in record.get("mates") or []:
+                if not isinstance(mate, dict):
+                    continue
+                if str(mate.get("name") or "").split("__", 1)[0] != str(declared["name"]):
+                    continue
+                if mate.get("suppressed") is True:
+                    continue
+                mate_kind = str(mate.get("type") or "").strip().lower()
+                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                    continue
+                if mate.get("suppressed") is not False or mate.get("error_code") != 0:
+                    native_errors.append(
+                        {"mate": mate.get("name"), "reason": "suppression or solve state is not clean"}
+                    )
+                    continue
+                flag = mate.get("is_advanced_mate")
+                if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
+                    native_errors.append(
+                        {"mate": mate.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                    )
+                    continue
+                if flag is not True:
+                    continue
+                if mate_kind not in {"limitdistance", "limitangle"}:
+                    native_errors.append(
+                        {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
+                    )
+                    continue
+                try:
+                    lower, upper, unit = validate_native_limit(mate, component_records)
+                except ValueError as error:
+                    native_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
+                expected_unit = "m" if kind == "prismatic" else "rad"
+                if unit != expected_unit:
+                    native_errors.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
+                        }
+                    )
+                    continue
+                native_values.add((lower, upper))
+            if native_errors:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_unreadable",
+                        obj,
+                        "native position-limit evidence is incomplete or unreadable",
+                        {"errors": native_errors},
+                    )
                 )
-                for mate in native_ranges
-                if isinstance(mate.get("limits"), dict)
-                and type(mate["limits"].get("lower")) in (int, float)
-                and type(mate["limits"].get("upper")) in (int, float)
-            }
-            if native_ranges and len(native_values) != 1:
+                continue
+            if len(native_values) > 1:
                 findings.append(
                     _finding(
                         "discovery.joint_limits_conflict",
