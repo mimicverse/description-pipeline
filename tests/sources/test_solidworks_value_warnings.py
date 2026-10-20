@@ -326,6 +326,8 @@ class ValueWarningTests(unittest.TestCase):
                         "limits_after": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
                         "drive_before": {"effort": 1.0, "velocity": 2.0},
                         "drive_after": {"effort": 1.0, "velocity": 2.0},
+                        "limits_status": "present",
+                        "drive_status": "present",
                         "warning_does_not_authorize": True,
                         "warning_does_not_replace_evidence": True,
                     }

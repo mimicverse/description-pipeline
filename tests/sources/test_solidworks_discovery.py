@@ -38,6 +38,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
+from description_pipeline.verification.solidworks_urdf import _carrier_snapshot  # noqa: E402
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA  # noqa: E402
 from description_pipeline.verification.native_discovery import (  # noqa: E402
     rebuild_interface_frames,
@@ -1748,6 +1749,54 @@ class DiscoveryTests(unittest.TestCase):
         minus = rebuild_joint_facts(payload, output, purpose="engineering")[0]
         self.assertEqual(minus["axis"], [-value for value in plus["axis"]])
         self.assertEqual(minus["limits"], plus["limits"])
+
+    def test_author_negative_axis_sign_keeps_asymmetric_native_limits(self):
+        def limits(payload):
+            payload["mates"][0]["limits"] = {"lower": -0.3, "upper": 0.7, "unit": "rad"}
+
+        baseline, _source, baseline_output = self._prepare(mutate=limits)
+        self.assertTrue(baseline.passed, baseline.findings)
+        baseline_payload = json.loads((baseline_output / "discovery/native-discovery.json").read_text())
+        plus = rebuild_joint_facts(baseline_payload, baseline_output, purpose="engineering")[0]
+
+        def reversed_limits(payload):
+            limits(payload)
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].update(
+                {"dp.joint.axis_sign": "-1"}
+            )
+
+        result, _source, output = self._prepare(mutate=reversed_limits)
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        minus = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertEqual(minus["axis"], [-value for value in plus["axis"]])
+        self.assertEqual(
+            {key: minus["limits"][key] for key in ("lower", "upper")},
+            {"lower": -0.3, "upper": 0.7},
+        )
+        self.assertEqual(minus["limits"], plus["limits"])
+
+    def test_rebuild_carrier_snapshot_binds_author_negative_sign(self):
+        def reversed_limits(payload):
+            payload["mates"][0]["limits"] = {"lower": -0.3, "upper": 0.7, "unit": "rad"}
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"].update(
+                {"dp.joint.axis_sign": "-1"}
+            )
+
+        result, _source, output = self._prepare(mutate=reversed_limits)
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text())
+        raw = payload.get("raw", payload)
+        carrier = _carrier_snapshot(
+            None,
+            rebuild_rigid_bodies(payload),
+            rebuild_joint_facts(payload, output, purpose="engineering"),
+            raw,
+        )
+        joint = next(
+            row for row in carrier["joints"] if row["name"] == "shoulder_pitch_joint"
+        )
+        self.assertEqual(joint["axis_sign"], -1)
 
     def test_native_limit_record_must_be_finite(self):
         def mutate(payload):

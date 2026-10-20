@@ -933,6 +933,8 @@ class PublishTests(unittest.TestCase):
                                 "model_frame": "child",
                                 "q_sign": 1,
                                 "range_transform": "not_applied",
+                                "limits_status": "present",
+                                "drive_status": "present",
                                 "rule_id": "direction.native_axis_sign",
                                 "rule_version": "v1",
                                 "reason": "author sign selects the undirected positive direction",

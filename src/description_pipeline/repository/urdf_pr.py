@@ -520,6 +520,7 @@ def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
         f"{row.get('model_frame')} `{json.dumps(row.get('actual_child_axis'), separators=(',', ':'))}`; "
         f"native_sign={row.get('native_sign')}, q_sign={row.get('q_sign')}, "
         f"range_transform={row.get('range_transform')}, "
+        f"limits={row.get('limits_status')}, drive={row.get('drive_status')}, "
         f"({row.get('rule_id')}/{row.get('rule_version')}); {row.get('reason')}; "
         f"warning_does_not_replace_evidence={row.get('warning_does_not_replace_evidence')}\n"
         for row in (provenance.get("direction_sign_warnings") or [])

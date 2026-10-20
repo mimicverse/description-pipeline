@@ -2493,6 +2493,8 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "entry": {
                     "id": name,
                     "name": name,
+                    "mate": identity,
+                    "mates": mate_names,
                     "type": joint_type,
                     "axis_reference": axis_reference,
                     "limits": limits,

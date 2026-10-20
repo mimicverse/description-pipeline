@@ -69,7 +69,7 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.link_name_missing": "Rigid-body coordinate system is unidentified",
     "discovery.joint_unsupported_pattern": "Recorded constraints do not identify a one-DOF joint",
     "discovery.joint_axis_sign_missing": "dp.joint.axis_sign (+/-1) is missing",
-    "discovery.direction_sign_reversed": "CAD author axis sign is applied; q and ranges are reparameterized",
+    "discovery.direction_sign_reversed": "CAD author axis sign is applied; q and ranges remain in author q",
     "direction.author_sign_applied": (
         "CAD author axis_sign selects the undirected shaft positive direction; q and ranges stay in author q"
     ),

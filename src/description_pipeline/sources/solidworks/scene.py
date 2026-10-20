@@ -960,6 +960,8 @@ def _value_warnings(
                         "limits_after": source_joint.get("limits"),
                         "drive_before": source_joint.get("drive"),
                         "drive_after": source_joint.get("drive"),
+                        "limits_status": "present" if source_joint.get("limits") is not None else "absent",
+                        "drive_status": "present" if source_joint.get("drive") is not None else "absent",
                         "warning_does_not_authorize": True,
                         "warning_does_not_replace_evidence": True,
                     }
