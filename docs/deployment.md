@@ -126,7 +126,18 @@ C:\description\runtime\Scripts\description.exe serve --config C:\description\end
 
 配置服务账户的 Git 身份及 GitHub 认证，确认目标仓库与 base 可读写。配置专用 SSH key 和已核验 Windows host key；传输使用 SSH 隧道和端点令牌，内侧均为 loopback。拒绝跨主机重定向和未认证端点。
 
-校验同版 Linux 离线运行档案、部署档案与全部摘要。在提取的部署目录执行唯一生命周期入口：
+校验同版 Linux 离线运行档案、部署档案与全部摘要。首次安装须先用受支持的 CPython 3.12 和该发行的 Linux 角色档案建立独立引导环境；后续控制命令也须使用已核验的同版环境，不能假定系统 `python3` 已装有规范验证器。以下路径均为待替换的示例：
+
+```sh
+python3.12 -m venv /path/to/bootstrap-venv
+/path/to/bootstrap-venv/bin/python -m pip install \
+  --no-index --require-hashes \
+  --find-links /path/to/linux-runtime/wheels \
+  -r /path/to/linux-runtime/requirements.lock
+export PATH="/path/to/bootstrap-venv/bin:$PATH"
+```
+
+在提取的同版部署目录执行唯一生命周期入口：
 
 ```sh
 bash deploy/operator/operatorctl.sh validate --config /srv/description/platform.json
@@ -146,7 +157,7 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 
 示例中的路径和安装标识须替换为本次发行的实际值。端点健康原件来自已认证的真实 Windows `/health`，须与本次 `release.json` 校验一致；不能手写身份、沿用旧端点收据或使用开发分支资产。安装使用同一发行目录中的 wheel 和清单；状态根、数据库端口和其他运行路径从当前平台配置及其受管安装记录解析，不从历史运行或个人目录猜测。
 
-`validate` 只检查静态配置和发行身份。`install` 在关闭准入的状态下安装锁定运行环境、渲染服务、初始化数据库并校验 DAG；不能改变正在运行的安装。`start` 先验证两端身份、服务及配置，再开启任务准入。数据库、内部服务和隧道不对用户暴露端口。
+`validate` 只检查静态配置，不验证发行文件、实际端点身份或运行健康。发行资产须单独核验；`install_record.py endpoint-identity` 将真实端点健康原件与发行清单交叉验证，`install` 再核验绑定输入，并在关闭准入的状态下安装锁定运行环境、渲染服务、初始化数据库及校验 DAG；不能改变正在运行的安装。`start` 先验证两端身份、服务及配置，再开启任务准入。数据库、内部服务和隧道不对用户暴露端口。
 
 需要在服务启动后完成对账或维护验收时，使用 `start --keep-admission-closed --config /srv/description/platform.json`。它执行相同启动检查，但全程保持准入关闭，成功结果明确区分“服务已启动”和“准入已开放”。完成规范对账并通过结算门后，再执行普通 `start` 重验并开闸；不得手工改状态或先开闸再关闭。该选项不能用于其他生命周期命令。
 
