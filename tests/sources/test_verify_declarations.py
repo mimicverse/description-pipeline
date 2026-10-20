@@ -607,17 +607,12 @@ class DeclarationConsumerTests(unittest.TestCase):
                 lambda raw: [
                     raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part")) for _ in range(2)
                 ],
-                "derive the same frame name",
+                "duplicate native interface datum identity",
             ),
             (
                 "wrong configuration",
                 lambda raw: raw["datums"].append(self._interface("TCP_tool_tcp", "module-1/tool_part", "Other")),
                 "another referenced configuration",
-            ),
-            (
-                "body name collision",
-                lambda raw: raw["datums"].append(self._interface("TCP_base_link", "module-1/tool_part")),
-                "collides with a body name",
             ),
         )
         for label, mutate, needle in cases:

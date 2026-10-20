@@ -2061,6 +2061,9 @@ def rebuild_interface_frames(
     body_names = {str(body["name"]) for body in bodies}
     frames: list[dict] = []
     seen: dict[str, str] = {}
+    datum_identities: set[tuple[str, str, str]] = set()
+    from ..sources.solidworks.naming import fallback_name, frame_name as format_frame_name
+
     for datum in raw.get("datums") or []:
         if not isinstance(datum, dict):
             continue
@@ -2070,6 +2073,14 @@ def rebuild_interface_frames(
         owner = str(datum.get("owner") or "")
         if (owner, name) in link_datums:
             continue
+        native_identity = (owner, name, str(datum.get("configuration") or ""))
+        _require(
+            native_identity not in datum_identities,
+            "discovery.interface_frame_rebuild",
+            "duplicate native interface datum identity",
+            {"datum": name, "owner": owner},
+        )
+        datum_identities.add(native_identity)
         body_name = _body_of(owner)
         if body_name is None and base is not None and owner == "":
             body_name = str(base["name"])
@@ -2098,27 +2109,29 @@ def rebuild_interface_frames(
                 "interface datum belongs to another referenced configuration",
                 {"datum": name, "owner": owner, "configuration": carried, "referenced": expected},
             )
-        _prefix, _separator, suffix = name.partition("_")
+        _prefix, _separator, native_suffix = name.partition("_")
+        try:
+            suffix = format_frame_name(name)
+        except ValueError:
+            suffix = fallback_name("frame", f"{name}|{owner}")
+        if suffix in seen or suffix in body_names:
+            suffix = fallback_name("frame", f"{name}|{owner}", semantic=body_name)
         _require(
-            _SNAKE.fullmatch(suffix) is not None,
+            suffix not in seen and suffix not in body_names,
             "discovery.interface_frame_rebuild",
-            "interface datum suffix must already be exact snake_case",
-            {"datum": name},
-        )
-        _require(
-            suffix not in seen,
-            "discovery.interface_frame_rebuild",
-            "two interface datums derive the same frame name",
-            {"name": suffix, "other": seen.get(suffix)},
-        )
-        _require(
-            suffix not in body_names,
-            "discovery.interface_frame_rebuild",
-            "an interface frame collides with a body name under the shared name contract",
+            "interface frame name collision cannot be resolved deterministically",
             {"name": suffix},
         )
         seen[suffix] = name
-        frames.append({"id": suffix, "name": suffix, "parent": body_name, "coordinate_system": name})
+        frames.append(
+            {
+                "id": suffix,
+                "name": suffix,
+                "parent": body_name,
+                "coordinate_system": name,
+                "source_name": native_suffix,
+            }
+        )
     return frames
 
 
@@ -3969,6 +3982,8 @@ def verify_discovery(package: Path) -> dict:
         return {"bodies": len(bodies), "joints": len(source.get("joints") or [])}
 
     def frames():
+        from ..sources.solidworks.naming import fallback_name, frame_name as format_frame_name
+
         payload = state["payload"]
         raw = payload["raw"]
         attached = _frame_attached_members(raw)
@@ -4029,25 +4044,20 @@ def verify_discovery(package: Path) -> dict:
                 "a recognised interface datum is not owned by any body",
                 {"datum": name, "owner": owner},
             )
-            _prefix, _, suffix = name.partition("_")
-            _require(
-                _SNAKE.fullmatch(suffix) is not None,
-                "discovery.frames",
-                "an interface datum suffix is not exact snake_case",
-                {"datum": name},
-            )
-            frame_name = suffix
+            _prefix, _, _native_suffix = name.partition("_")
+            try:
+                frame_name = format_frame_name(name)
+            except ValueError:
+                frame_name = fallback_name("frame", f"{name}|{owner}")
+            if frame_name in expected or frame_name in {
+                str(item.get("name")) for item in source.get("bodies") or []
+            }:
+                frame_name = fallback_name("frame", f"{name}|{owner}", semantic=body)
             _require(
                 frame_name not in expected,
                 "discovery.frames",
                 "two interface datums derive the same frame name",
                 {"datum": name},
-            )
-            _require(
-                frame_name not in {str(item.get("name")) for item in source.get("bodies") or []},
-                "discovery.frames",
-                "an interface frame collides with a body name",
-                {"datum": name, "name": frame_name},
             )
             expected[frame_name] = (body, name)
         observed: dict[str, tuple[str, str]] = {}

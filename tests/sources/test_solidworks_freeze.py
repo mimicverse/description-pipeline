@@ -741,7 +741,7 @@ class FreezeTests(unittest.TestCase):
         self.assertAlmostEqual(links["arm_link"]["inertial"]["xyz"][2], 0.05, places=9)
         self.assertEqual(len(links["arm_link"]["visuals"]), 1)
         self.assertEqual(scene["joints"][0]["axis"], [0.0, 0.0, 1.0])
-        self.assertEqual(scene["frames"][0]["name"], "imu")
+        self.assertEqual(scene["frames"][0]["name"], "imu_tcp")
         self.assertEqual(scene["provenance"]["snapshot"]["evidence_class"], "fixture")
 
     def test_link_frame_rotation_is_applied_to_com_and_inertia(self) -> None:

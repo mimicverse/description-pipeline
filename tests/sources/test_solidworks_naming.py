@@ -10,6 +10,7 @@ from description_pipeline.sources.solidworks.naming import (
     deduplicate_names,
     fallback_name,
     fixed_joint_name,
+    frame_name,
     joint_name,
     link_name,
     material_name,
@@ -46,6 +47,12 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(joint_name("a_r_shoulder_roll"), "right_shoulder_roll_joint")
         self.assertEqual(joint_name("LeftShoulderPitch"), "left_shoulder_pitch_joint")
         self.assertEqual(joint_name("左髋关节"), "left_hip_joint")
+        self.assertEqual(frame_name("TCP_Tool"), "tool_tcp")
+        self.assertEqual(frame_name("SCS_tool_flange"), "tool_flange_frame")
+        self.assertEqual(frame_name("CS_arm_link_mount"), "arm_link_mount")
+        self.assertEqual(frame_name("SCS_camera_optical"), "camera_optical")
+        self.assertEqual(frame_name("tool_mount"), "tool_mount")
+        self.assertEqual(frame_name("tool_tcp"), "tool_tcp")
         self.assertEqual(
             fixed_joint_name("left_upper_arm_link", "left_hand_link"),
             "left_upper_arm_link_to_left_hand_link_joint",

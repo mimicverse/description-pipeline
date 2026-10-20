@@ -55,7 +55,9 @@ class ValueWarningTests(unittest.TestCase):
                 "value_warnings": [
                     {
                         "code": "naming.formatted_interface",
-                        "message": "Link and joint names are deterministic formatting of native CAD identities.",
+                        "message": (
+                            "Link, joint, and frame names are deterministic formatting of native CAD identities."
+                        ),
                         "objects": [
                             {
                                 "object_type": "link",
@@ -213,6 +215,103 @@ class ValueWarningTests(unittest.TestCase):
         model["links"][0]["visuals"][0]["sha256"] = "b" * 64
         with self.assertRaisesRegex(PipelineError, "digest"):
             _value_warning_gate(self.root, self.source, model)
+
+    def test_frame_warning_and_robot_source_name_are_rederived(self):
+        source = copy.deepcopy(self.source)
+        model = copy.deepcopy(self.model)
+        source["assembly"] = "input/cad/M3.0.3_20261016.SLDASM"
+        source["robot_name_source"] = "cad_filename_derived"
+        source["frames"] = [
+            {
+                "id": "tool_tcp",
+                "name": "tool_tcp",
+                "parent": "base_link",
+                "coordinate_system": "TCP_Tool",
+                "source_name": "Tool",
+            }
+        ]
+        model["frames"] = [{"id": "tool_tcp", "name": "tool_tcp"}]
+        warnings = model["provenance"]["value_warnings"]
+        next(item for item in warnings if item["code"] == "naming.formatted_interface")["objects"].append(
+            {
+                "object_type": "frame",
+                "object": "tool_tcp",
+                "field": "name",
+                "actual": "tool_tcp",
+                "source": "CAD interface datum formatting for TCP_Tool",
+                "original": "Tool",
+                "rule_id": "naming.frame",
+                "rule_version": "naming-v1",
+                "reason": "CAD interface datum formatting",
+            }
+        )
+        next(item for item in warnings if item["code"] == "geometry.derived_from_native")["objects"].append(
+            {
+                "object_type": "frame",
+                "object": "tool_tcp",
+                "fields": ["xyz", "rpy"],
+                "actual": "derived from native coordinate systems",
+                "source": "native_derived",
+            }
+        )
+        warnings.append(
+            {
+                "code": "naming.formatted_robot_name",
+                "message": "The robot name is formatted from the native top-assembly filename.",
+                "objects": [
+                    {
+                        "object_type": "robot",
+                        "object": "robot",
+                        "field": "name",
+                        "actual": "robot",
+                        "source": "native top assembly filename formatting",
+                        "original": "M3.0.3_20261016.SLDASM",
+                        "rule_id": "naming.robot",
+                        "rule_version": "naming-v1",
+                        "reason": "native top assembly filename formatting",
+                    }
+                ],
+            }
+        )
+        result = _value_warning_gate(self.root, source, model)
+        self.assertEqual(result["objects"], 11)
+
+    def test_unclassified_joint_has_a_direct_warning_fixture(self):
+        source = copy.deepcopy(self.source)
+        model = copy.deepcopy(self.model)
+        source["joints"] = [{"name": "waist_joint", "source_name": "waist_joint", "type": "revolute"}]
+        model["joints"] = [{"name": "waist_joint"}]
+        warnings = model["provenance"]["value_warnings"]
+        next(item for item in warnings if item["code"] == "geometry.derived_from_native")["objects"].append(
+            {
+                "object_type": "joint",
+                "object": "waist_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        warnings.append(
+            {
+                "code": "naming.motion_unresolved",
+                "message": "Joint names without a CAD motion classification retain a neutral name.",
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "waist_joint",
+                        "field": "name",
+                        "actual": "waist_joint",
+                        "source": "neutral joint naming",
+                        "original": "waist_joint",
+                        "rule_id": "naming.joint_motion",
+                        "rule_version": "naming-v1",
+                        "reason": "motion classification unavailable",
+                    }
+                ],
+            }
+        )
+        result = _value_warning_gate(self.root, source, model)
+        self.assertEqual(result["objects"], 10)
 
 
 if __name__ == "__main__":

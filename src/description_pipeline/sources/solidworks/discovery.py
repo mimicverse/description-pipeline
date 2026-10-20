@@ -3227,7 +3227,7 @@ def _interface_frames(
     frames: list[dict] = []
     seen: dict[str, str] = {}
     body_names = {str(body.get("name")) for body in bodies}
-    from .naming import fallback_name, token as format_token
+    from .naming import fallback_name, frame_name as format_frame_name
 
     for datum in record.get("datums") or []:
         if not isinstance(datum, dict):
@@ -3254,7 +3254,7 @@ def _interface_frames(
             continue
         _prefix, _, suffix = name.partition("_")
         try:
-            frame_name = format_token(suffix)
+            frame_name = format_frame_name(name)
         except ValueError:
             frame_name = fallback_name("frame", f"{name}|{owner}")
         if frame_name != suffix:
@@ -3296,6 +3296,7 @@ def _interface_frames(
                 "name": frame_name,
                 "parent": body["name"],
                 "coordinate_system": name,
+                "source_name": suffix,
             }
         )
     return frames
@@ -4838,14 +4839,6 @@ def _derive_carriers(
                 for body in bodies
                 if body.get("identity") == f"exporter:{declaration['root']}" or body["name"] == declaration["root"]
             )
-            if root["name"] != "base_link":
-                findings.append(
-                    _finding(
-                        "discovery.root_name_missing",
-                        f"body:{root['name']}",
-                        "the declared root link must be named base_link",
-                    )
-                )
             _exporter_constraint_checks(
                 declaration,
                 clusters,
@@ -4855,6 +4848,14 @@ def _derive_carriers(
                 settings=settings,
             )
             _apply_cad_names(bodies, joints, clusters, findings, root=str(root["name"]))
+            if root["name"] != "base_link":
+                findings.append(
+                    _finding(
+                        "discovery.root_name_missing",
+                        f"body:{root['name']}",
+                        "the naming rule did not reserve base_link for the declared root",
+                    )
+                )
             derived_names = {
                 str(body.get("source_name") or body["name"]): body["name"] for body in bodies
             } | {
@@ -5117,6 +5118,7 @@ def source_definition(
                 "name": frame["name"],
                 "parent": frame["parent"],
                 "coordinate_system": frame["coordinate_system"],
+                "source_name": frame.get("source_name"),
             }
             for frame in sorted(frames, key=lambda item: item["name"])
         ],

@@ -8,6 +8,7 @@ import unicodedata
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SIDE = (("l_", "left_"), ("r_", "right_"))
+_FRAME_SUFFIXES = ("_mount", "_tcp", "_optical", "_frame")
 _VOCABULARY = (
     ("\u4e0a\u81c2", "upper_arm"),
     ("\u524d\u81c2", "forearm"),
@@ -78,6 +79,25 @@ def fixed_joint_name(parent: str, child: str) -> str:
     """Fixed interface name from the two normalized endpoint names."""
 
     return f"{token(parent)}_to_{token(child)}_joint"
+
+
+def frame_name(native_name: str) -> str:
+    """Normalize a carrier datum while retaining its interface purpose."""
+
+    normalized_full = token(str(native_name))
+    carrier, separator, suffix = str(native_name).partition("_")
+    if carrier.upper() not in {"CS", "TCP", "SCS"}:
+        if normalized_full.endswith(_FRAME_SUFFIXES):
+            return normalized_full
+        return normalized_full + "_frame"
+    if not separator or not suffix:
+        raise ValueError("native interface datum has no carrier and suffix")
+    name = token(suffix)
+    if name.endswith(_FRAME_SUFFIXES):
+        return name
+    if carrier.upper() == "TCP":
+        return name + "_tcp"
+    return name + "_frame"
 
 
 def robot_name(native_name: str) -> str:

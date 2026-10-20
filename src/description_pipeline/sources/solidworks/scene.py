@@ -912,6 +912,22 @@ def _value_warnings(
                     "reason": "motion classification unavailable",
                 }
             )
+    for frame in cfg.get("frames") or []:
+        source_name = str(frame.get("source_name") or "")
+        if source_name and source_name != frame.get("name"):
+            mappings.append(
+                {
+                    "object_type": "frame",
+                    "object": frame.get("name"),
+                    "field": "name",
+                    "actual": frame.get("name"),
+                    "source": f"CAD interface datum formatting for {frame.get('coordinate_system')}",
+                    "original": source_name,
+                    "rule_id": "naming.frame",
+                    "rule_version": "naming-v1",
+                    "reason": "CAD interface datum formatting",
+                }
+            )
     for link in links:
         for visual in link.get("visuals") or []:
             visuals.append(
@@ -958,7 +974,7 @@ def _value_warnings(
         warnings.append(
             {
                 "code": "naming.formatted_interface",
-                "message": "Link and joint names are deterministic formatting of native CAD identities.",
+                "message": "Link, joint, and frame names are deterministic formatting of native CAD identities.",
                 "objects": mappings,
             }
         )
@@ -995,6 +1011,7 @@ def _value_warnings(
             }
         )
     if cfg.get("robot_name_source") == "cad_filename_derived":
+        source_name = str(cfg.get("assembly") or "").replace("\\", "/").rsplit("/", 1)[-1]
         warnings.append(
             {
                 "code": "naming.formatted_robot_name",
@@ -1006,7 +1023,7 @@ def _value_warnings(
                         "field": "name",
                         "actual": cfg.get("robot_name"),
                         "source": "native top assembly filename formatting",
-                        "original": cfg.get("robot_name"),
+                        "original": source_name,
                         "rule_id": "naming.robot",
                         "rule_version": "naming-v1",
                         "reason": "native top assembly filename formatting",

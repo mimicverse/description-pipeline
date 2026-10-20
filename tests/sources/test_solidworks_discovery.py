@@ -743,12 +743,13 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(bodies["arm_link"]["components"], ["arm-1"])
         frames = {frame["name"]: frame for frame in rebuild_interface_frames(payload)}
         self.assertEqual(
-            frames["tool_flange"],
+            frames["tool_flange_frame"],
             {
-                "id": "tool_flange",
-                "name": "tool_flange",
+                "id": "tool_flange_frame",
+                "name": "tool_flange_frame",
                 "parent": "base_link",
                 "coordinate_system": "SCS_tool_flange",
+                "source_name": "tool_flange",
             },
         )
         joints = rebuild_joint_facts(payload, output, purpose="engineering")
@@ -1472,7 +1473,7 @@ class DiscoveryTests(unittest.TestCase):
             {frame["name"]: (frame["parent"], frame["coordinate_system"]) for frame in frames},
             {
                 "arm_link_mount": ("arm_link", "CS_arm_link_mount"),
-                "pinch": ("arm_link", "TCP_pinch"),
+                "pinch_tcp": ("arm_link", "TCP_pinch"),
             },
         )
         names = [body["name"] for body in rebuild_rigid_bodies(payload)]
@@ -1499,7 +1500,7 @@ class DiscoveryTests(unittest.TestCase):
         # exists that dropping a frame could suppress.
         self.assertTrue(report["passed"], report["errors"])
         payload = json.loads((destination / "evidence/discovery.json").read_text(encoding="utf-8"))
-        self.assertIn("pinch", [frame["name"] for frame in rebuild_interface_frames(payload)])
+        self.assertIn("pinch_tcp", [frame["name"] for frame in rebuild_interface_frames(payload)])
 
     def test_jcs_must_alias_the_child_datum(self):
         def alias(payload):
@@ -1559,13 +1560,14 @@ class DiscoveryTests(unittest.TestCase):
         def mutate(payload):
             payload["datums"].append({"name": "TCP_Tool", "owner": "arm-1", "array": _translated(0.0, 0.0, 0.3)})
 
-        result, _source, _output = self._prepare(mutate=mutate)
+        result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
         finding = next(item for item in result.findings if item["code"] == "discovery.interface_name_invalid")
         self.assertFalse(finding["blocking"])
-        self.assertEqual(finding["detail"]["output"], "tool")
+        self.assertEqual(finding["detail"]["output"], "tool_tcp")
+        self.assertTrue(self._verify(output)["passed"])
 
-    def test_interface_frame_colliding_with_a_body_name_is_namespaced(self):
+    def test_interface_frame_purpose_suffix_avoids_a_body_name_collision(self):
         def mutate(payload):
             payload["datums"].append({"name": "TCP_base_link", "owner": "base-1", "array": _translated(0.0, 0.0, 0.3)})
 
@@ -1573,7 +1575,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(result.passed, result.findings)
         finding = next(item for item in result.findings if item["code"] == "discovery.interface_name_invalid")
         self.assertFalse(finding["blocking"])
-        self.assertRegex(finding["detail"]["output"], r"^base_link_[0-9a-f]{16}_frame$")
+        self.assertEqual(finding["detail"]["output"], "base_link_tcp")
 
     def test_two_owned_link_datums_need_an_explicit_body_datum(self):
         def mutate(payload):

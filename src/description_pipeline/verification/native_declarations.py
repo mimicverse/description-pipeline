@@ -23,9 +23,6 @@ from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
 SCHEMA = "solidworks-to-urdf.native-declarations-verification/v1"
-_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
-
-
 def _require(condition, code, message, **detail):
     if not condition:
         raise DeclarationError(code, message, detail)
@@ -405,9 +402,9 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             _require(isinstance(link, dict), "v14.topology", "a link tree contains a null link")
             name = link.get("name")
             _require(
-                isinstance(name, str) and _NAME.fullmatch(name) and name not in links,
+                isinstance(name, str) and bool(name) and name not in links,
                 "v14.topology",
-                "link names must be unique snake_case names",
+                "link names must be non-empty and unique",
                 name=name,
             )
             links[name] = link
@@ -430,9 +427,9 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 )
                 jname = joint.get("name")
                 _require(
-                    isinstance(jname, str) and _NAME.fullmatch(jname) and jname not in joints,
+                    isinstance(jname, str) and bool(jname) and jname not in joints,
                     "v14.topology",
-                    "joint names must be unique snake_case names",
+                    "joint names must be non-empty and unique",
                     joint=jname,
                 )
                 _require(

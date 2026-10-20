@@ -155,6 +155,7 @@ class RebuildCarrierTests(unittest.TestCase):
                     "name": "tool_mount",
                     "parent": "arm_link",
                     "coordinate_system": "TCP_tool_mount",
+                    "source_name": "tool_mount",
                 }
             ],
         )
@@ -176,18 +177,17 @@ class RebuildCarrierTests(unittest.TestCase):
             record["datums"].append(datum)
             return record
 
-        duplicate = with_datum("TCP_tool_mount", "arm-1")
-        duplicate["datums"].append(copy.deepcopy(duplicate["datums"][-1]))
         cases = (
-            ("duplicate frame name", duplicate),
-            ("non snake suffix", with_datum("TCP_Tool-Mount", "arm-1")),
             ("unowned datum", with_datum("TCP_orphan", "ghost-1")),
-            ("body name collision", with_datum("TCP_base_link", "arm-1")),
             ("ownerless without a base", with_datum("TCP_top_mount", "")),
         )
         for label, record in cases:
             with self.subTest(case=label), self.assertRaises(_Failure):
                 rebuild_interface_frames(record)
+        self.assertEqual(
+            rebuild_interface_frames(with_datum("TCP_ToolPoint", "arm-1"))[0]["name"],
+            "tool_point_tcp",
+        )
 
     def test_missing_or_ambiguous_frame_datum_fails_closed(self) -> None:
         payload, _output = self._prepared(oracle_fixtures.native_record())

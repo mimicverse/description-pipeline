@@ -231,11 +231,17 @@ class ExporterWireTests(unittest.TestCase):
             wire_xml().replace('z:Ref="rootlinkname"', 'z:Ref="missing"'),
             wire_xml().replace('z:Id="movingname"', 'z:Id="rootname"'),
             wire_xml().replace('<Parent z:Ref="root"/>', '<Parent z:Ref="moving"/>'),
-            wire_xml().replace(">base_link</Value>", ">Bad Name</Value>"),
             wire_xml().replace("<a:base64Binary>YXJt", "<a:base64Binary>***"),
         ):
             with self.subTest(xml=xml[:100]), self.assertRaises(ExporterDeclarationError):
                 decode_exporter_v14(xml, 1.4)
+
+    def test_non_snake_raw_names_are_preserved_for_the_shared_normalizer(self):
+        xml = wire_xml().replace(">base_link</Value>", ">Base Link</Value>").replace(">arm</Value>", ">A Arm</Value>")
+        parsed = decode_exporter_v14(xml, 1.4)
+        self.assertEqual(parsed["root"], "Base Link")
+        self.assertEqual([link["name"] for link in parsed["links"]], ["Base Link", "A Arm"])
+        self.assertEqual(parsed["links"][1]["joint"]["name"], "hinge")
 
     def test_dtd_and_xml_resource_limits_fail_before_decoding(self):
         with self.assertRaises(ExporterDeclarationError):
@@ -713,6 +719,27 @@ class ExporterDiscoveryTests(unittest.TestCase):
         owner = next(item for item in result.findings if item["code"] == "discovery.owner_missing")
         self.assertFalse(owner["blocking"])
         self.assertEqual(owner["detail"]["publication_blocker"], "owner")
+        self.assertFalse([item for item in result.findings if item["blocking"]])
+
+    def test_non_snake_native_interfaces_are_normalized_without_blocking(self):
+        raw = raw_record()
+        xml = raw["exporter"]["raw_xml"].replace(">base_link</Value>", ">Base Link</Value>").replace(
+            ">arm</Value>", ">A Arm</Value>"
+        )
+        raw["exporter"].update(raw_xml=xml, raw_xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input"
+            source.mkdir()
+            for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT"):
+                (source / name).write_bytes(b"native-file-test")
+            prepared = Path(directory) / "prepared"
+            result = prepare_native_package(source, prepared, "raw-names", backend=FakeBackend(raw))
+            self.assertTrue(result.passed, result.findings)
+            payload = json.loads(result.discovery_path.read_text())
+        self.assertEqual(
+            payload["derived_interface_names"],
+            {"A Arm": "arm_link", "Base Link": "base_link", "hinge": "hinge_joint"},
+        )
         self.assertFalse([item for item in result.findings if item["blocking"]])
 
     def test_valid_declarations_generate_named_axis_input_without_stale_derived_values(self):

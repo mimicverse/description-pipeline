@@ -1987,6 +1987,23 @@ def _value_warning_gate(root, source, model):
                     "reason": "motion classification unavailable",
                 },
             )
+    for frame in source.get("frames", []):
+        source_name = str(frame.get("source_name") or "")
+        if source_name and source_name != frame["name"]:
+            add(
+                "naming.formatted_interface",
+                {
+                    "object_type": "frame",
+                    "object": frame["name"],
+                    "field": "name",
+                    "actual": frame["name"],
+                    "source": f"CAD interface datum formatting for {frame['coordinate_system']}",
+                    "original": source_name,
+                    "rule_id": "naming.frame",
+                    "rule_version": "naming-v1",
+                    "reason": "CAD interface datum formatting",
+                },
+            )
     for link, shape in shapes:
         provenance = shape.get("provenance") if isinstance(shape.get("provenance"), dict) else {}
         native_component = str(provenance.get("native_component") or "")
@@ -2049,6 +2066,7 @@ def _value_warning_gate(root, source, model):
             },
         )
     if source.get("robot_name_source") == "cad_filename_derived":
+        source_name = str(source.get("assembly") or "").replace("\\", "/").rsplit("/", 1)[-1]
         add(
             "naming.formatted_robot_name",
             {
@@ -2057,7 +2075,7 @@ def _value_warning_gate(root, source, model):
                 "field": "name",
                 "actual": source["robot_name"],
                 "source": "native top assembly filename formatting",
-                "original": source["robot_name"],
+                "original": source_name,
                 "rule_id": "naming.robot",
                 "rule_version": "naming-v1",
                 "reason": "native top assembly filename formatting",
@@ -2143,7 +2161,9 @@ def _value_warning_gate(root, source, model):
             "Geometry, frame transforms and signed joint axes are derived from native evidence."
         ),
         "display.constant": "Display scale and material color are platform constants, not CAD readings.",
-        "naming.formatted_interface": "Link and joint names are deterministic formatting of native CAD identities.",
+        "naming.formatted_interface": (
+            "Link, joint, and frame names are deterministic formatting of native CAD identities."
+        ),
         "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
         "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
         "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
