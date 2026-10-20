@@ -123,6 +123,7 @@ _INDEPENDENT_LABELS = {
     "source.native": "Native source presence",
     "model.schema": "Model schema conformance",
     "source.raw": "Native raw-evidence presence",
+    "provenance.value_warnings": "Non-native value provenance warnings",
     "physics.mass_closure_equality": "Mass closure (URDF mass = whole CAD mass)",
     "source.dependencies": "Native dependency closure",
     "source.coverage": "Native source coverage",
@@ -721,6 +722,7 @@ _WARNING_DETAIL_KEYS = (
     "label_source",
     "mass_kg",
     "masses",
+    "objects",
 )
 _WARNING_RESIDUAL_KEYS = ("max_abs_residual", "max_normalized_residual", "threshold")
 

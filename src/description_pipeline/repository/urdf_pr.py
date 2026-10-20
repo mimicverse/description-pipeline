@@ -499,11 +499,26 @@ def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
         f"{' (unqualified)' if status == 'unqualified' else ''}\n"
         for object_id, fact_id, status in qualifications
     )
+    provenance = next(
+        (
+            check.get("details")
+            for check in checks
+            if check.get("id") == "provenance.value_warnings" and check.get("state") == "passed"
+        ),
+        {},
+    )
+    provenance_line = (
+        f"- value provenance: {provenance.get('objects')} non-native field/object warnings; "
+        f"codes: {', '.join(provenance.get('codes') or [])}\n"
+        if isinstance(provenance, dict) and provenance.get("codes")
+        else ""
+    )
     return (
         f"Automatic SolidWorks-to-URDF publication.\n\n"
         f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
         f"- purpose: `{purpose}`\n"
         f"- verifier: recomputed, passed ({len(checks)} checks)\n"
+        f"{provenance_line}"
         f"{qualification_lines}"
     )
 

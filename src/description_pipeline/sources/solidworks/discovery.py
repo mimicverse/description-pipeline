@@ -161,7 +161,7 @@ class DiscoverySettings:
     """
 
     record_roots: tuple[Path, ...] = ()
-    frozen_names: Mapping[str, str] = field(default_factory=dict)
+    frozen_names: Mapping[str, str | int] = field(default_factory=dict)
     main_assembly: str | None = None
     purpose: str = PURPOSE_ENGINEERING
 
@@ -2540,6 +2540,104 @@ def _exporter_reference(value: Any, findings: list[dict], obj: str) -> dict | No
     return {"kind": "reference_axis", "component": component, "feature_name": feature}
 
 
+def _apply_exporter_names(
+    bodies: list[dict],
+    joints: list[dict],
+    clusters: _Clusters,
+    settings: DiscoverySettings,
+    findings: list[dict],
+) -> None:
+    """Apply a controlled native-to-interface name registry without changing identity."""
+
+    frozen = settings.frozen_names or {}
+    body_sources = {str(body["name"]) for body in bodies}
+    joint_sources = {str(joint["name"]) for joint in joints}
+    body_targets = {str(body["name"]): str(frozen.get(f"exporter:{body['name']}", body["name"])) for body in bodies}
+    joint_targets = {str(joint["name"]): str(frozen.get(f"joint:{joint['name']}", joint["name"])) for joint in joints}
+    for key in frozen:
+        if key.startswith("exporter:") and key.removeprefix("exporter:") not in body_sources:
+            findings.append(
+                _finding(
+                    "discovery.interface_registry_invalid",
+                    f"registry:{key}",
+                    "registered link name selects an unknown exporter body",
+                )
+            )
+        if key.startswith("joint:") and key.removeprefix("joint:") not in joint_sources:
+            findings.append(
+                _finding(
+                    "discovery.interface_registry_invalid",
+                    f"registry:{key}",
+                    "registered joint name selects an unknown exporter joint",
+                )
+            )
+        if key.startswith("axis_sign:"):
+            source_name = key.removeprefix("axis_sign:")
+            value = frozen[key]
+            if source_name not in joint_sources or type(value) is not int or value not in {-1, 1}:
+                findings.append(
+                    _finding(
+                        "discovery.interface_registry_invalid",
+                        f"registry:{key}",
+                        "registered axis sign must name a known joint and be the integer -1 or 1",
+                        {"joint": source_name, "value": value},
+                    )
+                )
+    for label, targets in (("link", body_targets), ("joint", joint_targets)):
+        invalid = sorted(name for name in targets.values() if _SNAKE.fullmatch(name) is None)
+        duplicate = sorted(name for name in set(targets.values()) if list(targets.values()).count(name) > 1)
+        if invalid:
+            findings.append(
+                _finding(
+                    "discovery.interface_registry_invalid",
+                    f"registry:{label}",
+                    "registered interface names must be snake_case",
+                    {"names": invalid[:10]},
+                )
+            )
+        if duplicate:
+            findings.append(
+                _finding(
+                    "discovery.interface_registry_invalid",
+                    f"registry:{label}",
+                    "registered interface names must be unique",
+                    {"names": duplicate[:10]},
+                )
+            )
+    body_names = {
+        str(body["name"]): body_targets[str(body["name"])]
+        for body in bodies
+    }
+    for body in bodies:
+        source_name = str(body["name"])
+        body["source_name"] = source_name
+        body["name"] = body_names[source_name]
+    clusters.members = {
+        body_names.get(name, name): members for name, members in clusters.members.items()
+    }
+    clusters.of = {
+        component: body_names.get(owner, owner) for component, owner in clusters.of.items()
+    }
+    for joint in joints:
+        source_name = str(joint["name"])
+        joint["source_name"] = source_name
+        joint["parent"] = body_names.get(str(joint["parent"]), str(joint["parent"]))
+        joint["child"] = body_names.get(str(joint["child"]), str(joint["child"]))
+        joint["name"] = joint_targets[source_name]
+        sign = frozen.get(f"axis_sign:{source_name}")
+        if sign == -1:
+            declared_axis = joint.get("declared_axis")
+            if isinstance(declared_axis, list):
+                joint["declared_axis"] = [-float(value) for value in declared_axis]
+            limits = joint.get("limits")
+            if isinstance(limits, dict) and "lower" in limits and "upper" in limits:
+                joint["limits"] = {
+                    **limits,
+                    "lower": -float(limits["upper"]),
+                    "upper": -float(limits["lower"]),
+                }
+
+
 def _body_datum(record: dict, body: dict) -> dict | None:
     owners = [body["datum_owner"]] if "datum_owner" in body else body["owners"]
     return _datum(record, body["datum"], owners)
@@ -4178,7 +4276,12 @@ def _identity(
             )
         technical_name = None
     else:
-        technical = _snake(hardware) if hardware else None
+        registered_name = settings.frozen_names.get("robot_name") if settings.frozen_names else None
+        technical = registered_name if _text(registered_name) and _SNAKE.fullmatch(str(registered_name)) else None
+        if technical is not None:
+            sources["robot_name"] = "registered_engineering_id"
+        else:
+            technical = _snake(hardware) if hardware else None
         technical_name = technical if technical and _SNAKE.fullmatch(technical) else "robot"
         robot_name = None
         findings.append(
@@ -5044,7 +5147,11 @@ def _derive_carriers(
         if declaration is not None:
             bodies, clusters = _exporter_memberships(record, declaration, findings)
             joints = _exporter_joint_facts(record, declaration, bodies, findings)
-            root = next(body for body in bodies if body["name"] == declaration["root"])
+            root = next(
+                body
+                for body in bodies
+                if body.get("identity") == f"exporter:{declaration['root']}" or body["name"] == declaration["root"]
+            )
             if root["name"] != "base_link":
                 findings.append(
                     _finding(
@@ -5061,6 +5168,7 @@ def _derive_carriers(
                 record=record,
                 settings=settings,
             )
+            _apply_exporter_names(bodies, joints, clusters, settings, findings)
             frames = _interface_frames(record, clusters, bodies, root, findings)
             for body in bodies:
                 if settings.frozen_names.get(body["identity"], body["name"]) != body["name"]:
@@ -5214,6 +5322,7 @@ def source_definition(
         entry: dict[str, Any] = {
             "id": joint["name"],
             "name": joint["name"],
+            "source_name": joint.get("source_name", joint["name"]),
             "type": joint["type"],
             "parent": joint["parent"],
             "child": joint["child"],
@@ -5277,7 +5386,12 @@ def source_definition(
     )
     source: dict[str, Any] = {
         "provider": "solidworks",
-        "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
+        "robot_name": (
+            identity.get("robot_name")
+            or settings.frozen_names.get("robot_name")
+            or identity.get("robot_name_technical")
+            or "robot"
+        ),
         "assembly": str(confined(package.resolve(), cad_prefix + str(view["main_assembly"]))),
         "configuration": view["delivery_configuration"],
         "allowed_roots": [str(package.resolve())],
@@ -5288,6 +5402,7 @@ def source_definition(
             {
                 "id": body["name"],
                 "name": body["name"],
+                "source_name": body.get("source_name", body["name"]),
                 "components": body["components"],
                 "frame": {"coordinate_system": body["datum"]},
             }
@@ -5305,6 +5420,7 @@ def source_definition(
             for frame in sorted(frames, key=lambda item: item["name"])
         ],
         "material_source": "cad",
+        "interface_names": dict(settings.frozen_names),
         "documented_masses": {},
         "mass_evidence": None,
         "geometry_exclusions": {},

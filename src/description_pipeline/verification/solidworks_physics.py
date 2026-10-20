@@ -411,7 +411,8 @@ def _direct_link_sum(record: dict, source: dict) -> tuple[float, np.ndarray, np.
     entries = []
     for body in source.get("bodies") or []:
         name = str(body.get("name"))
-        entry = (record.get("links") or {}).get(name)
+        source_name = str(body.get("source_name") or name)
+        entry = (record.get("links") or {}).get(source_name)
         _require(isinstance(entry, dict), name + ": the link group mass record carries no entry")
         read = entry["reads"][0]
         mass = oracle._finite_positive(read.get("mass_kg"), name + " link group mass")
@@ -1088,7 +1089,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
     def direct_record():
         direct["record"] = _link_direct_record(root, configuration=str(source.get("configuration") or ""))
-        bodies = {str(body["name"]) for body in source["bodies"]}
+        bodies = {str(body.get("source_name") or body["name"]) for body in source["bodies"]}
         _require(
             set(direct["record"]["links"]) == bodies,
             "The link group mass record does not cover the selected bodies exactly",
@@ -1101,7 +1102,8 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
 
         def reconstruct(body=body):
             name = body["name"]
-            entry = ((direct["record"] or {}).get("links") or {}).get(name)
+            source_name = str(body.get("source_name") or name)
+            entry = ((direct["record"] or {}).get("links") or {}).get(source_name)
             _require(isinstance(entry, dict), name + ": the link group mass record carries no entry")
             contributions = oracle._resolved_contributions(body, raw, masses, declared, effective)
             expected_selection = sorted(str(note["component"]) for *_rest, note in contributions)

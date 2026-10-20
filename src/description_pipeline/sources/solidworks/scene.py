@@ -10,9 +10,10 @@ joint definition is an error, not a default.
 from __future__ import annotations
 
 import math
-from pathlib import Path
-from typing import Any
+import re
 from collections.abc import Iterable, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 from .errors import ConfigError
 from .jsonio import read_json
@@ -445,10 +446,16 @@ def _direct_link_reads(
         )
     links = record.get("links")
     expected = {str(body.get("name") or body.get("id") or "") for body in bodies}
-    if not isinstance(links, dict) or set(links) != expected:
+    record_names = {
+        str(body.get("name") or body.get("id") or ""): str(
+            body.get("source_name") or body.get("name") or body.get("id") or ""
+        )
+        for body in bodies
+    }
+    if not isinstance(links, dict) or set(links) != set(record_names.values()):
         raise ConfigError(
             "the link group record does not cover exactly the configured bodies",
-            {"expected": sorted(expected), "recorded": sorted(links or [])},
+            {"expected": sorted(record_names.values()), "recorded": sorted(links or [])},
         )
     meta = {
         "assembly": str(record.get("assembly") or ""),
@@ -458,7 +465,7 @@ def _direct_link_reads(
     }
     reads: dict[str, dict[str, Any]] = {}
     for name in sorted(expected):
-        entry = links[name]
+        entry = links[record_names[name]]
         selection = entry.get("selection") if isinstance(entry, dict) else None
         rows = entry.get("reads") if isinstance(entry, dict) else None
         if (
@@ -511,6 +518,8 @@ def build_scene(
     bodies = list(cfg.get("bodies") or [])
     if not bodies:
         raise ConfigError("native discovery must define the rigid bodies")
+    interface_names = cfg.get("interface_names") or {}
+    _validate_scene_interface_names(interface_names, geometry_by_component)
 
     # Recheck the mass-mode contract against actual readings: documented_table must
     # cover every included component; CAD readings remain unchanged but carry warnings.
@@ -523,6 +532,7 @@ def build_scene(
 
     links: list[dict[str, Any]] = []
     link_frames: dict[str, tuple[Matrix3, Vector3, str | None]] = {}
+    visual_index = 0
     for body in bodies:
         body_id = str(body.get("id") or body.get("name") or "")
         if not body_id:
@@ -619,15 +629,24 @@ def build_scene(
             entry = geometry_by_component.get(reading.name)
             if entry is None:
                 continue
-            visuals.append(
-                {
-                    "kind": "mesh",
-                    "filename": entry["path"],
-                    "scale": [1.0, 1.0, 1.0],
-                    "xyz": list(reading.relative_translation),
-                    "rpy": list(rpy_from_matrix(reading.relative_rotation)),
-                }
-            )
+            visual = {
+                "kind": "mesh",
+                "name": str(interface_names.get(f"visual:{reading.name}", f"visual_{visual_index}")),
+                "filename": entry["path"],
+                "sha256": entry.get("sha256"),
+                "scale": [1.0, 1.0, 1.0],
+                "xyz": list(reading.relative_translation),
+                "rpy": list(rpy_from_matrix(reading.relative_rotation)),
+            }
+            mesh_name = interface_names.get(f"mesh:{reading.name}")
+            if isinstance(mesh_name, str) and mesh_name:
+                visual["mesh_name"] = mesh_name.removeprefix("../")
+            material_name = interface_names.get(f"material:{reading.name}")
+            if isinstance(material_name, str) and material_name:
+                visual["material"] = material_name
+                visual["rgba"] = [0.7, 0.7, 0.7, 1.0]
+            visuals.append(visual)
+            visual_index += 1
         links.append(
             {
                 "id": body_id,
@@ -724,6 +743,9 @@ def build_scene(
         "unassigned_entities": sorted(set(placements) - included),
         "world_from_root": world_from_root,
     }
+    value_warnings = _value_warnings(cfg, bodies, links, joint_entries, frames)
+    if value_warnings:
+        scene_provenance["value_warnings"] = value_warnings
     if unverified_material:
         scene_provenance["warnings"] = _material_warnings(unverified_material, masses)
     return {
@@ -735,6 +757,67 @@ def build_scene(
         "frames": frames,
         "provenance": scene_provenance,
     }
+
+
+def _validate_scene_interface_names(
+    names: dict[str, Any],
+    geometry_entries: dict[str, dict[str, Any]],
+) -> None:
+    """Reject partial, unknown, colliding or escaping display/mesh mappings."""
+
+    geometry_components = set(geometry_entries)
+    categories: dict[str, dict[str, str]] = {"visual": {}, "material": {}, "mesh": {}}
+    for key, value in names.items():
+        if key == "robot_name" or key.startswith(("exporter:", "joint:", "axis_sign:")) or ":" not in key:
+            continue
+        category, occurrence = key.split(":", 1)
+        if category not in categories or occurrence not in geometry_components:
+            raise ConfigError(
+                "the interface-name registry names an unknown scene object",
+                {"key": key},
+            )
+        if not isinstance(value, str) or not value:
+            raise ConfigError("the interface-name registry carries an empty value", {"key": key})
+        categories[category][occurrence] = value
+    for category, entries in categories.items():
+        if entries and set(entries) != geometry_components:
+            raise ConfigError(
+                "an interface-name category does not cover every captured mesh",
+                {"category": category, "missing": sorted(geometry_components - set(entries))[:10]},
+            )
+    visual_names = list(categories["visual"].values())
+    if len(set(visual_names)) != len(visual_names):
+        raise ConfigError("registered visual names must be unique")
+    for name in visual_names + list(categories["material"].values()):
+        if any(not (character.isascii() and (character.isalnum() or character == "_")) for character in name):
+            raise ConfigError("registered display names must use ASCII letters, digits and underscores", {"name": name})
+    for value in categories["mesh"].values():
+        normalized = value.removeprefix("../")
+        path = PurePosixPath(normalized)
+        if (
+            "\\" in normalized
+            or value.startswith("/")
+            or path.is_absolute()
+            or ".." in path.parts
+            or not normalized.startswith("meshes/visual/")
+            or path.suffix.lower() != ".stl"
+            or re.fullmatch(r"meshes/visual/[a-z0-9._-]+/native_[0-9a-f]{64}\.stl", normalized) is None
+        ):
+            raise ConfigError(
+                "registered mesh paths must stay under meshes/visual and name a relative STL",
+                {"value": value},
+            )
+    by_alias: dict[str, set[str]] = {}
+    for occurrence, value in categories["mesh"].items():
+        by_alias.setdefault(value.removeprefix("../"), set()).add(
+            str(geometry_entries[occurrence].get("sha256") or "")
+        )
+    collision = sorted(alias for alias, digests in by_alias.items() if len(digests) != 1)
+    if collision:
+        raise ConfigError(
+            "one historical mesh alias cannot name different current mesh bytes",
+            {"aliases": collision[:10]},
+        )
 
 
 def _build_joints(
@@ -818,6 +901,301 @@ def _build_joints(
             entry["dynamics"] = {str(key): float(value) for key, value in dynamics.items()}
         joints.append(entry)
     return joints
+
+
+def _value_warnings(
+    cfg: dict[str, Any],
+    bodies: Sequence[dict[str, Any]],
+    links: Sequence[dict[str, Any]],
+    joints: Sequence[dict[str, Any]],
+    frames: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe every delivered value whose provenance is not a direct native read."""
+
+    names = cfg.get("interface_names") or {}
+    warnings: list[dict[str, Any]] = []
+    mappings = []
+    mesh_aliases = []
+    axis_mappings = []
+    for body in bodies:
+        if body.get("source_name") and body["source_name"] != body.get("name"):
+            mappings.append(
+                {
+                    "object_type": "link",
+                    "object": body["name"],
+                    "field": "name",
+                    "actual": body["name"],
+                    "source": f"registered interface name for {body['source_name']}",
+                }
+            )
+    source_joints = cfg.get("joints") or []
+    for index, joint in enumerate(joints):
+        source_joint = source_joints[index] if index < len(source_joints) else {}
+        source_name = str(source_joint.get("source_name") or source_joint.get("name") or joint["name"])
+        if source_name != joint["name"]:
+            mappings.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "name",
+                    "actual": joint["name"],
+                    "source": f"registered interface name for {source_name}",
+                }
+            )
+        sign = names.get(f"axis_sign:{source_name}")
+        if sign in {-1, 1}:
+            axis_mappings.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "axis/limits",
+                    "actual": {"sign": sign, "axis": joint.get("axis"), "limits": joint.get("limits")},
+                    "source": "registered signed-axis convention",
+                }
+            )
+    for link in links:
+        for visual in link.get("visuals") or []:
+            if visual.get("name"):
+                mappings.append(
+                    {
+                        "object_type": "visual",
+                        "object": visual["name"],
+                        "field": "name",
+                        "actual": visual["name"],
+                        "source": "registered display name",
+                    }
+                )
+            if visual.get("material"):
+                mappings.append(
+                    {
+                        "object_type": "material",
+                        "object": f"{link['name']}:{visual['name']}",
+                        "field": "material",
+                        "actual": visual["material"],
+                        "source": "registered display material",
+                    }
+                )
+            if visual.get("mesh_name"):
+                mesh_aliases.append(
+                    {
+                        "object_type": "visual",
+                        "object": visual["name"],
+                        "field": "mesh filename",
+                        "actual": visual["mesh_name"],
+                        "source": "registered historical mesh label",
+                        "current_sha256": visual.get("sha256"),
+                    }
+                )
+    if mappings:
+        warnings.append(
+            {
+                "code": "naming.registered_interface",
+                "message": "Delivered names or display values come from a registered naming mapping.",
+                "objects": mappings,
+            }
+        )
+    if axis_mappings:
+        warnings.append(
+            {
+                "code": "axis.registered_sign_mapping",
+                "message": (
+                    "Joint axes and position bounds use a controlled sign mapping "
+                    "relative to the native declaration."
+                ),
+                "objects": axis_mappings,
+            }
+        )
+    if mesh_aliases:
+        warnings.append(
+            {
+                "code": "naming.historical_mesh_alias",
+                "message": (
+                    "Mesh paths use controlled historical labels; the manifest current SHA-256 "
+                    "is the content identity."
+                ),
+                "objects": mesh_aliases,
+            }
+        )
+    if names.get("robot_name"):
+        warnings.append(
+            {
+                "code": "naming.registered_robot_name",
+                "message": (
+                    "The robot name comes from the registered engineering identity because the CAD "
+                    "declaration is absent."
+                ),
+                "objects": [
+                    {
+                        "object_type": "robot",
+                        "object": cfg.get("robot_name"),
+                        "field": "name",
+                        "actual": cfg.get("robot_name"),
+                        "source": "registered engineering identity",
+                    }
+                ],
+            }
+        )
+    geometry_objects = [
+        {
+            "object_type": "link",
+            "object": link["name"],
+            "fields": ["visual.xyz", "visual.rpy", "visual.filename", "visual.scale"],
+            "actual": "derived from native occurrence transforms and capture geometry",
+            "source": "native_derived",
+        }
+        for link in links
+    ]
+    geometry_objects.extend(
+        {
+            "object_type": "joint",
+            "object": joint["name"],
+            "fields": ["xyz", "rpy", "axis"],
+            "actual": "derived from native coordinate systems and axis declarations",
+            "source": "native_derived",
+        }
+        for joint in joints
+    )
+    geometry_objects.extend(
+        {
+            "object_type": "frame",
+            "object": frame["name"],
+            "fields": ["xyz", "rpy"],
+            "actual": "derived from native coordinate systems",
+            "source": "native_derived",
+        }
+        for frame in frames
+    )
+    if geometry_objects:
+        warnings.append(
+            {
+                "code": "geometry.derived_from_native",
+                "message": "Geometry, frame transforms and signed joint axes are derived from native evidence.",
+                "objects": geometry_objects,
+            }
+        )
+    warnings.append(
+        {
+            "code": "units.si_conversion",
+            "message": "Delivered values use SI units after conversion from native CAD units.",
+            "objects": [
+                {
+                    "object_type": "robot",
+                    "object": cfg.get("robot_name"),
+                    "field": "units",
+                    "actual": "SI",
+                    "source": "native_derived",
+                }
+            ],
+        }
+    )
+    physics_objects = [
+        {
+            "object_type": "link",
+            "object": link["name"],
+            "fields": ["inertial.mass", "inertial.xyz", "inertial.rpy", "inertial.inertia"],
+            "actual": "transformed or recombined from native readings",
+            "source": "native_derived",
+        }
+        for link in links
+        if link.get("inertial") is not None
+    ]
+    if physics_objects:
+        warnings.append(
+            {
+                "code": "physics.derived_from_native",
+                "message": "Link mass properties are transformed, translated or recombined from native readings.",
+                "objects": physics_objects,
+            }
+        )
+    policy = [
+        {
+            "object_type": "joint",
+            "object": joint["name"],
+            "field": "limits",
+            "actual": joint.get("limits"),
+            "source": "policy_preview_window",
+        }
+        for joint in joints
+        if joint.get("limit_source") == "policy_preview_window"
+    ]
+    if policy:
+        warnings.append(
+            {
+                "code": "limits.policy_preview_window",
+                "message": (
+                    "Joint limits are inspection-preview policy values, not native or controlled "
+                    "engineering limits."
+                ),
+                "objects": policy,
+            }
+        )
+    controlled = [
+        {
+            "object_type": "joint",
+            "object": joint["name"],
+            "field": "limits",
+            "actual": joint.get("limits"),
+            "source": "controlled_record",
+        }
+        for joint in joints
+        if joint.get("limit_source") == "controlled"
+    ]
+    if controlled:
+        warnings.append(
+            {
+                "code": "limits.controlled_record",
+                "message": "Joint limits come from a controlled external record, not a direct CAD reading.",
+                "objects": controlled,
+            }
+        )
+    declared = [
+        {
+            "object_type": "joint",
+            "object": joint["name"],
+            "field": "limits",
+            "actual": joint.get("limits"),
+            "source": "declared_preview_window",
+        }
+        for joint in joints
+        if joint.get("limit_source") == "declared_preview_window"
+    ]
+    if declared:
+        warnings.append(
+            {
+                "code": "limits.declared_preview_window",
+                "message": (
+                    "Joint limits come from a declared inspection-preview window, "
+                    "not a mechanical or native limit."
+                ),
+                "objects": declared,
+            }
+        )
+    constants = []
+    for link in links:
+        for visual in link.get("visuals") or []:
+            fields = ["scale"]
+            actual = {"scale": visual.get("scale")}
+            if visual.get("rgba"):
+                fields.append("material.rgba")
+                actual["rgba"] = visual["rgba"]
+            constants.append(
+                {
+                    "object_type": "visual",
+                    "object": visual["name"],
+                    "fields": fields,
+                    "actual": actual,
+                    "source": "display constant",
+                }
+            )
+    if constants:
+        warnings.append(
+            {
+                "code": "display.constant",
+                "message": "Display scale and material color are platform constants, not CAD readings.",
+                "objects": constants,
+            }
+        )
+    return warnings
 
 
 def _build_frames(

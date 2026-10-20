@@ -79,6 +79,9 @@
             "items": {
               "type": "object",
               "properties": {
+                "name": {
+                  "type": "string"
+                },
                 "kind": {
                   "enum": [
                     "mesh",
@@ -104,6 +107,12 @@
                   "maxItems": 3
                 },
                 "filename": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "mesh_name": {
                   "type": "string"
                 },
                 "scale": {
@@ -137,6 +146,9 @@
                   },
                   "minItems": 4,
                   "maxItems": 4
+                },
+                "material": {
+                  "type": "string"
                 },
                 "provenance": {
                   "type": "object"
@@ -215,6 +227,9 @@
             "items": {
               "type": "object",
               "properties": {
+                "name": {
+                  "type": "string"
+                },
                 "kind": {
                   "enum": [
                     "mesh",
@@ -240,6 +255,12 @@
                   "maxItems": 3
                 },
                 "filename": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "mesh_name": {
                   "type": "string"
                 },
                 "scale": {
@@ -273,6 +294,9 @@
                   },
                   "minItems": 4,
                   "maxItems": 4
+                },
+                "material": {
+                  "type": "string"
                 },
                 "provenance": {
                   "type": "object"

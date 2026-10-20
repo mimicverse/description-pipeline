@@ -102,6 +102,7 @@ FIXED_REQUIRED_CHECKS = frozenset(
         "source.coverage",
         "verification.complete",
         "model.policy",
+        "provenance.value_warnings",
         "physics.independent",
         "frames.native",
         "frames.components",

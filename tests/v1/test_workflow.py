@@ -110,6 +110,61 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(report["cad_revision"]["hardware_id"], "arm")
         self.assertEqual(report["cad_revision"]["revision"], "r1")
 
+    def test_replay_uses_the_registered_robot_name_from_the_frozen_derivation(self):
+        staging = self.root / "replay"
+        write_json(
+            staging / "input/handoff.json",
+            {
+                "passed": True,
+                "package_files": {},
+                "input": {"files": 0},
+                "cad_revision": {"hardware_id": "m3.0", "revision": None},
+                "input_receipt": {"inventory": []},
+            },
+        )
+        write_json(
+            staging / "evidence/discovery.json",
+            {
+                "identity": {
+                    "hardware_id": "m3.0",
+                    "robot_name": None,
+                    "robot_name_technical": "m3_0",
+                },
+                "robot_name": "m3_0",
+                "derivation": {"frozen_names": {"robot_name": "m3_23dof_2515_r01"}},
+            },
+        )
+        with patch.object(steps, "inspect_prepared_input", return_value=read_data(staging / "input/handoff.json")):
+            definition, _report = solidworks._replay_seeded_inputs(staging)
+        self.assertEqual(definition["source"]["robot_name"], "m3_23dof_2515_r01")
+        self.assertEqual(definition["hardware_id"], "m3.0")
+
+    def test_frozen_name_registry_accepts_only_a_canonical_flat_mapping(self):
+        flat = {"robot_name": "robot", "exporter:arm": "arm_link", "axis_sign:arm": -1}
+        flat_path = self.root / "names-flat.json"
+        write_json(flat_path, flat)
+        self.assertEqual(steps._frozen_names(flat_path), flat)
+        structured = self.root / "names-structured.json"
+        write_json(
+            structured,
+            {
+                "schema_version": "solidworks-to-urdf.interface-names/v1",
+                "links": {"exporter:arm": "arm_link"},
+                "flat": flat,
+            },
+        )
+        self.assertEqual(steps._frozen_names(structured), flat)
+        grouped = self.root / "names-grouped.json"
+        write_json(
+            grouped,
+            {
+                "schema_version": "solidworks-to-urdf.interface-names/v1",
+                "links": {"exporter:arm": "arm_link"},
+            },
+        )
+        with self.assertRaisesRegex(PipelineError, "Frozen-name registry"):
+            steps._frozen_names(grouped)
+
     def acquisition_without_admin(self):
         """Byte-binding control only; these placeholders do not qualify CAD."""
         from tests.sources.selection_support import sealed_selection

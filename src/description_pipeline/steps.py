@@ -78,6 +78,30 @@ def freeze_inputs(
     return identity
 
 
+def _frozen_names(path: str | Path) -> dict:
+    """Load the canonical flat registry or its structured, flat-bearing record."""
+
+    def valid(key, value):
+        return isinstance(key, str) and (
+            isinstance(value, str)
+            or (key.startswith("axis_sign:") and type(value) is int and value in {-1, 1})
+        )
+
+    payload = read_data(path)
+    if isinstance(payload, dict) and all(valid(key, value) for key, value in payload.items()):
+        return dict(payload)
+    flat = payload.get("flat") if isinstance(payload, dict) else None
+    if (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == "solidworks-to-urdf.interface-names/v1"
+        and isinstance(flat, dict)
+        and flat
+        and all(valid(key, value) for key, value in flat.items())
+    ):
+        return dict(flat)
+    raise PipelineError("Frozen-name registry must map native identities to interface names")
+
+
 def discover_structure(
     frozen: Path,
     output: Path,
@@ -116,11 +140,18 @@ def discover_structure(
                 "Prepared discovery has invalid controlled-record root identifiers",
             )
         else:
-            names = read_data(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
+            names = _frozen_names(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
             record_roots = configuration.get("record_roots", [])
         _require(
             isinstance(names, dict)
-            and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
+            and all(
+                isinstance(key, str)
+                and (
+                    isinstance(value, str)
+                    or (key.startswith("axis_sign:") and type(value) is int and value in {-1, 1})
+                )
+                for key, value in names.items()
+            ),
             "Frozen-name registry must map native identities to interface names",
         )
         purpose = configuration.get("purpose") if isinstance(configuration, dict) else None

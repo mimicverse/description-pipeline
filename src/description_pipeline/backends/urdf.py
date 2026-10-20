@@ -78,6 +78,14 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
 
     data = robot.to_dict()
     document = ET.Element("robot", name=name)
+    for warning in data.get("provenance", {}).get("value_warnings", []):
+        if isinstance(warning, dict) and warning.get("code"):
+            document.append(
+                ET.Comment(
+                    f"WARNING {warning['code']}: {warning.get('message', '')} "
+                    "See reports/quality.json for object and field details."
+                )
+            )
     for link in data["links"]:
         node = ET.SubElement(document, "link", name=link["name"])
         inertia = link["inertial"]
@@ -96,16 +104,18 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
         for role in ("visuals", "collisions"):
             tag = "visual" if role == "visuals" else "collision"
             for index, shape in enumerate(link[role]):
+                attributes = {"name": shape["name"]} if shape.get("name") else {}
                 kind = shape["kind"]
                 if kind == "mesh":
                     original = confined(source, shape["filename"])
                     if original.suffix.lower() != ".stl":
                         raise PipelineError("SolidWorks-to-URDF v1 supports native STL meshes")
-                    meshes = _export_mesh(original, destination, f"meshes/{tag}/{link['name']}_{index}.stl")
+                    relative = shape.get("mesh_name") or f"meshes/{tag}/{link['name']}_{index}.stl"
+                    meshes = _export_mesh(original, destination, relative.removeprefix("../"))
                 else:
                     meshes = [None]
                 for relative in meshes:
-                    geometry = ET.SubElement(node, tag)
+                    geometry = ET.SubElement(node, tag, **attributes)
                     _origin(geometry, shape)
                     element = ET.SubElement(geometry, "geometry")
                     if relative is not None:
@@ -121,7 +131,11 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
                     else:
                         raise PipelineError(f"Unsupported URDF geometry: {kind}")
                     if tag == "visual" and "rgba" in shape:
-                        material = ET.SubElement(geometry, "material", name=f"{link['name']}_color_{index}")
+                        material = ET.SubElement(
+                            geometry,
+                            "material",
+                            name=str(shape.get("material") or f"{link['name']}_color_{index}"),
+                        )
                         ET.SubElement(material, "color", rgba=_numbers(shape["rgba"]))
     for joint in data["joints"]:
         node = ET.SubElement(document, "joint", name=joint["name"], type=joint["type"])
