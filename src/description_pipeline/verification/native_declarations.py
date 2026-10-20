@@ -755,6 +755,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     owner_for,
                     child_tree,
                     name,
+                    parent_owner=str(joint["parent_link"]),
                     assembly_owner=assembly_owner,
                 )
                 if scope == "unrelated":

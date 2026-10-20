@@ -141,6 +141,7 @@ def limit_mate_scope(
     child_tree: set[str],
     joint_name: str,
     *,
+    parent_owner: str,
     assembly_owner: str | None = None,
 ) -> str:
     """Classify a limit candidate before validating its units or evidence.
@@ -155,7 +156,9 @@ def limit_mate_scope(
     owners = limit_entity_owners(mate, owner_for, assembly_owner=assembly_owner)
     if owners is None:
         return "claimed_unreadable" if name_match else "unrelated"
-    if (owners[0] in child_tree) != (owners[1] in child_tree):
+    if (owners[0] == parent_owner and owners[1] in child_tree) or (
+        owners[1] == parent_owner and owners[0] in child_tree
+    ):
         return "crossing"
     return "claimed_same_side" if name_match else "unrelated"
 
@@ -165,6 +168,7 @@ def validate_limit_entity_topology(
     owner_for: Callable[[str], str | None],
     child_tree: set[str],
     *,
+    parent_owner: str,
     assembly_owner: str | None = None,
 ) -> tuple[str, str]:
     """Prove the two limit entities sit on opposite sides of the joint.
@@ -179,7 +183,10 @@ def validate_limit_entity_topology(
     owners = limit_entity_owners(mate, owner_for, assembly_owner=assembly_owner)
     if owners is None:
         raise ValueError("native limit entity is not owned by exactly one declared body")
-    if (owners[0] in child_tree) == (owners[1] in child_tree):
+    if not (
+        (owners[0] == parent_owner and owners[1] in child_tree)
+        or (owners[1] == parent_owner and owners[0] in child_tree)
+    ):
         raise ValueError("native limit entities do not span the declared parent/child subtrees")
     return owners[0], owners[1]
 

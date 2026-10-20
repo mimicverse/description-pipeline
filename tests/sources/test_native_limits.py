@@ -73,20 +73,33 @@ class NativeLimitValidationTests(unittest.TestCase):
         mate = support.native_limit_mate("base-1", "arm-1")
         owners = {"base-1": "base", "arm-1": "arm"}
         self.assertEqual(
-            validate_limit_entity_topology(mate, owners.get, {"arm"}),
+            validate_limit_entity_topology(mate, owners.get, {"arm"}, parent_owner="base"),
             ("base", "arm"),
         )
         same_side = copy.deepcopy(mate)
         same_side["entities"][1]["component"] = "base-1"
         with self.assertRaisesRegex(ValueError, "span"):
-            validate_limit_entity_topology(same_side, owners.get, {"arm"})
+            validate_limit_entity_topology(same_side, owners.get, {"arm"}, parent_owner="base")
 
     def test_unrelated_mate_from_another_dimension_is_ignored(self) -> None:
         angle = support.native_limit_mate("base-1", "arm-1")
         distance = support.native_limit_mate("base-1", "base-2")
         owners = {"base-1": "base", "arm-1": "arm", "base-2": "base"}
-        self.assertEqual(limit_mate_scope(angle, owners.get, {"arm"}, "hinge"), "crossing")
-        self.assertEqual(limit_mate_scope(distance, owners.get, {"arm"}, "hinge"), "unrelated")
+        self.assertEqual(limit_mate_scope(angle, owners.get, {"arm"}, "hinge", parent_owner="base"), "crossing")
+        self.assertEqual(limit_mate_scope(distance, owners.get, {"arm"}, "hinge", parent_owner="base"), "unrelated")
+        unrelated_name = copy.deepcopy(angle)
+        unrelated_name["name"] = "other__limit"
+        unrelated_name["entities"][1]["component"] = "other-1"
+        owners["other-1"] = "other"
+        self.assertEqual(
+            limit_mate_scope(unrelated_name, owners.get, {"arm"}, "hinge", parent_owner="base"),
+            "unrelated",
+        )
+        unrelated_name["entities"][0]["component"] = "arm-1"
+        self.assertEqual(
+            limit_mate_scope(unrelated_name, owners.get, {"arm"}, "hinge", parent_owner="base"),
+            "unrelated",
+        )
 
     def test_assembly_frame_binds_only_with_an_explicit_root(self) -> None:
         mate = support.native_limit_mate("", "arm-1")
@@ -94,11 +107,18 @@ class NativeLimitValidationTests(unittest.TestCase):
         owners = {"arm-1": "arm"}
         self.assertEqual(validate_native_limit(mate), (-1.0, 1.0, "rad"))
         self.assertEqual(
-            limit_mate_scope(mate, owners.get, {"arm"}, "hinge_joint", assembly_owner="base"),
+            limit_mate_scope(
+                mate,
+                owners.get,
+                {"arm"},
+                "hinge_joint",
+                parent_owner="base",
+                assembly_owner="base",
+            ),
             "crossing",
         )
         self.assertEqual(
-            limit_mate_scope(mate, owners.get, {"arm"}, "hinge_joint"),
+            limit_mate_scope(mate, owners.get, {"arm"}, "hinge_joint", parent_owner="base"),
             "claimed_unreadable",
         )
         self.assertEqual(
@@ -106,6 +126,7 @@ class NativeLimitValidationTests(unittest.TestCase):
                 mate,
                 owners.get,
                 {"arm"},
+                parent_owner="base",
                 assembly_owner="base",
             ),
             ("base", "arm"),

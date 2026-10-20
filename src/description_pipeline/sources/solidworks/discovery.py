@@ -3160,6 +3160,7 @@ def _exporter_joint_facts(
                     owner_for,
                     subtree,
                     str(declared["name"]),
+                    parent_owner=str(parent["name"]),
                     assembly_owner=assembly_owner,
                 )
                 if scope == "unrelated":

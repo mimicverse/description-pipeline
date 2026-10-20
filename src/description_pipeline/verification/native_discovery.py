@@ -52,7 +52,7 @@ from ..sources.solidworks.session_artifacts import (
     session_materialization_under_root,
     session_root_pid,
 )
-from ..sources.solidworks.native_limits import validate_native_limit
+from ..sources.solidworks.native_limits import limit_entity_owners, validate_native_limit
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -2198,6 +2198,18 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
     by_component = {
         str(component): str(body["name"]) for body in bodies for component in body["components"]
     }
+
+    def owner_for(component: str) -> str | None:
+        if component in by_component:
+            return by_component[component]
+        expanded = {
+            leaf
+            for leaf in component_records
+            if leaf == component or leaf.startswith(component + "/")
+        }
+        owners = [body for body, members in full_cluster.items() if expanded and expanded <= members]
+        return owners[0] if len(owners) == 1 else None
+
     attached = _frame_attached_members(raw)
     raw_mates = raw.get("mates") or []
     _members, pairs = _independent_clusters(raw)
@@ -2386,6 +2398,13 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "discovery.joint_limits_unreadable",
                 "native limit unit does not match the joint type",
                 {"pair": [left, right], "unit": unit, "expected": expected_unit},
+            )
+            owners = limit_entity_owners(mate_item, owner_for)
+            _require(
+                owners is not None and set(owners) == {left_body, right_body},
+                "discovery.joint_limits_unreadable",
+                "native limit entities do not bind the declared joint bodies",
+                {"pair": [left, right], "mate": mate_item.get("name"), "owners": owners},
             )
             validated_native.add((lower, upper, unit))
         _require(
