@@ -4504,6 +4504,22 @@ def _validate_windows_acl_projection(value: object, label: str) -> None:
             "windows_recovery_state_invalid",
             f"{label}.rules[{index}] is malformed",
         )
+    rule_order = [
+        (
+            rule["sid"].casefold(),
+            rule["rights"],
+            rule["access_type"],
+            rule["inheritance"],
+            rule["propagation"],
+            rule["inherited"],
+        )
+        for rule in projection["rules"]
+    ]
+    require(
+        rule_order == sorted(rule_order),
+        "windows_recovery_state_invalid",
+        f"{label}.rules is not in canonical order",
+    )
     require(
         projection["projection_sha256"] == _windows_acl_projection_sha256(projection),
         "windows_recovery_state_invalid",

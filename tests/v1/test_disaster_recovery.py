@@ -2789,6 +2789,16 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
     def test_windows_state_negative_boundary_matrix(self) -> None:
         _out, manifest = self.backup()
+
+        def reverse_acl_rules(state):
+            projection = state["acl"]["roots"]["state_root"]
+            first = projection["rules"][0]
+            projection["rules"] = [
+                {**first, "sid": "S-1-5-21-2"},
+                first,
+            ]
+            projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
+
         cases = (
             (
                 "started",
@@ -2823,6 +2833,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
             (
                 "acl_digest",
                 lambda state: state["acl"]["roots"]["package_root"].update(sddl="D:FA"),
+                "windows_recovery_state_invalid",
+            ),
+            (
+                "acl_rule_order",
+                reverse_acl_rules,
                 "windows_recovery_state_invalid",
             ),
             (
