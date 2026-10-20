@@ -1808,22 +1808,99 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(carrier["joints"][0]["axis_sign"], -1)
 
-        conflict = _carrier_snapshot(
-            None,
-            [],
-            [joint],
-            {
-                "properties": {
-                    "document": {"dp.joint.shoulder_pitch_joint.axis_sign": "-1"},
-                    "mates": {
-                        "shoulder_pitch_joint__coaxial": {
-                            "dp.joint.shoulder_pitch_joint.axis_sign": "+1"
-                        }
-                    },
-                }
-            },
+        with self.assertRaises(PipelineError):
+            _carrier_snapshot(
+                None,
+                [],
+                [
+                    {
+                        "name": "shoulder_pitch_joint",
+                        "mate": "shoulder_pitch_joint__coaxial",
+                        "mates": ["shoulder_pitch_joint__coaxial"],
+                    }
+                ],
+                {
+                    "properties": {
+                        "document": {"dp.joint.shoulder_pitch_joint.axis_sign": "-1"},
+                        "mates": {
+                            "shoulder_pitch_joint__coaxial": {
+                                "dp.joint.shoulder_pitch_joint.axis_sign": "+1"
+                            }
+                        },
+                    }
+                },
+            )
+
+    def test_carrier_snapshot_scope_and_type_boundaries(self):
+        joint = {"name": "arm_joint"}
+
+        def sign(raw, candidate=joint):
+            return _carrier_snapshot(None, [], [candidate], raw)["joints"][0]["axis_sign"]
+
+        self.assertIsNone(
+            sign({"properties": {"components": {"part": {"dp.joint.axis_sign": "-1"}}}})
         )
-        self.assertIsNone(conflict["joints"][0]["axis_sign"])
+        self.assertEqual(
+            sign(
+                {
+                    "properties": {
+                        "document": {"dp.joint.arm_joint.axis_sign": "-1"},
+                        "components": {"part": {"dp.joint.axis_sign": "+1"}},
+                    }
+                }
+            ),
+            -1,
+        )
+        self.assertIsNone(
+            sign(
+                {
+                    "properties": {
+                        "components": {
+                            "arm_joint": {"dp.joint.arm_joint.axis_sign": "-1"}
+                        }
+                    }
+                }
+            )
+        )
+        self.assertIsNone(
+            sign({"properties": {"document": {"dp.joint.other_joint.axis_sign": "-1"}}})
+        )
+        for value in (True, False, -1.0, 1.0):
+            with self.subTest(value=value), self.assertRaises(PipelineError):
+                sign({"properties": {"document": {"dp.joint.arm_joint.axis_sign": value}}})
+        with self.assertRaises(PipelineError):
+            sign(
+                {
+                    "properties": {
+                        "mates": {
+                            "arm_joint__a": {"dp.joint.axis_sign": "-1"},
+                            "arm_joint__b": {"dp.joint.axis_sign": "+1"},
+                        }
+                    }
+                },
+                {
+                    "name": "arm_joint",
+                    "mate": "arm_joint__a",
+                    "mates": ["arm_joint__a", "arm_joint__b"],
+                },
+            )
+        with self.assertRaises(PipelineError):
+            _carrier_snapshot(
+                None,
+                [],
+                [
+                    {"name": "arm_joint", "mate": "m1"},
+                    {"name": "arm_joint", "mate": "m2"},
+                ],
+                {
+                    "properties": {
+                        "mates": {
+                            "m1": {"dp.joint.axis_sign": "-1"},
+                            "m2": {"dp.joint.axis_sign": "+1"},
+                        }
+                    }
+                },
+            )
 
     def test_native_limit_record_must_be_finite(self):
         def mutate(payload):

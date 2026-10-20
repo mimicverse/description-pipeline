@@ -414,47 +414,61 @@ def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
 
     def axis_sign(joint: dict, properties: dict) -> int | None:
         name = str(joint.get("name") or "")
-        keys = (f"dp.joint.{name}.axis_sign", "dp.joint.axis_sign")
+        direct_key = f"dp.joint.{name}.axis_sign"
+        legacy_key = "dp.joint.axis_sign"
         candidates: list[object] = []
-        scopes = [properties.get("document") or {}]
-        scopes.extend(
-            scope
-            for scope in (properties.get("components") or {}).values()
-            if isinstance(scope, dict)
-        )
-        for scope in scopes:
-            if isinstance(scope, dict):
-                candidates.extend(scope[key] for key in keys if key in scope)
+
+        def add(scope: object, key: str) -> None:
+            if not isinstance(scope, dict) or key not in scope:
+                return
+            value = scope[key]
+            if type(value) is int and value in (1, -1):
+                candidates.append(value)
+            elif type(value) is str and value in ("+1", "1", "-1"):
+                candidates.append(-1 if value == "-1" else 1)
+            else:
+                raise PipelineError(f"{name} carries an invalid {key}: {value!r}")
+
+        # The declaration form is a main-assembly property scoped by the joint
+        # name.  Never scan unrelated components: a generic key on another part
+        # does not describe this joint.
+        add(properties.get("document") or {}, direct_key)
         mate_names: list[str] = []
         if isinstance(joint.get("mate"), str):
             mate_names.append(joint["mate"])
         if isinstance(joint.get("mates"), list):
             mate_names.extend(str(item) for item in joint["mates"] if isinstance(item, str))
         mate_properties = properties.get("mates") or {}
-        for mate_name in mate_names:
+        for mate_name in sorted(set(mate_names)):
             scope = mate_properties.get(mate_name) or {}
             if isinstance(scope, dict):
-                candidates.extend(scope[key] for key in keys if key in scope)
-        for mate_name, scope in mate_properties.items():
-            if (
-                isinstance(scope, dict)
-                and str(mate_name).split("__", 1)[0] == name
-            ):
-                candidates.extend(scope[key] for key in keys if key in scope)
-        signs = {
-            -1 if value in (-1, "-1") else 1
-            for value in candidates
-            if value in (1, -1, "1", "+1", "-1")
-        }
-        return signs.pop() if len(signs) == 1 else None
+                add(scope, legacy_key)
+                add(scope, direct_key)
+        signs = set(candidates)
+        if len(signs) > 1:
+            raise PipelineError(f"{name} carries conflicting axis signs: {sorted(signs)}")
+        return signs.pop() if signs else None
 
-    signs: dict[str, int] = {}
-    if isinstance(raw, dict):
-        properties = raw.get("properties") or {}
-        for joint in joints:
-            sign = axis_sign(joint, properties)
-            if sign is not None:
-                signs[str(joint["name"])] = sign
+    properties = raw.get("properties") or {} if isinstance(raw, dict) else {}
+    joint_rows = [
+        {
+            "name": str(joint["name"]),
+            "type": joint.get("type"),
+            "parent": str(joint.get("parent") or ""),
+            "child": str(joint.get("child") or ""),
+            "axis_sign": axis_sign(joint, properties),
+        }
+        for joint in joints
+    ]
+    by_name: dict[str, int] = {}
+    for row in joint_rows:
+        sign = row["axis_sign"]
+        if sign is None:
+            continue
+        name = row["name"]
+        if name in by_name and by_name[name] != sign:
+            raise PipelineError(f"duplicate joint name {name} carries conflicting author signs")
+        by_name[name] = sign
     return {
         "root": None if root is None else str(root),
         "bodies": [
@@ -465,16 +479,7 @@ def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
             }
             for body in bodies
         ],
-        "joints": [
-            {
-                "name": str(joint["name"]),
-                "type": joint.get("type"),
-                "parent": str(joint.get("parent") or ""),
-                "child": str(joint.get("child") or ""),
-                "axis_sign": signs.get(str(joint["name"])),
-            }
-            for joint in joints
-        ],
+        "joints": joint_rows,
     }
 
 
@@ -2095,10 +2100,15 @@ def _value_warning_gate(root, source, model, carrier=None):
 
     bodies = source.get("bodies") or []
     joints = source.get("joints") or []
-    carrier_signs = {
-        str(row["name"]): row.get("axis_sign")
-        for row in (carrier or {}).get("joints") or []
-    }
+    carrier_signs: dict[str, int] = {}
+    for row in (carrier or {}).get("joints") or []:
+        sign = row.get("axis_sign")
+        if sign is None:
+            continue
+        name = str(row["name"])
+        if name in carrier_signs and carrier_signs[name] != sign:
+            raise PipelineError(f"duplicate joint name {name} carries conflicting author signs")
+        carrier_signs[name] = sign
     links = model.get("links") or []
     model_joints = model.get("joints") or []
     shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
