@@ -416,6 +416,78 @@ def _input(root, diagnostics=None):
 def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
     """Freeze the raw-decoded carrier names, members and native topology."""
 
+    raw_rows = raw.get("reference_axes") if isinstance(raw, dict) else None
+    raw_rows = raw_rows if isinstance(raw_rows, list) else []
+    axes_by_selector: dict[tuple[str, str, str], dict] = {}
+    axes_by_joint: dict[str, list[dict]] = {}
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        selector = row.get("selector") if isinstance(row.get("selector"), dict) else {}
+        key = (
+            str(selector.get("kind") or ""),
+            str(selector.get("component") or ""),
+            str(selector.get("feature_name") or ""),
+        )
+        if any(key):
+            previous = axes_by_selector.get(key)
+            _require(
+                previous is None or previous.get("axis_direction") == row.get("axis_direction"),
+                f"Native axis selector {key!r} carries conflicting directions",
+            )
+            axes_by_selector[key] = row
+        joint_name = row.get("joint")
+        if isinstance(joint_name, str) and joint_name:
+            axes_by_joint.setdefault(joint_name, []).append(row)
+
+    def assembly_axis(joint: dict) -> list[float] | None:
+        selector = joint.get("axis_reference")
+        selector_key = None
+        if isinstance(selector, dict):
+            selector_key = (
+                str(selector.get("kind") or ""),
+                str(selector.get("component") or ""),
+                str(selector.get("feature_name") or ""),
+            )
+        matches: list[dict] = []
+        if selector_key is not None:
+            selected = axes_by_selector.get(selector_key)
+            if selected is not None:
+                matches.append(selected)
+        matches.extend(axes_by_joint.get(str(joint.get("name") or ""), []))
+        unique: dict[tuple[float, float, float], list[float]] = {}
+        for row in matches:
+            values = row.get("axis_direction")
+            _require(
+                isinstance(values, list) and len(values) == 3,
+                "Native axis direction is malformed",
+            )
+            try:
+                direction = np.asarray(values, dtype=float)
+            except (TypeError, ValueError) as error:
+                raise PipelineError("Native axis direction is malformed") from error
+            _require(
+                np.isfinite(direction).all() and float(np.linalg.norm(direction)) > 1e-12,
+                "Native axis direction is invalid",
+            )
+            _require(
+                row.get("coordinate_frame") == "assembly",
+                "Functional naming requires an assembly-frame native axis",
+            )
+            _require(
+                row.get("direction_semantics") == "undirected_axis_line",
+                "Functional naming requires an undirected native axis line",
+            )
+            normalized = direction / float(np.linalg.norm(direction))
+            unique[tuple(float(value) for value in np.round(normalized, 12))] = [
+                float(value) for value in normalized
+            ]
+        _require(
+            len(unique) <= 1,
+            f"{joint.get('name')} carries conflicting native axis directions",
+        )
+        return next(iter(unique.values()), None)
+
     def axis_sign(joint: dict, properties: dict) -> int | None:
         name = str(joint.get("name") or "")
         direct_key = f"dp.joint.{name}.axis_sign"
@@ -461,6 +533,7 @@ def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
             "parent": str(joint.get("parent") or ""),
             "child": str(joint.get("child") or ""),
             "axis_sign": axis_sign(joint, properties),
+            "axis_assembly_direction": assembly_axis(joint),
         }
         for joint in joints
     ]
@@ -1879,11 +1952,18 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
 
     source = definition["source"]
     carrier = source.get("carrier")
+    native_geometry_rows = evidence.geometry(root)
     gates.add("model.policy", lambda: _policy(source, model))
     gates.add("source.carrier_binding", lambda: _carrier_binding(source, carrier))
     gates.add(
         "provenance.value_warnings",
-        lambda: _value_warning_gate(root, source, model, carrier),
+        lambda: _value_warning_gate(
+            root,
+            source,
+            model,
+            carrier,
+            native_geometry_rows=native_geometry_rows,
+        ),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
@@ -1974,7 +2054,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             )
     for frame in source.get("frames", []):
         gates.add("frames." + frame["name"], lambda f=frame: _frame(f, model, joints, links, datums, body_datums))
-    geometry_rows = evidence.geometry(root)
+    geometry_rows = native_geometry_rows
     geometry = {row["component"]: row for row in geometry_rows}
     gates.add("geometry.coverage", lambda: _geometry_coverage(geometry_rows, components))
     points, used = [], []
@@ -2093,7 +2173,7 @@ def _carrier_binding(source, carrier):
     return {"bodies": len(native), "joints": len(delivered)}
 
 
-def _value_warning_gate(root, source, model, carrier=None):
+def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_rows=None):
     """Re-derive every non-native value warning from source facts and the model."""
 
     from ..sources.solidworks.naming import (
@@ -2139,6 +2219,16 @@ def _value_warning_gate(root, source, model, carrier=None):
     links = model.get("links") or []
     model_joints = model.get("joints") or []
     shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
+    native_geometry = {}
+    for row in native_geometry_rows or []:
+        _require(isinstance(row, dict), "Raw geometry rows must be objects")
+        component = str(row.get("component") or "")
+        _require(component and component not in native_geometry, "Raw geometry components are not unique")
+        _require(
+            not ({"material", "rgba", "appearance", "color", "colour"} & set(row)),
+            "The capture schema carries no independently verified CAD appearance",
+        )
+        native_geometry[component] = row
 
     # Re-derive the canonical names and their provenance from the native
     # topology.  A source record's own name_rule claim is never trusted: the
@@ -2146,6 +2236,11 @@ def _value_warning_gate(root, source, model, carrier=None):
     # warning metadata is computed from the same rule, not copied from source.
     output_to_native = {
         str(body["name"]): str(body.get("source_name") or body["name"]) for body in bodies
+    }
+    carrier_axes = {
+        str(row["name"]): row.get("axis_assembly_direction")
+        for row in (carrier or {}).get("joints") or []
+        if row.get("axis_assembly_direction") is not None
     }
     native_bodies = [
         {
@@ -2168,10 +2263,8 @@ def _value_warning_gate(root, source, model, carrier=None):
                 str(joint.get("child") or ""), str(joint.get("child") or "")
             ),
             "axis": {
-                "assembly_direction": (
-                    (joint.get("axis_provenance") or {}).get("assembly_direction")
-                    if isinstance(joint.get("axis_provenance"), dict)
-                    else None
+                "assembly_direction": carrier_axes.get(
+                    str(joint.get("source_name") or joint["name"])
                 )
             },
         }
@@ -2382,6 +2475,14 @@ def _value_warning_gate(root, source, model, carrier=None):
         provenance = shape.get("provenance") if isinstance(shape.get("provenance"), dict) else {}
         native_component = str(provenance.get("native_component") or "")
         _require(native_component, "Visual carries no native component identity")
+        if native_geometry_rows is not None:
+            native_row = native_geometry.get(native_component)
+            _require(native_row is not None, "Visual is missing from the raw geometry evidence")
+            _require(
+                native_row.get("path") == shape.get("filename")
+                and native_row.get("sha256") == shape.get("sha256"),
+                "Visual mesh identity differs from the raw geometry evidence",
+            )
         _require(
             shape.get("name") == visual_name(native_component, link=link["name"]),
             "Visual name differs from the CAD-derived rule",
@@ -2445,6 +2546,15 @@ def _value_warning_gate(root, source, model, carrier=None):
                 "rule_version": provenance.get("rule_version"),
                 "reason": provenance.get("reason"),
             },
+        )
+    if native_geometry_rows is not None:
+        _require(
+            set(native_geometry)
+            == {
+                str((shape.get("provenance") or {}).get("native_component") or "")
+                for _link, shape in shapes
+            },
+            "Raw geometry and delivered visual occurrences differ",
         )
     if source.get("robot_name_source") == "cad_filename_derived":
         source_name = str(source.get("assembly") or "").replace("\\", "/").rsplit("/", 1)[-1]

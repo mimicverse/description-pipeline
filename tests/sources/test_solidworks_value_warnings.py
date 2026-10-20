@@ -260,6 +260,195 @@ class ValueWarningTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             _value_warning_gate(self.root, source, model)
 
+    def test_model_cannot_self_claim_cad_material_when_raw_schema_has_no_appearance(self):
+        model = copy.deepcopy(self.model)
+        visual = model["links"][0]["visuals"][0]
+        visual.update(material="fabricated_blue", rgba=[0.0, 0.0, 1.0, 1.0])
+        visual["provenance"].update(
+            material_source="cad",
+            material_original="fabricated_blue",
+            rule_id="naming.cad_appearance",
+            rule_version="naming-v1",
+            reason="CAD appearance material formatting",
+        )
+        warning = next(
+            item
+            for item in model["provenance"]["value_warnings"]
+            if item["code"] == "display.material_fallback"
+        )
+        warning["objects"][0].update(
+            actual={"name": "fabricated_blue", "rgba": [0.0, 0.0, 1.0, 1.0]},
+            source="CAD appearance",
+            original="fabricated_blue",
+            rule_id="naming.cad_appearance",
+        )
+        with self.assertRaisesRegex(
+            PipelineError,
+            "capture schema carries no independently verified CAD appearance",
+        ):
+            _value_warning_gate(
+                self.root,
+                self.source,
+                model,
+                native_geometry_rows=[
+                    {
+                        "component": "part-1",
+                        "path": "geometry/mesh.stl",
+                        "sha256": self.digest,
+                    }
+                ],
+            )
+
+    def test_unverified_raw_appearance_is_rejected_instead_of_becoming_fallback(self):
+        with self.assertRaisesRegex(
+            PipelineError,
+            "capture schema carries no independently verified CAD appearance",
+        ):
+            _value_warning_gate(
+                self.root,
+                self.source,
+                self.model,
+                native_geometry_rows=[
+                    {
+                        "component": "part-1",
+                        "path": "geometry/mesh.stl",
+                        "sha256": self.digest,
+                        "material": "cad_gray",
+                        "rgba": [0.7, 0.7, 0.7, 1.0],
+                    }
+                ],
+            )
+
+    def test_functional_joint_name_is_rederived_from_raw_axis_not_source_provenance(self):
+        native_bodies = [
+            {
+                "name": "base_link3.0-1",
+                "frame": {"coordinate_system": "CS_base_link"},
+                "components": ["base"],
+            },
+            {
+                "name": "l_elbow3.0.3-1",
+                "frame": {"coordinate_system": "c_l_elbow"},
+                "components": ["forearm"],
+            },
+            {
+                "name": "l_wrist_pitch3.0-1",
+                "frame": {"coordinate_system": "c_l_wrist_pitch"},
+                "components": ["hand"],
+            },
+        ]
+        native_joints = [
+            {
+                "name": "l_elbow",
+                "type": "revolute",
+                "parent": "base_link3.0-1",
+                "child": "l_elbow3.0.3-1",
+                "axis_reference": {
+                    "kind": "reference_axis",
+                    "component": "",
+                    "feature_name": "a_l_elbow",
+                },
+            },
+            {
+                "name": "l_wrist_pitch",
+                "type": "revolute",
+                "parent": "l_elbow3.0.3-1",
+                "child": "l_wrist_pitch3.0-1",
+                "axis_reference": {
+                    "kind": "reference_axis",
+                    "component": "",
+                    "feature_name": "a_l_wrist_pitch",
+                },
+            },
+        ]
+        raw = {
+            "reference_axes": [
+                {
+                    "selector": {
+                        "kind": "reference_axis",
+                        "component": "",
+                        "feature_name": "a_l_elbow",
+                    },
+                    "axis_direction": [0.0, 1.0, 0.0],
+                    "coordinate_frame": "assembly",
+                    "direction_semantics": "undirected_axis_line",
+                },
+                {
+                    "selector": {
+                        "kind": "reference_axis",
+                        "component": "",
+                        "feature_name": "a_l_wrist_pitch",
+                    },
+                    "axis_direction": [0.0, 0.0, 1.0],
+                    "coordinate_frame": "assembly",
+                    "direction_semantics": "undirected_axis_line",
+                },
+            ]
+        }
+        carrier = _carrier_snapshot("base_link3.0-1", native_bodies, native_joints, raw)
+        self.assertEqual(
+            carrier["joints"][0]["axis_assembly_direction"],
+            [0.0, 1.0, 0.0],
+        )
+
+        source = copy.deepcopy(self.source)
+        source["bodies"] = [
+            {
+                "name": "base_link",
+                "source_name": "base_link3.0-1",
+                "frame": {"coordinate_system": "CS_base_link"},
+                "components": ["base"],
+            },
+            {
+                "name": "left_forearm_link",
+                "source_name": "l_elbow3.0.3-1",
+                "frame": {"coordinate_system": "c_l_elbow"},
+                "components": ["forearm"],
+            },
+            {
+                "name": "left_hand_link",
+                "source_name": "l_wrist_pitch3.0-1",
+                "frame": {"coordinate_system": "c_l_wrist_pitch"},
+                "components": ["hand"],
+            },
+        ]
+        source["joints"] = [
+            {
+                "name": "left_elbow_pitch_joint",
+                "source_name": "l_elbow",
+                "type": "revolute",
+                "parent": "base_link",
+                "child": "left_forearm_link",
+                "axis": [0.0, 1.0, 0.0],
+                "axis_provenance": {
+                    "assembly_direction": [0.0, 1.0, 0.0],
+                },
+            },
+            {
+                "name": "left_wrist_pitch_joint",
+                "source_name": "l_wrist_pitch",
+                "type": "revolute",
+                "parent": "left_forearm_link",
+                "child": "left_hand_link",
+                "axis": [0.0, 0.0, 1.0],
+            },
+        ]
+        model = copy.deepcopy(self.model)
+        model["links"] = [
+            {"name": "base_link", "visuals": []},
+            {"name": "left_forearm_link", "visuals": []},
+            {"name": "left_hand_link", "visuals": []},
+        ]
+        model["joints"] = [
+            {"name": "left_elbow_pitch_joint", "axis": [0.0, 1.0, 0.0]},
+            {"name": "left_wrist_pitch_joint", "axis": [0.0, 0.0, 1.0]},
+        ]
+        with self.assertRaisesRegex(
+            PipelineError,
+            "joint name is not the deterministic CAD-derived rule output",
+        ):
+            _value_warning_gate(self.root, source, model, carrier)
+
     def test_author_sign_reversal_warning_is_derived_and_field_level(self):
         source = copy.deepcopy(self.source)
         provenance = {
