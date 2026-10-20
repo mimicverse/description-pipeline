@@ -40,6 +40,34 @@ _LIMIT_TYPES = {
     },
 }
 
+PREVIEW_POLICY_ID = "inspection_rotation_full_turn/v1"
+PREVIEW_WINDOW_RAD = math.pi
+
+
+def native_limit_inventory_complete(mates) -> bool:
+    """Whether the raw mate inventory proves no enabled native position limit."""
+
+    if not isinstance(mates, list):
+        return False
+    for mate in mates:
+        if not isinstance(mate, Mapping):
+            return False
+        if type(mate.get("suppressed")) is not bool:
+            return False
+        if mate["suppressed"]:
+            continue
+        if mate.get("error_code") != 0:
+            return False
+        if mate.get("native_limit") is not None or mate.get("limits") is not None:
+            return False
+        mate_type = str(mate.get("type") or "").lower()
+        if mate_type in {"distance", "angle", "limitangle", "limitdistance"}:
+            if type(mate.get("is_advanced_mate")) is not bool or mate.get("is_advanced_mate_error") is not None:
+                return False
+            if mate["is_advanced_mate"] is True:
+                return False
+    return True
+
 
 def _finite(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):

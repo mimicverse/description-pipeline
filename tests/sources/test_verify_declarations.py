@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,7 +20,7 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
-from description_pipeline.interface_records import PURPOSE_INSPECTION_PREVIEW
+from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification.native_declarations import verify_declarations
@@ -330,6 +331,18 @@ def rewrite(raw, transform):
     raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(xml.encode()).hexdigest()
 
 
+def zero_limit_values(raw):
+    def transform(root):
+        for item in root.iter():
+            if (item.get(Z_TAG + "Id") or "").startswith("joint_limit_") and item.find(
+                NS_TAG + "Value"
+            ) is not None:
+                item.find(NS_TAG + "Value").text = "0"
+
+    rewrite(raw, transform)
+    return raw
+
+
 def component(name, document=None):
     return {
         "name2": name,
@@ -476,6 +489,27 @@ def source_claims():
         ],
         "frames": [],
     }
+
+
+def preview_claims():
+    claims = source_claims()
+    claims["joints"][0]["limits"] = {
+        "lower": -math.pi,
+        "upper": math.pi,
+        "effort": 0.0,
+        "velocity": 0.0,
+    }
+    claims["joints"][0]["limit_source"] = "preview_policy"
+    claims["joints"][0]["preview_policy"] = {
+        "rule_id": "inspection_rotation_full_turn/v1",
+        "rule_version": "v1",
+        "window_rad": [-math.pi, math.pi],
+        "native_cad_ranges": False,
+        "hardware_qualified": False,
+        "author_limits": {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0},
+        "native_absence": "complete_mate_inventory_no_enabled_limit",
+    }
+    return claims
 
 
 def lock(left, right, *, error=0, kind="lock"):
@@ -978,7 +1012,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         rewrite(candidate, drop_effort)
         self.assertIn("v14.attribute_shape", self.errors(candidate))
 
-    def test_zero_placeholder_without_native_range_is_rejected(self):
+    def test_zero_placeholder_requires_preview_policy_scope(self):
         def zero_limits(raw):
             def transform(root):
                 for item in root.iter():
@@ -993,8 +1027,12 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw = zero_limits(fixture())
         raw["mates"] = [lock("base_part", "module-1/tool_part", kind="lock")]
         report = verify_declarations(raw, purpose=PURPOSE_INSPECTION_PREVIEW)
-        self.assertFalse(report["passed"])
-        self.assertIn("v14.native_limits_missing", {item["code"] for item in report["errors"]})
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertEqual(report["carrier"]["joints"][0]["limit_source"], "preview_policy")
+
+        engineering = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(engineering["passed"])
+        self.assertIn("v14.native_limits_missing", {item["code"] for item in engineering["errors"]})
 
         native = copy.deepcopy(raw)
         native["mates"] = [
@@ -1043,6 +1081,45 @@ class NativeDeclarationsTests(unittest.TestCase):
         incomplete_report = verify_declarations(incomplete, purpose=PURPOSE_INSPECTION_PREVIEW)
         self.assertFalse(incomplete_report["passed"])
         self.assertNotIn("limit_source", incomplete_report["carrier"]["joints"][0])
+
+    def test_preview_policy_requires_complete_inventory_and_inspection_purpose(self):
+        raw = zero_limit_values(fixture())
+        raw["mates"] = []
+        preview = verify_declarations(raw, preview_claims(), purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(preview["passed"], preview["errors"])
+        joint = preview["carrier"]["joints"][0]
+        self.assertEqual(joint["limit_source"], "preview_policy")
+        self.assertEqual(
+            joint["limits"],
+            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
+        )
+        self.assertEqual(joint["preview_policy"]["rule_id"], "inspection_rotation_full_turn/v1")
+
+        engineering = verify_declarations(raw, preview_claims(), purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(engineering["passed"])
+        self.assertIn("v14.native_limits_missing", {item["code"] for item in engineering["errors"]})
+
+        incomplete = copy.deepcopy(raw)
+        incomplete["mates"] = [{"name": "incomplete", "type": "distance"}]
+        incomplete_report = verify_declarations(
+            incomplete,
+            preview_claims(),
+            purpose=PURPOSE_INSPECTION_PREVIEW,
+        )
+        self.assertFalse(incomplete_report["passed"])
+        self.assertIn(
+            "v14.native_limits_unreadable",
+            {item["code"] for item in incomplete_report["errors"]},
+        )
+
+    def test_valid_author_range_takes_precedence_over_preview_policy(self):
+        raw = fixture()
+        raw["mates"] = []
+        claims = source_claims()
+        claims["joints"][0]["limit_source"] = "declared_author"
+        report = verify_declarations(raw, claims, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertEqual(report["carrier"]["joints"][0]["limit_source"], "declared_author")
 
     def test_boundary_tristate_exact_hash_document_configuration_and_pid(self):
         for change, code in [

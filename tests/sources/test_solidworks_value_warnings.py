@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import tempfile
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree as ET
+
+import numpy as np
 
 from description_pipeline.io import PipelineError
 from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
-from description_pipeline.verification.solidworks_urdf import _value_warning_gate
+from description_pipeline.sources.solidworks.scene import _value_warnings
+from description_pipeline.verification.solidworks_urdf import _joint, _value_warning_gate
 
 
 class ValueWarningTests(unittest.TestCase):
@@ -401,6 +406,86 @@ class ValueWarningTests(unittest.TestCase):
         )
         result = _value_warning_gate(self.root, source, model)
         self.assertEqual(result["objects"], 10)
+
+    def test_preview_policy_limit_warning_is_field_level(self):
+        policy = {
+            "rule_id": "inspection_rotation_full_turn/v1",
+            "rule_version": "v1",
+            "window_rad": [-math.pi, math.pi],
+            "native_cad_ranges": False,
+            "hardware_qualified": False,
+            "author_limits": {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0},
+        }
+        cfg = {
+            "joints": [
+                {
+                    "name": "hinge",
+                    "source_name": "hinge",
+                    "type": "revolute",
+                    "limit_source": "preview_policy",
+                    "preview_policy": policy,
+                }
+            ],
+            "frames": [],
+        }
+        joints = [
+            {
+                "name": "hinge",
+                "limits": {
+                    "lower": -math.pi,
+                    "upper": math.pi,
+                    "effort": 0.0,
+                    "velocity": 0.0,
+                },
+            }
+        ]
+        warnings = _value_warnings(cfg, [], [], joints, [])
+        warning = next(item for item in warnings if item["code"] == "limits.preview_policy")
+        row = warning["objects"][0]
+        self.assertEqual(row["field"], "limits")
+        self.assertEqual(row["rule_id"], "inspection_rotation_full_turn/v1")
+        self.assertEqual(row["actual"], joints[0]["limits"])
+        self.assertEqual(row["original"], policy["author_limits"])
+        self.assertFalse(row["native_cad_ranges"])
+        self.assertFalse(row["hardware_qualified"])
+
+    def test_preview_policy_joint_gate_requires_inspection_and_the_exact_window(self):
+        node = ET.fromstring(
+            "<joint name='hinge' type='revolute'>"
+            "<parent link='base'/><child link='tool'/>"
+            "<origin xyz='0 0 0' rpy='0 0 0'/><axis xyz='0 0 1'/>"
+            "<limit lower='-3.141592653589793' upper='3.141592653589793' effort='0' velocity='0'/>"
+            "</joint>"
+        )
+        limits = {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0}
+        policy = {
+            "rule_id": "inspection_rotation_full_turn/v1",
+            "rule_version": "v1",
+            "native_cad_ranges": False,
+            "hardware_qualified": False,
+        }
+        authored = {
+            "name": "hinge",
+            "type": "revolute",
+            "parent": "base",
+            "child": "tool",
+            "axis": [0.0, 0.0, 1.0],
+            "limits": limits,
+            "limit_source": "preview_policy",
+            "preview_policy": policy,
+        }
+        canonical = {
+            **authored,
+            "xyz": [0.0, 0.0, 0.0],
+            "rpy": [0.0, 0.0, 0.0],
+        }
+        body_datums = {"base": np.eye(4), "tool": np.eye(4)}
+        self.assertEqual(
+            _joint(node, authored, canonical, {}, body_datums, [], preview=True)["limits"],
+            limits,
+        )
+        with self.assertRaises(PipelineError):
+            _joint(node, authored, canonical, {}, body_datums, [], preview=False)
 
 
 if __name__ == "__main__":

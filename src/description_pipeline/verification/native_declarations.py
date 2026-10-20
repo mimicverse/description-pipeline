@@ -15,11 +15,18 @@ import re
 
 import numpy as np
 
+from ..interface_records import PURPOSE_INSPECTION_PREVIEW
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
 )
-from ..sources.solidworks.native_limits import limit_mate_scope, validate_native_limit
+from ..sources.solidworks.native_limits import (
+    PREVIEW_POLICY_ID,
+    PREVIEW_WINDOW_RAD,
+    limit_mate_scope,
+    native_limit_inventory_complete,
+    validate_native_limit,
+)
 from ..sources.solidworks.direction import canonicalize_axis
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
@@ -729,8 +736,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             if not isinstance(raw_mates, list):
                 native_complete = False
                 raw_mates = []
-            elif joint["type"] != "continuous" and not raw_mates:
-                native_complete = False
             limit_types = {"distance", "angle", "limitdistance", "limitangle"}
             for mate in raw_mates:
                 if not isinstance(mate, dict):
@@ -831,6 +836,42 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 }
                 state.setdefault("effective_limits", {})[name] = dict(limits)
                 state.setdefault("effective_limit_sources", {})[name] = "native"
+            elif (
+                joint["type"] == "revolute"
+                and purpose == PURPOSE_INSPECTION_PREVIEW
+                and native_limit_inventory_complete(raw.get("mates"))
+                and _all_zero_limits(raw_limits)
+            ):
+                preview_limits = {
+                    "lower": -PREVIEW_WINDOW_RAD,
+                    "upper": PREVIEW_WINDOW_RAD,
+                }
+                for key in ("effort", "velocity"):
+                    if _number(raw_limits.get(key)) and raw_limits[key] >= 0:
+                        preview_limits[key] = raw_limits[key]
+                limits = preview_limits
+                state.setdefault("effective_limits", {})[name] = dict(limits)
+                state.setdefault("effective_limit_sources", {})[name] = "preview_policy"
+                state.setdefault("preview_policies", {})[name] = {
+                    "rule_id": PREVIEW_POLICY_ID,
+                    "rule_version": "v1",
+                    "window_rad": [-PREVIEW_WINDOW_RAD, PREVIEW_WINDOW_RAD],
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
+                    "author_limits": dict(raw_limits),
+                    "native_absence": "complete_mate_inventory_no_enabled_limit",
+                }
+                diagnostics.append(
+                    {
+                        "code": "v14.preview_policy",
+                        "blocking": False,
+                        "message": (
+                            "inspection preview uses the versioned full-turn rotation window; "
+                            "no engineering position range is established"
+                        ),
+                        "detail": {"joint": name, **state["preview_policies"][name]},
+                    }
+                )
             elif _all_zero_limits(raw_limits):
                 raise DeclarationError(
                     "v14.native_limits_missing",
@@ -1121,6 +1162,11 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     **(
                         {"limit_source": state["effective_limit_sources"][name]}
                         if name in state.get("effective_limit_sources", {})
+                        else {}
+                    ),
+                    **(
+                        {"preview_policy": state["preview_policies"][name]}
+                        if name in state.get("preview_policies", {})
                         else {}
                     ),
                 }

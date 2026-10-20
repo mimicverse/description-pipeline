@@ -25,6 +25,7 @@ from ..geometry import stl
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
+from ..sources.solidworks.native_limits import PREVIEW_POLICY_ID, PREVIEW_WINDOW_RAD
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
@@ -919,7 +920,7 @@ def _link_physics(node, canonical):
     return {"mass_kg": mass, "principal_inertia_kg_m2": eigenvalues.tolist()}
 
 
-def _joint(node, authored, canonical, datums, body_datums, diagnostics):
+def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, preview=False):
     _require(node.get("type") == authored["type"] == canonical["type"], "Joint type changed")
     for key in ("parent", "child"):
         _require(_one(node, key).get("link") == authored[key] == canonical[key], f"Joint {key} changed")
@@ -956,10 +957,28 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics):
         _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
+    limit_source = authored.get("limit_source")
     _require(
-        authored.get("limit_source") in {"native", "declared_author"},
+        limit_source in {"native", "declared_author", "preview_policy"},
         "Moving joint limits are not bound to a CAD native or author declaration",
     )
+    if limit_source == "preview_policy":
+        policy = authored.get("preview_policy")
+        _require(
+            preview and authored["type"] == "revolute" and isinstance(policy, dict),
+            "The preview window is not allowed for this purpose or joint type",
+        )
+        _require(
+            policy.get("rule_id") == PREVIEW_POLICY_ID
+            and policy.get("rule_version") == "v1"
+            and policy.get("native_cad_ranges") is False
+            and policy.get("hardware_qualified") is False,
+            "The preview window has another rule or qualification",
+        )
+        _require(
+            limits.get("lower") == -PREVIEW_WINDOW_RAD and limits.get("upper") == PREVIEW_WINDOW_RAD,
+            "The inspection-preview window does not equal the frozen full-turn radius",
+        )
     unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
         unqualified.append("degenerate_position_range")
@@ -1815,11 +1834,20 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
         joint_sources.get(str(row["joint"]), str(row["joint"])): row
         for row in axes
     }
+    preview = _request_purpose(root) == PURPOSE_INSPECTION_PREVIEW
     for authored in source["joints"]:
         name = authored["name"]
         gates.add(
             "joints." + name,
-            lambda a=authored: _joint(joints[a["name"]], a, model_joints[a["name"]], datums, body_datums, diagnostics),
+            lambda a=authored: _joint(
+                joints[a["name"]],
+                a,
+                model_joints[a["name"]],
+                datums,
+                body_datums,
+                diagnostics,
+                preview=preview,
+            ),
         )
         if authored["type"] != "fixed":
             gates.add(
@@ -2010,6 +2038,24 @@ def _value_warning_gate(root, source, model):
             }
             if provenance.get("status", provenance.get("direction_relation")) != "local_class_aligned":
                 add("direction.semantics_unresolved", row)
+        if joint.get("limit_source") == "preview_policy":
+            policy = joint.get("preview_policy") or {}
+            add(
+                "limits.preview_policy",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "limits",
+                    "actual": joint["limits"],
+                    "source": "inspection preview full-turn policy",
+                    "original": policy.get("author_limits"),
+                    "rule_id": PREVIEW_POLICY_ID,
+                    "rule_version": "v1",
+                    "reason": "inspection preview window; no native mechanical range is claimed",
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
+                },
+            )
     for frame in source.get("frames", []):
         source_name = str(frame.get("source_name") or "")
         native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]

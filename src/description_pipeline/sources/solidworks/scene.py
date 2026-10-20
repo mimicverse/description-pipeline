@@ -17,6 +17,7 @@ from typing import Any
 from .errors import ConfigError
 from .jsonio import read_json
 from .naming import material_name, mesh_path, visual_name
+from .native_limits import PREVIEW_POLICY_ID
 from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 SCENE_SCHEMA = "solidworks-to-urdf.scene/v1"
@@ -823,6 +824,9 @@ def _build_joints(
         limit_source = joint.get("limit_source")
         if isinstance(limit_source, str) and limit_source:
             entry["limit_source"] = limit_source
+        preview_policy = joint.get("preview_policy")
+        if isinstance(preview_policy, dict):
+            entry["provenance"]["preview_policy"] = dict(preview_policy)
         if movable:
             entry["axis"] = [float(value) for value in axis]
             axis_provenance = joint.get("axis_provenance")
@@ -868,6 +872,7 @@ def _value_warnings(
     mappings = []
     motion_unresolved = []
     direction_unresolved = []
+    preview_limits = []
     visuals = []
     materials = []
     mesh_paths = []
@@ -936,6 +941,23 @@ def _value_warnings(
                     "rule_id": "naming.joint_motion",
                     "rule_version": "naming-v1",
                     "reason": "motion classification unavailable",
+                }
+            )
+        if source_joint.get("limit_source") == "preview_policy":
+            policy = source_joint.get("preview_policy") or {}
+            preview_limits.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "limits",
+                    "actual": joint["limits"],
+                    "source": "inspection preview full-turn policy",
+                    "original": policy.get("author_limits"),
+                    "rule_id": PREVIEW_POLICY_ID,
+                    "rule_version": "v1",
+                    "reason": "inspection preview window; no native mechanical range is claimed",
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
                 }
             )
     for frame in cfg.get("frames") or []:
@@ -1019,6 +1041,17 @@ def _value_warnings(
                 "code": "direction.semantics_unresolved",
                 "message": "Authored CAD axes are preserved; functional positive motion is not proven.",
                 "objects": direction_unresolved,
+            }
+        )
+    if preview_limits:
+        warnings.append(
+            {
+                "code": "limits.preview_policy",
+                "message": (
+                    "Inspection preview uses a versioned full-turn rotation window; "
+                    "no native mechanical range is claimed."
+                ),
+                "objects": preview_limits,
             }
         )
     if visuals:

@@ -72,6 +72,7 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.interface_name_invalid": "CAD interface name was normalized with a warning",
     "discovery.interface_motion_unresolved": "CAD joint motion is unclassified; a neutral name is retained",
     "direction.semantics_unresolved": "Authored CAD axis is preserved; functional positive motion is not proven",
+    "limits.preview_policy": "Inspection preview full-turn window; no native mechanical range is claimed",
     "direction.reference_frame_missing": "The local parent mechanical reference frame is missing",
     "direction.reference_frame_invalid": "The local parent mechanical reference frame is invalid",
     "direction.invalid": "Positive-motion semantics could not be evaluated",

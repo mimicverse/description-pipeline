@@ -69,12 +69,18 @@ from typing import Any
 from collections.abc import Mapping, Sequence
 
 from ...io import PipelineError, artifact_path_parts, confined, digest, inventory, parse_data, read_data
-from ...interface_records import PURPOSE_ENGINEERING
+from ...interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
-from .native_limits import limit_mate_scope, validate_native_limit
+from .native_limits import (
+    PREVIEW_POLICY_ID,
+    PREVIEW_WINDOW_RAD,
+    limit_mate_scope,
+    native_limit_inventory_complete,
+    validate_native_limit,
+)
 from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
@@ -3032,7 +3038,14 @@ def _exporter_origin(declared: dict, child: dict, parent: dict, record: dict, fi
         )
 
 
-def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], findings: list[dict]) -> list[dict]:
+def _exporter_joint_facts(
+    record: dict,
+    declaration: dict,
+    bodies: list[dict],
+    findings: list[dict],
+    *,
+    purpose: str = PURPOSE_ENGINEERING,
+) -> list[dict]:
     by_name = {body["name"]: body for body in bodies}
     component_records = {
         str(item.get("name2")): item
@@ -3076,6 +3089,9 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
         else []
     )
     assembly_owner = root_name if len(ownerless_root) == 1 else None
+    preview_allowed = purpose == PURPOSE_INSPECTION_PREVIEW and native_limit_inventory_complete(
+        record.get("mates")
+    )
 
     joints = []
     for link in declaration["links"]:
@@ -3110,6 +3126,7 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
             axis, selector = _exporter_axis(record, declared, child, parent, findings)
         limits = declared["limits"]
         limit_source = "declared_author" if isinstance(limits, dict) else None
+        preview_policy = None
         if kind != "fixed":
 
             def valid(value):
@@ -3242,14 +3259,45 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 and float(limits["lower"]) == 0.0
                 and float(limits["upper"]) == 0.0
             ):
-                findings.append(
-                    _finding(
-                        "discovery.joint_limits_missing",
-                        obj,
-                        "the CAD contains no active native working range and no non-placeholder author range",
+                if kind == "revolute" and preview_allowed:
+                    author_limits = dict(limits)
+                    preview_limits = {
+                        "lower": -PREVIEW_WINDOW_RAD,
+                        "upper": PREVIEW_WINDOW_RAD,
+                    }
+                    for key in ("effort", "velocity"):
+                        if valid(author_limits.get(key)) and author_limits[key] >= 0:
+                            preview_limits[key] = author_limits[key]
+                    limits = preview_limits
+                    limit_source = "preview_policy"
+                    preview_policy = {
+                        "rule_id": PREVIEW_POLICY_ID,
+                        "rule_version": "v1",
+                        "window_rad": [-PREVIEW_WINDOW_RAD, PREVIEW_WINDOW_RAD],
+                        "native_cad_ranges": False,
+                        "hardware_qualified": False,
+                        "author_limits": author_limits,
+                        "native_absence": "complete_mate_inventory_no_enabled_limit",
+                    }
+                    findings.append(
+                        _finding(
+                            "discovery.joint_preview_policy",
+                            obj,
+                            "inspection preview uses the versioned full-turn rotation window; "
+                            "no native mechanical limit is claimed",
+                            preview_policy,
+                            blocking=False,
+                        )
                     )
-                )
-                continue
+                else:
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_missing",
+                            obj,
+                            "the CAD contains no active native working range and no non-placeholder author range",
+                        )
+                    )
+                    continue
             if kind != "continuous" and limits["lower"] == limits["upper"]:
                 findings.append(
                     _finding(
@@ -3319,6 +3367,7 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 "limits": limits,
                 "limit_source": limit_source,
                 "limit_evidence": None,
+                "preview_policy": preview_policy,
                 "drive": None,
             }
         )
@@ -5203,7 +5252,7 @@ def _derive_carriers(
         frames: list = []
         if declaration is not None:
             bodies, clusters = _exporter_memberships(record, declaration, findings)
-            joints = _exporter_joint_facts(record, declaration, bodies, findings)
+            joints = _exporter_joint_facts(record, declaration, bodies, findings, purpose=settings.purpose)
             root = next(
                 body
                 for body in bodies
@@ -5396,7 +5445,14 @@ def source_definition(
             "axis_provenance": joint.get("axis") if isinstance(joint.get("axis"), dict) else None,
             "axis_reference": joint["axis_reference"],
         }
-        if joint["axis"].get("source") == "exporter":
+        if isinstance(joint.get("preview_policy"), dict):
+            entry["limits"] = {
+                key: float(value)
+                for key, value in joint["limits"].items()
+                if value is not None
+            }
+            entry["preview_policy"] = dict(joint["preview_policy"])
+        elif joint["axis"].get("source") == "exporter":
             entry["limits"] = {
                 key: float(joint["limits"][key])
                 for key in (

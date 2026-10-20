@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,7 @@ from description_pipeline.sources.solidworks.exporter import (
     ExporterDeclarationError,
     decode_exporter_v14,
 )
+from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 
 
 def wire_xml(limit_values=None) -> str:
@@ -278,6 +280,48 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
         self.assertEqual([item["code"] for item in findings], ["direction.semantics_unresolved"])
         self.assertFalse(findings[0]["blocking"])
+
+    def test_preview_policy_only_applies_to_inspection_with_no_native_or_author_range(self):
+        record = raw_record()
+        record["exporter"]["raw_xml"] = wire_xml(
+            {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
+        )
+        record["exporter"]["raw_xml_sha256"] = hashlib.sha256(
+            record["exporter"]["raw_xml"].encode()
+        ).hexdigest()
+        declaration = decode_exporter_v14(record["exporter"]["raw_xml"], 1.4)
+        bodies, _clusters = _exporter_memberships(record, declaration, [])
+        findings = []
+        joints = _exporter_joint_facts(
+            record,
+            declaration,
+            bodies,
+            findings,
+            purpose=PURPOSE_INSPECTION_PREVIEW,
+        )
+        self.assertEqual(joints[0]["limit_source"], "preview_policy")
+        self.assertEqual(
+            joints[0]["limits"],
+            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
+        )
+        self.assertEqual(
+            joints[0]["preview_policy"]["rule_id"], "inspection_rotation_full_turn/v1"
+        )
+        engineering_findings = []
+        self.assertEqual(
+            _exporter_joint_facts(
+                record,
+                declaration,
+                bodies,
+                engineering_findings,
+                purpose=PURPOSE_ENGINEERING,
+            ),
+            [],
+        )
+        self.assertIn(
+            "discovery.joint_limits_missing",
+            [item["code"] for item in engineering_findings],
+        )
 
     def test_equal_bounds_and_zero_drives_are_preserved_as_stage_warnings(self):
         for values, expected in (

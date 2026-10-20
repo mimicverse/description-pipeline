@@ -466,7 +466,8 @@
           "limit_source": {
             "enum": [
               "native",
-                "declared_author"
+              "declared_author",
+              "preview_policy"
             ]
           },
           "dynamics": {
