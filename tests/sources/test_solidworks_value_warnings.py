@@ -449,6 +449,68 @@ class ValueWarningTests(unittest.TestCase):
         self.assertFalse(row["native_cad_ranges"])
         self.assertFalse(row["hardware_qualified"])
 
+    def test_preview_policy_warning_gate_accepts_the_policy(self):
+        source = copy.deepcopy(self.source)
+        model = copy.deepcopy(self.model)
+        policy = {
+            "rule_id": "inspection_rotation_full_turn/v1",
+            "rule_version": "v1",
+            "window_rad": [-math.pi, math.pi],
+            "native_cad_ranges": False,
+            "hardware_qualified": False,
+            "author_limits": {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0},
+        }
+        limits = {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0}
+        source["joints"] = [
+            {
+                "name": "right_elbow_pitch_joint",
+                "source_name": "right_elbow_pitch_joint",
+                "type": "revolute",
+                "limit_source": "preview_policy",
+                "preview_policy": policy,
+                "limits": limits,
+            }
+        ]
+        model["joints"] = [{"name": "right_elbow_pitch_joint", "limits": limits}]
+        next(
+            item for item in model["provenance"]["value_warnings"]
+            if item["code"] == "geometry.derived_from_native"
+        )["objects"].append(
+            {
+                "object_type": "joint",
+                "object": "right_elbow_pitch_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        model["provenance"]["value_warnings"].append(
+            {
+                "code": "limits.preview_policy",
+                "message": (
+                    "Inspection preview uses a versioned full-turn rotation window; "
+                    "no native mechanical range is claimed."
+                ),
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "right_elbow_pitch_joint",
+                        "field": "limits",
+                        "actual": limits,
+                        "source": "inspection preview full-turn policy",
+                        "original": policy["author_limits"],
+                        "rule_id": "inspection_rotation_full_turn/v1",
+                        "rule_version": "v1",
+                        "reason": "inspection preview window; no native mechanical range is claimed",
+                        "native_cad_ranges": False,
+                        "hardware_qualified": False,
+                    }
+                ],
+            }
+        )
+        result = _value_warning_gate(self.root, source, model)
+        self.assertGreaterEqual(result["objects"], 1)
+
     def test_preview_policy_joint_gate_requires_inspection_and_the_exact_window(self):
         node = ET.fromstring(
             "<joint name='hinge' type='revolute'>"

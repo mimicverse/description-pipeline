@@ -2241,6 +2241,10 @@ def _value_warning_gate(root, source, model):
         "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
         "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
         "naming.derived_material": "Material names are derived from the owner link and native component identity.",
+        "limits.preview_policy": (
+            "Inspection preview uses a versioned full-turn rotation window; "
+            "no native mechanical range is claimed."
+        ),
         "naming.formatted_robot_name": "The robot name is formatted from the native top-assembly filename.",
         "physics.derived_from_native": (
             "Link mass properties are transformed, translated or recombined from native readings."
