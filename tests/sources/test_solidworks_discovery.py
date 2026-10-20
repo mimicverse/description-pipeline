@@ -1798,6 +1798,33 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(joint["axis_sign"], -1)
 
+    def test_carrier_snapshot_binds_declaration_axis_sign_from_raw_properties(self):
+        joint = {"name": "shoulder_pitch_joint"}
+        carrier = _carrier_snapshot(
+            None,
+            [],
+            [joint],
+            {"properties": {"document": {"dp.joint.shoulder_pitch_joint.axis_sign": "-1"}}},
+        )
+        self.assertEqual(carrier["joints"][0]["axis_sign"], -1)
+
+        conflict = _carrier_snapshot(
+            None,
+            [],
+            [joint],
+            {
+                "properties": {
+                    "document": {"dp.joint.shoulder_pitch_joint.axis_sign": "-1"},
+                    "mates": {
+                        "shoulder_pitch_joint__coaxial": {
+                            "dp.joint.shoulder_pitch_joint.axis_sign": "+1"
+                        }
+                    },
+                }
+            },
+        )
+        self.assertIsNone(conflict["joints"][0]["axis_sign"])
+
     def test_native_limit_record_must_be_finite(self):
         def mutate(payload):
             payload["mates"][0]["limits"] = {"lower": -1.5, "upper": 1.5, "unit": "rad"}

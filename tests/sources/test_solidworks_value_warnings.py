@@ -15,7 +15,12 @@ import numpy as np
 from description_pipeline.io import PipelineError
 from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
 from description_pipeline.sources.solidworks.scene import _value_warnings
-from description_pipeline.verification.solidworks_urdf import _carrier_binding, _joint, _value_warning_gate
+from description_pipeline.verification.solidworks_urdf import (
+    _carrier_binding,
+    _carrier_snapshot,
+    _joint,
+    _value_warning_gate,
+)
 
 
 class ValueWarningTests(unittest.TestCase):
@@ -265,7 +270,16 @@ class ValueWarningTests(unittest.TestCase):
                 "axis_provenance": provenance,
             }
         ]
-        carrier = {"joints": [{"name": "arm_joint", "axis_sign": -1}]}
+        carrier = _carrier_snapshot(
+            None,
+            [],
+            [{"name": "arm_joint"}],
+            {
+                "properties": {
+                    "document": {"dp.joint.arm_joint.axis_sign": "-1"}
+                }
+            },
+        )
         model = copy.deepcopy(self.model)
         model["joints"] = [{"name": "arm_joint", "axis": [0.0, 0.0, -1.0]}]
         warnings = model["provenance"]["value_warnings"]

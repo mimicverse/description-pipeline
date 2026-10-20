@@ -412,18 +412,49 @@ def _input(root, diagnostics=None):
 def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
     """Freeze the raw-decoded carrier names, members and native topology."""
 
+    def axis_sign(joint: dict, properties: dict) -> int | None:
+        name = str(joint.get("name") or "")
+        keys = (f"dp.joint.{name}.axis_sign", "dp.joint.axis_sign")
+        candidates: list[object] = []
+        scopes = [properties.get("document") or {}]
+        scopes.extend(
+            scope
+            for scope in (properties.get("components") or {}).values()
+            if isinstance(scope, dict)
+        )
+        for scope in scopes:
+            if isinstance(scope, dict):
+                candidates.extend(scope[key] for key in keys if key in scope)
+        mate_names: list[str] = []
+        if isinstance(joint.get("mate"), str):
+            mate_names.append(joint["mate"])
+        if isinstance(joint.get("mates"), list):
+            mate_names.extend(str(item) for item in joint["mates"] if isinstance(item, str))
+        mate_properties = properties.get("mates") or {}
+        for mate_name in mate_names:
+            scope = mate_properties.get(mate_name) or {}
+            if isinstance(scope, dict):
+                candidates.extend(scope[key] for key in keys if key in scope)
+        for mate_name, scope in mate_properties.items():
+            if (
+                isinstance(scope, dict)
+                and str(mate_name).split("__", 1)[0] == name
+            ):
+                candidates.extend(scope[key] for key in keys if key in scope)
+        signs = {
+            -1 if value in (-1, "-1") else 1
+            for value in candidates
+            if value in (1, -1, "1", "+1", "-1")
+        }
+        return signs.pop() if len(signs) == 1 else None
+
     signs: dict[str, int] = {}
     if isinstance(raw, dict):
-        properties = (raw.get("properties") or {}).get("mates") or {}
+        properties = raw.get("properties") or {}
         for joint in joints:
-            mate = joint.get("mate")
-            if not isinstance(mate, str):
-                continue
-            value = (properties.get(mate) or {}).get("dp.joint.axis_sign")
-            if value in (1, "1", "+1"):
-                signs[str(joint["name"])] = 1
-            elif value in (-1, "-1"):
-                signs[str(joint["name"])] = -1
+            sign = axis_sign(joint, properties)
+            if sign is not None:
+                signs[str(joint["name"])] = sign
     return {
         "root": None if root is None else str(root),
         "bodies": [
