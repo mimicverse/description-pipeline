@@ -1375,6 +1375,49 @@ class RecoveryControlFlowTests(unittest.TestCase):
             recovery.restore_workspaces(manifest, extracted, verify_only=False)
         self.assertEqual(raised.exception.code, "recovery_target_not_empty")
 
+    def test_workspace_bundle_digest_tamper_is_refused(self) -> None:
+        extracted, _, manifest = self.workspace_bundle()
+        plan_path = extracted / "reconstruct" / "workspace-plan.json"
+        plan = json.loads(plan_path.read_text())
+        plan["repositories"][0]["bundle_sha256"] = "0" * 64
+        plan_path.write_text(recovery.canonical_json(plan).decode(), encoding="utf-8")
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.restore_workspaces(manifest, extracted, verify_only=False)
+        self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
+
+    def test_release_runtime_preflight_rejects_external_venv(self) -> None:
+        release_root = self.root / "release-preflight"
+        extracted = self.root / "release-preflight-extracted"
+        operator_env = (
+            extracted
+            / "config"
+            / "state"
+            / "derived"
+            / "install-a"
+            / "operator.env"
+        )
+        write(
+            operator_env,
+            f"AIRFLOW_VENV={self.root / 'outside-venv'}\n"
+            f"AIRFLOW_HOME={self.root / 'airflow-home'}\n",
+        )
+        manifest = {
+            "reconstructibles": {
+                "release_root": {
+                    "path": str(release_root),
+                    "recipe": "offline-release-artifacts",
+                }
+            },
+            "maintenance": {"receipt": {"identity": {"install_id": "install-a"}}},
+        }
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.validate_release_runtime_target(
+                manifest,
+                extracted,
+                verify_only=False,
+            )
+        self.assertEqual(raised.exception.code, "recovery_target_path_unsafe")
+
     def test_release_runtime_rehydrates_from_offline_role_archives(self) -> None:
         release_root = self.root / "runtime-release"
         extracted = self.root / "runtime-extracted"

@@ -5469,9 +5469,27 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         reconstructibles["release_root"]["recipe"] == "offline-release-artifacts"
         and reconstructibles["workspace_root"]["recipe"] == "git-origin-head-clean"
         and reconstructibles["workspace_root"]["plan_member"] == "reconstruct/workspace-plan.json"
-        and isinstance(reconstructibles["external"], list),
+        and isinstance(reconstructibles["external"], list)
+        and all(
+            isinstance(value, str) and bool(value)
+            for value in reconstructibles["external"]
+        ),
         "recovery_manifest_invalid",
         "reconstructible plan is malformed",
+    )
+    for name in ("release_root", "workspace_root"):
+        path = reconstructibles[name]["path"]
+        require(
+            isinstance(path, str)
+            and bool(path)
+            and Path(path).is_absolute()
+            and ".." not in Path(path).parts,
+            "recovery_manifest_invalid",
+            f"reconstructibles.{name}.path is unsafe",
+        )
+    require_bound_file(
+        reconstructibles["workspace_root"]["plan_member"],
+        where="reconstructibles.workspace_root.plan_member",
     )
     producer = _exact_keys(
         doc["producer"],
