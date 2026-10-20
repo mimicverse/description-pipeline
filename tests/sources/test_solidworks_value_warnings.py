@@ -15,7 +15,7 @@ import numpy as np
 from description_pipeline.io import PipelineError
 from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
 from description_pipeline.sources.solidworks.scene import _value_warnings
-from description_pipeline.verification.solidworks_urdf import _joint, _value_warning_gate
+from description_pipeline.verification.solidworks_urdf import _carrier_binding, _joint, _value_warning_gate
 
 
 class ValueWarningTests(unittest.TestCase):
@@ -237,6 +237,59 @@ class ValueWarningTests(unittest.TestCase):
         )
         with self.assertRaises(PipelineError):
             _value_warning_gate(self.root, source, model)
+
+    def test_carrier_binding_rejects_tampered_names_members_and_topology(self):
+        carrier = {
+            "root": "CS_base_link",
+            "bodies": [
+                {"name": "CS_base_link", "frame": {"coordinate_system": "CS_base_link"}, "components": ["base"]},
+                {"name": "a_arm", "frame": {"coordinate_system": "c_arm"}, "components": ["arm"]},
+            ],
+            "joints": [
+                {"name": "a_arm", "type": "revolute", "parent": "CS_base_link", "child": "a_arm"},
+            ],
+        }
+        source = {
+            "bodies": [
+                {
+                    "name": "base_link",
+                    "source_name": "CS_base_link",
+                    "components": ["base"],
+                    "frame": {"coordinate_system": "CS_base_link"},
+                },
+                {
+                    "name": "arm_link",
+                    "source_name": "a_arm",
+                    "components": ["arm"],
+                    "frame": {"coordinate_system": "c_arm"},
+                },
+            ],
+            "joints": [
+                {
+                    "name": "arm_joint",
+                    "source_name": "a_arm",
+                    "type": "revolute",
+                    "parent": "base_link",
+                    "child": "arm_link",
+                },
+            ],
+        }
+        self.assertEqual(_carrier_binding(source, carrier), {"bodies": 2, "joints": 1})
+
+        forged_name = copy.deepcopy(source)
+        forged_name["bodies"][1]["source_name"] = "forged"
+        with self.assertRaises(PipelineError):
+            _carrier_binding(forged_name, carrier)
+
+        forged_members = copy.deepcopy(source)
+        forged_members["bodies"][1]["components"] = ["forged"]
+        with self.assertRaises(PipelineError):
+            _carrier_binding(forged_members, carrier)
+
+        forged_topology = copy.deepcopy(source)
+        forged_topology["joints"][0]["parent"] = "arm_link"
+        with self.assertRaises(PipelineError):
+            _carrier_binding(forged_topology, carrier)
 
     def test_frame_warning_and_robot_source_name_are_rederived(self):
         source = copy.deepcopy(self.source)
