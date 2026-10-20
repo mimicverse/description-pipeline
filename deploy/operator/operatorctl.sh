@@ -216,7 +216,7 @@ load_generation_env() {
 }
 
 acquire_maintenance_lock() {
-  local state_root="$1" lock_dir lock_path owner_document owner_id inherited_owner
+  local state_root="$1" lock_dir lock_path inherited_owner inherited_fd inherited_path
   [ -z "$MAINTENANCE_LOCK_PATH" ] || return 0
   [ -d "$state_root" ] && [ ! -L "$state_root" ] \
     || die "the state root for the maintenance lock is missing or a link: $state_root"
@@ -230,31 +230,54 @@ acquire_maintenance_lock() {
   command -v flock >/dev/null 2>&1 || die "flock is required for the maintenance lifecycle"
   inherited_owner="${OPERATORCTL_MAINTENANCE_LOCK_OWNER:-}"
   if [ -n "$inherited_owner" ]; then
+    inherited_fd="${OPERATORCTL_MAINTENANCE_LOCK_FD:-}"
+    inherited_path="${OPERATORCTL_MAINTENANCE_LOCK_PATH:-}"
+    [[ "$inherited_fd" =~ ^[0-9]+$ ]] \
+      || die "an inherited maintenance lock must carry the caller's file descriptor"
+    [ "$inherited_path" = "$lock_path" ] \
+      || die "the inherited maintenance lock path does not match the state-root lock"
     [ -f "$lock_path" ] || die "the inherited maintenance lock is missing: $lock_path"
-    owner_document="$(python3 - "$lock_path" <<'PY'
+    python3 - "$inherited_fd" "$lock_path" "$inherited_owner" <<'PY' \
+      || die "the inherited maintenance lock descriptor is not the held state-root lock"
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
+descriptor = int(sys.argv[1])
+lock_path = Path(sys.argv[2])
+expected_owner = sys.argv[3]
 try:
-    document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    document = json.loads(lock_path.read_text(encoding="utf-8"))
 except Exception as error:
     raise SystemExit(f"cannot read the maintenance lock owner: {error}")
-if not isinstance(document, dict) or not isinstance(document.get("owner_id"), str):
+if (
+    not isinstance(document, dict)
+    or set(document)
+    != {"schema_version", "owner_id", "acquired_at", "pid"}
+    or document.get("schema_version")
+    != "solidworks-to-urdf.maintenance-lock/v1"
+    or document.get("owner_id") != expected_owner
+):
     raise SystemExit("the maintenance lock owner is malformed")
-print(document["owner_id"])
+inherited_metadata = os.fstat(descriptor)
+path_metadata = os.stat(lock_path, follow_symlinks=False)
+if (
+    not os.path.isfile(f"/proc/self/fd/{descriptor}")
+    or (inherited_metadata.st_dev, inherited_metadata.st_ino)
+    != (path_metadata.st_dev, path_metadata.st_ino)
+):
+    raise SystemExit("the inherited descriptor names another file")
+fdinfo = Path(f"/proc/self/fdinfo/{descriptor}").read_text(encoding="utf-8")
+if not re.search(
+    r"^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\b",
+    fdinfo,
+    flags=re.MULTILINE,
+):
+    raise SystemExit("the inherited descriptor does not itself hold the write lock")
 PY
-)" || die "the inherited maintenance lock owner is unreadable"
-    [ "$owner_document" = "$inherited_owner" ] \
-      || die "the inherited maintenance lock owner does not match the held lock"
-    exec {MAINTENANCE_LOCK_FD}<>"$lock_path"
-    if flock -n "$MAINTENANCE_LOCK_FD"; then
-      exec {MAINTENANCE_LOCK_FD}>&-
-      MAINTENANCE_LOCK_FD=""
-      die "the inherited maintenance lock is not held by the caller"
-    fi
-    exec {MAINTENANCE_LOCK_FD}>&-
-    MAINTENANCE_LOCK_FD=""
+    MAINTENANCE_LOCK_FD="$inherited_fd"
     MAINTENANCE_LOCK_PATH="$lock_path"
     echo "maintenance_lock=inherited:$lock_path"
     return 0

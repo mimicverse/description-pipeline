@@ -551,10 +551,10 @@ def fake_maintenance_state(
     *,
     operatorctl_path: Path,
     timeout: int,
-    lock_owner: str = "",
+    maintenance_lock: recovery.MaintenanceLock | None = None,
 ) -> dict:
     del database, timeout
-    assert lock_owner
+    assert maintenance_lock is not None
     operatorctl_path = Path(operatorctl_path).resolve()
     probe = {
         "admission": {
@@ -1889,7 +1889,10 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 """\
                 #!/usr/bin/env bash
                 set -euo pipefail
-                printf '%s|%s\\n' "$*" "${OPERATORCTL_MAINTENANCE_LOCK_OWNER:-}" >> "$QUIESCE_LOG"
+                printf '%s|%s|%s|%s\\n' "$*" \
+                  "${OPERATORCTL_MAINTENANCE_LOCK_OWNER:-}" \
+                  "${OPERATORCTL_MAINTENANCE_LOCK_FD:-}" \
+                  "${OPERATORCTL_MAINTENANCE_LOCK_PATH:-}" >> "$QUIESCE_LOG"
                 """
             ),
             mode=0o700,
@@ -1920,54 +1923,66 @@ class RecoveryControlFlowTests(unittest.TestCase):
             "stdout_sha256": hashlib.sha256(b"").hexdigest(),
             "stderr_sha256": hashlib.sha256(b"").hexdigest(),
         }
-        with (
-            mock.patch.dict(os.environ, {"QUIESCE_LOG": str(log)}),
-            mock.patch.object(
-                recovery,
-                "_require_airflow_interpreter",
-                return_value=Path("/fixture/python"),
-            ),
-            mock.patch.object(
-                recovery,
-                "_wait_database_quiescence",
-                return_value=probe,
-            ),
-            mock.patch.object(
-                recovery,
-                "_linux_unit_states",
-                return_value=[{"unit": unit, "active_state": "inactive"} for unit in recovery.MAINTENANCE_UNITS],
-            ),
-            mock.patch.object(
-                recovery,
-                "_disable_windows_task",
-                return_value=("Disabled", [evidence]),
-            ),
-        ):
-            state = self.real_quiesce_maintenance(
-                self.context,
-                {
-                    "authority": {
-                        "system_identifier": "1",
-                        "catalog_version": "202107181",
-                        "database": "airflow_meta",
-                        "database_oid": "16384",
-                        "socket_dir": "/fixture/socket",
-                        "port": 55432,
-                    }
-                },
-                operatorctl_path=operatorctl,
-                timeout=30,
-                lock_owner="a" * 64,
+        lock = recovery.acquire_maintenance_lock(
+            Path(self.context.resolved["storage"]["state_root"])
+        )
+        try:
+            with (
+                mock.patch.dict(os.environ, {"QUIESCE_LOG": str(log)}),
+                mock.patch.object(
+                    recovery,
+                    "_require_airflow_interpreter",
+                    return_value=Path("/fixture/python"),
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_wait_database_quiescence",
+                    return_value=probe,
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_linux_unit_states",
+                    return_value=[
+                        {"unit": unit, "active_state": "inactive"}
+                        for unit in recovery.MAINTENANCE_UNITS
+                    ],
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_disable_windows_task",
+                    return_value=("Disabled", [evidence]),
+                ),
+            ):
+                state = self.real_quiesce_maintenance(
+                    self.context,
+                    {
+                        "authority": {
+                            "system_identifier": "1",
+                            "catalog_version": "202107181",
+                            "database": "airflow_meta",
+                            "database_oid": "16384",
+                            "socket_dir": "/fixture/socket",
+                            "port": 55432,
+                        }
+                    },
+                    operatorctl_path=operatorctl,
+                    timeout=30,
+                    maintenance_lock=lock,
+                )
+            commands = log.read_text().splitlines()
+            self.assertEqual(len(commands), 2)
+            self.assertTrue(commands[0].startswith("drain --config "))
+            inherited = f"|{lock.owner_id}|{lock.descriptor}|{lock.path}"
+            self.assertTrue(commands[0].endswith(inherited))
+            self.assertNotIn("--keep-database", commands[0])
+            self.assertTrue(commands[1].startswith("stop --config "))
+            self.assertTrue(
+                commands[1].endswith(" --keep-database" + inherited)
             )
-        commands = log.read_text().splitlines()
-        self.assertEqual(len(commands), 2)
-        self.assertTrue(commands[0].startswith("drain --config "))
-        self.assertTrue(commands[0].endswith("|" + "a" * 64))
-        self.assertNotIn("--keep-database", commands[0])
-        self.assertTrue(commands[1].startswith("stop --config "))
-        self.assertTrue(commands[1].endswith(" --keep-database|" + "a" * 64))
-        self.assertEqual(state["windows"]["state"], "Disabled")
-        self.assertEqual(state["database_before"], probe)
+            self.assertEqual(state["windows"]["state"], "Disabled")
+            self.assertEqual(state["database_before"], probe)
+        finally:
+            lock.close()
 
     def test_key_inside_source_failure_domain_is_refused(self) -> None:
         key = write(

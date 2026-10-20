@@ -40,9 +40,22 @@ ALL_VERBS = (
 OPERATIONAL_VERBS = tuple(verb for verb in ALL_VERBS if verb not in {"validate", "install"})
 
 
-def run(args: list[str]) -> subprocess.CompletedProcess:
+def run(
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess:
     merged = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home())}
-    return subprocess.run(["bash", str(CONTROL), *args], capture_output=True, text=True, env=merged, cwd=str(ROOT))
+    merged.update(env or {})
+    return subprocess.run(
+        ["bash", str(CONTROL), *args],
+        capture_output=True,
+        text=True,
+        env=merged,
+        cwd=str(ROOT),
+        pass_fds=pass_fds,
+    )
 
 
 def platform_document(root: Path) -> dict:
@@ -180,6 +193,94 @@ class OperatorctlSurfaceTests(unittest.TestCase):
             "another supported lifecycle operation owns the maintenance lock",
             result.stderr,
         )
+
+    def test_inherited_lock_requires_the_actual_held_file_descriptor(self):
+        state_root = self.root / "state"
+        state_root.mkdir()
+        (state_root / "resolved.env").write_text("", encoding="utf-8")
+        lock_dir = state_root / "locks"
+        lock_dir.mkdir()
+        lock_path = lock_dir / "maintenance.lock"
+        owner = "a" * 64
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.maintenance-lock/v1",
+                    "owner_id": owner,
+                    "acquired_at": "2026-10-21T00:00:00Z",
+                    "pid": os.getpid(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        held = os.open(lock_path, os.O_RDWR)
+        unlocked = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            missing_fd = run(
+                ["start", "--config", str(self.config)],
+                env={
+                    "OPERATORCTL_MAINTENANCE_LOCK_OWNER": owner,
+                    "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(lock_path),
+                },
+            )
+            self.assertIn("must carry the caller's file descriptor", missing_fd.stderr)
+
+            unlocked_result = run(
+                ["start", "--config", str(self.config)],
+                env={
+                    "OPERATORCTL_MAINTENANCE_LOCK_OWNER": owner,
+                    "OPERATORCTL_MAINTENANCE_LOCK_FD": str(unlocked),
+                    "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(lock_path),
+                },
+                pass_fds=(unlocked,),
+            )
+            self.assertIn(
+                "does not itself hold the write lock",
+                unlocked_result.stderr,
+            )
+
+            inherited = run(
+                ["start", "--config", str(self.config)],
+                env={
+                    "OPERATORCTL_MAINTENANCE_LOCK_OWNER": owner,
+                    "OPERATORCTL_MAINTENANCE_LOCK_FD": str(held),
+                    "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(lock_path),
+                },
+                pass_fds=(held,),
+            )
+            self.assertIn("maintenance_lock=inherited:", inherited.stdout)
+            self.assertNotIn("inherited maintenance lock", inherited.stderr)
+
+            replaced = self.root / "maintenance.lock.replaced"
+            os.replace(lock_path, replaced)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "solidworks-to-urdf.maintenance-lock/v1",
+                        "owner_id": owner,
+                        "acquired_at": "2026-10-21T00:00:01Z",
+                        "pid": os.getpid(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            replaced_result = run(
+                ["start", "--config", str(self.config)],
+                env={
+                    "OPERATORCTL_MAINTENANCE_LOCK_OWNER": owner,
+                    "OPERATORCTL_MAINTENANCE_LOCK_FD": str(held),
+                    "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(lock_path),
+                },
+                pass_fds=(held,),
+            )
+            self.assertIn(
+                "descriptor is not the held state-root lock",
+                replaced_result.stderr,
+            )
+        finally:
+            os.close(unlocked)
+            os.close(held)
 
     def test_invalid_config_fails_before_any_verb_behavior(self):
         bad = self.root / "bad.json"

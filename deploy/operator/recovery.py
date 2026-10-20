@@ -3607,6 +3607,7 @@ def _run_maintenance_command(
     *,
     timeout: int,
     env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[subprocess.CompletedProcess, dict]:
     command = [str(value) for value in argv]
     child_env = os.environ.copy()
@@ -3619,6 +3620,7 @@ def _run_maintenance_command(
             timeout=timeout,
             check=False,
             env=child_env,
+            pass_fds=pass_fds,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise RecoveryError(
@@ -3824,7 +3826,7 @@ def quiesce_maintenance(
     *,
     operatorctl_path: Path,
     timeout: int,
-    lock_owner: str = "",
+    maintenance_lock: MaintenanceLock | None = None,
 ) -> dict:
     _require_airflow_interpreter(context)
     operatorctl_path = Path(operatorctl_path).resolve()
@@ -3847,15 +3849,27 @@ def quiesce_maintenance(
         "--config",
         context.config_path,
     ]
-    inherited = (
-        {"OPERATORCTL_MAINTENANCE_LOCK_OWNER": lock_owner}
-        if lock_owner
-        else {}
-    )
+    inherited = {}
+    inherited_fds = ()
+    if maintenance_lock is not None:
+        require(
+            maintenance_lock.descriptor >= 0,
+            "recovery_maintenance_unavailable",
+            "the maintenance lock descriptor is closed",
+        )
+        inherited = {
+            "OPERATORCTL_MAINTENANCE_LOCK_OWNER": maintenance_lock.owner_id,
+            "OPERATORCTL_MAINTENANCE_LOCK_FD": str(
+                maintenance_lock.descriptor
+            ),
+            "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(maintenance_lock.path),
+        }
+        inherited_fds = (maintenance_lock.descriptor,)
     _, drain_evidence = _run_maintenance_command(
         drain_argv,
         timeout=timeout,
         env=inherited,
+        pass_fds=inherited_fds,
     )
     _wait_database_quiescence(database, timeout=timeout)
     stop_argv = [
@@ -3870,6 +3884,7 @@ def quiesce_maintenance(
         stop_argv,
         timeout=timeout,
         env=inherited,
+        pass_fds=inherited_fds,
     )
     linux_states = _linux_unit_states(timeout=timeout)
     windows = context.resolved["windows"]
@@ -4092,7 +4107,7 @@ def _backup_command_claimed(
         database,
         operatorctl_path=operatorctl_path,
         timeout=3600,
-        lock_owner=lifecycle_lock.owner_id,
+        maintenance_lock=lifecycle_lock,
     )
     write_json_once(
         maintenance_stopped_path,
