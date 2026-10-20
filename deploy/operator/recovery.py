@@ -851,11 +851,7 @@ def _git_output(repo: Path, *args: str) -> str:
             ["git", "-C", str(repo), *args],
             text=True,
             stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "GIT_OPTIONAL_LOCKS": "0",
-                "GIT_TERMINAL_PROMPT": "0",
-            },
+            env=_git_environment(),
         ).strip()
     except (OSError, subprocess.CalledProcessError) as error:
         raise RecoveryError(
@@ -869,11 +865,7 @@ def _git_optional_output(repo: Path, *args: str) -> str | None:
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
-        env={
-            **os.environ,
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_TERMINAL_PROMPT": "0",
-        },
+        env=_git_environment(),
         check=False,
     )
     if completed.returncode == 1:
@@ -887,31 +879,47 @@ def _git_optional_output(repo: Path, *args: str) -> str | None:
     return completed.stdout.strip()
 
 
-def _workspace_refs(repo: Path) -> tuple[str | None, dict[str, str]]:
+def _git_environment() -> dict[str, str]:
+    return {
+        **os.environ,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _workspace_refs(
+    repo: Path,
+) -> tuple[str | None, dict[str, str], dict[str, str]]:
     head_symref = _git_optional_output(repo, "symbolic-ref", "-q", "HEAD")
     output = _git_output(
         repo,
         "for-each-ref",
-        "--format=%(refname) %(objectname)",
+        "--format=%(refname) %(objectname) %(symref)",
         "refs/heads",
         "refs/tags",
         "refs/remotes",
     )
     refs = {}
+    symrefs = {}
     for line in output.splitlines():
         if not line:
             continue
-        name, separator, object_id = line.rpartition(" ")
+        fields = line.split()
         require(
-            bool(separator)
-            and bool(name)
-            and bool(GIT_OBJECT.fullmatch(object_id))
-            and name not in refs,
+            len(fields) in {2, 3}
+            and bool(GIT_OBJECT.fullmatch(fields[1]))
+            and fields[0] not in refs,
             "recovery_release_missing",
             f"workspace ref identity is malformed for {repo}",
         )
-        refs[name] = object_id
-    return head_symref, refs
+        refs[fields[0]] = fields[1]
+        if len(fields) == 3:
+            symrefs[fields[0]] = fields[2]
+    return head_symref, refs, symrefs
 
 
 def workspace_reconstructible_plan(resolved: dict) -> dict:
@@ -930,7 +938,7 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
             slug,
         )
         head = _git_output(path, "rev-parse", "HEAD")
-        head_symref, refs = _workspace_refs(path)
+        head_symref, refs, symrefs = _workspace_refs(path)
         status = _git_output(path, "status", "--porcelain=v1")
         expected = resolved["targets"]
         bases = [target["base"] for target in expected.values() if target["repository_slug"] == slug]
@@ -953,6 +961,7 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
             "tree": _git_output(path, "rev-parse", "HEAD^{tree}"),
             "head_symref": head_symref,
             "refs": refs,
+            "symrefs": symrefs,
             "bases": sorted(set(bases)),
             "status": "clean",
         }
@@ -1052,7 +1061,7 @@ def capture_workspace_bundles(
                     "--version=2",
                     str(bundle),
                     "HEAD",
-                    "--all",
+                    *sorted(row.get("refs", {})),
                 ],
                 capture_output=True,
                 text=True,
@@ -1091,9 +1100,20 @@ def capture_workspace_bundles(
                 timeout=120,
                 check=False,
             )
-            if heads.returncode != 0 or row["head"] not in {
-                line.split(maxsplit=1)[0] for line in heads.stdout.splitlines() if line.strip()
-            }:
+            listed_heads = {
+                line.split(maxsplit=1)[1]
+                for line in heads.stdout.splitlines()
+                if line.strip()
+            }
+            if (
+                heads.returncode != 0
+                or row["head"] not in {
+                    line.split(maxsplit=1)[0]
+                    for line in heads.stdout.splitlines()
+                    if line.strip()
+                }
+                or not set(row.get("refs", {})).issubset(listed_heads)
+            ):
                 raise RuntimeError(heads.stderr.strip()[-2000:] or "recorded HEAD is absent from bundle")
             require(
                 _git_output(repository, "rev-parse", "HEAD") == row["head"]
@@ -7033,21 +7053,23 @@ def _workspace_plan(manifest: dict, extracted: Path) -> tuple[Path, dict]:
 
 
 def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
-    base_keys = {
+    required_keys = {
             "repository_slug",
             "path",
             "origin",
             "head",
             "tree",
+            "head_symref",
+            "refs",
+            "symrefs",
             "bases",
             "status",
             "bundle_member",
             "bundle_sha256",
         }
-    extended_keys = base_keys | {"head_symref", "refs"}
     require(
         isinstance(row, dict)
-        and set(row) in (base_keys, extended_keys)
+        and set(row) == required_keys
         and isinstance(row["repository_slug"], str)
         and bool(row["repository_slug"])
         and isinstance(row["origin"], str)
@@ -7065,30 +7087,37 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
         "recovery_manifest_invalid",
         "workspace reconstruction row is malformed",
     )
-    if "refs" in row:
-        require(
-            isinstance(row["head_symref"], (str, type(None)))
-            and (
-                row["head_symref"] is None
-                or row["head_symref"].startswith("refs/heads/")
-            )
-            and isinstance(row["refs"], dict)
-            and all(
-                isinstance(name, str)
-                and bool(name)
-                and isinstance(object_id, str)
-                and bool(GIT_OBJECT.fullmatch(object_id))
-                for name, object_id in row["refs"].items()
-            ),
-            "recovery_manifest_invalid",
-            "workspace ref identity is malformed",
+    require(
+        isinstance(row["head_symref"], (str, type(None)))
+        and (
+            row["head_symref"] is None
+            or row["head_symref"].startswith("refs/heads/")
         )
-        if row["head_symref"] is not None:
-            require(
-                row["refs"].get(row["head_symref"]) == row["head"],
-                "recovery_manifest_invalid",
-                "workspace symbolic HEAD is not bound to the recorded head",
-            )
+        and isinstance(row["refs"], dict)
+        and isinstance(row["symrefs"], dict)
+        and all(
+            isinstance(name, str)
+            and bool(name)
+            and isinstance(object_id, str)
+            and bool(GIT_OBJECT.fullmatch(object_id))
+            for name, object_id in row["refs"].items()
+        )
+        and all(
+            isinstance(name, str)
+            and name in row["refs"]
+            and isinstance(target, str)
+            and bool(target)
+            for name, target in row["symrefs"].items()
+        ),
+        "recovery_manifest_invalid",
+        "workspace ref identity is malformed",
+    )
+    if row["head_symref"] is not None:
+        require(
+            row["refs"].get(row["head_symref"]) == row["head"],
+            "recovery_manifest_invalid",
+            "workspace symbolic HEAD is not bound to the recorded head",
+        )
     _safe_workspace_origin(row["origin"], row["repository_slug"])
     target = absolute_text(row["path"], f"workspace target {row['repository_slug']}")
     require(
@@ -7113,14 +7142,7 @@ def _workspace_verify(path: Path, row: dict) -> None:
         "recovery_workspace_mismatch",
         "workspace checkout carries local attribute overrides",
     )
-    environment = {
-        **os.environ,
-        "GIT_ATTR_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_OPTIONAL_LOCKS": "0",
-        "GIT_TERMINAL_PROMPT": "0",
-    }
+    environment = _git_environment()
     try:
         origin = subprocess.check_output(
             ["git", "-C", str(path), "remote", "get-url", "origin"],
@@ -7244,6 +7266,24 @@ def _workspace_verify(path: Path, row: dict) -> None:
             "extra": sorted(set(indexed) - set(expected))[:20],
         },
     )
+    try:
+        flag_output = subprocess.check_output(
+            ["git", "-C", str(path), "ls-files", "-v", "-z"],
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RecoveryError(
+            "recovery_workspace_missing",
+            f"cannot inspect workspace index flags: {path}",
+        ) from error
+    for record in flag_output.split(b"\0"):
+        if record:
+            require(
+                record.startswith(b"H "),
+                "recovery_workspace_mismatch",
+                f"workspace index carries an assume-unchanged or skip-worktree flag: {path}",
+            )
 
     attribute_input = b"\0".join(
         os.fsencode(relative) for relative in sorted(expected)
@@ -7366,20 +7406,20 @@ def _workspace_verify(path: Path, row: dict) -> None:
             "object_format": object_format,
         },
     )
-    if "refs" in row:
-        actual_head_symref, actual_refs = _workspace_refs(path)
-        require(
-            actual_head_symref == row["head_symref"]
-            and actual_refs == row["refs"],
-            "recovery_workspace_mismatch",
-            f"workspace refs differ from the reconstruction plan: {path}",
-            {
-                "expected_head": row["head_symref"],
-                "actual_head": actual_head_symref,
-                "missing_refs": sorted(set(row["refs"]) - set(actual_refs))[:20],
-                "extra_refs": sorted(set(actual_refs) - set(row["refs"]))[:20],
-            },
-        )
+    actual_head_symref, actual_refs, actual_symrefs = _workspace_refs(path)
+    require(
+        actual_head_symref == row["head_symref"]
+        and actual_refs == row["refs"]
+        and actual_symrefs == row["symrefs"],
+        "recovery_workspace_mismatch",
+        f"workspace refs differ from the reconstruction plan: {path}",
+        {
+            "expected_head": row["head_symref"],
+            "actual_head": actual_head_symref,
+            "missing_refs": sorted(set(row["refs"]) - set(actual_refs))[:20],
+            "extra_refs": sorted(set(actual_refs) - set(row["refs"]))[:20],
+        },
+    )
 
 
 def validate_workspace_targets(
@@ -7438,7 +7478,7 @@ def _apply_workspace_modes(path: Path) -> None:
     output = subprocess.check_output(
         ["git", "-C", str(path), "ls-tree", "-r", "-z", "HEAD"],
         stderr=subprocess.PIPE,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        env=_git_environment(),
     )
     for record in output.split(b"\0"):
         if not record:
@@ -7459,6 +7499,84 @@ def _apply_workspace_modes(path: Path) -> None:
         target.chmod(0o755 if mode_text == "100755" else 0o644)
 
 
+def _workspace_attributes_safe(path: Path) -> None:
+    tree_output = subprocess.check_output(
+        ["git", "-C", str(path), "ls-tree", "-r", "-z", "HEAD"],
+        stderr=subprocess.PIPE,
+        env=_git_environment(),
+    )
+    paths = []
+    for record in tree_output.split(b"\0"):
+        if record:
+            paths.append(os.fsdecode(record.split(b"\t", 1)[1]))
+    attribute_input = b"\0".join(os.fsencode(path_name) for path_name in sorted(paths)) + b"\0"
+    attribute_output = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(path),
+            "check-attr",
+            "--cached",
+            "--source=HEAD",
+            "-z",
+            "filter",
+            "working-tree-encoding",
+            "--stdin",
+        ],
+        input=attribute_input,
+        stderr=subprocess.PIPE,
+        env=_git_environment(),
+    )
+    rows = attribute_output.split(b"\0")
+    require(
+        len(rows) % 3 == 1 and not rows[-1],
+        "recovery_workspace_mismatch",
+        "workspace attribute query returned malformed data",
+    )
+    for index in range(0, len(rows) - 1, 3):
+        relative = os.fsdecode(rows[index])
+        name = rows[index + 1].decode("ascii", "replace")
+        value = rows[index + 2].decode("ascii", "replace")
+        require(
+            value in {"unspecified", "unset"},
+            "recovery_workspace_mismatch",
+            f"workspace attribute is unsupported: {relative} {name}",
+        )
+
+
+def _restore_workspace_ref(
+    target: Path,
+    name: str,
+    object_id: str,
+    row: dict,
+) -> None:
+    if name in row["symrefs"]:
+        command = [
+            "git",
+            "-C",
+            str(target),
+            "symbolic-ref",
+            name,
+            row["symrefs"][name],
+        ]
+    else:
+        command = ["git", "-C", str(target), "update-ref", name, object_id]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=_git_environment(),
+    )
+    require(
+        completed.returncode == 0,
+        "recovery_workspace_failed",
+        f"cannot restore workspace ref {name}",
+        {"stderr": completed.stderr[-2000:]},
+    )
+
+
 def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
     require(
         not path_exists(target),
@@ -7473,6 +7591,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
         text=True,
         timeout=600,
         check=False,
+        env=_git_environment(),
         preexec_fn=_workspace_umask,
     )
     require(
@@ -7481,6 +7600,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
         f"cannot clone workspace bundle: {row['repository_slug']}",
         {"stderr": clone.stderr[-2000:]},
     )
+    _workspace_attributes_safe(target)
     if "refs" in row:
         current_refs = set(
             subprocess.check_output(
@@ -7496,15 +7616,17 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 ],
                 text=True,
                 stderr=subprocess.PIPE,
+                env=_git_environment(),
             ).splitlines()
         )
         for name in sorted(current_refs - set(row["refs"])):
             remove = subprocess.run(
-                ["git", "-C", str(target), "update-ref", "-d", name],
+                ["git", "-C", str(target), "update-ref", "--no-deref", "-d", name],
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
+                env=_git_environment(),
             )
             require(
                 remove.returncode == 0,
@@ -7513,19 +7635,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 {"stderr": remove.stderr[-2000:]},
             )
         for name, object_id in sorted(row["refs"].items()):
-            update = subprocess.run(
-                ["git", "-C", str(target), "update-ref", name, object_id],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            require(
-                update.returncode == 0,
-                "recovery_workspace_failed",
-                f"cannot restore workspace ref {name}",
-                {"stderr": update.stderr[-2000:]},
-            )
+            _restore_workspace_ref(target, name, object_id, row)
         if row["head_symref"] is not None:
             symbolic = subprocess.run(
                 [
@@ -7540,6 +7650,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 text=True,
                 timeout=30,
                 check=False,
+                env=_git_environment(),
             )
             require(
                 symbolic.returncode == 0,
@@ -7561,6 +7672,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
         text=True,
         timeout=120,
         check=False,
+        env=_git_environment(),
         preexec_fn=_workspace_umask,
     )
     require(
@@ -7585,6 +7697,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 ],
                 text=True,
                 stderr=subprocess.PIPE,
+                env=_git_environment(),
             ).splitlines()
         )
         for name in sorted(current_refs - set(row["refs"])):
@@ -7594,6 +7707,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 text=True,
                 timeout=30,
                 check=False,
+                env=_git_environment(),
             )
             require(
                 remove.returncode == 0,
@@ -7607,6 +7721,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
         text=True,
         timeout=30,
         check=False,
+        env=_git_environment(),
     )
     require(
         origin.returncode == 0,
@@ -7629,15 +7744,17 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 ],
                 text=True,
                 stderr=subprocess.PIPE,
+                env=_git_environment(),
             ).splitlines()
         )
         for name in sorted(current_refs - set(row["refs"])):
             remove = subprocess.run(
-                ["git", "-C", str(target), "update-ref", "-d", name],
+                ["git", "-C", str(target), "update-ref", "--no-deref", "-d", name],
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
+                env=_git_environment(),
             )
             require(
                 remove.returncode == 0,
@@ -7646,19 +7763,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
                 {"stderr": remove.stderr[-2000:]},
             )
         for name, object_id in sorted(row["refs"].items()):
-            update = subprocess.run(
-                ["git", "-C", str(target), "update-ref", name, object_id],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            require(
-                update.returncode == 0,
-                "recovery_workspace_failed",
-                f"cannot restore workspace ref {name}",
-                {"stderr": update.stderr[-2000:]},
-            )
+            _restore_workspace_ref(target, name, object_id, row)
         if "refs/remotes/origin/HEAD" not in row["refs"]:
             remove = subprocess.run(
                 [

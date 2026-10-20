@@ -1311,6 +1311,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                         "refs/heads/main": head,
                         "refs/remotes/origin/main": head,
                     },
+                    "symrefs": {},
                     "bases": ["main"],
                     "status": "clean",
                 }
@@ -1489,6 +1490,12 @@ class RecoveryControlFlowTests(unittest.TestCase):
             "origin": str(origin),
             "head": head,
             "tree": tree,
+            "head_symref": "refs/heads/main",
+            "refs": {
+                "refs/heads/main": head,
+                "refs/remotes/origin/main": head,
+            },
+            "symrefs": {},
             "bases": ["main"],
             "status": "clean",
             "bundle_member": "reconstruct/workspaces/fixture.bundle",
@@ -1513,6 +1520,12 @@ class RecoveryControlFlowTests(unittest.TestCase):
             "origin": str(origin),
             "head": head,
             "tree": tree,
+            "head_symref": "refs/heads/main",
+            "refs": {
+                "refs/heads/main": head,
+                "refs/remotes/origin/main": head,
+            },
+            "symrefs": {},
             "bases": ["main"],
             "status": "clean",
             "bundle_member": "reconstruct/workspaces/fixture.bundle",
@@ -1521,6 +1534,43 @@ class RecoveryControlFlowTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery._workspace_verify(repository, row)
         self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
+
+    def test_workspace_verify_rejects_index_flags_without_content_change(self) -> None:
+        repository, origin, head, tree = self.workspace_fixture()
+        row = {
+            "repository_slug": "owner/model",
+            "path": str(repository),
+            "origin": str(origin),
+            "head": head,
+            "tree": tree,
+            "head_symref": "refs/heads/main",
+            "refs": {
+                "refs/heads/main": head,
+                "refs/remotes/origin/main": head,
+            },
+            "symrefs": {},
+            "bases": ["main"],
+            "status": "clean",
+            "bundle_member": "reconstruct/workspaces/fixture.bundle",
+            "bundle_sha256": "0" * 64,
+        }
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            subprocess.run(
+                ["git", "-C", str(repository), "update-index", flag, "tracked.txt"],
+                check=True,
+            )
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery._workspace_verify(repository, row)
+            self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
+            clear = (
+                "--no-assume-unchanged"
+                if flag == "--assume-unchanged"
+                else "--no-skip-worktree"
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "update-index", clear, "tracked.txt"],
+                check=True,
+            )
 
     def test_release_runtime_preflight_rejects_external_venv(self) -> None:
         release_root = self.root / "release-preflight"
