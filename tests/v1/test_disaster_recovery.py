@@ -667,6 +667,71 @@ def fake_maintenance_receipt(
     }
 
 
+def runtime_wheel_payloads(source_sha: str = "b" * 64) -> dict[str, bytes]:
+    return {
+        "description_pipeline/__init__.py": b'VERSION = "1.0.0-test"',
+        "description_pipeline/tool-release.json": json.dumps(
+            {"source_sha256": source_sha, "version": "1.0.0-test"},
+            separators=(",", ":"),
+        ).encode(),
+        "mimicverse_description-1.0.0-test.dist-info/METADATA": (
+            b"Metadata-Version: 2.1 Name: mimicverse-description Version: 1.0.0-test"
+        ),
+        "mimicverse_description-1.0.0-test.dist-info/RECORD": (
+            b"description_pipeline/__init__.py,, description_pipeline/tool-release.json,"
+            b"mimicverse_description-1.0.0-test.dist-info/METADATA,"
+        ),
+    }
+
+
+def write_runtime_wheel(path: Path, source_sha: str = "b" * 64) -> dict[str, bytes]:
+    payloads = runtime_wheel_payloads(source_sha)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in payloads.items():
+            archive.writestr(name, payload)
+    path.chmod(0o600)
+    return payloads
+
+
+def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
+    site = venv / "lib" / "python3.12" / "site-packages"
+    package = site / "description_pipeline"
+    identity = json.dumps(
+        {
+            "version": "1.0.0-test",
+            "source_sha256": source_sha,
+            "file": str(package),
+        },
+        separators=(",", ":"),
+    )
+    lines = [
+        "#!/bin/sh",
+        "set -eu",
+        'mkdir -p "$AIRFLOW_VENV/bin"',
+        f'mkdir -p "{package}" "{site / "mimicverse_description-1.0.0-test.dist-info"}" "{site / "airflow"}"',
+        'cat > "$AIRFLOW_VENV/bin/python" <<\'PY\'',
+        "#!/bin/sh",
+        f"printf '%s\\n' '{identity}'",
+        "PY",
+        'chmod +x "$AIRFLOW_VENV/bin/python"',
+    ]
+    for name, payload in runtime_wheel_payloads(source_sha).items():
+        target = site / name
+        lines.append(
+            f"printf '%s' {payload.decode()!r} > {str(target)!r}"
+        )
+    lines.extend(
+        [
+            f"printf '%s' '' > {str(site / 'airflow' / '__init__.py')!r}",
+            f"printf '%s' '#!/bin/sh' > {str(venv / 'bin' / 'airflow')!r}",
+            f"chmod +x {str(venv / 'bin' / 'airflow')!r}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     source = root / "source"
     postgres_root = root / "fixture-pg"
@@ -752,9 +817,8 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     write(handoff_root / "request.json", '{"handoff":true}\n')
     write(artifact_root / "artifact.bin", b"artifact")
     write(spec_root / "spec.md", "specification\n")
-    release_bytes = b"portable-wheel\n"
     wheel_name = "mimicverse_description-1.0.0-test-py3-none-any.whl"
-    write(release_root / wheel_name, release_bytes)
+    write_runtime_wheel(release_root / wheel_name)
     readme_bytes = b"runtime-role\n"
     linux_name = "description-1.0.0-test-linux-cp312-x86_64.zip"
     linux_path = release_root / linux_name
@@ -767,32 +831,7 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     linux_path.chmod(0o600)
     deployment_name = "description-1.0.0-test-deployment.zip"
     deployment_path = release_root / deployment_name
-    fake_identity = json.dumps(
-        {
-            "version": "1.0.0-test",
-            "source_sha256": "b" * 64,
-            "file": str(
-                release_root
-                / ("airflow-venv-" + install_id)
-                / "lib"
-                / "description_pipeline"
-            ),
-        },
-        separators=(",", ":"),
-    )
-    installer = "\n".join(
-        (
-            "#!/bin/sh",
-            "set -eu",
-            'mkdir -p "$AIRFLOW_VENV/bin"',
-            'cat > "$AIRFLOW_VENV/bin/python" <<\'PY\'',
-            "#!/bin/sh",
-            f"printf '%s\\n' '{fake_identity}'",
-            "PY",
-            'chmod +x "$AIRFLOW_VENV/bin/python"',
-            "",
-        )
-    )
+    installer = runtime_installer(release_root / ("airflow-venv-" + install_id))
     with zipfile.ZipFile(deployment_path, "w") as archive:
         archive.writestr("deploy/airflow/install.sh", installer)
     deployment_path.chmod(0o600)
@@ -1385,6 +1424,35 @@ class RecoveryControlFlowTests(unittest.TestCase):
             recovery.restore_workspaces(manifest, extracted, verify_only=False)
         self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
 
+    def test_workspace_verify_detects_assume_unchanged_content(self) -> None:
+        repository, origin, head, tree = self.workspace_fixture()
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "update-index",
+                "--assume-unchanged",
+                "tracked.txt",
+            ],
+            check=True,
+        )
+        write(repository / "tracked.txt", "hidden-change\n", mode=0o644)
+        row = {
+            "repository_slug": "owner/model",
+            "path": str(repository),
+            "origin": str(origin),
+            "head": head,
+            "tree": tree,
+            "bases": ["main"],
+            "status": "clean",
+            "bundle_member": "reconstruct/workspaces/fixture.bundle",
+            "bundle_sha256": "0" * 64,
+        }
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery._workspace_verify(repository, row)
+        self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
+
     def test_release_runtime_preflight_rejects_external_venv(self) -> None:
         release_root = self.root / "release-preflight"
         extracted = self.root / "release-preflight-extracted"
@@ -1441,7 +1509,6 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 )
             ),
         )
-        wheel = b"offline-wheel\n"
         readme = b"offline-role\n"
         release_files = extracted / "release"
         (release_files / "artifacts").mkdir(parents=True)
@@ -1450,36 +1517,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
             archive.writestr("files.json", json.dumps({"README.md": hashlib.sha256(readme).hexdigest()}))
             archive.writestr("README.md", readme)
         deployment_zip = release_files / "artifacts" / "description-1.0.0-test-deployment.zip"
-        fake_identity = json.dumps(
-            {
-                "version": "1.0.0-test",
-                "source_sha256": "b" * 64,
-                "file": str(
-                    release_root
-                    / "airflow-venv"
-                    / "lib"
-                    / "description_pipeline"
-                ),
-            },
-            separators=(",", ":"),
-        )
-        installer = "\n".join(
-            (
-                "#!/bin/sh",
-                "set -eu",
-                'mkdir -p "$AIRFLOW_VENV/bin"',
-                'cat > "$AIRFLOW_VENV/bin/python" <<\'PY\'',
-                "#!/bin/sh",
-                f"printf '%s\\n' '{fake_identity}'",
-                "PY",
-                'chmod +x "$AIRFLOW_VENV/bin/python"',
-                "",
-            )
-        )
+        installer = runtime_installer(release_root / "airflow-venv")
         with zipfile.ZipFile(deployment_zip, "w") as archive:
             archive.writestr("deploy/airflow/install.sh", installer)
         wheel_path = release_files / "artifacts" / "mimicverse_description-1.0.0-test-py3-none-any.whl"
-        wheel_path.write_bytes(wheel)
+        write_runtime_wheel(wheel_path)
         write(release_files / "release.json", "{}\n")
         manifest = {
             "release": {

@@ -7003,53 +7003,154 @@ def _workspace_verify(path: Path, row: dict) -> None:
             stderr=subprocess.PIPE,
             env=environment,
         ).strip()
-        status = subprocess.check_output(
-            [
-                "git",
-                "-C",
-                str(path),
-                "status",
-                "--porcelain=v2",
-                "--untracked-files=all",
-            ],
-            text=True,
-            stderr=subprocess.PIPE,
-            env=environment,
-        ).strip()
         object_format = subprocess.check_output(
             ["git", "-C", str(path), "rev-parse", "--show-object-format"],
             text=True,
             stderr=subprocess.PIPE,
             env=environment,
         ).strip()
-        for args in (
-            ("diff-index", "--cached", "--quiet", "HEAD", "--"),
-            ("diff-files", "--quiet"),
-        ):
-            completed = subprocess.run(
-                ["git", "-C", str(path), *args],
-                text=True,
-                capture_output=True,
-                env=environment,
-                check=False,
-            )
-            require(
-                completed.returncode == 0,
-                "recovery_workspace_mismatch",
-                f"workspace has a dirty index or worktree: {path}",
-                {"git": args, "stderr": completed.stderr[-2000:]},
-            )
+        tree_output = subprocess.check_output(
+            ["git", "-C", str(path), "ls-tree", "-r", "-z", "HEAD"],
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
     except (OSError, subprocess.SubprocessError) as error:
         raise RecoveryError(
             "recovery_workspace_missing",
             f"cannot inspect workspace checkout: {path}",
         ) from error
+
+    expected: dict[str, tuple[int, str]] = {}
+    for record in tree_output.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_relative = record.split(b"\t", 1)
+        fields = metadata.decode("ascii").split()
+        require(
+            len(fields) == 3 and fields[1] == "blob",
+            "recovery_workspace_mismatch",
+            f"workspace HEAD carries an unsupported object: {raw_relative!r}",
+        )
+        mode_text, _, object_id = fields
+        require(
+            bool(re.fullmatch(r"[0-7]{6}", mode_text))
+            and bool(GIT_OBJECT.fullmatch(object_id)),
+            "recovery_workspace_mismatch",
+            f"workspace HEAD carries an invalid tree entry: {raw_relative!r}",
+        )
+        relative = os.fsdecode(raw_relative)
+        require(
+            relative not in expected,
+            "recovery_workspace_mismatch",
+            f"workspace HEAD repeats a path: {relative}",
+        )
+        expected[relative] = (int(mode_text, 8), object_id)
+
+    attribute_input = b"\0".join(
+        os.fsencode(relative) for relative in sorted(expected)
+    ) + b"\0"
+    try:
+        attribute_output = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(path),
+                "check-attr",
+                "-z",
+                "filter",
+                "working-tree-encoding",
+                "--stdin",
+            ],
+            input=attribute_input,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RecoveryError(
+            "recovery_workspace_missing",
+            f"cannot inspect workspace attributes: {path}",
+        ) from error
+    attribute_rows = attribute_output.split(b"\0")
+    require(
+        len(attribute_rows) % 3 == 1 and not attribute_rows[-1],
+        "recovery_workspace_mismatch",
+        "workspace attribute query returned malformed data",
+    )
+    for index in range(0, len(attribute_rows) - 1, 3):
+        attribute_path = os.fsdecode(attribute_rows[index])
+        attribute_name = attribute_rows[index + 1].decode("ascii", "replace")
+        attribute_value = attribute_rows[index + 2].decode("ascii", "replace")
+        require(
+            attribute_value in {"unspecified", "unset"},
+            "recovery_workspace_mismatch",
+            f"workspace attribute is unsupported: {attribute_path} {attribute_name}",
+        )
+
+    actual: set[str] = set()
+    for directory, directories, filenames in os.walk(path, followlinks=False):
+        current = Path(directory)
+        if current == path:
+            directories[:] = [name for name in directories if name != ".git"]
+        for name in directories:
+            candidate = current / name
+            require(
+                not candidate.is_symlink(),
+                "recovery_workspace_mismatch",
+                f"workspace checkout carries a directory link: {candidate}",
+            )
+        for name in filenames:
+            if current == path and name == ".git":
+                continue
+            candidate = current / name
+            require(
+                not candidate.is_symlink(),
+                "recovery_workspace_mismatch",
+                f"workspace checkout carries a file link: {candidate}",
+            )
+            actual.add(candidate.relative_to(path).as_posix())
+    require(
+        actual == set(expected),
+        "recovery_workspace_mismatch",
+        f"workspace checkout differs from HEAD: {path}",
+        {
+            "missing": sorted(set(expected) - actual)[:20],
+            "extra": sorted(actual - set(expected))[:20],
+        },
+    )
+    for relative, (mode, object_id) in expected.items():
+        require(
+            mode in {0o100644, 0o100755},
+            "recovery_workspace_mismatch",
+            f"workspace HEAD carries an unsupported mode: {relative}",
+        )
+        target = path / relative
+        metadata = target.lstat()
+        require(
+            stat.S_ISREG(metadata.st_mode),
+            "recovery_workspace_mismatch",
+            f"workspace tracked path is not a regular file: {relative}",
+        )
+        executable = bool(metadata.st_mode & 0o111)
+        require(
+            executable == (mode == 0o100755),
+            "recovery_workspace_mismatch",
+            f"workspace tracked mode differs: {relative}",
+        )
+        digest = hashlib.sha1()
+        digest.update(f"blob {metadata.st_size}\0".encode("ascii"))
+        with target.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        require(
+            digest.hexdigest() == object_id,
+            "recovery_workspace_mismatch",
+            f"workspace tracked bytes differ: {relative}",
+        )
     require(
         origin == row["origin"]
         and head == row["head"]
         and tree == row["tree"]
-        and object_format == "sha1"
-        and status == "",
+        and object_format == "sha1",
         "recovery_workspace_mismatch",
         f"workspace checkout differs from the reconstruction plan: {path}",
         {
@@ -7057,7 +7158,6 @@ def _workspace_verify(path: Path, row: dict) -> None:
             "head": head,
             "tree": tree,
             "object_format": object_format,
-            "status": status.splitlines()[:20],
         },
     )
 
@@ -7424,6 +7524,58 @@ def _read_rehydrate_env(path: Path) -> dict[str, str]:
     return values
 
 
+def _verify_installed_wheel(wheel: Path, site_packages: Path) -> None:
+    require_real_file(wheel, "recovered release wheel", "recovery_release_missing")
+    require_real_dir(site_packages, "installed site-packages", "recovery_release_missing")
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members: dict[str, bytes] = {}
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                name = confined_member(info.filename, f"wheel member {info.filename!r}")
+                with archive.open(info) as stream:
+                    members[name] = stream.read()
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise RecoveryError(
+            "recovery_release_missing",
+            f"release wheel is invalid: {wheel.name}",
+        ) from error
+    require(
+        "description_pipeline/__init__.py" in members
+        and any(name.endswith(".dist-info/RECORD") for name in members),
+        "recovery_release_missing",
+        "release wheel does not carry the package or its RECORD",
+    )
+    for name, payload in members.items():
+        target = site_packages / name
+        require(
+            target.is_relative_to(site_packages),
+            "recovery_target_path_unsafe",
+            f"installed wheel member escapes site-packages: {name}",
+        )
+        require_real_file(
+            target,
+            f"installed wheel member {name}",
+            "recovery_release_missing",
+        )
+        require(
+            sha256_file(target) == hashlib.sha256(payload).hexdigest(),
+            "recovery_release_missing",
+            f"installed wheel member differs: {name}",
+        )
+    require_real_dir(
+        site_packages / "airflow",
+        "installed Airflow package",
+        "recovery_release_missing",
+    )
+    require_real_file(
+        site_packages / "airflow" / "__init__.py",
+        "installed Airflow package entry",
+        "recovery_release_missing",
+    )
+
+
 def verify_release_runtime(
     *,
     manifest: dict,
@@ -7451,7 +7603,11 @@ def verify_release_runtime(
         "recovered Airflow environment is outside its release root",
     )
     python = venv / "bin" / "python"
-    require_real_file(python, "recovered Airflow interpreter", "recovery_release_missing")
+    require(
+        python.is_file() and os.access(python, os.X_OK),
+        "recovery_release_missing",
+        "recovered Airflow interpreter is missing or not executable",
+    )
     completed = subprocess.run(
         [
             str(python),
@@ -7486,6 +7642,33 @@ def verify_release_runtime(
         and Path(identity.get("file", "")).is_relative_to(venv),
         "recovery_release_missing",
         "recovered package identity differs from the release",
+    )
+    package = Path(identity["file"]).resolve()
+    require(
+        package.name == "description_pipeline" and package.is_dir(),
+        "recovery_release_missing",
+        "recovered package directory is not the expected package",
+    )
+    require(
+        package.parent.is_relative_to(venv.resolve()),
+        "recovery_release_missing",
+        "recovered package directory is outside its virtual environment",
+    )
+    artifacts = _release_artifacts(manifest)
+    _, _, wheel_name = _release_role_archives(artifacts)
+    wheel = release_root / "artifacts" / wheel_name
+    require_real_file(wheel, "recovered release wheel", "recovery_release_missing")
+    require(
+        sha256_file(wheel) == artifacts[wheel_name]["sha256"],
+        "recovery_release_missing",
+        "recovered release wheel digest differs",
+    )
+    _verify_installed_wheel(wheel, package.parent)
+    require(
+        (venv / "bin" / "airflow").is_file()
+        and os.access(venv / "bin" / "airflow", os.X_OK),
+        "recovery_release_missing",
+        "recovered Airflow entry point is missing or not executable",
     )
     return {"install_id": install_id, "venv": str(venv), "identity": identity}
 
