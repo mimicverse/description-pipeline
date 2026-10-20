@@ -307,6 +307,7 @@ def _input(root, diagnostics=None):
         bodies, joints = carrier["bodies"], carrier["joints"]
         from ..sources.solidworks.naming import carrier_names
 
+        carrier_snapshot = _carrier_snapshot(carrier["root"], bodies, joints)
         body_names, joint_names = carrier_names(bodies, joints, str(carrier["root"]))
         for body in bodies:
             source_name = str(body["name"])
@@ -329,6 +330,8 @@ def _input(root, diagnostics=None):
     else:
         bodies = rebuild_rigid_bodies(discovery_record)
         joints = rebuild_joint_facts(discovery_record, root, purpose=_request_purpose(root))
+        rebuild_root = next((str(body["name"]) for body in bodies if str(body["name"]) == "base_link"), None)
+        carrier_snapshot = _carrier_snapshot(rebuild_root, bodies, joints)
         frames = rebuild_interface_frames(discovery_record)
     source = read_source_record(root)
     handoff = evidence.handoff(root)
@@ -396,12 +399,38 @@ def _input(root, diagnostics=None):
             "robot_name_source": "cad" if raw_identity.get("robot_name") else "cad_filename_derived",
             "bodies": bodies,
             "joints": joints,
+            "carrier": carrier_snapshot,
             "frames": frames,
             "material_source": material_source,
             "documented_masses": declared.get("items") or {},
             "mass_evidence": declared.get("evidence"),
         },
         "checks": checks,
+    }
+
+
+def _carrier_snapshot(root, bodies, joints) -> dict:
+    """Freeze the raw-decoded carrier names, members and native topology."""
+
+    return {
+        "root": None if root is None else str(root),
+        "bodies": [
+            {
+                "name": str(body["name"]),
+                "frame": dict(body.get("frame") or {}),
+                "components": list(body.get("components") or []),
+            }
+            for body in bodies
+        ],
+        "joints": [
+            {
+                "name": str(joint["name"]),
+                "type": joint.get("type"),
+                "parent": str(joint.get("parent") or ""),
+                "child": str(joint.get("child") or ""),
+            }
+            for joint in joints
+        ],
     }
 
 
@@ -1797,6 +1826,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
 
     source = definition["source"]
     gates.add("model.policy", lambda: _policy(source, model))
+    gates.add("source.carrier_binding", lambda: _carrier_binding(source, definition.get("carrier")))
     gates.add("provenance.value_warnings", lambda: _value_warning_gate(root, source, model))
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
@@ -1928,6 +1958,62 @@ def _policy(source, model):
         expected = {(row["id"], row["name"]) for row in source.get(key, [])}
         _require(actual == expected, f"Canonical {key} set differs from author inputs")
     return {"scope": "SolidWorks tree, STL visuals, URDF"}
+
+
+def _carrier_binding(source, carrier):
+    """Bind delivered names, members and topology to the raw-decoded carrier."""
+
+    _require(isinstance(carrier, dict), "The raw carrier snapshot is missing")
+    bodies = source.get("bodies") or []
+    joints = source.get("joints") or []
+    native = {str(body.get("source_name") or body["name"]): body for body in bodies}
+    expected = {str(body["name"]): body for body in carrier.get("bodies") or []}
+    _require(
+        bool(expected) and set(native) == set(expected),
+        "Delivered bodies differ from the raw carrier membership",
+    )
+    for name, body in native.items():
+        original = expected[name]
+        _require(
+            list(body.get("components") or []) == list(original.get("components") or []),
+            f"Body {name} components differ from the raw carrier",
+        )
+        _require(
+            str((body.get("frame") or {}).get("coordinate_system") or "")
+            == str((original.get("frame") or {}).get("coordinate_system") or ""),
+            f"Body {name} datum differs from the raw carrier",
+        )
+    output_to_native = {
+        str(body["name"]): str(body.get("source_name") or body["name"]) for body in bodies
+    }
+    delivered = {str(joint.get("source_name") or joint["name"]): joint for joint in joints}
+    expected_joints = {str(joint["name"]): joint for joint in carrier.get("joints") or []}
+    _require(
+        set(delivered) == set(expected_joints),
+        "Delivered joints differ from the raw carrier membership",
+    )
+    for name, joint in delivered.items():
+        original = expected_joints[name]
+        _require(joint.get("type") == original.get("type"), f"Joint {name} type differs from the raw carrier")
+        _require(
+            output_to_native.get(str(joint.get("parent") or ""), str(joint.get("parent") or ""))
+            == str(original.get("parent") or ""),
+            f"Joint {name} parent differs from the raw carrier",
+        )
+        _require(
+            output_to_native.get(str(joint.get("child") or ""), str(joint.get("child") or ""))
+            == str(original.get("child") or ""),
+            f"Joint {name} child differs from the raw carrier",
+        )
+    root = carrier.get("root")
+    if root is not None:
+        base = next((body for body in bodies if body.get("name") == "base_link"), None)
+        _require(base is not None, "The raw carrier root is not delivered as base_link")
+        _require(
+            str(base.get("source_name") or base["name"]) == str(root),
+            "The delivered base_link does not bind to the raw carrier root",
+        )
+    return {"bodies": len(native), "joints": len(delivered)}
 
 
 def _value_warning_gate(root, source, model):

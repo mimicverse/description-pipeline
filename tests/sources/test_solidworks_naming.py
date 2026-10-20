@@ -208,7 +208,7 @@ class NamingTests(unittest.TestCase):
             "right_forearm_link",
         )
 
-    def test_full_humanoid_topology_is_closed_and_exactly_named(self):
+    def test_full_humanoid_topology_role_names_and_unresolved_neutral_names(self):
         bodies = [{"name": "base", "frame": {"coordinate_system": "CS_base_link"}, "components": ["base"]}]
         joints = []
 
@@ -252,6 +252,7 @@ class NamingTests(unittest.TestCase):
         add_body("head_pitch")
         add_joint("head_pitch", "head_yaw", "head_pitch")
         add_body("sensor", "CS_sensor_housing_link")
+        joints.append({"name": "sensor_mount", "type": "fixed", "parent": "base", "child": "sensor"})
 
         body_names, joint_names = carrier_names(bodies, joints, "base")
 
@@ -311,12 +312,41 @@ class NamingTests(unittest.TestCase):
                 "left_hip_roll_joint",
                 "left_knee_joint",
                 "left_ankle_joint",
+                "base_link_to_sensor_housing_link_joint",
+            },
+        )
+        # The four role families below have no proven motion token in the
+        # current CAD capture.  They stay neutral and are reported as an
+        # unresolved reference/standard conflict; a topology-only guess never
+        # fabricates a `_pitch` name.
+        self.assertEqual(
+            {
+                name: joint_names[name]
+                for name in (
+                    "r_elbow",
+                    "l_elbow",
+                    "waist",
+                    "r_knee",
+                    "l_knee",
+                    "r_ankle",
+                    "l_ankle",
+                )
+            },
+            {
+                "r_elbow": "right_elbow_joint",
+                "l_elbow": "left_elbow_joint",
+                "waist": "waist_joint",
+                "r_knee": "right_knee_joint",
+                "l_knee": "left_knee_joint",
+                "r_ankle": "right_ankle_joint",
+                "l_ankle": "left_ankle_joint",
             },
         )
         self.assertEqual(len(body_names), 25)
-        self.assertEqual(len(joint_names), 23)
+        self.assertEqual(len(joint_names), 24)
         self.assertEqual(len(set(body_names.values())), 25)
-        self.assertEqual(len(set(joint_names.values())), 23)
+        self.assertEqual(len(set(joint_names.values())), 24)
+        self.assertTrue(joint_names["sensor_mount"].endswith("_joint"))
         for joint in joints:
             self.assertIn(body_names[joint["parent"]], body_names.values())
             self.assertIn(body_names[joint["child"]], body_names.values())
