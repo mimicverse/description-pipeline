@@ -164,9 +164,14 @@ def offline_bundle(source, output, wheel, platform, bound):
         wheels = staging / "wheels"
         arguments = [sys.executable, "-m", "pip", "download", "--only-binary=:all:", "--dest", str(wheels)]
         arguments += target_arguments(platform, bound)
-        lock_files = [source / f"requirements/{platform}-py312.lock"]
-        if platform == "linux":
-            lock_files.append(source / "deploy/airflow/requirements.lock")
+        lock_files = [
+            source
+            / (
+                "deploy/airflow/requirements.lock"
+                if platform == "linux"
+                else f"requirements/{platform}-py312.lock"
+            )
+        ]
         for lock_file in lock_files:
             arguments += ["-r", str(lock_file)]
         subprocess.run(arguments, check=True)
