@@ -707,7 +707,12 @@ function Get-AclProjection([string]$Path) {
 }
 function Set-AclProjection([string]$Path, $Projection) {
   $sections = [System.Security.AccessControl.AccessControlSections]::All
-  $security = New-Object System.Security.AccessControl.FileSecurity
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if ($item.PSIsContainer) {
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+  } else {
+    $security = New-Object System.Security.AccessControl.FileSecurity
+  }
   $security.SetSecurityDescriptorSddlForm([string]$Projection.sddl, $sections)
   Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
 }
@@ -720,6 +725,20 @@ function Get-TaskFilePath($Task) {
     throw 'the scheduled task file escapes the Task Scheduler root'
   }
   return $path
+}
+function Assert-NoReparseAncestor([string]$Path) {
+  $current = [System.IO.Path]::GetFullPath($Path)
+  while ($current) {
+    if (Test-Path -LiteralPath $current) {
+      $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+      if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Die 'windows_recovery_target_unsafe' ('recovery path crosses a reparse point: ' + $current)
+      }
+    }
+    $parent = [System.IO.Path]::GetDirectoryName($current)
+    if (-not $parent -or $parent -eq $current) { break }
+    $current = $parent
+  }
 }
 function Get-RecoveryTask([string]$TaskName, [string]$TaskPath = '') {
   $tasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
@@ -1049,6 +1068,12 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
     endpoint_token = Get-AclProjection ([string]$identity.token_path)
     install_id = Get-AclProjection ([string]$identity.install_id_path)
     cad_ownership = $(if ([bool]$cad.ledger_present) { Get-AclProjection ([string]$cad.ownership_path) } else { $null })
+    roots = [ordered]@{
+      package_root = Get-AclProjection ([string]$identity.package_root)
+      output_root = Get-AclProjection ([string]$identity.output_root)
+      state_root = Get-AclProjection ([string]$identity.state_root)
+      endpoint_root = Get-AclProjection ([string]$identity.endpoint_root)
+    }
   }
   $state = [ordered]@{
     schema_version = 'solidworks-to-urdf.windows-recovery/v1'
@@ -1093,12 +1118,19 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
 }
 function Set-PrivateRecoveryAcl([string]$Path) {
   $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-  $security = New-Object System.Security.AccessControl.DirectorySecurity
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if ($item.PSIsContainer) {
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+  } else {
+    $security = New-Object System.Security.AccessControl.FileSecurity
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+  }
   $security.SetAccessRuleProtection($true, $false)
   $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
     $sid, [System.Security.AccessControl.FileSystemRights]::FullControl,
-    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+    $inheritance,
     [System.Security.AccessControl.PropagationFlags]::None,
     [System.Security.AccessControl.AccessControlType]::Allow)
   $security.AddAccessRule($rule)
@@ -1166,6 +1198,7 @@ function Expand-RecoveryBundle([string]$Path, [string]$Destination) {
   return @{ state=$state; root=$root }
 }
 function Restore-RecoveryFile([string]$Source, [string]$Target, $Acl, [string]$Sha256) {
+  Assert-NoReparseAncestor $Target
   $parent = Split-Path -Parent $Target
   if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
     Die 'windows_endpoint_not_provisioned' ('the target parent directory is missing: ' + $parent)
@@ -1206,6 +1239,7 @@ function Invoke-RecoverySnapshot($Binding) {
   if (-not (Test-Path -LiteralPath $RecoveryDir -PathType Container)) {
     Die 'recovery_dir_required' 'the Windows recovery directory is missing'
   }
+  Assert-NoReparseAncestor $RecoveryDir
   $recoveryDirItem = Get-Item -LiteralPath $RecoveryDir -Force
   if ($recoveryDirItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
     Die 'windows_recovery_target_unsafe' 'the Windows recovery directory is a reparse point'
@@ -1257,6 +1291,8 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
   $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-recovery-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $temp | Out-Null
   $ownedTask = $false
+  $registeringTask = $false
+  $state = $null
   try {
     Set-PrivateRecoveryAcl $temp
     $extracted = Expand-RecoveryBundle $RecoveryBundle $temp
@@ -1282,6 +1318,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       Die 'windows_operator_principal_mismatch' 'the SSH account differs from the recovery principal'
     }
     foreach ($root in @($state.identity.package_root,$state.identity.output_root,$state.identity.state_root)) {
+      Assert-NoReparseAncestor ([string]$root)
       if (-not (Test-Path -LiteralPath ([string]$root) -PathType Container)) {
         Die 'windows_endpoint_not_provisioned' ('the existing endpoint root is missing: ' + $root)
       }
@@ -1300,8 +1337,12 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       }
       if ($existing.Count -eq 1) {
         $existingProjection = Get-TaskProjection $existing[0]
+        $existingTaskFile = Get-TaskFilePath $existing[0]
+        $existingTaskAcl = Get-AclProjection $existingTaskFile
         if ([string]$existing[0].TaskPath -ne [string]$Binding.task_path -or
-            $existingProjection.semantic_sha256 -ne [string]$state.task.semantic_sha256) {
+            $existingProjection.semantic_sha256 -ne [string]$state.task.semantic_sha256 -or
+            $existingProjection.xml_sha256 -ne [string]$state.task.xml_sha256 -or
+            $existingTaskAcl.projection_sha256 -ne [string]$state.acl.task_file.projection_sha256) {
           Die 'windows_task_projection_mismatch' 'the existing task is not the archived managed task'
         }
         $ownedTask = $true
@@ -1326,12 +1367,18 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
         if (-not (Test-Path -LiteralPath $taskFolder -PathType Container)) {
           Die 'windows_endpoint_not_provisioned' 'the existing Task Scheduler folder is missing'
         }
+        $registeringTask = $true
         Register-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) `
           -Xml (Get-Content -LiteralPath (Join-Path $extracted.root 'task.xml') -Raw) -ErrorAction Stop | Out-Null
+        $registeringTask = $false
         $ownedTask = $true
         Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null
       }
       Set-AclProjection (Join-Path $env:SystemRoot ('System32\Tasks\' + ([string]$Binding.task_path).TrimStart('\') + [string]$Binding.task_name)) $state.acl.task_file
+      Set-AclProjection ([string]$state.identity.package_root) $state.acl.roots.package_root
+      Set-AclProjection ([string]$state.identity.output_root) $state.acl.roots.output_root
+      Set-AclProjection ([string]$state.identity.state_root) $state.acl.roots.state_root
+      Set-AclProjection ([string]$state.identity.endpoint_root) $state.acl.roots.endpoint_root
       Set-DomainPins ([string]$state.identity.state_root) ([string]$state.identity.endpoint_root)
     }
     $current = Get-RecoveryCurrentState ([string]$Binding.ssh_host) ([string]$Binding.task_path) ([string]$Binding.task_name)
@@ -1343,7 +1390,21 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       endpoint='stopped'; cad_ownership='free'; state_sha256=(Get-JsonSha256 $state)
     }
   } catch {
-    if (-not $VerifyOnly -and $ownedTask) {
+    $failedOwner = $ownedTask
+    if (-not $VerifyOnly -and $registeringTask -and $state) {
+      try {
+        $candidate = @(Get-ScheduledTask -TaskName ([string]$Binding.task_name) -ErrorAction Stop |
+          Where-Object { [string]$_.TaskPath -eq [string]$Binding.task_path })
+        if ($candidate.Count -eq 1) {
+          $candidateProjection = Get-TaskProjection $candidate[0]
+          $failedOwner = $candidateProjection.xml_sha256 -eq [string]$state.task.xml_sha256 -and
+            $candidateProjection.semantic_sha256 -eq [string]$state.task.semantic_sha256
+        }
+      } catch {
+        $failedOwner = $false
+      }
+    }
+    if (-not $VerifyOnly -and $failedOwner) {
       try { Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null } catch { }
     }
     throw

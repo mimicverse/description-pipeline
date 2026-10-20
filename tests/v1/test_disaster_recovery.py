@@ -117,6 +117,12 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         "endpoint_token": acl_projection("c"),
         "install_id": acl_projection("d"),
         "cad_ownership": None,
+        "roots": {
+            "package_root": acl_projection("e"),
+            "output_root": acl_projection("f"),
+            "state_root": acl_projection("1"),
+            "endpoint_root": acl_projection("2"),
+        },
     }
     state = {
         "schema_version": recovery.WINDOWS_RECOVERY_SCHEMA,
@@ -3067,6 +3073,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 script="fixture",
                 timeout=5,
                 commands=[],
+                expected_verb="recovery-snapshot",
             )
         self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
 

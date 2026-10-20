@@ -4081,6 +4081,7 @@ def _run_windows_recovery_json(
     script: str,
     timeout: int,
     commands: list[dict],
+    expected_verb: str,
 ) -> dict:
     completed = _run_windows_powershell(
         ssh_host=ssh_host,
@@ -4100,7 +4101,11 @@ def _run_windows_recovery_json(
                 "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
             },
         ) from error
-    if completed.returncode == 0 and document.get("passed") is True:
+    if (
+        completed.returncode == 0
+        and document.get("passed") is True
+        and document.get("verb") == expected_verb
+    ):
         return document
     code = document.get("code")
     if completed.returncode == 1 and document.get("passed") is False and isinstance(code, str) and code:
@@ -4116,6 +4121,8 @@ def _run_windows_recovery_json(
             "returncode": completed.returncode,
             "passed": document.get("passed"),
             "code": code,
+            "verb": document.get("verb"),
+            "expected_verb": expected_verb,
         },
     )
 
@@ -4507,10 +4514,46 @@ def _validate_windows_recovery_state(document: object) -> dict:
     )
     acl = _exact_keys(
         state["acl"],
-        {"task_file", "endpoint_config", "endpoint_token", "install_id", "cad_ownership"},
+        {
+            "task_file",
+            "endpoint_config",
+            "endpoint_token",
+            "install_id",
+            "cad_ownership",
+            "roots",
+        },
         "windows state acl",
     )
+    roots_acl = _exact_keys(
+        acl["roots"],
+        {"package_root", "output_root", "state_root", "endpoint_root"},
+        "windows state acl.roots",
+    )
     for name, value in acl.items():
+        if name == "roots":
+            for root_name, projection in roots_acl.items():
+                require(
+                    isinstance(projection, dict)
+                    and set(projection)
+                    == {"owner_sid", "group_sid", "protected", "sddl", "rules", "projection_sha256"},
+                    "windows_recovery_state_invalid",
+                    f"Windows root ACL projection {root_name} is malformed",
+                )
+                require(
+                    isinstance(projection["owner_sid"], str)
+                    and projection["owner_sid"].startswith("S-1-")
+                    and isinstance(projection["group_sid"], str)
+                    and projection["group_sid"].startswith("S-1-")
+                    and type(projection["protected"]) is bool
+                    and isinstance(projection["sddl"], str)
+                    and bool(projection["sddl"])
+                    and isinstance(projection["rules"], list)
+                    and isinstance(projection["projection_sha256"], str)
+                    and bool(HEX64.fullmatch(projection["projection_sha256"])),
+                    "windows_recovery_state_invalid",
+                    f"Windows root ACL projection {root_name} is malformed",
+                )
+            continue
         if value is None:
             require(
                 name == "cad_ownership",
@@ -4653,6 +4696,13 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows_recovery_state_invalid",
         "Windows recovery file roles and members differ",
     )
+    task_xml_file = next(row for row in files if row["role"] == "task_xml")
+    require(
+        task_xml_file["sha256"] == task["xml_sha256"]
+        and task_xml_file["member"] == "task.xml",
+        "windows_recovery_state_invalid",
+        "Windows task XML file and task projection differ",
+    )
     members = state["members"]
     require(isinstance(members, list) and bool(members), "windows_recovery_state_invalid", "Windows members are empty")
     for index, row in enumerate(members):
@@ -4760,8 +4810,13 @@ def _transfer_windows_recovery(
         uploads = [script, binding]
         if upload_bundle is not None:
             uploads.append(upload_bundle)
-        _create_remote_dir(ssh_host=ssh_host, remote_dir=remote_dir, timeout=timeout, commands=commands)
         try:
+            _create_remote_dir(
+                ssh_host=ssh_host,
+                remote_dir=remote_dir,
+                timeout=timeout,
+                commands=commands,
+            )
             _windows_scp(
                 ssh_host=ssh_host,
                 sources=uploads,
@@ -4789,6 +4844,7 @@ def _transfer_windows_recovery(
                 script=invocation,
                 timeout=timeout,
                 commands=commands,
+                expected_verb=operation,
             )
             if download_bundle is not None:
                 require(
