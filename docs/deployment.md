@@ -130,10 +130,21 @@ C:\description\runtime\Scripts\description.exe serve --config C:\description\end
 
 ```sh
 bash deploy/operator/operatorctl.sh validate --config /srv/description/platform.json
-bash deploy/operator/operatorctl.sh install --config /srv/description/platform.json
+python3 deploy/operator/install_record.py endpoint-identity \
+  --health /path/to/endpoint-health.json \
+  --release-file /path/to/release/release.json \
+  --out /path/to/endpoint-identity.json
+bash deploy/operator/operatorctl.sh install \
+  --config /srv/description/platform.json \
+  --install-id NEW_INSTALL_ID \
+  --wheel /path/to/release/package.whl \
+  --release-file /path/to/release/release.json \
+  --endpoint-identity /path/to/endpoint-identity.json
 bash deploy/operator/operatorctl.sh start --config /srv/description/platform.json
 bash deploy/operator/operatorctl.sh health --config /srv/description/platform.json
 ```
+
+示例中的路径和安装标识须替换为本次发行的实际值。端点健康原件来自已认证的真实 Windows `/health`，须与本次 `release.json` 校验一致；不能手写身份、沿用旧端点收据或使用开发分支资产。安装使用同一发行目录中的 wheel 和清单；状态根、数据库端口和其他运行路径从当前平台配置及其受管安装记录解析，不从历史运行或个人目录猜测。
 
 `validate` 只检查静态配置和发行身份。`install` 在关闭准入的状态下安装锁定运行环境、渲染服务、初始化数据库并校验 DAG；不能改变正在运行的安装。`start` 先验证两端身份、服务及配置，再开启任务准入。数据库、内部服务和隧道不对用户暴露端口。
 
@@ -142,6 +153,8 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 首个受管代绑定真实目标发行的代码、运行环境和双端身份，不能为未受管的旧部署补造安装身份。切换前保存旧配置、服务绑定、原件和数据路径作为回退基线；回退不得丢弃已经发生的业务或对账事实。
 
 安装记录明确管理的全部服务与路径，不依赖工作目录或个人工具位置。配置变化先渲染并验证新快照，再按受控切换流程应用；运行中的请求继续使用其固定配置身份。`status/health` 及提交准入核验安装记录、发行文件、配置快照、实际服务、Airflow 配置引用和 Windows 发行/契约/端口身份，端点认证同时证明令牌一致；漂移关闭新准入，健康查询不打开 CAD。
+
+同版双端核验比较 `version`、`source_commit` 和 `source_sha256`。两端各自的 `install_id`、`config_digest` 必须匹配对应主机的安装记录和实际配置，不要求两端这些值相同；不能用同版发行身份代替每端的配置、角色和运行身份核验。
 
 DAG 验收还须核对活动记录中的绝对路径与发行成员摘要、实际生效的 `core.dags_folder`、当前 `DagVersion` 和 `SerializedDag` 关联，以及序列化的文件和解析目录。唯一支持的 `dags-folder` 本地 bundle 使用空版本；不能因此省略已登记版本 UUID 与实际任务来源核对。真实监督任务日志记录加载的 DAG 路径、SHA-256 和 Python 包来源。历史目录即使存在同名字节，也不能代替当前发行绑定；身份不符时不得开放新准入。
 
@@ -199,6 +212,8 @@ Windows 候选配置由正式 `stage` 按当前端点 schema 确定性生成。�
 `stage` 不切换运行中的 DAG。晋升、回退及再次前进仅在排空且执行服务全部停止的屏障内，按目标安装记录渲染其 DAG 配置；记录指针与配置可以分步更新，但任一步失败都必须返回失败并保持关闭。配置核验成功后才启动执行服务，当前 DAG 序列化身份核验成功后才开放准入。回退读取原代自身绑定；再次前进使用新的安装标识和一次性收据，仍来自同一已合入 `main` 的固定发行。
 
 升级意图和每个切换步骤持久登记。失败记录已完成与未确认步骤，`rollback` 使用该记录恢复两端明确的上一发行和配置，再检查身份与状态；不能猜测目录或最新备份。代码回滚必须兼容当前持久状态，不能回退数据库而丢失已产生的运行、证据或发布记录。涉及存储 schema 的变化须提供备份、迁移验证及明确可恢复方案，准入在完成前保持关闭。
+
+`operatorctl rollback` 不回滚数据库。`backup.py open` 只解密备份、检查成员并提取到新目录，不执行数据库、文件引用或服务恢复。当前没有可替代完整灾难恢复的单一命令；每次发行须绑定该 `main` 提交准备并演练恢复步骤，覆盖平台与 Airflow 数据库、原件及其引用、安装记录、配置、密钥、双端身份和未决外部结果。仅解密成功、代码回滚成功或服务健康不能作为恢复验收通过的依据。
 
 恢复 Windows 任务定义不等于可以启动端点。未知锁属主或观察器失败时保持停止；只有取得可启动的锁及属主证据才启动。恢复核验使用切换前绑定的上一代自身发行身份，不能拿候选身份核验旧版；上一代身份缺证时健康结论保持未知，准入保持关闭。
 

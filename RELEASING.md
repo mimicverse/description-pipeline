@@ -4,14 +4,14 @@
 
 ## 构建身份
 
-从干净、已提交 checkout 构建。构建器显式从该 checkout 加载版本和构建逻辑，校验实际导入来源，使用锁定构建依赖与规范归档；ambient 安装不能影响输入。
+从已合入受保护 `main` 的同一固定提交的干净 checkout 构建。构建器显式从该 checkout 加载版本和构建逻辑，校验实际导入来源，使用锁定构建依赖与规范归档；ambient 安装不能影响输入。
 
 在[开发环境](CONTRIBUTING.md)中构建到两个新的外部目录：
 
 ```sh
 python tools/build_release.py --output /path/to/release-a
 python tools/build_release.py --output /path/to/release-b
-diff /path/to/release-a/release.json /path/to/release-b/release.json
+diff -r /path/to/release-a /path/to/release-b
 ```
 
 归档成员按相对 UTF-8 路径排序，固定权限、UID/GID 和空用户名，移除绝对路径及本机元数据；ZIP 使用固定 1980 epoch，tar/gzip 使用 epoch 0，压缩算法和版本锁定。模型与发行 JSON 使用[统一规范序列化](docs/contracts.md#delivery)。不同路径、时间和 ambient 安装下的独立构建必须得到相同字节，核对清单及每项资产摘要。
@@ -48,6 +48,8 @@ diff /path/to/release-a/release.json /path/to/release-b/release.json
 ## 发行与部署
 
 规范和实现评审通过后，将同一结果合入 `main`。从该提交构建最终发行并验收；源码 tag 为 `v<package version>`，tag、发行清单与全部资产必须指向同一提交。已发布 tag 和资产不可重写。
+
+当前仓库没有自动创建 GitHub Release、tag 或上传资产的工作流。发布负责人须核验 tag 尚未占用，再按上述固定 `main` 提交受控创建 tag、发布全部资产并保存回执；CI 成功不会自动完成这些步骤。
 
 发布 wheel、源码、部署与角色运行档案、`release.json` 和可公开验收摘要。下载远端资产后再次核对字节、源码身份及隔离安装结果；公开摘要不包含原生产品资料或秘密。
 
