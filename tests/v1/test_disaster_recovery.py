@@ -669,7 +669,7 @@ def fake_maintenance_receipt(
 
 
 def runtime_wheel_payloads(source_sha: str = "b" * 64) -> dict[str, bytes]:
-    return {
+    payloads = {
         "description_pipeline/__init__.py": b'VERSION = "1.0.0-test"',
         "description_pipeline/tool-release.json": json.dumps(
             {"source_sha256": source_sha, "version": "1.0.0"},
@@ -681,13 +681,17 @@ def runtime_wheel_payloads(source_sha: str = "b" * 64) -> dict[str, bytes]:
         "apache_airflow-3.3.2.dist-info/METADATA": (
             b"Metadata-Version: 2.1\nName: apache-airflow\nVersion: 3.3.2\n"
         ),
-        "mimicverse_description-1.0.0.dist-info/RECORD": (
-            b"description_pipeline/__init__.py,,\n"
-            b"description_pipeline/tool-release.json,,\n"
-            b"mimicverse_description-1.0.0.dist-info/METADATA,,\n"
-            b"apache_airflow-3.3.2.dist-info/METADATA,,\n"
-        ),
     }
+    record_lines = []
+    for name, payload in payloads.items():
+        encoded = base64.urlsafe_b64encode(
+            hashlib.sha256(payload).digest()
+        ).rstrip(b"=").decode("ascii")
+        record_lines.append(f"{name},sha256={encoded},{len(payload)}")
+    record_name = "mimicverse_description-1.0.0.dist-info/RECORD"
+    record_lines.append(f"{record_name},,")
+    payloads[record_name] = ("\n".join(record_lines) + "\n").encode()
+    return payloads
 
 
 def write_runtime_wheel(path: Path, source_sha: str = "b" * 64) -> dict[str, bytes]:

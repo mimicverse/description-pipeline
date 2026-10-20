@@ -8135,14 +8135,18 @@ def _verify_installed_wheel_members(
     expected_package: dict[str, str] | None = None,
     expected_version: str | None = None,
     expected_source_sha256: str | None = None,
+    *,
+    require_package: bool = True,
+    require_airflow: bool = True,
 ) -> None:
     require_real_dir(site_packages, "installed site-packages", "recovery_release_missing")
-    require(
-        "description_pipeline/__init__.py" in members
-        and any(name.endswith(".dist-info/RECORD") for name in members),
-        "recovery_release_missing",
-        f"{label} does not carry the package or its RECORD",
-    )
+    if require_package:
+        require(
+            "description_pipeline/__init__.py" in members
+            and any(name.endswith(".dist-info/RECORD") for name in members),
+            "recovery_release_missing",
+            f"{label} does not carry the package or its RECORD",
+        )
     package_members = {
         name: hashlib.sha256(payload).hexdigest()
         for name, payload in members.items()
@@ -8150,6 +8154,14 @@ def _verify_installed_wheel_members(
         and name != "description_pipeline/tool-release.json"
     }
     if expected_package is not None:
+        expected_package = {
+            name.removeprefix("description_pipeline/"): digest
+            for name, digest in expected_package.items()
+        }
+        package_members = {
+            name.removeprefix("description_pipeline/"): digest
+            for name, digest in package_members.items()
+        }
         require(
             package_members == expected_package,
             "recovery_release_missing",
@@ -8209,35 +8221,58 @@ def _verify_installed_wheel_members(
             "recovery_release_missing",
             f"installed {label} RECORD is invalid",
         ) from error
-    recorded = {
-        row[0]
-        for row in record_rows
-        if row and row[0] and not row[0].startswith("#")
-    }
+    recorded = {}
+    for row in record_rows:
+        require(
+            len(row) >= 3 and bool(row[0]) and row[0] not in recorded,
+            "recovery_release_missing",
+            f"installed {label} RECORD has duplicate or malformed rows",
+        )
+        recorded[row[0]] = (row[1], row[2])
+    for name, payload in members.items():
+        if name.endswith(".dist-info/RECORD"):
+            require(
+                recorded.get(name) == ("", ""),
+                "recovery_release_missing",
+                f"installed {label} RECORD is not self-referential",
+            )
+            continue
+        record = recorded.get(name)
+        require(
+            record is not None,
+            "recovery_release_missing",
+            f"installed {label} RECORD misses {name}",
+        )
+        encoded = base64.urlsafe_b64encode(
+            hashlib.sha256(payload).digest()
+        ).rstrip(b"=").decode("ascii")
+        require(
+            record[0] == f"sha256={encoded}"
+            and record[1] == str(len(payload)),
+            "recovery_release_missing",
+            f"installed {label} RECORD digest differs: {name}",
+        )
     require(
-        all(
-            name in recorded
-            for name in members
-            if not name.endswith(".dist-info/RECORD")
-        ),
+        all(name in recorded for name in members),
         "recovery_release_missing",
         f"installed {label} RECORD does not cover its wheel files",
     )
-    require_real_dir(
-        site_packages / "airflow",
-        "installed Airflow package",
-        "recovery_release_missing",
-    )
-    require_real_file(
-        site_packages / "airflow" / "__init__.py",
-        "installed Airflow package entry",
-        "recovery_release_missing",
-    )
-    require(
-        (site_packages / "airflow" / "__init__.py").stat().st_size > 0,
-        "recovery_release_missing",
-        "installed Airflow package entry is empty",
-    )
+    if require_airflow:
+        require_real_dir(
+            site_packages / "airflow",
+            "installed Airflow package",
+            "recovery_release_missing",
+        )
+        require_real_file(
+            site_packages / "airflow" / "__init__.py",
+            "installed Airflow package entry",
+            "recovery_release_missing",
+        )
+        require(
+            (site_packages / "airflow" / "__init__.py").stat().st_size > 0,
+            "recovery_release_missing",
+            "installed Airflow package entry is empty",
+        )
 
 
 def _verify_installed_wheel(
@@ -8301,6 +8336,8 @@ def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
             )
             for name in wheels:
                 wheel_name = name.removeprefix("wheels/").lower()
+                payload = role.read(name)
+                payload_hash = hashlib.sha256(payload).hexdigest()
                 require(
                     any(
                         wheel_name.startswith(
@@ -8313,18 +8350,20 @@ def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
                         .split("==", 1)[1]
                         .split()[0]
                         in wheel_name
+                        and line.rsplit("sha256:", 1)[-1].split()[0] == payload_hash
                         for line in lock_lines
                     ),
                     "recovery_release_missing",
                     f"recovered lock does not bind wheel: {name}",
                 )
-                payload = role.read(name)
                 with zipfile.ZipFile(io.BytesIO(payload)) as wheel:
                     members = _wheel_members(wheel, f"role wheel {name}")
                 _verify_installed_wheel_members(
                     members,
                     site_packages,
                     name,
+                    require_package=False,
+                    require_airflow=False,
                 )
     except (OSError, zipfile.BadZipFile, RuntimeError) as error:
         raise RecoveryError(
@@ -8403,6 +8442,24 @@ def verify_release_runtime(
         venv / "pyvenv.cfg",
         "recovered virtual environment marker",
         "recovery_release_missing",
+    )
+    try:
+        python_header = python.resolve().read_bytes()[:4]
+        pyvenv_text = (venv / "pyvenv.cfg").read_text(encoding="utf-8")
+    except OSError as error:
+        raise RecoveryError(
+            "recovery_release_missing",
+            "recovered virtual environment metadata is unreadable",
+        ) from error
+    require(
+        python_header == b"\x7fELF"
+        and any(
+            line.strip().startswith("home = ")
+            and Path(line.split("=", 1)[1].strip()).is_absolute()
+            for line in pyvenv_text.splitlines()
+        ),
+        "recovery_release_missing",
+        "recovered interpreter is not a real CPython environment",
     )
     completed = subprocess.run(
         [
@@ -8538,8 +8595,9 @@ def verify_release_runtime(
         {"stderr": pip_check.stderr[-2000:]},
     )
     for entry in ("airflow", "description"):
+        version_args = ["version"] if entry == "airflow" else ["--version"]
         entry_probe = subprocess.run(
-            [str(venv / "bin" / entry), "version"],
+            [str(venv / "bin" / entry), *version_args],
             capture_output=True,
             text=True,
             timeout=120,
