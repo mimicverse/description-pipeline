@@ -4623,6 +4623,18 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows_recovery_state_invalid",
         "Windows recovery does not cover its required files",
     )
+    require(
+        roles
+        <= {
+            "task_xml",
+            "endpoint_config",
+            "endpoint_token",
+            "install_id",
+            "cad_ownership",
+        },
+        "windows_recovery_state_invalid",
+        "Windows recovery contains an unsupported file role",
+    )
     members = state["members"]
     require(isinstance(members, list) and bool(members), "windows_recovery_state_invalid", "Windows members are empty")
     for index, row in enumerate(members):

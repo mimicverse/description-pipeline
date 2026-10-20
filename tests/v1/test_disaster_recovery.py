@@ -3004,6 +3004,53 @@ class RecoveryControlFlowTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "windows_recovery_bundle_invalid")
 
+    def test_windows_snapshot_refuses_files_member_aliases(self) -> None:
+        staging = self.root / "windows-member-alias-staging"
+        staging.mkdir()
+        _expected, _state = windows_recovery_fixture(self.context, staging)
+        bundle = staging / recovery.WINDOWS_BUNDLE_MEMBER
+        replacement = staging / "replacement.zip"
+        with zipfile.ZipFile(bundle) as source:
+            state = json.loads(source.read(recovery.WINDOWS_STATE_MEMBER))
+            token = next(row for row in state["files"] if row["role"] == "endpoint_token")
+            state["files"].append(
+                {
+                    **token,
+                    "role": "endpoint_token_alias",
+                }
+            )
+            payloads = {name: source.read(name) for name in source.namelist()}
+        payloads[recovery.WINDOWS_STATE_MEMBER] = json.dumps(
+            state,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        with zipfile.ZipFile(replacement, "w") as target:
+            for name, payload in payloads.items():
+                target.writestr(name, payload)
+        replacement.replace(bundle)
+        with (
+            mock.patch.object(
+                recovery,
+                "_transfer_windows_recovery",
+                return_value={
+                    "passed": True,
+                    "verb": "recovery-snapshot",
+                    "task_state": "Disabled",
+                    "endpoint": "stopped",
+                    "cad_ownership": "free",
+                },
+            ),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            self.real_capture_windows_recovery(
+                self.context,
+                backup_id="windows-member-alias",
+                staging=staging,
+                commands=[],
+            )
+        self.assertEqual(raised.exception.code, "windows_recovery_state_invalid")
+
     def test_windows_result_with_contradictory_exit_is_unknown(self) -> None:
         completed = subprocess.CompletedProcess(
             ["ssh", "windows-fixture"],

@@ -43,6 +43,7 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
     wheel.write_bytes(b"wheel bytes")
     demo_wheel = b"demo wheel bytes"
     deployment_members = {
+        "deploy/airflow/requirements.lock": b"demo==1.0\n",
         "requirements/linux-py312.lock": b"demo==1.0\n",
         "requirements/windows-py312.lock": b"demo==1.0\n",
         "deploy/operator/operatorctl.sh": b"operator tool",
