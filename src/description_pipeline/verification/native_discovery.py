@@ -43,6 +43,7 @@ import yaml
 from ..delivery import read_delivery_manifest, read_source_record
 from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data, read_data
+from ..sources.solidworks.direction import canonicalize_axis, transform_limits
 from ..schemas import exporter_declaration_present
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
@@ -2198,6 +2199,18 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         str(component): str(body["name"]) for body in bodies for component in body["components"]
     }
     attached = _frame_attached_members(raw)
+    root_body = by_name["base_link"]
+    root_datum = _owned_datum(
+        raw,
+        root_body["frame"]["coordinate_system"],
+        _datum_owners(full_cluster["base_link"], attached),
+    )
+    base_frame = _frame(root_datum.get("array")) if root_datum else None
+    _require(
+        base_frame is not None,
+        "discovery.joint_rebuild",
+        "the base_link mechanical datum is unreadable",
+    )
     raw_mates = raw.get("mates") or []
     _members, pairs = _independent_clusters(raw)
     facts: list[dict] = []
@@ -2524,7 +2537,27 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 {"body": neighbour},
             )
             norm = math.sqrt(_dot(local, local))
-            fact["entry"]["axis"] = [value / norm for value in local]
+            local = [value / norm for value in local]
+            try:
+                direction_decision = canonicalize_axis(
+                    fact["entry"]["name"],
+                    local,
+                    [value for row in frame for value in row],
+                    [value for row in base_frame for value in row],
+                    joint_type=fact["entry"]["type"],
+                )
+            except ValueError as error:
+                raise _Failure(
+                    "discovery.joint_rebuild",
+                    "positive-motion semantics could not be evaluated",
+                    {"body": neighbour, "error": str(error)},
+                ) from error
+            fact["entry"]["axis"] = direction_decision["delivered_local_axis"]
+            fact["entry"]["axis_provenance"] = direction_decision
+            fact["entry"]["limits"] = transform_limits(
+                fact["entry"].get("limits"),
+                int(direction_decision["sign"]),
+            )
             if neighbour not in order:
                 order[neighbour] = order[current] + 1
                 queue.append(neighbour)

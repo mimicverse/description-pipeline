@@ -2574,7 +2574,7 @@ def _base_frame_datum(record: dict, body: dict | None, findings: list[dict]) -> 
     """Return the root body's unique readable datum used as the mechanical frame."""
 
     datum = _body_datum(record, body) if body is not None else None
-    if datum is None:
+    if datum is None or str(datum.get("name") or "") not in {"c_base", "c_base_link", "CS_base_link"}:
         findings.append(
             _finding(
                 "direction.reference_frame_missing",
@@ -2884,7 +2884,7 @@ def _exporter_axis(
                 obj,
                 "the joint axis cannot be assigned a canonical principal-motion sign",
                 semantic,
-                blocking=False,
+                blocking=True,
             )
         )
         delivered_local = local
@@ -2892,6 +2892,10 @@ def _exporter_axis(
     else:
         delivered_local = semantic["delivered_local_axis"]
         canonical_base = semantic["canonical_base_axis"]
+        canonical_assembly = [
+            semantic["sign"] * value
+            for value in signed
+        ]
         if semantic["sign"] == -1:
             findings.append(
                 _finding(
@@ -2902,6 +2906,8 @@ def _exporter_axis(
                     blocking=False,
                 )
             )
+    if semantic["status"] != "canonical":
+        canonical_assembly = signed
     origin = [transform[3], transform[7], transform[11]]
     offset = _axis_offset(point, origin, direction)
     if offset > AXIS_OFFSET_TOL_M:
@@ -2915,7 +2921,8 @@ def _exporter_axis(
         )
     axis.update(
         point=point,
-        direction=canonical_base,
+        direction=canonical_assembly,
+        base_direction=canonical_base,
         native_direction=semantic["raw_base_axis"],
         assembly_direction=signed,
         delivered_local_axis=delivered_local,
@@ -3195,8 +3202,6 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
             and all(type(value) in (int, float) and math.isfinite(value) for value in raw_axis)
         ):
             declared_axis = [float(value) for value in raw_axis]
-        if axis.get("source") == "exporter" and isinstance(limits, dict):
-            limits = transform_limits(limits, int(axis.get("sign", 1)))
         delivered_axis = axis.get("delivered_local_axis") if isinstance(axis, dict) else None
         joints.append(
             {
@@ -3218,6 +3223,38 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 "drive": None,
             }
         )
+    def pair_key(name: str):
+        lowered = name.lower()
+        for prefix in ("left_", "l_"):
+            if lowered.startswith(prefix):
+                return "left", name[len(prefix) :].removesuffix("_joint")
+        for prefix in ("right_", "r_"):
+            if lowered.startswith(prefix):
+                return "right", name[len(prefix) :].removesuffix("_joint")
+        return None
+
+    pairs: dict[str, dict[str, dict]] = {}
+    for joint in joints:
+        if joint.get("axis", {}).get("status", joint.get("axis", {}).get("direction_relation")) != "canonical":
+            continue
+        key = pair_key(str(joint["name"]))
+        if key is not None:
+            pairs.setdefault(key[1], {})[key[0]] = joint
+    for key, sides in sorted(pairs.items()):
+        if set(sides) != {"left", "right"}:
+            continue
+        left_joint, right_joint = sides["left"], sides["right"]
+        left, right = left_joint["axis"], right_joint["axis"]
+        dot = _dot(left.get("base_direction") or [], right.get("base_direction") or [])
+        if dot < 1.0 - 1e-7:
+            findings.append(
+                _finding(
+                    "direction.paired_mismatch",
+                    f"joint:{left_joint['name']}",
+                    "left/right joints do not share a positive functional axis",
+                    {"pair": key, "dot": dot},
+                )
+            )
     return joints
 
 
@@ -5292,14 +5329,17 @@ def source_definition(
             "axis_reference": joint["axis_reference"],
         }
         if joint["axis"].get("source") == "exporter":
-            entry["limits"] = {
+            entry["limits"] = transform_limits(
+                {
                 key: float(joint["limits"][key])
                 for key in (
                     ("effort", "velocity")
                     if joint["type"] == "continuous"
                     else ("lower", "upper", "effort", "velocity")
                 )
-            }
+                },
+                int(joint["axis"].get("sign", 1)),
+            )
             entry["limit_evidence"] = {
                 "file": discovery_name,
                 "sha256": discovery_sha256,

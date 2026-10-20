@@ -615,12 +615,15 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         if joint.get("type") == "fixed":
             return None
         root = ((state.get("declaration") or {}).get("root") or {}).get("name")
+        root_frame_name = (state.get("frame_names") or {}).get(root)
         child = state.get("frames", {}).get(joint.get("child_link"))
         base = state.get("frames", {}).get(root)
         _require(
-            child is not None and base is not None,
+            child is not None
+            and base is not None
+            and root_frame_name in {"c_base", "c_base_link", "CS_base_link", "base", "base_frame"},
             "v14.direction_frame_unread",
-            "positive motion needs readable child and CS_base_link frames",
+            "positive motion needs readable child and root mechanical frames",
             joint=name,
         )
         try:
@@ -640,13 +643,10 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         state["directions"][name] = decision
         state["carried_axes"][name] = decision["delivered_local_axis"]
         if decision["status"] != "canonical":
-            diagnostics.append(
-                {
-                    "code": "direction.semantics_unresolved",
-                    "blocking": False,
-                    "message": "the joint axis cannot be assigned a canonical principal-motion sign",
-                    "detail": {"joint": name, **decision},
-                }
+            raise DeclarationError(
+                "v14.direction_unresolved",
+                "the joint has no canonical positive-motion sign",
+                {"joint": name, **decision},
             )
         elif decision["sign"] == -1:
             diagnostics.append(
@@ -1047,6 +1047,45 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 )
         return {"bodies": len(bodies), "joints": len(joints)}
 
+    def paired_motion():
+        def pair_key(name):
+            lowered = name.lower()
+            for prefix in ("left_", "l_"):
+                if lowered.startswith(prefix):
+                    return "left", name[len(prefix) :].removesuffix("_joint")
+            for prefix in ("right_", "r_"):
+                if lowered.startswith(prefix):
+                    return "right", name[len(prefix) :].removesuffix("_joint")
+            return None
+
+        pairs: dict[str, dict[str, dict]] = {}
+        for name, decision in (state.get("directions") or {}).items():
+            key = pair_key(name)
+            if key is not None:
+                pairs.setdefault(key[1], {})[key[0]] = decision
+        checked = 0
+        for key, sides in sorted(pairs.items()):
+            if set(sides) != {"left", "right"}:
+                continue
+            left, right = sides["left"], sides["right"]
+            if left["status"] != "canonical" or right["status"] != "canonical":
+                continue
+            _require(
+                left["motion"] == right["motion"],
+                "v14.paired_motion",
+                "left/right joints have different positive-motion classes",
+                {"pair": key, "left": left["motion"], "right": right["motion"]},
+            )
+            dot = float(np.dot(left["canonical_base_axis"], right["canonical_base_axis"]))
+            _require(
+                dot >= 1.0 - 1e-7,
+                "v14.paired_motion",
+                "left/right joints do not share a positive functional axis",
+                {"pair": key, "dot": dot},
+            )
+            checked += 1
+        return {"pairs": checked}
+
     if check("declarations.binding", boundary) and check("declarations.topology", topology):
         check("declarations.membership", membership)
         for name in state["links"]:
@@ -1057,6 +1096,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         for name, joint in state["joints"].items():
             check("declarations.limits." + name, lambda n=name, j=joint: joint_limits(n, j))
             check("declarations.axis." + name, lambda n=name, j=joint: joint_geometry(n, j))
+        check("declarations.paired_motion", paired_motion)
         # Saved mates may intentionally hold an authored moving joint at its current
         # pose. Preserve the measured restriction separately; it is no pass/fail gate.
         diagnostics.extend(pose_diagnostics())

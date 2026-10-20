@@ -18,14 +18,24 @@ _PRINCIPAL = {
     "yaw": (0.0, 0.0, 1.0),
 }
 _PRINCIPAL_ORDER = ("roll", "pitch", "yaw")
-_ALIGNMENT_THRESHOLD = 0.8
+_ALIGNMENT_THRESHOLD = 0.9
 
 
 def _rotation(frame) -> list[list[float]]:
     values = list(frame or ())
     if len(values) != 16 or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in values):
         raise ValueError("a 4x4 finite transform is required")
-    return [[float(values[row * 4 + column]) for column in range(3)] for row in range(3)]
+    matrix = [[float(values[row * 4 + column]) for column in range(3)] for row in range(3)]
+    for left in range(3):
+        for right in range(3):
+            value = _dot(matrix[left], matrix[right])
+            expected = 1.0 if left == right else 0.0
+            if abs(value - expected) > 1e-7:
+                raise ValueError("CAD reference frame is not orthonormal")
+    determinant = _dot(matrix[0], _cross(matrix[1], matrix[2]))
+    if determinant <= 0.0:
+        raise ValueError("CAD reference frame is not right handed")
+    return matrix
 
 
 def _matvec(matrix: list[list[float]], vector: list[float]) -> list[float]:
@@ -50,16 +60,27 @@ def _dot(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right, strict=True))
 
 
+def _cross(left: list[float], right: list[float]) -> list[float]:
+    return [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    ]
+
+
 def _motion_token(native_name: str) -> str | None:
     tokens = token(native_name).split("_")
     return next((motion for motion in _PRINCIPAL_ORDER if motion in tokens), None)
 
 
 def _geometry_motion(base_axis: list[float], threshold: float) -> tuple[str | None, float]:
+    magnitudes = sorted((abs(value) for value in base_axis), reverse=True)
     index = max(range(3), key=lambda item: abs(base_axis[item]))
     projection = base_axis[index]
-    if abs(projection) < threshold:
+    if len(magnitudes) > 1 and magnitudes[0] - magnitudes[1] <= 1e-9:
         return None, projection
+    if abs(projection) < threshold:
+        return "oblique", projection
     return _PRINCIPAL_ORDER[index], projection
 
 
@@ -87,11 +108,13 @@ def canonicalize_axis(
         motion = named_motion
         classification_source = "name"
         alignment = _dot(base_axis, _PRINCIPAL[motion])
+        if abs(alignment) <= 1e-9:
+            motion = None
     else:
         motion, alignment = _geometry_motion(base_axis, threshold)
         classification_source = "geometry" if motion is not None else "unresolved"
 
-    if motion is None or abs(alignment) < threshold:
+    if motion is None:
         return {
             "status": "unresolved",
             "motion": motion,

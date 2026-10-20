@@ -76,6 +76,8 @@ _DISCOVERY_CODE_LABELS = {
     "direction.reference_frame_missing": "The CS_base_link positive-motion reference frame is missing",
     "direction.reference_frame_invalid": "The CS_base_link positive-motion reference frame is invalid",
     "direction.invalid": "Positive-motion semantics could not be evaluated",
+    "v14.direction_unresolved": "Saved joint has no canonical positive-motion sign",
+    "direction.paired_mismatch": "Left/right joint positive-motion axes disagree",
     "discovery.joint_axis_selector_missing": "No readable joint-axis selector",
     "discovery.mate_entities_unsupported": "Mate entity combination is not supported",
     "discovery.mate_geometry_mismatch": "Recorded mate geometry conflicts with the constraint",

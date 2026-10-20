@@ -830,6 +830,7 @@ def _build_joints(
                 for key in (
                     "source",
                     "native_direction",
+                    "base_direction",
                     "assembly_direction",
                     "delivered_local_axis",
                     "direction_relation",
