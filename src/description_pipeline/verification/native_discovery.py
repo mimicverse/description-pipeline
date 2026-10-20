@@ -43,7 +43,7 @@ import yaml
 from ..delivery import read_delivery_manifest, read_source_record
 from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data, read_data
-from ..sources.solidworks.direction import canonicalize_axis, transform_limits
+from ..sources.solidworks.direction import canonicalize_axis
 from ..schemas import exporter_declaration_present
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
@@ -2555,10 +2555,6 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 ) from error
             fact["entry"]["axis"] = direction_decision["delivered_local_axis"]
             fact["entry"]["axis_provenance"] = direction_decision
-            fact["entry"]["limits"] = transform_limits(
-                fact["entry"].get("limits"),
-                int(direction_decision["sign"]),
-            )
             if neighbour not in order:
                 order[neighbour] = order[current] + 1
                 queue.append(neighbour)

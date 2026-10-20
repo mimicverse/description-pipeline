@@ -2000,16 +2000,15 @@ def _value_warning_gate(root, source, model):
                 "field": "axis",
                 "actual": model_joint.get("axis"),
                 "source": "CAD signed axis and versioned positive-motion rule",
-                "original": provenance.get("raw_base_axis"),
+                "original": provenance.get("parent_axis"),
                 "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
                 "rule_version": provenance.get("rule_version", "v3"),
                 "reason": provenance.get(
                     "reason", provenance.get("direction_relation", provenance.get("status"))
                 ),
-                "sign": provenance.get("sign"),
                 "motion": provenance.get("motion"),
             }
-            if provenance.get("status", provenance.get("direction_relation")) != "verified":
+            if provenance.get("status", provenance.get("direction_relation")) != "local_class_aligned":
                 add("direction.semantics_unresolved", row)
     for frame in source.get("frames", []):
         source_name = str(frame.get("source_name") or "")

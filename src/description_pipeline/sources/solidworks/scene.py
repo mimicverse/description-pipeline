@@ -830,11 +830,11 @@ def _build_joints(
                 for key in (
                     "source",
                     "native_direction",
-                    "base_direction",
+                    "parent_direction",
+                    "parent_axis",
                     "assembly_direction",
                     "delivered_local_axis",
                     "direction_relation",
-                    "sign",
                     "motion",
                     "classification_source",
                     "alignment",
@@ -867,7 +867,6 @@ def _value_warnings(
     warnings: list[dict[str, Any]] = []
     mappings = []
     motion_unresolved = []
-    direction_changes = []
     direction_unresolved = []
     visuals = []
     materials = []
@@ -913,16 +912,15 @@ def _value_warnings(
                 "field": "axis",
                 "actual": joint["axis"],
                 "source": "CAD signed axis and versioned positive-motion rule",
-                "original": provenance.get("raw_base_axis"),
+                "original": provenance.get("parent_axis"),
                 "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
                 "rule_version": provenance.get("rule_version", "v3"),
                 "reason": provenance.get(
                     "reason", provenance.get("direction_relation", provenance.get("status"))
                 ),
-                "sign": provenance.get("sign"),
                 "motion": provenance.get("motion"),
             }
-            if provenance.get("status", provenance.get("direction_relation")) != "verified":
+            if provenance.get("status", provenance.get("direction_relation")) != "local_class_aligned":
                 direction_unresolved.append(direction)
         if source_joint.get("type") != "fixed" and not any(
             word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
@@ -1013,14 +1011,6 @@ def _value_warnings(
                 "code": "naming.motion_unresolved",
                 "message": "Joint names without a CAD motion classification retain a neutral name.",
                 "objects": motion_unresolved,
-            }
-        )
-    if direction_changes:
-        warnings.append(
-            {
-                "code": "direction.sign_normalized",
-                "message": "Joint axes were normalized to the versioned positive-motion convention.",
-                "objects": direction_changes,
             }
         )
     if direction_unresolved:

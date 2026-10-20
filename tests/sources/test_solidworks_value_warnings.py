@@ -358,9 +358,8 @@ class ValueWarningTests(unittest.TestCase):
                 "type": "revolute",
                 "axis_provenance": {
                     "status": "unverified",
-                    "sign": 1,
                     "motion": "pitch",
-                    "raw_base_axis": [0.0, -0.9396926208, -0.3420201433],
+                    "parent_axis": [0.0, -0.9396926208, -0.3420201433],
                     "rule_id": "direction.positive_semantics",
                     "rule_version": "v3",
                     "reason": "declared motion does not match the local mechanical axis",
@@ -395,7 +394,6 @@ class ValueWarningTests(unittest.TestCase):
                         "rule_id": "direction.positive_semantics",
                         "rule_version": "v3",
                         "reason": "declared motion does not match the local mechanical axis",
-                        "sign": 1,
                         "motion": "pitch",
                     }
                 ],

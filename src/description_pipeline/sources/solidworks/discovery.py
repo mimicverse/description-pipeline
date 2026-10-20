@@ -75,7 +75,7 @@ from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .native_limits import validate_native_limit
-from .direction import canonicalize_axis, transform_limits
+from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
 from .session_artifacts import session_materialization_under_root, session_root_pid
@@ -2622,13 +2622,11 @@ def _apply_mate_direction(record: dict, bodies: list[dict], joints: list[dict], 
             )
             continue
         joint["axis"].update(
-            base_direction=semantic["canonical_base_axis"],
-            raw_base_axis=semantic["raw_base_axis"],
-            canonical_base_axis=semantic["canonical_base_axis"],
+            parent_direction=semantic["parent_axis"],
+            parent_axis=semantic["parent_axis"],
             delivered_local_axis=semantic["delivered_local_axis"],
             status=semantic["status"],
             direction_relation=semantic["status"],
-            sign=semantic["sign"],
             motion=semantic["motion"],
             classification_source=semantic["classification_source"],
             alignment=semantic["alignment"],
@@ -2636,7 +2634,7 @@ def _apply_mate_direction(record: dict, bodies: list[dict], joints: list[dict], 
             rule_id=semantic["rule_id"],
             rule_version=semantic["rule_version"],
         )
-        if semantic["status"] != "verified":
+        if semantic["status"] != "local_class_aligned":
             findings.append(
                 _finding(
                     "direction.semantics_unresolved",
@@ -2939,7 +2937,7 @@ def _exporter_axis(
             )
         )
         return axis, selector
-    if semantic["status"] != "verified":
+    if semantic["status"] != "local_class_aligned":
         findings.append(
             _finding(
                 "direction.semantics_unresolved",
@@ -2949,11 +2947,7 @@ def _exporter_axis(
                 blocking=False,
             )
         )
-        delivered_local = local
-        canonical_base = semantic["raw_base_axis"]
-    else:
-        delivered_local = semantic["delivered_local_axis"]
-        canonical_base = semantic["canonical_base_axis"]
+    delivered_local = semantic["delivered_local_axis"]
     canonical_assembly = signed
     origin = [transform[3], transform[7], transform[11]]
     offset = _axis_offset(point, origin, direction)
@@ -2969,12 +2963,12 @@ def _exporter_axis(
     axis.update(
         point=point,
         direction=canonical_assembly,
-        base_direction=canonical_base,
-        native_direction=semantic["raw_base_axis"],
+        parent_direction=semantic["parent_axis"],
+        parent_axis=semantic["parent_axis"],
+        native_direction=semantic["parent_axis"],
         assembly_direction=signed,
         delivered_local_axis=delivered_local,
         direction_relation=semantic["status"],
-        sign=semantic["sign"],
         motion=semantic["motion"],
         classification_source=semantic["classification_source"],
         alignment=semantic["alignment"],
@@ -3270,38 +3264,6 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 "drive": None,
             }
         )
-    def pair_key(name: str):
-        lowered = name.lower()
-        for prefix in ("left_", "l_"):
-            if lowered.startswith(prefix):
-                return "left", name[len(prefix) :].removesuffix("_joint")
-        for prefix in ("right_", "r_"):
-            if lowered.startswith(prefix):
-                return "right", name[len(prefix) :].removesuffix("_joint")
-        return None
-
-    pairs: dict[str, dict[str, dict]] = {}
-    for joint in joints:
-        if joint.get("axis", {}).get("status", joint.get("axis", {}).get("direction_relation")) != "canonical":
-            continue
-        key = pair_key(str(joint["name"]))
-        if key is not None:
-            pairs.setdefault(key[1], {})[key[0]] = joint
-    for key, sides in sorted(pairs.items()):
-        if set(sides) != {"left", "right"}:
-            continue
-        left_joint, right_joint = sides["left"], sides["right"]
-        left, right = left_joint["axis"], right_joint["axis"]
-        dot = _dot(left.get("base_direction") or [], right.get("base_direction") or [])
-        if dot < 1.0 - 1e-7:
-            findings.append(
-                _finding(
-                    "direction.paired_mismatch",
-                    f"joint:{left_joint['name']}",
-                    "left/right joints do not share a positive functional axis",
-                    {"pair": key, "dot": dot},
-                )
-            )
     return joints
 
 
@@ -5377,17 +5339,14 @@ def source_definition(
             "axis_reference": joint["axis_reference"],
         }
         if joint["axis"].get("source") == "exporter":
-            entry["limits"] = transform_limits(
-                {
+            entry["limits"] = {
                 key: float(joint["limits"][key])
                 for key in (
                     ("effort", "velocity")
                     if joint["type"] == "continuous"
                     else ("lower", "upper", "effort", "velocity")
                 )
-                },
-                int(joint["axis"].get("sign", 1)),
-            )
+            }
             entry["limit_evidence"] = {
                 "file": discovery_name,
                 "sha256": discovery_sha256,

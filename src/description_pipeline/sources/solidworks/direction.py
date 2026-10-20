@@ -113,10 +113,8 @@ def canonicalize_axis(
             "local_principal": local_principal,
             "classification_source": "unresolved",
             "alignment": local_projection,
-            "raw_base_axis": parent_axis,
-            "canonical_base_axis": parent_axis,
+            "parent_axis": parent_axis,
             "delivered_local_axis": local,
-            "sign": 1,
             "reason": "no explicit CAD motion class",
             "rule_id": "direction.positive_semantics",
             "rule_version": "v3",
@@ -125,30 +123,17 @@ def canonicalize_axis(
     alignment = _dot(parent_axis, _PRINCIPAL[declared_motion])
     verified = abs(alignment) >= threshold
     return {
-        "status": "verified" if verified else "unverified",
+        "status": "local_class_aligned" if verified else "unverified",
         "motion": declared_motion,
         "declared_motion": declared_motion,
         "local_principal": local_principal,
-        "classification_source": "name",
+        "classification_source": "name_local_axis_alignment",
         "alignment": alignment,
-        "raw_base_axis": parent_axis,
-        "canonical_base_axis": parent_axis,
+        "parent_axis": parent_axis,
         "delivered_local_axis": local,
-        "sign": 1,
         "reason": "declared motion matches the local mechanical axis"
         if verified
         else "declared motion does not match the local mechanical axis",
         "rule_id": "direction.positive_semantics",
         "rule_version": "v3",
     }
-
-
-def transform_limits(limits: dict | None, sign: int) -> dict | None:
-    """Apply a canonical axis sign to a joint's coordinate interval."""
-
-    if not isinstance(limits, dict):
-        return limits
-    result = dict(limits)
-    if sign == -1 and "lower" in result and "upper" in result:
-        result["lower"], result["upper"] = -float(result["upper"]), -float(result["lower"])
-    return result

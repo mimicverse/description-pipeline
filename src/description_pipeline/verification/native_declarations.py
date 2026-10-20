@@ -20,7 +20,7 @@ from ..sources.solidworks.session_artifacts import (
     session_materialization_under_root,
 )
 from ..sources.solidworks.native_limits import validate_native_limit
-from ..sources.solidworks.direction import canonicalize_axis, transform_limits
+from ..sources.solidworks.direction import canonicalize_axis
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
@@ -638,7 +638,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             ) from error
         state["directions"][name] = decision
         state["carried_axes"][name] = decision["delivered_local_axis"]
-        if decision["status"] != "verified":
+        if decision["status"] != "local_class_aligned":
             diagnostics.append(
                 {
                     "code": "direction.semantics_unresolved",
@@ -652,7 +652,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
     def joint_limits(name, joint):
         if joint["type"] == "fixed":
             return {"type": "fixed"}
-        positive = positive_direction(name, joint)
+        positive_direction(name, joint)
         limits = joint.get("limit")
         _require(isinstance(limits, dict), "v14.limits", "moving joint has no authored limit record", joint=name)
         raw_limits = dict(limits)
@@ -823,7 +823,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             else:
                 state.setdefault("effective_limits", {})[name] = dict(limits)
                 state.setdefault("effective_limit_sources", {})[name] = "declared_author"
-        limits = transform_limits(limits, 1 if positive is None else int(positive["sign"]))
         if name in state.get("effective_limits", {}):
             state["effective_limits"][name] = dict(limits)
         unqualified = [key for key in ("effort", "velocity") if limits.get(key) == 0]
@@ -1037,45 +1036,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 )
         return {"bodies": len(bodies), "joints": len(joints)}
 
-    def paired_motion():
-        def pair_key(name):
-            lowered = name.lower()
-            for prefix in ("left_", "l_"):
-                if lowered.startswith(prefix):
-                    return "left", name[len(prefix) :].removesuffix("_joint")
-            for prefix in ("right_", "r_"):
-                if lowered.startswith(prefix):
-                    return "right", name[len(prefix) :].removesuffix("_joint")
-            return None
-
-        pairs: dict[str, dict[str, dict]] = {}
-        for name, decision in (state.get("directions") or {}).items():
-            key = pair_key(name)
-            if key is not None:
-                pairs.setdefault(key[1], {})[key[0]] = decision
-        checked = 0
-        for key, sides in sorted(pairs.items()):
-            if set(sides) != {"left", "right"}:
-                continue
-            left, right = sides["left"], sides["right"]
-            if left["status"] != "verified" or right["status"] != "verified":
-                continue
-            _require(
-                left["motion"] == right["motion"],
-                "v14.paired_motion",
-                "left/right joints have different positive-motion classes",
-                {"pair": key, "left": left["motion"], "right": right["motion"]},
-            )
-            dot = float(np.dot(left["canonical_base_axis"], right["canonical_base_axis"]))
-            _require(
-                dot >= 1.0 - 1e-7,
-                "v14.paired_motion",
-                "left/right joints do not share a positive functional axis",
-                {"pair": key, "dot": dot},
-            )
-            checked += 1
-        return {"pairs": checked}
-
     if check("declarations.binding", boundary) and check("declarations.topology", topology):
         check("declarations.membership", membership)
         for name in state["links"]:
@@ -1086,7 +1046,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         for name, joint in state["joints"].items():
             check("declarations.limits." + name, lambda n=name, j=joint: joint_limits(n, j))
             check("declarations.axis." + name, lambda n=name, j=joint: joint_geometry(n, j))
-        check("declarations.paired_motion", paired_motion)
         # Saved mates may intentionally hold an authored moving joint at its current
         # pose. Preserve the measured restriction separately; it is no pass/fail gate.
         diagnostics.extend(pose_diagnostics())
