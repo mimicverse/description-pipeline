@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prototype exact-path disaster recovery for the description pipeline.
+"""Exact-path disaster recovery for the description pipeline.
 
 This file is intended to be reviewed as ``deploy/operator/recovery.py``.  It owns
 the recovery contract; the legacy ``backup.py`` is reused only for its encrypted

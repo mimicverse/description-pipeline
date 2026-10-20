@@ -1,4 +1,4 @@
-"""Fake-CLI unit and end-to-end control tests for the recovery prototype."""
+"""Fake-CLI unit and end-to-end control tests for recovery."""
 
 from __future__ import annotations
 
@@ -24,11 +24,9 @@ from unittest import mock
 from cryptography.fernet import Fernet
 
 HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parents[1]
 DEPLOY = Path(
-    os.environ.get(
-        "DESCRIPTION_DEPLOY_DIR",
-        "/home/andy/Work/worktrees/semantic-naming-20261020/deploy/operator",
-    )
+    os.environ.get("DESCRIPTION_DEPLOY_DIR", REPOSITORY / "deploy" / "operator")
 )
 sys.path.insert(0, str(DEPLOY))
 sys.path.insert(0, str(HERE))
