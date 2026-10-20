@@ -16,9 +16,10 @@ from pathlib import Path
 
 from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.io import PipelineError, inventory, write_json
-from tools.verify_distribution import safe_members, validate_deployment_boundary, verify_release
+from tools.verify_distribution import _locked_pins, safe_members, validate_deployment_boundary, verify_release
 
 VERSION = "1.4.0"
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def complete_release(root: Path, *, identity: dict | None = None) -> dict:
@@ -92,6 +93,23 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
 
 
 class DistributionTests(unittest.TestCase):
+    def test_hash_bearing_lock_lines_bind_the_package_version_only(self):
+        self.assertEqual(
+            _locked_pins(b"packaging==26.3 --hash=sha256:" + b"a" * 64 + b"\n"),
+            {"packaging": "26.3"},
+        )
+
+    def test_ci_installs_the_linux_runner_from_its_airflow_lock(self):
+        workflow = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "--runtime-lock deploy/airflow/requirements.lock",
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count("--runtime-lock requirements/linux-py312.lock"),
+            0,
+        )
+
     def test_windows_paths_and_case_collisions_are_rejected_on_linux(self):
         for names in (["../outside"], ["..\\..\\outside"], ["C:\\outside"], ["/outside"], ["a.py", "A.py"]):
             with self.subTest(names=names), self.assertRaises(PipelineError):

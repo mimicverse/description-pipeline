@@ -216,7 +216,7 @@ jobs:
           set -eu
           wheel=( "$RUNNER_TEMP"/release-a/*.whl )
           python tools/verify_distribution.py "${wheel[0]}" \
-            --runtime-lock requirements/linux-py312.lock \
+            --runtime-lock deploy/airflow/requirements.lock \
             --wheelhouse /tmp/role-linux/wheels \
             --report release-verify-report.json
       - name: Record the verification runtime environment
