@@ -908,7 +908,7 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
             "AIRFLOW_VENV": str(fake_venv),
         },
         workspace_plan={
-            "schema_version": "solidworks-to-urdf.workspace-rehydrate/v1",
+            "schema_version": "solidworks-to-urdf.workspace-rehydrate/v2",
             "repositories": [],
         },
         source_code={
@@ -1258,7 +1258,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         repository, origin, head, tree = self.workspace_fixture()
         context = copy.deepcopy(self.context)
         context.workspace_plan = {
-            "schema_version": "solidworks-to-urdf.workspace-rehydrate/v1",
+            "schema_version": "solidworks-to-urdf.workspace-rehydrate/v2",
             "repositories": [
                 {
                     "repository_slug": "owner/model",

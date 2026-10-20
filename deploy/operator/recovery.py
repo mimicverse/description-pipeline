@@ -873,7 +873,10 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
             "recovery_release_missing",
             f"workspace checkout is not a Git repository: {path}",
         )
-        origin = _git_output(path, "remote", "get-url", "origin")
+        origin = _safe_workspace_origin(
+            _git_output(path, "remote", "get-url", "origin"),
+            slug,
+        )
         head = _git_output(path, "rev-parse", "HEAD")
         status = _git_output(path, "status", "--porcelain=v1")
         expected = resolved["targets"]
@@ -901,9 +904,42 @@ def workspace_reconstructible_plan(resolved: dict) -> dict:
             }
         )
     return {
-        "schema_version": "solidworks-to-urdf.workspace-rehydrate/v1",
+        "schema_version": "solidworks-to-urdf.workspace-rehydrate/v2",
         "repositories": rows,
     }
+
+
+def _safe_workspace_origin(value: str, slug: str) -> str:
+    require(
+        isinstance(value, str) and bool(value) and not CONTROL.search(value),
+        "recovery_release_missing",
+        f"workspace origin is malformed for {slug}",
+    )
+    if "://" in value:
+        parsed = urlsplit(value)
+        require(
+            parsed.scheme in {"https", "ssh"}
+            and (parsed.scheme != "https" or not parsed.username)
+            and (parsed.scheme != "ssh" or parsed.username in {None, "git"})
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment,
+            "recovery_release_missing",
+            f"workspace origin carries unsupported authority for {slug}",
+        )
+    elif value.startswith("git@"):
+        require(
+            re.fullmatch(r"git@[A-Za-z0-9._-]+:[^\s]+", value) is not None,
+            "recovery_release_missing",
+            f"workspace origin is not a safe SSH remote for {slug}",
+        )
+    else:
+        require(
+            Path(value).is_absolute() and ".." not in Path(value).parts,
+            "recovery_release_missing",
+            f"workspace origin is not an absolute local remote for {slug}",
+        )
+    return value
 
 
 def capture_workspace_bundles(
@@ -6921,7 +6957,7 @@ def _workspace_plan(manifest: dict, extracted: Path) -> tuple[Path, dict]:
     )
     require(
         isinstance(plan, dict)
-        and plan.get("schema_version") == "solidworks-to-urdf.workspace-rehydrate/v1"
+        and plan.get("schema_version") == "solidworks-to-urdf.workspace-rehydrate/v2"
         and isinstance(plan.get("repositories"), list),
         "recovery_manifest_invalid",
         "workspace reconstruction plan is malformed",
@@ -6962,6 +6998,7 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
         "recovery_manifest_invalid",
         "workspace reconstruction row is malformed",
     )
+    _safe_workspace_origin(row["origin"], row["repository_slug"])
     target = absolute_text(row["path"], f"workspace target {row['repository_slug']}")
     require(
         target != root and target.is_relative_to(root),
@@ -6975,9 +7012,9 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
 def _workspace_verify(path: Path, row: dict) -> None:
     require_real_dir(path, f"workspace checkout {row['repository_slug']}", "recovery_workspace_missing")
     require(
-        path.joinpath(".git").exists(),
+        path.joinpath(".git").exists() and not is_link(path.joinpath(".git")),
         "recovery_workspace_missing",
-        f"workspace checkout is not a Git repository: {path}",
+        f"workspace checkout has no real Git directory: {path}",
     )
     environment = {
         **os.environ,
