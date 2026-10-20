@@ -7076,6 +7076,70 @@ def validate_workspace_targets(
             )
 
 
+def validate_release_runtime_target(
+    manifest: dict,
+    extracted: Path,
+    *,
+    verify_only: bool,
+) -> None:
+    release = _exact_keys(
+        manifest["reconstructibles"]["release_root"],
+        {"path", "recipe"},
+        "reconstructibles.release_root",
+    )
+    require(
+        release["recipe"] == "offline-release-artifacts",
+        "recovery_manifest_invalid",
+        "release reconstruction recipe is unsupported",
+    )
+    release_root = absolute_text(release["path"], "release_root")
+    install_id = manifest["maintenance"]["receipt"]["identity"]["install_id"]
+    operator_env = extracted / "config" / "state" / "derived" / install_id / "operator.env"
+    require_real_file(
+        operator_env,
+        "recovered operator environment",
+        "recovery_release_missing",
+    )
+    values = _read_rehydrate_env(operator_env)
+    require(
+        isinstance(values.get("AIRFLOW_VENV"), str)
+        and isinstance(values.get("AIRFLOW_HOME"), str),
+        "recovery_release_missing",
+        "recovered operator environment lacks the Airflow runtime paths",
+    )
+    venv = Path(values["AIRFLOW_VENV"])
+    airflow_home = Path(values["AIRFLOW_HOME"])
+    require(
+        venv.is_absolute() and venv.is_relative_to(release_root),
+        "recovery_target_path_unsafe",
+        "recovered Airflow environment is outside its release root",
+    )
+    require(
+        airflow_home.is_absolute(),
+        "recovery_target_path_unsafe",
+        "recovered Airflow home is not absolute",
+    )
+    if verify_only:
+        require_real_dir(
+            release_root,
+            "recovered release root",
+            "recovery_release_missing",
+        )
+        require_real_file(
+            venv / "bin" / "python",
+            "recovered Airflow interpreter",
+            "recovery_release_missing",
+        )
+    else:
+        require_no_links(release_root.parent, "recovered release root parent")
+        require_empty_target_directory(release_root, "recovered release root")
+        require(
+            not path_exists(venv),
+            "recovery_target_not_empty",
+            "release runtime target is not a fresh path",
+        )
+
+
 def restore_workspaces(manifest: dict, extracted: Path, *, verify_only: bool) -> None:
     root, plan = _workspace_plan(manifest, extracted)
     require(
@@ -7721,6 +7785,11 @@ def restore_command(
         )
         verify_archive_consistency(manifest, extracted)
         validate_workspace_targets(
+            manifest,
+            extracted,
+            verify_only=verify_only,
+        )
+        validate_release_runtime_target(
             manifest,
             extracted,
             verify_only=verify_only,
