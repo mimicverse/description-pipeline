@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import tempfile
@@ -235,6 +236,18 @@ class CapturePlanTests(unittest.TestCase):
                 {},
             )
 
+    def test_a_producer_refuses_conflicting_native_instance_identities(self) -> None:
+        with self.assertRaisesRegex(PipelineError, "conflicting instance identities"):
+            discovery._capture_plan_selector(
+                {
+                    "instance_id": "part-1",
+                    "name2": "part-2",
+                    "document": "cad/part.SLDPRT",
+                    "suppression_state": 2,
+                },
+                {},
+            )
+
     def test_a_duplicate_native_selector_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan["objects"].append(dict(plan["objects"][0])))
         with self.assertRaisesRegex(PipelineError, "repeats a native object selector"):
@@ -275,10 +288,140 @@ class CapturePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "unknown native selector field"):
             steps._consume_sealed_definition(self.root)
 
+    def test_capture_mass_scope_covers_material_occurrences_not_assembly_containers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capture-mass-scope-") as temporary:
+            staging = Path(temporary)
+            raw = staging / "evidence" / "raw"
+            raw.mkdir(parents=True)
+            plan = {
+                "objects": [
+                    {"name": "arm-1", "document": "cad/arm.SLDASM", "state": 2},
+                    {"name": "arm-1/part-1", "document": "cad/part.SLDPRT", "state": 2},
+                    {"name": "arm-1/virtual-1", "state": 2},
+                    {"name": "arm-1/virtual-asm-1", "state": 2},
+                    {"name": "arm-1/virtual-asm-1/part-2", "document": "cad/part2.SLDPRT", "state": 2},
+                ],
+                "datums": [],
+                "evidence_requests": [],
+            }
+            components = [
+                {"name": "arm-1/part-1", "document_type": "part"},
+                {"name": "arm-1/virtual-1", "document_type": "part"},
+                {"name": "arm-1/virtual-asm-1/part-2", "document_type": "part"},
+            ]
+            discovery_components = [
+                {"name2": "arm-1", "document": "cad/arm.SLDASM"},
+                {"name2": "arm-1/part-1", "document": "cad/part.SLDPRT"},
+                {
+                    "name2": "arm-1/virtual-1",
+                    "document": "c:/temp/swx/VC~~/arm/virtual.SLDPRT",
+                },
+                {
+                    "name2": "arm-1/virtual-asm-1",
+                    "document": "c:/temp/swx/VC~~/arm/virtual-asm.SLDPRT",
+                },
+                {
+                    "name2": "arm-1/virtual-asm-1/part-2",
+                    "document": "cad/part2.SLDPRT",
+                },
+                {
+                    "name2": "arm-1/suppressed-1",
+                    "document": "cad/suppressed.SLDPRT",
+                    "suppressed": True,
+                },
+            ]
+            write_json(
+                staging / "evidence" / "discovery.json",
+                {
+                    "raw": {
+                        "components": discovery_components
+                    }
+                },
+            )
+            write_json(raw / "scene_raw.json", {"components": components})
+            write_json(
+                raw / "mass_properties.json",
+                {
+                    "arm-1/part-1": {},
+                    "arm-1/virtual-1": {},
+                    "arm-1/virtual-asm-1/part-2": {},
+                },
+            )
+            steps._require_plan_against_capture(staging, plan)
+
+            write_json(raw / "mass_properties.json", {"arm-1/part-1": {}})
+            with self.assertRaisesRegex(PipelineError, "did not read every planned native instance"):
+                steps._require_plan_against_capture(staging, plan)
+
+            write_json(
+                raw / "mass_properties.json",
+                {
+                    "arm-1/part-1": {},
+                    "arm-1/virtual-1": {},
+                    "arm-1/virtual-asm-1/part-2": {},
+                    "arm-1/extra-1": {},
+                },
+            )
+            with self.assertRaisesRegex(PipelineError, "did not read every planned native instance"):
+                steps._require_plan_against_capture(staging, plan)
+
+            components[0]["document_type"] = "assembly"
+            write_json(raw / "scene_raw.json", {"components": components})
+            write_json(
+                raw / "mass_properties.json",
+                {
+                    "arm-1/part-1": {},
+                    "arm-1/virtual-1": {},
+                    "arm-1/virtual-asm-1/part-2": {},
+                },
+            )
+            with self.assertRaisesRegex(PipelineError, "did not read every planned native instance"):
+                steps._require_plan_against_capture(staging, plan)
+
+            discovery_components.append(dict(discovery_components[1]))
+            write_json(staging / "evidence" / "discovery.json", {"raw": {"components": discovery_components}})
+            with self.assertRaisesRegex(PipelineError, "repeats a sealed native instance identity"):
+                steps._require_plan_against_capture(staging, plan)
+
     def test_a_boolean_selector_state_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan["objects"][0].update(state=True))
         with self.assertRaisesRegex(PipelineError, "native suppression state"):
             steps._consume_sealed_definition(self.root)
+
+    def test_a_virtual_container_with_only_suppressed_children_needs_no_mass(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capture-empty-container-") as temporary:
+            staging = Path(temporary)
+            evidence = staging / "evidence"
+            raw = evidence / "raw"
+            raw.mkdir(parents=True)
+            plan = {
+                "objects": [{"name": "container-1", "state": 2}],
+                "datums": [],
+                "evidence_requests": [],
+            }
+            write_json(
+                evidence / "discovery.json",
+                {
+                    "raw": {
+                        "components": [
+                            {
+                                "instance_id": "container-1",
+                                "name2": "container-1",
+                                "document": "c:/temp/swx/VC~~/container/container.SLDPRT",
+                            },
+                            {
+                                "instance_id": "container-1/part-1",
+                                "name2": "container-1/part-1",
+                                "document": "part.SLDPRT",
+                                "suppressed": True,
+                            },
+                        ]
+                    }
+                },
+            )
+            write_json(raw / "scene_raw.json", {"components": []})
+            write_json(raw / "mass_properties.json", {})
+            steps._require_plan_against_capture(staging, plan)
 
     def test_a_source_selection_not_bound_to_the_raw_inventory_is_refused(self) -> None:
         discovery_document = json.loads(
@@ -301,6 +444,28 @@ class CapturePlanTests(unittest.TestCase):
     def test_a_plan_naming_an_unregistered_instance_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan["objects"][1].update(name="ghost-1"))
         with self.assertRaisesRegex(PipelineError, "outside the sealed record"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_conflicting_native_instance_identities_are_refused(self) -> None:
+        discovery_path = self.root / "discovery" / "native-discovery.json"
+        discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+        component = discovery["raw"]["components"][1]
+        component["instance_id"] = component["name2"]
+        component["name2"] = "tampered-1"
+        write_json(discovery_path, discovery)
+        discovery_sha = hashlib.sha256(discovery_path.read_bytes()).hexdigest()
+        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
+        with self.assertRaisesRegex(PipelineError, "conflicting instance identities"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_duplicate_native_component_rows_are_refused_before_mapping(self) -> None:
+        discovery_path = self.root / "discovery" / "native-discovery.json"
+        discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+        discovery["raw"]["components"].append(copy.deepcopy(discovery["raw"]["components"][1]))
+        write_json(discovery_path, discovery)
+        discovery_sha = hashlib.sha256(discovery_path.read_bytes()).hexdigest()
+        self._rewrite_plan(lambda plan: plan.update(discovery_sha256=discovery_sha))
+        with self.assertRaisesRegex(PipelineError, "repeats a native object selector"):
             steps._consume_sealed_definition(self.root)
 
     def test_a_plan_omitting_a_non_virtual_document_is_refused(self) -> None:

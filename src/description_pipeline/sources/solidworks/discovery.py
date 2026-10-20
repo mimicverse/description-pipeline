@@ -4422,9 +4422,7 @@ def _capture_plan_selector(
 
     if not isinstance(component, dict) or component.get("suppressed"):
         return None
-    name = component.get("instance_id") or component.get("name2")
-    if not isinstance(name, str) or not name:
-        return None
+    name = native_component_identity(component)
     selector = {"name": name}
     document = component.get("document")
     session_document = sealed_embedded_virtual_document(
@@ -4451,6 +4449,24 @@ def _capture_plan_selector(
         raise PipelineError("A native capture selector carries no truthful suppression state")
     selector["state"] = state
     return selector
+
+
+def native_component_identity(component: dict) -> str:
+    """The one complete identity of a sealed native occurrence."""
+
+    values = []
+    for key in ("instance_id", "name2"):
+        if key not in component:
+            continue
+        value = component[key]
+        if not isinstance(value, str) or not value:
+            raise PipelineError(f"A native component carries an invalid {key}")
+        values.append(value)
+    if not values:
+        raise PipelineError("A native component carries no instance identity")
+    if len(set(values)) != 1:
+        raise PipelineError("A native component carries conflicting instance identities")
+    return values[0]
 
 
 def derive_native_package(

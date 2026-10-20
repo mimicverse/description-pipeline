@@ -18,6 +18,7 @@ from description_pipeline.sources.solidworks.scene import (  # noqa: E402
     _build_frames,
     _build_joints,
     identity_matrix,
+    rpy_from_matrix,
 )
 
 
@@ -47,6 +48,18 @@ def _array(rotation, translation) -> list[float]:
     ]
 
 
+def _rpy_matrix(rpy) -> tuple[tuple[float, float, float], ...]:
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+        (-sp, cp * sr, cp * cr),
+    )
+
+
 def _joint(**overrides) -> dict:
     joint = {
         "id": "j1",
@@ -64,6 +77,44 @@ def _joint(**overrides) -> dict:
 
 
 class DerivedJointFrameTests(unittest.TestCase):
+    def test_near_gimbal_visual_rotations_round_trip_stably(self):
+        matrices = (
+            (
+                (-3.942051141924053e-17, -8.32478591197218e-17, -0.9999999999999999),
+                (-2.261116678377418e-16, 1.0, -1.4503776679243207e-16),
+                (0.9999999999999999, 1.9788393831288693e-16, -5.318123046661821e-17),
+            ),
+            (
+                (-1.1938193336237747e-31, 0.9999999999999999, -8.351180438273273e-20),
+                (-5.951359960758642e-32, 1.2467590293219489e-16, 0.9999999999999998),
+                (0.9999999999999999, 9.860761315262648e-32, 1.9721522630525295e-31),
+            ),
+        )
+        for matrix in matrices:
+            with self.subTest(matrix=matrix):
+                reconstructed = _rpy_matrix(rpy_from_matrix(matrix))
+                error = max(
+                    abs(reconstructed[row][column] - matrix[row][column]) for row in range(3) for column in range(3)
+                )
+                self.assertLess(error, 1e-6)
+
+    def test_gimbal_branch_uses_projected_cosine_without_raising_tolerance(self):
+        matrices = []
+        for pitch in (math.pi / 2 - 9e-7, -math.pi / 2 + 9e-7):
+            for roll in (-2.5, 0.0, 2.5):
+                for yaw in (-2.2, -0.7, 1.4):
+                    matrices.append(_rpy_matrix((roll, pitch, yaw)))
+        for offset in (1e-7, 1e-9, 1e-10, 0.0, -1e-10, -1e-9, -1e-7):
+            for yaw in (-2.2, -0.7, 1.4):
+                matrices.append(_rpy_matrix((0.4, math.pi / 2 + offset, yaw)))
+        for matrix in matrices:
+            with self.subTest(matrix=matrix):
+                reconstructed = _rpy_matrix(rpy_from_matrix(matrix))
+                error = max(
+                    abs(reconstructed[row][column] - matrix[row][column]) for row in range(3) for column in range(3)
+                )
+                self.assertLess(error, 1e-6)
+
     def test_origin_is_derived_from_identity_parent_frame(self):
         frames = {
             "base_link": (identity_matrix(), (0.0, 0.0, 0.0), "base_datum"),
