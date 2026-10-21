@@ -1223,11 +1223,7 @@ function Read-Json([string]$path) {{
 }}
 function Get-Sample {{
   $task = Get-ScheduledTask -TaskName $expected.task_name -ErrorAction Stop
-  if ($task.State -ne 'Ready') {{ throw "task state is $($task.State)" }}
-  $info = Get-ScheduledTaskInfo -TaskName $expected.task_name -ErrorAction Stop
-  if ($info.LastTaskResult -ne 0) {{
-    throw "task LastTaskResult is $($info.LastTaskResult)"
-  }}
+  if ($task.State -ne 'Running') {{ throw "task state is $($task.State)" }}
   $arguments = [string]$task.Actions[0].Arguments
   $match = [regex]::Match($arguments, 'serve --config\s+"?([^"]+)"?')
   if (-not $match.Success) {{ throw 'task action does not bind serve --config' }}
@@ -1354,7 +1350,7 @@ sample = result.get("sample")
 if (
     not isinstance(sample, dict)
     or sample.get("task_name") != task_name
-    or sample.get("task_state") != "Ready"
+    or sample.get("task_state") != "Running"
     or sample.get("install_id") != identity["install_id"]
     or sample.get("config_digest") != identity["config_digest"]
     or sample.get("health_install_id") != identity["install_id"]
@@ -1370,7 +1366,7 @@ print(
     json.dumps(
         {
             "task_name": task_name,
-            "task_state": "Ready",
+            "task_state": "Running",
             "listener_pid": sample["listener_pid"],
             "process_start_utc": sample["process_start_utc"],
             "install_id": sample["install_id"],

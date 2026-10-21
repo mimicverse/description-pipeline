@@ -287,7 +287,7 @@ if match is None:
 expected = json.loads(base64.b64decode(match.group(1)).decode())
 sample = {
     "task_name": expected["task_name"],
-    "task_state": "Ready",
+    "task_state": "Running",
     "listener_pid": 4242,
     "process_start_utc": "2026-10-21T00:00:00Z",
     "install_id": expected["install_id"],
@@ -1918,7 +1918,7 @@ class LifecycleTests(unittest.TestCase):
                 (state / "install-record.json").read_text(encoding="utf-8")
             )
             identity = record["ends"]["windows"]
-            for task_state in ("Disabled", "Failed"):
+            for task_state in ("Ready", "Disabled", "Failed"):
                 sample = {
                     "passed": True,
                     "sample": {
