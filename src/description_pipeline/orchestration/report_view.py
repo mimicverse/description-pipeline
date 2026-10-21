@@ -13,7 +13,11 @@ from __future__ import annotations
 
 from pathlib import PureWindowsPath
 
-from ..geometry.native_u import NATIVE_SCOPE_IDENTITY_WARNING_CODES
+from ..geometry.native_u import (
+    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_details_match,
+)
+from ..io import PipelineError
 from ..stages import FIXED_REQUIRED_CHECKS, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
@@ -811,10 +815,27 @@ def _warning_row(stage: dict, item: dict) -> dict:
     return row
 
 
-def _recorded_warnings(stage: dict, findings: list, rows: list[dict]) -> list[dict]:
+def _recorded_warnings(
+    stage: dict,
+    findings: list,
+    rows: list[dict],
+    quality_diagnostics: list[dict] | None = None,
+) -> list[dict]:
     """Warnings from recorded evidence only: non-blocking findings and check diagnostics."""
 
     warnings: list[dict] = []
+    if quality_diagnostics is not None and not isinstance(
+        quality_diagnostics,
+        list,
+    ):
+        raise PipelineError("Quality diagnostics are malformed")
+    native_diagnostics = [
+        item
+        for item in quality_diagnostics or []
+        if isinstance(item, dict)
+        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    scope_compared = False
     if stage.get("id") == "discover":
         warnings.extend(
             _warning_row(stage, item)
@@ -825,6 +846,33 @@ def _recorded_warnings(stage: dict, findings: list, rows: list[dict]) -> list[di
         details = row.get("raw_details")
         recorded = details.get("warnings") if isinstance(details, dict) else None
         if isinstance(recorded, list):
+            raw_scope = [
+                item
+                for item in recorded
+                if isinstance(item, dict)
+                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            ]
+            if raw_scope:
+                if not native_scope_warning_details_match(
+                    native_diagnostics,
+                    recorded,
+                ):
+                    raise PipelineError(
+                        "Native scope warnings differ from quality diagnostics"
+                    )
+                scope_compared = True
+                recorded = [
+                    next(
+                        item
+                        for item in native_diagnostics
+                        if item["code"] == row["code"]
+                        and item["detail"] == row.get("detail")
+                    )
+                    if row.get("code")
+                    in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+                    else row
+                    for row in recorded
+                ]
             warnings.extend(
                 _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
             )
@@ -833,6 +881,10 @@ def _recorded_warnings(stage: dict, findings: list, rows: list[dict]) -> list[di
             warnings.extend(
                 _warning_row(stage, item) for item in diagnostics if isinstance(item, dict) and item.get("code")
             )
+    if native_diagnostics and not scope_compared:
+        raise PipelineError(
+            "Native scope diagnostics have no matching gate warnings"
+        )
     return warnings
 
 
@@ -915,7 +967,12 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                         "whole_cad_mass_kg": details.get("whole_cad_mass_kg"),
                         "delta_kg": details.get("delta_kg"),
                     }
-        warning_rows = _recorded_warnings(stage, discovery_findings, [*boundary_rows, *independent_rows])
+        warning_rows = _recorded_warnings(
+            stage,
+            discovery_findings,
+            [*boundary_rows, *independent_rows],
+            quality.get("diagnostics"),
+        )
         stage_out = {
             "id": stage.get("id"),
             "name": stage.get("name"),

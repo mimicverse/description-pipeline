@@ -1173,6 +1173,215 @@ open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(health) + "\n")
 PY
 }
 
+windows_status_check() {
+  python3 - "$CONFIG_FILE" "$OPERATOR_STATE_DIR/install-record.json" <<'PY'
+import base64
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+windows = config.get("windows")
+if not isinstance(windows, dict) or not isinstance(windows.get("instance"), dict):
+    raise SystemExit("operatorctl status: Windows instance configuration is missing")
+ends = record.get("ends")
+expected = ends.get("windows") if isinstance(ends, dict) else None
+if not isinstance(expected, dict):
+    raise SystemExit("operatorctl status: Windows install identity is missing")
+host = windows.get("ssh_host")
+instance = windows["instance"]
+task_name = instance.get("task_name")
+port = windows.get("endpoint_port")
+if (
+    not isinstance(host, str)
+    or not host
+    or not isinstance(task_name, str)
+    or not task_name
+    or type(port) is not int
+    or not 0 < port < 65536
+):
+    raise SystemExit("operatorctl status: Windows endpoint identity is malformed")
+identity = {
+    "task_name": task_name,
+    "port": port,
+    "install_id": expected.get("install_id"),
+    "config_digest": expected.get("config_digest"),
+    "release": expected.get("release"),
+}
+encoded = base64.b64encode(
+    json.dumps(identity, separators=(",", ":"), sort_keys=True).encode()
+).decode("ascii")
+script = rf"""
+$ErrorActionPreference = 'Stop'
+$expected = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String('{encoded}')))
+function Read-Json([string]$path) {{
+  (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json
+}}
+function Get-Sample {{
+  $task = Get-ScheduledTask -TaskName $expected.task_name -ErrorAction Stop
+  if ($task.State -ne 'Ready') {{ throw "task state is $($task.State)" }}
+  $info = Get-ScheduledTaskInfo -TaskName $expected.task_name -ErrorAction Stop
+  if ($info.LastTaskResult -ne 0) {{
+    throw "task LastTaskResult is $($info.LastTaskResult)"
+  }}
+  $arguments = [string]$task.Actions[0].Arguments
+  $match = [regex]::Match($arguments, 'serve --config\s+"?([^"]+)"?')
+  if (-not $match.Success) {{ throw 'task action does not bind serve --config' }}
+  $configPath = $match.Groups[1].Value
+  $generation = Split-Path -Parent $configPath
+  $python = Join-Path $generation 'runtime\Scripts\python.exe'
+  if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {{
+    throw 'task generation runtime Python is missing'
+  }}
+  $program = "import json,sys;" +
+    "from description_pipeline.orchestration import windows;" +
+    "from description_pipeline.runtime import tool_record;" +
+    "c=windows.read_config(sys.argv[1]);" +
+    "print(json.dumps({{'config_digest':c['config_digest']," +
+    "'state_root':str(c['state_root']),'port':c['port']," +
+    "'release':tool_record(role='native')}},sort_keys=True))"
+  $probe = ((& $python -I -c $program $configPath) | Select-Object -Last 1) |
+    ConvertFrom-Json
+  $config = Read-Json $configPath
+  $installId = (
+    Get-Content -LiteralPath (Join-Path ([string]$probe.state_root) 'install-id') -Raw
+  ).Trim()
+  $listeners = @(Get-NetTCPConnection -LocalPort ([int]$expected.port) -State Listen `
+    -ErrorAction Stop)
+  if ($listeners.Count -ne 1) {{
+    throw "expected one listener on port $($expected.port), got $($listeners.Count)"
+  }}
+  $process = Get-Process -Id ([int]$listeners[0].OwningProcess) -ErrorAction Stop
+  $token = (Get-Content -LiteralPath ([string]$config.token_file) -Raw).Trim()
+  $health = $null
+  for ($attempt = 0; $attempt -lt 10 -and -not $health; $attempt++) {{
+    try {{
+      $health = Invoke-RestMethod -Uri (
+        'http://127.0.0.1:' + [string]$expected.port + '/health'
+      ) -Headers @{{Authorization=('Bearer ' + $token)}} -TimeoutSec 3
+    }} catch {{
+      Start-Sleep -Milliseconds 500
+    }}
+  }}
+  if (-not $health) {{ throw 'endpoint health is unavailable' }}
+  $embedded = $probe.release.release
+  [ordered]@{{
+    task_name = [string]$task.TaskName
+    task_state = [string]$task.State
+    listener_pid = [int]$process.Id
+    process_start_utc = $process.StartTime.ToUniversalTime().ToString('o')
+    install_id = [string]$installId
+    config_digest = [string]$probe.config_digest
+    release = [ordered]@{{
+      version = [string]$probe.release.version
+      source_commit = [string]$embedded.source_commit
+      source_sha256 = [string]$probe.release.source_sha256
+      role = 'native'
+    }}
+    health_install_id = [string]$health.install.install_id
+    health_config_digest = [string]$health.install.config_digest
+    health_release = [ordered]@{{
+      version = [string]$health.release.version
+      source_commit = [string]$health.release.source_commit
+      source_sha256 = [string]$health.release.source_sha256
+      role = [string]$health.release.role
+    }}
+  }}
+}}
+try {{
+  $first = Get-Sample
+  Start-Sleep -Seconds 1
+  $second = Get-Sample
+  $firstJson = $first | ConvertTo-Json -Depth 8 -Compress
+  $secondJson = $second | ConvertTo-Json -Depth 8 -Compress
+  if ($firstJson -ne $secondJson) {{
+    throw 'two status probes returned different process or install identity'
+  }}
+  @{{
+    passed = $true
+    sample = $first
+  }} | ConvertTo-Json -Depth 8 -Compress
+}} catch {{
+  @{{
+    passed = $false
+    error = $_.Exception.Message
+  }} | ConvertTo-Json -Depth 8 -Compress
+  exit 1
+}}
+"""
+ssh_bin = os.environ.get("SOLIDWORKS_SSH_BIN", "ssh")
+try:
+    completed = subprocess.run(
+        [
+            ssh_bin,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            host,
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "-",
+        ],
+        input=script,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+except (OSError, subprocess.TimeoutExpired) as error:
+    raise SystemExit(f"operatorctl status: Windows probe failed: {error}") from error
+if completed.returncode != 0:
+    raise SystemExit(
+        "operatorctl status: Windows probe failed: "
+        + (completed.stderr or completed.stdout or "unknown failure").strip()[:1000]
+    )
+try:
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+except (IndexError, ValueError) as error:
+    raise SystemExit("operatorctl status: Windows probe returned no JSON") from error
+if not isinstance(result, dict) or result.get("passed") is not True:
+    raise SystemExit(
+        "operatorctl status: "
+        + str(result.get("error") if isinstance(result, dict) else "invalid result")
+    )
+sample = result.get("sample")
+if (
+    not isinstance(sample, dict)
+    or sample.get("task_name") != task_name
+    or sample.get("task_state") != "Ready"
+    or sample.get("install_id") != identity["install_id"]
+    or sample.get("config_digest") != identity["config_digest"]
+    or sample.get("health_install_id") != identity["install_id"]
+    or sample.get("health_config_digest") != identity["config_digest"]
+    or sample.get("release") != identity["release"]
+    or sample.get("health_release") != identity["release"]
+    or type(sample.get("listener_pid")) is not int
+    or not isinstance(sample.get("process_start_utc"), str)
+    or not sample["process_start_utc"]
+):
+    raise SystemExit("operatorctl status: Windows process/identity probe differs from the install record")
+print(
+    json.dumps(
+        {
+            "task_name": task_name,
+            "task_state": "Ready",
+            "listener_pid": sample["listener_pid"],
+            "process_start_utc": sample["process_start_utc"],
+            "install_id": sample["install_id"],
+            "config_digest": sample["config_digest"],
+        },
+        sort_keys=True,
+    )
+)
+PY
+}
+
 load_installed() {
   OPERATOR_STATE_DIR="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
@@ -1617,11 +1826,13 @@ case "$ACTION" in
     load_installed
     STATUS_RC=0
     drift_check || STATUS_RC=1
+    STATUS_SYSTEMCTL="${SYSTEMCTL_BIN:-systemctl}"
     for unit in "${UNITS[@]}"; do
-      state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+      state="$("$STATUS_SYSTEMCTL" --user is-active "$unit" 2>/dev/null || true)"
       printf '%s %s\n' "$unit" "${state:-unknown}"
       [ "$state" = "active" ] || STATUS_RC=1
     done
+    windows_status_check || STATUS_RC=1
     exit "$STATUS_RC"
     ;;
   health)

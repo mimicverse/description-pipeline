@@ -51,7 +51,7 @@ from ..stages import (
 )
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_scope_warning_diagnostic_is_valid,
+    native_scope_warning_details_match,
 )
 from .airflow_client import (
     EndpointConfig,
@@ -306,12 +306,28 @@ def _quality_warnings(report: dict | None) -> list[dict]:
         for item in diagnostics
         if str(item["code"]) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
-    if native_scope and (
-        {str(item["code"]) for item in native_scope}
-        != NATIVE_SCOPE_IDENTITY_WARNING_CODES
-        or any(
-            not native_scope_warning_diagnostic_is_valid(item)
-            for item in native_scope
+    native_gate_warnings = None
+    for check in (report or {}).get("checks") or []:
+        if (
+            isinstance(check, dict)
+            and check.get("id") == "geometry.native_tessellation"
+            and isinstance(check.get("details"), dict)
+        ):
+            gate_warning_rows = check["details"].get("warnings")
+            if isinstance(gate_warning_rows, list):
+                native_gate_warnings = gate_warning_rows
+            break
+    raw_scope = [
+        item
+        for item in native_gate_warnings or []
+        if isinstance(item, dict)
+        and str(item.get("code")) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    if (native_scope or raw_scope) and (
+        native_gate_warnings is None
+        or not native_scope_warning_details_match(
+            native_scope,
+            native_gate_warnings,
         )
     ):
         raise PortalError(

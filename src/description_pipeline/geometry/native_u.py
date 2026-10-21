@@ -55,6 +55,29 @@ NATIVE_SCOPE_IDENTITY_WARNING_CODES = frozenset(
     }
 )
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+NATIVE_SCOPE_WARNING_DETAIL_FIELDS = frozenset(
+    {
+        "component",
+        "entity_kind",
+        "body_type",
+        "body_index",
+        "owner_scope_key",
+        "persistent",
+        "rule_version",
+        "object_indices",
+        "field",
+        "native_reference_sha256",
+        "source_document_sha256",
+        "referenced_configuration",
+        "occurrence_scope",
+        "body_name",
+        "mapping_source_part_document_sha256",
+        "mapping_source_body_reference_sha256",
+        "mapped_source_indices",
+        "mapped_source_persistent_reference_sha256",
+        "topology_signature_sha256s",
+    }
+)
 
 
 def native_scope_warning_detail_is_valid(detail: object) -> bool:
@@ -62,6 +85,7 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
 
     return (
         isinstance(detail, dict)
+        and set(detail) == NATIVE_SCOPE_WARNING_DETAIL_FIELDS
         and isinstance(detail.get("component"), str)
         and bool(detail["component"])
         and detail.get("entity_kind") in {"face", "edge", "vertex"}
@@ -74,6 +98,7 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
         and detail.get("persistent") is False
         and detail.get("rule_version") == NATIVE_SCOPE_IDENTITY_RULE
         and isinstance(detail.get("object_indices"), list)
+        and bool(detail["object_indices"])
         and detail["object_indices"]
         == sorted(set(detail["object_indices"]))
         and all(
@@ -81,6 +106,87 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
             for index in detail["object_indices"]
         )
         and detail.get("field") == "identity.warnings"
+        and isinstance(detail.get("native_reference_sha256"), str)
+        and bool(_HEX64.fullmatch(detail["native_reference_sha256"]))
+        and isinstance(detail.get("source_document_sha256"), str)
+        and bool(_HEX64.fullmatch(detail["source_document_sha256"]))
+        and (
+            detail.get("referenced_configuration") is None
+            or isinstance(detail["referenced_configuration"], str)
+        )
+        and (
+            detail.get("occurrence_scope") is None
+            or isinstance(detail["occurrence_scope"], str)
+        )
+        and (
+            detail.get("body_name") is None
+            or isinstance(detail["body_name"], str)
+        )
+        and isinstance(
+            detail.get("mapping_source_part_document_sha256"),
+            str,
+        )
+        and bool(
+            _HEX64.fullmatch(
+                detail["mapping_source_part_document_sha256"]
+            )
+        )
+        and isinstance(
+            detail.get("mapping_source_body_reference_sha256"),
+            str,
+        )
+        and bool(
+            _HEX64.fullmatch(
+                detail["mapping_source_body_reference_sha256"]
+            )
+        )
+        and isinstance(detail.get("mapped_source_indices"), list)
+        and bool(detail["mapped_source_indices"])
+        and detail["mapped_source_indices"]
+        == sorted(set(detail["mapped_source_indices"]))
+        and all(
+            type(index) is int and index >= 0
+            for index in detail["mapped_source_indices"]
+        )
+        and isinstance(
+            detail.get("mapped_source_persistent_reference_sha256"),
+            list,
+        )
+        and bool(
+            detail["mapped_source_persistent_reference_sha256"]
+        )
+        and detail[
+            "mapped_source_persistent_reference_sha256"
+        ]
+        == sorted(
+            set(
+                detail[
+                    "mapped_source_persistent_reference_sha256"
+                ]
+            )
+        )
+        and all(
+            isinstance(reference, str)
+            and bool(_HEX64.fullmatch(reference))
+            for reference in detail[
+                "mapped_source_persistent_reference_sha256"
+            ]
+        )
+        and isinstance(
+            detail.get("topology_signature_sha256s"),
+            list,
+        )
+        and bool(detail["topology_signature_sha256s"])
+        and detail["topology_signature_sha256s"]
+        == sorted(set(detail["topology_signature_sha256s"]))
+        and all(
+            isinstance(reference, str)
+            and bool(_HEX64.fullmatch(reference))
+            for reference in detail["topology_signature_sha256s"]
+        )
+        and len(detail["object_indices"])
+        == len(detail["mapped_source_indices"])
+        == len(detail["mapped_source_persistent_reference_sha256"])
     )
 
 
@@ -103,6 +209,107 @@ def native_scope_warning_diagnostic_is_valid(item: object) -> bool:
             f"{item['detail']['body_index']}"
         )
     )
+
+
+def native_scope_warning_projection(item: dict) -> dict:
+    """Project one raw native warning without losing its full object location."""
+
+    detail = item.get("detail")
+    if not isinstance(detail, dict):
+        detail = {
+            key: value
+            for key, value in item.items()
+            if key
+            not in {
+                "code",
+                "blocking",
+                "severity",
+                "message",
+                "object",
+                "detail",
+            }
+        }
+    return {
+        "code": str(item["code"]),
+        "blocking": item.get("blocking", False),
+        "severity": item.get("severity", "warning"),
+        "message": str(
+            item.get("message")
+            or f"Native tessellation recorded {item['code']}"
+        ),
+        "object": str(
+            item.get("object")
+            or detail.get("component")
+            or detail.get("document")
+            or ""
+        ),
+        "detail": detail,
+    }
+
+
+def native_scope_warning_diagnostics_are_complete(
+    items: list[dict],
+) -> bool:
+    """Require all four warnings for every component/scope/object group."""
+
+    groups: dict[str, list[dict]] = {}
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        if not native_scope_warning_diagnostic_is_valid(item):
+            return False
+        detail = item["detail"]
+        group = json.dumps(
+            detail,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        marker = (group, item["code"])
+        if marker in seen:
+            return False
+        seen.add(marker)
+        groups.setdefault(group, []).append(item)
+    return all(
+        {item["code"] for item in group}
+        == NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        and len(group) == len(NATIVE_SCOPE_IDENTITY_WARNING_CODES)
+        for group in groups.values()
+    )
+
+
+def native_scope_warning_details_match(
+    diagnostics: list[dict],
+    raw_warnings: list[dict],
+) -> bool:
+    """Require diagnostics to reproduce the gate rows exactly, group by group."""
+
+    raw_scope = [
+        native_scope_warning_projection(item)
+        for item in raw_warnings
+        if isinstance(item, dict)
+        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    if not native_scope_warning_diagnostics_are_complete(raw_scope):
+        return False
+    if not native_scope_warning_diagnostics_are_complete(diagnostics):
+        return False
+
+    def comparable(items):
+        return sorted(
+            (
+                item["code"],
+                json.dumps(
+                    item["detail"],
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                item["object"],
+            )
+            for item in items
+        )
+
+    return comparable(raw_scope) == comparable(diagnostics)
 
 
 def native_scope_identity_sha256(value: dict) -> str:

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_details_match,
     native_scope_warning_diagnostic_is_valid,
 )
 from .geometry.native_tessellation import parse_native_tessellation
@@ -487,6 +488,18 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
         if isinstance(quality, dict)
         else None
     )
+    native_gate_warnings = None
+    if isinstance(quality, dict) and isinstance(quality.get("checks"), list):
+        for check in quality["checks"]:
+            if (
+                isinstance(check, dict)
+                and check.get("id") == "geometry.native_tessellation"
+                and isinstance(check.get("details"), dict)
+            ):
+                warnings = check["details"].get("warnings")
+                if isinstance(warnings, list):
+                    native_gate_warnings = warnings
+                break
     if quality_diagnostics is not None:
         if not isinstance(quality_diagnostics, list):
             entries.append(
@@ -506,12 +519,19 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 if isinstance(item, dict)
                 and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
             ]
-            if native_scope and (
-                {item.get("code") for item in native_scope}
-                != NATIVE_SCOPE_IDENTITY_WARNING_CODES
-                or any(
-                    not native_scope_warning_diagnostic_is_valid(item)
-                    for item in native_scope
+            raw_scope = [
+                item
+                for item in native_gate_warnings or []
+                if isinstance(item, dict)
+                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            ]
+            if (
+                native_scope or raw_scope
+            ) and (
+                native_gate_warnings is None
+                or not native_scope_warning_details_match(
+                    native_scope,
+                    native_gate_warnings,
                 )
             ):
                 entries.append(

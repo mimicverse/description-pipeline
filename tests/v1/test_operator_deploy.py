@@ -262,6 +262,52 @@ def platform_fixture(
     (tmp / "bin").mkdir(exist_ok=True)
     fixture_nginx = tmp / "bin" / "nginx"
     write_stub(fixture_nginx, "#!/bin/bash\nexit 0\n")
+    fixture_ssh = tmp / "bin" / "ssh"
+    write_stub(
+        fixture_ssh,
+        r'''#!/usr/bin/env bash
+root="$(cd "$(dirname "$0")/.." && pwd)"
+script="$(cat)"
+python3 - "$root" "$script" <<'PY'
+import base64
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+override = root / "windows-status.json"
+if override.is_file():
+    print(override.read_text(encoding="utf-8").strip())
+    raise SystemExit(0)
+script = sys.argv[2]
+match = re.search(r"FromBase64String\('([^']+)'\)", script)
+if match is None:
+    raise SystemExit(2)
+expected = json.loads(base64.b64decode(match.group(1)).decode())
+sample = {
+    "task_name": expected["task_name"],
+    "task_state": "Ready",
+    "listener_pid": 4242,
+    "process_start_utc": "2026-10-21T00:00:00Z",
+    "install_id": expected["install_id"],
+    "config_digest": expected["config_digest"],
+    "release": expected["release"],
+    "health_install_id": expected["install_id"],
+    "health_config_digest": expected["config_digest"],
+    "health_release": expected["release"],
+}
+print(json.dumps({"passed": True, "sample": sample}, sort_keys=True))
+PY
+''',
+    )
+    with Path(env_path).open("a", encoding="utf-8") as stream:
+        stream.write(
+            "SOLIDWORKS_SSH_BIN="
+            + encode_env_value(str(fixture_ssh))
+            + "\n"
+        )
+    env["SOLIDWORKS_SSH_BIN"] = str(fixture_ssh)
     env["NGINX_BIN"] = str(fixture_nginx)
     repinned = run(
         [
@@ -353,6 +399,37 @@ def tree_state(root: Path) -> dict:
 def write_stub(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
+
+
+def status_env(tmp: Path, config_home: Path) -> dict[str, str]:
+    """A read-only status environment with every managed unit explicitly active."""
+
+    bindir = tmp / "bin"
+    bindir.mkdir(exist_ok=True)
+    state_dir = tmp / "status-unit-state"
+    state_dir.mkdir(exist_ok=True)
+    for unit in (
+        "description-postgres",
+        "description-solidworks-tunnel",
+        "description-airflow-dag-processor",
+        "description-airflow-scheduler",
+        "description-airflow-api-server",
+        "description-portal",
+        "description-operator-proxy",
+    ):
+        (state_dir / unit).write_text("active\n", encoding="utf-8")
+    systemctl = bindir / "status-systemctl"
+    write_stub(
+        systemctl,
+        '#!/usr/bin/env bash\n'
+        '[ "${1:-}" = "--user" ] && [ "${2:-}" = "is-active" ] || exit 2\n'
+        'cat "$STATUS_UNIT_STATE_DIR/${3:-}" 2>/dev/null || echo unknown\n',
+    )
+    return {
+        "XDG_CONFIG_HOME": str(config_home),
+        "SYSTEMCTL_BIN": str(systemctl),
+        "STATUS_UNIT_STATE_DIR": str(state_dir),
+    }
 
 
 class RenderTests(unittest.TestCase):
@@ -1656,7 +1733,8 @@ class LifecycleTests(unittest.TestCase):
             )
             before = {path: digest(path) for path in tracked}
             result = run(
-                ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
+                ["bash", str(CONTROL), "status", "--config", str(config_path)],
+                status_env(Path(tmp), config_home),
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("DRIFT", result.stdout)
@@ -1677,9 +1755,9 @@ class LifecycleTests(unittest.TestCase):
             proxy.write_text(proxy.read_text(encoding="utf-8").replace(bound, str(other)), encoding="utf-8")
             result = run(
                 ["bash", str(CONTROL), "status", "--config", str(config_path)],
-                {"XDG_CONFIG_HOME": str(config_home)},
+                status_env(Path(tmp), config_home),
             )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(
                 "DRIFT the installed proxy unit does not execute the bound nginx binary", result.stdout
             )
@@ -1800,14 +1878,15 @@ class LifecycleTests(unittest.TestCase):
     def test_drift_check_reports_missing_and_changed_units(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, _, config_home, target = self._render_units(Path(tmp))
-            control_env = {"XDG_CONFIG_HOME": str(config_home)}
+            control_env = status_env(Path(tmp), config_home)
             portal = target / "description-portal.service"
             portal.write_text(portal.read_text(encoding="utf-8") + "# drifted\n", encoding="utf-8")
             changed = run(["bash", str(CONTROL), "status", "--config", str(config_path)], control_env)
-            self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+            self.assertNotEqual(changed.returncode, 0, changed.stdout + changed.stderr)
             self.assertIn("DRIFT unit differs: description-portal.service", changed.stdout)
             (target / "description-airflow-scheduler.service").unlink()
             missing = run(["bash", str(CONTROL), "status", "--config", str(config_path)], control_env)
+            self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
             self.assertIn("DRIFT unit missing: description-airflow-scheduler.service", missing.stdout)
             self.assertIn("DRIFT unit differs: description-portal.service", missing.stdout)
 
@@ -1823,11 +1902,82 @@ class LifecycleTests(unittest.TestCase):
             )
             failed = run(
                 ["bash", str(CONTROL), "status", "--config", str(config_path)],
-                {"XDG_CONFIG_HOME": str(config_home)},
+                status_env(Path(tmp), config_home),
             )
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
             self.assertIn("DRIFT unit missing from render: description-portal.service", failed.stdout)
             self.assertIn("DRIFT unit missing from render: description-operator-proxy.service", failed.stdout)
             self.assertIn("provided TLS certificate or key is missing", failed.stderr)
+
+    def test_status_requires_the_ready_windows_task_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, state, config_home, _ = self._render_units(root)
+            env = status_env(root, config_home)
+            record = json.loads(
+                (state / "install-record.json").read_text(encoding="utf-8")
+            )
+            identity = record["ends"]["windows"]
+            for task_state in ("Disabled", "Failed"):
+                sample = {
+                    "passed": True,
+                    "sample": {
+                        "task_name": "description-e2e-endpoint",
+                        "task_state": task_state,
+                        "listener_pid": 4242,
+                        "process_start_utc": "2026-10-21T00:00:00Z",
+                        "install_id": identity["install_id"],
+                        "config_digest": identity["config_digest"],
+                        "release": identity["release"],
+                        "health_install_id": identity["install_id"],
+                        "health_config_digest": identity["config_digest"],
+                        "health_release": identity["release"],
+                    },
+                }
+                (root / "windows-status.json").write_text(
+                    json.dumps(sample),
+                    encoding="utf-8",
+                )
+                result = run(
+                    [
+                        "bash",
+                        str(CONTROL),
+                        "status",
+                        "--config",
+                        str(config_path),
+                    ],
+                    env,
+                )
+                self.assertNotEqual(
+                    result.returncode,
+                    0,
+                    result.stdout + result.stderr,
+                )
+
+            (root / "windows-status.json").write_text(
+                json.dumps(
+                    {
+                        "passed": False,
+                        "error": "scheduled task is missing",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            missing = run(
+                [
+                    "bash",
+                    str(CONTROL),
+                    "status",
+                    "--config",
+                    str(config_path),
+                ],
+                env,
+            )
+            self.assertNotEqual(
+                missing.returncode,
+                0,
+                missing.stdout + missing.stderr,
+            )
 
     def test_portal_unit_injects_the_derived_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -28,7 +28,7 @@ from pathlib import Path
 from ..delivery import check_layout, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_scope_warning_diagnostic_is_valid,
+    native_scope_warning_details_match,
 )
 from ..interface_records import REQUEST_PURPOSES, validate_source_record
 from ..io import PipelineError, acquire_process_lock, confined, file_digest
@@ -497,7 +497,24 @@ def _native_scope_warning_rows(report: dict) -> list[dict]:
         if isinstance(item, dict)
         and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
-    if not rows:
+    native_gate_warnings = None
+    for check in report.get("checks") or []:
+        if (
+            isinstance(check, dict)
+            and check.get("id") == "geometry.native_tessellation"
+            and isinstance(check.get("details"), dict)
+        ):
+            warnings = check["details"].get("warnings")
+            if isinstance(warnings, list):
+                native_gate_warnings = warnings
+            break
+    raw_scope = [
+        item
+        for item in native_gate_warnings or []
+        if isinstance(item, dict)
+        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    if not rows and native_gate_warnings is not None:
         for check in report.get("checks") or []:
             if not isinstance(check, dict) or check.get("id") != "geometry.native_tessellation":
                 continue
@@ -510,10 +527,12 @@ def _native_scope_warning_rows(report: dict) -> list[dict]:
                 if item["code"] in NATIVE_SCOPE_IDENTITY_WARNING_CODES
             ]
             break
-    if rows and (
-        {item.get("code") for item in rows}
-        != NATIVE_SCOPE_IDENTITY_WARNING_CODES
-        or any(not native_scope_warning_diagnostic_is_valid(item) for item in rows)
+    if (rows or raw_scope) and (
+        native_gate_warnings is None
+        or not native_scope_warning_details_match(
+            rows,
+            native_gate_warnings,
+        )
     ):
         raise PipelineError("Native scope warning projection is incomplete or forged")
     return rows

@@ -24,7 +24,8 @@ from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, 
 from ..geometry import stl
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_scope_warning_diagnostic_is_valid,
+    native_scope_warning_details_match,
+    native_scope_warning_projection,
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
@@ -1917,56 +1918,20 @@ def native_gate_warning_diagnostics(details: dict) -> list[dict]:
     warnings = details.get("warnings")
     _require(isinstance(warnings, list), "Native tessellation warnings are unreadable")
     projected = []
-    scope_codes = set()
     for warning in warnings:
         _require(
             isinstance(warning, dict) and isinstance(warning.get("code"), str),
             "Native tessellation warning has no code",
         )
-        code = warning["code"]
-        if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
-            scope_codes.add(code)
-        detail = warning.get("detail")
-        if not isinstance(detail, dict):
-            detail = {
-                key: value
-                for key, value in warning.items()
-                if key
-                not in {
-                    "code",
-                    "blocking",
-                    "severity",
-                    "message",
-                    "object",
-                    "detail",
-                }
-            }
-        item = {
-            "code": code,
-            "blocking": False,
-            "severity": "warning",
-            "message": str(
-                warning.get("message")
-                or f"Native tessellation recorded {code}"
-            ),
-            "object": str(
-                warning.get("object")
-                or detail.get("component")
-                or detail.get("document")
-                or ""
-            ),
-            "detail": detail,
-        }
-        if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
-            _require(
-                native_scope_warning_diagnostic_is_valid(item),
-                "Native scope warning is missing its object location",
-            )
-        projected.append(item)
+        projected.append(native_scope_warning_projection(warning))
+    scope_projection = [
+        item
+        for item in projected
+        if item["code"] in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
     _require(
-        not scope_codes
-        or scope_codes == NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-        "Native scope warning projection is incomplete",
+        native_scope_warning_details_match(scope_projection, warnings),
+        "Native scope warning projection is incomplete, forged or mismatched",
     )
     return projected
 

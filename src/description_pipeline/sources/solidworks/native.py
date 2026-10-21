@@ -5886,6 +5886,7 @@ class SolidWorksBackend(CadBackend):
         if edge_aliased:
             _require_scope_owner(owner_scope, base)
 
+        mapped_edge_witnesses = {}
         vertex_groups = {}
         for edge_row in edge_rows:
             for order, endpoint_name in enumerate(("start", "end")):
@@ -5954,6 +5955,7 @@ class SolidWorksBackend(CadBackend):
             _require_scope_owner(owner_scope, base)
             vertex_witnesses = get_witness_rows().get("vertex", {})
             edge_witnesses = get_witness_rows().get("edge", {})
+            mapped_edge_witnesses = edge_witnesses
             for vertex_index, (
                 point_bits,
                 coincident_ordinal,
@@ -5981,6 +5983,27 @@ class SolidWorksBackend(CadBackend):
                     edge_index
                     for edge_index, _ in group["occurrences"]
                 })
+                for edge_index in incident_component_edges:
+                    edge_witness = edge_witnesses.get(edge_index)
+                    if (
+                        not isinstance(edge_witness, dict)
+                        or set(edge_witness)
+                        != {
+                            "part_document_sha256",
+                            "part_body_reference_sha256",
+                            "edge_index",
+                            "persistent_reference_sha256",
+                        }
+                    ):
+                        raise CadError(
+                            "cad_scope_witness_unavailable",
+                            "an aliased native vertex has no mapped edge witness",
+                            {
+                                **base,
+                                "vertex_index": vertex_index,
+                                "edge_index": edge_index,
+                            },
+                        )
                 incident_part_edges = sorted(
                     edge_witnesses[edge_index]["edge_index"]
                     for edge_index in incident_component_edges
@@ -6853,6 +6876,20 @@ class SolidWorksBackend(CadBackend):
                         else NATIVE_PERSISTENT_IDENTITY_RULE
                     ),
                     "edge_identity": row.get("identity"),
+                    "mapping_source_edge_index": (
+                        mapped_edge_witnesses.get(
+                            row["index"],
+                            {},
+                        ).get("edge_index")
+                    ),
+                    "mapping_source_edge_persistent_reference_sha256": (
+                        mapped_edge_witnesses.get(
+                            row["index"],
+                            {},
+                        ).get(
+                            "persistent_reference_sha256"
+                        )
+                    ),
                     "start_vertex_reference_sha256": (
                         row["endpoints"]["start"]["reference"]["typed_sha256"]
                         if row["endpoints"]["start"]["reference"] is not None

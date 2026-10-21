@@ -394,6 +394,11 @@ def native_tessellation_fixture(
             NATIVE_PERSISTENT_IDENTITY_RULE,
         )
         edge.setdefault("edge_identity", None)
+        edge.setdefault("mapping_source_edge_index", None)
+        edge.setdefault(
+            "mapping_source_edge_persistent_reference_sha256",
+            None,
+        )
     fixture_triangles = []
     body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
     evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
@@ -749,6 +754,13 @@ def native_tessellation_fixture(
                 ],
                 "edge_identity_mode": edge["edge_identity_mode"],
                 "edge_identity": edge["edge_identity"],
+                "mapping_source_edge_index": edge.get(
+                    "mapping_source_edge_index"
+                ),
+                "mapping_source_edge_persistent_reference_sha256":
+                    edge.get(
+                        "mapping_source_edge_persistent_reference_sha256"
+                    ),
                 "start_vertex_reference_sha256": edge["start_vertex_reference_sha256"],
                 "end_vertex_reference_sha256": edge["end_vertex_reference_sha256"],
                 "start_point_m": [float(value) for value in edge["start_point_m"]],

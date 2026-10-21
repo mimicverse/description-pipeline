@@ -3565,6 +3565,145 @@ class NativeFinCaptureTests(unittest.TestCase):
             "existing_owned_session_no_close",
         )
 
+    def test_vertex_alias_with_persistent_edges_round_trips(self):
+        body, _face_10, _face_20, _edge, _tessellation, extension = (
+            self.fixture()
+        )
+        shared_vertex_reference = hashlib.sha256(
+            b"shared-vertex-reference"
+        ).digest()
+
+        def reference(value):
+            if isinstance(value, FakeVertex):
+                return list(shared_vertex_reference)
+            return list(
+                hashlib.sha256(
+                    f"native-{id(value)}".encode()
+                ).digest()
+            )
+
+        extension.GetPersistReference3 = reference
+        backend = SolidWorksBackend()
+        document_key = object()
+        source_path = Path(__file__).resolve()
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        part_body_reference = hashlib.sha256(
+            b"persistent-edge-part-body"
+        ).hexdigest()
+        edge_witness = {
+            "part_document_sha256": source_sha256,
+            "part_body_reference_sha256": part_body_reference,
+            "edge_index": 0,
+            "persistent_reference_sha256": hashlib.sha256(
+                b"part-edge-0"
+            ).hexdigest(),
+        }
+        backend._source_components = {
+            "part-1": (document_key, "Default")
+        }
+        backend._source_documents = {
+            document_key: (
+                str(source_path),
+                "source",
+                "Default",
+                object(),
+            )
+        }
+        backend._scope_witnesses_override = lambda *_args: {
+            "face": {},
+            "edge": {0: edge_witness},
+            "vertex": {
+                index: {
+                    "part_document_sha256": source_sha256,
+                    "part_body_reference_sha256": part_body_reference,
+                    "vertex_index": index,
+                    "persistent_reference_sha256": hashlib.sha256(
+                        f"part-vertex-{index}".encode()
+                    ).hexdigest(),
+                }
+                for index in range(2)
+            },
+        }
+        backend._captured_document = lambda *_args, **_kwargs: (
+            SimpleNamespace(Extension=extension)
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            destination = Path(directory) / "vertex-alias.stl"
+            entry = backend._write_component_mesh(
+                "part-1",
+                destination,
+                FakeHolder(body),
+            )
+            triangles = self.stl_triangles(destination)
+            native_edge = entry["tessellation"]["native_edges"][0]
+            self.assertIsNone(native_edge["edge_identity"])
+            self.assertEqual(
+                native_edge["mapping_source_edge_index"],
+                0,
+            )
+            self.assertEqual(
+                native_edge[
+                    "mapping_source_edge_persistent_reference_sha256"
+                ],
+                edge_witness["persistent_reference_sha256"],
+            )
+            parse_native_tessellation(
+                "part-1",
+                entry["tessellation"],
+                entry["bodies"],
+                entry["triangles"],
+                triangles,
+            )
+
+            vertex_row = next(
+                row
+                for row in entry["tessellation"]["itessellation"][
+                    "solidworks_vertex_identities"
+                ]
+                if row["identity"] is not None
+            )
+            self.assertEqual(
+                vertex_row["identity"][
+                    "incident_mapped_edge_indices"
+                ],
+                [0],
+            )
+            self.assertEqual(
+                vertex_row["identity"][
+                    "incident_mapped_edge_reference_sha256"
+                ],
+                [edge_witness["persistent_reference_sha256"]],
+            )
+
+            forged = copy.deepcopy(entry["tessellation"])
+            forged_vertex = next(
+                row
+                for row in forged["itessellation"][
+                    "solidworks_vertex_identities"
+                ]
+                if row["identity"] is not None
+            )
+            forged_vertex["identity"][
+                "incident_mapped_edge_reference_sha256"
+            ] = ["0" * 64]
+            forged_vertex["identity_sha256"] = (
+                native_scope_identity_sha256(
+                    forged_vertex["identity"]
+                )
+            )
+            with self.assertRaises(PipelineError):
+                parse_native_tessellation(
+                    "part-1",
+                    forged,
+                    entry["bodies"],
+                    entry["triangles"],
+                    triangles,
+                )
+
     def test_same_kind_edge_alias_uses_mapped_scope_identity(self):
         triangles = []
         spans = []
@@ -3837,6 +3976,14 @@ class NativeFinCaptureTests(unittest.TestCase):
             identity_sha256 = native_scope_identity_sha256(edge_identity)
             edge["edge_identity_mode"] = "native-scope-entity-id-v1"
             edge["edge_identity"] = edge_identity
+            edge["mapping_source_edge_index"] = edge_identity[
+                "mapping_source_edge_index"
+            ]
+            edge[
+                "mapping_source_edge_persistent_reference_sha256"
+            ] = edge_identity[
+                "mapping_source_edge_persistent_reference_sha256"
+            ]
             edge["edge_reference_sha256"] = identity_sha256
             for fin_id in edge["fin_ids"]:
                 fins[fin_id]["edge_reference_sha256"] = identity_sha256

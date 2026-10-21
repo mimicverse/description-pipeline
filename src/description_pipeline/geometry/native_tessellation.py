@@ -1066,6 +1066,8 @@ def parse_native_tessellation(
         "native_edge_reference_sha256",
         "edge_identity_mode",
         "edge_identity",
+        "mapping_source_edge_index",
+        "mapping_source_edge_persistent_reference_sha256",
         "start_vertex_reference_sha256",
         "end_vertex_reference_sha256",
         "start_point_m",
@@ -1106,6 +1108,10 @@ def parse_native_tessellation(
         native_reference = edge["native_edge_reference_sha256"]
         identity_mode = edge["edge_identity_mode"]
         identity = edge["edge_identity"]
+        mapped_source_index = edge["mapping_source_edge_index"]
+        mapped_source_reference = edge[
+            "mapping_source_edge_persistent_reference_sha256"
+        ]
         start_reference = edge["start_vertex_reference_sha256"]
         end_reference = edge["end_vertex_reference_sha256"]
         start_point = edge["start_point_m"]
@@ -1132,6 +1138,18 @@ def parse_native_tessellation(
                 NATIVE_PERSISTENT_IDENTITY_RULE,
                 NATIVE_SCOPE_IDENTITY_RULE,
             }
+            and (
+                (
+                    mapped_source_index is None
+                    and mapped_source_reference is None
+                )
+                or (
+                    _integer(mapped_source_index)
+                    and mapped_source_index >= 0
+                    and isinstance(mapped_source_reference, str)
+                    and bool(HEX64.fullmatch(mapped_source_reference))
+                )
+            )
             and (
                 start_reference is None
                 or (
@@ -1338,6 +1356,12 @@ def parse_native_tessellation(
                     ]["face_identity"]["owner_scope_key"]
                 )
                 and reference == native_scope_identity_sha256(identity)
+                and mapped_source_index
+                == identity["mapping_source_edge_index"]
+                and mapped_source_reference
+                == identity[
+                    "mapping_source_edge_persistent_reference_sha256"
+                ]
                 and identity["topology_signature_sha256"]
                 == expected_topology,
                 component + f": native edge {index} scope identity is invalid",
@@ -2129,15 +2153,44 @@ def _parse_itessellation_evidence(
             (*body_key, row["identity_sha256"])
         )
         if identity is not None:
-            scope_edges_by_source = {
-                (
+            scope_edges_by_source = {}
+            for edge in native_edges:
+                edge_identity = edge["edge_identity"]
+                source_index = (
+                    edge_identity["mapping_source_edge_index"]
+                    if edge_identity is not None
+                    else edge["mapping_source_edge_index"]
+                )
+                source_reference = (
+                    edge_identity[
+                        "mapping_source_edge_persistent_reference_sha256"
+                    ]
+                    if edge_identity is not None
+                    else edge[
+                        "mapping_source_edge_persistent_reference_sha256"
+                    ]
+                )
+                if source_index is None:
+                    _require(
+                        source_reference is None,
+                        component
+                        + ": native edge has a partial part-witness mapping",
+                    )
+                    continue
+                key = (
                     edge["body_type"],
                     edge["body_index"],
-                    edge["edge_identity"]["mapping_source_edge_index"],
-                ): edge
-                for edge in native_edges
-                if edge["edge_identity"] is not None
-            }
+                    source_index,
+                )
+                _require(
+                    key not in scope_edges_by_source,
+                    component
+                    + ": native part edge witness is reused",
+                )
+                scope_edges_by_source[key] = (
+                    edge,
+                    source_reference,
+                )
             incident_edges = []
             for edge_index, edge_reference in zip(
                 identity["incident_mapped_edge_indices"],
@@ -2146,19 +2199,16 @@ def _parse_itessellation_evidence(
                 ],
                 strict=True,
             ):
-                edge = scope_edges_by_source.get(
+                mapped = scope_edges_by_source.get(
                     (*body_key, edge_index)
                 )
                 _require(
-                    edge is not None
-                    and edge["edge_identity"][
-                        "mapping_source_edge_persistent_reference_sha256"
-                    ]
-                    == edge_reference,
+                    mapped is not None
+                    and mapped[1] == edge_reference,
                     component
                     + f": native scope-local vertex {index} names an unknown mapped edge",
                 )
-                incident_edges.append(edge)
+                incident_edges.append(mapped[0])
         else:
             incident_edges = [
                 edge

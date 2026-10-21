@@ -11,6 +11,8 @@ from pathlib import Path
 from description_pipeline.geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_RULE,
+    NATIVE_SCOPE_WARNING_DETAIL_FIELDS,
+    native_scope_warning_details_match,
 )
 from description_pipeline.io import PipelineError, write_json
 from description_pipeline.orchestration.portal import (
@@ -30,8 +32,7 @@ def raw_warnings() -> list[dict]:
 
     warnings = []
     for code in sorted(NATIVE_SCOPE_IDENTITY_WARNING_CODES):
-        warnings.append(
-            {
+        row = {
                 "code": code,
                 "component": "part-1",
                 "entity_kind": "face",
@@ -57,12 +58,36 @@ def raw_warnings() -> list[dict]:
                 "topology_signature_sha256s": ["1" * 64, "2" * 64],
                 "object": "part-1:face:0/1",
             }
-        )
+        row["detail"] = {
+            key: row[key]
+            for key in NATIVE_SCOPE_WARNING_DETAIL_FIELDS
+        }
+        warnings.append(row)
     return warnings
 
 
 def diagnostics() -> list[dict]:
     return native_gate_warning_diagnostics({"warnings": raw_warnings()})
+
+
+def quality_report(
+    rows: list[dict] | None = None,
+    raw: list[dict] | None = None,
+) -> dict:
+    return {
+        "checks": [
+            {
+                "id": "geometry.native_tessellation",
+                "state": "passed",
+                "passed": True,
+                "details": {
+                    "warnings": raw_warnings() if raw is None else raw,
+                },
+            }
+        ],
+        "diagnostics": diagnostics() if rows is None else rows,
+        "qualifications": [],
+    }
 
 
 class NativeScopeWarningProjectionTests(unittest.TestCase):
@@ -90,9 +115,92 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             native_gate_warning_diagnostics(partial)
 
         unlocated = copy.deepcopy(raw_warnings())
-        unlocated[0].pop("owner_scope_key")
-        with self.assertRaisesRegex(PipelineError, "object location"):
+        unlocated[0]["detail"].pop("owner_scope_key")
+        with self.assertRaisesRegex(PipelineError, "incomplete"):
             native_gate_warning_diagnostics({"warnings": unlocated})
+
+        for missing in (
+            "native_reference_sha256",
+            "source_document_sha256",
+            "mapping_source_part_document_sha256",
+            "mapping_source_body_reference_sha256",
+            "mapped_source_indices",
+            "mapped_source_persistent_reference_sha256",
+            "topology_signature_sha256s",
+        ):
+            malformed = copy.deepcopy(raw_warnings())
+            malformed[0]["detail"].pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(PipelineError):
+                native_gate_warning_diagnostics({"warnings": malformed})
+
+        for field, value in (
+            ("object_indices", []),
+            ("mapped_source_indices", []),
+            ("mapped_source_persistent_reference_sha256", []),
+            ("topology_signature_sha256s", []),
+            ("mapped_source_indices", [0]),
+        ):
+            malformed = copy.deepcopy(raw_warnings())
+            malformed[0]["detail"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(
+                PipelineError
+            ):
+                native_gate_warning_diagnostics({"warnings": malformed})
+
+        blocking = copy.deepcopy(raw_warnings())
+        blocking[0]["blocking"] = True
+        with self.assertRaises(PipelineError):
+            native_gate_warning_diagnostics({"warnings": blocking})
+
+        duplicate = [*raw_warnings(), copy.deepcopy(raw_warnings()[0])]
+        with self.assertRaises(PipelineError):
+            native_gate_warning_diagnostics({"warnings": duplicate})
+
+    def test_each_owner_group_requires_all_four_identical_warning_codes(
+        self,
+    ) -> None:
+        first = raw_warnings()
+        second = copy.deepcopy(first)
+        for row in second:
+            row["owner_scope_key"] = "9" * 64
+            row["object_indices"] = [4, 5]
+            row["mapped_source_indices"] = [4, 5]
+            row["mapped_source_persistent_reference_sha256"] = [
+                "7" * 64,
+                "8" * 64,
+            ]
+            row["topology_signature_sha256s"] = [
+                "3" * 64,
+                "4" * 64,
+            ]
+            row["detail"] = {
+                key: row[key]
+                for key in NATIVE_SCOPE_WARNING_DETAIL_FIELDS
+            }
+            row["object"] = "part-1:face:0/1"
+        raw = [*first, *second]
+        projected = native_gate_warning_diagnostics({"warnings": raw})
+        self.assertEqual(len(projected), 8)
+        self.assertTrue(
+            native_scope_warning_details_match(projected, raw)
+        )
+        self.assertFalse(
+            native_scope_warning_details_match(projected[:4], raw)
+        )
+        partial_quality = quality_report(projected[:4], raw)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(
+                root / "reports/quality.json",
+                partial_quality,
+            )
+            structural = build_structural_report({}, evidence_root=root)
+        self.assertIn(
+            "report.native_identity_warning_invalid",
+            {row["code"] for row in structural["findings"]},
+        )
+        with self.assertRaises(PortalError):
+            _quality_warnings(partial_quality)
 
     def test_unique_persistent_path_emits_no_scope_warning(self) -> None:
         self.assertEqual(
@@ -104,11 +212,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         self,
     ) -> None:
         rows = diagnostics()
-        quality = {
-            "checks": [],
-            "diagnostics": rows,
-            "qualifications": [],
-        }
+        quality = quality_report(rows)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -155,6 +259,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             {"id": "verify", "name": "Verify"},
             [],
             [{"raw_details": {"warnings": raw_warnings()}}],
+            rows,
         )
         self.assertEqual(
             {row["code"] for row in view},
@@ -186,11 +291,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             root = Path(temporary)
             write_json(
                 root / "reports/quality.json",
-                {
-                    "checks": [],
-                    "diagnostics": forged,
-                    "qualifications": [],
-                },
+                quality_report(forged),
             )
             structural = build_structural_report({}, evidence_root=root)
         self.assertIn(
@@ -198,7 +299,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             {row["code"] for row in structural["findings"]},
         )
 
-        quality = {"diagnostics": forged}
+        quality = quality_report(forged)
         with self.assertRaises(PortalError):
             _quality_warnings(quality)
         with self.assertRaisesRegex(PipelineError, "incomplete or forged"):
@@ -211,6 +312,55 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
 
         encoded = json.dumps(forged, sort_keys=True)
         self.assertIn("part-1:face:0/9", encoded)
+
+    def test_report_view_rejects_orphan_groups_and_partial_fields(self) -> None:
+        first = raw_warnings()
+        second = copy.deepcopy(first)
+        for row in second:
+            row["owner_scope_key"] = "9" * 64
+            row["object_indices"] = [4, 5]
+            row["mapped_source_indices"] = [4, 5]
+            row["mapped_source_persistent_reference_sha256"] = [
+                "7" * 64,
+                "8" * 64,
+            ]
+            row["topology_signature_sha256s"] = [
+                "3" * 64,
+                "4" * 64,
+            ]
+            row["detail"] = {
+                key: row[key]
+                for key in NATIVE_SCOPE_WARNING_DETAIL_FIELDS
+            }
+        raw = [*first, *second]
+        complete = native_gate_warning_diagnostics({"warnings": raw})
+        with self.assertRaisesRegex(PipelineError, "differ"):
+            _recorded_warnings(
+                {"id": "verify", "name": "Verify"},
+                [],
+                [{"raw_details": {"warnings": raw}}],
+                complete[:4],
+            )
+
+        missing = copy.deepcopy(raw)
+        missing[0]["detail"].pop("topology_signature_sha256s")
+        forged = copy.deepcopy(complete)
+        forged[0]["detail"].pop("topology_signature_sha256s")
+        with self.assertRaisesRegex(PipelineError, "differ"):
+            _recorded_warnings(
+                {"id": "verify", "name": "Verify"},
+                [],
+                [{"raw_details": {"warnings": missing}}],
+                forged,
+            )
+
+        with self.assertRaisesRegex(PipelineError, "differ"):
+            _recorded_warnings(
+                {"id": "verify", "name": "Verify"},
+                [],
+                [{"raw_details": {"warnings": first}}],
+                complete[:1],
+            )
 
 
 if __name__ == "__main__":
