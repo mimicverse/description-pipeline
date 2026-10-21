@@ -7,6 +7,7 @@ Failures raise stable error codes and only owned process trees are reclaimed.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import math
 import ntpath
@@ -21,6 +22,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from ...schemas import NATIVE_TESSELLATION_SCHEMA
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
 from .session_artifacts import (
@@ -61,6 +63,8 @@ IMATE2_IID = "{B09D234A-7581-408E-B3B3-FC0A514AAFA8}"
 IMATEENTITY2_IID = "{CE7FE69D-BCFA-441F-A37D-E740546458A4}"
 IBODY2_IID = "{3A075BFD-9962-4431-8321-7AF4903C55AD}"
 IFACE2_IID = "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}"
+IEDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
+IVERTEX_IID = "{83A33D63-27C5-11CE-BFD4-00400513BB57}"
 ISURFACE_IID = "{83A33D40-27C5-11CE-BFD4-00400513BB57}"
 ICURVE_IID = "{83A33D44-27C5-11CE-BFD4-00400513BB57}"
 IMATHTRANSFORM_IID = "{F7D97F82-162E-11D4-AEAB-00C04FA0AC51}"
@@ -83,6 +87,8 @@ RETURN_VIEWS = {
     "MateEntity": IMATEENTITY2_IID,
     "GetSurface": ISURFACE_IID,
     "GetCurve": ICURVE_IID,
+    "GetStartVertex": IVERTEX_IID,
+    "GetEndVertex": IVERTEX_IID,
     "GetTotalTransform": IMATHTRANSFORM_IID,
     "OpenDoc6": IMODELDOC2_IID,
 }
@@ -91,6 +97,7 @@ RETURN_VIEWS = {
 RETURN_ARRAY_VIEWS = {
     "GetBodies2": IBODY2_IID,
     "GetFaces": IFACE2_IID,
+    "GetEdges": IEDGE_IID,
 }
 
 
@@ -145,6 +152,18 @@ def _modeldoc2(value):
 def _partdoc(value):
     """Bind a part document dispatch to the IPartDoc domain interface."""
     return _interface(value, IPARTDOC_IID)
+
+
+def _edge(value):
+    """Bind a native edge to its published IEdge interface."""
+
+    return _interface(value, IEDGE_IID)
+
+
+def _vertex(value):
+    """Bind a native vertex to its published IVertex interface."""
+
+    return _interface(value, IVERTEX_IID)
 
 
 def _assemblydoc(value):
@@ -4096,8 +4115,15 @@ class SolidWorksBackend(CadBackend):
         """
 
         values: list[float] = []
-        evidence = {"faces": 0, "no_facets_faces": []}
+        evidence = {
+            "schema_version": NATIVE_TESSELLATION_SCHEMA,
+            "faces": 0,
+            "face_spans": [],
+            "native_edges": [],
+            "no_facets_faces": [],
+        }
         completed_faces = 0
+        native_edges: dict[str, dict] = {}
         for index, raw_body in enumerate(bodies):
             body = _dynamic(raw_body)
             body_values: list[float] = []
@@ -4116,13 +4142,65 @@ class SolidWorksBackend(CadBackend):
                     "the occurrence body's faces could not be read",
                     {**context, "api": "IBody2.GetFaces", "error": str(error)},
                 ) from error
+            if not faces:
+                raise CadError(
+                    "cad_mesh_export_failed",
+                    "a native body carries no faces",
+                    {**context, "api": "IBody2.GetFaces"},
+                )
+            body_name = _member(body, "Name")
+            if not isinstance(body_name, str) or not body_name.strip():
+                raise CadError(
+                    "cad_mesh_export_failed",
+                    "a native body carries no stable authored name",
+                    context,
+                )
+            body_reference_sha256 = self._required_persist_reference_sha256(
+                body,
+                context={**context, "identity_kind": "body"},
+            )
+            body_triangle_start = len(body_values) // 9
+            face_count = len(faces)
             for face_index, raw_face in enumerate(faces):
                 face = _dynamic(raw_face)
                 evidence["faces"] += 1
                 read_state = {"face": face}
+                face_reference_sha256 = self._required_persist_reference_sha256(
+                    face,
+                    context={
+                        **context,
+                        "face_index": face_index,
+                        "identity_kind": "face",
+                    },
+                )
+                face_edge_references = self._capture_face_edges(
+                    face,
+                    native_edges,
+                    body_type=body_type,
+                    body_index=index,
+                    face_index=face_index,
+                    context=context,
+                )
 
-                def _read_face_values(body=body, face_index=face_index, read_state=read_state) -> list[float]:
+                def _read_face_values(
+                    body=body,
+                    context=context,
+                    expected_face_count=face_count,
+                    face_index=face_index,
+                    read_state=read_state,
+                ) -> list[float]:
                     fresh_faces = _as_list(_member(body, "GetFaces"))
+                    if len(fresh_faces) != expected_face_count:
+                        raise CadError(
+                            "cad_face_identity_changed",
+                            "the native face inventory changed during tessellation",
+                            {
+                                **context,
+                                "face_index": face_index,
+                                "expected_face_count": expected_face_count,
+                                "actual_face_count": len(fresh_faces),
+                            },
+                        )
                     if len(fresh_faces) > face_index:
                         read_state["face"] = _dynamic(fresh_faces[face_index])
                     return list(map(float, _member(read_state["face"], "GetTessTriangles", True) or ()))
@@ -4134,6 +4212,8 @@ class SolidWorksBackend(CadBackend):
                         delays=FACE_READ_RETRY_DELAYS,
                     )
                     face = read_state["face"]
+                except CadError:
+                    raise
                 except Exception as error:
                     raise CadError(
                         "cad_face_tessellation_unreadable",
@@ -4146,6 +4226,25 @@ class SolidWorksBackend(CadBackend):
                             "error": str(error),
                         },
                     ) from error
+                current_face_reference_sha256 = self._required_persist_reference_sha256(
+                    face,
+                    context={
+                        **context,
+                        "face_index": face_index,
+                        "identity_kind": "face",
+                    },
+                )
+                if current_face_reference_sha256 != face_reference_sha256:
+                    raise CadError(
+                        "cad_face_identity_changed",
+                        "the native face identity changed during tessellation",
+                        {
+                            **context,
+                            "face_index": face_index,
+                            "expected_reference_sha256": face_reference_sha256,
+                            "actual_reference_sha256": current_face_reference_sha256,
+                        },
+                    )
                 if not face_values or len(face_values) % 9 or not all(map(math.isfinite, face_values)):
                     classification = (
                         "empty"
@@ -4237,6 +4336,20 @@ class SolidWorksBackend(CadBackend):
                                 "used_api": FACETLESS_EVIDENCE_API,
                             }
                         evidence["no_facets_faces"].append(row)
+                        evidence["face_spans"].append(
+                            {
+                                "body_type": body_type,
+                                "body_index": index,
+                                "body_name": body_name,
+                                "body_reference_sha256": body_reference_sha256,
+                                "face_index": face_index,
+                                "face_reference_sha256": face_reference_sha256,
+                                "edge_references": face_edge_references,
+                                "triangle_start": body_triangle_start + len(body_values) // 9,
+                                "triangle_count": 0,
+                                "triangle_records_sha256": hashlib.sha256(b"").hexdigest(),
+                            }
+                        )
                         completed_faces += 1
                         continue
                     raise CadError(
@@ -4254,6 +4367,22 @@ class SolidWorksBackend(CadBackend):
                             "facetless_error": facetless_error,
                         },
                     )
+                triangle_start = body_triangle_start + len(body_values) // 9
+                triangle_count = len(face_values) // 9
+                evidence["face_spans"].append(
+                    {
+                        "body_type": body_type,
+                        "body_index": index,
+                        "body_name": body_name,
+                        "body_reference_sha256": body_reference_sha256,
+                        "face_index": face_index,
+                        "face_reference_sha256": face_reference_sha256,
+                        "edge_references": face_edge_references,
+                        "triangle_start": triangle_start,
+                        "triangle_count": triangle_count,
+                        "triangle_records_sha256": None,
+                    }
+                )
                 body_values.extend(face_values)
                 completed_faces += 1
             if not body_values:
@@ -4268,7 +4397,185 @@ class SolidWorksBackend(CadBackend):
                         {"component": component, "body_type": body_type, "body_index": index},
                     )
             values.extend(body_values)
+            if (
+                self._required_persist_reference_sha256(
+                    body,
+                    context={**context, "identity_kind": "body"},
+                )
+                != body_reference_sha256
+            ):
+                raise CadError(
+                    "cad_body_identity_changed",
+                    "the native body identity changed during tessellation",
+                    context,
+                )
+        evidence["native_edges"] = sorted(
+            native_edges.values(),
+            key=lambda row: (row["body_type"], row["body_index"], row["edge_reference_sha256"]),
+        )
+        body_identities = {
+            (span["body_type"], span["body_index"]): span["body_reference_sha256"]
+            for span in evidence["face_spans"]
+        }
+        face_identities = {
+            span["face_reference_sha256"]
+            for span in evidence["face_spans"]
+        }
+        edge_identities = set(native_edges)
+        if (
+            set(body_identities.values()) & face_identities
+            or set(body_identities.values()) & edge_identities
+            or face_identities & edge_identities
+        ):
+            raise CadError(
+                "cad_persistent_reference_type_conflict",
+                "native body, face and edge persistent references alias",
+                {"component": component, "body_type": body_type},
+            )
         return values, evidence
+
+    def _capture_face_edges(
+        self,
+        face,
+        native_edges: dict[str, dict],
+        *,
+        body_type: int,
+        body_index: int,
+        face_index: int,
+        context: dict,
+    ) -> list[str]:
+        try:
+            edges = _as_list(_member(face, "GetEdges"))
+        except Exception as error:
+            raise CadError(
+                "cad_face_edge_evidence_unavailable",
+                "a native face's edges could not be read",
+                {**context, "face_index": face_index, "error": str(error)},
+            ) from error
+        references = []
+        for edge_index, raw_edge in enumerate(edges):
+            edge = _edge(_dynamic(raw_edge))
+            edge_reference = self._required_persist_reference_sha256(
+                edge,
+                context={
+                    **context,
+                    "face_index": face_index,
+                    "edge_index": edge_index,
+                    "identity_kind": "edge",
+                },
+            )
+            try:
+                start = _vertex(_dynamic(_member(edge, "GetStartVertex")))
+                end = _vertex(_dynamic(_member(edge, "GetEndVertex")))
+                start_point = [float(value) for value in (_as_list(_method(start, "GetPoint")) or [])]
+                end_point = [float(value) for value in (_as_list(_method(end, "GetPoint")) or [])]
+            except Exception as error:
+                raise CadError(
+                    "cad_edge_vertex_evidence_unavailable",
+                    "a native edge's endpoints could not be read",
+                    {**context, "face_index": face_index, "edge_index": edge_index, "error": str(error)},
+                ) from error
+            if (
+                len(start_point) != 3
+                or len(end_point) != 3
+                or not all(map(math.isfinite, (*start_point, *end_point)))
+            ):
+                raise CadError(
+                    "cad_edge_vertex_evidence_unavailable",
+                    "a native edge endpoint is malformed",
+                    {**context, "face_index": face_index, "edge_index": edge_index},
+                )
+            start_reference = self._required_persist_reference_sha256(
+                start,
+                context={
+                    **context,
+                    "face_index": face_index,
+                    "edge_index": edge_index,
+                    "identity_kind": "start_vertex",
+                },
+            )
+            end_reference = self._required_persist_reference_sha256(
+                end,
+                context={
+                    **context,
+                    "face_index": face_index,
+                    "edge_index": edge_index,
+                    "identity_kind": "end_vertex",
+                },
+            )
+            row = {
+                "body_type": body_type,
+                "body_index": body_index,
+                "edge_reference_sha256": edge_reference,
+                "start_vertex_reference_sha256": start_reference,
+                "end_vertex_reference_sha256": end_reference,
+                "start_point_m": start_point,
+                "end_point_m": end_point,
+                "face_indices": [face_index],
+            }
+            previous = native_edges.get(edge_reference)
+            if previous is None:
+                native_edges[edge_reference] = row
+            else:
+                same_endpoints = {
+                    previous["start_vertex_reference_sha256"],
+                    previous["end_vertex_reference_sha256"],
+                } == {start_reference, end_reference}
+                same_points = {
+                    tuple(previous["start_point_m"]),
+                    tuple(previous["end_point_m"]),
+                } == {tuple(start_point), tuple(end_point)}
+                if (
+                    previous["body_type"] != body_type
+                    or previous["body_index"] != body_index
+                    or not same_endpoints
+                    or not same_points
+                ):
+                    raise CadError(
+                        "cad_edge_identity_conflict",
+                        "a native edge persistent reference changed its binding",
+                        {**context, "face_index": face_index, "edge_reference_sha256": edge_reference},
+                    )
+                previous["face_indices"].append(face_index)
+            references.append(edge_reference)
+        if len(references) != len(set(references)):
+            raise CadError(
+                "cad_edge_identity_conflict",
+                "a native face repeats an edge reference",
+                {**context, "face_index": face_index},
+            )
+        return sorted(references)
+
+    def _required_persist_reference_sha256(self, entity, *, context: dict) -> str:
+        try:
+            reference = self._persist_reference(entity)
+        except Exception as error:  # noqa: BLE001 - identity absence is fatal evidence
+            raise CadError(
+                "cad_persistent_reference_unavailable",
+                "a native body or face has no persistent identity",
+                {**context, "error": str(error)},
+            ) from error
+        if not isinstance(reference, str) or not reference:
+            raise CadError(
+                "cad_persistent_reference_unavailable",
+                "a native body or face has no persistent identity",
+                context,
+            )
+        try:
+            blob = base64.b64decode(reference, validate=True)
+        except (TypeError, ValueError) as error:
+            raise CadError(
+                "cad_persistent_reference_unavailable",
+                "a native body or face persistent identity is malformed",
+                context,
+            ) from error
+        if not blob:
+            raise CadError(
+                "cad_persistent_reference_unavailable",
+                "a native body or face persistent identity is empty",
+                context,
+            )
+        return hashlib.sha256(blob).hexdigest()
 
     def export_component_meshes(self, destinations, on_activity=None):
         """Keep one live assembly traversal through the entire geometry batch.
@@ -4319,7 +4626,13 @@ class SolidWorksBackend(CadBackend):
         sources: list[str] = []
         values: list[float] = []
         body_counts = {"solid": 0, "sheet": 0}
-        tessellation = {"faces": 0, "no_facets_faces": []}
+        tessellation = {
+            "schema_version": NATIVE_TESSELLATION_SCHEMA,
+            "faces": 0,
+            "face_spans": [],
+            "native_edges": [],
+            "no_facets_faces": [],
+        }
         for body_type, kind, source in (
             (0, "solid", "solid_body_faces"),
             (1, "sheet", "sheet_body_faces"),
@@ -4328,9 +4641,18 @@ class SolidWorksBackend(CadBackend):
             body_counts[kind] = len(bodies)
             if bodies:
                 body_values, body_evidence = self._body_face_triangles(bodies, body_type, component)
+                triangle_offset = len(values) // 9
                 values.extend(body_values)
                 sources.append(source)
                 tessellation["faces"] += body_evidence["faces"]
+                tessellation["native_edges"].extend(body_evidence["native_edges"])
+                for span in body_evidence["face_spans"]:
+                    tessellation["face_spans"].append(
+                        {
+                            **span,
+                            "triangle_start": span["triangle_start"] + triangle_offset,
+                        }
+                    )
                 tessellation["no_facets_faces"].extend(body_evidence["no_facets_faces"])
         if not values:
             raise CadError(
@@ -4361,6 +4683,7 @@ class SolidWorksBackend(CadBackend):
                 if size == 0:
                     raise CadError("cad_mesh_degenerate", component)
                 handle.write(struct.pack("<12fH", *(t / size for t in n), *xyz, 0))
+        self._fill_face_span_digests(dest_path, tessellation["face_spans"])
         # The count already written into the header is the writer's own
         # tessellation count; no reader pass is needed (the Linux verifier
         # parses the delivered bytes and owns all mesh quality checks).
@@ -4383,10 +4706,35 @@ class SolidWorksBackend(CadBackend):
             "tessellation_sources": sources,
             "bodies": body_counts,
             "tessellation": {
+                "schema_version": tessellation["schema_version"],
                 "faces": tessellation["faces"],
+                "face_spans": tessellation["face_spans"],
+                "native_edges": tessellation["native_edges"],
                 "no_facets_faces": tessellation["no_facets_faces"],
             },
         }
+
+    def _fill_face_span_digests(self, path, spans: list[dict]) -> None:
+        with open(path, "rb") as handle:
+            for span in spans:
+                start = int(span["triangle_start"])
+                count = int(span["triangle_count"])
+                handle.seek(84 + 50 * start)
+                payload = handle.read(50 * count)
+                if len(payload) != 50 * count:
+                    raise CadError(
+                        "cad_mesh_export_failed",
+                        "a face span escapes the native STL record stream",
+                        {
+                            "path": str(path),
+                            "body_type": span["body_type"],
+                            "body_index": span["body_index"],
+                            "face_index": span["face_index"],
+                            "triangle_start": start,
+                            "triangle_count": count,
+                        },
+                    )
+                span["triangle_records_sha256"] = hashlib.sha256(payload).hexdigest()
 
     def _record_source_document(self, path, configuration, *, session_document=False):
         role = self._role_for_path(path)

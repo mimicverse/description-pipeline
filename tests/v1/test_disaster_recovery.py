@@ -199,8 +199,29 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         },
         "state_sha256": recovery._digest_document(state),
         "state": state,
+        "remote_cleanup": {
+            "attempted": True,
+            "passed": True,
+            "remote_dir": "C:/description/state/recovery/snapshot/windows-fixture",
+        },
     }
     return block, state
+
+
+def windows_snapshot_receipt(*, remote_cleanup: dict | None = None) -> dict:
+    return {
+        "passed": True,
+        "verb": "recovery-snapshot",
+        "task_state": "Disabled",
+        "endpoint": "stopped",
+        "cad_ownership": "free",
+        "remote_cleanup": remote_cleanup
+        or {
+            "attempted": True,
+            "passed": True,
+            "remote_dir": "C:/description/state/recovery/snapshot/windows-fixture",
+        },
+    }
 
 
 def fake_capture_windows_recovery(context, *, backup_id, staging, commands):
@@ -2881,6 +2902,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     "endpoint": "stopped",
                     "cad_ownership": "free",
                     "state_sha256": manifest["windows"]["state_sha256"],
+                    "remote_cleanup": {
+                        "attempted": True,
+                        "passed": True,
+                        "remote_dir": "C:/description/state/recovery/restore/windows-fixture",
+                    },
                 },
             ),
             self.assertRaises(recovery.RecoveryError) as raised,
@@ -2936,13 +2962,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         with mock.patch.object(
             recovery,
             "_transfer_windows_recovery",
-            return_value={
-                "passed": True,
-                "verb": "recovery-snapshot",
-                "task_state": "Disabled",
-                "endpoint": "stopped",
-                "cad_ownership": "free",
-            },
+            return_value=windows_snapshot_receipt(),
         ):
             captured = self.real_capture_windows_recovery(
                 self.context,
@@ -2955,6 +2975,35 @@ class RecoveryControlFlowTests(unittest.TestCase):
             expected["bundle"]["sha256"],
         )
         self.assertEqual(captured["state"], expected["state"])
+        self.assertEqual(captured["remote_cleanup"], expected["remote_cleanup"])
+
+    def test_windows_snapshot_carries_cleanup_residual_into_the_manifest_block(self) -> None:
+        staging = self.root / "windows-snapshot-cleanup-staging"
+        staging.mkdir()
+        windows_recovery_fixture(self.context, staging)
+        residual = {
+            "attempted": True,
+            "passed": False,
+            "remote_dir": "C:/description/state/recovery/snapshot/windows-fixture",
+            "ownership_marker": (
+                "C:/description/state/recovery/snapshot/windows-fixture/.recovery-owner"
+            ),
+            "code": "windows_recovery_transport_unknown",
+            "message": "fixture cleanup failed",
+            "detail": {"stderr_sha256": "0" * 64},
+        }
+        with mock.patch.object(
+            recovery,
+            "_transfer_windows_recovery",
+            return_value=windows_snapshot_receipt(remote_cleanup=residual),
+        ):
+            captured = self.real_capture_windows_recovery(
+                self.context,
+                backup_id="windows-snapshot-cleanup",
+                staging=staging,
+                commands=[],
+            )
+        self.assertEqual(captured["remote_cleanup"], residual)
 
     def test_windows_snapshot_refuses_a_tampered_member_before_acceptance(self) -> None:
         staging = self.root / "windows-tampered-staging"
@@ -2973,13 +3022,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             mock.patch.object(
                 recovery,
                 "_transfer_windows_recovery",
-                return_value={
-                    "passed": True,
-                    "verb": "recovery-snapshot",
-                    "task_state": "Disabled",
-                    "endpoint": "stopped",
-                    "cad_ownership": "free",
-                },
+                return_value=windows_snapshot_receipt(),
             ),
             self.assertRaises(recovery.RecoveryError) as raised,
         ):
@@ -3019,13 +3062,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             mock.patch.object(
                 recovery,
                 "_transfer_windows_recovery",
-                return_value={
-                    "passed": True,
-                    "verb": "recovery-snapshot",
-                    "task_state": "Disabled",
-                    "endpoint": "stopped",
-                    "cad_ownership": "free",
-                },
+                return_value=windows_snapshot_receipt(),
             ),
             self.assertRaises(recovery.RecoveryError) as raised,
         ):
@@ -3098,13 +3135,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             mock.patch.object(
                 recovery,
                 "_transfer_windows_recovery",
-                return_value={
-                    "passed": True,
-                    "verb": "recovery-snapshot",
-                    "task_state": "Disabled",
-                    "endpoint": "stopped",
-                    "cad_ownership": "free",
-                },
+                return_value=windows_snapshot_receipt(),
             ),
             self.assertRaises(recovery.RecoveryError) as raised,
         ):

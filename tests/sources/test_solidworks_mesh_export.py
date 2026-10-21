@@ -13,6 +13,7 @@ from unittest.mock import patch
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.geometry.stl import read as read_stl  # noqa: E402
+from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA  # noqa: E402
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     FACE_READ_RETRY_ATTEMPTS,
@@ -22,8 +23,40 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
 TRIANGLE = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
+class FakeVertex:
+    def __init__(self, point, reference):
+        self._point = list(point)
+        self._persist_reference = reference
+
+    def GetPoint(self):  # noqa: N802 - SolidWorks API name
+        return list(self._point)
+
+
+class FakeEdge:
+    def __init__(self, reference, start, end):
+        self._persist_reference = reference
+        self._start = FakeVertex(start, reference + b"-start")
+        self._end = FakeVertex(end, reference + b"-end")
+
+    def GetStartVertex(self):  # noqa: N802 - SolidWorks API name
+        return self._start
+
+    def GetEndVertex(self):  # noqa: N802 - SolidWorks API name
+        return self._end
+
+
 class FakeFace:
-    def __init__(self, triangles, surface=None, feature="shaft", triangle_count=None, area=0.0):
+    _next_reference = 1
+
+    def __init__(
+        self,
+        triangles,
+        surface=None,
+        feature="shaft",
+        triangle_count=None,
+        area=0.0,
+        edges=None,
+    ):
         self._triangles = triangles
         self._surface = surface
         self.Name = "Face3"
@@ -32,6 +65,9 @@ class FakeFace:
         # evidence-type rejection (a boolean is not an integer count or area).
         self._triangle_count = triangle_count if triangle_count is not None else len(list(triangles)) // 9
         self._area = area
+        self._edges = list(edges or ())
+        self._persist_reference = b"face-" + FakeFace._next_reference.to_bytes(8, "little")
+        FakeFace._next_reference += 1
 
     def GetTessTriangles(self, flag):  # noqa: N802 - SolidWorks API name
         return list(self._triangles)
@@ -48,6 +84,9 @@ class FakeFace:
     def GetArea(self):  # noqa: N802 - SolidWorks API name
         return self._area
 
+    def GetEdges(self):  # noqa: N802 - SolidWorks API name
+        return list(self._edges)
+
 
 class FakeSurface:
     def __init__(self, params):
@@ -55,8 +94,13 @@ class FakeSurface:
 
 
 class FakeBody:
-    def __init__(self, faces):
+    _next_reference = 1
+
+    def __init__(self, faces, *, name: str | None = None):
         self._faces = faces
+        self.Name = name or f"Body{FakeBody._next_reference}"
+        self._persist_reference = b"body-" + FakeBody._next_reference.to_bytes(8, "little")
+        FakeBody._next_reference += 1
 
     def GetFaces(self):  # noqa: N802 - SolidWorks API name
         return list(self._faces)
@@ -82,8 +126,8 @@ class FakeTessellation:
 
 
 class FakeTessellationBody(FakeBody):
-    def __init__(self, faces, tessellation):
-        super().__init__(faces)
+    def __init__(self, faces, tessellation, *, name: str | None = None):
+        super().__init__(faces, name=name)
         self._tessellation = tessellation
 
     def GetTessellation(self):  # noqa: N802 - SolidWorks API name
@@ -186,6 +230,11 @@ def _backend(component, name="pcb-1") -> SolidWorksBackend:
         ),
         IsOpenedReadOnly=True,
         GetPathName=lambda: path,
+        Extension=SimpleNamespace(
+            GetPersistReference3=lambda item: list(
+                getattr(item, "_persist_reference", b"missing-persistent-reference")
+            )
+        ),
     )
     backend._sessions["source"] = SimpleNamespace(
         app=SimpleNamespace(GetOpenDocumentByName=lambda _path: doc),
@@ -219,6 +268,37 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
         self.assertIn("GetBodies2(1)", entry["used_api"])
         self.assertEqual(read_stl(self.dest).triangles, 1)
+
+    def test_native_face_spans_carry_shared_edge_incidence(self):
+        shared = FakeEdge(
+            b"shared-native-edge",
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+        )
+        component = FakeComponent(
+            FakeDocument([]),
+            {
+                0: [],
+                1: [
+                    FakeBody(
+                        [
+                            FakeFace(TRIANGLE, edges=[shared]),
+                            FakeFace(TRIANGLE, edges=[shared]),
+                        ],
+                        name="fixture-sheet",
+                    )
+                ],
+            },
+        )
+        entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
+        spans = entry["tessellation"]["face_spans"]
+        edges = entry["tessellation"]["native_edges"]
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(spans[0]["edge_references"], spans[1]["edge_references"])
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["face_indices"], [0, 1])
+        self.assertEqual(edges[0]["start_point_m"], [0.0, 0.0, 0.0])
+        self.assertEqual(edges[0]["end_point_m"], [1.0, 0.0, 0.0])
 
     def test_export_emits_component_progress_and_survives_a_failing_callback(self):
         component = FakeComponent(
@@ -815,7 +895,32 @@ class NoFullScanExportTests(unittest.TestCase):
                 entries = {}
                 for component, destination in destinations.items():
                     Path(destination).write_bytes(payload)
-                    entries[component] = {"component": component, "written": destination, "used_api": "fixture"}
+                    entries[component] = {
+                        "component": component,
+                        "written": destination,
+                        "used_api": "fixture",
+                        "bodies": {"solid": 1, "sheet": 0},
+                        "tessellation": {
+                            "schema_version": NATIVE_TESSELLATION_SCHEMA,
+                            "faces": 1,
+                            "face_spans": [
+                                {
+                                    "body_type": 0,
+                                    "body_index": 0,
+                                    "body_name": "fixture",
+                                    "body_reference_sha256": "1" * 64,
+                                    "face_index": 0,
+                                    "face_reference_sha256": "2" * 64,
+                                    "edge_references": [],
+                                    "triangle_start": 0,
+                                    "triangle_count": 2,
+                                    "triangle_records_sha256": hashlib.sha256(payload[84:]).hexdigest(),
+                                }
+                            ],
+                            "native_edges": [],
+                            "no_facets_faces": [],
+                        },
+                    }
                 return entries
 
         with tempfile.TemporaryDirectory() as tmp:

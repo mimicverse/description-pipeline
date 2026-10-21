@@ -1,11 +1,13 @@
 """The generated team report retains evidence on both successful and failed runs."""
 
+import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
 from description_pipeline.io import file_digest, write_json
+from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.structural_report import write_structural_report
 
 
@@ -750,16 +752,60 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("cad_surface_only_effective_instance", codes)
 
     def _geometry_list(self, rows):
+        def span(body_type, body_index, face_index, start, count):
+            return {
+                "body_type": body_type,
+                "body_index": body_index,
+                "body_name": f"Body{body_type}-{body_index}",
+                "body_reference_sha256": hashlib.sha256(
+                    f"body-{body_type}-{body_index}".encode()
+                ).hexdigest(),
+                "face_index": face_index,
+                "face_reference_sha256": hashlib.sha256(
+                    f"face-{body_type}-{body_index}-{face_index}".encode()
+                ).hexdigest(),
+                "edge_references": [],
+                "triangle_start": start,
+                "triangle_count": count,
+                "triangle_records_sha256": "0" * 64,
+            }
+
+        solid_spans = [
+            span(0, body, face, body * 4 + face, 1)
+            for body in range(3)
+            for face in range(4)
+        ]
+        sheet_spans = [
+            span(1, body, 0, body, 1)
+            for body in range(5)
+        ] + [
+            span(1, 5, face, 5, 0)
+            for face in range(len(rows))
+        ]
         return [
             {
                 "component": "arm-1",
+                "triangles": 12,
                 "bodies": {"solid": 3, "sheet": 0},
-                "tessellation": {"faces": 12, "no_facets_faces": []},
+                "tessellation": {
+                    "schema_version": NATIVE_TESSELLATION_SCHEMA,
+                    "faces": 12,
+                    "face_spans": solid_spans,
+                    "native_edges": [],
+                    "no_facets_faces": [],
+                },
             },
             {
                 "component": "board-1",
+                "triangles": 5,
                 "bodies": {"solid": 0, "sheet": 6},
-                "tessellation": {"faces": 7, "no_facets_faces": rows},
+                "tessellation": {
+                    "schema_version": NATIVE_TESSELLATION_SCHEMA,
+                    "faces": 5 + len(rows),
+                    "face_spans": sheet_spans,
+                    "native_edges": [],
+                    "no_facets_faces": rows,
+                },
             },
         ]
 

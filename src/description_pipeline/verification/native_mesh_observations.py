@@ -1,16 +1,68 @@
 """Validate native tessellation accounting without silently completing surfaces."""
 
+import hashlib
 import math
+import struct
 from pathlib import Path
 
-from ..io import PipelineError
+from ..geometry.native_tessellation import (
+    HEX64,
+    parse_native_tessellation,
+    summarize_native_topology,
+)
+from ..io import PipelineError, confined
 from ..sources.snapshot import verify_snapshot
 from . import native_discovery as evidence
 
 
 def _require(condition, message):
+    """One stable verifier failure boundary for all native mesh evidence."""
+
     if not condition:
         raise PipelineError(message)
+
+
+def _integer(value) -> bool:
+    return type(value) is int
+
+
+def _stl_binding(bundle: Path, entry: dict, triangles: int) -> Path:
+    relative = entry.get("path")
+    digest = entry.get("sha256")
+    _require(
+        isinstance(relative, str)
+        and isinstance(digest, str)
+        and bool(HEX64.fullmatch(digest)),
+        entry["component"] + ": native STL identity is missing",
+    )
+    path = confined(Path(bundle) / "evidence", relative)
+    actual = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            actual.update(chunk)
+    size = path.stat().st_size
+    with path.open("rb") as stream:
+        header = stream.read(84)
+    _require(
+        actual.hexdigest() == digest
+        and len(header) == 84
+        and size == 84 + 50 * triangles
+        and struct.unpack_from("<I", header, 80)[0] == triangles,
+        entry["component"] + ": native STL bytes do not bind the recorded triangle count",
+    )
+    return path
+
+
+def _span_digests(path: Path, spans: list[dict]) -> None:
+    with path.open("rb") as stream:
+        for span in spans:
+            stream.seek(84 + 50 * span["triangle_start"])
+            payload = stream.read(50 * span["triangle_count"])
+            _require(
+                len(payload) == 50 * span["triangle_count"]
+                and hashlib.sha256(payload).hexdigest() == span["triangle_records_sha256"],
+                "a native face span does not bind its exact STL triangle records",
+            )
 
 
 def verify_native_mesh_observations(bundle: Path) -> dict:
@@ -18,6 +70,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
     native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
     rows = evidence.geometry(bundle)
     warnings = []
+    topologies = []
     observed = 0
     for entry in rows:
         tessellation = entry.get("tessellation")
@@ -25,17 +78,27 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             continue
         component = entry["component"]
         _require(isinstance(tessellation, dict), component + ": native tessellation accounting is missing")
-        _require(set(tessellation) == {"faces", "no_facets_faces"}, component + ": unknown tessellation accounting")
         faces = tessellation["faces"]
         omitted = tessellation["no_facets_faces"]
         _require(type(faces) is int and faces > 0, component + ": invalid native face count")
         _require(isinstance(omitted, list) and len(omitted) < faces, component + ": no tessellated native faces remain")
+        triangles = entry.get("triangles")
+        _require(_integer(triangles) and triangles > 0, component + ": invalid declared STL triangle count")
         bodies = entry.get("bodies")
         _require(isinstance(bodies, dict) and set(bodies) == {"solid", "sheet"}, component + ": body counts missing")
         _require(
             all(type(count) is int and count >= 0 for count in bodies.values()), component + ": invalid body counts"
         )
         _require(sum(bodies.values()) > 0, component + ": no native bodies recorded")
+        spans = parse_native_tessellation(component, tessellation, bodies, triangles)
+        topologies.append(
+            {
+                "component": component,
+                **summarize_native_topology(tessellation, spans),
+            }
+        )
+        path = _stl_binding(bundle, entry, triangles)
+        _span_digests(path, spans)
         seen = set()
         base = {"body_type", "body_index", "face_index", "triangle_count", "area_m2", "used_api"}
         for face in omitted:
@@ -45,15 +108,16 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                 component + ": malformed untessellated-face observation",
             )
             _require(
-                type(face["body_type"]) is int and face["body_type"] == 1,
+                _integer(face["body_type"]) and face["body_type"] == 1,
                 component + ": only native sheet faces may lack tessellation",
             )
             _require(
-                type(face["body_index"]) is int and 0 <= face["body_index"] < bodies["sheet"],
+                _integer(face["body_index"]) and 0 <= face["body_index"] < bodies["sheet"],
                 component + ": untessellated body is outside the native sheet inventory",
             )
             _require(
-                type(face["face_index"]) is int and face["face_index"] >= 0, component + ": invalid native face index"
+                _integer(face["face_index"]) and face["face_index"] >= 0,
+                component + ": invalid native face index",
             )
             key = (face["body_type"], face["body_index"], face["face_index"])
             _require(key not in seen, component + ": duplicate untessellated face")
@@ -101,9 +165,23 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                     "qualification": "native_facets_absent; complete_surface_geometry_unqualified",
                 }
             )
+        span_counts = {
+            (span["body_type"], span["body_index"], span["face_index"]): span["triangle_count"]
+            for span in spans
+        }
+        _require(
+            set(seen)
+            == {
+                key
+                for key, count in span_counts.items()
+                if count == 0
+            },
+            component + ": untessellated-face evidence differs from zero-length face spans",
+        )
         observed += 1
     return {
         "components": observed,
         "warnings": warnings,
+        "topologies": topologies,
         "untessellated_native_area_m2": math.fsum(row["area_m2"] for row in warnings),
     }

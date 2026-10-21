@@ -40,12 +40,35 @@ $ProgressPreference='SilentlyContinue'
 function Emit([hashtable]$payload) {
   $payload | ConvertTo-Json -Depth 8 -Compress
 }
+function Close-RecoveryTemp {
+  $path = [string]$Script:RecoveryTemp
+  if (-not $path) {
+    return @{attempted=$false; passed=$null; path=''}
+  }
+  $result = @{attempted=$true; passed=$true; path=$path}
+  try {
+    if (Test-Path -LiteralPath $path) {
+      Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+    }
+  } catch {
+    $result.passed = $false
+    $result.error = [string]$_.Exception.Message
+  }
+  $Script:RecoveryTemp = $null
+  return $result
+}
 function Die([string]$code, [string]$message) {
-  Emit @{passed=$false; code=$code; message=$message; verb=$Script:Verb}
+  $cleanup = Close-RecoveryTemp
+  $payload = @{passed=$false; code=$code; message=$message; verb=$Script:Verb}
+  if ($cleanup.attempted) { $payload.cleanup = $cleanup }
+  Emit $payload
   exit 1
 }
 function DieUnknown([string]$code, [string]$message, $detail = $null) {
-  Emit @{passed=$false; code=$code; message=$message; detail=$detail; verb=$Script:Verb}
+  $cleanup = Close-RecoveryTemp
+  $payload = @{passed=$false; code=$code; message=$message; detail=$detail; verb=$Script:Verb}
+  if ($cleanup.attempted) { $payload.cleanup = $cleanup }
+  Emit $payload
   exit 2
 }
 function Read-Json([string]$path) {
@@ -1366,6 +1389,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
   $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-recovery-' + [guid]::NewGuid().ToString('N'))
   Assert-NoReparseAncestor $temp
   New-Item -ItemType Directory -Path $temp | Out-Null
+  $Script:RecoveryTemp = $temp
   $tempItem = Get-Item -LiteralPath $temp -Force -ErrorAction Stop
   if (-not $tempItem.PSIsContainer -or
       ($tempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
@@ -1468,16 +1492,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
     if ((Get-JsonSha256 $current.state) -ne (Get-JsonSha256 $state)) {
       Die 'windows_recovery_verification_failed' 'Windows recovery did not read back the archived state'
     }
-    if (Test-Path -LiteralPath $temp) {
-      $cleanup.attempted = $true
-      try {
-        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop
-        $cleanup.passed = $true
-      } catch {
-        $cleanup.passed = $false
-        $cleanup.error = [string]$_.Exception.Message
-      }
-    }
+    $cleanup = Close-RecoveryTemp
     Emit @{
       passed=$true; verb=$Script:Verb; task_state=[string]$current.task_projection.state;
       endpoint='stopped'; cad_ownership='free'; state_sha256=(Get-JsonSha256 $state);
@@ -1503,13 +1518,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
     }
     throw
   } finally {
-    if (Test-Path -LiteralPath $temp) {
-      try {
-        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop
-      } catch {
-        Write-Warning ('recovery temp cleanup failed: ' + $temp + ': ' + $_.Exception.Message)
-      }
-    }
+    if ($Script:RecoveryTemp) { Close-RecoveryTemp | Out-Null }
   }
 }
 function Invoke-RecoveryResume($Binding) {

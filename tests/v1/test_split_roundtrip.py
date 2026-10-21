@@ -8,6 +8,7 @@ portable role).  The control fixture is explicitly NOT native CAD qualification.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -21,6 +22,7 @@ from description_pipeline.io import digest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
+from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
@@ -97,7 +99,38 @@ class AxisFixtureBackend(support.FixtureCadBackend):
         entries = super().export_component_meshes(destinations, on_activity=on_activity)
         for info in entries.values():
             info["bodies"] = {"solid": 1, "sheet": 0}
-            info["tessellation"] = {"faces": 6, "no_facets_faces": []}
+            payload = Path(info["written"]).read_bytes()
+            triangles = info["triangles"]
+            counts = [2] * 6
+            if sum(counts) != triangles:
+                raise AssertionError("the split fixture cube must carry twelve triangles")
+            spans = []
+            start = 0
+            for face_index, count in enumerate(counts):
+                spans.append(
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "body_name": "fixture-solid",
+                        "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
+                        "face_index": face_index,
+                        "face_reference_sha256": hashlib.sha256(f"fixture-face-{face_index}".encode()).hexdigest(),
+                        "edge_references": [],
+                        "triangle_start": start,
+                        "triangle_count": count,
+                        "triangle_records_sha256": hashlib.sha256(
+                            payload[84 + 50 * start : 84 + 50 * (start + count)]
+                        ).hexdigest(),
+                    }
+                )
+                start += count
+            info["tessellation"] = {
+                "schema_version": NATIVE_TESSELLATION_SCHEMA,
+                "faces": 6,
+                "face_spans": spans,
+                "native_edges": [],
+                "no_facets_faces": [],
+            }
         return entries
 
 

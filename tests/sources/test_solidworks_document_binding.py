@@ -519,10 +519,16 @@ class ReturnViewRegistryTests(unittest.TestCase):
         "MateEntity": native.IMATEENTITY2_IID,
         "GetSurface": native.ISURFACE_IID,
         "GetCurve": native.ICURVE_IID,
+        "GetStartVertex": native.IVERTEX_IID,
+        "GetEndVertex": native.IVERTEX_IID,
         "GetTotalTransform": native.IMATHTRANSFORM_IID,
         "OpenDoc6": native.IMODELDOC2_IID,
     }
-    EXPECTED_ARRAYS: ClassVar[dict[str, str]] = {"GetBodies2": native.IBODY2_IID, "GetFaces": native.IFACE2_IID}
+    EXPECTED_ARRAYS: ClassVar[dict[str, str]] = {
+        "GetBodies2": native.IBODY2_IID,
+        "GetFaces": native.IFACE2_IID,
+        "GetEdges": native.IEDGE_IID,
+    }
 
     def setUp(self):
         self.stubs = _InterfaceModules()

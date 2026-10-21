@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 
+from .geometry.native_tessellation import parse_native_tessellation
 from .io import PipelineError, file_digest, read_data, write_json
 from .schemas import EFFECTIVE_INSTANCES_SCHEMA
 
@@ -270,7 +271,7 @@ def _canonical_untessellated_faces(value) -> list | None:
     for entry in value:
         if not isinstance(entry, dict):
             return None
-        if any(key not in entry for key in ("component", "bodies", "tessellation")):
+        if any(key not in entry for key in ("component", "triangles", "bodies", "tessellation")):
             return None
         component = entry.get("component")
         bodies = entry.get("bodies")
@@ -283,6 +284,15 @@ def _canonical_untessellated_faces(value) -> list | None:
             count = bodies.get(key)
             if type(count) is not int or count < 0:
                 return None
+        try:
+            spans = parse_native_tessellation(
+                component,
+                tessellation,
+                bodies,
+                entry.get("triangles"),
+            )
+        except PipelineError:
+            return None
         faces = tessellation.get("faces")
         if type(faces) is not int or faces < 0:
             return None
@@ -340,6 +350,12 @@ def _canonical_untessellated_faces(value) -> list | None:
                 return None
             seen.add(key)
             out.append({"component": component, **row})
+        span_counts = {
+            (span["body_type"], span["body_index"], span["face_index"]): span["triangle_count"]
+            for span in spans
+        }
+        if set(seen) != {key for key, count in span_counts.items() if count == 0}:
+            return None
     return out
 
 

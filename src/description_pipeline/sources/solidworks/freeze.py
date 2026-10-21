@@ -36,7 +36,7 @@ from .jsonio import digest_json, read_json, sha256_file, write_json
 
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import inventory
-from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
+from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA, NATIVE_TESSELLATION_SCHEMA
 
 #: Freeze/capture record ids live in the ``solidworks-to-urdf.*`` family only.
 #: Sealed evidence from before the XC-01 rename is replayed with its era
@@ -2026,6 +2026,28 @@ def _export_geometry(
                 {"component": component},
                 exit_code=3,
             )
+        tessellation = info.get("tessellation")
+        if (
+            not isinstance(tessellation, dict)
+            or set(tessellation) != {
+                "schema_version",
+                "faces",
+                "face_spans",
+                "native_edges",
+                "no_facets_faces",
+            }
+            or tessellation.get("schema_version") != NATIVE_TESSELLATION_SCHEMA
+            or not isinstance(tessellation.get("faces"), int)
+            or not isinstance(tessellation.get("face_spans"), list)
+            or not isinstance(tessellation.get("native_edges"), list)
+            or not isinstance(tessellation.get("no_facets_faces"), list)
+        ):
+            raise BridgeError(
+                "cad_mesh_export_failed",
+                "native geometry carries no complete face-span evidence",
+                {"component": component},
+                exit_code=3,
+            )
         # Raw identity plus the binary-header triangle count only: area, volume,
         # topology and degeneracy stay with the independent Linux verifier.
         with target.open("rb") as handle:
@@ -2052,7 +2074,7 @@ def _export_geometry(
                 "triangles": triangles,
                 "used_api": info.get("used_api"),
                 "bodies": info.get("bodies"),
-                "tessellation": info.get("tessellation") or {"faces": 0, "no_facets_faces": []},
+                "tessellation": tessellation,
                 "sha256": sha256_file(target),
             }
         )

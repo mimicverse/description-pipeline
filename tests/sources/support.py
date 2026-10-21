@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import struct
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any, cast
 from collections.abc import Sequence
 
 from description_pipeline.io import file_digest
+from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
@@ -567,11 +569,43 @@ class FixtureCadBackend(CadBackend):
                 )
             triangles = cube_stl(Path(dest_path))
             self.exported.append(str(dest_path))
+            payload = Path(dest_path).read_bytes()
+            spans = []
+            start = 0
+            for face_index in range(6):
+                count = 2
+                spans.append(
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "body_name": "fixture-solid",
+                        "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
+                        "face_index": face_index,
+                        "face_reference_sha256": hashlib.sha256(
+                            f"fixture-face-{face_index}".encode()
+                        ).hexdigest(),
+                        "edge_references": [],
+                        "triangle_start": start,
+                        "triangle_count": count,
+                        "triangle_records_sha256": hashlib.sha256(
+                            payload[84 + 50 * start : 84 + 50 * (start + count)]
+                        ).hexdigest(),
+                    }
+                )
+                start += count
             entries[component] = {
                 "component": component,
                 "written": dest_path,
                 "used_api": "fixture",
                 "triangles": triangles,
+                "bodies": {"solid": 1, "sheet": 0},
+                "tessellation": {
+                    "schema_version": NATIVE_TESSELLATION_SCHEMA,
+                    "faces": 6,
+                    "face_spans": spans,
+                    "native_edges": [],
+                    "no_facets_faces": [],
+                },
             }
         return entries
 

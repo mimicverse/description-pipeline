@@ -4961,6 +4961,45 @@ def _windows_target_from_state(state: dict) -> dict:
     }
 
 
+def _validate_remote_cleanup(value: object) -> dict:
+    require(isinstance(value, dict), "recovery_manifest_invalid", "windows.remote_cleanup must be an object")
+    required = {"attempted", "passed", "remote_dir"}
+    allowed = required | {"ownership_marker", "code", "message", "detail"}
+    require(
+        required <= set(value) and set(value) <= allowed,
+        "recovery_manifest_invalid",
+        "windows.remote_cleanup carries an unknown shape",
+    )
+    attempted = value["attempted"]
+    passed = value["passed"]
+    remote_dir = value["remote_dir"]
+    require(
+        isinstance(attempted, bool)
+        and (
+            (attempted and isinstance(passed, bool))
+            or (not attempted and passed is None)
+        )
+        and isinstance(remote_dir, str)
+        and bool(re.fullmatch(r"[A-Za-z]:/[^/].*", remote_dir))
+        and ".." not in remote_dir.split("/"),
+        "recovery_manifest_invalid",
+        "windows.remote_cleanup identity is malformed",
+    )
+    if passed is False:
+        require(
+            isinstance(value.get("ownership_marker"), str)
+            and value["ownership_marker"].startswith(remote_dir.rstrip("/") + "/")
+            and isinstance(value.get("code"), str)
+            and bool(value["code"])
+            and isinstance(value.get("message"), str)
+            and bool(value["message"])
+            and isinstance(value.get("detail"), dict),
+            "recovery_manifest_invalid",
+            "failed windows.remote_cleanup lacks residual evidence",
+        )
+    return value
+
+
 def _windows_snapshot_binding(context: BackupContext) -> dict:
     windows = context.resolved["windows"]
     instance = windows["instance"]
@@ -5162,6 +5201,7 @@ def capture_windows_recovery(
         "windows_recovery_state_invalid",
         "Windows snapshot did not prove a disabled, stopped, CAD-free endpoint",
     )
+    cleanup = _validate_remote_cleanup(result.get("remote_cleanup"))
     return {
         "schema_version": WINDOWS_RECOVERY_SCHEMA,
         "bundle": {
@@ -5171,6 +5211,7 @@ def capture_windows_recovery(
         },
         "state_sha256": _digest_document(state),
         "state": state,
+        "remote_cleanup": cleanup,
     }
 
 
@@ -5225,6 +5266,7 @@ def restore_windows_recovery(
         timeout=timeout,
         upload_bundle=bundle,
     )
+    _validate_remote_cleanup(result.get("remote_cleanup"))
     require(
         result.get("task_state") == "Disabled"
         and result.get("endpoint") == "stopped"
@@ -6793,7 +6835,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
     )
     windows = _exact_keys(
         doc["windows"],
-        {"schema_version", "bundle", "state_sha256", "state"},
+        {"schema_version", "bundle", "state_sha256", "state", "remote_cleanup"},
         "windows",
     )
     bundle = _exact_keys(
@@ -6809,6 +6851,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         "recovery_manifest_invalid",
         "Windows recovery block is malformed",
     )
+    _validate_remote_cleanup(windows["remote_cleanup"])
     require_bound_file(
         bundle["member"],
         expected_bytes=bundle["bytes"],
