@@ -84,7 +84,7 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 `windows.instance` 固定 Windows 执行端的任务名及工程、产物和状态目录，维护命令依据配置和安装记录定位该目标。同一主机上的任务共享 CAD 排他资源约束，新用户或新目录不形成独立资源域。
 
-配置、状态、上传、交付、临时工作区和发行安装使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`。Windows 受管路径使用 protected ACL，只保留 `Administrators` 与 `SYSTEM` 的 `FullControl`，移除 `Authenticated Users`、`Users`、`Everyone` 等普通主体；日志只展示标识、摘要和路径，不展示秘密值。
+配置、状态、上传、交付、临时工作区和发行安装使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`。Windows 受管路径使用 protected ACL，仅允许 `Administrators`、`SYSTEM` 与受控的本地管理员 service SID 的 `FullControl`；该 service SID 是已批准的运行时身份，不把管理员运行宣称为 least privilege。受管根目录和共同父目录的 ACE 必须对新建目录与文件可继承，bootstrap、stage、promote、rollback 在写入前保存完整 ACL，写入和服务访问检查失败时恢复 root、marker、现有子项及本次新建子项的 ACL 后 fail closed；不得让新 generation 或后续目录形成空 DACL。移除 `Authenticated Users`、`Users`、`Everyone` 等普通主体；日志只展示标识、摘要和路径，不展示秘密值。
 
 产品目标、仓库与 base 仅在 Linux 维护。Git 凭据属于 Linux 服务账户；模型仓库来源必须与目标一致，发布使用受管理的干净工作区。模型工程值以封存 CAD 为依据，允许版本化配置承载命名、方向及数值表达规则；配置不得抄入手工结果或覆盖原生事实。仓库规则须允许服务主体向受管理候选分支追加提交和创建 PR，禁止非 fast-forward；凭据权限限定于配置目标，工程集成 base 保持独立评审。PostgreSQL 的平台与 Airflow 角色只能迁移各自 schema，连接预算及恢复目标在部署验收中固定并验证。
 
