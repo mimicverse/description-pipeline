@@ -3353,11 +3353,13 @@ class NativeFinCaptureTests(unittest.TestCase):
                 ).hexdigest(),
                 "endpoints": {
                     "start": {
+                        "state": "present",
                         "object_pointer": start_pointer,
                         "reference_sha256": start_reference,
                         "point_m": [0.0, 0.0, 0.0],
                     },
                     "end": {
+                        "state": "present",
                         "object_pointer": start_pointer + 100,
                         "reference_sha256": hashlib.sha256(
                             f"end-{edge_index}".encode()

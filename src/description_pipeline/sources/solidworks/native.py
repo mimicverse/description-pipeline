@@ -320,8 +320,17 @@ def _scope_edge_rows(body, extension, face_rows) -> list[dict]:
                 if endpoint == "start"
                 else "GetEndVertex",
             )
+            if raw_vertex is None:
+                endpoints[endpoint] = {
+                    "state": "absent",
+                    "object_pointer": None,
+                    "reference_sha256": None,
+                    "point_m": None,
+                }
+                continue
             vertex = _interface(_dynamic(raw_vertex), IVERTEX_IID)
             endpoints[endpoint] = {
+                "state": "present",
                 "object_pointer": _com_object_pointer(vertex),
                 "reference_sha256": _persistent_reference_sha256(
                     extension,
@@ -359,6 +368,16 @@ def _scope_edge_rows(body, extension, face_rows) -> list[dict]:
             ICURVE_IID,
         )
         end_params = _read_curve_end_params(curve)
+        endpoint_states = {
+            endpoints[name]["state"] for name in ("start", "end")
+        }
+        if endpoint_states == {"absent"}:
+            if not end_params["is_closed"]:
+                raise ValueError(
+                    "both edge endpoints are absent without a closed curve"
+                )
+        elif endpoint_states != {"present"}:
+            raise ValueError("edge endpoint states differ")
         rows.append(
             {
                 "edge_index": edge_index,
@@ -390,16 +409,20 @@ def _scope_edge_mapping_key(
     adjacent_face_indices: list[int],
 ) -> str:
     endpoints = row["endpoints"]
+    def point_bits(point):
+        return (
+            None
+            if point is None
+            else [_binary64_bits(value) for value in point]
+        )
     return native_scope_identity_sha256(
         {
-            "start_point_binary64": [
-                _binary64_bits(value)
-                for value in endpoints["start"]["point_m"]
-            ],
-            "end_point_binary64": [
-                _binary64_bits(value)
-                for value in endpoints["end"]["point_m"]
-            ],
+            "start_point_binary64": point_bits(
+                endpoints["start"]["point_m"]
+            ),
+            "end_point_binary64": point_bits(
+                endpoints["end"]["point_m"]
+            ),
             "curve_u_min_binary64": _binary64_bits(row["u_min"]),
             "curve_u_max_binary64": _binary64_bits(row["u_max"]),
             "curve_start_point_binary64": [
@@ -424,6 +447,8 @@ def _scope_vertex_rows(edge_rows) -> list[dict]:
     for row in edge_rows:
         for order, endpoint_name in enumerate(("start", "end")):
             endpoint = row["endpoints"][endpoint_name]
+            if endpoint["state"] != "present":
+                continue
             pointer = endpoint["object_pointer"]
             group = groups.setdefault(
                 pointer,
@@ -5870,13 +5895,13 @@ class SolidWorksBackend(CadBackend):
                 )
                 continue
             endpoints = edge_row["endpoints"]
-            if any(
-                endpoints[name]["point_m"] is None
-                for name in ("start", "end")
-            ):
+            endpoint_states = {
+                endpoints[name]["state"] for name in ("start", "end")
+            }
+            if endpoint_states not in ({"present"}, {"absent"}):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "a native edge has no identity endpoint",
+                    "native edge endpoint states differ",
                     {**base, "edge_index": edge_row["index"]},
                 )
             face_witnesses = get_witness_rows().get("face", {})
@@ -5885,15 +5910,36 @@ class SolidWorksBackend(CadBackend):
                 for face_index in edge_row["face_indices"]
             )
             curve = edge_row["curve"]
+            _parameter_endpoints, topology_endpoints = (
+                native_curve_endpoint_roles(
+                    curve["start_point_m"],
+                    curve["end_point_m"],
+                    curve["sense"],
+                )
+            )
+            identity_endpoints = {
+                name: (
+                    endpoints[name]["point_m"]
+                    if endpoints[name]["state"] == "present"
+                    else topology_endpoints[index]
+                )
+                for index, name in enumerate(("start", "end"))
+            }
+
+            def point_bits(point):
+                return (
+                    None
+                    if point is None
+                    else [_binary64_bits(value) for value in point]
+                )
+
             topology_key = {
-                "start_point_binary64": [
-                    _binary64_bits(value)
-                    for value in endpoints["start"]["point_m"]
-                ],
-                "end_point_binary64": [
-                    _binary64_bits(value)
-                    for value in endpoints["end"]["point_m"]
-                ],
+                "start_point_binary64": point_bits(
+                    endpoints["start"]["point_m"]
+                ),
+                "end_point_binary64": point_bits(
+                    endpoints["end"]["point_m"]
+                ),
                 "curve_u_min_binary64": _binary64_bits(curve["u_min"]),
                 "curve_u_max_binary64": _binary64_bits(curve["u_max"]),
                 "curve_start_point_binary64": [
@@ -5962,18 +6008,22 @@ class SolidWorksBackend(CadBackend):
                 "native_edge_index": edge_row["index"],
                 "start_point_binary64_hex": [
                     _binary64_bits(value)
-                    for value in endpoints["start"]["point_m"]
+                    for value in identity_endpoints["start"]
                 ],
                 "end_point_binary64_hex": [
                     _binary64_bits(value)
-                    for value in endpoints["end"]["point_m"]
+                    for value in identity_endpoints["end"]
                 ],
-                "start_vertex_reference_sha256": endpoints["start"][
-                    "reference"
-                ]["typed_sha256"],
-                "end_vertex_reference_sha256": endpoints["end"]["reference"][
-                    "typed_sha256"
-                ],
+                "start_vertex_reference_sha256": (
+                    endpoints["start"]["reference"]["typed_sha256"]
+                    if endpoints["start"]["reference"] is not None
+                    else None
+                ),
+                "end_vertex_reference_sha256": (
+                    endpoints["end"]["reference"]["typed_sha256"]
+                    if endpoints["end"]["reference"] is not None
+                    else None
+                ),
                 "curve_type": curve["curve_type"],
                 "curve_sense": curve["sense"],
                 "curve_domain_binary64_hex": [

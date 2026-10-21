@@ -272,20 +272,32 @@ def _valid_scope_identity(
                     _binary64_hex(item)
                     for item in value["end_point_binary64_hex"]
                 )
-                and isinstance(
-                    value["start_vertex_reference_sha256"], str
-                )
-                and bool(
-                    HEX64.fullmatch(
-                        value["start_vertex_reference_sha256"]
+                and (
+                    value["start_vertex_reference_sha256"] is None
+                    or (
+                        isinstance(
+                            value["start_vertex_reference_sha256"],
+                            str,
+                        )
+                        and bool(
+                            HEX64.fullmatch(
+                                value["start_vertex_reference_sha256"]
+                            )
+                        )
                     )
                 )
-                and isinstance(
-                    value["end_vertex_reference_sha256"], str
-                )
-                and bool(
-                    HEX64.fullmatch(
-                        value["end_vertex_reference_sha256"]
+                and (
+                    value["end_vertex_reference_sha256"] is None
+                    or (
+                        isinstance(
+                            value["end_vertex_reference_sha256"],
+                            str,
+                        )
+                        and bool(
+                            HEX64.fullmatch(
+                                value["end_vertex_reference_sha256"]
+                            )
+                        )
                     )
                 )
                 and _integer(value["curve_type"])
