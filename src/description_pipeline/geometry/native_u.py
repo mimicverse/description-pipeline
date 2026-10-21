@@ -198,6 +198,7 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
         and len(detail["object_indices"])
         == len(detail["mapped_source_indices"])
         == len(detail["mapped_source_persistent_reference_sha256"])
+        == len(detail["topology_signature_sha256s"])
     )
 
 
@@ -208,6 +209,7 @@ def native_scope_warning_diagnostic_is_valid(item: object) -> bool:
         isinstance(item, dict)
         and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
         and item.get("blocking") is False
+        and item.get("severity") == "warning"
         and isinstance(item.get("message"), str)
         and bool(item["message"].strip())
         and isinstance(item.get("object"), str)
@@ -316,6 +318,8 @@ def native_scope_warning_details_match(
                     sort_keys=True,
                 ),
                 item["object"],
+                item["severity"],
+                item["message"],
             )
             for item in items
         )

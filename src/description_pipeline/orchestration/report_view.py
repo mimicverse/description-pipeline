@@ -845,9 +845,10 @@ def _recorded_warnings(
         )
     for row in rows:
         details = row.get("raw_details")
-        if row.get("id") == "geometry.native_tessellation" and row.get(
-            "state"
-        ) == "passed":
+        row_passed = (
+            row.get("state") == "passed" or row.get("passed") is True
+        )
+        if row.get("id") == "geometry.native_tessellation" and row_passed:
             native_gate_seen = True
         recorded = details.get("warnings") if isinstance(details, dict) else None
         if isinstance(recorded, list):
@@ -881,9 +882,7 @@ def _recorded_warnings(
             warnings.extend(
                 _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
             )
-        elif row.get("id") == "geometry.native_tessellation" and row.get(
-            "state"
-        ) == "passed":
+        elif row.get("id") == "geometry.native_tessellation" and row_passed:
             raise PipelineError(
                 "Passed native tessellation gate carries no warning list"
             )

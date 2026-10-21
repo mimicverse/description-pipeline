@@ -34,7 +34,6 @@ from ..interface_records import REQUEST_PURPOSES, validate_source_record
 from ..io import PipelineError, acquire_process_lock, confined, file_digest
 from ..request_evidence import read_request_evidence
 from ..stages import record_check
-from ..verification.solidworks_urdf import native_gate_warning_diagnostics
 
 #: The target delivery tree (contracts delivery format and digest): manifest.json is the
 #: subject manifest, tool.json carries the tool identity, reports/ holds only the
@@ -523,19 +522,6 @@ def _native_scope_warning_rows(report: dict) -> list[dict]:
         if isinstance(item, dict)
         and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
-    if not rows and native_gate_warnings is not None:
-        for check in report.get("checks") or []:
-            if not isinstance(check, dict) or check.get("id") != "geometry.native_tessellation":
-                continue
-            details = check.get("details")
-            if not isinstance(details, dict):
-                raise PipelineError("Native tessellation warning details are malformed")
-            rows = [
-                item
-                for item in native_gate_warning_diagnostics(details)
-                if item["code"] in NATIVE_SCOPE_IDENTITY_WARNING_CODES
-            ]
-            break
     if (native_gate_passed and native_gate_warnings is None) or (
         (rows or raw_scope)
         and (

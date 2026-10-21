@@ -138,6 +138,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             ("mapped_source_indices", []),
             ("mapped_source_persistent_reference_sha256", []),
             ("topology_signature_sha256s", []),
+            ("topology_signature_sha256s", ["1" * 64]),
             ("mapped_source_indices", [0]),
         ):
             malformed = copy.deepcopy(raw_warnings())
@@ -155,6 +156,20 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         duplicate = [*raw_warnings(), copy.deepcopy(raw_warnings()[0])]
         with self.assertRaises(PipelineError):
             native_gate_warning_diagnostics({"warnings": duplicate})
+
+        complete = diagnostics()
+        for key, value in (
+            ("severity", "error"),
+            ("message", "forged"),
+        ):
+            forged = copy.deepcopy(complete)
+            forged[0][key] = value
+            self.assertFalse(
+                native_scope_warning_details_match(
+                    forged,
+                    raw_warnings(),
+                )
+            )
 
         for field in (
             "referenced_configuration",
@@ -220,6 +235,21 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             [],
         )
 
+        raw = raw_warnings()
+        quality = quality_report([], raw)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "reports/quality.json", quality)
+            structural = build_structural_report({}, evidence_root=root)
+        self.assertIn(
+            "report.native_identity_warning_invalid",
+            {row["code"] for row in structural["findings"]},
+        )
+        with self.assertRaises(PortalError):
+            _quality_warnings(quality)
+        with self.assertRaises(PipelineError):
+            _body("a" * 64, "b" * 40, quality, "engineering")
+
     def test_a_passed_gate_must_explicitly_carry_its_warning_list(
         self,
     ) -> None:
@@ -260,6 +290,19 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
                             "id": "geometry.native_tessellation",
                             "state": "passed",
                             "raw_details": details,
+                        }
+                    ],
+                    [],
+                )
+            with self.assertRaises(PipelineError):
+                _recorded_warnings(
+                    {"id": "verify", "name": "Verify"},
+                    [],
+                    [
+                        {
+                            "id": "geometry.native_tessellation",
+                            "passed": True,
+                            "raw_details": {},
                         }
                     ],
                     [],
