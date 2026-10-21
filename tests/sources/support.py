@@ -254,6 +254,8 @@ def _u_evidence(
     return {
         "u": u_parameter,
         "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
+        "parameter_u_source": "get_parameter",
+        "fallback_reason": None,
         "rule_version": NATIVE_U_IDENTITY_RULE,
         "point_roundtrip_rule": point_roundtrip_rule,
         "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
@@ -265,6 +267,7 @@ def _u_evidence(
         "point_tolerance_m": tolerance,
         "closest_point_error_m": 0.0,
         "evaluate_point_error_m": 0.0,
+        "source_evaluate_error_m": 0.0,
         "closest_evaluate_error_m": 0.0,
         "closest_point_on_raw": [*point, u_parameter, 0.0],
         "parameter_input_point_m": list(point),

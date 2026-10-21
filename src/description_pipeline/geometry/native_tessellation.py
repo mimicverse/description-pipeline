@@ -13,6 +13,7 @@ from .native_u import (
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+    NATIVE_U_CLOSEST_FALLBACK_RULE,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
@@ -76,6 +77,8 @@ def _valid_u_evidence(
     if not isinstance(value, dict) or set(value) != {
         "u",
         "u_parameter_rule",
+        "parameter_u_source",
+        "fallback_reason",
         "rule_version",
         "point_roundtrip_rule",
         "projection_rule",
@@ -85,6 +88,7 @@ def _valid_u_evidence(
         "point_tolerance_m",
         "closest_point_error_m",
         "evaluate_point_error_m",
+        "source_evaluate_error_m",
         "closest_evaluate_error_m",
         "closest_point_on_raw",
         "parameter_input_point_m",
@@ -190,6 +194,10 @@ def _valid_u_evidence(
         )
         point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
     evaluate_error = native_point_error(closest_point, evaluated_point)
+    source_evaluate_error = native_point_error(
+        source_point,
+        evaluated_point,
+    )
     closest_evaluate_error = native_point_error(
         closest_point,
         evaluated_point,
@@ -199,11 +207,31 @@ def _valid_u_evidence(
         value["point_tolerance_m"],
         value["closest_point_error_m"],
         value["evaluate_point_error_m"],
+        value["source_evaluate_error_m"],
         value["closest_evaluate_error_m"],
     )
+    parameter_success = native_get_parameter_success(
+        parameter[1]
+    ) if isinstance(parameter, list) and len(parameter) == 2 else None
+    fallback = parameter_success is False
+    expected_u_rule = (
+        NATIVE_U_CLOSEST_FALLBACK_RULE
+        if fallback
+        else NATIVE_U_POINT_PARAMETER_RULE
+    )
+    expected_u_source = (
+        "closest_point_fallback"
+        if fallback
+        else "get_parameter"
+    )
+    expected_fallback_reason = "get_parameter_false" if fallback else None
+    expected_success_bit = 0 if fallback else 1
+    authoritative_u = closest[3] if fallback else parameter[0]
     return (
         value["rule_version"] == NATIVE_U_IDENTITY_RULE
-        and value["u_parameter_rule"] == NATIVE_U_POINT_PARAMETER_RULE
+        and value["u_parameter_rule"] == expected_u_rule
+        and value["parameter_u_source"] == expected_u_source
+        and value["fallback_reason"] == expected_fallback_reason
         and value["point_roundtrip_rule"] == point_roundtrip_rule
         and all(
             type(item) in numeric and math.isfinite(float(item))
@@ -214,6 +242,7 @@ def _valid_u_evidence(
         and value["projection_error_m"] == projection_error
         and value["closest_point_error_m"] == projection_error
         and value["evaluate_point_error_m"] == evaluate_error
+        and value["source_evaluate_error_m"] == source_evaluate_error
         and value["closest_evaluate_error_m"] == closest_evaluate_error
         and max(evaluate_error, closest_evaluate_error)
         <= computed_tolerance
@@ -222,7 +251,7 @@ def _valid_u_evidence(
         and len(parameter) == 2
         and type(parameter[0]) in numeric
         and math.isfinite(float(parameter[0]))
-        and native_get_parameter_success(parameter[1]) is True
+        and parameter_success is not None
         and native_u_in_closed_interval(
             closest[3],
             domain_lower,
@@ -230,13 +259,18 @@ def _valid_u_evidence(
         )
         and value["parameter_success_raw"] == parameter[1]
         and value["parameter_success_raw_type"] == type(parameter[1]).__name__
-        and value["parameter_success_bit"] == 1
-        and value["parameter_success_parsed"] is True
-        and native_u_equal(parameter[0], value["u"])
+        and value["parameter_success_bit"] == expected_success_bit
+        and value["parameter_success_parsed"] is (not fallback)
+        and native_u_equal(authoritative_u, value["u"])
         and native_u_in_closed_interval(
-            parameter[0],
+            authoritative_u,
             domain_lower,
             domain_upper,
+        )
+        and (
+            not fallback
+            or source_evaluate_error
+            <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
         )
         and _valid_evaluate2_packed_status(
             value["evaluate_packed_status"]

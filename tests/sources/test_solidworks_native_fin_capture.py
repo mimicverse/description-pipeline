@@ -1538,6 +1538,36 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertIn("50 micrometre bound", caught.exception.message)
 
+    def test_get_parameter_false_uses_closest_u_fallback(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        _start, _end, evaluated_start, _evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        edge.GetParameter = lambda x, y, z: [
+            edge.u_min if (x, y, z) == evaluated_start else edge.u_max,
+            0.0 if (x, y, z) == evaluated_start else packed_evaluate_status(1),
+        ]
+
+        captured = self.capture(body, extension)
+
+        evidence = next(
+            row
+            for row in captured["itessellation_body"]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(row["start_u"], edge.u_min)
+        )["start_evidence"]
+        self.assertEqual(
+            evidence["u_parameter_rule"],
+            "native-u-closest-point-fallback-v1",
+        )
+        self.assertEqual(
+            evidence["parameter_u_source"],
+            "closest_point_fallback",
+        )
+        self.assertEqual(evidence["fallback_reason"], "get_parameter_false")
+        self.assertEqual(evidence["parameter_success_bit"], 0)
+        self.assertIs(evidence["parameter_success_parsed"], False)
+
     def test_parser_accepts_group_333_operation_bound(self):
         evidence, triangles = self.group_333_tessellation()
 
@@ -1631,6 +1661,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 fin_evidence["source_point_m"] = list(start)
                 fin_evidence["parameter_input_point_m"] = list(start)
                 fin_evidence["projection_error_m"] = 0.0
+                fin_evidence["source_evaluate_error_m"] = error
                 fin_evidence["point_tolerance_m"] = tolerance
                 fin_evidence["closest_point_error_m"] = 0.0
                 fin_evidence["evaluate_point_error_m"] = error
@@ -1691,6 +1722,10 @@ class NativeFinCaptureTests(unittest.TestCase):
                 )
                 fin_evidence["evaluate_point_error_m"] = error
                 fin_evidence["closest_evaluate_error_m"] = error
+                fin_evidence["source_evaluate_error_m"] = native_point_error(
+                    source,
+                    evaluated,
+                )
         for vertex in evidence["itessellation"]["vertices"]:
             if vertex["vertex_id"] in affected_vertices:
                 vertex["point_m"] = list(source)
@@ -1718,6 +1753,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         fin_evidence["source_point_m"] = source
         fin_evidence["projection_error_m"] = 60e-6
         fin_evidence["closest_point_error_m"] = 60e-6
+        fin_evidence["source_evaluate_error_m"] = 60e-6
 
         with self.assertRaises(PipelineError) as caught:
             parse_native_tessellation(
@@ -1753,6 +1789,8 @@ class NativeFinCaptureTests(unittest.TestCase):
         evidence = {
             "u": 0.0,
             "u_parameter_rule": "native-u-point-parameter-authoritative-v2",
+            "parameter_u_source": "get_parameter",
+            "fallback_reason": None,
             "rule_version": NATIVE_U_IDENTITY_RULE,
             "point_roundtrip_rule": (
                 "native-curve-endpoint-float32-operation-v4"
@@ -1764,6 +1802,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             "point_tolerance_m": projected_tolerance,
             "closest_point_error_m": projection_error,
             "evaluate_point_error_m": 0.0,
+            "source_evaluate_error_m": projection_error,
             "closest_evaluate_error_m": 0.0,
             "closest_point_on_raw": [*projected, 0.0, 0.0],
             "parameter_input_point_m": list(projected),
@@ -1788,6 +1827,38 @@ class NativeFinCaptureTests(unittest.TestCase):
                 opposite,
             )
         )
+
+    def test_parser_accepts_closest_u_fallback_for_exact_false_status(self):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(row["start_u"], edge["u_min"])
+        )
+        fin_evidence = fin["start_evidence"]
+        fin_evidence["parameter_raw"][0] = edge["u_min"]
+        fin_evidence["parameter_raw"][1] = 0.0
+        fin_evidence["parameter_success_raw"] = 0.0
+        fin_evidence["parameter_success_raw_type"] = "float"
+        fin_evidence["parameter_success_bit"] = 0
+        fin_evidence["parameter_success_parsed"] = False
+        fin_evidence["u_parameter_rule"] = (
+            "native-u-closest-point-fallback-v1"
+        )
+        fin_evidence["parameter_u_source"] = "closest_point_fallback"
+        fin_evidence["fallback_reason"] = "get_parameter_false"
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+        )
+
+        self.assertEqual(len(spans), 2)
 
     def test_parser_rejects_group_333_operation_bound_overshoot(self):
         evidence, triangles = self.group_333_tessellation()
@@ -2018,6 +2089,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                         evidence["source_point_m"] = [0.0, 0.0, 0.0]
                         evidence["parameter_input_point_m"] = [0.0, 0.0, 0.0]
                         evidence["projection_error_m"] = 0.0
+                        evidence["source_evaluate_error_m"] = 0.0
                         evidence["point_tolerance_m"] = (
                             native_curve_endpoint_operation_tolerance(
                                 [0.0, 0.0, 0.0],

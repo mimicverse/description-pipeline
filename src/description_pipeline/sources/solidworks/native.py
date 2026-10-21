@@ -27,6 +27,7 @@ from ...geometry.native_u import (
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+    NATIVE_U_CLOSEST_FALLBACK_RULE,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
@@ -5296,7 +5297,7 @@ class SolidWorksBackend(CadBackend):
                     {**base, "fin_id": fin_id, "endpoint": endpoint},
                 )
             parameter_success = native_get_parameter_success(parameter[1])
-            if parameter_success is not True:
+            if parameter_success is None:
                 raise CadError(
                     "cad_native_tessellation_unreadable",
                     "GetParameter success is not strict bool, numeric 0/1, "
@@ -5308,13 +5309,20 @@ class SolidWorksBackend(CadBackend):
                         "parameter_success_raw": repr(parameter[1])[:80],
                     },
                 )
-            parameter_u = float(parameter[0])
-            if (
-                not native_u_in_closed_interval(
-                    parameter_u,
-                    domain["u_min"],
-                    domain["u_max"],
-                )
+            if parameter_success:
+                parameter_u = float(parameter[0])
+                u_parameter_rule = NATIVE_U_POINT_PARAMETER_RULE
+                parameter_u_source = "get_parameter"
+                fallback_reason = None
+            else:
+                parameter_u = closest_u
+                u_parameter_rule = NATIVE_U_CLOSEST_FALLBACK_RULE
+                parameter_u_source = "closest_point_fallback"
+                fallback_reason = "get_parameter_false"
+            if not native_u_in_closed_interval(
+                parameter_u,
+                domain["u_min"],
+                domain["u_max"],
             ):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
@@ -5372,6 +5380,7 @@ class SolidWorksBackend(CadBackend):
                 )
                 point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
             evaluate_error = point_error(closest_point, evaluated_point)
+            source_evaluate_error = point_error(point, evaluated_point)
             closest_evaluate_error = point_error(
                 closest_point,
                 evaluated_point,
@@ -5390,13 +5399,31 @@ class SolidWorksBackend(CadBackend):
                         "closest_point_error_m": projection_error,
                         "projection_error_m": projection_error,
                         "evaluate_point_error_m": evaluate_error,
+                        "source_evaluate_error_m": source_evaluate_error,
                         "closest_evaluate_error_m": closest_evaluate_error,
                         "point_tolerance_m": point_tolerance,
                     },
                 )
+            if (
+                parameter_success is False
+                and source_evaluate_error
+                > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+            ):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "closest-point fallback does not close within 50 micrometres",
+                    {
+                        **base,
+                        "fin_id": fin_id,
+                        "endpoint": endpoint,
+                        "source_evaluate_error_m": source_evaluate_error,
+                    },
+                )
             return {
                 "u": parameter_u,
-                "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
+                "u_parameter_rule": u_parameter_rule,
+                "parameter_u_source": parameter_u_source,
+                "fallback_reason": fallback_reason,
                 "rule_version": NATIVE_U_IDENTITY_RULE,
                 "point_roundtrip_rule": point_roundtrip_rule,
                 "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
@@ -5408,6 +5435,7 @@ class SolidWorksBackend(CadBackend):
                 "point_tolerance_m": point_tolerance,
                 "closest_point_error_m": projection_error,
                 "evaluate_point_error_m": evaluate_error,
+                "source_evaluate_error_m": source_evaluate_error,
                 "closest_evaluate_error_m": closest_evaluate_error,
                 "closest_point_on_raw": list(closest),
                 "parameter_input_point_m": list(closest_point),

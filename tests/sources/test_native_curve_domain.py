@@ -168,6 +168,7 @@ class NativeCurveDomainTests(unittest.TestCase):
                     evidence["source_point_m"] = list(common_point)
                     evidence["parameter_input_point_m"] = list(common_point)
                     evidence["projection_error_m"] = 0.0
+                    evidence["source_evaluate_error_m"] = 0.0
                     evidence["point_tolerance_m"] = (
                         native_curve_endpoint_operation_tolerance(
                             common_point,
@@ -341,6 +342,7 @@ class NativeCurveDomainTests(unittest.TestCase):
                 evidence["source_point_m"] = list(former_end)
                 evidence["parameter_input_point_m"] = list(former_end)
                 evidence["projection_error_m"] = 0.0
+                evidence["source_evaluate_error_m"] = 0.0
                 evidence["point_tolerance_m"] = (
                     native_curve_endpoint_operation_tolerance(
                         former_end,

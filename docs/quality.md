@@ -95,6 +95,8 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 原生 tessellation fin 端点采用版本化 `tessellation-edge-projection-v1` 绑定：保留原始顶点 `q`，先以 `GetClosestPointOn(q)` 取得边上的投影点 `p_on`，并要求 `q` 到 `p_on` 的最大坐标差不超过 `5e-5 m`（50 µm）；`GetParameter` 和 `Evaluate2` 均以 `p_on` 为输入。`p_on` 与 `Evaluate2` 点在内部参数使用 v3 点界，在原生 edge 边界参数使用上述 curve-operation v4 界。原始顶点、投影点、求值点、U、投影误差和规则版本均须留证并由 parser 独立复算；投影仅用于参数与证据绑定，不得替换交付网格顶点或放宽 50 µm 表面验收。
 
+当且仅当 `GetParameter(p_on)` 返回严格失败（原值 0/false、packed low32 为 0）时，可采用版本化 `native-u-closest-point-fallback-v1`：使用 `GetClosestPointOn` 返回的有限且位于 edge U 域内的参数，要求 `Evaluate2` packed 成功，并同时满足既有 `p_on` 到求值点 v3/v4 界以及原始 `q` 到求值点的 50 µm 上限。失败状态、原始类型、位值、最近点参数、求值点及 fallback 原因必须全部保留；`GetParameter` 成功时始终以其参数为权威，不得用 closest U 覆盖。若最近 U 越域、`Evaluate2` 不闭合或任何覆盖、cofin、拓扑检查失败，结果仍为 unresolved。
+
 <a id="qualification"></a>
 ## 警告与资格
 
