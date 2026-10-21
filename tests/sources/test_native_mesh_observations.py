@@ -194,12 +194,12 @@ class NativeMeshObservationTests(unittest.TestCase):
             "tessellation": tessellation,
         }
 
-    def verify(self, capture_class: str = "cad"):
+    def verify(self, capture_class: str = "cad", rows=None):
         # Adversarial rows keep NaN/Infinity literals on purpose: the verifier
         # must reject them semantically, so the block bytes are written raw.
         path = support.capture_file_for(self.root)
         capture = json.loads(path.read_text(encoding="utf-8"))
-        capture["geometry"] = [self.row]
+        capture["geometry"] = [self.row] if rows is None else list(rows)
         path.write_text(json.dumps(capture, ensure_ascii=False, allow_nan=True), encoding="utf-8")
         write_manifest(
             self.root / "evidence",
@@ -224,6 +224,41 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.assertEqual(warning["code"], "cad_sheet_face_untessellated")
         self.assertFalse(warning["tessellate_result"])
         self.assertIn("unqualified", warning["qualification"])
+
+    def test_collapsed_fin_warning_is_separate_from_untessellated_area(self):
+        from .test_solidworks_native_fin_capture import NativeFinCaptureTests  # noqa: PLC0415
+
+        untessellated_row = copy.deepcopy(self.row)
+        evidence, triangles, _edge, _start, _near, _end, _bind = (
+            NativeFinCaptureTests.collapsed_u_tessellation()
+        )
+        stl = evidence.stl_bytes
+        relative = "geometry/collapsed-native.stl"
+        target = self.root / "evidence" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(stl)
+        collapsed_row = {
+            "component": "collapsed-native",
+            "path": relative,
+            "triangles": len(triangles),
+            "sha256": hashlib.sha256(stl).hexdigest(),
+            "bodies": {"solid": 1, "sheet": 0},
+            "tessellation": evidence,
+        }
+
+        result = self.verify(rows=[collapsed_row, untessellated_row])
+
+        self.assertEqual(result["components"], 2)
+        self.assertEqual(result["untessellated_native_area_m2"], 2e-13)
+        warnings = {
+            warning["code"]: warning
+            for warning in result["warnings"]
+        }
+        self.assertEqual(
+            set(warnings),
+            {"cad_sheet_face_untessellated", "native_fin_u_collapsed"},
+        )
+        self.assertEqual(len(warnings["native_fin_u_collapsed"]["fin_ids"]), 2)
 
     def test_zero_native_facets_after_success_are_also_explicit(self):
         self.row["tessellation"]["no_facets_faces"][0]["tessellate_result"] = True

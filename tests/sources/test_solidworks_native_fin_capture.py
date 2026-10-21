@@ -608,7 +608,8 @@ class NativeFinCaptureTests(unittest.TestCase):
             triangles = self.stl_triangles(destination)
         return entry["tessellation"], triangles
 
-    def collapsed_u_tessellation(self):
+    @staticmethod
+    def collapsed_u_tessellation():
         def binary32(point):
             return struct.unpack("<3f", struct.pack("<3f", *point))
 

@@ -92,6 +92,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
     native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
     rows = evidence.geometry(bundle)
     warnings = []
+    untessellated_warnings = []
     topologies = []
     observed = 0
     for entry in rows:
@@ -131,6 +132,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         topologies.append({"component": component, **topology})
         _span_digests(path, spans)
         seen = set()
+        component_untessellated = []
         base = {"body_type", "body_index", "face_index", "triangle_count", "area_m2", "used_api"}
         for face in omitted:
             keys = set(face) if isinstance(face, dict) else None
@@ -188,7 +190,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                 face["used_api"] == "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
                 component + ": unsupported untessellated-face evidence API",
             )
-            warnings.append(
+            component_untessellated.append(
                 {
                     "code": "cad_sheet_face_untessellated",
                     "component": component,
@@ -196,6 +198,8 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
                     "qualification": "native_facets_absent; complete_surface_geometry_unqualified",
                 }
             )
+        warnings.extend(component_untessellated)
+        untessellated_warnings.extend(component_untessellated)
         span_counts = {
             (span["body_type"], span["body_index"], span["face_index"]): span["triangle_count"]
             for span in spans
@@ -214,5 +218,7 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         "components": observed,
         "warnings": warnings,
         "topologies": topologies,
-        "untessellated_native_area_m2": math.fsum(row["area_m2"] for row in warnings),
+        "untessellated_native_area_m2": math.fsum(
+            row["area_m2"] for row in untessellated_warnings
+        ),
     }

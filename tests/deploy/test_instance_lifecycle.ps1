@@ -65,6 +65,10 @@ Check 'wording.windows_recovery_schema' ($source.Contains('recovery-snapshot') -
   $source.Contains('solidworks-to-urdf.windows-recovery/v1'))
 Check 'wording.windows_recovery_acl' ($source.Contains('Get-AclProjection') -and
   $source.Contains('Set-AclProjection') -and $source.Contains('AreAccessRulesProtected'))
+Check 'wording.windows_managed_acl' ($source.Contains('Set-ManagedEndpointAcls') -and
+  $source.Contains('Assert-ManagedEndpointAcls') -and $source.Contains('windows_managed_acl_invalid') -and
+  $source.Contains('windows_managed_acl_unsafe') -and $source.Contains('Get-ManagedCommonParent') -and
+  $source.Contains('windows_managed_acl_boundary_invalid'))
 Check 'wording.windows_recovery_identity' ($source.Contains('config_digest') -and
   $source.Contains('release_identity_sha256') -and $source.Contains('install_id') -and
   $source.Contains('script_sha256'))
@@ -88,6 +92,9 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
 $seams += 'Get-AclProjection', 'Set-AclProjection', 'Get-TaskProjection', 'Get-RecoveryCurrentState',
   'Invoke-RecoverySnapshot', 'Invoke-RecoveryRestore', 'Invoke-RecoveryResume', 'Test-NetTcpNoMatchError'
+$seams += 'Get-ManagedServiceSid', 'Set-ManagedAcl', 'Assert-ManagedAcl',
+  'Set-ManagedEndpointAcls', 'Assert-ManagedEndpointAcls', 'Get-ManagedEndpointPaths',
+  'Get-ManagedCommonParent', 'Test-ManagedPathWithin'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 Check 'windows_recovery.net_tcp_no_match' (Test-NetTcpNoMatchError ([pscustomobject]@{
   CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
@@ -165,6 +172,70 @@ Remove-Item -LiteralPath $jsonRoot -Recurse -Force -ErrorAction SilentlyContinue
 # In-process refusal cases need the script's top-level Die to throw instead of exiting the
 # harness; every existing check exercises throwing interpreters, never Die itself.
 function Die { param([string]$code, [string]$message) throw ($code + ': ' + $message) }
+
+# ---- real Windows ACL boundary: inherited broad access is replaced ----------
+if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+  $aclRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-managed-acl-' + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $aclRoot -Force
+  $aclChild = Join-Path $aclRoot 'child'
+  $null = New-Item -ItemType Directory -Path $aclChild -Force
+  $aclFile = Join-Path $aclChild 'state.json'
+  [System.IO.File]::WriteAllText($aclFile, '{}', (New-Object System.Text.UTF8Encoding($false)))
+  $packageRoot = Join-Path $aclRoot 'packages'
+  $outputRoot = Join-Path $aclRoot 'output'
+  $stateRoot = Join-Path $aclRoot 'state'
+  $endpointRoot = Join-Path $aclRoot 'generation'
+  foreach ($path in @($packageRoot, $outputRoot, $stateRoot, $endpointRoot)) {
+    $null = New-Item -ItemType Directory -Path $path -Force
+  }
+  $configPath = Join-Path $endpointRoot 'endpoint.json'
+  $tokenPath = Join-Path $stateRoot 'token'
+  $installIdPath = Join-Path $stateRoot 'install-id'
+  foreach ($path in @($configPath, $tokenPath, $installIdPath)) {
+    [System.IO.File]::WriteAllText($path, 'fixture', (New-Object System.Text.UTF8Encoding($false)))
+  }
+  $config = [pscustomobject]@{
+    package_root=$packageRoot
+    output_root=$outputRoot
+    state_root=$stateRoot
+    token_file=$tokenPath
+  }
+  $managedPaths = @(Get-ManagedEndpointPaths $config $endpointRoot $configPath $installIdPath)
+  $commonParent = Get-ManagedCommonParent $managedPaths
+  Check 'windows_acl.common_parent_from_config' ((Normalize-PathIdentity $commonParent) -eq
+    (Normalize-PathIdentity $aclRoot))
+  $aclRows = @(Get-ManagedEndpointAclRows $config $endpointRoot $configPath $installIdPath)
+  Check 'windows_acl.paths_deduplicated' (@($aclRows.path | Select-Object -Unique).Count -eq $aclRows.Count)
+  $recursiveRows = @($aclRows | Where-Object { $_.recurse })
+  Check 'windows_acl.common_parent_recursive_only' ($recursiveRows.Count -eq 1 -and
+    (Normalize-PathIdentity ([string]$recursiveRows[0].path)) -eq
+      (Normalize-PathIdentity $commonParent))
+  $serviceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $authenticated = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-11'
+  $broadAcl = Get-Acl -LiteralPath $aclRoot
+  $broadRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+    $authenticated,
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+  [void]$broadAcl.AddAccessRule($broadRule)
+  Set-Acl -LiteralPath $aclRoot -AclObject $broadAcl
+  Set-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $serviceSid
+  Assert-ManagedAcl $aclRoot $serviceSid -Recurse
+  $aclProjection = Get-AclProjection $aclRoot
+  Check 'windows_acl.broad_inheritance_removed' (-not @($aclProjection.rules | Where-Object {
+    $_.sid -in @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-4') -or $_.inherited
+  }))
+  Check 'windows_acl.one_owner_full_control' (@($aclProjection.rules).Count -eq 1 -and
+    $aclProjection.rules[0].sid -eq $serviceSid -and
+    $aclProjection.rules[0].rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl)
+  Check 'windows_acl.child_covered' ((Get-AclProjection $aclFile).rules[0].sid -eq $serviceSid)
+  Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
+} else {
+  Write-Host 'SKIP windows_acl.runtime (not a Windows host)'
+}
 
 # ---- harness: stub only the OS boundary -------------------------------------
 $script:TaskMissing = $false
