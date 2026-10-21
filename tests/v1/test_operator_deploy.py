@@ -267,20 +267,35 @@ def platform_fixture(
         fixture_ssh,
         r'''#!/usr/bin/env bash
 root="$(cd "$(dirname "$0")/.." && pwd)"
-script="$(cat)"
-python3 - "$root" "$script" <<'PY'
+stdin_script="$(cat)"
+python3 - "$root" "$stdin_script" "$@" <<'PY'
 import base64
+import gzip
 import json
 import re
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+stdin_script = sys.argv[2]
+arguments = sys.argv[3:]
 override = root / "windows-status.json"
 if override.is_file():
-    print(override.read_text(encoding="utf-8").strip())
-    raise SystemExit(0)
-script = sys.argv[2]
+    sys.stdout.write(override.read_text(encoding="utf-8").strip())
+    sys.stdout.write("\n")
+    stderr_path = root / "windows-status.stderr"
+    if stderr_path.is_file():
+        sys.stderr.buffer.write(stderr_path.read_bytes())
+    rc_path = root / "windows-status.rc"
+    raise SystemExit(int(rc_path.read_text(encoding="ascii")) if rc_path.is_file() else 0)
+script = stdin_script
+if "-EncodedCommand" in arguments:
+    encoded = arguments[arguments.index("-EncodedCommand") + 1]
+    launcher = base64.b64decode(encoded).decode("utf-16le")
+    match = re.search(r"FromBase64String\('([^']+)'\)", launcher)
+    if match is None or "GZipStream" not in launcher:
+        raise SystemExit(0)
+    script = gzip.decompress(base64.b64decode(match.group(1))).decode("utf-8")
 match = re.search(r"FromBase64String\('([^']+)'\)", script)
 if match is None:
     raise SystemExit(2)
@@ -881,7 +896,7 @@ class LifecycleTests(unittest.TestCase):
             '    fi\n'
             "    echo '{\"passed\":true,\"verb\":\"promote\",\"generation\":\"gen-2\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
-            "  *\"-Verb status\"*)\n"
+            "  *\"-Verb status\"*|*\"-EncodedCommand JABwAD0A\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
@@ -1740,6 +1755,71 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("DRIFT", result.stdout)
             self.assertEqual(before, {path: digest(path) for path in before})
+
+    def test_windows_status_probe_uses_encoded_command_and_rejects_bad_transport(self) -> None:
+        control = CONTROL.read_text(encoding="utf-8")
+        self.assertIn('"-EncodedCommand"', control)
+        self.assertNotIn('"-Command",\n            "-",', control)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, state, config_home, _ = self._render_units(root)
+            status_path = root / "windows-status.json"
+            stderr_path = root / "windows-status.stderr"
+            rc_path = root / "windows-status.rc"
+
+            def status() -> subprocess.CompletedProcess:
+                return run(
+                    ["bash", str(CONTROL), "status", "--config", str(config_path)],
+                    status_env(root, config_home),
+                )
+
+            baseline = status()
+            self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
+            baseline_sample = json.loads(baseline.stdout.strip().splitlines()[-1])
+            self.assertEqual(baseline_sample["task_state"], "Running")
+            expected = json.loads((state / "install-record.json").read_text(encoding="utf-8"))["ends"]["windows"]
+            raw_sample = {
+                "task_name": baseline_sample["task_name"],
+                "task_state": "Running",
+                "listener_pid": baseline_sample["listener_pid"],
+                "process_start_utc": baseline_sample["process_start_utc"],
+                "install_id": baseline_sample["install_id"],
+                "config_digest": baseline_sample["config_digest"],
+                "release": expected["release"],
+                "health_install_id": baseline_sample["install_id"],
+                "health_config_digest": baseline_sample["config_digest"],
+                "health_release": expected["release"],
+            }
+            raw_transport = json.dumps(
+                {"passed": True, "sample": raw_sample},
+                sort_keys=True,
+            )
+
+            status_path.write_text(
+                "transport start\n" + raw_transport + "\n",
+                encoding="utf-8",
+            )
+            multiline = status()
+            self.assertEqual(multiline.returncode, 0, multiline.stdout + multiline.stderr)
+
+            for name, content, expected in (
+                ("empty", "", "Windows probe returned no JSON"),
+                ("non-json", "not a JSON object\n", "Windows probe returned no JSON"),
+                ("truncated", '{"passed":true\n', "Windows probe returned no JSON"),
+            ):
+                with self.subTest(name=name):
+                    status_path.write_text(content, encoding="utf-8")
+                    result = status()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected, result.stderr)
+
+            status_path.write_text(raw_transport + "\n", encoding="utf-8")
+            stderr_path.write_bytes(b"\xd5\n")
+            rc_path.write_text("1\n", encoding="ascii")
+            invalid_stderr = status()
+            self.assertNotEqual(invalid_stderr.returncode, 0)
+            self.assertIn("Windows probe failed", invalid_stderr.stderr)
+            self.assertNotIn("UnicodeDecodeError", invalid_stderr.stderr)
 
     def test_status_reports_a_proxy_unit_that_executes_another_binary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2705,7 +2785,7 @@ class InstallOrderingTests(unittest.TestCase):
             '        cat "${FIXTURE_HEALTH_FILE_CANDIDATE:-$FIXTURE_HEALTH_FILE}" ;;\n'
             '      *) cat "$FIXTURE_HEALTH_FILE" ;;\n'
             "    esac ;;\n"
-            "  *\"-Verb status\"*)\n"
+            "  *\"-Verb status\"*|*\"-EncodedCommand JABwAD0A\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
