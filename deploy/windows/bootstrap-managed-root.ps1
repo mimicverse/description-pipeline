@@ -414,8 +414,8 @@ Emit @{
     privilege_qualification='user-approved-administrator-runtime'
     acl_ace=$true
   }
-  root_acl=Get-AclProjection $root
-  marker_acl=Get-AclProjection $markerPath
+  root_acl=(Get-AclProjection $root)
+  marker_acl=(Get-AclProjection $markerPath)
   managed_entry_acl_count=@($entriesBefore).Count
   volume=[ordered]@{
     before=$volumeBefore
