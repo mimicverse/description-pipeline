@@ -378,7 +378,7 @@ class ReportViewTests(unittest.TestCase):
         self.assertIn("byte recheck not recorded", rows["publication.git"]["summary"]["actual"])
         self.assertEqual(
             rows["discovery.inputs"]["summary"]["actual"],
-            "Inventory not recorded; names not recorded",
+            "Inventory not recorded",
         )
         self.assertIn("blocking findings 1", rows["discovery.definition"]["summary"]["actual"])
         job["status"] = "failed"

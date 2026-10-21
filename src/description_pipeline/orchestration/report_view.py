@@ -13,6 +13,11 @@ from __future__ import annotations
 
 from pathlib import PureWindowsPath
 
+from ..geometry.native_u import (
+    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_details_match,
+)
+from ..io import PipelineError
 from ..stages import FIXED_REQUIRED_CHECKS, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
@@ -69,6 +74,18 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.link_name_missing": "Rigid-body coordinate system is unidentified",
     "discovery.joint_unsupported_pattern": "Recorded constraints do not identify a one-DOF joint",
     "discovery.joint_axis_sign_missing": "dp.joint.axis_sign (+/-1) is missing",
+    "discovery.direction_sign_reversed": "CAD author axis sign is applied; q and ranges remain in author q",
+    "direction.author_sign_applied": (
+        "CAD author axis_sign selects the undirected shaft positive direction; q and ranges stay in author q"
+    ),
+    "discovery.interface_name_invalid": "CAD interface name was normalized with a warning",
+    "discovery.interface_motion_unresolved": "CAD joint motion is unclassified; a neutral name is retained",
+    "direction.semantics_unresolved": "Authored CAD axis is preserved; functional positive motion is not proven",
+    "limits.preview_policy": "Inspection preview full-turn window; no native mechanical range is claimed",
+    "direction.reference_frame_missing": "The local parent mechanical reference frame is missing",
+    "direction.reference_frame_invalid": "The local parent mechanical reference frame is invalid",
+    "direction.invalid": "Positive-motion semantics could not be evaluated",
+    "v14.direction_unresolved": "Saved joint has no canonical positive-motion sign",
     "discovery.joint_axis_selector_missing": "No readable joint-axis selector",
     "discovery.mate_entities_unsupported": "Mate entity combination is not supported",
     "discovery.mate_geometry_mismatch": "Recorded mate geometry conflicts with the constraint",
@@ -91,6 +108,12 @@ _DISCOVERY_CODE_LABELS = {
 
 #: Readable names for verifier diagnostics carried on check details (recorded warnings).
 _DIAGNOSTIC_CODE_LABELS = {
+    "cad_component_persistent_reference_aliased": "CAD component persistent reference is aliased (diagnostic)",
+    "cad_scope_local_identity_derived": "Scope-local native identity is derived (diagnostic)",
+    "cad_part_identity_witness_derived": "Part identity witness is derived (diagnostic)",
+    "cad_topology_identity_derived": "Topology identity is derived (diagnostic)",
+    "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
+    "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
     "v14.mate_inference_unavailable": "Mate inference unavailable (diagnostic)",
     "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",
@@ -123,11 +146,13 @@ _INDEPENDENT_LABELS = {
     "source.native": "Native source presence",
     "model.schema": "Model schema conformance",
     "source.raw": "Native raw-evidence presence",
+    "provenance.value_warnings": "Non-native value provenance warnings",
     "physics.mass_closure_equality": "Mass closure (URDF mass = whole CAD mass)",
     "source.dependencies": "Native dependency closure",
     "source.coverage": "Native source coverage",
     "verification.complete": "Independent verification completion marker",
     "model.policy": "Model policy conformance",
+    "source.carrier_binding": "Raw carrier identity and topology binding",
     "physics.independent": "Independent physical recomputation",
     "frames.native": "Native coordinate systems",
     "frames.components": "Component coordinate systems",
@@ -251,11 +276,9 @@ def _boundary_summary(identifier: object, details: dict) -> dict | None:
         }
     if name == "discovery.inputs":
         return {
-            "scope": "Frozen files and name registry",
-            "expected": "Frozen inventory agrees with the name registry",
-            "actual": (
-                f"Inventory {_short(details.get('files_sha256'))}; names {_short(details.get('frozen_names_sha256'))}"
-            ),
+            "scope": "Frozen files and derived interface names",
+            "expected": "Frozen inventory agrees with the CAD-derived interface names",
+            "actual": f"Inventory {_short(details.get('files_sha256'))}",
         }
     if name == "discovery.definition":
         findings = details.get("findings")
@@ -721,6 +744,20 @@ _WARNING_DETAIL_KEYS = (
     "label_source",
     "mass_kg",
     "masses",
+    "objects",
+    "component",
+    "entity_kind",
+    "body_type",
+    "body_index",
+    "owner_scope_key",
+    "object_indices",
+    "field",
+    "native_reference_sha256",
+    "mapping_source_part_document_sha256",
+    "mapping_source_body_reference_sha256",
+    "mapped_source_indices",
+    "mapped_source_persistent_reference_sha256",
+    "topology_signature_sha256s",
 )
 _WARNING_RESIDUAL_KEYS = ("max_abs_residual", "max_normalized_residual", "threshold")
 
@@ -730,6 +767,7 @@ def _warning_row(stage: dict, item: dict) -> dict:
 
     code = str(item.get("code") or "")
     detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    context = {**item, **detail}
     row: dict = {
         "stage": stage.get("id"),
         "stage_name": stage.get("name"),
@@ -738,13 +776,32 @@ def _warning_row(stage: dict, item: dict) -> dict:
         "state_label": "Warning",
         "blocking": False,
     }
-    object_id = item.get("object") or (f"joint:{detail['joint']}" if detail.get("joint") else None)
+    object_id = (
+        item.get("object")
+        or (f"joint:{detail['joint']}" if detail.get("joint") else None)
+        or (
+            f"{context['component']}:{context['entity_kind']}:"
+            f"{context['body_type']}/{context['body_index']}"
+            if all(
+                key in context
+                for key in (
+                    "component",
+                    "entity_kind",
+                    "body_type",
+                    "body_index",
+                )
+            )
+            else context.get("component")
+        )
+    )
     if object_id:
         row["object"] = str(object_id)
     if item.get("message"):
-        row["message"] = str(item.get("message"))
+        row["message"] = str(item["message"])
+    elif code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
+        row["message"] = str(row["label"])
     for key in _WARNING_DETAIL_KEYS:
-        value = detail.get(key)
+        value = context.get(key)
         if value is not None:
             # Authored zeros (for example an equal zero joint range) stay exact values.
             row[key] = value
@@ -758,10 +815,28 @@ def _warning_row(stage: dict, item: dict) -> dict:
     return row
 
 
-def _recorded_warnings(stage: dict, findings: list, rows: list[dict]) -> list[dict]:
+def _recorded_warnings(
+    stage: dict,
+    findings: list,
+    rows: list[dict],
+    quality_diagnostics: list[dict] | None = None,
+) -> list[dict]:
     """Warnings from recorded evidence only: non-blocking findings and check diagnostics."""
 
     warnings: list[dict] = []
+    if quality_diagnostics is not None and not isinstance(
+        quality_diagnostics,
+        list,
+    ):
+        raise PipelineError("Quality diagnostics are malformed")
+    native_diagnostics = [
+        item
+        for item in quality_diagnostics or []
+        if isinstance(item, dict)
+        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    scope_compared = False
+    native_gate_seen = False
     if stage.get("id") == "discover":
         warnings.extend(
             _warning_row(stage, item)
@@ -770,16 +845,58 @@ def _recorded_warnings(stage: dict, findings: list, rows: list[dict]) -> list[di
         )
     for row in rows:
         details = row.get("raw_details")
+        row_passed = (
+            row.get("state") == "passed" or row.get("passed") is True
+        )
+        if row.get("id") == "geometry.native_tessellation" and row_passed:
+            native_gate_seen = True
         recorded = details.get("warnings") if isinstance(details, dict) else None
         if isinstance(recorded, list):
+            raw_scope = [
+                item
+                for item in recorded
+                if isinstance(item, dict)
+                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            ]
+            if raw_scope:
+                if not native_scope_warning_details_match(
+                    native_diagnostics,
+                    recorded,
+                ):
+                    raise PipelineError(
+                        "Native scope warnings differ from quality diagnostics"
+                    )
+                scope_compared = True
+                recorded = [
+                    next(
+                        item
+                        for item in native_diagnostics
+                        if item["code"] == row["code"]
+                        and item["detail"] == row.get("detail")
+                    )
+                    if row.get("code")
+                    in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+                    else row
+                    for row in recorded
+                ]
             warnings.extend(
                 _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
+            )
+        elif row.get("id") == "geometry.native_tessellation" and row_passed:
+            raise PipelineError(
+                "Passed native tessellation gate carries no warning list"
             )
         diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
         if isinstance(diagnostics, list):
             warnings.extend(
                 _warning_row(stage, item) for item in diagnostics if isinstance(item, dict) and item.get("code")
             )
+    if native_diagnostics and (
+        not scope_compared or not native_gate_seen
+    ):
+        raise PipelineError(
+            "Native scope diagnostics have no matching gate warnings"
+        )
     return warnings
 
 
@@ -862,7 +979,12 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                         "whole_cad_mass_kg": details.get("whole_cad_mass_kg"),
                         "delta_kg": details.get("delta_kg"),
                     }
-        warning_rows = _recorded_warnings(stage, discovery_findings, [*boundary_rows, *independent_rows])
+        warning_rows = _recorded_warnings(
+            stage,
+            discovery_findings,
+            [*boundary_rows, *independent_rows],
+            quality.get("diagnostics"),
+        )
         stage_out = {
             "id": stage.get("id"),
             "name": stage.get("name"),

@@ -89,7 +89,7 @@ def _locked_pins(data: bytes) -> dict:
         key = canonicalize_name(name)
         if key in pins:
             raise PipelineError(f"Dependency lock repeats {key}")
-        pins[key] = version.strip()
+        pins[key] = version.strip().split()[0]
     return pins
 
 
@@ -162,7 +162,12 @@ def verify_release(directory, identity):
             lock = f"requirements/{platform}-py312.lock"
             if (identity.get("runtime_locks") or {}).get(platform) != members.get(lock):
                 raise PipelineError(f"Deployment lock {lock} is not this release's lock")
-            source_locks[platform] = archive.read(lock)
+            if platform == "linux":
+                if "deploy/airflow/requirements.lock" not in payloads:
+                    raise PipelineError("Linux release lacks its Airflow wheelhouse lock")
+                source_locks[platform] = payloads["deploy/airflow/requirements.lock"]
+            else:
+                source_locks[platform] = archive.read(lock)
     product = canonicalize_name("mimicverse-description")
     roles = {
         f"description-{version}-linux-cp312-x86_64.zip": "linux",

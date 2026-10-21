@@ -7,6 +7,7 @@
 # health probe run for real (Wait-Settled runs real and fails fast on the stub task state).
 # Scenarios: unknown_owner | startable_second_refusal | startable_missing_receipt |
 # stage_unknown_key_refused | stage_legacy_targets_refused | stage_duplicate_key_refused |
+# stage_acl_boundary |
 # promote_candidate_mismatch | promote_source_mismatch.
 # Prints one JSON object (scenario, message, calls, sleeps, receipt) and exits 0.
 param(
@@ -51,8 +52,16 @@ if ($Scenario -ne 'startable_missing_receipt') {
       ConvertTo-Json -Compress))
 }
 $bindingPath = Join-Path $Root 'binding.json'
+$archiveName = 'synthetic.zip'
+$archiveSha = 'synthetic'
+if ($Scenario -eq 'stage_acl_boundary') {
+  $archiveMember = Join-Path $Root 'archive-member.txt'
+  [System.IO.File]::WriteAllText($archiveMember, 'synthetic archive member')
+  Compress-Archive -LiteralPath $archiveMember -DestinationPath (Join-Path $Root $archiveName)
+  $archiveSha = (Get-FileHash -LiteralPath (Join-Path $Root $archiveName) -Algorithm SHA256).Hash.ToLower()
+}
 @{task_name='offline-endpoint'; state_root=$Root; generation=$newGeneration; dir=$Root;
-  archive='synthetic.zip'; artifact_sha256='synthetic'; port=8765; package_root=$Root; output_root=$Root;
+  archive=$archiveName; artifact_sha256=$archiveSha; port=8765; package_root=$Root; output_root=$Root;
   version='1.5.0'; source_commit=('b' * 40); source_sha256=('b' * 64)} |
   ConvertTo-Json | Set-Content -LiteralPath $bindingPath
 if ($Scenario -notlike 'stage_*') {
@@ -100,6 +109,36 @@ function Register-ScheduledTask {
   $script:CurrentAction=$script:OldAction
   $script:Calls.Add('register:old')
 }
+function Get-ManagedServiceSid { param($Task) return 'S-1-5-21-offline-harness' }
+function Set-ManagedAcl {
+  param(
+    [string]$Path,
+    [bool]$Protected,
+    [switch]$NonInheriting,
+    [switch]$AllowServiceOwner,
+    [switch]$Recurse)
+  $script:Calls.Add(
+    'managed-acl:' + $Path +
+    ':protected=' + [string]$Protected +
+    ':non-inheriting=' + [string][bool]$NonInheriting +
+    ':allow-service-owner=' + [string][bool]$AllowServiceOwner +
+    ':recurse=' + [string][bool]$Recurse)
+}
+function Set-ManagedEndpointAcls {
+  param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$TaskFile)
+  $script:Calls.Add('managed-endpoint-acl:' + $EndpointRoot)
+}
+function Assert-ManagedEndpointAcls {
+  param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$TaskFile)
+}
+function Assert-DomainPins { param([string]$StateRoot, [string]$ServedGeneration) return @() }
+if ($Scenario -eq 'stage_acl_boundary') {
+  function Expand-Archive {
+    param([string]$LiteralPath, [string]$DestinationPath)
+    throw 'DIE:injected_stage_acl_boundary:the archive expansion is intentionally stopped'
+  }
+}
+function Get-TaskFilePath { param($Task) return (Join-Path $Root 'task.xml') }
 function Get-Process {
   [CmdletBinding()] param([int]$Id)
   if ($Scenario -eq 'unknown_owner') {

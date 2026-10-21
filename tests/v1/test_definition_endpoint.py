@@ -18,7 +18,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import PipelineError
 from description_pipeline.orchestration.airflow_client import (
     EndpointConfig,
     WindowsEndpoint,
@@ -169,23 +169,19 @@ class DefinitionEndpointTests(EndpointFixture, unittest.TestCase):
             jobs.abort(request["run_id"], {**failure, "error": "another failure"})
         self.assertEqual(409, refused.exception.status)
 
-    def test_registry_and_derivation_settings_are_bound(self) -> None:
+    def test_derivation_settings_are_bound(self) -> None:
         jobs = self.jobs()
         request = self.request()
         jobs.create(request)
         finished = self.run_to_terminal(jobs, request["run_id"])
         self.assertEqual("native_complete", finished["status"], finished.get("error"))
-        self.assertTrue(self.frozen_names)
-        self.assertNotEqual(digest(self.frozen_names), digest({}))
         check = next(
             event["check"] for event in finished["events"] if (event.get("check") or {}).get("id") == "discovery.inputs"
         )
-        self.assertEqual(digest(self.frozen_names), check["details"]["frozen_names_sha256"])
         self.assertEqual([str(self.records_dir())], check["details"]["record_roots"])
         payload = json.loads(
             (self.config["state_root"] / "prepared" / request["run_id"] / DISCOVERY_FILE).read_text(encoding="utf-8")
         )
-        self.assertEqual(self.frozen_names, payload["derivation"]["frozen_names"])
         self.assertEqual(MAIN, payload["derivation"]["main_assembly"])
 
     def test_http_definition_route_rejects_bad_headers(self) -> None:
@@ -267,7 +263,7 @@ class DefinitionClientLoopbackTests(EndpointFixture, unittest.TestCase):
             expected_run_id=run_id,
             expected_selection=manifest,
             expected_native_tool=TOOL,
-            settings=DiscoverySettings(record_roots=[self.records_dir()], frozen_names=dict(self.frozen_names)),
+            settings=DiscoverySettings(record_roots=[self.records_dir()]),
         )
         request_archive = self.root / f"capture-request-{run_id}.zip"
         sealed_record = {**copy.deepcopy(self.record), "source_selection": copy.deepcopy(manifest)}

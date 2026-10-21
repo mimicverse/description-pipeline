@@ -16,13 +16,14 @@ param(
   [switch]$StaticOnly
 )
 $ErrorActionPreference = 'Stop'
+$repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $ScriptPath) {
   # Windows PowerShell 5.1 does not populate $PSScriptRoot while parameter defaults evaluate and
   # has no multi-child Join-Path (PowerShell 6+ -AdditionalChildPath): the repository-relative
   # default resolves here, after the parameter block.
-  $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
   $ScriptPath = Join-Path (Join-Path (Join-Path $repositoryRoot 'deploy') 'windows') 'instance-lifecycle.ps1'
 }
+$bootstrapScript = Join-Path (Join-Path (Join-Path $repositoryRoot 'deploy') 'windows') 'bootstrap-managed-root.ps1'
 $script:checks = 0
 $script:failures = [System.Collections.Generic.List[string]]::new()
 function Check([string]$name, [bool]$condition, [string]$detail = '') {
@@ -40,6 +41,11 @@ $tokens = $null
 $parseErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$parseErrors)
 Check 'parse.clean' ($parseErrors.Count -eq 0) (($parseErrors | Out-String).Trim())
+$bootstrapTokens = $null
+$bootstrapParseErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile(
+  $bootstrapScript, [ref]$bootstrapTokens, [ref]$bootstrapParseErrors)
+Check 'parse.bootstrap_clean' ($bootstrapParseErrors.Count -eq 0) (($bootstrapParseErrors | Out-String).Trim())
 $source = Get-Content -LiteralPath $ScriptPath -Raw
 # Design-lead settle rules: no blind wait/retry, positive owner proof first, three-valued
 # observers, and a recorded safe restore on the failure path.
@@ -60,6 +66,36 @@ Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfi
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
 Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
   $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
+Check 'wording.user_domain_pins' ($source.Contains("GetEnvironmentVariable(`$Name, 'User')") -and
+  $source.Contains("SetEnvironmentVariable(`$Name, `$Value, 'User')"))
+Check 'wording.windows_recovery_schema' ($source.Contains('recovery-snapshot') -and
+  $source.Contains('recovery-restore') -and $source.Contains('recovery-verify') -and
+  $source.Contains('solidworks-to-urdf.windows-recovery/v1'))
+Check 'wording.windows_recovery_acl' ($source.Contains('Get-AclProjection') -and
+  $source.Contains('Set-AclProjection') -and $source.Contains('AreAccessRulesProtected'))
+Check 'wording.windows_managed_acl' ($source.Contains('Set-ManagedEndpointAcls') -and
+  $source.Contains('Assert-ManagedEndpointAcls') -and $source.Contains('windows_managed_acl_invalid') -and
+  $source.Contains('windows_managed_acl_unsafe') -and $source.Contains('Get-ManagedCommonParent') -and
+  $source.Contains('windows_managed_acl_boundary_invalid') -and
+  $source.Contains('Get-ManagedServiceAuthorization') -and
+  $source.Contains('user-approved-administrator-runtime') -and
+  $source.Contains('windows_managed_acl_marker_missing') -and
+  $source.Contains('solidworks-to-urdf.managed-root/v1'))
+$harnessPath = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'
+$harnessSource = Get-Content -LiteralPath $harnessPath -Raw
+Check 'wording.harness_acl_signature' (
+  $harnessSource.Contains('[switch]$AllowServiceOwner') -and
+  -not $harnessSource.Contains('[string]$ServiceRights') -and
+  -not $harnessSource.Contains('[string]$ServiceSid, [string]$TaskFile'))
+Check 'wording.windows_recovery_identity' ($source.Contains('config_digest') -and
+  $source.Contains('release_identity_sha256') -and $source.Contains('install_id') -and
+  $source.Contains('script_sha256'))
+Check 'wording.windows_recovery_no_cad_inference' ($source.Contains('cad_session_facts') -and
+  $source.Contains('external_session_detected'))
+$restoreStart = $source.IndexOf('function Invoke-RecoveryRestore')
+$resumeStart = $source.IndexOf('function Invoke-RecoveryResume')
+Check 'wording.windows_restore_never_starts' ($restoreStart -ge 0 -and $resumeStart -gt $restoreStart -and
+  (-not $source.Substring($restoreStart, $resumeStart - $restoreStart).Contains('Start-ScheduledTask')))
 if ($StaticOnly) {
   Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
   exit ([int]($script:failures.Count -gt 0))
@@ -72,7 +108,51 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-PreviousGenerationBinding', 'Get-EndpointConfigEarlyProblems', 'Get-EndpointConfigCandidateProgram',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
   'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
+$seams += 'Get-AclProjection', 'Set-AclProjection', 'Get-TaskProjection', 'Get-RecoveryCurrentState',
+  'Invoke-RecoverySnapshot', 'Invoke-RecoveryRestore', 'Invoke-RecoveryResume', 'Test-NetTcpNoMatchError'
+$seams += 'Get-ManagedServiceSid', 'Set-ManagedAcl', 'Assert-ManagedAcl',
+  'Set-ManagedEndpointAcls', 'Assert-ManagedEndpointAcls', 'Get-ManagedEndpointPaths',
+  'Get-ManagedCommonParent', 'Test-ManagedPathWithin', 'Assert-ManagedOperatorIsAdministrator',
+  'Get-ManagedServiceAuthorization', 'New-ManagedAccessRule',
+  'Get-ManagedAclProjectionForRole'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
+Check 'windows_recovery.net_tcp_no_match' (Test-NetTcpNoMatchError ([pscustomobject]@{
+  CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
+  FullyQualifiedErrorId='CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'
+}))
+Check 'windows_recovery.net_tcp_not_found_text_is_not_enough' (-not (Test-NetTcpNoMatchError ([pscustomobject]@{
+  CategoryInfo=[pscustomobject]@{Category='InvalidOperation'}
+  FullyQualifiedErrorId='ProviderFailure'
+})))
+$releaseHash = Get-ReleaseIdentitySha256 @{
+  version='1.2.3'
+  source_commit='a' * 40
+  source_sha256='b' * 64
+  role='native'
+}
+Check 'windows_recovery.release_hash' ($releaseHash -eq 'd429e65c8f58a11d51d12ab6a83219568c3505e0698a34a52afd9668f47691c5')
+$recoveryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-recovery-' + [guid]::NewGuid().ToString('N'))
+$recoverySource = Join-Path $recoveryRoot 'source'
+$null = New-Item -ItemType Directory -Path $recoverySource -Force
+$taskText = '<Task />'
+[System.IO.File]::WriteAllText((Join-Path $recoverySource 'task.xml'), $taskText, (New-Object System.Text.UTF8Encoding($false)))
+$taskBytes = [System.Text.Encoding]::UTF8.GetBytes($taskText)
+$recoveryState = [ordered]@{
+  schema_version='solidworks-to-urdf.windows-recovery/v1'
+  members=@([ordered]@{member='task.xml';bytes=$taskBytes.Length;sha256=(Get-BytesSha256 $taskBytes)})
+}
+[System.IO.File]::WriteAllText(
+  (Join-Path $recoverySource 'windows-state.json'),
+  ($recoveryState | ConvertTo-Json -Depth 8 -Compress),
+  (New-Object System.Text.UTF8Encoding($false)))
+$recoveryBundle = Join-Path $recoveryRoot 'recovery.zip'
+Compress-Archive -Path (Join-Path $recoverySource '*') -DestinationPath $recoveryBundle
+$recoveryRead = Read-RecoveryBundle $recoveryBundle
+Check 'windows_recovery.bundle_schema' ($recoveryRead.schema_version -eq 'solidworks-to-urdf.windows-recovery/v1')
+$recoveryExpanded = Expand-RecoveryBundle $recoveryBundle $recoveryRoot
+Check 'windows_recovery.bundle_member' ((Get-FileHash -LiteralPath (Join-Path $recoveryExpanded.root 'task.xml') -Algorithm SHA256).Hash.ToLower() -eq
+  [string]$recoveryRead.members[0].sha256)
+Remove-Item -LiteralPath $recoveryRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # ---- strict JSON boundary on the bound CPython 3.12 (PowerShell 5.1-compatible path) --------
 $scanPython = Get-EndpointConfigScanPython
@@ -113,6 +193,220 @@ Remove-Item -LiteralPath $jsonRoot -Recurse -Force -ErrorAction SilentlyContinue
 # harness; every existing check exercises throwing interpreters, never Die itself.
 function Die { param([string]$code, [string]$message) throw ($code + ': ' + $message) }
 
+# ---- real Windows ACL boundary: inherited broad access is replaced ----------
+if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+  $driveRoot = ([System.IO.Path]::GetPathRoot($env:SystemRoot)).TrimEnd('\')
+  $aclRoot = Join-Path $driveRoot ('description-managed-acl-' + [guid]::NewGuid().ToString('N'))
+  $siblingRoot = Join-Path $driveRoot ('description-unmanaged-sibling-' + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $aclRoot -Force
+  $null = New-Item -ItemType Directory -Path $siblingRoot -Force
+  $packageRoot = Join-Path $aclRoot 'packages'
+  $outputRoot = Join-Path $aclRoot 'output'
+  $stateRoot = Join-Path $aclRoot 'state'
+  $secretRoot = Join-Path $aclRoot 'secrets'
+  $endpointRoot = Join-Path $aclRoot 'generation'
+  $lifecycleRoot = Join-Path $stateRoot 'lifecycle'
+  foreach ($path in @($packageRoot, $outputRoot, $stateRoot, $secretRoot, $endpointRoot, $lifecycleRoot)) {
+    $null = New-Item -ItemType Directory -Path $path -Force
+  }
+  $configPath = Join-Path $endpointRoot 'endpoint.json'
+  $tokenPath = Join-Path $secretRoot 'endpoint.token'
+  $installIdPath = Join-Path $stateRoot 'install-id'
+  $ownershipPath = Join-Path $stateRoot 'cad-ownership.json'
+  $leasePath = Join-Path $stateRoot 'cad-ownership.json.lease'
+  $taskFile = Join-Path $aclRoot 'endpoint-task.xml'
+  $packageChild = Join-Path $packageRoot 'cached-package.bin'
+  foreach ($path in @(
+      $configPath, $tokenPath, $installIdPath, $ownershipPath, $leasePath,
+      $taskFile, $packageChild)) {
+    [System.IO.File]::WriteAllText($path, 'fixture', (New-Object System.Text.UTF8Encoding($false)))
+  }
+  $operatorIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $serviceSid = [string]$operatorIdentity.User.Value
+  $bootstrapOutput = & $bootstrapScript -ManagedRoot $aclRoot -ServiceAccount $serviceSid
+  $bootstrapReceipt = ($bootstrapOutput | Select-Object -Last 1) | ConvertFrom-Json
+  Check 'windows_acl.bootstrap_marker' ($bootstrapReceipt.passed -eq $true -and
+    $bootstrapReceipt.service_sid -eq $serviceSid -and
+    $bootstrapReceipt.managed_runtime.sid -eq $serviceSid -and
+    $bootstrapReceipt.managed_runtime.administrator -eq $true -and
+    $bootstrapReceipt.managed_runtime.privilege_qualification -eq 'user-approved-administrator-runtime' -and
+    $bootstrapReceipt.managed_runtime.acl_ace -eq $false -and
+    (Test-Path -LiteralPath (Join-Path $aclRoot '.description-managed-root.json') -PathType Leaf))
+  Check 'windows_acl.bootstrap_marker_acl' (@($bootstrapReceipt.marker_acl.rules | Where-Object {
+    $_.sid -in @('S-1-5-18', 'S-1-5-32-544') -and
+    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl -and
+    -not $_.inherited
+  }).Count -eq 2 -and @($bootstrapReceipt.marker_acl.rules | Where-Object {
+    $_.sid -in @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-4')
+  }).Count -eq 0)
+  $operatorAuthorization = Get-ManagedServiceAuthorization $serviceSid
+  Check 'windows_acl.administrator_runtime_allowed' (
+    $operatorAuthorization.administrator -eq $true)
+  $config = [pscustomobject]@{
+    package_root=$packageRoot
+    output_root=$outputRoot
+    state_root=$stateRoot
+    token_file=$tokenPath
+  }
+  $managedPaths = @(Get-ManagedEndpointPaths $config $endpointRoot $configPath $installIdPath)
+  $commonParent = Get-ManagedCommonParent $managedPaths
+  Check 'windows_acl.common_parent_from_config' ((Normalize-PathIdentity $commonParent) -eq
+    (Normalize-PathIdentity $aclRoot))
+  $aclRows = @(Get-ManagedEndpointAclRows $config $endpointRoot $configPath $installIdPath $taskFile)
+  Check 'windows_acl.paths_deduplicated' (@($aclRows.path | Select-Object -Unique).Count -eq $aclRows.Count)
+  $commonRows = @($aclRows | Where-Object {
+    (Normalize-PathIdentity ([string]$_.path)) -eq (Normalize-PathIdentity $commonParent)
+  })
+  Check 'windows_acl.common_parent_non_inheriting' ($commonRows.Count -eq 1 -and
+    (-not $commonRows[0].recurse) -and $commonRows[0].non_inheriting)
+  $authenticated = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-11'
+  $broadAcl = Get-Acl -LiteralPath $aclRoot
+  $broadRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+    $authenticated,
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+  [void]$broadAcl.AddAccessRule($broadRule)
+  Set-Acl -LiteralPath $aclRoot -AclObject $broadAcl
+  $markerPath = Join-Path $aclRoot '.description-managed-root.json'
+  $siblingBefore = Get-AclProjection $siblingRoot
+  Set-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $taskFile
+  Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $taskFile
+  $broadFound = @()
+  foreach ($row in $aclRows) {
+    $broadFound += @((Get-AclProjection $row.path).rules | Where-Object {
+      $_.sid -in @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-4')
+    })
+  }
+  Check 'windows_acl.broad_principals_removed' ($broadFound.Count -eq 0)
+  $operatorSid = $serviceSid
+  Check 'windows_acl.administrator_owns_boundary' (
+    (Get-AclProjection $aclRoot).owner_sid -in @('S-1-5-32-544', $operatorSid))
+  $managedAclChecks = @(
+    $packageChild,
+    $tokenPath,
+    $markerPath,
+    $ownershipPath,
+    $endpointRoot
+  ) | ForEach-Object {
+    $rules = @((Get-AclProjection $_).rules)
+    @($rules).Count -eq 2 -and
+      @($rules | Where-Object {
+        $_.sid -in @('S-1-5-18', 'S-1-5-32-544') -and
+        $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
+      }).Count -eq 2
+  }
+  Check 'windows_acl.administrators_system_only' (@($managedAclChecks | Where-Object { -not $_ }).Count -eq 0)
+  $bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
+  $rootSetAcl = 'Set-Acl -LiteralPath $root -AclObject $rootAcl -ErrorAction Stop'
+  Check 'windows_acl.bootstrap_failure_injection_anchor' (
+    ([regex]::Matches($bootstrapSource, [regex]::Escape($rootSetAcl))).Count -eq 1)
+  $failureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'bootstrap-injected-failure-' + [guid]::NewGuid().ToString('N') + '.ps1')
+  $rootAssert = 'Assert-ManagedAcl $root'
+  Check 'windows_acl.bootstrap_post_root_failure_injection_anchor' (
+    ([regex]::Matches($bootstrapSource, [regex]::Escape($rootAssert))).Count -eq 1)
+  $postRootFailureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'bootstrap-post-root-failure-' + [guid]::NewGuid().ToString('N') + '.ps1')
+  [System.IO.File]::WriteAllText(
+    $failureScript,
+    $bootstrapSource.Replace(
+      $rootSetAcl,
+      "throw 'injected root ACL failure'"),
+    (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText(
+    $postRootFailureScript,
+    $bootstrapSource.Replace(
+      $rootAssert,
+      "throw 'injected post-root ACL failure'"),
+    (New-Object System.Text.UTF8Encoding($false)))
+  $powershellExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  $otherLocalUser = Get-LocalUser | Where-Object {
+    [string]$_.SID.Value -ne $serviceSid
+  } | Select-Object -First 1
+  if ($null -ne $otherLocalUser) {
+    $mismatchRoot = Join-Path $driveRoot (
+      'description-managed-mismatch-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $mismatchRoot -Force
+    $mismatchBefore = Get-AclProjection $mismatchRoot
+    $mismatchOutput = @(& $powershellExe -NoProfile -File $bootstrapScript `
+      -ManagedRoot $mismatchRoot -ServiceAccount ([string]$otherLocalUser.SID.Value))
+    $mismatchExit = $LASTEXITCODE
+    $mismatchReceipt = ($mismatchOutput | Select-Object -Last 1) | ConvertFrom-Json
+    Check 'windows_acl.bootstrap_operator_runtime_mismatch' (
+      $mismatchExit -ne 0 -and
+      $mismatchReceipt.code -eq 'managed_root_operator_runtime_mismatch' -and
+      -not (Test-Path -LiteralPath (
+        Join-Path $mismatchRoot '.description-managed-root.json')) -and
+      (Get-AclProjection $mismatchRoot).projection_sha256 -eq
+        $mismatchBefore.projection_sha256)
+    Remove-Item -LiteralPath $mismatchRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  $markerBeforeFailure = Get-AclProjection $markerPath
+  $rootBeforeFailure = Get-AclProjection $aclRoot
+  $failureOutput = @(& $powershellExe -NoProfile -File $failureScript `
+    -ManagedRoot $aclRoot -ServiceAccount $serviceSid)
+  $failureExit = $LASTEXITCODE
+  $failureReceipt = ($failureOutput | Select-Object -Last 1) | ConvertFrom-Json
+  Check 'windows_acl.bootstrap_failure_rolls_back' (
+    $failureExit -ne 0 -and
+    $failureReceipt.passed -eq $false -and
+    $failureReceipt.rollback.passed -eq $true -and
+    (Get-AclProjection $markerPath).projection_sha256 -eq $markerBeforeFailure.projection_sha256 -and
+    (Get-AclProjection $aclRoot).projection_sha256 -eq $rootBeforeFailure.projection_sha256)
+  $rollbackRoot = Join-Path $driveRoot (
+    'description-managed-rollback-' + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $rollbackRoot -Force
+  $rollbackBefore = Get-AclProjection $rollbackRoot
+  $rollbackOutput = @(& $powershellExe -NoProfile -File $postRootFailureScript `
+    -ManagedRoot $rollbackRoot -ServiceAccount $serviceSid)
+  $rollbackExit = $LASTEXITCODE
+  $rollbackReceipt = ($rollbackOutput | Select-Object -Last 1) | ConvertFrom-Json
+  $rollbackMarkerExists = Test-Path -LiteralPath (
+    Join-Path $rollbackRoot '.description-managed-root.json')
+  $rollbackAclStable = (
+    (Get-AclProjection $rollbackRoot).projection_sha256 -eq
+      $rollbackBefore.projection_sha256)
+  Check 'windows_acl.bootstrap_new_marker_rolls_back' (
+    $rollbackExit -ne 0 -and
+    -not $rollbackMarkerExists -and
+    $rollbackAclStable -and
+    $rollbackReceipt.rollback.passed -eq $true) (
+      'exit=' + [string]$rollbackExit +
+      ' marker=' + [string]$rollbackMarkerExists +
+      ' acl_stable=' + [string]$rollbackAclStable +
+      ' receipt=' + ($rollbackReceipt | ConvertTo-Json -Depth 8 -Compress))
+  Remove-Item -LiteralPath $failureScript -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $postRootFailureScript -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $rollbackRoot -Recurse -Force -ErrorAction SilentlyContinue
+  $badTokenAcl = Get-Acl -LiteralPath $tokenPath
+  [void]$badTokenAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+    $authenticated,
+    [System.Security.AccessControl.FileSystemRights]::Read,
+    [System.Security.AccessControl.InheritanceFlags]::None,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow)))
+  Set-Acl -LiteralPath $tokenPath -AclObject $badTokenAcl
+  $badBefore = Get-AclProjection $tokenPath
+  $assertRejected = $false
+  try {
+    Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $taskFile
+  } catch {
+    $assertRejected = $_.Exception.Message -match 'windows_managed_acl_invalid'
+  }
+  $badAfter = Get-AclProjection $tokenPath
+  Check 'windows_acl.snapshot_assert_is_read_only' ($assertRejected -and
+    $badBefore.projection_sha256 -eq $badAfter.projection_sha256)
+  Check 'windows_acl.sibling_untouched' (
+    (Get-AclProjection $siblingRoot).projection_sha256 -eq $siblingBefore.projection_sha256)
+  Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $siblingRoot -Recurse -Force -ErrorAction SilentlyContinue
+} else {
+  Write-Host 'SKIP windows_acl.runtime (not a Windows host)'
+}
+
 # ---- harness: stub only the OS boundary -------------------------------------
 $script:TaskMissing = $false
 $script:TaskState = 'Ready'
@@ -134,10 +428,17 @@ function Get-ScheduledTask {
 function Start-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:Starts++; $script:CallLog.Add('start') }
 function Stop-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:CallLog.Add('stop') }
 function Register-ScheduledTask {
-  [CmdletBinding()] param([string]$TaskName, [string]$Xml, [switch]$Force)
+  [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, [string]$Xml, [switch]$Force)
+  if ($PSBoundParameters.ContainsKey('TaskPath') -and -not $TaskPath) {
+    throw 'root task registration must omit an empty TaskPath'
+  }
   $script:CallLog.Add('register')
   return $null
 }
+$rootTaskRegistration = $true
+try { Register-ManagedTask -TaskName 'root-fixture' -TaskPath '' -TaskXml '<Task />' } catch { $rootTaskRegistration = $false }
+Check 'windows.recovery.root_task_registration_omits_empty_path' $rootTaskRegistration
+$script:CallLog.Clear()
 function Get-Process {
   [CmdletBinding()] param([int]$Id)
   switch ($script:ProcScenario) {
@@ -506,6 +807,14 @@ Check 'outer.stage_legacy_targets_refused' (($outer.message -match 'endpoint_con
 $outer = Invoke-Outer 'stage_duplicate_key_refused'
 Check 'outer.stage_duplicate_key_refused' (($outer.message -match 'endpoint_config_duplicate_keys') -and
   (@($outer.calls).Count -eq 0))
+
+$outer = Invoke-Outer 'stage_acl_boundary'
+$stageAclCalls = @($outer.calls | Where-Object {
+  $_ -like 'managed-acl:*staged:protected=True:non-inheriting=False:allow-service-owner=False:recurse=True'
+})
+Check 'outer.stage_acl_boundary_signature' (
+  ($outer.message -match 'injected_stage_acl_boundary') -and
+  $stageAclCalls.Count -eq 1)
 
 $outer = Invoke-Outer 'promote_candidate_mismatch'
 Check 'outer.promote_candidate_mismatch' (($outer.message -match 'candidate_config_mismatch') -and

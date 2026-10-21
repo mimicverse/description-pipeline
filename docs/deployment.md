@@ -2,7 +2,7 @@
 
 部署由一台 Linux 平台主机和一个串行 Windows 原生执行端组成。用户仅访问一个 HTTPS 操作台；Airflow、数据库、内部 API 和原生端点不直接向用户开放。
 
-Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置规格库、模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
+Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
 
 ## 开发与发行链路
 
@@ -15,6 +15,8 @@ Linux 承担全部平台与可移植工作。Windows 只安装原生运行依赖
 5. 将同一发行部署到 Linux 与 Windows，核验双端实际运行身份，完成真实端到端验收。
 
 `description-pipeline` 与 `description` 仓库向 `main` 的合并只由当前设计总师根会话执行；实现总工和 workers 不得合并、直接推送 `main` 或开启自动合并。设计审核通过不转授合并权限。开发分支或 PR head 的隔离测试产物不得作为正式发行或部署包；禁止先发布后补合并及线上补拷代码绕过此流程。构建成功、组件测试、服务健康和手动导出不能替代真实端到端验收。
+
+本次真实端到端须保留与固定手工参考的方向对比，但仅方向符号不一致不阻塞发行、部署或验收；实际驱动／编码器正向未建立时如实显示未验证资格及 warning。CAD 轴向、对象绑定、坐标转换、原生运动或来源审计的真实缺陷，以及命名、限位和其他必需检查仍阻塞。不能把该非阻塞条款扩大为免除独立 CAD 验证、同版双端身份核验或真实端到端运行，也不能以手工符号替代生产输入。
 
 ## 主机准备
 
@@ -82,23 +84,19 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 `windows.instance` 固定 Windows 执行端的任务名及工程、产物和状态目录，维护命令依据配置和安装记录定位该目标。同一主机上的任务共享 CAD 排他资源约束，新用户或新目录不形成独立资源域。
 
-配置、状态、上传、交付、临时工作区、发行安装和规格库使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`；Windows 使用仅执行用户可读写的 ACL。日志只展示标识、摘要和路径，不展示秘密值。
+配置、状态、上传、交付、临时工作区和发行安装使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`。Windows 受管路径使用 protected ACL，只保留 `Administrators` 与 `SYSTEM` 的 `FullControl`，移除 `Authenticated Users`、`Users`、`Everyone` 等普通主体；日志只展示标识、摘要和路径，不展示秘密值。
 
-产品目标、仓库与 base 仅在 Linux 维护。Git 凭据属于 Linux 服务账户；模型仓库来源必须与目标一致，发布使用受管理的干净工作区。规格库只解析 CAD 明确引用的不可变版本，不能被上传内容覆盖。仓库规则须允许服务主体向受管理候选分支追加提交和创建 PR，禁止非 fast-forward；凭据权限限定于配置目标，工程集成 base 保持独立评审。PostgreSQL 的平台与 Airflow 角色只能迁移各自 schema，连接预算及恢复目标在部署验收中固定并验证。
+产品目标、仓库与 base 仅在 Linux 维护。Git 凭据属于 Linux 服务账户；模型仓库来源必须与目标一致，发布使用受管理的干净工作区。模型工程值以封存 CAD 为依据，允许版本化配置承载命名、方向及数值表达规则；配置不得抄入手工结果或覆盖原生事实。仓库规则须允许服务主体向受管理候选分支追加提交和创建 PR，禁止非 fast-forward；凭据权限限定于配置目标，工程集成 base 保持独立评审。PostgreSQL 的平台与 Airflow 角色只能迁移各自 schema，连接预算及恢复目标在部署验收中固定并验证。
 
 ## 安装 Windows 执行端
 
+本次发行支持已完成受控初始化的 Windows 端点升级：目标已有受管管理员交互式执行账户、Scheduled Task、目录及 ACL、端点配置、令牌和安装身份。按用户 2026-10-21 决定，端点继续在已受管的管理员账户下运行；部署和恢复核验必须核验账户为本地、启用、属于 `Administrators` 且任务使用最高可用令牌，不得把该运行方式表述为 least privilege。全新 Windows 主机初始化及 Session 0 broker 不在本次支持范围，不能用依赖安装成功或手工启动端点代替完整初始化资格。既有端点的任务、配置、令牌、ACL 和安装身份恢复仍须实际验证。
+
+受管共同父目录必须通过同版 `deploy/windows/bootstrap-managed-root.ps1` 完成一次性初始化。引导入口只在当前管理员执行身份与任务运行账户一致时运行，拒绝盘符根、共享系统/用户目录、重解析路径和缺失或冲突的 marker；它事务性写入唯一的 `.description-managed-root.json`，将父目录和 marker 设为 protected 的 `Administrators`/`SYSTEM` ACL，并在任一步失败时恢复原 ACL、删除本次新建 marker。`stage` 只接受已经核验的 marker，不自行选择或创建共同父目录。缺少 marker、普通组 ACE、服务身份或任务令牌资格不符时，Windows 安装保持拒绝。
+
 内嵌虚拟组件随同版原生端点与 Linux 验证器部署，不增加服务、环境变量或配置字段。Windows 读取受控会话中的组件及所属装配绑定，Linux 按封存契约独立验证；不得将 `VC~~` 临时文档复制成上传来源或配置额外搜索目录。
 
-校验 Windows 离线运行档案与发行清单摘要，提取到独立发行目录并安装其 hash-locked 依赖：
-
-```powershell
-py -3.12 -m venv C:\description\runtime
-C:\description\runtime\Scripts\python.exe -m pip install --no-index --require-hashes --find-links wheels -r requirements.lock
-C:\description\runtime\Scripts\description.exe doctor
-```
-
-`doctor` 验证安装身份、最小角色依赖及 SolidWorks/COM 就绪；实际作业仍须检查文件和会话。为端点生成独立随机令牌，以受控方式在 Linux 保存副本。原生端点只绑定 loopback：
+校验 Windows 离线运行档案与发行清单摘要，由受支持的 `stage` 在新安装代目录建立运行环境并安装 hash-locked 依赖，再通过 `promote` 切换既有受管任务。禁止向活动运行目录直接安装依赖或手工替换代码。`doctor` 验证安装身份、最小角色依赖及 SolidWorks/COM 就绪；实际作业仍须检查文件和会话。端点令牌的两端副本受控保存，原生端点只绑定 loopback：
 
 ```json
 {
@@ -112,34 +110,52 @@ C:\description\runtime\Scripts\description.exe doctor
 }
 ```
 
-在专用登录桌面启动：
-
-```powershell
-C:\description\runtime\Scripts\description.exe serve --config C:\description\endpoint.json
-```
-
-验收后以同一账户的登录 Scheduled Task 启动同一命令，保持桌面登录和主机唤醒。每个执行端只使用安装记录绑定的配置和 state root，执行期间无独立 CAD 活动；就绪检查发现外部会话时显示不可执行原因，不能关闭该会话。保持时钟同步、桌面有效和磁盘容量充足，系统更新/重启使用同一排空流程。所有启动与清理入口共用资源域，遵守[CAD 所有权契约](contracts.md#resources)。
+由既有受管 Scheduled Task 在专用账户的交互桌面启动安装记录绑定的入口，保持桌面登录和主机唤醒。每个执行端只使用安装记录绑定的配置和 state root，执行期间无独立 CAD 活动；就绪检查发现外部会话时显示不可执行原因，不能关闭该会话。保持时钟同步、桌面有效和磁盘容量充足，系统更新/重启使用同一排空流程。所有启动与清理入口共用资源域，遵守[CAD 所有权契约](contracts.md#resources)。
 
 ## 安装 Linux 平台
 
 配置服务账户的 Git 身份及 GitHub 认证，确认目标仓库与 base 可读写。配置专用 SSH key 和已核验 Windows host key；传输使用 SSH 隧道和端点令牌，内侧均为 loopback。拒绝跨主机重定向和未认证端点。
 
-校验同版 Linux 离线运行档案、部署档案与全部摘要。在提取的部署目录执行唯一生命周期入口：
+校验同版 Linux 离线运行档案、部署档案与全部摘要。首次安装须先用受支持的 CPython 3.12 和该发行的 Linux 角色档案建立独立引导环境；后续控制命令也须使用已核验的同版环境，不能假定系统 `python3` 已装有规范验证器。以下路径均为待替换的示例：
+
+```sh
+python3.12 -m venv /path/to/bootstrap-venv
+/path/to/bootstrap-venv/bin/python -m pip install \
+  --no-index --require-hashes \
+  --find-links /path/to/linux-runtime/wheels \
+  -r /path/to/linux-runtime/requirements.lock
+export PATH="/path/to/bootstrap-venv/bin:$PATH"
+```
+
+在提取的同版部署目录执行唯一生命周期入口：
 
 ```sh
 bash deploy/operator/operatorctl.sh validate --config /srv/description/platform.json
-bash deploy/operator/operatorctl.sh install --config /srv/description/platform.json
+python3 deploy/operator/install_record.py endpoint-identity \
+  --health /path/to/endpoint-health.json \
+  --release-file /path/to/release/release.json \
+  --out /path/to/endpoint-identity.json
+bash deploy/operator/operatorctl.sh install \
+  --config /srv/description/platform.json \
+  --install-id NEW_INSTALL_ID \
+  --wheel /path/to/release/package.whl \
+  --release-file /path/to/release/release.json \
+  --endpoint-identity /path/to/endpoint-identity.json
 bash deploy/operator/operatorctl.sh start --config /srv/description/platform.json
 bash deploy/operator/operatorctl.sh health --config /srv/description/platform.json
 ```
 
-`validate` 只检查静态配置和发行身份。`install` 在关闭准入的状态下安装锁定运行环境、渲染服务、初始化数据库并校验 DAG；不能改变正在运行的安装。`start` 先验证两端身份、服务及配置，再开启任务准入。数据库、内部服务和隧道不对用户暴露端口。
+示例中的路径和安装标识须替换为本次发行的实际值。端点健康原件来自已认证的真实 Windows `/health`，须与本次 `release.json` 校验一致；不能手写身份、沿用旧端点收据或使用开发分支资产。安装使用同一发行目录中的 wheel 和清单；状态根、数据库端口和其他运行路径从当前平台配置及其受管安装记录解析，不从历史运行或个人目录猜测。
+
+`validate` 只检查静态配置，不验证发行文件、实际端点身份或运行健康。发行资产须单独核验；`install_record.py endpoint-identity` 将真实端点健康原件与发行清单交叉验证，`install` 再核验绑定输入，并在关闭准入的状态下安装锁定运行环境、渲染服务、初始化数据库及校验 DAG；不能改变正在运行的安装。`start` 先验证两端身份、服务及配置，再开启任务准入。数据库、内部服务和隧道不对用户暴露端口。
 
 需要在服务启动后完成对账或维护验收时，使用 `start --keep-admission-closed --config /srv/description/platform.json`。它执行相同启动检查，但全程保持准入关闭，成功结果明确区分“服务已启动”和“准入已开放”。完成规范对账并通过结算门后，再执行普通 `start` 重验并开闸；不得手工改状态或先开闸再关闭。该选项不能用于其他生命周期命令。
 
 首个受管代绑定真实目标发行的代码、运行环境和双端身份，不能为未受管的旧部署补造安装身份。切换前保存旧配置、服务绑定、原件和数据路径作为回退基线；回退不得丢弃已经发生的业务或对账事实。
 
 安装记录明确管理的全部服务与路径，不依赖工作目录或个人工具位置。配置变化先渲染并验证新快照，再按受控切换流程应用；运行中的请求继续使用其固定配置身份。`status/health` 及提交准入核验安装记录、发行文件、配置快照、实际服务、Airflow 配置引用和 Windows 发行/契约/端口身份，端点认证同时证明令牌一致；漂移关闭新准入，健康查询不打开 CAD。
+
+同版双端核验比较 `version`、`source_commit` 和 `source_sha256`。两端各自的 `install_id`、`config_digest` 必须匹配对应主机的安装记录和实际配置，不要求两端这些值相同；不能用同版发行身份代替每端的配置、角色和运行身份核验。
 
 DAG 验收还须核对活动记录中的绝对路径与发行成员摘要、实际生效的 `core.dags_folder`、当前 `DagVersion` 和 `SerializedDag` 关联，以及序列化的文件和解析目录。唯一支持的 `dags-folder` 本地 bundle 使用空版本；不能因此省略已登记版本 UUID 与实际任务来源核对。真实监督任务日志记录加载的 DAG 路径、SHA-256 和 Python 包来源。历史目录即使存在同名字节，也不能代替当前发行绑定；身份不符时不得开放新准入。
 
@@ -165,16 +181,20 @@ DAG 验收还须核对活动记录中的绝对路径与发行成员摘要、实�
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
-验收固定同一个已合入受保护 `main` 的提交。CI 的必需门包含锁定 Airflow 环境中的真实普通操作员提交/调度及发行完整性；模拟端点只覆盖运输与失败阻断。发布完整发行后，校验资产摘要并在两端按同一版本 stage/promote，不对活动发行目录补拷源码或脚本。最终记录绑定源码提交、发行清单、双端安装/配置、原始工程清单、运行、六阶段收据、独立报告、实际 URDF 预览和模型 PR。当前模型仓库为 `mimicverse/description`，集成 base 为 `main`；历史 PR 只作对照。
+验收固定同一个已合入受保护 `main` 的提交。CI 的必需门包含锁定 Airflow 环境中的真实普通操作员提交/调度及发行完整性；模拟端点只覆盖运输与失败阻断。发布完整发行后，校验资产摘要并在两端按同一版本 stage/promote，不对活动发行目录补拷源码或脚本。最终记录绑定源码提交、发行清单、双端安装/配置、原始工程清单、运行、六阶段收据、独立报告、实际 URDF 预览和模型 PR。当前模型仓库为 `mimicverse/description`，集成 base 为 `main`；手工与历史 PR 不参与工程生成；本次正式产物还须按用户要求完成与固定手工版的对比，纯方向符号差异作为非阻塞项保留，其余一致性要求不变。参考结果不能代替 CAD、独立验证和真实端到端的必需门。
 
 正式入口须验证普通操作员的必选目标及多行说明，并用浏览器实际加载绑定交付的 URDF/网格、执行关节交互。生成后自动显示预览；独立验证未通过时只提供明确标注的未验证诊断预览，不能使用通过绿标。页面阶段、检查计数和资格与同一封存结果一致。验收中的待执行项保持待执行，不因服务健康或历史运行通过而封板。
 
-操作员在同一入口明确选择工程或检查预览用途；冻结记录使用唯一 `request/v2` 并保留该选择。验收工程及组数以本次确认的验收范围为准，逐组按其显式用途核验输入、请求、运行、报告、实际关节预览与 `main` 候选 PR 的绑定，不能以同字节或同硬件跨用途代跑。检查预览的有限分析窗口须显著区别于机械限位，缺失驱动不显示为零能力；报告、预览和 PR 一致显示工程范围、驱动及实机资格未建立。必需检查和原生事实要求不因用途减弱。不同用途的候选与发布恢复身份按[发布协议](contracts.md#publication)隔离。
+操作员在同一入口明确选择工程或检查预览用途；冻结记录使用唯一 `request/v2` 并保留选择。逐组核验输入、请求、运行、报告、实际关节预览与 `main` 候选 PR 的绑定，不能跨用途代跑。两种用途均以当前 CAD 和明确的适用规则建立交付；检查预览可按[用途契约](contracts.md#purpose)的 `inspection_rotation_full_turn/v1` 使用全周窗口，必须验证适用条件并显式显示原生范围缺项与策略来源，不得抄入手工结果或冒称机械限位。已有有效 CAD 范围不得被窗口覆盖。缺失驱动不显示为零能力；报告、预览和 PR 一致显示参数来源与资格。必需检查和原生事实要求不因用途减弱。不同用途的候选与发布恢复身份按[发布协议](contracts.md#publication)隔离。
+
+方向验收绑定本次 CAD、规则版本、固定代码提交及实际交付：先核对全部关节的原值、作者声明绑定、必要坐标转换和未解决项，再通过门户预览执行有效范围内的非零运动，验证 CAD 运动语义、零位及范围的一致性。当前不发布基于右手定则或功能动作的新正向推导规则，历史试算不作为通过证据。生成与独立工程验证只取得 CAD 和规则输入，固定手工参考由最终对比单独读取，并保留参考不可访问及扰动反例。方向与手工参考的纯符号差异不阻塞发布；未解决的命名、范围或其他真实一致性缺陷，以及 CAD 轴向、坐标转换和原生运动错误仍阻塞。不得以试算、旧运行或健康状态替代发布验收。
 
 <a id="lifecycle"></a>
 ## 维护、升级与恢复
 
 生命周期命令为 `validate / install / start / drain / stop / status / health / reconcile / stage / promote / rollback`，统一读取同一配置及安装记录。`drain` 关闭新提交和 DAG 准入，保留在途执行；返回全部活动、未确认与发布中操作。`stop` 仅在已排空且状态已知时停止全部管理服务，禁止通过杀进程代替排空。
+
+备份维护使用 `stop --keep-database` 停止受支持写者并保留 PostgreSQL，随后核验实际 Linux 服务和 Windows 任务停止状态。备份从 `drain` 前至归档、清单及收据完成一直持有状态根下的 `locks/maintenance.lock`；`start / drain / stop / reconcile / stage / promote / rollback` 使用同一锁。嵌套调用须验证继承的锁及属主，不能仅凭环境变量绕过加锁。
 
 维护查询账户只获准读取准入与生命周期视图，无平台写入权或 Airflow schema 访问权。关闭与重开准入经平台受控事务入口执行，使用明确的写入授权；只读凭据不能执行这些变更。维护查询采用[架构定义的一致快照](design.md#持久化与一致性)，缺绑定、未知状态或权威不可读时拒绝停止和切换。
 
@@ -196,9 +216,13 @@ Windows 候选配置由正式 `stage` 按当前端点 schema 确定性生成。�
 
 升级意图和每个切换步骤持久登记。失败记录已完成与未确认步骤，`rollback` 使用该记录恢复两端明确的上一发行和配置，再检查身份与状态；不能猜测目录或最新备份。代码回滚必须兼容当前持久状态，不能回退数据库而丢失已产生的运行、证据或发布记录。涉及存储 schema 的变化须提供备份、迁移验证及明确可恢复方案，准入在完成前保持关闭。
 
+`operatorctl rollback` 不回滚数据库。灾难恢复通过同版 `recovery.py backup / restore` 执行受控备份和同路径空目标恢复；`backup.py` 的加密归档原语不承担完整恢复判定。备份使用新的输出目录和独立保管的外部密钥，恢复使用显式目标计划；复用既存目录或未取得本次归属的失败请求不得改写旧回执、归档或暂存文件。具体边界遵循[灾难恢复契约](contracts.md#灾难恢复)。
+
+每次发行须绑定该 `main` 提交准备并实际演练恢复步骤，覆盖平台与 Airflow 数据库、原件及其引用、发行与工作区重建、安装记录、配置、密钥、既有 Windows 任务与 ACL、双端身份和未决外部结果。命令只完成其中一部分时，报告逐项注明未完成范围；整体通过必须来自真实双端恢复和随后端到端运行。仅解密成功、代码回滚成功、隔离数据库与服务替身测试或服务健康不能作为完整恢复通过的依据。
+
 恢复 Windows 任务定义不等于可以启动端点。未知锁属主或观察器失败时保持停止；只有取得可启动的锁及属主证据才启动。恢复核验使用切换前绑定的上一代自身发行身份，不能拿候选身份核验旧版；上一代身份缺证时健康结论保持未知，准入保持关闭。
 
-备份前关闭准入、排空并确认无未决副作用，取得平台与 Airflow schema 的同一数据库快照，再按该快照引用复制冻结原件、交付/诊断、安装记录、配置与密钥并核验清单。备份加密、访问受控，按部署恢复目标保留；升级前须有已验证的恢复演练。恢复在关闭准入状态下核验清单和引用，查询两端作业与远端发布结果后重建投影，先证明完整再开启服务。
+备份前关闭准入、排空并确认无未决副作用，在同一维护锁内停止写者，取得平台与 Airflow schema 的同一数据库快照，再按该快照引用复制冻结原件、交付/诊断、安装记录、配置与密钥并核验清单。备份加密、访问受控，按部署恢复目标保留；升级前须有已验证的恢复演练。备份成功或中途失败后均明确报告服务停止与准入状态，由受控生命周期入口恢复运行。恢复在关闭准入状态下核验清单和引用，查询两端作业与远端发布结果后重建投影，先证明完整再开启服务。
 
 端点令牌轮换在排空后更新两端受控副本，验证认证与配置身份再开启准入；飞书和 Git 凭据轮换同样使用受控配置切换与实测登录/访问。秘密值不进入日志、命令行或发行档案。
 

@@ -165,6 +165,64 @@ class UrdfRobotLabelTests(unittest.TestCase):
             with self.assertRaises(PipelineError):
                 solidworks_urdf._xml(root, definition, model)
 
+    def test_urdf_warning_comments_must_match_the_model_exactly(self):
+        warning = {
+            "code": "units.si_conversion",
+            "message": "Delivered values use SI units.",
+            "objects": [{"object": "robot", "source": "native_derived", "field": "units"}],
+        }
+        model = {
+            "links": [{"name": "base"}],
+            "frames": [],
+            "joints": [],
+            "provenance": {"value_warnings": [warning]},
+        }
+        definition = {"hardware_id": None, "source": {"robot_name": "robot"}}
+        exact = (
+            '<robot name="robot">'
+            "<!--WARNING units.si_conversion: Delivered values use SI units. "
+            "See reports/quality.json for object and field details.-->"
+            '<link name="base"/></robot>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "urdf").mkdir()
+            (root / "urdf/robot.urdf").write_text(exact)
+            self.assertEqual(solidworks_urdf._xml(root, definition, model).get("name"), "robot")
+        for payload in (
+            '<robot name="robot"><link name="base"/></robot>',
+            exact.replace("Delivered values use SI units.", "All values were read directly from CAD."),
+        ):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "urdf").mkdir()
+                (root / "urdf/robot.urdf").write_text(payload)
+                with self.assertRaisesRegex(PipelineError, "value-provenance"):
+                    solidworks_urdf._xml(root, definition, model)
+
+
+
+
+class MeshAssetReuseTests(unittest.TestCase):
+    def test_every_actual_asset_may_be_referenced_more_than_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "meshes/visual").mkdir(parents=True)
+            (root / "meshes/visual/a.stl").write_bytes(b"a")
+            (root / "meshes/visual/b.stl").write_bytes(b"b")
+            result = solidworks_urdf._assets(
+                root,
+                ["meshes/visual/a.stl", "meshes/visual/a.stl", "meshes/visual/b.stl"],
+            )
+            self.assertEqual(result, {"meshes": 2, "references": 3})
+            with self.assertRaisesRegex(PipelineError, "Unused or multiply"):
+                solidworks_urdf._assets(root, ["meshes/visual/a.stl", "meshes/visual/a.stl"])
+            with self.assertRaisesRegex(PipelineError, "Unused or multiply"):
+                solidworks_urdf._assets(
+                    root,
+                    ["meshes/visual/a.stl", "meshes/visual/b.stl", "meshes/visual/missing.stl"],
+                )
+
 
 class HandoffHashBindingTests(unittest.TestCase):
     def _package(self, directory, contents, *, raw_files=None, inventory_digest=None):

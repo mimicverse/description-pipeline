@@ -426,8 +426,8 @@ def main() -> int:
             discovery = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             die(f"DISCOVERY_SETTINGS_FILE is unreadable: {error}")
-        if not isinstance(discovery, dict) or set(discovery) - {"record_roots", "frozen_names_file"}:
-            die("DISCOVERY_SETTINGS_FILE accepts only record_roots and frozen_names_file")
+        if not isinstance(discovery, dict) or set(discovery) - {"record_roots"}:
+            die("DISCOVERY_SETTINGS_FILE accepts only record_roots")
         records = discovery.get("record_roots", [])
         if not isinstance(records, list) or any(not isinstance(root, str) for root in records):
             die("discovery record_roots must be a list of absolute Linux directories")
@@ -435,13 +435,6 @@ def main() -> int:
             directory = private_dir(root, "controlled-record root")
             if any(parent.is_symlink() for parent in directory.parents):
                 die("Controlled-record roots cannot traverse a symlink")
-        if "frozen_names_file" in discovery:
-            registry = discovery["frozen_names_file"]
-            if not isinstance(registry, str):
-                die("frozen_names_file must be an absolute Linux file path")
-            path = private_dir(registry, "frozen-name registry")
-            if any(parent.is_symlink() for parent in path.parents):
-                die("Frozen-name registry cannot traverse a symlink")
     nginx_bin = args.nginx_bin or values.get("NGINX_BIN", "/usr/sbin/nginx")
     if args.check_paths:
         for path, where in ((Path(values["PIPELINE_WHEEL"]), "PIPELINE_WHEEL"), (Path(nginx_bin), "NGINX_BIN")):

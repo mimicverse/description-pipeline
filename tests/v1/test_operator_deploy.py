@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -261,6 +262,53 @@ def platform_fixture(
     (tmp / "bin").mkdir(exist_ok=True)
     fixture_nginx = tmp / "bin" / "nginx"
     write_stub(fixture_nginx, "#!/bin/bash\nexit 0\n")
+    fixture_ssh = tmp / "bin" / "ssh"
+    write_stub(
+        fixture_ssh,
+        r'''#!/usr/bin/env bash
+root="$(cd "$(dirname "$0")/.." && pwd)"
+script="$(cat)"
+python3 - "$root" "$script" <<'PY'
+import base64
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+override = root / "windows-status.json"
+if override.is_file():
+    print(override.read_text(encoding="utf-8").strip())
+    raise SystemExit(0)
+script = sys.argv[2]
+match = re.search(r"FromBase64String\('([^']+)'\)", script)
+if match is None:
+    raise SystemExit(2)
+expected = json.loads(base64.b64decode(match.group(1)).decode())
+sample = {
+    "task_name": expected["task_name"],
+    "task_state": "Running",
+    "last_task_result": 267009,
+    "listener_pid": 4242,
+    "process_start_utc": "2026-10-21T00:00:00Z",
+    "install_id": expected["install_id"],
+    "config_digest": expected["config_digest"],
+    "release": expected["release"],
+    "health_install_id": expected["install_id"],
+    "health_config_digest": expected["config_digest"],
+    "health_release": expected["release"],
+}
+print(json.dumps({"passed": True, "sample": sample}, sort_keys=True))
+PY
+''',
+    )
+    with Path(env_path).open("a", encoding="utf-8") as stream:
+        stream.write(
+            "SOLIDWORKS_SSH_BIN="
+            + encode_env_value(str(fixture_ssh))
+            + "\n"
+        )
+    env["SOLIDWORKS_SSH_BIN"] = str(fixture_ssh)
     env["NGINX_BIN"] = str(fixture_nginx)
     repinned = run(
         [
@@ -282,7 +330,7 @@ def platform_fixture(
     identity_path.write_text(
         json.dumps(
             {
-                "install_id": "ep-1",
+                "install_id": "win-" + "1" * 32,
                 "config_digest": "d" * 64,
                 "release": {
                     "version": release_document["version"],
@@ -354,13 +402,44 @@ def write_stub(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def status_env(tmp: Path, config_home: Path) -> dict[str, str]:
+    """A read-only status environment with every managed unit explicitly active."""
+
+    bindir = tmp / "bin"
+    bindir.mkdir(exist_ok=True)
+    state_dir = tmp / "status-unit-state"
+    state_dir.mkdir(exist_ok=True)
+    for unit in (
+        "description-postgres",
+        "description-solidworks-tunnel",
+        "description-airflow-dag-processor",
+        "description-airflow-scheduler",
+        "description-airflow-api-server",
+        "description-portal",
+        "description-operator-proxy",
+    ):
+        (state_dir / unit).write_text("active\n", encoding="utf-8")
+    systemctl = bindir / "status-systemctl"
+    write_stub(
+        systemctl,
+        '#!/usr/bin/env bash\n'
+        '[ "${1:-}" = "--user" ] && [ "${2:-}" = "is-active" ] || exit 2\n'
+        'cat "$STATUS_UNIT_STATE_DIR/${3:-}" 2>/dev/null || echo unknown\n',
+    )
+    return {
+        "XDG_CONFIG_HOME": str(config_home),
+        "SYSTEMCTL_BIN": str(systemctl),
+        "STATUS_UNIT_STATE_DIR": str(state_dir),
+    }
+
+
 class RenderTests(unittest.TestCase):
     def test_linux_discovery_settings_are_rendered_and_changes_are_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state = root / "state"
             settings = root / "discovery.json"
-            expected = {"record_roots": [str(root / "records")], "frozen_names_file": str(root / "names.json")}
+            expected = {"record_roots": [str(root / "records")]}
             settings.write_text(json.dumps(expected))
             settings.chmod(0o600)
             rendered = render(state, DISCOVERY_SETTINGS_FILE=str(settings))
@@ -696,7 +775,7 @@ class LifecycleTests(unittest.TestCase):
         op = release / "deploy" / "operator"
         op.mkdir(parents=True)
         (release / "release.json").write_text("{}\n", encoding="utf-8")
-        for name in ("airflow", "platform"):
+        for name in ("airflow", "platform", "windows"):
             os.symlink(OPERATOR.parent / name, release / "deploy" / name)
         for item in OPERATOR.iterdir():
             if item.name in {"operatorctl.sh", "health_gate.sh", "health.sh"}:
@@ -783,6 +862,13 @@ class LifecycleTests(unittest.TestCase):
             '      printf "%s|%s\\n" "$(stat -c %s "$FIXTURE_REMOTE_ARCHIVE")" \\\n'
             '        "$(sha256sum "$FIXTURE_REMOTE_ARCHIVE" | cut -d" " -f1)"\n'
             '    else echo absent; fi ;;\n'
+            "  *\"-Verb resume\"*)\n"
+            '    if [ "${FIXTURE_RESUME_RC:-0}" = "0" ]; then\n'
+            "      echo '{\"passed\":true,\"verb\":\"resume\"}'\n"
+            '    else\n'
+            "      echo '{\"passed\":false,\"verb\":\"resume\",\"code\":\"settle-timeout\",\"message\":\"refused\"}'\n"
+            '      exit "${FIXTURE_RESUME_RC}"\n'
+            '    fi ;;\n'
             "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
@@ -951,7 +1037,7 @@ class LifecycleTests(unittest.TestCase):
             "release": {"version": "1.4.0", "source_commit": "c" * 40, "source_sha256": "a" * 64, "role": "native"},
             "contract": {"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             "resource_policy": {"schema_version": ir.RESOURCE_POLICY_SCHEMA, "digest": ir.resource_policy_v1_digest()},
-            "install": {"config_digest": "d" * 64, "install_id": "ep-1"},
+            "install": {"config_digest": "d" * 64, "install_id": "win-" + "1" * 32},
             "endpoint": {"port": 9765},
             "cad": {"external_session_detected": False, "owned_sessions": 0, "lease_held": False},
             "jobs": {"active": 0, "queued": 0, "unresolved": 0},
@@ -1001,14 +1087,19 @@ class LifecycleTests(unittest.TestCase):
                 ingress = lines.index(
                     "systemctl --user enable --now description-portal.service description-operator-proxy.service"
                 )
-                self.assertLess(
-                    max(i for i, line in enumerate(lines) if line.startswith("dag_state_check ")),
-                    ingress,
-                )
                 ready = lines.index(
                     "systemctl --user is-active --quiet description-portal.service description-operator-proxy.service"
                 )
                 self.assertLess(ingress, ready)
+                resume = next(i for i, line in enumerate(lines) if "-Verb resume" in line)
+                self.assertLess(ready, resume, "the Windows endpoint resumes after Linux services are active")
+                self.assertLess(
+                    resume,
+                    min(i for i, line in enumerate(lines) if line.startswith("dag_state_check ")),
+                    "DAG state checks run only after the Windows endpoint has resumed",
+                )
+                unpause = lines.index("airflow dags unpause solidworks_to_urdf")
+                self.assertLess(resume, unpause, "the Windows endpoint resumes before DAG scheduling is enabled")
                 probe = lines.index("health-gate probe")
                 self.assertLess(ready, probe, "the Linux health gate runs after the ingress is ready")
                 self.assertLess(probe, lines.index("platform open_admission"), "the open waits for a passed gate")
@@ -1020,16 +1111,13 @@ class LifecycleTests(unittest.TestCase):
             result = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("platform admission stays closed", result.stderr)
-            # The DAG scheduling unpause already happened (a recorded fact); the PLATFORM gate
-            # is closed through the controlled start precondition and never reopens.
+            # The controlled start precondition closes the platform gate before services are
+            # launched; an ingress failure has no scheduling or Windows-resume side effect.
             order_text = order.read_text()
             self.assertIn("platform close_admission", order_text)
             lines = order_text.splitlines()
-            self.assertLess(
-                lines.index("platform close_admission"),
-                lines.index("airflow dags unpause solidworks_to_urdf"),
-                "the start window closes the leftover gate before scheduling changes",
-            )
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", order_text)
+            self.assertFalse([line for line in lines if "-Verb resume" in line])
             self.assertNotIn("is-active", order_text)
             self.assertNotIn("health-gate probe", order_text)
             self.assertNotIn("platform open_admission", order_text)
@@ -1187,14 +1275,37 @@ class LifecycleTests(unittest.TestCase):
         )
         self.assertNotEqual(classic["params_digest"], reported["params_digest"])
 
-    def test_unpause_failure_does_not_start_ingress(self) -> None:
+    def test_resume_failure_keeps_scheduling_and_admission_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, env, admission, order, control = self._admission_fixture(Path(tmp))
+            env["FIXTURE_RESUME_RC"] = "1"
+            result = run(["bash", str(control), "start", "--config", str(config_path)], env)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                "the Windows endpoint did not resume under the active install identity; admission stays closed",
+                result.stderr,
+            )
+            self.assertEqual(admission.read_text().strip(), "true")
+            lines = order.read_text().splitlines()
+            ingress = lines.index(
+                "systemctl --user is-active --quiet description-portal.service description-operator-proxy.service"
+            )
+            resume = next(i for i, line in enumerate(lines) if "-Verb resume" in line)
+            self.assertLess(ingress, resume)
+            self.assertNotIn("airflow dags unpause solidworks_to_urdf", lines)
+            self.assertNotIn("health-gate probe", lines)
+            self.assertNotIn("platform open_admission", lines)
+
+    def test_unpause_failure_keeps_admission_closed_after_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, env, admission, order, control = self._admission_fixture(Path(tmp), unpause_rc=7)
             result = run(["bash", str(control), "start", "--config", str(config_path)], env)
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
             self.assertEqual(admission.read_text().strip(), "true")
-            self.assertNotIn("description-portal.service", order.read_text())
-            self.assertNotIn("description-operator-proxy.service", order.read_text())
+            lines = order.read_text().splitlines()
+            self.assertTrue([line for line in lines if "-Verb resume" in line])
+            self.assertNotIn("health-gate probe", lines)
+            self.assertNotIn("platform open_admission", lines)
 
     def test_start_keep_admission_closed_starts_the_services_without_opening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1623,7 +1734,8 @@ class LifecycleTests(unittest.TestCase):
             )
             before = {path: digest(path) for path in tracked}
             result = run(
-                ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
+                ["bash", str(CONTROL), "status", "--config", str(config_path)],
+                status_env(Path(tmp), config_home),
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("DRIFT", result.stdout)
@@ -1644,9 +1756,9 @@ class LifecycleTests(unittest.TestCase):
             proxy.write_text(proxy.read_text(encoding="utf-8").replace(bound, str(other)), encoding="utf-8")
             result = run(
                 ["bash", str(CONTROL), "status", "--config", str(config_path)],
-                {"XDG_CONFIG_HOME": str(config_home)},
+                status_env(Path(tmp), config_home),
             )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(
                 "DRIFT the installed proxy unit does not execute the bound nginx binary", result.stdout
             )
@@ -1767,14 +1879,15 @@ class LifecycleTests(unittest.TestCase):
     def test_drift_check_reports_missing_and_changed_units(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, _, config_home, target = self._render_units(Path(tmp))
-            control_env = {"XDG_CONFIG_HOME": str(config_home)}
+            control_env = status_env(Path(tmp), config_home)
             portal = target / "description-portal.service"
             portal.write_text(portal.read_text(encoding="utf-8") + "# drifted\n", encoding="utf-8")
             changed = run(["bash", str(CONTROL), "status", "--config", str(config_path)], control_env)
-            self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+            self.assertNotEqual(changed.returncode, 0, changed.stdout + changed.stderr)
             self.assertIn("DRIFT unit differs: description-portal.service", changed.stdout)
             (target / "description-airflow-scheduler.service").unlink()
             missing = run(["bash", str(CONTROL), "status", "--config", str(config_path)], control_env)
+            self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
             self.assertIn("DRIFT unit missing: description-airflow-scheduler.service", missing.stdout)
             self.assertIn("DRIFT unit differs: description-portal.service", missing.stdout)
 
@@ -1790,11 +1903,86 @@ class LifecycleTests(unittest.TestCase):
             )
             failed = run(
                 ["bash", str(CONTROL), "status", "--config", str(config_path)],
-                {"XDG_CONFIG_HOME": str(config_home)},
+                status_env(Path(tmp), config_home),
             )
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
             self.assertIn("DRIFT unit missing from render: description-portal.service", failed.stdout)
             self.assertIn("DRIFT unit missing from render: description-operator-proxy.service", failed.stdout)
             self.assertIn("provided TLS certificate or key is missing", failed.stderr)
+
+    def test_status_requires_the_ready_windows_task_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, state, config_home, _ = self._render_units(root)
+            env = status_env(root, config_home)
+            record = json.loads(
+                (state / "install-record.json").read_text(encoding="utf-8")
+            )
+            identity = record["ends"]["windows"]
+            for task_state in ("Ready", "Disabled", "Failed"):
+                sample = {
+                    "passed": True,
+                    "sample": {
+                        "task_name": "description-e2e-endpoint",
+                        "task_state": task_state,
+                        "last_task_result": 267009,
+                        "listener_pid": 4242,
+                        "process_start_utc": "2026-10-21T00:00:00Z",
+                        "install_id": identity["install_id"],
+                        "config_digest": identity["config_digest"],
+                        "release": identity["release"],
+                        "health_install_id": identity["install_id"],
+                        "health_config_digest": identity["config_digest"],
+                        "health_release": identity["release"],
+                    },
+                }
+                (root / "windows-status.json").write_text(
+                    json.dumps(sample),
+                    encoding="utf-8",
+                )
+                result = run(
+                    [
+                        "bash",
+                        str(CONTROL),
+                        "status",
+                        "--config",
+                        str(config_path),
+                    ],
+                    env,
+                )
+                self.assertNotEqual(
+                    result.returncode,
+                    0,
+                    result.stdout + result.stderr,
+                )
+
+            (root / "windows-status.json").write_text(
+                json.dumps(
+                    {
+                        "passed": False,
+                        "error": "scheduled task is missing",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            missing = run(
+                [
+                    "bash",
+                    str(CONTROL),
+                    "status",
+                    "--config",
+                    str(config_path),
+                ],
+                env,
+            )
+            self.assertNotEqual(
+                missing.returncode,
+                0,
+                missing.stdout + missing.stderr,
+            )
+            control = CONTROL.read_text(encoding="utf-8")
+            self.assertNotIn("LastTaskResult -ne 0", control)
+            self.assertIn("$task.State -ne 'Running'", control)
 
     def test_portal_unit_injects_the_derived_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2176,6 +2364,11 @@ class InstallOrderingTests(unittest.TestCase):
             "    esac\n"
             '    if [ -n "$PROJECTION_FILE" ] && [ -f "$PROJECTION_FILE" ]; then cat "$PROJECTION_FILE"; fi\n'
             '    exit "${PROJECTION_RC:-0}" ;;\n'
+            "  *-c*description_pipeline.orchestration.portal*description_pipeline.orchestration.feishu_auth*)\n"
+            '    echo "module_check" >> "$ORDER_LOG"\n'
+            '    exit "${MODULE_CHECK_RC:-0}" ;;\n'
+            "  *.py|*.py\\ *)\n"
+            '    exec python3 "$@" ;;\n'
             "esac\n"
             'script="$(cat)"\n'
             'case "$script" in\n'
@@ -2703,7 +2896,7 @@ class InstallOrderingTests(unittest.TestCase):
             binary.rename(work / "saved-nginx")
             operatorctl = ["bash", str(release / "operator" / "operatorctl.sh")]
             config = str(release.parent / "platform.json")
-            for verb, expect_failure in (("status", False), ("health", True)):
+            for verb, expect_failure in (("status", True), ("health", True)):
                 with self.subTest(verb=verb):
                     order.write_text("", encoding="utf-8")
                     before = tree_state(work)
@@ -2878,6 +3071,84 @@ class InstallOrderingTests(unittest.TestCase):
                 before,
                 "no live DDL may run before the staged identity verifies",
             )
+
+    def test_candidate_reconcile_refuses_before_ddl_when_maintenance_lock_is_held(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(
+                Path(tmp),
+                fresh=False,
+                ready_after=1,
+                db_exists=True,
+            )
+            installed = self._install(release, control_env)
+            self.assertEqual(
+                installed.returncode,
+                0,
+                installed.stdout + installed.stderr,
+            )
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state,
+                "gen-1",
+                "PLATFORM_OPERATOR_DSN",
+            )
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            (Path(tmp) / "admission").write_text("true", encoding="utf-8")
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            receipt_before = receipt_path.read_bytes()
+            ddl_before = order.read_text(encoding="utf-8").count(
+                "psql_platform_apply"
+            )
+            lock_dir = state / "locks"
+            lock_dir.mkdir(exist_ok=True)
+            lock_path = lock_dir / "maintenance.lock"
+            lock_path.write_text("external lifecycle owns this lock\n", encoding="utf-8")
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                refused = run(
+                    [
+                        "bash",
+                        str(release / "operator" / "operatorctl.sh"),
+                        "reconcile",
+                        "--config",
+                        str(release.parent / "platform.json"),
+                        "--install-id",
+                        "gen-2",
+                        "--run-id",
+                        "portal-1",
+                        "--stage",
+                        "freeze",
+                        "--outcome",
+                        "failed",
+                        "--evidence",
+                        "receipt.json",
+                    ],
+                    control_env,
+                )
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            self.assertNotEqual(
+                refused.returncode,
+                0,
+                refused.stdout + refused.stderr,
+            )
+            self.assertIn(
+                "another supported lifecycle operation owns the maintenance lock",
+                refused.stderr,
+            )
+            self.assertEqual(
+                order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                ddl_before,
+            )
+            self.assertEqual(receipt_path.read_bytes(), receipt_before)
 
     def test_maintenance_reconcile_refuses_an_undefined_candidate_value(self) -> None:
         """A candidate env that cannot define a value never falls back to the running generation."""
@@ -4634,6 +4905,7 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(rolled["rollback-linux"], "completed")
             # The accepted remote switch is actually restored: exactly one bound rollback call.
             lines = Path(tmp, "order.log").read_text(encoding="utf-8").splitlines()
+            self.assertIn("module_check", lines)
             rollback_calls = [line for line in lines if line.startswith("ssh ") and "-Verb rollback" in line]
             self.assertEqual(len(rollback_calls), 1, lines[-8:])
             self.assertIn("previous-0001", rollback_calls[0])

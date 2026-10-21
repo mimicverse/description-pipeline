@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 from description_pipeline.backends.urdf import MESH_PART_TRIANGLE_LIMIT, generate_urdf
 from description_pipeline.io import PipelineError, file_digest, read_data
 from description_pipeline.model import Robot
+from description_pipeline.sources.solidworks.naming import material_name, mesh_path
 
 
 def _binary_stl(triangles: int) -> bytes:
@@ -81,6 +82,13 @@ class UrdfNumericContractTests(unittest.TestCase):
 
 
 class UrdfWriterTests(unittest.TestCase):
+    def test_broken_joint_reference_is_rejected_before_writing(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        scene["joints"][0]["child"] = "missing_link"
+        with self.assertRaisesRegex(PipelineError, "Unknown joint endpoint"):
+            Robot.from_dict(scene)
+
     def test_diagnostic_urdf_preserves_declared_zero_limits(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         scene = read_data(source / "scene.json")
@@ -127,11 +135,12 @@ class UrdfWriterTests(unittest.TestCase):
             destination = root / "delivery"
             output = generate_urdf(robot, source, destination, name="fixture_arm")
             node = next(link for link in ET.parse(output).getroot().findall("link") if link.get("name") == "base_link")
+            expected = "../" + mesh_path(file_digest(source / "geometry/big.stl"), namespace="fixture_arm")
             self.assertEqual(
                 [visual.find("geometry/mesh").get("filename") for visual in node.findall("visual")],
-                ["../meshes/visual/base_link_0.stl"],
+                [expected],
             )
-            self.assertEqual((destination / "meshes/visual/base_link_0.stl").read_bytes(), original)
+            self.assertEqual((destination / expected.removeprefix("../")).read_bytes(), original)
             self.assertEqual(list((destination / "meshes").rglob("*_part_*")), [])
 
     def test_oversized_mesh_is_partitioned_losslessly_and_deterministically(self):
@@ -150,9 +159,10 @@ class UrdfWriterTests(unittest.TestCase):
             links = {link.get("name"): link for link in ET.parse(output).getroot().findall("link")}
             base = links["base_link"]
             visuals = base.findall("visual")
+            stem = mesh_path(file_digest(source_file), namespace="fixture_arm")[:-4]
             expected_names = [
-                "../meshes/visual/base_link_0_part_0.stl",
-                "../meshes/visual/base_link_0_part_1.stl",
+                f"../{stem}_part_0.stl",
+                f"../{stem}_part_1.stl",
             ]
             self.assertEqual([visual.find("geometry/mesh").get("filename") for visual in visuals], expected_names)
             self.assertEqual(len(base.findall("collision")), 2)
@@ -174,7 +184,7 @@ class UrdfWriterTests(unittest.TestCase):
                 self.assertEqual(_floats(visual.find("origin").get("rpy")), [0.0, 0.0, 0.0])
                 self.assertEqual(_floats(visual.find("geometry/mesh").get("scale")), [1.0, 1.0, 1.0])
                 material = visual.find("material")
-                self.assertEqual(material.get("name"), "base_link_color_0")
+                self.assertEqual(material.get("name"), material_name("geometry/big.stl", link="base_link"))
                 self.assertEqual(_floats(material.find("color").get("rgba")), [0.7, 0.7, 0.72, 1.0])
             for collision in base.findall("collision"):
                 self.assertEqual(_floats(collision.find("origin").get("xyz")), [0.0, 0.0, 0.03125])
@@ -207,15 +217,29 @@ class UrdfWriterTests(unittest.TestCase):
         scene = read_data(source / "scene.json")
         base = next(link for link in scene["links"] if link["name"] == "base_link")
         base["visuals"] = [
-            {"kind": "box", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0], "size": [1.0, 2.0, 3.0]},
-            {"kind": "sphere", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0], "radius": 0.5},
             {
+                "name": "base_link_box_visual",
+                "kind": "box",
+                "xyz": [0.0, 0.0, 0.0],
+                "rpy": [0.0, 0.0, 0.0],
+                "size": [1.0, 2.0, 3.0],
+            },
+            {
+                "name": "base_link_sphere_visual",
+                "kind": "sphere",
+                "xyz": [0.0, 0.0, 0.0],
+                "rpy": [0.0, 0.0, 0.0],
+                "radius": 0.5,
+            },
+            {
+                "name": "base_link_cylinder_visual",
                 "kind": "cylinder",
                 "xyz": [0.0, 0.0, 0.0],
                 "rpy": [0.0, 0.0, 0.0],
                 "radius": 0.25,
                 "length": 0.75,
                 "rgba": [0.1, 0.2, 0.3, 1.0],
+                "material": "base_link_cylinder_material",
             },
         ]
         with tempfile.TemporaryDirectory() as temp:
@@ -228,7 +252,7 @@ class UrdfWriterTests(unittest.TestCase):
             cylinder = visuals[2].find("geometry/cylinder")
             self.assertEqual(_floats(cylinder.get("radius")), [0.25])
             self.assertEqual(_floats(cylinder.get("length")), [0.75])
-            self.assertEqual(visuals[2].find("material").get("name"), "base_link_color_2")
+        self.assertEqual(visuals[2].find("material").get("name"), "base_link_cylinder_material")
 
 
 if __name__ == "__main__":

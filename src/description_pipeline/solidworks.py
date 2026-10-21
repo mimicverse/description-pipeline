@@ -130,10 +130,11 @@ def _replay_seeded_inputs(staging: Path) -> tuple[dict, dict]:
     identity = frozen.get("identity") if isinstance(frozen.get("identity"), dict) else {}
     return {
         "source": {
-            "robot_name": frozen.get("robot_name")
-            or identity.get("robot_name")
+            "robot_name": identity.get("robot_name")
+            or frozen.get("robot_name")
             or identity.get("robot_name_technical")
-            or "robot"
+            or "robot",
+            "robot_name_source": "cad" if identity.get("robot_name") else "cad_filename_derived",
         },
         "hardware_id": identity.get("hardware_id"),
         "provenance": {

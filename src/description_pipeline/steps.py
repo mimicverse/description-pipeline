@@ -109,20 +109,13 @@ def discover_structure(
             derivation = payload.get("derivation") if isinstance(payload, dict) else None
             _require(isinstance(derivation, dict), "Prepared discovery lacks its Linux derivation settings")
             _require(derivation.get("main_assembly") == main_assembly, "Linux derivation selected another assembly")
-            names = derivation.get("frozen_names")
             record_roots = derivation.get("record_roots")
             _require(
                 isinstance(record_roots, list) and all(isinstance(value, str) for value in record_roots),
                 "Prepared discovery has invalid controlled-record root identifiers",
             )
         else:
-            names = read_data(configuration["frozen_names_file"]) if configuration.get("frozen_names_file") else {}
             record_roots = configuration.get("record_roots", [])
-        _require(
-            isinstance(names, dict)
-            and all(isinstance(key, str) and isinstance(value, str) for key, value in names.items()),
-            "Frozen-name registry must map native identities to interface names",
-        )
         purpose = configuration.get("purpose") if isinstance(configuration, dict) else None
         if prepared is None:
             _require(
@@ -135,7 +128,6 @@ def discover_structure(
             purpose = purpose if isinstance(purpose, str) and purpose in REQUEST_PURPOSES else PURPOSE_ENGINEERING
         return DiscoverySettings(
             record_roots=tuple(record_roots),
-            frozen_names=names,
             main_assembly=main_assembly,
             purpose=str(purpose),
         )
@@ -144,7 +136,6 @@ def discover_structure(
         described = {
             "handoff_sha256": expected_digest,
             "files_sha256": digest(expected_files),
-            "frozen_names_sha256": digest(value.frozen_names),
             "record_roots": [str(root) for root in value.record_roots],
         }
         if main_assembly is not None:

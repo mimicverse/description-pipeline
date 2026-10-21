@@ -104,9 +104,9 @@ const {
   }
 }
 
-// Static display seams (no browser): missing drive stays absent and labelled, the
-// preview window is labelled as an analysis window, and the tool identity is the
-// delivery-root tool.json.
+// Static display seams (no browser): missing drive stays absent and labelled,
+// old preview-window aliases are gone, and the tool identity is the delivery-root
+// tool.json.
 {
   const staticDir = path.join(here, "..", "..", "src", "description_pipeline", "orchestration", "static");
   const viewer = readFileSync(path.join(staticDir, "viewer.js"), "utf8");
@@ -114,7 +114,8 @@ const {
   assert.ok(viewer.includes('parseNumber(limit.getAttribute("effort"), null)'));
   assert.ok(!viewer.includes('parseNumber(limit.getAttribute("effort"), 0)'));
   assert.ok(app.includes("not provided (drive capability not established)"));
-  assert.ok(app.includes("inspection/preview analysis window, not a mechanical limit"));
+  assert.ok(!app.includes("policy_preview_window"));
+  assert.ok(!app.includes("declared_preview_window"));
   assert.ok(app.includes('loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal)'));
   assert.ok(app.includes('["Purpose", purposeLabel(run.purpose)]'));
   assert.ok(app.includes("purpose: preview.purpose"));

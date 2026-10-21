@@ -14,6 +14,7 @@ import math
 import ntpath
 import re
 import struct
+from collections import Counter
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -21,16 +22,20 @@ import numpy as np
 
 from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
+from ..geometry.native_u import (
+    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_details_match,
+    native_scope_warning_projection,
+)
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
+from ..sources.solidworks.native_limits import PREVIEW_POLICY_ID, PREVIEW_WINDOW_RAD
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
     PURPOSE_INSPECTION_PREVIEW,
     QUALIFICATION_SCHEMA,
-    preview_revolute_window_rad,
-    preview_sampling_interval_fraction,
     qualification_facts,
     validate_qualification,
 )
@@ -298,13 +303,34 @@ def _input(root, diagnostics=None):
         # swallowed into zero objects.
         from .native_declarations import verify_declarations
 
-        declarations = verify_declarations(raw)
+        declarations = verify_declarations(raw, purpose=_request_purpose(root))
         _require(
             declarations["passed"],
             f"the discovery record declaration gate failed: {declarations['errors'][:1]}",
         )
         carrier = declarations["carrier"]
         bodies, joints = carrier["bodies"], carrier["joints"]
+        from ..sources.solidworks.naming import carrier_names_and_rules
+
+        carrier_snapshot = _carrier_snapshot(carrier["root"], bodies, joints, raw)
+        body_names, joint_names, _body_rules, _joint_rules = carrier_names_and_rules(
+            bodies,
+            joints,
+            str(carrier["root"]),
+        )
+        for body in bodies:
+            source_name = str(body["name"])
+            body["source_name"] = source_name
+            body["name"] = body_names[source_name]
+            body["id"] = body["name"]
+        for joint in joints:
+            source_name = str(joint["name"])
+            joint["source_name"] = source_name
+            joint["parent"] = body_names.get(str(joint["parent"]), str(joint["parent"]))
+            joint["child"] = body_names.get(str(joint["child"]), str(joint["child"]))
+            joint["name"] = joint_names[source_name]
+            joint["id"] = joint["name"]
+        carrier["root"] = body_names.get(str(carrier.get("root")), carrier.get("root"))
         # The native interface interpretation is shared across the two modes: each mode
         # proves its own members/base first, then rebuilds the CS_/TCP_/SCS_ interfaces
         # from the raw datums (a missing declaration extension never proves absence).
@@ -313,6 +339,8 @@ def _input(root, diagnostics=None):
     else:
         bodies = rebuild_rigid_bodies(discovery_record)
         joints = rebuild_joint_facts(discovery_record, root, purpose=_request_purpose(root))
+        rebuild_root = next((str(body["name"]) for body in bodies if str(body["name"]) == "base_link"), None)
+        carrier_snapshot = _carrier_snapshot(rebuild_root, bodies, joints, raw)
         frames = rebuild_interface_frames(discovery_record)
     source = read_source_record(root)
     handoff = evidence.handoff(root)
@@ -325,7 +353,12 @@ def _input(root, diagnostics=None):
         handoff.get("configuration") == identity["configuration"],
         "Handoff and source record disagree on the configuration",
     )
-    robot_name = discovery_record.get("robot_name")
+    raw_identity = (discovery_record.get("raw") or {}).get("identity") or {}
+    robot_name = (
+        raw_identity.get("robot_name")
+        or discovery_record.get("robot_name")
+        or discovery_record.get("robot_name_technical")
+    )
     _require(isinstance(robot_name, str) and robot_name, "Discovery record carries no robot name")
     declared = evidence.declared_masses(root)
     material_source = _frozen_source_config(root).get("material_source")
@@ -372,14 +405,163 @@ def _input(root, diagnostics=None):
             "assembly": identity["main_assembly"],
             "configuration": identity["configuration"],
             "robot_name": robot_name,
+            "robot_name_source": "cad" if raw_identity.get("robot_name") else "cad_filename_derived",
             "bodies": bodies,
             "joints": joints,
+            "carrier": carrier_snapshot,
             "frames": frames,
             "material_source": material_source,
             "documented_masses": declared.get("items") or {},
             "mass_evidence": declared.get("evidence"),
         },
         "checks": checks,
+    }
+
+
+def _carrier_snapshot(root, bodies, joints, raw=None) -> dict:
+    """Freeze the raw-decoded carrier names, members and native topology."""
+
+    raw_rows = raw.get("reference_axes") if isinstance(raw, dict) else None
+    raw_rows = raw_rows if isinstance(raw_rows, list) else []
+    axes_by_selector: dict[tuple[str, str, str], dict] = {}
+    axes_by_joint: dict[str, list[dict]] = {}
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        selector = row.get("selector") if isinstance(row.get("selector"), dict) else {}
+        key = (
+            str(selector.get("kind") or ""),
+            str(selector.get("component") or ""),
+            str(selector.get("feature_name") or ""),
+        )
+        if any(key):
+            previous = axes_by_selector.get(key)
+            _require(
+                previous is None or previous.get("axis_direction") == row.get("axis_direction"),
+                f"Native axis selector {key!r} carries conflicting directions",
+            )
+            axes_by_selector[key] = row
+        joint_name = row.get("joint")
+        if isinstance(joint_name, str) and joint_name:
+            axes_by_joint.setdefault(joint_name, []).append(row)
+
+    def assembly_axis(joint: dict) -> list[float] | None:
+        selector = joint.get("axis_reference")
+        selector_key = None
+        if isinstance(selector, dict):
+            selector_key = (
+                str(selector.get("kind") or ""),
+                str(selector.get("component") or ""),
+                str(selector.get("feature_name") or ""),
+            )
+        matches: list[dict] = []
+        if selector_key is not None:
+            selected = axes_by_selector.get(selector_key)
+            if selected is not None:
+                matches.append(selected)
+        matches.extend(axes_by_joint.get(str(joint.get("name") or ""), []))
+        unique: dict[tuple[float, float, float], list[float]] = {}
+        for row in matches:
+            values = row.get("axis_direction")
+            _require(
+                isinstance(values, list) and len(values) == 3,
+                "Native axis direction is malformed",
+            )
+            try:
+                direction = np.asarray(values, dtype=float)
+            except (TypeError, ValueError) as error:
+                raise PipelineError("Native axis direction is malformed") from error
+            _require(
+                np.isfinite(direction).all() and float(np.linalg.norm(direction)) > 1e-12,
+                "Native axis direction is invalid",
+            )
+            _require(
+                row.get("coordinate_frame") == "assembly",
+                "Functional naming requires an assembly-frame native axis",
+            )
+            _require(
+                row.get("direction_semantics") == "undirected_axis_line",
+                "Functional naming requires an undirected native axis line",
+            )
+            normalized = direction / float(np.linalg.norm(direction))
+            unique[tuple(float(value) for value in np.round(normalized, 12))] = [
+                float(value) for value in normalized
+            ]
+        _require(
+            len(unique) <= 1,
+            f"{joint.get('name')} carries conflicting native axis directions",
+        )
+        return next(iter(unique.values()), None)
+
+    def axis_sign(joint: dict, properties: dict) -> int | None:
+        name = str(joint.get("name") or "")
+        direct_key = f"dp.joint.{name}.axis_sign"
+        legacy_key = "dp.joint.axis_sign"
+        candidates: list[object] = []
+
+        def add(scope: object, key: str) -> None:
+            if not isinstance(scope, dict) or key not in scope:
+                return
+            value = scope[key]
+            if type(value) is int and value in (1, -1):
+                candidates.append(value)
+            elif type(value) is str and value in ("+1", "1", "-1"):
+                candidates.append(-1 if value == "-1" else 1)
+            else:
+                raise PipelineError(f"{name} carries an invalid {key}: {value!r}")
+
+        # The declaration form is a main-assembly property scoped by the joint
+        # name.  Never scan unrelated components: a generic key on another part
+        # does not describe this joint.
+        add(properties.get("document") or {}, direct_key)
+        mate_names: list[str] = []
+        if isinstance(joint.get("mate"), str):
+            mate_names.append(joint["mate"])
+        if isinstance(joint.get("mates"), list):
+            mate_names.extend(str(item) for item in joint["mates"] if isinstance(item, str))
+        mate_properties = properties.get("mates") or {}
+        for mate_name in sorted(set(mate_names)):
+            scope = mate_properties.get(mate_name) or {}
+            if isinstance(scope, dict):
+                add(scope, legacy_key)
+                add(scope, direct_key)
+        signs = set(candidates)
+        if len(signs) > 1:
+            raise PipelineError(f"{name} carries conflicting axis signs: {sorted(signs)}")
+        return signs.pop() if signs else None
+
+    properties = raw.get("properties") or {} if isinstance(raw, dict) else {}
+    joint_rows = [
+        {
+            "name": str(joint["name"]),
+            "type": joint.get("type"),
+            "parent": str(joint.get("parent") or ""),
+            "child": str(joint.get("child") or ""),
+            "axis_sign": axis_sign(joint, properties),
+            "axis_assembly_direction": assembly_axis(joint),
+        }
+        for joint in joints
+    ]
+    by_name: dict[str, int] = {}
+    for row in joint_rows:
+        sign = row["axis_sign"]
+        if sign is None:
+            continue
+        name = row["name"]
+        if name in by_name and by_name[name] != sign:
+            raise PipelineError(f"duplicate joint name {name} carries conflicting author signs")
+        by_name[name] = sign
+    return {
+        "root": None if root is None else str(root),
+        "bodies": [
+            {
+                "name": str(body["name"]),
+                "frame": dict(body.get("frame") or {}),
+                "components": list(body.get("components") or []),
+            }
+            for body in bodies
+        ],
+        "joints": joint_rows,
     }
 
 
@@ -835,11 +1017,26 @@ def _xml(root, definition, model):
     _require(
         b"<!DOCTYPE" not in payload.upper() and b"<!ENTITY" not in payload.upper(), "XML declarations are forbidden"
     )
-    document = ET.fromstring(payload)
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    document = ET.fromstring(payload, parser=parser)
     robot_name = (definition.get("source") or {}).get("robot_name")
     _require(isinstance(robot_name, str) and bool(robot_name), "The input definition carries no robot label")
     _require(document.tag == "robot" and document.get("name") == robot_name, "Wrong URDF robot identity")
-    _require({child.tag for child in document} <= {"link", "joint"}, "Unexpected top-level URDF extension")
+    expected_comments = [
+        f"WARNING {item['code']}: {item.get('message', '')} "
+        "See reports/quality.json for object and field details."
+        for item in (model.get("provenance") or {}).get("value_warnings") or []
+        if isinstance(item, dict) and item.get("code")
+    ]
+    comments = [child for child in document if child.tag is ET.Comment]
+    _require(
+        [child.text for child in comments] == expected_comments,
+        "URDF value-provenance warnings differ from the model",
+    )
+    _require(
+        {child.tag for child in document if child.tag is not ET.Comment} <= {"link", "joint"},
+        "Unexpected top-level URDF extension",
+    )
     links = document.findall("link")
     joints = document.findall("joint")
     link_names = [element.get("name", "") for element in links]
@@ -883,7 +1080,7 @@ def _link_physics(node, canonical):
     return {"mass_kg": mass, "principal_inertia_kg_m2": eigenvalues.tolist()}
 
 
-def _joint(node, authored, canonical, datums, body_datums, diagnostics):
+def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, preview=False):
     _require(node.get("type") == authored["type"] == canonical["type"], "Joint type changed")
     for key in ("parent", "child"):
         _require(_one(node, key).get("link") == authored[key] == canonical[key], f"Joint {key} changed")
@@ -920,11 +1117,27 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics):
         _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
-    if authored.get("limit_source") == "policy_preview_window":
-        radius = preview_revolute_window_rad()
+    limit_source = authored.get("limit_source")
+    _require(
+        limit_source in {"native", "declared_author", "preview_policy"},
+        "Moving joint limits are not bound to a CAD native or author declaration",
+    )
+    if limit_source == "preview_policy":
+        policy = authored.get("preview_policy")
         _require(
-            authored["type"] == "revolute" and limits.get("lower") == -radius and limits.get("upper") == radius,
-            "The inspection-preview window does not equal the frozen policy radius",
+            preview and authored["type"] == "revolute" and isinstance(policy, dict),
+            "The preview window is not allowed for this purpose or joint type",
+        )
+        _require(
+            policy.get("rule_id") == PREVIEW_POLICY_ID
+            and policy.get("rule_version") == "v1"
+            and policy.get("native_cad_ranges") is False
+            and policy.get("hardware_qualified") is False,
+            "The preview window has another rule or qualification",
+        )
+        _require(
+            limits.get("lower") == -PREVIEW_WINDOW_RAD and limits.get("upper") == PREVIEW_WINDOW_RAD,
+            "The inspection-preview window does not equal the frozen full-turn radius",
         )
     unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
@@ -1006,7 +1219,7 @@ def _joint_sample(joint, sign):
         f"Joint {joint['name']} has no usable ordered limits",
     )
     middle = (float(lower) + float(upper)) / 2
-    quarter = (float(upper) - float(lower)) / 4 * preview_sampling_interval_fraction()
+    quarter = (float(upper) - float(lower)) / 4
     return middle + sign * quarter
 
 
@@ -1035,7 +1248,7 @@ def _joint_combined_sample(joint, sign):
     )
     lower, upper = float(lower), float(upper)
     middle = (lower + upper) / 2
-    quarter = (upper - lower) / 4 * preview_sampling_interval_fraction()
+    quarter = (upper - lower) / 4
     if quarter == 0:
         _require(lower <= 0.0 <= upper, f"Joint {joint['name']} has a zero-width range that excludes its zero")
         return 0.0
@@ -1456,8 +1669,9 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
                 "Mesh URI must reference delivered meshes",
             )
             delivery_name = "meshes/" + uri[len("../meshes/") :]
-            expected_name = f"meshes/visual/{node.attrib['name']}_{index}" + (
-                f"_part_{part}.stl" if chunks > 1 else ".stl"
+            base_name = shape.get("mesh_name") or f"meshes/visual/{node.attrib['name']}_{index}.stl"
+            expected_name = (
+                base_name.removesuffix(".stl") + f"_part_{part}.stl" if chunks > 1 else base_name
             )
             _require(
                 delivery_name == expected_name,
@@ -1490,6 +1704,7 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             stats.volume > 1e-15 or occurrence in exclusions or _qualified_surface_only(root, occurrence),
             "Zero-volume geometry needs a documented exclusion",
         )
+        _verify_native_solid_orientation(source_bytes, row)
         points = stl.vertices(original)
         world = urdf_pose @ origins[0]
         native = components[occurrence]
@@ -1518,6 +1733,209 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
     return used, world_points
 
 
+def _verify_native_solid_orientation(source_bytes: bytes, row: dict) -> None:
+    """Check orientation only on native bodies whose edge incidence proves closure."""
+
+    tessellation = row.get("tessellation")
+    if not isinstance(tessellation, dict):
+        return
+    spans = tessellation.get("face_spans")
+    native_edges = tessellation.get("native_edges")
+    if not isinstance(spans, list) or not isinstance(native_edges, list):
+        return
+    solid_bodies = sorted(
+        {
+            span["body_index"]
+            for span in spans
+            if span.get("body_type") == 0
+        }
+    )
+    for body_index in solid_bodies:
+        body_edges = [
+            edge
+            for edge in native_edges
+            if edge.get("body_type") == 0 and edge.get("body_index") == body_index
+        ]
+        triangles = []
+        for span in spans:
+            if span.get("body_type") != 0 or span.get("body_index") != body_index:
+                continue
+            for triangle_index in range(
+                span["triangle_start"],
+                span["triangle_start"] + span["triangle_count"],
+            ):
+                offset = 84 + 50 * triangle_index + 12
+                values = struct.unpack_from("<9f", source_bytes, offset)
+                triangles.append(tuple(tuple(values[index : index + 3]) for index in range(0, 9, 3)))
+        directed: dict[tuple, list[int]] = {}
+        points = []
+        point_index = {}
+        faces = []
+        for triangle in triangles:
+            keys = []
+            for point in triangle:
+                index = point_index.get(point)
+                if index is None:
+                    index = len(points)
+                    point_index[point] = index
+                    points.append(point)
+                keys.append(index)
+            faces.append(tuple(keys))
+            for left, right in ((keys[0], keys[1]), (keys[1], keys[2]), (keys[2], keys[0])):
+                key = tuple(sorted((left, right)))
+                directed.setdefault(key, []).append(1 if left < right else -1)
+        _require(
+            all(
+                len(directions) != 2
+                or directions[0] != directions[1]
+                for directions in directed.values()
+            ),
+            "Native solid faces contain same-oriented shared triangle edges",
+        )
+        if not body_edges or any(
+            len(edge.get("face_indices") or []) != 2
+            for edge in body_edges
+        ):
+            continue
+        adjacency = {}
+        for triangle_index, face in enumerate(faces):
+            for vertex in face:
+                adjacency.setdefault(vertex, set()).add(triangle_index)
+        pending = set(range(len(faces)))
+        components = []
+        while pending:
+            stack = [pending.pop()]
+            component = []
+            while stack:
+                triangle_index = stack.pop()
+                component.append(triangle_index)
+                for vertex in faces[triangle_index]:
+                    for neighbor in adjacency[vertex]:
+                        if neighbor in pending:
+                            pending.remove(neighbor)
+                            stack.append(neighbor)
+            signed_volume = 0.0
+            weighted_center = [0.0, 0.0, 0.0]
+            sample = None
+            sample_area = -1.0
+            for triangle_index in component:
+                a, b, c = (
+                    tuple(float(value) for value in points[index])
+                    for index in faces[triangle_index]
+                )
+                volume = (
+                    a[0] * (b[1] * c[2] - b[2] * c[1])
+                    - a[1] * (b[0] * c[2] - b[2] * c[0])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0])
+                ) / 6.0
+                signed_volume += volume
+                for axis in range(3):
+                    weighted_center[axis] += volume * (a[axis] + b[axis] + c[axis]) / 4.0
+                normal = np.cross(np.asarray(b) - np.asarray(a), np.asarray(c) - np.asarray(a))
+                area = float(np.linalg.norm(normal))
+                if area > sample_area and area > 0.0:
+                    triangle_center = np.asarray(
+                        tuple((a[axis] + b[axis] + c[axis]) / 3.0 for axis in range(3))
+                    )
+                    edge_scale = min(
+                        float(np.linalg.norm(np.asarray(b) - np.asarray(a))),
+                        float(np.linalg.norm(np.asarray(c) - np.asarray(b))),
+                        float(np.linalg.norm(np.asarray(a) - np.asarray(c))),
+                    )
+                    sample_area = area
+                    sample = (
+                        triangle_center,
+                        normal / area,
+                        max(edge_scale * 1.0e-6, 1.0e-12),
+                    )
+            if abs(signed_volume) <= 1e-18:
+                continue
+            center = tuple(value / signed_volume for value in weighted_center)
+            triangle_center, unit_normal, epsilon = sample
+            interior_sample = tuple(
+                float(
+                    triangle_center[axis]
+                    - (1.0 if signed_volume > 0 else -1.0) * epsilon * unit_normal[axis]
+                )
+                for axis in range(3)
+            )
+            components.append(
+                {
+                    "triangles": component,
+                    "signed_volume": signed_volume,
+                    "center": center,
+                    "interior_sample": interior_sample,
+                }
+            )
+        _require(
+            components and sum(component["signed_volume"] for component in components) > 0,
+            "Closed native solid has no positive total material volume",
+        )
+        for component_index, component in enumerate(components):
+            nesting_depth = sum(
+                _point_inside_triangle_component(
+                    component["interior_sample"],
+                    points,
+                    faces,
+                    other["triangles"],
+                )
+                for other_index, other in enumerate(components)
+                if other_index != component_index
+            )
+            expected_positive = nesting_depth % 2 == 0
+            _require(
+                (component["signed_volume"] > 0) == expected_positive,
+                "Closed native solid shell orientation differs from its nesting depth",
+            )
+
+
+def _point_inside_triangle_component(point, points, faces, component) -> bool:
+    """Solid-angle membership used only to distinguish outer shells from valid cavities."""
+
+    origin = np.asarray(point, dtype=float)
+    solid_angle = 0.0
+    for triangle_index in component:
+        a, b, c = (
+            np.asarray(points[index], dtype=float) - origin
+            for index in faces[triangle_index]
+        )
+        numerator = float(np.dot(a, np.cross(b, c)))
+        denominator = (
+            float(np.linalg.norm(a) * np.linalg.norm(b) * np.linalg.norm(c))
+            + float(np.dot(a, b)) * float(np.linalg.norm(c))
+            + float(np.dot(b, c)) * float(np.linalg.norm(a))
+            + float(np.dot(c, a)) * float(np.linalg.norm(b))
+        )
+        if abs(denominator) <= 1e-18:
+            continue
+        solid_angle += 2.0 * math.atan2(numerator, denominator)
+    return abs(solid_angle) > 2.0 * math.pi
+
+
+def native_gate_warning_diagnostics(details: dict) -> list[dict]:
+    """Project verified native-gate warnings into the quality report."""
+
+    warnings = details.get("warnings")
+    _require(isinstance(warnings, list), "Native tessellation warnings are unreadable")
+    projected = []
+    for warning in warnings:
+        _require(
+            isinstance(warning, dict) and isinstance(warning.get("code"), str),
+            "Native tessellation warning has no code",
+        )
+        projected.append(native_scope_warning_projection(warning))
+    scope_projection = [
+        item
+        for item in projected
+        if item["code"] in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    _require(
+        native_scope_warning_details_match(scope_projection, warnings),
+        "Native scope warning projection is incomplete, forged or mismatched",
+    )
+    return projected
+
+
 def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
     """Recompute the quality report without reading the saved quality decision.
 
@@ -1544,12 +1962,29 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
         source = definition["source"]
         from .native_mesh_observations import verify_native_mesh_observations
 
-        gates.add("geometry.native_tessellation", lambda: verify_native_mesh_observations(root))
+        def _verify_native_tessellation():
+            native_details = verify_native_mesh_observations(root)
+            projected = native_gate_warning_diagnostics(native_details)
+            diagnostics.extend(projected)
+            return native_details
+
+        gates.add("geometry.native_tessellation", _verify_native_tessellation)
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add(
             "verification.complete",
             lambda: _verify_model(root, gates, definition, model, raw, diagnostics),
         )
+    if model is not None:
+        for warning in (model.get("provenance") or {}).get("value_warnings") or []:
+            if isinstance(warning, dict) and warning.get("code"):
+                diagnostics.append(
+                    {
+                        "code": str(warning["code"]),
+                        "blocking": False,
+                        "message": str(warning.get("message") or "non-native derived value"),
+                        "detail": {"objects": warning.get("objects") or []},
+                    }
+                )
     required = required_checks(definition)
     observed = {check["id"] for check in gates.checks}
     for identifier in required:
@@ -1716,7 +2151,7 @@ def _engineering_status(fact_id: str, object_id: str, joints: dict, preview: boo
         return "unqualified"
     joint = joints.get(object_id) or {}
     if fact_id == "engineering_position_range":
-        return "established" if joint.get("limit_source") in ("native", "controlled") else "unqualified"
+        return "established" if joint.get("limit_source") in ("native", "declared_author") else "unqualified"
     limits = joint.get("limits") or {}
     return "established" if "effort" in limits and "velocity" in limits else "unqualified"
 
@@ -1731,7 +2166,20 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     from .solidworks_physics import verify_physics
 
     source = definition["source"]
+    carrier = source.get("carrier")
+    native_geometry_rows = evidence.geometry(root)
     gates.add("model.policy", lambda: _policy(source, model))
+    gates.add("source.carrier_binding", lambda: _carrier_binding(source, carrier))
+    gates.add(
+        "provenance.value_warnings",
+        lambda: _value_warning_gate(
+            root,
+            source,
+            model,
+            carrier,
+            native_geometry_rows=native_geometry_rows,
+        ),
+    )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
     datums = gates.add(
         "frames.native",
@@ -1761,12 +2209,47 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
     model_links = {link["name"]: link for link in model["links"]}
     model_joints = {joint["name"]: joint for joint in model["joints"]}
     axes = evidence.axes(root)
-    axis_map = {row["joint"]: row for row in axes}
+    joint_sources = {
+        str(joint.get("source_name") or joint["name"]): joint["name"] for joint in source["joints"]
+    }
+    selector_sources = {}
+    for joint in source["joints"]:
+        selector = joint.get("axis_reference")
+        if not isinstance(selector, dict):
+            continue
+        key = (
+            str(selector.get("kind") or ""),
+            str(selector.get("component") or ""),
+            str(selector.get("feature_name") or ""),
+        )
+        _require(key not in selector_sources, "Native axis selectors are not unique")
+        selector_sources[key] = joint["name"]
+    axis_map = {}
+    for row in axes:
+        selector = row.get("selector") if isinstance(row.get("selector"), dict) else {}
+        key = (
+            str(selector.get("kind") or ""),
+            str(selector.get("component") or ""),
+            str(selector.get("feature_name") or ""),
+        )
+        name = joint_sources.get(str(row.get("joint"))) or selector_sources.get(key)
+        _require(isinstance(name, str) and name, "Native axis row has no unique joint binding")
+        _require(name not in axis_map, "Native axis rows repeat one joint binding")
+        axis_map[name] = row
+    preview = _request_purpose(root) == PURPOSE_INSPECTION_PREVIEW
     for authored in source["joints"]:
         name = authored["name"]
         gates.add(
             "joints." + name,
-            lambda a=authored: _joint(joints[a["name"]], a, model_joints[a["name"]], datums, body_datums, diagnostics),
+            lambda a=authored: _joint(
+                joints[a["name"]],
+                a,
+                model_joints[a["name"]],
+                datums,
+                body_datums,
+                diagnostics,
+                preview=preview,
+            ),
         )
         if authored["type"] != "fixed":
             gates.add(
@@ -1786,7 +2269,7 @@ def _verify_model(root, gates, definition, model, raw, diagnostics):
             )
     for frame in source.get("frames", []):
         gates.add("frames." + frame["name"], lambda f=frame: _frame(f, model, joints, links, datums, body_datums))
-    geometry_rows = evidence.geometry(root)
+    geometry_rows = native_geometry_rows
     geometry = {row["component"]: row for row in geometry_rows}
     gates.add("geometry.coverage", lambda: _geometry_coverage(geometry_rows, components))
     points, used = [], []
@@ -1849,6 +2332,607 @@ def _policy(source, model):
     return {"scope": "SolidWorks tree, STL visuals, URDF"}
 
 
+def _carrier_binding(source, carrier):
+    """Bind delivered names, members and topology to the raw-decoded carrier."""
+
+    _require(isinstance(carrier, dict), "The raw carrier snapshot is missing")
+    bodies = source.get("bodies") or []
+    joints = source.get("joints") or []
+    native = {str(body.get("source_name") or body["name"]): body for body in bodies}
+    expected = {str(body["name"]): body for body in carrier.get("bodies") or []}
+    _require(
+        bool(expected) and set(native) == set(expected),
+        "Delivered bodies differ from the raw carrier membership",
+    )
+    for name, body in native.items():
+        original = expected[name]
+        _require(
+            list(body.get("components") or []) == list(original.get("components") or []),
+            f"Body {name} components differ from the raw carrier",
+        )
+        _require(
+            str((body.get("frame") or {}).get("coordinate_system") or "")
+            == str((original.get("frame") or {}).get("coordinate_system") or ""),
+            f"Body {name} datum differs from the raw carrier",
+        )
+    output_to_native = {
+        str(body["name"]): str(body.get("source_name") or body["name"]) for body in bodies
+    }
+    delivered = {str(joint.get("source_name") or joint["name"]): joint for joint in joints}
+    expected_joints = {str(joint["name"]): joint for joint in carrier.get("joints") or []}
+    _require(
+        set(delivered) == set(expected_joints),
+        "Delivered joints differ from the raw carrier membership",
+    )
+    for name, joint in delivered.items():
+        original = expected_joints[name]
+        _require(joint.get("type") == original.get("type"), f"Joint {name} type differs from the raw carrier")
+        _require(
+            output_to_native.get(str(joint.get("parent") or ""), str(joint.get("parent") or ""))
+            == str(original.get("parent") or ""),
+            f"Joint {name} parent differs from the raw carrier",
+        )
+        _require(
+            output_to_native.get(str(joint.get("child") or ""), str(joint.get("child") or ""))
+            == str(original.get("child") or ""),
+            f"Joint {name} child differs from the raw carrier",
+        )
+    root = carrier.get("root")
+    if root is not None:
+        base = next((body for body in bodies if body.get("name") == "base_link"), None)
+        _require(base is not None, "The raw carrier root is not delivered as base_link")
+        _require(
+            str(base.get("source_name") or base["name"]) == str(root),
+            "The delivered base_link does not bind to the raw carrier root",
+        )
+    return {"bodies": len(native), "joints": len(delivered)}
+
+
+def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_rows=None):
+    """Re-derive every non-native value warning from source facts and the model."""
+
+    from ..sources.solidworks.naming import (
+        DISPLAY_MATERIAL_FALLBACK_NAME,
+        DISPLAY_MATERIAL_FALLBACK_RGBA,
+        DISPLAY_MATERIAL_FALLBACK_RULE,
+        asset_namespace,
+        carrier_names_and_rules,
+        mesh_path,
+        visual_name,
+    )
+
+    mesh_namespace = asset_namespace(Path(str(source.get("assembly") or "robot")).name)
+    warnings = (model.get("provenance") or {}).get("value_warnings")
+    _require(isinstance(warnings, list), "Non-native value provenance warnings are missing")
+    actual: dict[str, list[dict]] = {}
+    actual_messages: dict[str, list[str]] = {}
+    for item in warnings:
+        _require(
+            isinstance(item, dict)
+            and isinstance(item.get("code"), str)
+            and bool(item["code"])
+            and isinstance(item.get("message"), str)
+            and bool(item["message"])
+            and isinstance(item.get("objects"), list)
+            and bool(item["objects"]),
+            "Non-native value provenance warning is malformed",
+        )
+        actual.setdefault(item["code"], []).extend(item["objects"])
+        actual_messages.setdefault(item["code"], []).append(item["message"])
+
+    bodies = source.get("bodies") or []
+    joints = source.get("joints") or []
+    carrier_signs: dict[str, int] = {}
+    for row in (carrier or {}).get("joints") or []:
+        sign = row.get("axis_sign")
+        if sign is None:
+            continue
+        name = str(row["name"])
+        if name in carrier_signs and carrier_signs[name] != sign:
+            raise PipelineError(f"duplicate joint name {name} carries conflicting author signs")
+        carrier_signs[name] = sign
+    links = model.get("links") or []
+    model_joints = model.get("joints") or []
+    shapes = [(link, shape) for link in links for shape in link.get("visuals") or []]
+    native_geometry = {}
+    for row in native_geometry_rows or []:
+        _require(isinstance(row, dict), "Raw geometry rows must be objects")
+        component = str(row.get("component") or "")
+        _require(component and component not in native_geometry, "Raw geometry components are not unique")
+        _require(
+            not ({"material", "rgba", "appearance", "color", "colour"} & set(row)),
+            "The capture schema carries no independently verified CAD appearance",
+        )
+        native_geometry[component] = row
+
+    # Re-derive the canonical names and their provenance from the native
+    # topology.  A source record's own name_rule claim is never trusted: the
+    # delivered names must be exactly what the shared pure rule emits, and the
+    # warning metadata is computed from the same rule, not copied from source.
+    output_to_native = {
+        str(body["name"]): str(body.get("source_name") or body["name"]) for body in bodies
+    }
+    carrier_axes = {
+        str(row["name"]): row.get("axis_assembly_direction")
+        for row in (carrier or {}).get("joints") or []
+        if row.get("axis_assembly_direction") is not None
+    }
+    native_bodies = [
+        {
+            "name": str(body.get("source_name") or body["name"]),
+            "frame": body.get("frame") or {},
+            "components": body.get("components"),
+            "owners": body.get("owners"),
+            "datum": body.get("datum"),
+        }
+        for body in bodies
+    ]
+    native_joints = [
+        {
+            "name": str(joint.get("source_name") or joint["name"]),
+            "type": joint.get("type"),
+            "parent": output_to_native.get(
+                str(joint.get("parent") or ""), str(joint.get("parent") or "")
+            ),
+            "child": output_to_native.get(
+                str(joint.get("child") or ""), str(joint.get("child") or "")
+            ),
+            "axis": {
+                "assembly_direction": carrier_axes.get(
+                    str(joint.get("source_name") or joint["name"])
+                )
+            },
+        }
+        for joint in joints
+    ]
+    native_root = next(
+        (
+            str(body.get("source_name") or body["name"])
+            for body in bodies
+            if body.get("name") == "base_link"
+        ),
+        "",
+    )
+    rederived_bodies, rederived_joints, body_rules, joint_rules = carrier_names_and_rules(
+        native_bodies, native_joints, native_root
+    )
+    for body in bodies:
+        native = str(body.get("source_name") or body["name"])
+        _require(
+            rederived_bodies.get(native) == body.get("name"),
+            "A link name is not the deterministic CAD-derived rule output",
+        )
+    for joint in joints:
+        native = str(joint.get("source_name") or joint["name"])
+        _require(
+            rederived_joints.get(native) == joint.get("name"),
+            "A joint name is not the deterministic CAD-derived rule output",
+        )
+
+    expected: dict[str, list[dict]] = {}
+
+    def add(code, value):
+        expected.setdefault(code, []).append(value)
+
+    for body in bodies:
+        source_name = str(body.get("source_name") or body["name"])
+        if source_name != body["name"]:
+            rule = body_rules.get(source_name) or {}
+            add(
+                "naming.formatted_interface",
+                {
+                    "object_type": "link",
+                    "object": body["name"],
+                    "field": "name",
+                    "actual": body["name"],
+                    "source": f"CAD-derived interface naming for {source_name}",
+                    "original": source_name,
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD datum formatting"),
+                },
+            )
+    for joint in joints:
+        source_name = str(joint.get("source_name") or joint["name"])
+        if source_name != joint["name"]:
+            rule = joint_rules.get(source_name) or {}
+            add(
+                "naming.formatted_interface",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "name",
+                    "actual": joint["name"],
+                    "source": f"CAD-derived interface naming for {source_name}",
+                    "original": source_name,
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD reference-axis formatting"),
+                },
+            )
+        if joint.get("type") != "fixed" and not any(
+            word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
+        ):
+            add(
+                "naming.motion_unresolved",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "name",
+                    "actual": joint["name"],
+                    "source": "neutral joint naming",
+                    "original": source_name,
+                    "rule_id": "naming.joint_motion",
+                    "rule_version": "naming-v1",
+                    "reason": "motion classification unavailable",
+                },
+            )
+        provenance = joint.get("axis_provenance")
+        native_name = str(joint.get("source_name") or joint["name"])
+        model_joint = next(
+            (item for item in model_joints if item.get("name") == joint.get("name")),
+            None,
+        )
+        if carrier_signs.get(native_name) == -1:
+            _require(isinstance(provenance, dict), "Author axis_sign reversal has no source provenance")
+            _require(
+                provenance.get("native_sign") == -1
+                and provenance.get("sign_reversal") is True
+                and provenance.get("sign_warning") == "discovery.direction_sign_reversed",
+                "Author axis_sign reversal provenance is missing or inconsistent",
+            )
+            _require(model_joint is not None, "A canonical joint is missing from the model")
+            native_axis = provenance.get("native_direction")
+            output_axis = provenance.get("direction")
+            _require(
+                isinstance(native_axis, list)
+                and isinstance(output_axis, list)
+                and len(native_axis) == 3
+                and len(output_axis) == 3
+                and all(
+                    abs(float(before) + float(after)) <= 1e-12
+                    for before, after in zip(native_axis, output_axis, strict=True)
+                ),
+                "Author axis_sign reversal does not reverse the native shaft",
+            )
+            add(
+                "direction.author_sign_applied",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "axis",
+                    "actual": model_joint.get("axis"),
+                    "source": "CAD author dp.joint.axis_sign",
+                    "original": native_axis,
+                    "rule_id": provenance.get("rule_id", "direction.native_axis_sign"),
+                    "rule_version": provenance.get("rule_version", "v1"),
+                    "reason": (
+                        "CAD author axis_sign selects the positive direction of the "
+                        "undirected shaft; q and ranges remain in author q"
+                    ),
+                    "native_joint_identity": native_name,
+                    "native_sign": provenance.get("native_sign"),
+                    "sign_reversal": provenance.get("sign_reversal"),
+                    "sign_warning": provenance.get("sign_warning"),
+                    "original_axis_assembly": native_axis,
+                    "output_axis_assembly": output_axis,
+                    "actual_child_axis": model_joint.get("axis"),
+                    "original_frame": provenance.get("original_frame", "assembly"),
+                    "output_frame": provenance.get("output_frame", "assembly"),
+                    "model_frame": "child",
+                    "q_sign": 1,
+                    "range_transform": "not_applied",
+                    "limits_before": joint.get("limits"),
+                    "limits_after": joint.get("limits"),
+                    "drive_before": joint.get("drive"),
+                    "drive_after": joint.get("drive"),
+                    "limits_status": "present" if joint.get("limits") is not None else "absent",
+                    "drive_status": "present" if joint.get("drive") is not None else "absent",
+                    "warning_does_not_authorize": True,
+                    "warning_does_not_replace_evidence": True,
+                },
+            )
+        if isinstance(provenance, dict):
+            _require(model_joint is not None, "A canonical joint is missing from the model")
+            row = {
+                "object_type": "joint",
+                "object": joint["name"],
+                "field": "axis",
+                "actual": model_joint.get("axis"),
+                "source": "CAD signed axis and versioned positive-motion rule",
+                "original": provenance.get("parent_axis"),
+                "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
+                "rule_version": provenance.get("rule_version", "v3"),
+                "reason": provenance.get(
+                    "reason", provenance.get("direction_relation", provenance.get("status"))
+                ),
+                "motion": provenance.get("motion"),
+            }
+            if provenance.get("status", provenance.get("direction_relation")) != "local_class_aligned":
+                add("direction.semantics_unresolved", row)
+        if joint.get("limit_source") == "preview_policy":
+            policy = joint.get("preview_policy") or {}
+            add(
+                "limits.preview_policy",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "limits",
+                    "actual": joint["limits"],
+                    "source": "inspection preview full-turn policy",
+                    "original": policy.get("author_limits"),
+                    "rule_id": PREVIEW_POLICY_ID,
+                    "rule_version": "v1",
+                    "reason": "inspection preview window; no native mechanical range is claimed",
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
+                },
+            )
+    for frame in source.get("frames", []):
+        source_name = str(frame.get("source_name") or "")
+        native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
+        if source_name and native_suffix != frame["name"]:
+            add(
+                "naming.formatted_interface",
+                {
+                    "object_type": "frame",
+                    "object": frame["name"],
+                    "field": "name",
+                    "actual": frame["name"],
+                    "source": f"CAD interface datum formatting for {frame['coordinate_system']}",
+                    "original": source_name,
+                    "rule_id": "naming.frame",
+                    "rule_version": "naming-v1",
+                    "reason": "CAD interface datum formatting",
+                },
+            )
+    for link, shape in shapes:
+        provenance = shape.get("provenance") if isinstance(shape.get("provenance"), dict) else {}
+        native_component = str(provenance.get("native_component") or "")
+        _require(native_component, "Visual carries no native component identity")
+        if native_geometry_rows is not None:
+            native_row = native_geometry.get(native_component)
+            _require(native_row is not None, "Visual is missing from the raw geometry evidence")
+            _require(
+                native_row.get("path") == shape.get("filename")
+                and native_row.get("sha256") == shape.get("sha256"),
+                "Visual mesh identity differs from the raw geometry evidence",
+            )
+        _require(
+            shape.get("name") == visual_name(native_component, link=link["name"]),
+            "Visual name differs from the CAD-derived rule",
+        )
+        current_sha256 = file_digest(confined(root / "evidence", str(shape.get("filename") or "")))
+        _require(shape.get("sha256") == current_sha256, "Visual digest differs from capture evidence")
+        _require(
+            shape.get("mesh_name")
+            == mesh_path(current_sha256, namespace=mesh_namespace),
+            "Mesh path differs from content addressing",
+        )
+        material_source = provenance.get("material_source")
+        _require(
+            material_source == "platform_display_fallback",
+            "The capture schema carries no independently verified CAD appearance",
+        )
+        _require(
+            shape.get("material") == DISPLAY_MATERIAL_FALLBACK_NAME
+            and shape.get("rgba") == list(DISPLAY_MATERIAL_FALLBACK_RGBA)
+            and all(provenance.get(key) == value for key, value in DISPLAY_MATERIAL_FALLBACK_RULE.items()),
+            "Display material fallback differs from its versioned platform rule",
+        )
+        add(
+            "naming.derived_visual",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "field": "name",
+                "actual": shape["name"],
+                "source": "native component identity formatting",
+                "original": native_component,
+                "rule_id": "naming.visual",
+                "rule_version": "naming-v1",
+                "reason": "native component identity formatting",
+            },
+        )
+        add(
+            "naming.content_addressed_mesh",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "field": "mesh filename",
+                "actual": shape["mesh_name"],
+                "source": "current capture content addressing",
+                "original": current_sha256,
+                "rule_id": "naming.mesh",
+                "rule_version": "naming-v1",
+                "reason": "current capture content addressing",
+            },
+        )
+        add(
+            "display.material_fallback",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "field": "material",
+                "actual": {"name": shape["material"], "rgba": shape["rgba"]},
+                "source": "platform display fallback; CAD appearance unobserved",
+                "original": None,
+                "rule_id": provenance.get("rule_id"),
+                "rule_version": provenance.get("rule_version"),
+                "reason": provenance.get("reason"),
+            },
+        )
+    if native_geometry_rows is not None:
+        _require(
+            set(native_geometry)
+            == {
+                str((shape.get("provenance") or {}).get("native_component") or "")
+                for _link, shape in shapes
+            },
+            "Raw geometry and delivered visual occurrences differ",
+        )
+    if source.get("robot_name_source") == "cad_filename_derived":
+        source_name = str(source.get("assembly") or "").replace("\\", "/").rsplit("/", 1)[-1]
+        add(
+            "naming.formatted_robot_name",
+            {
+                "object_type": "robot",
+                "object": source["robot_name"],
+                "field": "name",
+                "actual": source["robot_name"],
+                "source": "native top assembly filename formatting",
+                "original": source_name,
+                "rule_id": "naming.robot",
+                "rule_version": "naming-v1",
+                "reason": "native top assembly filename formatting",
+            },
+        )
+    for link in links:
+        add(
+            "geometry.derived_from_native",
+            {
+                "object_type": "link",
+                "object": link["name"],
+                "fields": ["visual.xyz", "visual.rpy", "visual.filename", "visual.scale"],
+                "actual": "derived from native occurrence transforms and capture geometry",
+                "source": "native_derived",
+            },
+        )
+    for joint in model_joints:
+        add(
+            "geometry.derived_from_native",
+            {
+                "object_type": "joint",
+                "object": joint["name"],
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            },
+        )
+    for frame in model.get("frames") or []:
+        add(
+            "geometry.derived_from_native",
+            {
+                "object_type": "frame",
+                "object": frame["name"],
+                "fields": ["xyz", "rpy"],
+                "actual": "derived from native coordinate systems",
+                "source": "native_derived",
+            },
+        )
+    add(
+        "units.si_conversion",
+        {
+            "object_type": "robot",
+            "object": source["robot_name"],
+            "field": "units",
+            "actual": "SI",
+            "source": "native_derived",
+        },
+    )
+    for link in links:
+        if link.get("inertial") is not None:
+            add(
+                "physics.derived_from_native",
+                {
+                    "object_type": "link",
+                    "object": link["name"],
+                    "fields": ["inertial.mass", "inertial.xyz", "inertial.rpy", "inertial.inertia"],
+                    "actual": "transformed or recombined from native readings",
+                    "source": "native_derived",
+                },
+            )
+    for _link, shape in shapes:
+        fields = ["scale"]
+        actual_value = {"scale": shape.get("scale")}
+        if shape.get("rgba"):
+            fields.append("material.rgba")
+            actual_value["rgba"] = shape["rgba"]
+        add(
+            "display.constant",
+            {
+                "object_type": "visual",
+                "object": shape["name"],
+                "fields": fields,
+                "actual": actual_value,
+                "source": "display constant",
+            },
+        )
+
+    def canonical(rows):
+        return Counter(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows)
+
+    messages = {
+        "geometry.derived_from_native": (
+            "Geometry, frame transforms and signed joint axes are derived from native evidence."
+        ),
+        "display.constant": "Display scale and material color are platform constants, not CAD readings.",
+        "display.material_fallback": (
+            "CAD appearance is unavailable; a platform display fallback is used without material semantics."
+        ),
+        "naming.formatted_interface": (
+            "Link, joint, and frame names are deterministic formatting of native CAD identities."
+        ),
+        "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
+        "direction.semantics_unresolved": "Authored CAD axes are preserved; functional positive motion is not proven.",
+        "direction.author_sign_applied": (
+            "CAD author axis_sign selects the positive direction of the undirected "
+            "shaft; q and ranges remain in author q."
+        ),
+        "naming.derived_visual": "Visual names are derived from the exact native component occurrence identity.",
+        "naming.content_addressed_mesh": "Mesh paths are derived from the current captured STL content digest.",
+        "limits.preview_policy": (
+            "Inspection preview uses a versioned full-turn rotation window; "
+            "no native mechanical range is claimed."
+        ),
+        "naming.formatted_robot_name": "The robot name is formatted from the native top-assembly filename.",
+        "physics.derived_from_native": (
+            "Link mass properties are transformed, translated or recombined from native readings."
+        ),
+        "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
+    }
+    _require(
+        set(actual) == set(expected),
+        "Non-native value provenance warning classes differ from the delivery: "
+        f"actual={sorted(actual)} expected={sorted(expected)}",
+    )
+    _require(
+        {code: Counter(values) for code, values in actual_messages.items()}
+        == {code: Counter([messages[code]]) for code in expected},
+        "Non-native value provenance warning messages differ from the delivery",
+    )
+    for code in sorted(expected):
+        _require(
+            canonical(actual[code]) == canonical(expected[code]),
+            f"Non-native value provenance warning objects differ for {code}",
+        )
+    return {
+        "codes": sorted(actual),
+        "objects": sum(len(rows) for rows in actual.values()),
+        "direction_sign_warnings": [
+            {
+                "object": row.get("object"),
+                "native_sign": row.get("native_sign"),
+                "original_axis_assembly": row.get("original_axis_assembly"),
+                "output_axis_assembly": row.get("output_axis_assembly"),
+                "actual_child_axis": row.get("actual_child_axis"),
+                "original_frame": row.get("original_frame"),
+                "output_frame": row.get("output_frame"),
+                "model_frame": row.get("model_frame"),
+                "q_sign": row.get("q_sign"),
+                "range_transform": row.get("range_transform"),
+                "limits_status": row.get("limits_status"),
+                "drive_status": row.get("drive_status"),
+                "rule_id": row.get("rule_id"),
+                "rule_version": row.get("rule_version"),
+                "reason": row.get("reason"),
+                "warning_does_not_replace_evidence": row.get("warning_does_not_replace_evidence"),
+            }
+            for row in expected.get("direction.author_sign_applied", [])
+        ],
+    }
+
+
 def _frame(frame, model, joints, links, datums, body_datums):
     name = frame["name"]
     _require(not list(links[name]), "Reference frame must be massless and have no geometry")
@@ -1874,8 +2958,8 @@ def _geometry_coverage(rows, components):
 
 def _assets(root, used):
     actual = {"meshes/" + name for name in inventory(root / "meshes")}
-    _require(set(used) == actual and len(used) == len(actual), "Unused or multiply referenced delivery mesh")
-    return {"meshes": len(actual)}
+    _require(set(used) == actual, "Unused or multiply referenced delivery mesh")
+    return {"meshes": len(actual), "references": len(used)}
 
 
 def _extent(points, bounds):

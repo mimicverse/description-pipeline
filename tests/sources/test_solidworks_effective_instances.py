@@ -327,6 +327,14 @@ class EffectiveInstanceSceneTests(unittest.TestCase):
         self.assertAlmostEqual(link["inertial"]["mass"], 0.061, places=12)
         self.assertNotIn("effective_instances", link["provenance"])
 
+    def test_direct_link_read_uses_the_configured_name_after_native_renaming(self):
+        cfg = self._cfg()
+        cfg["bodies"][0]["source_name"] = "CAD_base_body"
+        scene = build_scene(cfg, self._with_direct_record(cfg, self._scene({})), [])
+        link = scene["links"][0]
+        self.assertEqual(link["name"], "base_link")
+        self.assertAlmostEqual(link["inertial"]["mass"], 0.061, places=12)
+
     def test_flagless_native_context_is_primary_and_keeps_part_diagnostic(self):
         reading = _effective_reading(0.04, (0.01, 0, 0), role="leaf", document_type="part", name=DEV)
         reading["reference"]["overrides"] = _flags()

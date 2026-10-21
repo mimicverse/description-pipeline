@@ -7,9 +7,10 @@ import struct
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from ..io import PipelineError, confined, format_number
+from ..io import PipelineError, confined, file_digest, format_number
 from ..geometry.stl import MESH_PART_TRIANGLES_MAX
 from ..model import Robot
+from ..sources.solidworks.naming import material_name, mesh_path, visual_name
 
 #: Consumers reject a single display mesh above this many triangles, so larger
 #: native meshes are delivered as deterministic, lossless parts.
@@ -78,6 +79,14 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
 
     data = robot.to_dict()
     document = ET.Element("robot", name=name)
+    for warning in data.get("provenance", {}).get("value_warnings", []):
+        if isinstance(warning, dict) and warning.get("code"):
+            document.append(
+                ET.Comment(
+                    f"WARNING {warning['code']}: {warning.get('message', '')} "
+                    "See reports/quality.json for object and field details."
+                )
+            )
     for link in data["links"]:
         node = ET.SubElement(document, "link", name=link["name"])
         inertia = link["inertial"]
@@ -95,17 +104,31 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
             )
         for role in ("visuals", "collisions"):
             tag = "visual" if role == "visuals" else "collision"
-            for index, shape in enumerate(link[role]):
+            for _index, shape in enumerate(link[role]):
+                visual_identity = (
+                    shape.get("filename")
+                    or f"{link['name']}:{shape.get('kind')}:{shape.get('name') or 'geometry'}"
+                )
+                output_name = shape.get("name") or visual_name(
+                    visual_identity,
+                    link=link["name"],
+                )
+                attributes = {"name": output_name}
                 kind = shape["kind"]
                 if kind == "mesh":
                     original = confined(source, shape["filename"])
                     if original.suffix.lower() != ".stl":
                         raise PipelineError("SolidWorks-to-URDF v1 supports native STL meshes")
-                    meshes = _export_mesh(original, destination, f"meshes/{tag}/{link['name']}_{index}.stl")
+                    relative = shape.get("mesh_name") or mesh_path(
+                        str(shape.get("sha256") or file_digest(original)),
+                        category=tag,
+                        namespace=name,
+                    )
+                    meshes = _export_mesh(original, destination, relative.removeprefix("../"))
                 else:
                     meshes = [None]
                 for relative in meshes:
-                    geometry = ET.SubElement(node, tag)
+                    geometry = ET.SubElement(node, tag, **attributes)
                     _origin(geometry, shape)
                     element = ET.SubElement(geometry, "geometry")
                     if relative is not None:
@@ -121,7 +144,17 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
                     else:
                         raise PipelineError(f"Unsupported URDF geometry: {kind}")
                     if tag == "visual" and "rgba" in shape:
-                        material = ET.SubElement(geometry, "material", name=f"{link['name']}_color_{index}")
+                        material = ET.SubElement(
+                            geometry,
+                            "material",
+                            name=str(
+                                shape.get("material")
+                                or material_name(
+                                    shape.get("name") or visual_identity,
+                                    link=link["name"],
+                                )
+                            ),
+                        )
                         ET.SubElement(material, "color", rgba=_numbers(shape["rgba"]))
     for joint in data["joints"]:
         node = ET.SubElement(document, "joint", name=joint["name"], type=joint["type"])

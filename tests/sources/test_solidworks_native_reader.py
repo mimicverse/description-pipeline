@@ -15,7 +15,9 @@ stays owned by the native owner.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import struct
 import sys
 import threading
 import types
@@ -26,6 +28,8 @@ from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
+
+from . import support
 
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
@@ -148,9 +152,11 @@ class _MateSpecific:
             return self._entities(index)
         return self._entities[index]
 
+    @property
     def MinimumVariation(self):
         return self._value(self._lower)
 
+    @property
     def MaximumVariation(self):
         return self._value(self._upper)
 
@@ -312,11 +318,19 @@ class _PropertyManager:
 
 
 class _Extension:
-    def __init__(self, scopes, coordinate_systems=None, manager=_AUTO, scope_managers=None):
+    def __init__(
+        self,
+        scopes,
+        coordinate_systems=None,
+        manager=_AUTO,
+        scope_managers=None,
+        needs_rebuild2=0,
+    ):
         self._scopes = scopes
         self._coordinate_systems = dict(coordinate_systems or {})
         self._manager = manager
         self._scope_managers = dict(scope_managers or {})
+        self.NeedsRebuild2 = needs_rebuild2
 
     def CustomPropertyManager(self, scope):
         if scope in self._scope_managers:
@@ -330,6 +344,12 @@ class _Extension:
         if transform is None:
             return None
         return types.SimpleNamespace(ArrayData=list(transform))
+
+    def GetPersistReference3(self, item):
+        reference = getattr(item, "_persist_reference", None)
+        if reference is None:
+            raise RuntimeError("fixture entity has no persistent reference")
+        return list(reference)
 
 
 class _ConfigurationManager:
@@ -346,7 +366,11 @@ class _ConfigurationManager:
             GetPathName=lambda: self._doc._path,
             GetChildren=lambda: list(self._doc.children_for(name)),
         )
-        return types.SimpleNamespace(Name=name, GetRootComponent3=lambda _visible: root)
+        return types.SimpleNamespace(
+            Name=name,
+            NeedsRebuild=False,
+            GetRootComponent3=lambda _visible: root,
+        )
 
 
 class _Doc:
@@ -369,6 +393,7 @@ class _Doc:
         doc_type=1,
         show_success=True,
         show_effect=True,
+        needs_rebuild2=0,
         custom_property_manager=_AUTO,
         scope_managers=None,
     ):
@@ -383,7 +408,13 @@ class _Doc:
         scopes = {"": dict(properties or {})}
         for name, values in (configuration_properties or {}).items():
             scopes[name] = dict(values)
-        self.Extension = _Extension(scopes, coordinate_systems, custom_property_manager, scope_managers)
+        self.Extension = _Extension(
+            scopes,
+            coordinate_systems,
+            custom_property_manager,
+            scope_managers,
+            needs_rebuild2,
+        )
         self.ConfigurationManager = _ConfigurationManager(self)
         self._first_feature = first_feature
 
@@ -407,6 +438,7 @@ class _Doc:
         return os.path.basename(self._path)
 
     def ForceRebuild3(self, _force):
+        self.Extension.NeedsRebuild2 = 0
         return True
 
     def GetType(self):
@@ -538,6 +570,162 @@ def _write(root: Path, name: str) -> Path:
     return path
 
 
+def _mesh_face(read_triangles, key: str):
+    try:
+        fixture_values = list(read_triangles(True))
+        fixture_readable = True
+    except Exception:  # noqa: BLE001 - the production read must surface this later
+        fixture_values = []
+        fixture_readable = False
+    return types.SimpleNamespace(
+        GetTessTriangles=read_triangles,
+        GetTessTriangleCount=lambda: len(fixture_values) // 9,
+        GetArea=lambda: 1.0,
+        GetEdges=list,
+        GetBody=lambda: None,
+        _persist_reference=f"fixture-face-{key}".encode(),
+        _fixture_values=fixture_values,
+        _fixture_readable=fixture_readable,
+    )
+
+
+def _mesh_body(faces, key: str):
+    faces = list(faces)
+    for face in faces:
+        if not hasattr(face, "GetTessTriangles"):
+            face._fixture_values = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+            face._fixture_readable = True
+            face.GetTessTriangles = lambda _quality, values=face._fixture_values: list(values)
+    triangles = [
+        tuple(
+            tuple(values[offset : offset + 3])
+            for offset in range(triangle_start, triangle_start + 9, 3)
+        )
+        for face in faces
+        for values in (list(face._fixture_values),)
+        for triangle_start in range(0, len(values), 9)
+    ]
+    spans = []
+    triangle_start = 0
+    body_reference = f"fixture-body-{key}".encode()
+    for face_index, face in enumerate(faces):
+        values = list(face._fixture_values)
+        triangle_count = len(values) // 9
+        record_points = [
+            point
+            for triangle in triangles[
+                triangle_start : triangle_start + triangle_count
+            ]
+            for point in triangle
+        ]
+        spans.append(
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "body_name": f"fixture-body-{key}",
+                "body_reference_sha256": hashlib.sha256(body_reference).hexdigest(),
+                "face_index": face_index,
+                "face_reference_sha256": hashlib.sha256(face._persist_reference).hexdigest(),
+                "face_owner_id": face_index + 1,
+                "edge_references": [],
+                "triangle_start": triangle_start,
+                "triangle_count": triangle_count,
+                "triangle_records_sha256": hashlib.sha256(
+                    b"".join(
+                        struct.pack("<3f", *point) for point in record_points
+                    )
+                ).hexdigest(),
+            }
+        )
+        triangle_start += triangle_count
+    tessellation = support.native_tessellation_fixture(
+        spans,
+        [],
+        triangle_vertices=triangles,
+    )
+    cursor = 0
+    for span, face in zip(spans, faces, strict=True):
+        values = [
+            coordinate
+            for triangle in tessellation.triangle_vertices[
+                cursor : cursor + span["triangle_count"]
+            ]
+            for point in triangle
+            for coordinate in point
+        ]
+        cursor += span["triangle_count"]
+        if face._fixture_readable:
+            face.GetTessTriangles = lambda _quality, values=values: list(values)
+    body_graph = tessellation["itessellation"]["bodies"][0]
+    facets_by_face = {
+        face_index: row["facet_ids"]
+        for face_index, row in enumerate(body_graph["faces"])
+    }
+    facets_by_reference = {
+        hashlib.sha256(face._persist_reference).hexdigest(): facets_by_face[face_index]
+        for face_index, face in enumerate(faces)
+    }
+    fins_by_facet = {
+        row["facet_id"]: row["fin_ids"] for row in body_graph["facets"]
+    }
+    fin_vertices = {
+        row["fin_id"]: row["vertex_ids"] for row in body_graph["fins"]
+    }
+    vertex_points = {
+        row["vertex_id"]: row["point_m"]
+        for row in tessellation["itessellation"]["vertices"]
+    }
+    face_by_id = {id(face): index for index, face in enumerate(faces)}
+
+    class _MeshTessellation:
+        NeedFaceFacetMap = True
+        NeedEdgeFinMap = True
+        NeedVertexParams = True
+
+        def Tessellate(self):  # noqa: N802 - SolidWorks API name
+            return True
+
+        def GetFaceFacets(self, face):  # noqa: N802 - SolidWorks API name
+            values = facets_by_face.get(face_by_id.get(id(face)))
+            if values is None:
+                values = facets_by_reference[
+                    hashlib.sha256(face._persist_reference).hexdigest()
+                ]
+            return list(values)
+
+        def GetFacetFins(self, facet_id):  # noqa: N802 - SolidWorks API name
+            return list(fins_by_facet[facet_id])
+
+        def GetEdgeFins(self, _edge):  # noqa: N802 - SolidWorks API name
+            return []
+
+        def GetFinVertices(self, fin_id):  # noqa: N802 - SolidWorks API name
+            return list(fin_vertices[fin_id])
+
+        def GetVertexPoint(self, vertex_id):  # noqa: N802 - SolidWorks API name
+            return list(vertex_points[vertex_id])
+
+        def GetFacetCount(self):  # noqa: N802 - SolidWorks API name
+            return len(fins_by_facet)
+
+        def GetFinCount(self):  # noqa: N802 - SolidWorks API name
+            return len(fin_vertices)
+
+        def GetVertexCount(self):  # noqa: N802 - SolidWorks API name
+            return len(vertex_points)
+
+    body = types.SimpleNamespace(
+        Name=f"fixture-body-{key}",
+        GetFaces=lambda: list(faces),
+        GetEdges=list,
+        GetTessellation=lambda _face_list: _MeshTessellation(),
+        _persist_reference=body_reference,
+    )
+    for face in faces:
+        face.GetBody = lambda body=body: body
+    return body
+
+
 @contextmanager
 def _com_stubs():
     """Minimal pythoncom/win32com surface used by the by-ref property reads."""
@@ -552,7 +740,10 @@ def _com_stubs():
     pythoncom.COINIT_APARTMENTTHREADED = 2
     pythoncom.CoInitializeEx = lambda *_args, **_kwargs: None
     pythoncom.CoUninitialize = lambda: None
-    pythoncom.VARIANT = lambda _vt, value: types.SimpleNamespace(value=value)
+    pythoncom.VARIANT = lambda vt, value: types.SimpleNamespace(
+        value=value,
+        varianttype=vt,
+    )
     win32com = types.ModuleType("win32com")
     client = types.ModuleType("win32com.client")
     client.VARIANT = pythoncom.VARIANT
@@ -581,6 +772,15 @@ def _mate(
     name, mate_type, entities, *, lower=0.0, upper=0.0, count=None, suppressed=False, error_code=0, definition=None
 ):
     specific = _MateSpecific(mate_type, entities, lower=lower, upper=upper, count=count)
+    if definition is not None:
+        if mate_type == 5 and not hasattr(definition, "Distance"):
+            definition.Distance = 0.0
+            definition.MinimumDistance = lower
+            definition.MaximumDistance = upper
+        if mate_type == 6 and not hasattr(definition, "Angle"):
+            definition.Angle = 0.0
+            definition.MinimumAngle = lower
+            definition.MaximumAngle = upper
     return _Feature(
         name, f"Mate{mate_type}", specific=specific, suppressed=suppressed, error_code=error_code, definition=definition
     )
@@ -606,9 +806,31 @@ class MateRecordTests(unittest.TestCase):
             component = _Component("base-1", base)
             plane_entity = _MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))
             cylinder_entity = _MateEntity(component, "Cylinder1", _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 2.0), 0.02))
-            travel = _mate("travel_limit", 5, [plane_entity], lower=0.0, upper=0.03)
-            swing = _mate("swing_limit", 6, [cylinder_entity], lower=-0.1, upper=0.2, suppressed=True)
-            open_distance = _mate("travel_open", 5, [plane_entity], lower=0.0, upper=0.0)
+            travel = _mate(
+                "travel_limit",
+                5,
+                [plane_entity],
+                lower=0.0,
+                upper=0.03,
+                definition=types.SimpleNamespace(IsAdvancedMate=True),
+            )
+            swing = _mate(
+                "swing_limit",
+                6,
+                [cylinder_entity],
+                lower=-0.1,
+                upper=0.2,
+                suppressed=True,
+                definition=types.SimpleNamespace(IsAdvancedMate=True),
+            )
+            open_distance = _mate(
+                "travel_open",
+                5,
+                [plane_entity],
+                lower=0.0,
+                upper=0.0,
+                definition=types.SimpleNamespace(IsAdvancedMate=False),
+            )
             locked = _mate("locked_seat", 16, [plane_entity], suppressed=True)
             broken = _mate("broken_solve", 0, [plane_entity], error_code=3)
             travel._next_sub = swing
@@ -627,7 +849,21 @@ class MateRecordTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(mates["travel_limit"]),
-                {"name", "type", "suppressed", "limits", "entities", "error_code", "scope", "configuration"},
+                {
+                    "name",
+                    "type",
+                    "suppressed",
+                    "limits",
+                    "is_advanced_mate",
+                    "is_advanced_mate_error",
+                    "is_advanced_mate_api",
+                    "native_limit",
+                    "entity_count",
+                    "entities",
+                    "error_code",
+                    "scope",
+                    "configuration",
+                },
             )
             self.assertEqual({mate["configuration"] for mate in mates.values()}, {"Default"})
             self.assertEqual(mates["travel_limit"]["type"], "limitdistance")
@@ -639,16 +875,87 @@ class MateRecordTests(unittest.TestCase):
             self.assertEqual(entity["component"], "base-1")
             self.assertEqual(entity["feature"], "Plane1")
             self.assertEqual(entity["plane"], PLANE_XY)
-            self.assertEqual(mates["swing_limit"]["type"], "limitangle")
-            self.assertEqual(mates["swing_limit"]["limits"], {"lower": -0.1, "upper": 0.2, "unit": "rad"})
+            self.assertEqual(mates["swing_limit"]["type"], "angle")
+            self.assertIsNone(mates["swing_limit"]["limits"])
+            self.assertIsNone(mates["swing_limit"]["native_limit"])
             self.assertIs(mates["swing_limit"]["suppressed"], True)
-            self.assertEqual(mates["swing_limit"]["entities"][0]["cylinder"], CYLINDER_Z)
+            self.assertEqual(mates["swing_limit"]["entities"], [])
             self.assertEqual(mates["travel_open"]["type"], "distance")
             self.assertIsNone(mates["travel_open"]["limits"])
             self.assertEqual(mates["locked_seat"]["type"], "lock")
             self.assertIs(mates["locked_seat"]["suppressed"], True)
             self.assertEqual(mates["broken_solve"]["type"], "coincident")
             self.assertEqual(mates["broken_solve"]["error_code"], 3)
+
+    def test_limit_mate_flag_is_authoritative_for_zero_and_standard_mates(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            plane_entity = _MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))
+            zero = _mate(
+                "zero_limit",
+                5,
+                [plane_entity],
+                lower=0.0,
+                upper=0.0,
+                definition=types.SimpleNamespace(IsAdvancedMate=True),
+            )
+            standard = _mate(
+                "standard_distance",
+                5,
+                [plane_entity],
+                lower=-1.0,
+                upper=2.0,
+                definition=types.SimpleNamespace(IsAdvancedMate=False),
+            )
+            unknown = _mate("unknown_state", 6, [plane_entity], lower=0.0, upper=0.0)
+            zero._next_sub = standard
+            standard._next_sub = unknown
+            group = _Feature("MateGroup", "MateGroup", first_sub=zero)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            mates = {mate["name"]: mate for mate in _read(root, _App({assembly: doc}))["mates"]}
+
+            self.assertEqual(mates["zero_limit"]["limits"], {"lower": 0.0, "upper": 0.0, "unit": "m"})
+            self.assertIs(mates["zero_limit"]["is_advanced_mate"], True)
+            self.assertEqual(
+                mates["zero_limit"]["is_advanced_mate_api"],
+                "IDistanceMateFeatureData.IsAdvancedMate",
+            )
+            self.assertIsNone(mates["standard_distance"]["limits"])
+            self.assertIs(mates["standard_distance"]["is_advanced_mate"], False)
+            self.assertEqual(mates["standard_distance"]["type"], "distance")
+            self.assertIsNone(mates["unknown_state"]["limits"])
+            self.assertIsNone(mates["unknown_state"]["is_advanced_mate"])
+            self.assertTrue(mates["unknown_state"]["is_advanced_mate_error"])
+
+    def test_limit_mate_composes_nominal_and_variation_into_absolute_bounds(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            plane_entity = _MateEntity(component, "Plane1", _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)))
+            definition = types.SimpleNamespace(
+                IsAdvancedMate=True,
+                Distance=0.05,
+                MinimumDistance=0.04,
+                MaximumDistance=0.07,
+            )
+            specific = _MateSpecific(5, [plane_entity], lower=-0.01, upper=0.02)
+            feature = _Feature("travel_limit", "MateDistance", specific=specific, definition=definition)
+            group = _Feature("MateGroup", "MateGroup", first_sub=feature)
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, first_feature=group, children=[component])
+
+            mate = _read(root, _App({assembly: doc}))["mates"][0]
+
+            self.assertEqual(mate["limits"], {"lower": 0.04, "upper": 0.07, "unit": "m"})
+            self.assertEqual(mate["native_limit"]["nominal_dimension"]["value"], 0.05)
+            self.assertEqual(mate["native_limit"]["minimum_variation"]["value"], -0.01)
+            self.assertEqual(mate["native_limit"]["maximum_variation"]["value"], 0.02)
+            self.assertEqual(mate["entities"][0]["reference_configuration"], "Default")
 
     def test_concentric_mate_records_the_native_lock_rotation_flag(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1035,7 +1342,11 @@ class ProducerContextTests(unittest.TestCase):
             arm_component = _Component("arm-1", arm_path, doc=arm_doc)
             sub_doc = _Doc(sub_path, first_feature=None, children=[arm_component])
             sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc)
-            scoped_reference = types.SimpleNamespace(Name2="sub-1/arm-1", GetPathName=arm_component.GetPathName)
+            scoped_reference = types.SimpleNamespace(
+                Name2="sub-1/arm-1",
+                GetPathName=arm_component.GetPathName,
+                ReferencedConfiguration="Default",
+            )
             descendant_reference = _mate(
                 "top_descendant",
                 0,
@@ -1062,7 +1373,11 @@ class ProducerContextTests(unittest.TestCase):
             arm_component = _Component("arm-1", arm_path, doc=arm_doc)
             sub_doc = _Doc(sub_path, first_feature=None, children=[arm_component])
             sub_component = _Component("sub-1", sub_path, children=[arm_component], doc=sub_doc)
-            leaf_reference = types.SimpleNamespace(Name2="arm-1", GetPathName=arm_component.GetPathName)
+            leaf_reference = types.SimpleNamespace(
+                Name2="arm-1",
+                GetPathName=arm_component.GetPathName,
+                ReferencedConfiguration="Default",
+            )
             leaf_mate = _mate(
                 "ambiguous_descendant",
                 0,
@@ -1413,8 +1728,11 @@ class CaptureSceneTests(unittest.TestCase):
                     "Short": [0, 0, 0, 1, 0, 0, 0, 1, 0],
                     "Long": [0, 0, 0, 2, 0, 0, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0],
                 }[self.ReferencedConfiguration]
-                face = types.SimpleNamespace(GetTessTriangles=lambda _quality: triangles)
-                return [types.SimpleNamespace(GetFaces=lambda: [face])]
+                face = _mesh_face(
+                    lambda _quality, values=triangles: values,
+                    self.ReferencedConfiguration,
+                )
+                return [_mesh_body([face], self.ReferencedConfiguration)]
 
         class ConfiguredBackend(_CaptureBackend):
             def _mass_properties_document(self, doc, require_material=True):
@@ -1863,30 +2181,32 @@ class CaptureSceneTests(unittest.TestCase):
                 GetFeature=lambda: types.SimpleNamespace(Name="shaft"),
                 GetSurface=lambda: _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), 0.02),
             )
-            short.GetBodies2 = lambda body_type: [types.SimpleNamespace(GetFaces=lambda: [face])]
+            face.GetEdges = list
+            face._persist_reference = b"fixture-shaft-face"
+            short.GetBodies2 = lambda body_type: [_mesh_body([face], "shaft")]
             lifetimes = self._borrowed_occurrence_geometry(backend, root)
             result = backend.capture_axis_reference({"component": "part-short", "feature_name": "shaft"})
             self.assertEqual(result["axis_direction"], [0.0, 0.0, 1.0])
             self.assertEqual(result["radius_m"], 0.02)
             self.assertTrue(all(parent() is None for parents in lifetimes for parent in parents))
 
-    def test_face_read_failure_reports_the_exact_occurrence_and_completed_work(self):
+    def test_display_read_failure_is_isolated_from_the_tessellation_graph(self):
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
             backend, _, _, short, _ = self._configured_occurrences(root)
-            good = types.SimpleNamespace(GetTessTriangles=lambda _quality: [0, 0, 0, 1, 0, 0, 0, 1, 0])
-            failed = types.SimpleNamespace(GetTessTriangles=_raiser(RuntimeError("RPC_S_UNKNOWN_IF")))
+            good = _mesh_face(lambda _quality: [0, 0, 0, 1, 0, 0, 0, 1, 0], "good")
+            failed = _mesh_face(_raiser(RuntimeError("RPC_S_UNKNOWN_IF")), "failed")
             short.GetBodies2 = lambda body_type: (
-                [types.SimpleNamespace(GetFaces=lambda: [good, failed])] if body_type == 0 else []
+                [_mesh_body([good, failed], "failure")] if body_type == 0 else []
             )
             path = root / "failed.stl"
             with self.assertRaises(CadError) as caught:
                 backend.export_component_meshes({"part-short": path})["part-short"]
-            self.assertEqual(caught.exception.code, "cad_face_tessellation_unreadable")
+            self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
             self.assertEqual(caught.exception.detail["component"], "part-short")
             self.assertEqual(caught.exception.detail["face_index"], 1)
-            self.assertEqual(caught.exception.detail["completed_faces"], 1)
-            self.assertEqual(caught.exception.detail["api"], "IFace2.GetTessTriangles(True)")
+            self.assertEqual(caught.exception.detail["completed_faces"], 0)
+            self.assertEqual(caught.exception.detail["classification"], "empty")
             self.assertFalse(path.exists())
 
     def test_fresh_nested_occurrences_keep_duplicate_leaf_names_distinct(self):
@@ -2336,7 +2656,12 @@ class CaptureSceneTests(unittest.TestCase):
                 def GetSaveFlag(self):
                     return False
 
-            first = RebuildableDoc(assembly, doc_type=2, children=[component])
+            first = RebuildableDoc(
+                assembly,
+                doc_type=2,
+                children=[component],
+                needs_rebuild2=1,
+            )
             refreshed = RebuildableDoc(assembly, doc_type=2, children=[component], configuration="Other")
 
             class ConfigChangingBackend(_CaptureBackend):
@@ -2762,7 +3087,18 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "cylinder", "mate_entity_reference"})
+            self.assertEqual(
+                set(geometry),
+                {
+                    "component",
+                    "entity_index",
+                    "feature",
+                    "face_index",
+                    "reference_configuration",
+                    "cylinder",
+                    "mate_entity_reference",
+                },
+            )
             self.assertEqual(
                 geometry["cylinder"],
                 {"point": [0.1, 0.2, 0.3], "direction": [0.0, 1.0, 0.0], "radius": 0.05},
@@ -2780,7 +3116,18 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "circle", "mate_entity_reference"})
+            self.assertEqual(
+                set(geometry),
+                {
+                    "component",
+                    "entity_index",
+                    "feature",
+                    "face_index",
+                    "reference_configuration",
+                    "circle",
+                    "mate_entity_reference",
+                },
+            )
             self.assertEqual(
                 geometry["circle"],
                 {"center": [1.0, 2.0, 3.0], "normal": [0.0, 0.0, -1.0], "radius": 0.25},
@@ -2810,7 +3157,18 @@ class EntityGeometryTests(unittest.TestCase):
             record = self._record(tmp, [("seat", entity)])
 
             geometry = record["mates"][0]["entities"][0]
-            self.assertEqual(set(geometry), {"component", "feature", "face_index", "point", "mate_entity_reference"})
+            self.assertEqual(
+                set(geometry),
+                {
+                    "component",
+                    "entity_index",
+                    "feature",
+                    "face_index",
+                    "reference_configuration",
+                    "point",
+                    "mate_entity_reference",
+                },
+            )
             self.assertEqual(geometry["point"], [1.0, 2.0, 3.0])
 
     def test_nonfinite_entity_geometry_blocks(self) -> None:
@@ -2966,7 +3324,11 @@ class MateFailureTests(unittest.TestCase):
 
     def test_ambiguous_or_unreadable_entity_scope_blocks(self) -> None:
         def wrong_component(component):
-            reference = types.SimpleNamespace(Name2="ghost-1", GetPathName=component.GetPathName)
+            reference = types.SimpleNamespace(
+                Name2="ghost-1",
+                GetPathName=component.GetPathName,
+                ReferencedConfiguration="Default",
+            )
             return _mate("seat", 0, [_MateEntity(reference, "Plane1")])
 
         error = self._error(wrong_component)

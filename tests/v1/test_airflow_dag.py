@@ -2394,16 +2394,48 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertEqual(call["checkpoint_uri"], "store://sealed/run-1/generate")
 
     def test_an_early_failure_without_a_tree_registers_its_shape_only(self) -> None:
+        run_id = "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
         absent = Path(self.temporary.name) / "absent"
         with (
             patch.object(self.module.flow, "run_stage", side_effect=RuntimeError("no products")),
             self.assertRaises(RuntimeError),
         ):
-            self.module._portable_registered("run-1", "generate", tree=absent)
+            self.module._portable_registered(run_id, "generate", tree=absent)
         call = self.calls[0]
         self.assertEqual(call["state"], "failed")
         self.assertEqual(call["receipt"]["state"], "failed")
+        self.assertEqual(call["run_id"], run_id)
         self.assertNotIn("checkpoint_uri", call)
+
+    def test_an_early_failure_keeps_run_level_products_and_original_error(
+        self,
+    ) -> None:
+        run_id = "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
+        run_dir = self.root / run_id
+        (run_dir / "reports").mkdir(parents=True)
+        (run_dir / "reports" / "structural-team.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        absent = run_dir / "stages" / "generate"
+        original = RuntimeError("no products")
+        with (
+            patch.object(self.module.flow, "run_stage", side_effect=original),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            self.module._portable_registered(
+                run_id,
+                "generate",
+                tree=absent,
+            )
+        self.assertIs(caught.exception, original)
+        call = self.calls[0]
+        self.assertEqual(call["state"], "failed")
+        self.assertIn("no products", call["receipt"]["error"])
+        self.assertIn(
+            "reports/structural-team.json",
+            {record["path"] for record in call["receipt"]["artifacts"]},
+        )
 
     def test_the_freeze_stage_seals_the_admitted_originals(self) -> None:
         from description_pipeline.delivery import read_delivery_manifest

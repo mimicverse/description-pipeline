@@ -10,7 +10,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from description_pipeline.delivery import PIPELINE_ID
+from description_pipeline.delivery import PIPELINE_ID, read_delivery_manifest
 from description_pipeline.io import PipelineError, digest, file_digest, write_json
 from description_pipeline.platform.native_recovery import build_discovery_tree_from_prepared
 from description_pipeline.platform.native_recovery import discovery_receipt
@@ -228,6 +228,21 @@ class NativeRecoveryTests(unittest.TestCase):
                 stage="discover",
                 row=("discover", "completed", changed, checkpoint, None, None),
             )
+
+    def test_every_recovered_discovery_file_is_bound_by_the_delivery_manifest(self) -> None:
+        self._build()
+        tree = self.root / "discover"
+        self.assertFalse((tree / "discovery").exists(), "recovered evidence has no unregistered root directory")
+        manifest = read_delivery_manifest(tree)
+        paths = {record["path"] for record in manifest["subject"]["files"]}
+        self.assertIn("evidence/discovery.json", paths)
+        self.assertIn("evidence/discovery/findings.json", paths)
+        self.assertIn("evidence/discovery/identity-resolution.json", paths)
+
+        changed = tree / "evidence" / "discovery" / "findings.json"
+        changed.write_text('{"changed":true}\n', encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "subject files differ"):
+            read_delivery_manifest(tree)
 
     def test_recovery_refuses_missing_or_contradictory_original_evidence(self) -> None:
         cases = (

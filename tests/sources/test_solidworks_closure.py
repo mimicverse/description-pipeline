@@ -141,9 +141,11 @@ def _carrier_record(bodies: list[dict]) -> tuple[dict, dict[str, str]]:
     named = [body for body in bodies if body.get("components")]
     if len(named) > 1:
         left, right = str(named[0]["components"][0]), str(named[1]["components"][0])
-        mates += support.native_hinge_mates(
+        hinge_mates = support.native_hinge_mates(
             left, right, left_point=_hinge_point(left), right_point=_hinge_point(right), radius=0.005
         )
+        mates += hinge_mates
+        mates.append(support.native_limit_mate(left, right))
         joint_claims = support.native_joint_claims()
         controlled["joints/hinge.json"] = support.native_joint_record()
     masses = [

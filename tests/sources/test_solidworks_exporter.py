@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,7 @@ from description_pipeline.sources.solidworks.exporter import (
     ExporterDeclarationError,
     decode_exporter_v14,
 )
+from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 
 
 def wire_xml(limit_values=None) -> str:
@@ -110,7 +112,7 @@ def wire_xml(limit_values=None) -> str:
 
 
 def raw_record() -> dict:
-    xml = wire_xml()
+    xml = wire_xml({"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
     files = {
         name: hashlib.sha256(b"native-file-test").hexdigest()
         for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
@@ -231,11 +233,17 @@ class ExporterWireTests(unittest.TestCase):
             wire_xml().replace('z:Ref="rootlinkname"', 'z:Ref="missing"'),
             wire_xml().replace('z:Id="movingname"', 'z:Id="rootname"'),
             wire_xml().replace('<Parent z:Ref="root"/>', '<Parent z:Ref="moving"/>'),
-            wire_xml().replace(">base_link</Value>", ">Bad Name</Value>"),
             wire_xml().replace("<a:base64Binary>YXJt", "<a:base64Binary>***"),
         ):
             with self.subTest(xml=xml[:100]), self.assertRaises(ExporterDeclarationError):
                 decode_exporter_v14(xml, 1.4)
+
+    def test_non_snake_raw_names_are_preserved_for_the_shared_normalizer(self):
+        xml = wire_xml().replace(">base_link</Value>", ">Base Link</Value>").replace(">arm</Value>", ">A Arm</Value>")
+        parsed = decode_exporter_v14(xml, 1.4)
+        self.assertEqual(parsed["root"], "Base Link")
+        self.assertEqual([link["name"] for link in parsed["links"]], ["Base Link", "A Arm"])
+        self.assertEqual(parsed["links"][1]["joint"]["name"], "hinge")
 
     def test_dtd_and_xml_resource_limits_fail_before_decoding(self):
         with self.assertRaises(ExporterDeclarationError):
@@ -269,15 +277,50 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(
             joints[0]["axis_reference"], {"kind": "reference_axis", "component": "", "feature_name": "a_hinge"}
         )
-        self.assertEqual(joints[0]["limits"], dict.fromkeys(("lower", "upper", "effort", "velocity"), 0.0))
-        self.assertEqual(
-            {finding["code"] for finding in findings},
-            {"discovery.joint_limits_degenerate", "discovery.joint_drive_unspecified"},
+        self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
+        self.assertEqual([item["code"] for item in findings], ["direction.semantics_unresolved"])
+        self.assertFalse(findings[0]["blocking"])
+
+    def test_preview_policy_only_applies_to_inspection_with_no_native_or_author_range(self):
+        record = raw_record()
+        record["exporter"]["raw_xml"] = wire_xml(
+            {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
         )
-        self.assertFalse(any(item["blocking"] for item in findings))
+        record["exporter"]["raw_xml_sha256"] = hashlib.sha256(
+            record["exporter"]["raw_xml"].encode()
+        ).hexdigest()
+        declaration = decode_exporter_v14(record["exporter"]["raw_xml"], 1.4)
+        bodies, _clusters = _exporter_memberships(record, declaration, [])
+        findings = []
+        joints = _exporter_joint_facts(
+            record,
+            declaration,
+            bodies,
+            findings,
+            purpose=PURPOSE_INSPECTION_PREVIEW,
+        )
+        self.assertEqual(joints[0]["limit_source"], "preview_policy")
         self.assertEqual(
-            {item["detail"]["qualification_blocker"] for item in findings},
-            {"usable_joint_range", "usable_joint_drive"},
+            joints[0]["limits"],
+            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
+        )
+        self.assertEqual(
+            joints[0]["preview_policy"]["rule_id"], "inspection_rotation_full_turn/v1"
+        )
+        engineering_findings = []
+        self.assertEqual(
+            _exporter_joint_facts(
+                record,
+                declaration,
+                bodies,
+                engineering_findings,
+                purpose=PURPOSE_ENGINEERING,
+            ),
+            [],
+        )
+        self.assertIn(
+            "discovery.joint_limits_missing",
+            [item["code"] for item in engineering_findings],
         )
 
     def test_equal_bounds_and_zero_drives_are_preserved_as_stage_warnings(self):
@@ -290,9 +333,22 @@ class ExporterDiscoveryTests(unittest.TestCase):
             raw["exporter"]["raw_xml"] = wire_xml(values)
             _, joints, findings = self.derive(raw)
             self.assertEqual(joints[0]["limits"], values)
-            self.assertEqual([item["code"] for item in findings], [expected])
+            self.assertEqual(
+                [item["code"] for item in findings],
+                ["direction.semantics_unresolved", expected],
+            )
             self.assertFalse(findings[0]["blocking"])
-            self.assertIn("qualification_blocker", findings[0]["detail"])
+            self.assertFalse(findings[1]["blocking"])
+            self.assertIn("qualification_blocker", findings[1]["detail"])
+
+    def test_exporter_zero_placeholder_without_native_range_blocks(self):
+        raw = raw_record()
+        raw["exporter"]["raw_xml"] = wire_xml()
+        raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(raw["exporter"]["raw_xml"].encode()).hexdigest()
+        _bodies, joints, findings = self.derive(raw)
+        self.assertEqual(joints, [])
+        item = next(item for item in findings if item["code"] == "discovery.joint_limits_missing")
+        self.assertTrue(item["blocking"])
 
     def test_missing_nonfinite_negative_drive_and_reversed_bounds_still_block(self):
         for changes, code in (
@@ -620,21 +676,39 @@ class ExporterDiscoveryTests(unittest.TestCase):
         limits = {"unit": "rad", "lower": -2, "upper": 2}
         raw["mates"] = [
             {
-                "name": "cad_limit",
+                "name": "hinge__limit",
                 "scope": "",
                 "type": "limitangle",
+                "suppressed": False,
+                "is_advanced_mate": True,
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                "native_limit": support.native_limit_observation(6, nominal=0.0, lower=-2.0, upper=2.0),
                 "error_code": 0,
-                "entities": [{"component": "base-1"}, {"component": "arm-1"}],
+                "entities": [
+                    {
+                        "entity_index": 0,
+                        "component": "base-1",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane1",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                    },
+                    {
+                        "entity_index": 1,
+                        "component": "arm-1",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane2",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                    },
+                ],
                 "limits": limits,
             }
         ]
         _, joints, findings = self.derive(raw)
         observed = next(item for item in findings if item["code"] == "discovery.joint_limits_conflict")
-        self.assertEqual(observed["detail"]["mate"], "cad_limit")
-        self.assertEqual(observed["detail"]["native"], limits)
-        self.assertEqual(observed["detail"]["declared"], joints[0]["limits"])
-        self.assertEqual(joints[0]["limits"]["lower"], 0)
-        self.assertEqual(joints[0]["limits"]["upper"], 0)
+        self.assertEqual(observed["detail"]["native"], [-2.0, 2.0])
+        self.assertEqual(observed["detail"]["declared"], (-1.0, 1.0))
+        self.assertEqual(joints, [])
         self.assertTrue(observed["blocking"])
 
     def test_structural_declaration_errors_remain_blocking(self):
@@ -712,9 +786,27 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertFalse(owner["blocking"])
         self.assertEqual(owner["detail"]["publication_blocker"], "owner")
         self.assertFalse([item for item in result.findings if item["blocking"]])
-        zero_findings = [item for item in result.findings if item["code"].startswith("discovery.joint_")]
-        self.assertEqual(len(zero_findings), 2)
-        self.assertTrue(all(not item["blocking"] and item["detail"]["qualification_blocker"] for item in zero_findings))
+
+    def test_non_snake_native_interfaces_are_normalized_without_blocking(self):
+        raw = raw_record()
+        xml = raw["exporter"]["raw_xml"].replace(">base_link</Value>", ">Base Link</Value>").replace(
+            ">arm</Value>", ">A Arm</Value>"
+        )
+        raw["exporter"].update(raw_xml=xml, raw_xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input"
+            source.mkdir()
+            for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT"):
+                (source / name).write_bytes(b"native-file-test")
+            prepared = Path(directory) / "prepared"
+            result = prepare_native_package(source, prepared, "raw-names", backend=FakeBackend(raw))
+            self.assertTrue(result.passed, result.findings)
+            payload = json.loads(result.discovery_path.read_text())
+        self.assertEqual(
+            payload["derived_interface_names"],
+            {"A Arm": "arm_link", "Base Link": "base_link", "hinge": "hinge_joint"},
+        )
+        self.assertFalse([item for item in result.findings if item["blocking"]])
 
     def test_valid_declarations_generate_named_axis_input_without_stale_derived_values(self):
         raw = raw_record()
@@ -722,7 +814,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         xml = wire_xml(limits)
         raw["exporter"].update(raw_xml=xml, raw_xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
         bodies, joints, findings = self.derive(raw)
-        self.assertFalse(findings)
+        self.assertEqual([item["code"] for item in findings], ["direction.semantics_unresolved"])
         self.assertEqual(joints[0]["limits"], limits)
         self.assertEqual(joints[0]["axis"]["direction"], [0.0, 0.0, 1.0])
         # One clear schema shape: a delivery without interface datums has no interface frames.

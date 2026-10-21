@@ -75,6 +75,9 @@ def _native_record(*, with_arm: bool, with_joint: bool, files: dict[str, str]) -
         mates = support.native_hinge_mates(
             "base-1", "arm-1", left_point=(0.0, 0.0, 0.2), right_point=(0.0, 0.0, 0.0), radius=0.006
         )
+        mates[0]["limits"] = {"lower": -1.0, "upper": 1.0, "unit": "rad"}
+        mates[0]["is_advanced_mate"] = True
+        mates[0]["native_limit"] = {"type_index": 6}
         joint_claims = support.native_joint_claims()
     return support.native_record(
         hardware_id="freeze_fixture",
@@ -738,7 +741,7 @@ class FreezeTests(unittest.TestCase):
         self.assertAlmostEqual(links["arm_link"]["inertial"]["xyz"][2], 0.05, places=9)
         self.assertEqual(len(links["arm_link"]["visuals"]), 1)
         self.assertEqual(scene["joints"][0]["axis"], [0.0, 0.0, 1.0])
-        self.assertEqual(scene["frames"][0]["name"], "imu")
+        self.assertEqual(scene["frames"][0]["name"], "imu_tcp")
         self.assertEqual(scene["provenance"]["snapshot"]["evidence_class"], "fixture")
 
     def test_link_frame_rotation_is_applied_to_com_and_inertia(self) -> None:

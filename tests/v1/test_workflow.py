@@ -110,6 +110,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(report["cad_revision"]["hardware_id"], "arm")
         self.assertEqual(report["cad_revision"]["revision"], "r1")
 
+    def test_replay_uses_the_native_robot_name_without_a_registry(self):
+        staging = self.root / "replay"
+        write_json(
+            staging / "input/handoff.json",
+            {
+                "passed": True,
+                "package_files": {},
+                "input": {"files": 0},
+                "cad_revision": {"hardware_id": "m3.0", "revision": None},
+                "input_receipt": {"inventory": []},
+            },
+        )
+        write_json(
+            staging / "evidence/discovery.json",
+            {
+                "identity": {
+                    "hardware_id": "m3.0",
+                    "robot_name": "cad_robot",
+                    "robot_name_technical": "m3_0",
+                },
+            },
+        )
+        with patch.object(steps, "inspect_prepared_input", return_value=read_data(staging / "input/handoff.json")):
+            definition, _report = solidworks._replay_seeded_inputs(staging)
+        self.assertEqual(definition["source"]["robot_name"], "cad_robot")
+        self.assertEqual(definition["source"]["robot_name_source"], "cad")
+        self.assertEqual(definition["hardware_id"], "m3.0")
+
     def acquisition_without_admin(self):
         """Byte-binding control only; these placeholders do not qualify CAD."""
         from tests.sources.selection_support import sealed_selection

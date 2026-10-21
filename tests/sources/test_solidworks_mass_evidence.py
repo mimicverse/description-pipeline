@@ -89,6 +89,7 @@ def _native_record(*, files: dict[str, str]) -> dict:
     mates = support.native_hinge_mates(
         "base-1", "arm-1", left_point=(0.0, 0.0, 0.2), right_point=(0.0, 0.0, 0.0), radius=0.006
     )
+    mates.append(support.native_limit_mate("base-1", "arm-1", point=(0.0, 0.0, 0.2)))
     return support.native_record(
         hardware_id="mass_evidence_fixture",
         change_summary="mass evidence module fixture",

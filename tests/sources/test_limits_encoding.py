@@ -1,20 +1,14 @@
-"""Drive encoding, limit-source carry-through and the policy-exact preview window."""
+"""Drive encoding, native limit-source carry-through and deterministic sampling."""
 
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 import numpy as np
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.interface_records import (  # noqa: E402
-    preview_revolute_window_rad,
-    preview_sampling_interval_fraction,
-)
-from description_pipeline.io import PipelineError  # noqa: E402
 from description_pipeline.sources.solidworks.scene import _build_joints  # noqa: E402
 from description_pipeline.verification.solidworks_urdf import (  # noqa: E402
     _joint,
@@ -38,6 +32,7 @@ def _authored(**overrides) -> dict:
         "child": "tool",
         "axis": [0.0, 0.0, 1.0],
         "limits": {"lower": -1.0, "upper": 1.0},
+        "limit_source": "native",
     }
     value.update(overrides)
     return value
@@ -74,42 +69,10 @@ class DriveEncodingTests(unittest.TestCase):
             {"effort", "velocity"},
         )
 
-    def test_the_preview_window_equals_the_frozen_policy_radius(self) -> None:
-        radius = preview_revolute_window_rad()
-        authored = _authored(
-            limits={"lower": -radius, "upper": radius},
-            limit_source="policy_preview_window",
-        )
-        canonical = {**authored, "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0]}
-        result, _diagnostics = self._call(
-            authored, canonical,
-            f'<limit lower="-{radius}" upper="{radius}"/>',
-        )
-        self.assertEqual(result["limits"], {"lower": -radius, "upper": radius})
-
-        wrong = _authored(limits={"lower": -1.0, "upper": 1.0}, limit_source="policy_preview_window")
-        with self.assertRaisesRegex(PipelineError, "policy radius"):
-            self._call(
-                wrong, {**wrong, "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0]},
-                '<limit lower="-1" upper="1"/>',
-            )
-
-        dropped = dict(canonical)
-        dropped.pop("limit_source")
-        with self.assertRaisesRegex(PipelineError, "limit source changed"):
-            self._call(authored, dropped, f'<limit lower="-{radius}" upper="{radius}"/>')
-
-    def test_sampling_reads_the_policy_fraction(self) -> None:
+    def test_sampling_uses_the_complete_native_range(self) -> None:
         joint = {"name": "j", "type": "revolute", "limits": {"lower": -2.0, "upper": 2.0}}
-        self.assertEqual(preview_sampling_interval_fraction(), 1.0)
         self.assertEqual(_joint_sample(joint, 1.0), 1.0)
         self.assertEqual(_joint_combined_sample(joint, 1.0), 1.0)
-        with patch(
-            "description_pipeline.verification.solidworks_urdf.preview_sampling_interval_fraction",
-            return_value=0.5,
-        ):
-            self.assertEqual(_joint_sample(joint, 1.0), 0.5)
-            self.assertEqual(_joint_combined_sample(joint, 1.0), 0.5)
 
     def test_scene_carries_the_limit_source_and_exact_drive_keys(self) -> None:
         identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -121,10 +84,10 @@ class DriveEncodingTests(unittest.TestCase):
             {"lower": -1.0, "upper": 1.0, "effort": 0.0, "velocity": 0.0},
         ):
             with self.subTest(limits=limits):
-                cfg = {"joints": [{**base, "limits": limits, "limit_source": "policy_preview_window"}]}
+                cfg = {"joints": [{**base, "limits": limits, "limit_source": "native"}]}
                 entry = _build_joints(cfg, {"base_link", "tool"}, frames)[0]
                 self.assertEqual(entry["limits"], limits)
-                self.assertEqual(entry["limit_source"], "policy_preview_window")
+                self.assertEqual(entry["limit_source"], "native")
 
 
 if __name__ == "__main__":

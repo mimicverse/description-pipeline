@@ -1575,6 +1575,7 @@ class StructuralQualityTests(unittest.TestCase):
             "type": "continuous",
             "axis": [0, 0, 1],
             "limits": {"effort": 1.0, "velocity": 2.0},
+            "limit_source": "native",
         }
         canonical_joint = {**authored, "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
         node = ET.fromstring(
@@ -1598,6 +1599,7 @@ class StructuralQualityTests(unittest.TestCase):
             "type": "continuous",
             "axis": [0, 0, 1],
             "limits": {"effort": 0.0, "velocity": 0.0},
+            "limit_source": "native",
         }
         canonical_joint = {**authored, "xyz": [0, 0, 0], "rpy": [0, 0, 0]}
         node = ET.fromstring(
@@ -1913,7 +1915,19 @@ class MeshChunkContractTests(unittest.TestCase):
 
     def _mesh(self, triangles):
         header = b"chunk contract test".ljust(80, b" ")
-        records = b"".join(struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 0) for a, b, c in triangles)
+        records = b"".join(
+            struct.pack(
+                "<12fH",
+                0.0,
+                0.0,
+                1.0,
+                *a,
+                *b,
+                *c,
+                1 if index < 2 else 2,
+            )
+            for index, (a, b, c) in enumerate(triangles)
+        )
         return header + struct.pack("<I", len(triangles)) + records
 
     def _parts(self, payload, limit):
@@ -1928,14 +1942,96 @@ class MeshChunkContractTests(unittest.TestCase):
             )
         return parts
 
-    def _fixture(self, root, *, limit, mutate):
+    def _fixture(self, root, *, limit, mutate, body_type=0):
         triangles = [
-            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
             ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
-            ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            ((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
             ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
         ]
-        payload = self._mesh(triangles)
+        face_triangles = {0: (0, 1), 1: (2, 3)}
+        edge_occurrences = {}
+        for face_index, triangle_indices in face_triangles.items():
+            for triangle_index in triangle_indices:
+                triangle = triangles[triangle_index]
+                for offset in range(3):
+                    start = triangle[offset]
+                    end = triangle[(offset + 1) % 3]
+                    key = frozenset(
+                        (
+                            tuple(struct.pack("<3f", *start)),
+                            tuple(struct.pack("<3f", *end)),
+                        )
+                    )
+                    edge_occurrences.setdefault(key, []).append(
+                        (face_index, triangle_index, start, end)
+                    )
+        face_edges = {0: [], 1: []}
+        native_edges = []
+        for index, occurrences in enumerate(
+            sorted(edge_occurrences.values(), key=lambda rows: rows[0][1:]),
+            start=1,
+        ):
+            face_indices = sorted({row[0] for row in occurrences})
+            if len(face_indices) != 2:
+                continue
+            reference = hashlib.sha256(f"fixture-edge-{index}".encode()).hexdigest()
+            for face_index in face_indices:
+                face_edges[face_index].append(reference)
+            start = occurrences[0][2]
+            end = occurrences[0][3]
+            native_edges.append(
+                {
+                    "body_type": body_type,
+                    "body_index": 0,
+                    "edge_reference_sha256": reference,
+                    "start_vertex_reference_sha256": hashlib.sha256(
+                        struct.pack("<3f", *start)
+                    ).hexdigest(),
+                    "end_vertex_reference_sha256": hashlib.sha256(
+                        struct.pack("<3f", *end)
+                    ).hexdigest(),
+                    "start_point_m": list(start),
+                    "end_point_m": list(end),
+                    "face_indices": face_indices,
+                }
+            )
+        for references in face_edges.values():
+            references.sort()
+        face_spans = [
+            {
+                "body_type": body_type,
+                "body_index": 0,
+                "body_name": "fixture-body",
+                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
+                "face_index": 0,
+                "face_reference_sha256": hashlib.sha256(b"fixture-face-0").hexdigest(),
+                "face_owner_id": 1,
+                "edge_references": face_edges[0],
+                "triangle_start": 0,
+                "triangle_count": 2,
+                "triangle_records_sha256": "0" * 64,
+            },
+            {
+                "body_type": body_type,
+                "body_index": 0,
+                "body_name": "fixture-body",
+                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
+                "face_index": 1,
+                "face_reference_sha256": hashlib.sha256(b"fixture-face-1").hexdigest(),
+                "face_owner_id": 2,
+                "edge_references": face_edges[1],
+                "triangle_start": 2,
+                "triangle_count": 2,
+                "triangle_records_sha256": "0" * 64,
+            },
+        ]
+        tessellation = support.native_tessellation_fixture(
+            face_spans,
+            native_edges,
+            triangle_vertices=triangles,
+        )
+        payload = tessellation.stl_bytes
         parts = self._parts(payload, limit)
         if mutate is not None:
             mutate(payload, parts)
@@ -1973,13 +2069,19 @@ class MeshChunkContractTests(unittest.TestCase):
                 "scale": [1, 1, 1],
                 "xyz": [0, 0, 0],
                 "rpy": [0, 0, 0],
+                "tessellation": tessellation,
             }
         }
         components = {"pcb-1": np.identity(4)}
         return node, body, model_link, geometry, components
 
-    def _run(self, root, *, limit=2, mutate=None):
-        node, body, model_link, geometry, components = self._fixture(root, limit=limit, mutate=mutate)
+    def _run(self, root, *, limit=2, mutate=None, body_type=0):
+        node, body, model_link, geometry, components = self._fixture(
+            root,
+            limit=limit,
+            mutate=mutate,
+            body_type=body_type,
+        )
         with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", limit):
             return quality._geometry(
                 root, body, node, model_link, geometry, components, np.identity(4), np.identity(4), set()
@@ -2013,6 +2115,156 @@ class MeshChunkContractTests(unittest.TestCase):
         self.assertEqual(quality._mesh_chunk_count(362_415), 2)
         self.assertEqual(quality._mesh_chunk_count(399_998), 2)
         self.assertEqual(quality._mesh_chunk_count(399_999), 3)
+
+    def test_globally_flipped_closed_mesh_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node, body, model_link, geometry, components = self._fixture(
+                root,
+                limit=2,
+                mutate=None,
+            )
+            source = root / "evidence/geometry/0001_mesh.stl"
+            flipped = bytearray(source.read_bytes())
+            count = struct.unpack_from("<I", flipped, 80)[0]
+            for index in range(count):
+                offset = 84 + 50 * index
+                normal = struct.unpack_from("<3f", flipped, offset)
+                first = struct.unpack_from("<3f", flipped, offset + 12)
+                second = struct.unpack_from("<3f", flipped, offset + 24)
+                third = struct.unpack_from("<3f", flipped, offset + 36)
+                struct.pack_into("<12f", flipped, offset, *[-value for value in normal], *first, *third, *second)
+            source.write_bytes(flipped)
+            geometry["pcb-1"]["sha256"] = hashlib.sha256(flipped).hexdigest()
+            for index, part in enumerate(self._parts(flipped, 2)):
+                (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
+            with (
+                self.assertRaisesRegex(PipelineError, "positive total material volume"),
+                mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 2),
+            ):
+                quality._geometry(
+                    root,
+                    body,
+                    node,
+                    model_link,
+                    geometry,
+                    components,
+                    np.identity(4),
+                    np.identity(4),
+                    set(),
+                )
+
+    def test_open_sheet_negative_signed_integral_is_not_a_solid_flip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node, body, model_link, geometry, components = self._fixture(
+                root,
+                limit=2,
+                mutate=None,
+                body_type=1,
+            )
+            source = root / "evidence/geometry/0001_mesh.stl"
+            flipped = bytearray(source.read_bytes())
+            count = struct.unpack_from("<I", flipped, 80)[0]
+            for index in range(count):
+                offset = 84 + 50 * index
+                normal = struct.unpack_from("<3f", flipped, offset)
+                first = struct.unpack_from("<3f", flipped, offset + 12)
+                second = struct.unpack_from("<3f", flipped, offset + 24)
+                third = struct.unpack_from("<3f", flipped, offset + 36)
+                struct.pack_into(
+                    "<12f",
+                    flipped,
+                    offset,
+                    *[-value for value in normal],
+                    *first,
+                    *third,
+                    *second,
+                )
+            source.write_bytes(flipped)
+            geometry["pcb-1"]["sha256"] = hashlib.sha256(flipped).hexdigest()
+            for index, part in enumerate(self._parts(flipped, 2)):
+                (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
+            with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 2):
+                _used, points = quality._geometry(
+                    root,
+                    body,
+                    node,
+                    model_link,
+                    geometry,
+                    components,
+                    np.identity(4),
+                    np.identity(4),
+                    set(),
+                )
+            self.assertEqual(len(points), 12)
+
+    def test_hollow_solid_accepts_inward_cavity_but_rejects_outward_cavity(self):
+        def tetra(scale, center, inward):
+            source = [
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            ][0]
+            transformed = [
+                tuple(
+                    float(center[axis] + scale * (point[axis] - 0.25))
+                    for axis in range(3)
+                )
+                for point in source
+            ]
+            faces = (
+                (0, 2, 1),
+                (0, 1, 3),
+                (0, 3, 2),
+                (1, 2, 3),
+            )
+            if inward:
+                faces = tuple((first, third, second) for first, second, third in faces)
+            return [tuple(transformed[index] for index in face) for face in faces]
+
+        def run_case(root, *, inward):
+            node, body, model_link, geometry, components = self._fixture(
+                root,
+                limit=2,
+                mutate=None,
+            )
+            triangles = tetra(2.0, (0.0, 0.0, 0.0), False) + tetra(
+                0.25,
+                (0.0, 0.0, 0.0),
+                inward,
+            )
+            payload = self._mesh(triangles)
+            source = root / "evidence/geometry/0001_mesh.stl"
+            source.write_bytes(payload)
+            geometry["pcb-1"]["sha256"] = hashlib.sha256(payload).hexdigest()
+            geometry["pcb-1"]["triangles"] = 8
+            spans = geometry["pcb-1"]["tessellation"]["face_spans"]
+            spans[0]["triangle_count"] = 4
+            spans[0]["triangle_records_sha256"] = hashlib.sha256(payload[84:284]).hexdigest()
+            spans[1]["triangle_start"] = 4
+            spans[1]["triangle_count"] = 4
+            spans[1]["triangle_records_sha256"] = hashlib.sha256(payload[284:484]).hexdigest()
+            for index, part in enumerate(self._parts(payload, 4)):
+                (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
+            with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 4):
+                return quality._geometry(
+                    root,
+                    body,
+                    node,
+                    model_link,
+                    geometry,
+                    components,
+                    np.identity(4),
+                    np.identity(4),
+                    set(),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_case(Path(tmp), inward=True)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            self.assertRaisesRegex(PipelineError, "shell orientation"),
+        ):
+            run_case(Path(tmp), inward=False)
 
 
 class EntityPartitionTests(unittest.TestCase):

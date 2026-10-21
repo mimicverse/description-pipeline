@@ -156,13 +156,24 @@ class PublishTests(unittest.TestCase):
         self.gh_mode = "ok"
         self.branch = BRANCH
         self.prs: dict[str, dict] = {}
+        self.duplicate_prs: list[dict] = []
+        self.pr_list_calls = 0
         self.qualification_reversed = False
 
         def fake_gh(repository: Path, *args: str) -> str:
             self.gh_calls.append(args)
-            if self.gh_mode == "fail":
+            if self.gh_mode == "fail" and not (
+                args[:2] == ("pr", "list") and self.pr_list_calls == 0
+            ):
                 raise subprocess.CalledProcessError(1, ["gh", *args], stderr="gh down")
             if args[:2] == ("pr", "list"):
+                self.pr_list_calls += 1
+                if self.gh_mode == "ambiguous_after_push":
+                    if self.pr_list_calls > 1:
+                        return json.dumps(self.duplicate_prs)
+                    return "[]"
+                if self.duplicate_prs:
+                    return json.dumps(self.duplicate_prs)
                 entry = self.prs.get(self.branch)
                 if entry is not None:
                     return json.dumps(
@@ -172,6 +183,11 @@ class PublishTests(unittest.TestCase):
                                 "number": entry["number"],
                                 "baseRefName": "feature/m3.0",
                                 "headRefName": self.branch,
+                                "headRefOid": self.fx.remote_head(
+                                    self.branch
+                                ),
+                                "state": "OPEN",
+                                "isCrossRepository": False,
                             }
                         ]
                     )
@@ -618,6 +634,59 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(result["error"], "branch_foreign")
         self.assertEqual(self.fx.remote_head(), foreign)
 
+    def _duplicate_prs(self) -> list[dict]:
+        return [
+            {
+                "url": f"https://github.com/example/m3.0/pull/{number}",
+                "number": number,
+                "baseRefName": "feature/m3.0",
+                "headRefName": BRANCH,
+                "headRefOid": character * 40,
+                "state": "OPEN",
+                "isCrossRepository": False,
+            }
+            for number, character in ((9, "c"), (10, "d"))
+        ]
+
+    def test_ambiguous_prs_refuse_before_any_remote_write(self) -> None:
+        self.duplicate_prs = self._duplicate_prs()
+
+        result = self.submit()
+
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], "pr_ambiguous_before_write")
+        self.assertEqual(self.fx.remote_head(), "")
+        self.assertFalse(
+            any(
+                args[:2] in {("pr", "create"), ("api", "--method")}
+                for args in self.gh_calls
+            )
+        )
+        self.assertEqual(
+            {item["number"] for item in result["detail"]},
+            {9, 10},
+        )
+
+    def test_ambiguous_prs_after_push_are_unresolved_with_candidate(
+        self,
+    ) -> None:
+        self.gh_mode = "ambiguous_after_push"
+        self.duplicate_prs = self._duplicate_prs()
+
+        result = self.submit()
+
+        self.assertEqual(result["state"], "unresolved")
+        self.assertEqual(result["error"], "pr_ambiguous_after_push")
+        self.assertEqual(result["commit"], self.fx.remote_head())
+        self.assertEqual(
+            {item["number"] for item in result["detail"]},
+            {9, 10},
+        )
+        self.assertIn("retry", result)
+        self.assertFalse(
+            any(args[:2] == ("pr", "create") for args in self.gh_calls)
+        )
+
     def test_bad_verification_and_tamper_never_push(self) -> None:
         with mock.patch.object(urdf_pr, "_load_verifier", lambda: lambda bundle: {"passed": False}):
             self.assertEqual(self.submit()["error"], "verification_failed")
@@ -911,6 +980,46 @@ class PublishTests(unittest.TestCase):
             qualification_lines(self.rest_payloads[-1]["body"]),
             qualification_lines(forward),
         )
+
+    def test_pr_body_carries_object_level_author_sign_warning(self) -> None:
+        report = {
+            "checks": [
+                {
+                    "id": "provenance.value_warnings",
+                    "state": "passed",
+                    "details": {
+                        "codes": ["direction.author_sign_applied"],
+                        "objects": 1,
+                        "direction_sign_warnings": [
+                            {
+                                "object": "arm_joint",
+                                "native_sign": -1,
+                                "original_axis_assembly": [0, 0, 1],
+                                "output_axis_assembly": [0, 0, -1],
+                                "actual_child_axis": [0, 0, -1],
+                                "original_frame": "assembly",
+                                "output_frame": "assembly",
+                                "model_frame": "child",
+                                "q_sign": 1,
+                                "range_transform": "not_applied",
+                                "limits_status": "present",
+                                "drive_status": "present",
+                                "rule_id": "direction.native_axis_sign",
+                                "rule_version": "v1",
+                                "reason": "author sign selects the undirected positive direction",
+                                "warning_does_not_replace_evidence": True,
+                            }
+                        ],
+                    },
+                }
+            ],
+            "qualifications": [],
+        }
+        body = urdf_pr._body("subject", "commit", report, "engineering")
+        self.assertIn("- direction author sign `arm_joint`", body)
+        self.assertIn("assembly `[0,0,1]` -> assembly `[0,0,-1]`", body)
+        self.assertIn("child `[0,0,-1]`", body)
+        self.assertIn("direction.native_axis_sign/v1", body)
 
 
 if __name__ == "__main__":

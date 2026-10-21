@@ -10,6 +10,12 @@ import json
 import re
 from pathlib import Path
 
+from .geometry.native_u import (
+    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_details_match,
+    native_scope_warning_diagnostic_is_valid,
+)
+from .geometry.native_tessellation import parse_native_tessellation
 from .io import PipelineError, file_digest, read_data, write_json
 from .schemas import EFFECTIVE_INSTANCES_SCHEMA
 
@@ -270,7 +276,7 @@ def _canonical_untessellated_faces(value) -> list | None:
     for entry in value:
         if not isinstance(entry, dict):
             return None
-        if any(key not in entry for key in ("component", "bodies", "tessellation")):
+        if any(key not in entry for key in ("component", "triangles", "bodies", "tessellation")):
             return None
         component = entry.get("component")
         bodies = entry.get("bodies")
@@ -283,6 +289,17 @@ def _canonical_untessellated_faces(value) -> list | None:
             count = bodies.get(key)
             if type(count) is not int or count < 0:
                 return None
+        try:
+            spans = parse_native_tessellation(
+                component,
+                tessellation,
+                bodies,
+                entry.get("triangles"),
+                native_fin_resolutions=[],
+                native_identity_warnings=[],
+            )
+        except PipelineError:
+            return None
         faces = tessellation.get("faces")
         if type(faces) is not int or faces < 0:
             return None
@@ -340,6 +357,12 @@ def _canonical_untessellated_faces(value) -> list | None:
                 return None
             seen.add(key)
             out.append({"component": component, **row})
+        span_counts = {
+            (span["body_type"], span["body_index"], span["face_index"]): span["triangle_count"]
+            for span in spans
+        }
+        if set(seen) != {key for key, count in span_counts.items() if count == 0}:
+            return None
     return out
 
 
@@ -359,7 +382,20 @@ def _findings(value, source, *, severity=None):
         level = "blocker" if value.get("blocking") is True or value.get("passed") is False else severity or "warning"
         if value.get("blocking") is False:
             level = "warning"
-        yield {
+        if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES and not native_scope_warning_diagnostic_is_valid(value):
+            yield {
+                "severity": "blocker",
+                "code": "report.native_identity_warning_invalid",
+                "object": value.get("object") or value.get("component"),
+                "message": (
+                    f"Native scope warning {code} is forged or does not locate its component, "
+                    "entity, body, indices and field"
+                ),
+                "source": source,
+                "evidence": value,
+            }
+            return
+        finding = {
             "severity": level,
             "code": code,
             "object": value.get("object") or value.get("instance") or value.get("document"),
@@ -367,6 +403,25 @@ def _findings(value, source, *, severity=None):
             "source": source,
             "evidence": value,
         }
+        detail = value.get("detail")
+        if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES and isinstance(detail, dict):
+            for key in (
+                "component",
+                "entity_kind",
+                "body_type",
+                "body_index",
+                "owner_scope_key",
+                "object_indices",
+                "field",
+                "native_reference_sha256",
+                "mapping_source_part_document_sha256",
+                "mapping_source_body_reference_sha256",
+                "mapped_source_indices",
+                "mapped_source_persistent_reference_sha256",
+                "topology_signature_sha256s",
+            ):
+                finding[key] = detail.get(key)
+        yield finding
         return
     # Deterministic traversal: a persisted (sorted) receipt must render exactly
     # like the live one, so neither finding order nor the first-seen duplicate
@@ -427,6 +482,83 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             # code/message and must not be double-reported by the generic walk.
             continue
         entries.extend(_findings(value, source))
+    quality = sources.get("reports/quality.json")
+    quality_diagnostics = (
+        quality.get("diagnostics")
+        if isinstance(quality, dict)
+        else None
+    )
+    native_gate_warnings = None
+    native_gate_passed = False
+    if isinstance(quality, dict) and isinstance(quality.get("checks"), list):
+        for check in quality["checks"]:
+            if (
+                isinstance(check, dict)
+                and check.get("id") == "geometry.native_tessellation"
+            ):
+                native_gate_passed = (
+                    check.get("state") == "passed"
+                    or check.get("passed") is True
+                )
+                details = check.get("details")
+                warnings = (
+                    details.get("warnings")
+                    if isinstance(details, dict)
+                    else None
+                )
+                if isinstance(warnings, list):
+                    native_gate_warnings = warnings
+                break
+    if quality_diagnostics is not None:
+        if not isinstance(quality_diagnostics, list):
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.native_identity_warning_invalid",
+                    "object": receipt.get("main_assembly"),
+                    "message": "Quality diagnostics are malformed",
+                    "source": "reports/quality.json/diagnostics",
+                    "evidence": {"type": type(quality_diagnostics).__name__},
+                }
+            )
+        else:
+            native_scope = [
+                item
+                for item in quality_diagnostics
+                if isinstance(item, dict)
+                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            ]
+            raw_scope = [
+                item
+                for item in native_gate_warnings or []
+                if isinstance(item, dict)
+                and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            ]
+            if (
+                native_gate_passed
+                and native_gate_warnings is None
+            ) or (
+                (native_scope or raw_scope)
+                and (
+                    native_gate_warnings is None
+                    or not native_scope_warning_details_match(
+                        native_scope,
+                        native_gate_warnings,
+                    )
+                )
+            ):
+                entries.append(
+                    {
+                        "severity": "blocker",
+                        "code": "report.native_identity_warning_invalid",
+                        "object": receipt.get("main_assembly"),
+                        "message": (
+                            "Native scope warning projection is incomplete or forged"
+                        ),
+                        "source": "reports/quality.json/diagnostics",
+                        "evidence": {"native_scope_warnings": native_scope},
+                    }
+                )
     closure = ((receipt.get("selection") or {}).get("manifest") or {}).get("closure") or {}
     opened = closure.get("open_status") or {}
     if opened.get("warnings"):

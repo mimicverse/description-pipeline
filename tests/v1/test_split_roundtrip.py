@@ -97,7 +97,6 @@ class AxisFixtureBackend(support.FixtureCadBackend):
         entries = super().export_component_meshes(destinations, on_activity=on_activity)
         for info in entries.values():
             info["bodies"] = {"solid": 1, "sheet": 0}
-            info["tessellation"] = {"faces": 6, "no_facets_faces": []}
         return entries
 
 
@@ -218,7 +217,11 @@ class SplitRoundtripTests(unittest.TestCase):
                 expected_inputs=prepared_files,
                 prior_events=events,
             )
-        self.assertIs(capture["native_complete"], True)
+        self.assertEqual(
+            capture["state"],
+            "native_complete",
+            capture.get("error"),
+        )
         self.assertIs(capture["passed"], False)
         archive = self.capture_output / transfer.CAPTURE_ARCHIVE
         manifest_path = self.capture_output / transfer.CAPTURE_MANIFEST

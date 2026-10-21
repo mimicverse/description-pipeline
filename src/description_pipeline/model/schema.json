@@ -9,7 +9,8 @@
     },
     "name": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*$"
     },
     "units": {
       "const": "SI"
@@ -25,7 +26,7 @@
           },
           "name": {
             "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+            "pattern": "^[a-z][a-z0-9_]*$"
           },
           "inertial": {
             "anyOf": [
@@ -79,6 +80,10 @@
             "items": {
               "type": "object",
               "properties": {
+                "name": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                },
                 "kind": {
                   "enum": [
                     "mesh",
@@ -104,6 +109,12 @@
                   "maxItems": 3
                 },
                 "filename": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "mesh_name": {
                   "type": "string"
                 },
                 "scale": {
@@ -137,6 +148,10 @@
                   },
                   "minItems": 4,
                   "maxItems": 4
+                },
+                "material": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
                 },
                 "provenance": {
                   "type": "object"
@@ -215,6 +230,10 @@
             "items": {
               "type": "object",
               "properties": {
+                "name": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                },
                 "kind": {
                   "enum": [
                     "mesh",
@@ -240,6 +259,12 @@
                   "maxItems": 3
                 },
                 "filename": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "mesh_name": {
                   "type": "string"
                 },
                 "scale": {
@@ -273,6 +298,10 @@
                   },
                   "minItems": 4,
                   "maxItems": 4
+                },
+                "material": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
                 },
                 "provenance": {
                   "type": "object"
@@ -373,7 +402,7 @@
           },
           "name": {
             "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+            "pattern": "^[a-z][a-z0-9_]*$"
           },
           "type": {
             "enum": [
@@ -385,11 +414,11 @@
           },
           "parent": {
             "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+            "pattern": "^[a-z][a-z0-9_]*$"
           },
           "child": {
             "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+            "pattern": "^[a-z][a-z0-9_]*$"
           },
           "xyz": {
             "type": "array",
@@ -437,9 +466,8 @@
           "limit_source": {
             "enum": [
               "native",
-              "controlled",
-              "policy_preview_window",
-              "declared_preview_window"
+              "declared_author",
+              "preview_policy"
             ]
           },
           "dynamics": {
@@ -462,7 +490,7 @@
             "properties": {
               "joint": {
                 "type": "string",
-                "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+                "pattern": "^[a-z][a-z0-9_]*$"
               },
               "multiplier": {
                 "type": "number"
@@ -505,11 +533,11 @@
           },
           "name": {
             "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+            "pattern": "^[a-z][a-z0-9_]*$"
           },
           "parent": {
             "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+            "pattern": "^[a-z][a-z0-9_]*$"
           },
           "xyz": {
             "type": "array",

@@ -5,7 +5,8 @@
 #   start     enable/start PostgreSQL, Airflow, tunnel, portal and the HTTPS proxy
 #             (start --keep-admission-closed: services up, the platform admission stays closed)
 #   drain     close submissions and DAG admission, keep in-flight, return active/unresolved
-#   stop      disable/stop them in reverse order (only when drained and settled)
+#   stop      disable/stop them in reverse order (only when drained and settled);
+#             --keep-database stops the supported writers while retaining PostgreSQL
 #   status    systemctl --user is-active for every managed unit
 #   health    deploy/operator/health.sh (static checks plus live service/HTTP checks)
 #   reconcile confirm and register external outcomes; never repeats unknown side effects
@@ -20,6 +21,8 @@
 #   orphan recovery: reconcile --run-id R --stage S --outcome failed --evidence FILE... \
 #     --native-receipt FILE --native-run-id UUID --orphan-operation-id OP \
 #     --orphan-task-id TASK --orphan-map-index N
+#   native capture recovery first reads the recorded operation/stage/owner result; a complete
+#   replay returns it without requiring the original receipt, derived directory or archive.
 #
 # Only description-* units are written; unrelated user units are untouched. Credentials and state
 # live under the configured state root (outside Git).
@@ -43,9 +46,11 @@ usage() {
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
 install inputs: --install-id ID --wheel FILE --endpoint-identity FILE [--release-file FILE]
 start inputs: [--keep-admission-closed] (services start; the platform admission stays closed)
+stop inputs: [--keep-database] (supported writers stop; the managed database stays active)
 reconcile inputs: --run-id R --stage S --outcome completed|failed|cancelled --evidence FILE...
 orphan recovery adds: --native-receipt FILE --native-run-id UUID --orphan-operation-id OP --orphan-task-id TASK --orphan-map-index N [--reported-stage STAGE]
-native capture recovery adds: --install-id ID --derived DIR --archive FILE (--reported-stage capture, --stage discover, --outcome failed)
+native capture recovery adds: --install-id ID [--derived DIR --archive FILE] (--reported-stage capture, --stage discover, --outcome failed)
+  a completed replay returns immediately; the input files are required only when the state-first read misses
 exit codes: 0 ok; 1 configuration/environment error; 2 usage
 USAGE
   exit 2
@@ -71,6 +76,9 @@ ORPHAN_TASK_ID=""
 ORPHAN_MAP_INDEX=""
 REPORTED_STAGE=""
 KEEP_ADMISSION_CLOSED=""
+KEEP_DATABASE=""
+MAINTENANCE_LOCK_FD=""
+MAINTENANCE_LOCK_PATH=""
 EVIDENCE=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -92,6 +100,7 @@ while [ $# -gt 0 ]; do
     --archive) NATIVE_ARCHIVE="${2:-}"; shift 2 ;;
     --evidence) EVIDENCE+=("${2:-}"); shift 2 ;;
     --keep-admission-closed) KEEP_ADMISSION_CLOSED=1; shift ;;
+    --keep-database) KEEP_DATABASE=1; shift ;;
     *) usage ;;
   esac
 done
@@ -103,6 +112,10 @@ esac
 # Only start owns this switch; every other verb refuses it here, before any side effect runs.
 if [ -n "$KEEP_ADMISSION_CLOSED" ] && [ "$ACTION" != "start" ]; then
   echo "operatorctl: --keep-admission-closed is only accepted by start" >&2
+  exit 2
+fi
+if [ -n "$KEEP_DATABASE" ] && [ "$ACTION" != "stop" ]; then
+  echo "operatorctl: --keep-database is only accepted by stop" >&2
   exit 2
 fi
 
@@ -200,6 +213,81 @@ load_generation_env() {
     [ -n "${!key:-}" ] \
       || die "generation environment $ENV_FILE does not define $key"
   done
+}
+
+acquire_maintenance_lock() {
+  local state_root="$1" lock_dir lock_path inherited_owner inherited_fd inherited_path
+  [ -z "$MAINTENANCE_LOCK_PATH" ] || return 0
+  [ -d "$state_root" ] && [ ! -L "$state_root" ] \
+    || die "the state root for the maintenance lock is missing or a link: $state_root"
+  lock_dir="$state_root/locks"
+  mkdir -p "$lock_dir"
+  [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] \
+    || die "the maintenance lock directory is not a real directory: $lock_dir"
+  chmod 700 "$lock_dir"
+  lock_path="$lock_dir/maintenance.lock"
+  [ ! -L "$lock_path" ] || die "the maintenance lock is a link: $lock_path"
+  command -v flock >/dev/null 2>&1 || die "flock is required for the maintenance lifecycle"
+  inherited_owner="${OPERATORCTL_MAINTENANCE_LOCK_OWNER:-}"
+  if [ -n "$inherited_owner" ]; then
+    inherited_fd="${OPERATORCTL_MAINTENANCE_LOCK_FD:-}"
+    inherited_path="${OPERATORCTL_MAINTENANCE_LOCK_PATH:-}"
+    [[ "$inherited_fd" =~ ^[0-9]+$ ]] \
+      || die "an inherited maintenance lock must carry the caller's file descriptor"
+    [ "$inherited_path" = "$lock_path" ] \
+      || die "the inherited maintenance lock path does not match the state-root lock"
+    [ -f "$lock_path" ] || die "the inherited maintenance lock is missing: $lock_path"
+    python3 - "$inherited_fd" "$lock_path" "$inherited_owner" <<'PY' \
+      || die "the inherited maintenance lock descriptor is not the held state-root lock"
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+descriptor = int(sys.argv[1])
+lock_path = Path(sys.argv[2])
+expected_owner = sys.argv[3]
+try:
+    document = json.loads(lock_path.read_text(encoding="utf-8"))
+except Exception as error:
+    raise SystemExit(f"cannot read the maintenance lock owner: {error}")
+if (
+    not isinstance(document, dict)
+    or set(document)
+    != {"schema_version", "owner_id", "acquired_at", "pid"}
+    or document.get("schema_version")
+    != "solidworks-to-urdf.maintenance-lock/v1"
+    or document.get("owner_id") != expected_owner
+):
+    raise SystemExit("the maintenance lock owner is malformed")
+inherited_metadata = os.fstat(descriptor)
+path_metadata = os.stat(lock_path, follow_symlinks=False)
+if (
+    not os.path.isfile(f"/proc/self/fd/{descriptor}")
+    or (inherited_metadata.st_dev, inherited_metadata.st_ino)
+    != (path_metadata.st_dev, path_metadata.st_ino)
+):
+    raise SystemExit("the inherited descriptor names another file")
+fdinfo = Path(f"/proc/self/fdinfo/{descriptor}").read_text(encoding="utf-8")
+if not re.search(
+    r"^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\b",
+    fdinfo,
+    flags=re.MULTILINE,
+):
+    raise SystemExit("the inherited descriptor does not itself hold the write lock")
+PY
+    MAINTENANCE_LOCK_FD="$inherited_fd"
+    MAINTENANCE_LOCK_PATH="$lock_path"
+    echo "maintenance_lock=inherited:$lock_path"
+    return 0
+  fi
+  exec {MAINTENANCE_LOCK_FD}>>"$lock_path"
+  flock -n "$MAINTENANCE_LOCK_FD" \
+    || die "another supported lifecycle operation owns the maintenance lock: $lock_path"
+  chmod 600 "$lock_path"
+  MAINTENANCE_LOCK_PATH="$lock_path"
+  echo "maintenance_lock=$lock_path"
 }
 
 # One env contract: platform_env and render_operator write every derived value through the
@@ -651,7 +739,8 @@ instance_lifecycle_health() {
   local dir="$OPERATOR_STATE/promotions/$generation"
   local binding="$dir/windows-health-binding.json" output="$dir/windows-health.out"
   mkdir -p "$dir"
-  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" <<'PY' || return 1
+  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
+    "$HERE/../windows/instance-lifecycle.ps1" <<'PY' || return 1
 import json
 import sys
 from pathlib import Path
@@ -769,6 +858,110 @@ PY
   fi
   if [ "$parse_rc" != "0" ]; then
     echo "instance_lifecycle: the health outcome is unreadable; see $output" >&2
+    return 2
+  fi
+  echo "$output"
+}
+
+instance_lifecycle_resume() {
+  local generation="$1" identity_file="$2"
+  local stamp dir binding output remote remote_script remote_binding
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dir="$OPERATOR_STATE/health-gate/windows-resume-$generation-$stamp"
+  binding="$dir/windows-resume-binding.json"
+  output="$dir/windows-resume.out"
+  mkdir -p "$dir"
+  python3 - "$CONFIG_FILE" "$identity_file" "$binding" "$generation" \
+    "$HERE/../windows/instance-lifecycle.ps1" <<'PY' || return 1
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+config_path, identity_path, out_path = map(Path, sys.argv[1:4])
+generation, script_path = sys.argv[4], Path(sys.argv[5])
+config = json.loads(config_path.read_text(encoding="utf-8"))
+identity = json.loads(identity_path.read_text(encoding="utf-8"))
+windows = config["windows"]
+instance = windows["instance"]
+end = identity.get("ends", {}).get("windows")
+if not isinstance(end, dict) or not isinstance(end.get("release"), dict):
+    raise SystemExit("operatorctl: the active install record carries no Windows identity")
+release = end["release"]
+if release.get("role") != "native":
+    raise SystemExit("operatorctl: the active Windows identity is not the native role")
+if not all(isinstance(release.get(key), str) and release[key] for key in ("version", "source_commit", "source_sha256")):
+    raise SystemExit("operatorctl: the active Windows release identity is incomplete")
+if not isinstance(end.get("install_id"), str) or not re.fullmatch(r"win-[0-9a-f]{32}", end["install_id"]):
+    raise SystemExit("operatorctl: the active Windows install identity is malformed")
+if not isinstance(end.get("config_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", end["config_digest"]):
+    raise SystemExit("operatorctl: the active Windows config digest is malformed")
+triple = "\n".join(
+    str(release.get(key) or "") for key in ("version", "source_commit", "source_sha256", "role")
+)
+document = {
+    "schema_version": "solidworks-to-urdf.windows-recovery/v1",
+    "ssh_host": windows["ssh_host"],
+    "task_name": instance["task_name"],
+    "state_root": instance["state_root"],
+    "package_root": instance["package_root"],
+    "output_root": instance["output_root"],
+    "port": windows["endpoint_port"],
+    "generation": str(generation),
+    "version": release["version"],
+    "source_commit": release["source_commit"],
+    "source_sha256": release["source_sha256"],
+    "install_id": end["install_id"],
+    "config_digest": end["config_digest"],
+    "release_identity_sha256": hashlib.sha256(triple.encode("utf-8")).hexdigest(),
+    "script_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
+}
+out_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  remote="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state_root"].rstrip("/") + "/instance-promotions/windows-resume-" + sys.argv[2])' \
+    "$binding" "$generation-$stamp")"
+  remote_script="$remote/instance-lifecycle.ps1"
+  remote_binding="$remote/windows-resume-binding.json"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST" \
+    "powershell.exe -NoProfile -NonInteractive -EncodedCommand $(python3 - "$remote" <<'PY'
+import base64
+import sys
+
+path = sys.argv[1].replace("/", "\\").replace("'", "''")
+script = "$ErrorActionPreference='Stop';New-Item -ItemType Directory -Path '" + path + "' -ErrorAction Stop | Out-Null"
+print(base64.b64encode(script.encode("utf-16le")).decode("ascii"))
+PY
+)" || { echo "instance_lifecycle_resume: could not create $remote" >&2; return 1; }
+  scp -q -p -o BatchMode=yes -o StrictHostKeyChecking=yes \
+    "$HERE/../windows/instance-lifecycle.ps1" "$binding" \
+    "$SOLIDWORKS_SSH_HOST:\"$remote/\"" \
+    || { echo "instance_lifecycle_resume: could not transfer the resume binding" >&2; return 1; }
+  local remote_rc=0
+  : > "$output"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST" \
+    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote_script\" -Verb resume -Binding \"$remote_binding\"" \
+    > "$output" || remote_rc=$?
+  local parse_rc=0
+  python3 - "$output" "$remote_rc" <<'PY' || parse_rc=$?
+import json
+import sys
+
+try:
+    document = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[-1])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(3)
+remote_rc = int(sys.argv[2])
+if remote_rc == 0 and document.get("passed") is True and document.get("verb") == "resume":
+    raise SystemExit(0)
+code = document.get("code")
+if remote_rc == 1 and document.get("passed") is False and isinstance(code, str) and code:
+    print(code, file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(3)
+PY
+  if [ "$parse_rc" != "0" ]; then
+    echo "instance_lifecycle_resume: the Windows resume outcome is not proven; see $output" >&2
     return 2
   fi
   echo "$output"
@@ -980,6 +1173,211 @@ open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(health) + "\n")
 PY
 }
 
+windows_status_check() {
+  python3 - "$CONFIG_FILE" "$OPERATOR_STATE_DIR/install-record.json" <<'PY'
+import base64
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+windows = config.get("windows")
+if not isinstance(windows, dict) or not isinstance(windows.get("instance"), dict):
+    raise SystemExit("operatorctl status: Windows instance configuration is missing")
+ends = record.get("ends")
+expected = ends.get("windows") if isinstance(ends, dict) else None
+if not isinstance(expected, dict):
+    raise SystemExit("operatorctl status: Windows install identity is missing")
+host = windows.get("ssh_host")
+instance = windows["instance"]
+task_name = instance.get("task_name")
+port = windows.get("endpoint_port")
+if (
+    not isinstance(host, str)
+    or not host
+    or not isinstance(task_name, str)
+    or not task_name
+    or type(port) is not int
+    or not 0 < port < 65536
+):
+    raise SystemExit("operatorctl status: Windows endpoint identity is malformed")
+identity = {
+    "task_name": task_name,
+    "port": port,
+    "install_id": expected.get("install_id"),
+    "config_digest": expected.get("config_digest"),
+    "release": expected.get("release"),
+}
+encoded = base64.b64encode(
+    json.dumps(identity, separators=(",", ":"), sort_keys=True).encode()
+).decode("ascii")
+script = rf"""
+$ErrorActionPreference = 'Stop'
+$expected = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String('{encoded}')))
+function Read-Json([string]$path) {{
+  (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json
+}}
+function Get-Sample {{
+  $task = Get-ScheduledTask -TaskName $expected.task_name -ErrorAction Stop
+  if ($task.State -ne 'Running') {{ throw "task state is $($task.State)" }}
+  $arguments = [string]$task.Actions[0].Arguments
+  $match = [regex]::Match($arguments, 'serve --config\s+"?([^"]+)"?')
+  if (-not $match.Success) {{ throw 'task action does not bind serve --config' }}
+  $configPath = $match.Groups[1].Value
+  $generation = Split-Path -Parent $configPath
+  $python = Join-Path $generation 'runtime\Scripts\python.exe'
+  if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {{
+    throw 'task generation runtime Python is missing'
+  }}
+  $program = "import json,sys;" +
+    "from description_pipeline.orchestration import windows;" +
+    "from description_pipeline.runtime import tool_record;" +
+    "c=windows.read_config(sys.argv[1]);" +
+    "print(json.dumps({{'config_digest':c['config_digest']," +
+    "'state_root':str(c['state_root']),'port':c['port']," +
+    "'release':tool_record(role='native')}},sort_keys=True))"
+  $probe = ((& $python -I -c $program $configPath) | Select-Object -Last 1) |
+    ConvertFrom-Json
+  $config = Read-Json $configPath
+  $installId = (
+    Get-Content -LiteralPath (Join-Path ([string]$probe.state_root) 'install-id') -Raw
+  ).Trim()
+  $listeners = @(Get-NetTCPConnection -LocalPort ([int]$expected.port) -State Listen `
+    -ErrorAction Stop)
+  if ($listeners.Count -ne 1) {{
+    throw "expected one listener on port $($expected.port), got $($listeners.Count)"
+  }}
+  $process = Get-Process -Id ([int]$listeners[0].OwningProcess) -ErrorAction Stop
+  $token = (Get-Content -LiteralPath ([string]$config.token_file) -Raw).Trim()
+  $health = $null
+  for ($attempt = 0; $attempt -lt 10 -and -not $health; $attempt++) {{
+    try {{
+      $health = Invoke-RestMethod -Uri (
+        'http://127.0.0.1:' + [string]$expected.port + '/health'
+      ) -Headers @{{Authorization=('Bearer ' + $token)}} -TimeoutSec 3
+    }} catch {{
+      Start-Sleep -Milliseconds 500
+    }}
+  }}
+  if (-not $health) {{ throw 'endpoint health is unavailable' }}
+  $embedded = $probe.release.release
+  [ordered]@{{
+    task_name = [string]$task.TaskName
+    task_state = [string]$task.State
+    listener_pid = [int]$process.Id
+    process_start_utc = $process.StartTime.ToUniversalTime().ToString('o')
+    install_id = [string]$installId
+    config_digest = [string]$probe.config_digest
+    release = [ordered]@{{
+      version = [string]$probe.release.version
+      source_commit = [string]$embedded.source_commit
+      source_sha256 = [string]$probe.release.source_sha256
+      role = 'native'
+    }}
+    health_install_id = [string]$health.install.install_id
+    health_config_digest = [string]$health.install.config_digest
+    health_release = [ordered]@{{
+      version = [string]$health.release.version
+      source_commit = [string]$health.release.source_commit
+      source_sha256 = [string]$health.release.source_sha256
+      role = [string]$health.release.role
+    }}
+  }}
+}}
+try {{
+  $first = Get-Sample
+  Start-Sleep -Seconds 1
+  $second = Get-Sample
+  $firstJson = $first | ConvertTo-Json -Depth 8 -Compress
+  $secondJson = $second | ConvertTo-Json -Depth 8 -Compress
+  if ($firstJson -ne $secondJson) {{
+    throw 'two status probes returned different process or install identity'
+  }}
+  @{{
+    passed = $true
+    sample = $first
+  }} | ConvertTo-Json -Depth 8 -Compress
+}} catch {{
+  @{{
+    passed = $false
+    error = $_.Exception.Message
+  }} | ConvertTo-Json -Depth 8 -Compress
+  exit 1
+}}
+"""
+ssh_bin = os.environ.get("SOLIDWORKS_SSH_BIN", "ssh")
+try:
+    completed = subprocess.run(
+        [
+            ssh_bin,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            host,
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "-",
+        ],
+        input=script,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+except (OSError, subprocess.TimeoutExpired) as error:
+    raise SystemExit(f"operatorctl status: Windows probe failed: {error}") from error
+if completed.returncode != 0:
+    raise SystemExit(
+        "operatorctl status: Windows probe failed: "
+        + (completed.stderr or completed.stdout or "unknown failure").strip()[:1000]
+    )
+try:
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+except (IndexError, ValueError) as error:
+    raise SystemExit("operatorctl status: Windows probe returned no JSON") from error
+if not isinstance(result, dict) or result.get("passed") is not True:
+    raise SystemExit(
+        "operatorctl status: "
+        + str(result.get("error") if isinstance(result, dict) else "invalid result")
+    )
+sample = result.get("sample")
+if (
+    not isinstance(sample, dict)
+    or sample.get("task_name") != task_name
+    or sample.get("task_state") != "Running"
+    or sample.get("install_id") != identity["install_id"]
+    or sample.get("config_digest") != identity["config_digest"]
+    or sample.get("health_install_id") != identity["install_id"]
+    or sample.get("health_config_digest") != identity["config_digest"]
+    or sample.get("release") != identity["release"]
+    or sample.get("health_release") != identity["release"]
+    or type(sample.get("listener_pid")) is not int
+    or not isinstance(sample.get("process_start_utc"), str)
+    or not sample["process_start_utc"]
+):
+    raise SystemExit("operatorctl status: Windows process/identity probe differs from the install record")
+print(
+    json.dumps(
+        {
+            "task_name": task_name,
+            "task_state": "Running",
+            "listener_pid": sample["listener_pid"],
+            "process_start_utc": sample["process_start_utc"],
+            "install_id": sample["install_id"],
+            "config_digest": sample["config_digest"],
+        },
+        sort_keys=True,
+    )
+)
+PY
+}
+
 load_installed() {
   OPERATOR_STATE_DIR="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
@@ -1074,6 +1472,8 @@ case "$ACTION" in
     [ -f "$START_STATE_ROOT/resolved.env" ] \
       || die "not installed: $START_STATE_ROOT/resolved.env is missing (run install first)"
     load_env_file "$START_STATE_ROOT/resolved.env"
+    STATE_ROOT="$START_STATE_ROOT"
+    acquire_maintenance_lock "$STATE_ROOT"
     ensure_postgres_ready
     platform_close_admission "start-window" "operatorctl start"
     load_active_env ;;
@@ -1088,6 +1488,7 @@ case "$ACTION" in
       # and admission stay untouched.  The channel is closed-window only: it refuses while
       # the admission is open.
       load_running_env
+      acquire_maintenance_lock "$STATE_ROOT"
       CANDIDATE_ID="$INSTALL_ID"
       RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
       [ -f "$RECEIPT_DIR/receipt.json" ] \
@@ -1230,6 +1631,11 @@ GUARD
 esac
 
 case "$ACTION" in
+  drain|stop|reconcile|stage|promote|rollback)
+    acquire_maintenance_lock "$STATE_ROOT" ;;
+esac
+
+case "$ACTION" in
   install)
     RENDER_LOG="$(mktemp)"
     TOOLCHAIN_LOG="$(mktemp)"
@@ -1342,13 +1748,15 @@ case "$ACTION" in
     # unpause and the platform open are the two state transitions of a plain start, and the
     # flagged start skips both (services up, admission closed; a later plain start re-verifies
     # and opens).  A failure above this point never opens anything.
-    if [ -z "$KEEP_ADMISSION_CLOSED" ]; then
-      airflow_unpause_dag
-    fi
     systemctl --user enable --now description-portal.service description-operator-proxy.service \
       || die "ingress services failed to start; the platform admission stays closed"
     systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
       || die "ingress services are not active; the platform admission stays closed"
+    instance_lifecycle_resume "$ACTIVE_ID" "$STATE_ROOT/install-record.json" \
+      || die "the Windows endpoint did not resume under the active install identity; admission stays closed"
+    if [ -z "$KEEP_ADMISSION_CLOSED" ]; then
+      airflow_unpause_dag
+    fi
     if [ -n "$KEEP_ADMISSION_CLOSED" ]; then
       # Identical checks and services, but nothing is opened (never open-then-close): the
       # start-window close above is the only admission transition that was written.
@@ -1399,13 +1807,29 @@ case "$ACTION" in
     systemctl --user disable --now description-operator-proxy.service description-portal.service || true
     ADMISSION_RC=0
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf || ADMISSION_RC=$?
-    airflow_lifecycle stop
+    if [ -n "$KEEP_DATABASE" ]; then
+      airflow_lifecycle stop-executors
+      state="$(systemctl --user is-active description-postgres.service 2>/dev/null || true)"
+      [ "$state" = "active" ] \
+        || die "the managed PostgreSQL unit is ${state:-unknown}; --keep-database refused"
+      echo "stop complete: supported writers are stopped; PostgreSQL remains active"
+    else
+      airflow_lifecycle stop
+    fi
     exit "$ADMISSION_RC"
     ;;
   status)
     load_installed
-    drift_check || true
-    systemctl --user is-active "${UNITS[@]}" || true
+    STATUS_RC=0
+    drift_check || STATUS_RC=1
+    STATUS_SYSTEMCTL="${SYSTEMCTL_BIN:-systemctl}"
+    for unit in "${UNITS[@]}"; do
+      state="$("$STATUS_SYSTEMCTL" --user is-active "$unit" 2>/dev/null || true)"
+      printf '%s %s\n' "$unit" "${state:-unknown}"
+      [ "$state" = "active" ] || STATUS_RC=1
+    done
+    windows_status_check || STATUS_RC=1
+    exit "$STATUS_RC"
     ;;
   health)
     load_installed
@@ -2100,30 +2524,31 @@ PY
         || die "orphan recovery requires --native-receipt, --native-run-id, --orphan-operation-id --orphan-task-id and --orphan-map-index together"
       [ "$OUTCOME" = "failed" ] || die "orphan recovery records the observed failed outcome only"
       [[ "$ORPHAN_MAP_INDEX" =~ ^-?[0-9]+$ ]] || die "--orphan-map-index must be an integer"
-      [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
     fi
-    if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]; then
-      [ -n "$NATIVE_DERIVED" ] && [ -n "$NATIVE_ARCHIVE" ] \
-        && [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] \
-        && [ "$REPORTED_STAGE" = "capture" ] \
-        && [ -n "$INSTALL_ID" ] \
+    if [ "$STAGE" = "discover" ] && [ "$OUTCOME" = "failed" ] && [ "$REPORTED_STAGE" = "capture" ]; then
+      [ -n "$INSTALL_ID" ] \
         && [ -n "$RUN_ID" ] && [ -n "$NATIVE_RECEIPT" ] && [ -n "$NATIVE_RUN_ID" ] \
         && [ -n "$ORPHAN_OPERATION_ID" ] && [ -n "$ORPHAN_TASK_ID" ] && [ -n "$ORPHAN_MAP_INDEX" ] \
         || die "native capture recovery requires the complete discover/capture receipt and operation binding"
       [ "$NATIVE_RUN_ID" = "$RUN_ID" ] || die "the native receipt names another run"
-      [ -d "$NATIVE_DERIVED" ] || die "the derived prepared directory is missing: $NATIVE_DERIVED"
-      [ -f "$NATIVE_ARCHIVE" ] || die "the capture-request archive is missing: $NATIVE_ARCHIVE"
       (
         set -a
         . "$ENV_FILE"
         set +a
-        args=(--run-id "$RUN_ID" --job "$NATIVE_RECEIPT" --derived "$NATIVE_DERIVED" \
-          --archive "$NATIVE_ARCHIVE" --operation-id "$ORPHAN_OPERATION_ID" \
+        args=(--run-id "$RUN_ID" --job "$NATIVE_RECEIPT" --operation-id "$ORPHAN_OPERATION_ID" \
           --task-id "$ORPHAN_TASK_ID" --map-index "$ORPHAN_MAP_INDEX")
+        [ -z "$NATIVE_DERIVED" ] || args+=(--derived "$NATIVE_DERIVED")
+        [ -z "$NATIVE_ARCHIVE" ] || args+=(--archive "$NATIVE_ARCHIVE")
         for item in "${EVIDENCE[@]}"; do args+=(--evidence "$item"); done
         "$AIRFLOW_VENV/bin/python" "$HERE/reconcile-native-capture.py" "${args[@]}"
       )
       exit $?
+    fi
+    if [ -n "$NATIVE_DERIVED$NATIVE_ARCHIVE" ]; then
+      die "native capture recovery inputs require --stage discover --outcome failed --reported-stage capture"
+    fi
+    if [ -n "$ORPHAN_INPUTS" ]; then
+      [ -f "$NATIVE_RECEIPT" ] || die "the native failed receipt is missing: $NATIVE_RECEIPT"
     fi
     # Every reconcile shape consumes the generation DSNs: read them back from the derived
     # environment file so the canonical action always runs against the controlled values.

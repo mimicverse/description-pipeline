@@ -155,6 +155,7 @@ class RebuildCarrierTests(unittest.TestCase):
                     "name": "tool_mount",
                     "parent": "arm_link",
                     "coordinate_system": "TCP_tool_mount",
+                    "source_name": "TCP_tool_mount",
                 }
             ],
         )
@@ -176,18 +177,51 @@ class RebuildCarrierTests(unittest.TestCase):
             record["datums"].append(datum)
             return record
 
-        duplicate = with_datum("TCP_tool_mount", "arm-1")
-        duplicate["datums"].append(copy.deepcopy(duplicate["datums"][-1]))
         cases = (
-            ("duplicate frame name", duplicate),
-            ("non snake suffix", with_datum("TCP_Tool-Mount", "arm-1")),
             ("unowned datum", with_datum("TCP_orphan", "ghost-1")),
-            ("body name collision", with_datum("TCP_base_link", "arm-1")),
             ("ownerless without a base", with_datum("TCP_top_mount", "")),
         )
         for label, record in cases:
             with self.subTest(case=label), self.assertRaises(_Failure):
                 rebuild_interface_frames(record)
+        self.assertEqual(
+            rebuild_interface_frames(with_datum("TCP_ToolPoint", "arm-1"))[0]["name"],
+            "tool_point_tcp",
+        )
+
+    def test_interface_frame_collision_is_independent_of_datum_order(self) -> None:
+        base = oracle_fixtures.native_record()
+        twin = base["datums"][1]
+
+        def mapping(order):
+            record = copy.deepcopy(base)
+            for name in order:
+                datum = copy.deepcopy(twin)
+                datum["name"], datum["owner"] = name, "arm-1"
+                record["datums"].append(datum)
+            frames = rebuild_interface_frames(
+                record,
+                bodies=[
+                    {
+                        "name": "base_link",
+                        "components": ["base-1"],
+                        "frame": {"coordinate_system": "CS_base_link"},
+                    },
+                    {
+                        "name": "arm_link",
+                        "components": ["arm-1"],
+                        "frame": {"coordinate_system": "CS_arm_link"},
+                    }
+                ],
+            )
+            self.assertTrue(all(frame["source_name"] == frame["coordinate_system"] for frame in frames))
+            return {frame["coordinate_system"]: frame["name"] for frame in frames}
+
+        first = mapping(["TCP_Tool", "CS_tool_tcp"])
+        reordered = mapping(["CS_tool_tcp", "TCP_Tool"])
+        self.assertEqual(first, reordered)
+        self.assertEqual(len(set(first.values())), 2)
+        self.assertTrue(all(name.endswith("_tcp") for name in first.values()))
 
     def test_missing_or_ambiguous_frame_datum_fails_closed(self) -> None:
         payload, _output = self._prepared(oracle_fixtures.native_record())

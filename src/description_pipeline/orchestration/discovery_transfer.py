@@ -90,10 +90,9 @@ MAX_REQUEST_BYTES = 512 * 1024 * 1024
 #: contract files plus the embedded controlled records (``records/<sha8>_<stem>.txt``).
 _EMBEDDED_RECORD_MEMBER = re.compile(rf"{re.escape(RECORD_DIR)}/[0-9a-f]{{8}}_[0-9A-Za-z._-]{{1,48}}\.txt")
 _GENERATED_MEMBERS = frozenset({SOURCE_FILE, DISCOVERY_FILE, FINDINGS_FILE, IDENTITY_FILE, PLAN_FILE})
-#: The content identity (source.json) and the identity resolution are written
-#: only once the administrative identity is nameable; the raw discovery and
-#: its findings always travel, so only those are required members.
-_REQUIRED_GENERATED = frozenset({DISCOVERY_FILE, FINDINGS_FILE, PLAN_FILE})
+#: Capture cannot consume a prepared package without its content identity or
+#: capture plan, so both are required before a request may cross to Windows.
+_REQUIRED_GENERATED = frozenset({SOURCE_FILE, DISCOVERY_FILE, FINDINGS_FILE, PLAN_FILE})
 
 _RECORD_MANIFEST_KEYS = frozenset(
     {

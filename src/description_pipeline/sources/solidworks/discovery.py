@@ -63,23 +63,26 @@ import ntpath
 import re
 import shutil
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Mapping, Sequence
 
 from ...io import PipelineError, artifact_path_parts, confined, digest, inventory, parse_data, read_data
-from ...interface_records import (
-    PREVIEW_RANGE_KEYS,
-    PREVIEW_RANGE_SCHEMA,
-    PURPOSE_ENGINEERING,
-    PURPOSE_INSPECTION_PREVIEW,
-    preview_revolute_window_rad,
-)
+from ...interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 from ...request_evidence import read_request_evidence
 from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
+from .native_limits import (
+    PREVIEW_POLICY_ID,
+    PREVIEW_WINDOW_RAD,
+    limit_mate_scope,
+    native_limit_inventory_complete,
+    validate_native_limit,
+)
+from .direction import canonicalize_axis
+from .naming import robot_name as format_robot_name
 from .revision import package_inventory
 from .session_artifacts import session_materialization_under_root, session_root_pid
 from ...schemas import SOURCE_RECORD_SCHEMA, exporter_declaration_present
@@ -114,10 +117,10 @@ _IDENTITY_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 _GIT_COMMIT = re.compile(r"\b[0-9a-f]{40}(?:[0-9a-f]{24})?\b")
 
 #: Datum name spaces the spec recognises: link frames, tool/sensor interfaces
-#: and joint frames.  A datum is ``<PREFIX>_<snake_case>``: the suffix must be
-#: exact snake_case before any transformation, so ``TCP_Tool`` blocks instead
-#: of silently becoming ``tcp_tool``.  Any owned ``CS_*`` datum that is not the
-#: body's link datum is a named interface frame.
+#: and joint frames. A datum is ``<PREFIX>_<semantic suffix>``; non-conforming
+#: suffixes are retained as source names, normalized by the shared rule and
+#: disambiguated from stable native identity. Any owned ``CS_*`` datum that is
+#: not the body's link datum is a named interface frame.
 INTERFACE_PREFIXES = ("CS_", "TCP_", "SCS_")
 JCS_PREFIX = "JCS_"
 _TOL = 1e-6
@@ -151,17 +154,16 @@ def _finding(code: str, obj: str, message: str, detail: Any = None, *, blocking:
 
 @dataclass(frozen=True)
 class DiscoverySettings:
-    """The platform-controlled inputs: records, published names, the entry and the purpose.
+    """The platform-controlled inputs: records, the entry and the purpose.
 
     ``purpose`` mirrors the frozen request solely as in-flight derivation input
-    (the persisted ``input/request.json`` remains the single purpose authority):
-    it selects which joint parameters may be proven missing and whether the
-    policy preview window or a bound preview declaration supplies them.  No
-    consumer may persist it as a second authority.
+    (the persisted ``input/request.json`` remains the single purpose authority).
+    Native joint limits and author declarations are derived from the CAD record;
+    the purpose never supplies a replacement range.  No consumer may persist the
+    input value as a second authority.
     """
 
     record_roots: tuple[Path, ...] = ()
-    frozen_names: Mapping[str, str] = field(default_factory=dict)
     main_assembly: str | None = None
     purpose: str = PURPOSE_ENGINEERING
 
@@ -1666,102 +1668,6 @@ def _resolve_record(settings: DiscoverySettings, reference: str, findings: list[
     }
 
 
-def _preview_number(value: Any) -> float:
-    """A finite real declaration number; booleans are not numeric facts."""
-
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return math.nan
-    number = float(value)
-    return number if math.isfinite(number) else math.nan
-
-
-def _declared_preview_range(
-    record: dict,
-    settings: DiscoverySettings,
-    findings: list[dict],
-    obj: str,
-    *,
-    joint: str,
-    instances: Sequence[str],
-) -> tuple[dict | None, dict | None]:
-    """Resolve one prismatic joint's bound finite preview declaration.
-
-    The declaration reuses the controlled-record reference: the resolved file's
-    digest and the parsed exact semantics (joint, instance, configuration, unit,
-    zero, direction, purpose and a finite ordered range) are all required - a
-    file that merely exists, or an anchor substring that merely matches, never
-    passes.  ``source_sha256`` is not part of the shape: the controlled-record
-    entry already owns and verifies the resolved file digest, so a second inner
-    digest claim would be provenance theatre.
-
-    The declared window is expressed in the declaration's own measure.  ``zero``
-    is the declared value that coincides with the joint's canonical zero and
-    ``direction`` (``+1``/``-1``) orients the declared positive sense against
-    the canonical positive axis, so the canonical window is
-    ``direction * (declared - zero)`` applied to both endpoints and ordered.
-    The mapping is always applied - a descriptor is never silently dropped, and
-    different zero/direction values yield different canonical bounds.
-    """
-
-    reference = (record.get("properties") or {}).get(f"{NAMESPACE}.joint.preview_range_record")
-    if not _text(reference):
-        findings.append(
-            _finding(
-                "discovery.joint_preview_range_missing",
-                obj,
-                "a prismatic joint with a proven-missing engineering range requires a bound finite "
-                "preview declaration",
-            )
-        )
-        return None, None
-    resolved = _resolve_record(settings, str(reference), findings, obj)
-    if resolved is None:
-        return None, None
-    value = resolved["value"]
-    if not isinstance(value, dict) or set(value) != PREVIEW_RANGE_KEYS:
-        findings.append(
-            _finding(
-                "discovery.joint_preview_range_invalid",
-                obj,
-                "preview declaration must carry exactly the bound finite semantics",
-                {"file": resolved["file"]},
-            )
-        )
-        return None, None
-    lower = _preview_number(value["lower"])
-    upper = _preview_number(value["upper"])
-    zero = _preview_number(value["zero"])
-    direction = value["direction"]
-    sign = 1.0 if direction == "+1" else -1.0 if direction == "-1" else math.nan
-    first, second = sign * (lower - zero), sign * (upper - zero)
-    configuration = str(record.get("saved_configuration") or "")
-    if (
-        value["schema_version"] != PREVIEW_RANGE_SCHEMA
-        or str(value["joint"]) != joint
-        or str(value["instance"]) not in {str(member) for member in instances}
-        or str(value["configuration"]) != configuration
-        or value["unit"] != "m"
-        or not math.isfinite(sign)
-        or value["purpose"] != PURPOSE_INSPECTION_PREVIEW
-        or not (math.isfinite(lower) and math.isfinite(upper) and math.isfinite(zero))
-        or not lower < upper
-        # The canonical endpoints the mapping actually produces must stay finite
-        # and strictly ordered: an overflowing or collapsing transform is refused.
-        or not (math.isfinite(first) and math.isfinite(second) and first != second)
-    ):
-        findings.append(
-            _finding(
-                "discovery.joint_preview_range_invalid",
-                obj,
-                "preview declaration does not bind this joint, instance, configuration, unit, zero, "
-                "direction, purpose and a finite ordered range",
-                {"file": resolved["file"]},
-            )
-        )
-        return None, None
-    return {"lower": min(first, second), "upper": max(first, second)}, resolved
-
-
 def _datum(record: dict, name: str | None, owners: Sequence[str]) -> dict | None:
     """The single datum of that name owned by one of ``owners``.
 
@@ -1794,27 +1700,6 @@ def _primary_mate(mates: list[dict], properties: dict) -> dict:
         if any(isinstance(entity.get("cylinder"), dict) for entity in _mate_entities(item)):
             return item
     return mates[0]
-
-
-def _declaration_joint_name(mates: list[dict], settings: DiscoverySettings, fallback: str) -> str:
-    """The canonical joint name a preview declaration must bind.
-
-    The independent rebuild derives it from the shared ``<joint>__<role>`` mate
-    head (with the frozen-name override); the derivation binds the same name so
-    the record can never attach to one naming and be read under another.
-    """
-
-    names = [str(item.get("name") or "") for item in mates]
-    heads: list[str] = []
-    for item in names:
-        head, separator, role = item.partition("__")
-        if not separator or not role:
-            heads = []
-            break
-        heads.append(head)
-    name = heads[0] if heads and len(set(heads)) == 1 else fallback
-    frozen = settings.frozen_names or {}
-    return str(frozen.get(names[0], name)) if names else fallback
 
 
 def _merged_joint_properties(
@@ -1866,6 +1751,11 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
     mate_properties = (record.get("properties") or {}).get("mates") or {}
     document_properties = (record.get("properties") or {}).get("document") or {}
     raw_mates = record.get("mates") or []
+    component_records = {
+        str(item.get("name2")): item
+        for item in record.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
     joints: list[dict] = []
     for (left, right), group in sorted(clusters.pairs.items()):
         if left not in clusters.of or right not in clusters.of or clusters.of[left] == clusters.of[right]:
@@ -1988,7 +1878,79 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             continue
         native_direction = [float(value) for value in shaft]
         if sign == -1:
+            # dp.joint.axis_sign is the CAD author's direction declaration on
+            # the undirected geometric axis.  Apply it, but never silently:
+            # record the object-level reversal and its linked fields.
             native_direction = [-value for value in native_direction]
+            findings.append(
+                _finding(
+                    "discovery.direction_sign_reversed",
+                    obj,
+                    "dp.joint.axis_sign=-1 selects the CAD author positive direction",
+                    {
+                        "native_identity": obj,
+                        "original_axis_assembly": [float(value) for value in shaft],
+                        "output_axis_assembly": native_direction,
+                        "original_frame": "assembly",
+                        "output_frame": "assembly; the joint record transforms it to the child frame",
+                        "reason": "CAD author dp.joint.axis_sign=-1",
+                        "transformation": "decode_author_sign",
+                        "rule_id": "direction.native_axis_sign",
+                        "rule_version": "v1",
+                        "applicability_evidence": {
+                            "property": f"{NAMESPACE}.joint.axis_sign",
+                            "value": sign,
+                            "joint_type": joint_type,
+                            "native_shaft": [float(value) for value in shaft],
+                        },
+                        "before_after": {
+                            "q_sign": 1,
+                            "axis": {
+                                "before": [float(value) for value in shaft],
+                                "after": native_direction,
+                            },
+                            "limits": "unchanged; the native range is already expressed in author q",
+                            "range_transform": "not_applied",
+                            "drive": "unchanged; non-negative magnitude fields are not negated",
+                        },
+                        "delivery_surfaces": {
+                            "report": "quality diagnostics and discovery finding",
+                            "urdf_source_record": "axis provenance and model warning",
+                            "preview": "quality diagnostics",
+                            "pr": "object-level direction author sign line",
+                        },
+                        "model_warning": {
+                            "code": "direction.author_sign_applied",
+                            "fields": [
+                                "native_joint_identity",
+                                "native_sign",
+                                "sign_reversal",
+                                "original_axis_assembly",
+                                "output_axis_assembly",
+                                "actual_child_axis",
+                                "original_frame",
+                                "output_frame",
+                                "model_frame",
+                                "q_sign",
+                                "range_transform",
+                                "limits_before",
+                                "limits_after",
+                                "drive_before",
+                                "drive_after",
+                                "limits_status",
+                                "drive_status",
+                            ],
+                            "note": (
+                                "delivery-surface summary; this discovery finding remains "
+                                "the authoritative evidence"
+                            ),
+                        },
+                        "warning_does_not_authorize": True,
+                        "warning_does_not_replace_evidence": True,
+                    },
+                    blocking=False,
+                )
+            )
         cylinder_entity = next(
             (
                 item
@@ -2018,6 +1980,70 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         limit_evidence = None
         limit_source = None
         native = group["limits"]
+        native_limit_values = set()
+        native_limit_errors = []
+        for mate_item in mates:
+            mate_kind = str(mate_item.get("type") or "").strip().lower()
+            if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                continue
+            if mate_item.get("suppressed") is True:
+                continue
+            if mate_item.get("suppressed") is not False or mate_item.get("error_code") != 0:
+                native_limit_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "suppression or solve state is not clean"}
+                )
+                continue
+            flag = mate_item.get("is_advanced_mate")
+            if type(flag) is not bool or mate_item.get("is_advanced_mate_error") is not None:
+                native_limit_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                )
+                continue
+            if flag is not True:
+                continue
+            if mate_kind not in {"limitdistance", "limitangle"}:
+                native_limit_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "advanced flag on a standard mate"}
+                )
+                continue
+            try:
+                lower, upper, unit = validate_native_limit(mate_item, component_records)
+            except ValueError as error:
+                native_limit_errors.append({"mate": mate_item.get("name"), "reason": str(error)})
+                continue
+            expected_unit = "m" if joint_type == "prismatic" else "rad"
+            if unit != expected_unit:
+                native_limit_errors.append(
+                    {
+                        "mate": mate_item.get("name"),
+                        "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
+                    }
+                )
+                continue
+            native_limit_values.add((lower, upper, unit))
+        if native_limit_errors:
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_unreadable",
+                    obj,
+                    "native position-limit evidence is incomplete or unreadable",
+                    {"errors": native_limit_errors},
+                )
+            )
+            continue
+        if len(native_limit_values) > 1:
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_conflict",
+                    obj,
+                    "native position-limit observations disagree for one joint",
+                    {"ranges": sorted(native_limit_values)},
+                )
+            )
+            continue
+        if native_limit_values:
+            lower, upper, unit = next(iter(native_limit_values))
+            native = {"lower": lower, "upper": upper, "unit": unit}
         if joint_type == "continuous":
             if isinstance(native, dict):
                 findings.append(
@@ -2081,64 +2107,18 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                         continue
                     limit_evidence = declared
         else:
-            record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
-            if _text(record_ref):
-                resolved = _resolve_record(settings, str(record_ref), findings, obj)
-                if resolved is None:
-                    continue
-                try:
-                    lower = float(resolved["value"]["lower"])
-                    upper = float(resolved["value"]["upper"])
-                except (KeyError, TypeError, ValueError):
-                    findings.append(
-                        _finding(
-                            "discovery.joint_limits_invalid",
-                            obj,
-                            "controlled record lacks finite lower/upper limits",
-                            {"file": resolved["file"]},
-                        )
-                    )
-                    continue
-                if not (math.isfinite(lower) and math.isfinite(upper)):
-                    findings.append(
-                        _finding("discovery.joint_limits_invalid", obj, "controlled position limits must be finite")
-                    )
-                    continue
-                limits = {"lower": lower, "upper": upper}
-                limit_evidence = resolved
-                limit_source = "controlled"
-            elif settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "revolute":
-                radius = preview_revolute_window_rad()
-                limits = {"lower": -radius, "upper": radius}
-                limit_source = "policy_preview_window"
-            elif settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
-                limits, limit_evidence = _declared_preview_range(
-                    {"properties": properties, "saved_configuration": record.get("saved_configuration")},
-                    settings,
-                    findings,
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_missing",
                     obj,
-                    joint=_declaration_joint_name(mates, settings, name),
-                    instances=(str(left), str(right)),
+                    "the active CAD constraints provide no native position range",
                 )
-                if limits is None:
-                    continue
-                limit_source = "declared_preview_window"
+            )
+            continue
         if joint_type != "continuous" and limits is None:
-            if settings.purpose == PURPOSE_INSPECTION_PREVIEW and joint_type == "prismatic":
-                findings.append(
-                    _finding(
-                        "discovery.joint_preview_range_missing",
-                        obj,
-                        "a prismatic joint with a proven-missing engineering range requires a bound finite "
-                        "preview declaration",
-                    )
-                )
-            else:
-                findings.append(
-                    _finding(
-                        "discovery.joint_limits_missing", obj, "no native or controlled position range for this joint"
-                    )
-                )
+            findings.append(
+                _finding("discovery.joint_limits_missing", obj, "no native position range for this joint")
+            )
             continue
         drive = None
         drive_source = "absent"
@@ -2148,11 +2128,6 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             if drive is None:
                 continue
             drive_source = "controlled"
-        elif settings.purpose != PURPOSE_INSPECTION_PREVIEW:
-            findings.append(
-                _finding("discovery.joint_drive_missing", obj, "no controlled drive specification for this joint")
-            )
-            continue
         if drive is not None:
             spec = drive["value"]
             try:
@@ -2189,6 +2164,15 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     "point": [float(value) for value in (group["point"] or [0.0, 0.0, 0.0])],
                     "direction": native_direction,
                     "source": "mate",
+                    "native_direction": [float(value) for value in shaft],
+                    "direction_relation": "author_sign_applied",
+                    "native_sign": sign,
+                    "sign_reversal": sign == -1,
+                    "sign_warning": "discovery.direction_sign_reversed" if sign == -1 else None,
+                    "original_frame": "assembly",
+                    "output_frame": "assembly",
+                    "rule_id": "direction.native_axis_sign",
+                    "rule_version": "v1",
                 },
                 "axis_reference": axis_reference,
                 "limits": limits,
@@ -2540,9 +2524,215 @@ def _exporter_reference(value: Any, findings: list[dict], obj: str) -> dict | No
     return {"kind": "reference_axis", "component": component, "feature_name": feature}
 
 
+def _apply_cad_names(
+    bodies: list[dict],
+    joints: list[dict],
+    clusters: _Clusters,
+    findings: list[dict],
+    *,
+    root: str | None = None,
+) -> None:
+    """Derive output names from CAD datums/reference axes through one rule."""
+
+    from .naming import (
+        carrier_names_and_rules,
+        joint_name as format_joint_name,
+        link_name as format_link_name,
+    )
+
+    body_names, joint_names, body_rules, joint_rules = carrier_names_and_rules(
+        bodies, joints, str(root) if root is not None else ""
+    )
+
+    for body in bodies:
+        native = str(body["name"])
+        datum = str(body.get("datum") or "")
+        semantic = datum or native
+        rule = body_rules.get(native)
+        if rule is not None:
+            body["name_rule"] = dict(rule)
+            findings.append(
+                _finding(
+                    "discovery.interface_role_convention",
+                    f"body:{native}",
+                    "the link name follows the versioned joint-role and child-topology convention",
+                    {
+                        "datum": datum,
+                        "native": native,
+                        "output": body_names[native],
+                        "rule_id": rule["rule_id"],
+                        "rule_version": rule["rule_version"],
+                    },
+                    blocking=False,
+                )
+            )
+            continue
+        try:
+            datum_target = format_link_name(semantic, root=semantic == "base_link")
+        except ValueError:
+            datum_target = None
+        if datum_target != body_names[native]:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_invalid",
+                    f"body:{native}",
+                    "the native datum cannot produce a unique valid output link name; "
+                    "a neutral or deterministic fallback is used",
+                    {"datum": datum, "name": native, "output": body_names[native]},
+                    blocking=False,
+                )
+            )
+
+    for joint in joints:
+        if "name" not in joint:
+            continue
+        native = str(joint["name"])
+        rule = joint_rules.get(native)
+        if rule is not None:
+            joint["name_rule"] = dict(rule)
+            findings.append(
+                _finding(
+                    "discovery.interface_role_convention",
+                    f"joint:{native}",
+                    "the joint name follows the versioned joint-role and child-topology convention",
+                    {
+                        "native": native,
+                        "output": joint_names[native],
+                        "rule_id": rule["rule_id"],
+                        "rule_version": rule["rule_version"],
+                    },
+                    blocking=False,
+                )
+            )
+            continue
+        try:
+            datum_target = (
+                format_joint_name(native) if joint.get("type") != "fixed" else joint_names[native]
+            )
+        except ValueError:
+            datum_target = None
+        if datum_target != joint_names[native]:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_invalid",
+                    f"joint:{native}",
+                    "the native joint name cannot produce a unique valid output joint name; "
+                    "a neutral or deterministic fallback is used",
+                    {"name": native, "output": joint_names[native]},
+                    blocking=False,
+                )
+            )
+        if joint.get("type") != "fixed" and not any(
+            word in {"roll", "pitch", "yaw"} for word in joint_names[native].split("_")
+        ):
+            findings.append(
+                _finding(
+                    "discovery.interface_motion_unresolved",
+                    f"joint:{native}",
+                    "the CAD name does not classify a motion; a neutral joint name is retained",
+                    {"native": native, "output": joint_names[native]},
+                    blocking=False,
+                )
+            )
+    for body in bodies:
+        source_name = str(body["name"])
+        body["source_name"] = source_name
+        body["name"] = body_names[source_name]
+    clusters.members = {
+        body_names.get(name, name): members for name, members in clusters.members.items()
+    }
+    clusters.of = {
+        component: body_names.get(owner, owner) for component, owner in clusters.of.items()
+    }
+    for joint in joints:
+        if "name" not in joint:
+            continue
+        source_name = str(joint["name"])
+        joint["source_name"] = source_name
+        joint["parent"] = body_names.get(str(joint["parent"]), str(joint["parent"]))
+        joint["child"] = body_names.get(str(joint["child"]), str(joint["child"]))
+        joint["name"] = joint_names[source_name]
+
+
 def _body_datum(record: dict, body: dict) -> dict | None:
     owners = [body["datum_owner"]] if "datum_owner" in body else body["owners"]
     return _datum(record, body["datum"], owners)
+
+
+def _apply_mate_direction(record: dict, bodies: list[dict], joints: list[dict], findings: list[dict]) -> None:
+    """Record the CAD-first audit for mate-derived joints without changing values."""
+
+    by_name = {str(body["name"]): body for body in bodies}
+    for joint in joints:
+        if "name" not in joint or joint.get("type") == "fixed":
+            continue
+        if joint.get("axis", {}).get("source") != "mate":
+            continue
+        parent = by_name.get(str(joint.get("parent")))
+        child = by_name.get(str(joint.get("child")))
+        parent_datum = _body_datum(record, parent) if parent else None
+        if parent_datum is None:
+            ownerless = [
+                item
+                for item in record.get("datums") or []
+                if isinstance(item, dict) and item.get("name") == "CS_base_link"
+            ]
+            if len(ownerless) == 1:
+                parent_datum = ownerless[0]
+        child_datum = _body_datum(record, child) if child else None
+        parent_array = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
+        child_array = _finite_vector(child_datum.get("array"), 16) if child_datum else None
+        local = _axis_in_child(joint, child_datum) if child_datum else None
+        if parent_array is None or child_array is None or local is None:
+            findings.append(
+                _finding(
+                    "direction.reference_frame_invalid",
+                    f"joint:{joint['name']}",
+                    "mate-derived joint has no readable parent/child datum or local axis",
+                )
+            )
+            continue
+        try:
+            semantic = canonicalize_axis(
+                str(joint["name"]),
+                local,
+                parent_array,
+                child_array,
+                joint_type=str(joint["type"]),
+            )
+        except ValueError as error:
+            findings.append(
+                _finding(
+                    "direction.invalid",
+                    f"joint:{joint['name']}",
+                    "positive-motion semantics could not be evaluated",
+                    {"error": str(error)},
+                )
+            )
+            continue
+        joint["axis"].update(
+            parent_direction=semantic["parent_axis"],
+            parent_axis=semantic["parent_axis"],
+            delivered_local_axis=semantic["delivered_local_axis"],
+            status=semantic["status"],
+            direction_relation=semantic["status"],
+            motion=semantic["motion"],
+            classification_source=semantic["classification_source"],
+            alignment=semantic["alignment"],
+            reason=semantic["reason"],
+            rule_id=semantic["rule_id"],
+            rule_version=semantic["rule_version"],
+        )
+        if semantic["status"] != "local_class_aligned":
+            findings.append(
+                _finding(
+                    "direction.semantics_unresolved",
+                    f"joint:{joint['name']}",
+                    "the authored CAD axis is preserved; its motion class is not proven",
+                    semantic,
+                    blocking=False,
+                )
+            )
 
 
 def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str, str], dict]:
@@ -2632,8 +2822,15 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
 
 
 def _exporter_constraint_checks(
-    declaration: dict, clusters: _Clusters, joints: list[dict], findings: list[dict]
+    declaration: dict,
+    clusters: _Clusters,
+    joints: list[dict],
+    findings: list[dict],
+    *,
+    record: dict | None = None,
+    settings: DiscoverySettings | None = None,
 ) -> None:
+    native_limits: dict[str, list[dict]] = {str(joint["name"]): [] for joint in joints}
     descendants: dict[str, set[str]] = {link["name"]: {link["name"]} for link in declaration["links"]}
     for link in reversed(declaration["links"]):
         if link["parent"] is not None:
@@ -2693,6 +2890,7 @@ def _exporter_constraint_checks(
                 limits = constraint["limits"]
                 if not isinstance(limits, dict):
                     continue
+                native_limits[str(joint["name"])].append(limits)
                 expected = "m" if joint["type"] == "prismatic" else "rad"
                 declared = joint.get("limits") or {}
                 if limits.get("unit") != expected or any(
@@ -2706,9 +2904,9 @@ def _exporter_constraint_checks(
                             {**detail, "native": limits, "declared": declared},
                         )
                     )
-
-
-def _exporter_axis(record: dict, declared: dict, body: dict, findings: list[dict]) -> tuple[dict, dict | None]:
+def _exporter_axis(
+    record: dict, declared: dict, body: dict, parent_body: dict | None, findings: list[dict]
+) -> tuple[dict, dict | None]:
     obj = f"joint:{declared['name']}"
     selector = _exporter_reference(declared.get("axis_name"), findings, obj)
     axis = {"point": None, "direction": None, "source": "exporter"}
@@ -2799,6 +2997,47 @@ def _exporter_axis(record: dict, declared: dict, body: dict, findings: list[dict
                 {"declared": signed, "native": direction},
             )
         )
+    parent_datum = _body_datum(record, parent_body) if parent_body is not None else None
+    parent_transform = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
+    if parent_transform is None:
+        findings.append(
+            _finding(
+                "direction.reference_frame_invalid",
+                obj,
+                "the parent body's local mechanical datum is not a finite 4x4 transform",
+            )
+        )
+        return axis, selector
+    try:
+        semantic = canonicalize_axis(
+            declared["name"],
+            local,
+            parent_transform,
+            transform,
+            joint_type=declared["type"],
+        )
+    except ValueError as error:
+        findings.append(
+            _finding(
+                "direction.invalid",
+                obj,
+                "positive-motion semantics could not be evaluated",
+                {"error": str(error)},
+            )
+        )
+        return axis, selector
+    if semantic["status"] != "local_class_aligned":
+        findings.append(
+            _finding(
+                "direction.semantics_unresolved",
+                obj,
+                "the authored CAD axis is preserved; its motion class is not proven",
+                semantic,
+                blocking=False,
+            )
+        )
+    delivered_local = semantic["delivered_local_axis"]
+    canonical_assembly = signed
     origin = [transform[3], transform[7], transform[11]]
     offset = _axis_offset(point, origin, direction)
     if offset > AXIS_OFFSET_TOL_M:
@@ -2810,7 +3049,22 @@ def _exporter_axis(record: dict, declared: dict, body: dict, findings: list[dict
                 {"offset_m": offset},
             )
         )
-    axis.update(point=point, direction=signed)
+    axis.update(
+        point=point,
+        direction=canonical_assembly,
+        parent_direction=semantic["parent_axis"],
+        parent_axis=semantic["parent_axis"],
+        native_direction=semantic["parent_axis"],
+        assembly_direction=signed,
+        delivered_local_axis=delivered_local,
+        direction_relation=semantic["status"],
+        motion=semantic["motion"],
+        classification_source=semantic["classification_source"],
+        alignment=semantic["alignment"],
+        reason=semantic["reason"],
+        rule_id=semantic["rule_id"],
+        rule_version=semantic["rule_version"],
+    )
     return axis, selector
 
 
@@ -2867,8 +3121,61 @@ def _exporter_origin(declared: dict, child: dict, parent: dict, record: dict, fi
         )
 
 
-def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], findings: list[dict]) -> list[dict]:
+def _exporter_joint_facts(
+    record: dict,
+    declaration: dict,
+    bodies: list[dict],
+    findings: list[dict],
+    *,
+    purpose: str = PURPOSE_ENGINEERING,
+) -> list[dict]:
     by_name = {body["name"]: body for body in bodies}
+    component_records = {
+        str(item.get("name2")): item
+        for item in record.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
+    children: dict[str, set[str]] = {}
+    for link in declaration["links"]:
+        if link["parent"] is not None:
+            children.setdefault(str(link["parent"]), set()).add(str(link["name"]))
+    component_owners: dict[str, set[str]] = {}
+    for body in bodies:
+        for component in {*body.get("owners", []), *body.get("components", [])}:
+            component_owners.setdefault(str(component), set()).add(str(body["name"]))
+
+    def child_tree(root: str) -> set[str]:
+        result = {root}
+        frontier = [root]
+        while frontier:
+            current = frontier.pop()
+            for child in children.get(current, set()):
+                if child not in result:
+                    result.add(child)
+                    frontier.append(child)
+        return result
+
+    def owner_for(component: str) -> str | None:
+        owners = component_owners.get(component, set())
+        return next(iter(owners)) if len(owners) == 1 else None
+
+    root_name = str(declaration.get("root") or "")
+    root_body = by_name.get(root_name)
+    root_datum = str(root_body.get("datum") or "") if root_body is not None else ""
+    ownerless_root = (
+        [
+            item
+            for item in record.get("datums") or []
+            if isinstance(item, dict) and str(item.get("name")) == root_datum and item.get("owner") == ""
+        ]
+        if root_name and root_datum
+        else []
+    )
+    assembly_owner = root_name if len(ownerless_root) == 1 else None
+    preview_allowed = purpose == PURPOSE_INSPECTION_PREVIEW and native_limit_inventory_complete(
+        record.get("mates")
+    )
+
     joints = []
     for link in declaration["links"]:
         if link["parent"] is None:
@@ -2895,11 +3202,14 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 )
             )
         child, parent = by_name[link["name"]], by_name[link["parent"]]
+        subtree = child_tree(str(child["name"]))
         _exporter_origin(declared, child, parent, record, findings)
         axis, selector = ({"point": None, "direction": None, "source": "exporter"}, None)
         if kind != "fixed":
-            axis, selector = _exporter_axis(record, declared, child, findings)
+            axis, selector = _exporter_axis(record, declared, child, parent, findings)
         limits = declared["limits"]
+        limit_source = "declared_author" if isinstance(limits, dict) else None
+        preview_policy = None
         if kind != "fixed":
 
             def valid(value):
@@ -2918,7 +3228,161 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                         limits,
                     )
                 )
-            elif kind != "continuous" and limits["lower"] == limits["upper"]:
+            native_values = set()
+            native_errors = []
+            for mate in record.get("mates") or []:
+                if not isinstance(mate, dict):
+                    continue
+                mate_kind = str(mate.get("type") or "").strip().lower()
+                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                    continue
+                if mate.get("suppressed") is True:
+                    continue
+                scope = limit_mate_scope(
+                    mate,
+                    owner_for,
+                    subtree,
+                    str(declared["name"]),
+                    parent_owner=str(parent["name"]),
+                    assembly_owner=assembly_owner,
+                )
+                if scope == "unrelated":
+                    continue
+                if scope in {"claimed_unreadable", "claimed_same_side"}:
+                    native_errors.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": "native limit entities do not span the declared parent/child subtrees",
+                        }
+                    )
+                    continue
+                if mate.get("suppressed") is not False or mate.get("error_code") != 0:
+                    native_errors.append(
+                        {"mate": mate.get("name"), "reason": "suppression or solve state is not clean"}
+                    )
+                    continue
+                flag = mate.get("is_advanced_mate")
+                if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
+                    native_errors.append(
+                        {"mate": mate.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                    )
+                    continue
+                if flag is not True:
+                    if mate.get("limits") is not None:
+                        native_errors.append(
+                            {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
+                        )
+                    continue
+                if mate_kind not in {"limitdistance", "limitangle"}:
+                    native_errors.append(
+                        {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
+                    )
+                    continue
+                try:
+                    lower, upper, unit = validate_native_limit(mate, component_records)
+                except ValueError as error:
+                    native_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
+                expected_unit = "m" if kind == "prismatic" else "rad"
+                if unit != expected_unit:
+                    native_errors.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
+                        }
+                    )
+                    continue
+                native_values.add((lower, upper))
+            if native_errors:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_unreadable",
+                        obj,
+                        "native position-limit evidence is incomplete or unreadable",
+                        {"errors": native_errors},
+                    )
+                )
+                continue
+            if len(native_values) > 1:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_conflict",
+                        obj,
+                        "native limit observations disagree for one joint",
+                        {"ranges": sorted(native_values)},
+                    )
+                )
+                continue
+            if native_values:
+                native_lower, native_upper = next(iter(native_values))
+                declared_values = (
+                    (float(limits.get("lower")), float(limits.get("upper")))
+                    if isinstance(limits, dict)
+                    else None
+                )
+                if declared_values not in {None, (0.0, 0.0), (native_lower, native_upper)}:
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_conflict",
+                            obj,
+                            "native limit observation disagrees with the saved author declaration",
+                            {"native": [native_lower, native_upper], "declared": declared_values},
+                        )
+                    )
+                    continue
+                limits = {
+                    "lower": native_lower,
+                    "upper": native_upper,
+                    "effort": (limits or {}).get("effort"),
+                    "velocity": (limits or {}).get("velocity"),
+                }
+                limit_source = "native"
+            elif kind != "continuous" and isinstance(limits, dict) and (
+                valid(limits.get("lower"))
+                and valid(limits.get("upper"))
+                and float(limits["lower"]) == 0.0
+                and float(limits["upper"]) == 0.0
+            ):
+                if kind == "revolute" and preview_allowed:
+                    author_limits = dict(limits)
+                    preview_limits = {
+                        "lower": -PREVIEW_WINDOW_RAD,
+                        "upper": PREVIEW_WINDOW_RAD,
+                    }
+                    for key in ("effort", "velocity"):
+                        if valid(author_limits.get(key)) and author_limits[key] >= 0:
+                            preview_limits[key] = author_limits[key]
+                    limits = preview_limits
+                    limit_source = "preview_policy"
+                    preview_policy = {
+                        "rule_id": PREVIEW_POLICY_ID,
+                        "rule_version": "v1",
+                        "window_rad": [-PREVIEW_WINDOW_RAD, PREVIEW_WINDOW_RAD],
+                        "native_cad_ranges": False,
+                        "hardware_qualified": False,
+                        "author_limits": author_limits,
+                        "native_absence": "complete_mate_inventory_no_enabled_limit",
+                    }
+                    findings.append(
+                        _finding(
+                            "discovery.joint_preview_policy",
+                            obj,
+                            "inspection preview uses the versioned full-turn rotation window; "
+                            "no native mechanical limit is claimed",
+                            preview_policy,
+                            blocking=False,
+                        )
+                    )
+                else:
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_missing",
+                            obj,
+                            "the CAD contains no active native working range and no non-placeholder author range",
+                        )
+                    )
+                    continue
+            if kind != "continuous" and limits["lower"] == limits["upper"]:
                 findings.append(
                     _finding(
                         "discovery.joint_limits_degenerate",
@@ -2969,6 +3433,7 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
             and all(type(value) in (int, float) and math.isfinite(value) for value in raw_axis)
         ):
             declared_axis = [float(value) for value in raw_axis]
+        delivered_axis = axis.get("delivered_local_axis") if isinstance(axis, dict) else None
         joints.append(
             {
                 "mate": f"exporter:{declared['name']}",
@@ -2981,9 +3446,12 @@ def _exporter_joint_facts(record: dict, declaration: dict, bodies: list[dict], f
                 "components": [link["parent"], link["name"]],
                 "axis": axis,
                 "declared_axis": declared_axis,
+                "delivered_axis": delivered_axis,
                 "axis_reference": selector,
                 "limits": limits,
+                "limit_source": limit_source,
                 "limit_evidence": None,
+                "preview_policy": preview_policy,
                 "drive": None,
             }
         )
@@ -2999,8 +3467,7 @@ def _body_records(
     """Link names come from the body's own ``CS_<link>`` coordinate system.
 
     No filename, folder or sanitized fallback naming: the native datum name is
-    the interface name.  A published name in the frozen registry wins, keyed by
-    the occurrence-aware component identity.
+    the source semantic and the shared naming rule produces the output name.
     """
 
     components = {
@@ -3009,7 +3476,6 @@ def _body_records(
         if isinstance(item, dict) and _text(item.get("name2"))
     }
     properties = (record.get("properties") or {}).get("components") or {}
-    frozen = settings.frozen_names or {}
     datums = [item for item in record.get("datums") or [] if isinstance(item, dict) and _text(item.get("name"))]
     attached = clusters.frame.members if clusters.frame is not None else None
     bodies: list[dict] = []
@@ -3135,29 +3601,6 @@ def _body_records(
             )
             continue
         source = "datum"
-        if identity in frozen:
-            published = str(frozen[identity])
-            if _SNAKE.fullmatch(published) is None:
-                findings.append(
-                    _finding(
-                        "discovery.link_name_invalid",
-                        f"body:{root}",
-                        "frozen published name is not snake_case",
-                        {"identity": identity, "name": published},
-                    )
-                )
-                continue
-            if published != name:
-                findings.append(
-                    _finding(
-                        "discovery.name_frozen_mismatch",
-                        f"body:{root}",
-                        "the frozen name differs from the current native CS_<link>; review the interface",
-                        {"identity": identity, "native": name, "published": published},
-                    )
-                )
-                continue
-            source = "frozen"
         bodies.append(
             {
                 "root": root,
@@ -3196,8 +3639,8 @@ def _interface_frames(
     """Every recognised named native interface becomes a source frame.
 
     A recognised datum is never dropped silently: an interface that cannot be
-    attributed to a body, or whose derived name is not an exact snake_case
-    name, blocks the package.
+    attributed to a body blocks the package, while a non-conforming suffix is
+    formatted or namespaced by the shared naming rule with a source warning.
     """
 
     body_of_component: dict[str, dict] = {}
@@ -3213,19 +3656,33 @@ def _interface_frames(
     ):
         # The proven base's own CS_base_link sits at the frozen top assembly scope.
         link_datums.add(("", str(base.get("datum"))))
-    frames: list[dict] = []
-    seen: dict[str, str] = {}
+    body_names = {str(body.get("name")) for body in bodies}
+    from .naming import (
+        disambiguated_frame_name,
+        fallback_name,
+        frame_identity,
+        frame_name as format_frame_name,
+    )
+
+    candidates: list[dict] = []
+    identities: set[str] = set()
+    referenced_configurations = {
+        str(item.get("name2")): item.get("configuration")
+        for item in record.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    }
     for datum in record.get("datums") or []:
         if not isinstance(datum, dict):
             continue
         name = str(datum.get("name") or "")
         if not name.startswith(INTERFACE_PREFIXES):
             continue
-        owner = datum.get("owner")
-        if isinstance(owner, str) and (owner, name) in link_datums:
+        raw_owner = datum.get("owner")
+        owner = str(raw_owner or "")
+        if isinstance(raw_owner, str) and (raw_owner, name) in link_datums:
             continue
-        body = body_of_component.get(str(owner or ""))
-        if body is None and base is not None and owner == "":
+        body = body_of_component.get(owner)
+        if body is None and base is not None and raw_owner == "":
             # Only the proven base binds the frozen top assembly's own datums.
             body = base
         if body is None:
@@ -3234,48 +3691,115 @@ def _interface_frames(
                     "discovery.interface_unowned",
                     f"datum:{name}",
                     "recognised interface datum is not owned by any body",
-                    {"owner": str(owner or "")},
+                    {"owner": owner},
                 )
             )
             continue
-        _prefix, _, suffix = name.partition("_")
-        if _SNAKE.fullmatch(suffix) is None:
+        if "configuration" in datum:
+            carried = str(datum.get("configuration") or "")
+            if raw_owner == "":
+                expected = str(record.get("saved_configuration") or "")
+            else:
+                referenced = referenced_configurations.get(owner)
+                if not isinstance(referenced, str) or not referenced:
+                    findings.append(
+                        _finding(
+                            "discovery.interface_configuration_unread",
+                            f"datum:{name}",
+                            "interface datum names an owner with no recorded referenced configuration",
+                            {"owner": owner},
+                        )
+                    )
+                    continue
+                expected = referenced
+            if carried != expected:
+                findings.append(
+                    _finding(
+                        "discovery.interface_configuration_mismatch",
+                        f"datum:{name}",
+                        "interface datum belongs to another referenced configuration",
+                        {"owner": owner, "configuration": carried, "referenced": expected},
+                    )
+                )
+                continue
+        configuration = str(datum.get("configuration") or "")
+        native_identity = frame_identity(owner, name, configuration)
+        if native_identity in identities:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_duplicate",
+                    f"datum:{name}",
+                    "duplicate native interface datum identity",
+                    {"owner": owner, "configuration": configuration},
+                )
+            )
+            continue
+        identities.add(native_identity)
+        _prefix, _, native_suffix = name.partition("_")
+        try:
+            base_name = format_frame_name(name)
+        except ValueError:
+            base_name = fallback_name("frame", native_identity)
+        candidates.append(
+            {
+                "body": body,
+                "name": name,
+                "owner": owner,
+                "configuration": configuration,
+                "identity": native_identity,
+                "native_suffix": native_suffix,
+                "base_name": base_name,
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate["base_name"]] = counts.get(candidate["base_name"], 0) + 1
+    frames: list[dict] = []
+    used: set[str] = set()
+    for candidate in sorted(candidates, key=lambda item: (item["identity"], item["name"])):
+        base_name = candidate["base_name"]
+        collided = counts[base_name] > 1 or base_name in body_names
+        frame_name = (
+            disambiguated_frame_name(base_name, candidate["identity"]) if collided else base_name
+        )
+        if frame_name in used or frame_name in body_names:
+            findings.append(
+                _finding(
+                    "discovery.interface_name_duplicate",
+                    f"datum:{candidate['name']}",
+                    "interface name collision cannot be resolved deterministically",
+                    {"name": frame_name, "input": candidate["name"]},
+                )
+            )
+            continue
+        if collided or base_name != candidate["native_suffix"]:
             findings.append(
                 _finding(
                     "discovery.interface_name_invalid",
-                    f"datum:{name}",
-                    "interface datum suffix must already be exact snake_case",
+                    f"datum:{candidate['name']}",
+                    "interface datum name was normalized or disambiguated by the shared naming rule",
+                    {
+                        "input": candidate["name"],
+                        "normalized": base_name,
+                        "output": frame_name,
+                        "owner": candidate["owner"],
+                        "configuration": candidate["configuration"],
+                        "collision": collided,
+                        "rule_id": "naming.frame",
+                        "rule_version": "naming-v1",
+                    },
+                    blocking=False,
                 )
             )
-            continue
-        frame_name = suffix
-        if frame_name in seen:
-            findings.append(
-                _finding(
-                    "discovery.interface_name_duplicate",
-                    f"datum:{name}",
-                    "two interface datums derive the same frame name",
-                    {"other": seen[frame_name]},
-                )
-            )
-            continue
-        if frame_name in {str(body.get("name")) for body in bodies}:
-            findings.append(
-                _finding(
-                    "discovery.interface_name_duplicate",
-                    f"datum:{name}",
-                    "an interface frame collides with a body name under the shared name contract",
-                    {"name": frame_name},
-                )
-            )
-            continue
-        seen[frame_name] = name
+        used.add(frame_name)
         frames.append(
             {
                 "id": frame_name,
                 "name": frame_name,
-                "parent": body["name"],
-                "coordinate_system": name,
+                "parent": candidate["body"]["name"],
+                "coordinate_system": candidate["name"],
+                "source_name": candidate["name"],
             }
         )
     return frames
@@ -3514,17 +4038,14 @@ def _orient(
 
 def _joint_names(
     joints: list[dict],
-    settings: DiscoverySettings,
     findings: list[dict],
 ) -> dict[str, str]:
     """Joint names come from named mate groups ``<joint>__<role>``.
 
     Every mate of one pair must share the same snake_case group name; missing
-    or conflicting groups block.  A frozen published name, keyed by the
-    occurrence-aware primary mate name, wins.
+    or conflicting groups block.
     """
 
-    frozen = settings.frozen_names or {}
     assigned: dict[str, str] = {}
     taken: dict[str, str] = {}
     for joint in joints:
@@ -3560,29 +4081,7 @@ def _joint_names(
             continue
         name = heads[0]
         identity = names[0]
-        if identity in frozen:
-            published = str(frozen[identity])
-            if _SNAKE.fullmatch(published) is None:
-                findings.append(
-                    _finding(
-                        "discovery.joint_name_invalid",
-                        f"mate:{identity}",
-                        "frozen published joint name is not snake_case",
-                        {"identity": identity, "name": published},
-                    )
-                )
-                continue
-            if published != name:
-                findings.append(
-                    _finding(
-                        "discovery.joint_name_frozen_mismatch",
-                        f"mate:{identity}",
-                        "the frozen name differs from the named mate group; review the interface change",
-                        {"identity": identity, "native": name, "published": published},
-                    )
-                )
-                continue
-            assigned[identity] = name
+        assigned[identity] = name
         if name in taken:
             findings.append(
                 _finding(
@@ -3968,7 +4467,12 @@ def _identity(
             )
         technical_name = None
     else:
-        technical = _snake(hardware) if hardware else None
+        try:
+            technical = format_robot_name(Path(str(main)).name) if main else None
+        except ValueError:
+            technical = None
+        if technical is not None:
+            sources["robot_name"] = "cad_filename_derived"
         technical_name = technical if technical and _SNAKE.fullmatch(technical) else "robot"
         robot_name = None
         findings.append(
@@ -4692,14 +5196,13 @@ def derive_native_package(
         "handoff_sha256": handoff_sha256,
         "native_files": native_files,
         "derivation": {
-            "frozen_names": dict(settings.frozen_names),
             "record_roots": [str(root) for root in settings.record_roots],
             "main_assembly": recorded_main,
             "configuration": configuration,
         },
         "identity": identity,
         "records": [],
-        "frozen_names": derived_names,
+        "derived_interface_names": derived_names,
         "raw": record,
         "findings": findings,
     }
@@ -4820,7 +5323,7 @@ def derive_native_package(
 def _derive_carriers(
     record: dict, identity: dict, settings: DiscoverySettings, findings: list[dict]
 ) -> tuple[list, list, list, dict]:
-    """Derive the in-memory source carriers: bodies, joints, frames and frozen names.
+    """Derive the in-memory source carriers: bodies, joints, frames and interface names.
 
     Shared by the discover stage and the capture-side definition rebuild; the
     carriers are always derived from the raw record alone, never read from a
@@ -4833,27 +5336,37 @@ def _derive_carriers(
         frames: list = []
         if declaration is not None:
             bodies, clusters = _exporter_memberships(record, declaration, findings)
-            joints = _exporter_joint_facts(record, declaration, bodies, findings)
-            root = next(body for body in bodies if body["name"] == declaration["root"])
+            joints = _exporter_joint_facts(record, declaration, bodies, findings, purpose=settings.purpose)
+            root = next(
+                body
+                for body in bodies
+                if body.get("identity") == f"exporter:{declaration['root']}" or body["name"] == declaration["root"]
+            )
+            _exporter_constraint_checks(
+                declaration,
+                clusters,
+                joints,
+                findings,
+                record=record,
+                settings=settings,
+            )
+            _apply_cad_names(bodies, joints, clusters, findings, root=str(root["name"]))
             if root["name"] != "base_link":
                 findings.append(
                     _finding(
                         "discovery.root_name_missing",
                         f"body:{root['name']}",
-                        "the declared root link must be named base_link",
+                        "the naming rule did not reserve base_link for the declared root",
                     )
                 )
-            _exporter_constraint_checks(declaration, clusters, joints, findings)
+            derived_names = {
+                str(body.get("source_name") or body["name"]): body["name"] for body in bodies
+            } | {
+                    str(joint.get("source_name") or joint["name"]): joint["name"]
+                    for joint in joints
+                    if "name" in joint
+            }
             frames = _interface_frames(record, clusters, bodies, root, findings)
-            for body in bodies:
-                if settings.frozen_names.get(body["identity"], body["name"]) != body["name"]:
-                    findings.append(
-                        _finding(
-                            "discovery.name_frozen_mismatch",
-                            f"body:{body['name']}",
-                            "saved declaration differs from the frozen published name",
-                        )
-                    )
         return bodies, joints, frames, derived_names
     clusters = _clusters(record, findings)
     bodies, by_root = _body_records(record, clusters, settings, findings)
@@ -4885,10 +5398,22 @@ def _derive_carriers(
     base = _attached_base(clusters, bodies, root)
     _frame_attachment_findings(record, clusters, bodies, findings)
     _orient(joints, bodies, by_root, root, findings)
-    derived_names = _joint_names(joints, settings, findings)
-    for body in bodies:
-        if body["source"] == "frozen":
-            derived_names[body["identity"]] = body["name"]
+    derived_names = _joint_names(joints, findings)
+    _apply_cad_names(
+        bodies,
+        joints,
+        clusters,
+        findings,
+        root=str(root["name"]) if root is not None else None,
+    )
+    _apply_mate_direction(record, bodies, joints, findings)
+    derived_names = {
+        str(body.get("source_name") or body["name"]): body["name"] for body in bodies
+    } | {
+        str(joint.get("source_name") or joint["name"]): joint["name"]
+        for joint in joints
+        if "name" in joint
+    }
     seen_names: dict[str, str] = {}
     for body in bodies:
         if body["name"] in seen_names:
@@ -4944,7 +5469,6 @@ def source_definition(
         request_record, _request_digest = read_request_evidence(package / "input" / "request.json")
         settings = DiscoverySettings(
             record_roots=(root,),
-            frozen_names=dict(derivation.get("frozen_names") or {}),
             main_assembly=derivation.get("main_assembly") or None,
             purpose=str(request_record["purpose"]),
         )
@@ -4983,10 +5507,10 @@ def source_definition(
         if axis is None:
             raise PipelineError(f"joint {joint['name']!r} has no usable child frame")
         if joint.get("axis", {}).get("source") == "exporter":
-            # The authored declaration is the source claim once the native geometry
-            # and its sign were proved; the reprojected native line would only add
-            # float noise the independent declaration check rejects.
-            declared_axis = joint.get("declared_axis")
+            # The delivered child-frame vector is the authored declaration after
+            # the versioned positive-motion rule; the native geometry remains the
+            # independent line proof and no float reprojection is introduced.
+            declared_axis = joint.get("delivered_axis") or joint.get("declared_axis")
             if (
                 not isinstance(declared_axis, (list, tuple))
                 or len(declared_axis) != 3
@@ -4997,13 +5521,24 @@ def source_definition(
         entry: dict[str, Any] = {
             "id": joint["name"],
             "name": joint["name"],
+            "source_name": joint.get("source_name", joint["name"]),
             "type": joint["type"],
             "parent": joint["parent"],
             "child": joint["child"],
             "axis": axis,
+            "axis_provenance": joint.get("axis") if isinstance(joint.get("axis"), dict) else None,
             "axis_reference": joint["axis_reference"],
         }
-        if joint["axis"].get("source") == "exporter":
+        if isinstance(joint.get("name_rule"), dict):
+            entry["name_rule"] = dict(joint["name_rule"])
+        if isinstance(joint.get("preview_policy"), dict):
+            entry["limits"] = {
+                key: float(value)
+                for key, value in joint["limits"].items()
+                if value is not None
+            }
+            entry["preview_policy"] = dict(joint["preview_policy"])
+        elif joint["axis"].get("source") == "exporter":
             entry["limits"] = {
                 key: float(joint["limits"][key])
                 for key in (
@@ -5013,10 +5548,14 @@ def source_definition(
                 )
             }
             entry["limit_evidence"] = {
-                "file": DISCOVERY_FILE,
+                "file": discovery_name,
                 "sha256": discovery_sha256,
                 "anchor": raw["exporter"]["raw_xml_sha256"],
             }
+            if isinstance(joint.get("declared_limits"), dict):
+                entry["limit_evidence"].update(
+                    {f"declared_{key}": str(value) for key, value in joint["declared_limits"].items()}
+                )
         elif joint["type"] == "continuous":
             if joint.get("drive") is not None:
                 entry["limits"] = {
@@ -5054,9 +5593,20 @@ def source_definition(
         {str(body["datum"]) for body in bodies if body.get("datum")}
         | {str(frame["coordinate_system"]) for frame in frames if frame.get("coordinate_system")}
     )
+    derived_robot_name = None
+    if view.get("main_assembly"):
+        try:
+            derived_robot_name = format_robot_name(Path(str(view["main_assembly"])).name)
+        except ValueError:
+            derived_robot_name = None
     source: dict[str, Any] = {
         "provider": "solidworks",
-        "robot_name": identity.get("robot_name") or identity.get("robot_name_technical") or "robot",
+        "robot_name": (
+            identity.get("robot_name")
+            or derived_robot_name
+            or "robot"
+        ),
+        "robot_name_source": "cad" if identity.get("robot_name") else "cad_filename_derived",
         "assembly": str(confined(package.resolve(), cad_prefix + str(view["main_assembly"]))),
         "configuration": view["delivery_configuration"],
         "allowed_roots": [str(package.resolve())],
@@ -5067,6 +5617,12 @@ def source_definition(
             {
                 "id": body["name"],
                 "name": body["name"],
+                "source_name": body.get("source_name", body["name"]),
+                **(
+                    {"name_rule": dict(body["name_rule"])}
+                    if isinstance(body.get("name_rule"), dict)
+                    else {}
+                ),
                 "components": body["components"],
                 "frame": {"coordinate_system": body["datum"]},
             }
@@ -5080,6 +5636,7 @@ def source_definition(
                 "name": frame["name"],
                 "parent": frame["parent"],
                 "coordinate_system": frame["coordinate_system"],
+                "source_name": frame.get("source_name"),
             }
             for frame in sorted(frames, key=lambda item: item["name"])
         ],

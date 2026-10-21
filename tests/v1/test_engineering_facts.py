@@ -68,8 +68,8 @@ class EngineeringFactTests(unittest.TestCase):
         statuses = self._statuses(self._definition(limit_source=None, drive=False))
         self.assertEqual(statuses[("engineering_position_range", "hinge")], "unqualified")
         self.assertEqual(statuses[("drive_sizing", "hinge")], "unqualified")
-        statuses = self._statuses(self._definition(limit_source="policy_preview_window"))
-        self.assertEqual(statuses[("engineering_position_range", "hinge")], "unqualified")
+        statuses = self._statuses(self._definition(limit_source="declared_author"))
+        self.assertEqual(statuses[("engineering_position_range", "hinge")], "established")
 
     def test_preview_states_all_three_unqualified_and_never_blocks(self) -> None:
         self._write_request("inspection_preview")

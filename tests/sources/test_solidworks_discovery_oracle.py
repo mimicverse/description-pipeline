@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from description_pipeline.sources.solidworks.discovery import (
     CONTRACT,
@@ -23,7 +24,12 @@ from description_pipeline.sources.solidworks.discovery import (
     DiscoverySettings,
     prepare_native_package,
 )
-from description_pipeline.verification.native_discovery import rebuild_rigid_bodies, verify_discovery
+from description_pipeline.verification import native_discovery
+from description_pipeline.verification.native_discovery import (
+    rebuild_joint_facts,
+    rebuild_rigid_bodies,
+    verify_discovery,
+)
 
 from . import support
 from .selection_support import sealed_selection
@@ -190,6 +196,36 @@ def native_record() -> dict:
                     },
                 ],
             },
+            {
+                "name": "shoulder_pitch_joint__limit",
+                "type": "limitangle",
+                "suppressed": False,
+                "error_code": 0,
+                "scope": "",
+                "limits": {"lower": -1.5, "upper": 1.5, "unit": "rad"},
+                "is_advanced_mate": True,
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                "native_limit": support.native_limit_observation(6, nominal=0.0, lower=-1.5, upper=1.5),
+                "entities": [
+                    {
+                        "entity_index": 0,
+                        "component": "base-1",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane1",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                        "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                    },
+                    {
+                        "entity_index": 1,
+                        "component": "arm-1",
+                        "reference_configuration": "Default",
+                        "feature": "LimitPlane2",
+                        "mate_entity_reference": {"error": None, "geometry": None},
+                        "plane": {"point": [0.0, 0.0, 0.1], "normal": [0.0, 0.0, 1.0]},
+                    },
+                ],
+            },
         ],
         "datums": [
             {"name": "CS_base_link", "owner": "base-1", "array": copy.deepcopy(IDENTITY)},
@@ -350,8 +386,8 @@ class OracleSemanticsTests(unittest.TestCase):
         passed, errors, _checks = self.check(package)
         self.assertTrue(passed, errors)
 
-    def test_unrecorded_inferred_joint_records_stay_rejected(self):
-        """Without an exporter declaration, missing controlled records still refuse."""
+    def test_unrecorded_controlled_joint_records_do_not_override_native_limits(self):
+        """Controlled records are optional once the native limit is directly observed."""
 
         package = self.baseline()
 
@@ -363,8 +399,7 @@ class OracleSemanticsTests(unittest.TestCase):
 
         self._native(package, strip_annotations)
         report = verify_discovery(package)
-        self.assertFalse(report["passed"])
-        self.assertTrue({"discovery.joints", "discovery.joint_rebuild"} & {item["code"] for item in report["errors"]})
+        self.assertTrue(report["passed"], report["errors"])
 
     def test_absent_exporter_state_keeps_the_mate_suite_and_skips_declarations(self) -> None:
         """Only a proven absent exporter state means the capture has no declarations.
@@ -526,7 +561,6 @@ class OracleSemanticsTests(unittest.TestCase):
             {"lower": -0.05, "upper": float("inf"), "unit": "m"},
             {"lower": -0.05, "upper": float("nan"), "unit": "m"},
             {"lower": 0.05, "upper": -0.05, "unit": "m"},
-            {"lower": 0.05, "upper": 0.05, "unit": "m"},
             {"lower": -0.05, "upper": 0.05, "unit": "mm"},
             {"lower": "0", "upper": "1", "unit": "m"},
             ["lower", "upper"],
@@ -543,7 +577,6 @@ class OracleSemanticsTests(unittest.TestCase):
             ("limitangle", None),
             ("limitdistance", {"lower": -0.05, "upper": 0.05, "unit": "rad"}),
             ("limitangle", {"lower": -0.05, "upper": 0.05, "unit": "m"}),
-            ("limitdistance", {"lower": 0.05, "upper": 0.05, "unit": "m"}),
         ):
             unit = "m" if kind == "limitdistance" else "rad"
             with self.subTest(kind=kind, limits=limits):
@@ -551,17 +584,47 @@ class OracleSemanticsTests(unittest.TestCase):
                     lambda raw, payload, mate_type=kind, value=limits: raw["mates"][1].update(
                         {"type": mate_type, "limits": value}
                     ),
-                    f"a {kind} mate must carry finite lower < upper bounds in {unit}",
+                    f"a {kind} mate must carry finite ordered bounds in {unit}",
                 )
 
     def test_typed_bounded_mate_with_matching_bounds_keeps_the_graph_valid(self) -> None:
-        def mutate(raw, payload):
-            raw["mates"][1].update({"type": "limitdistance", "limits": {"lower": -0.05, "upper": 0.05, "unit": "m"}})
+        for kind, bounds in (
+            ("limitdistance", {"lower": -0.05, "upper": 0.05, "unit": "m"}),
+            ("limitdistance", {"lower": 0.0, "upper": 0.0, "unit": "m"}),
+            ("coincident", {"lower": 0.0, "upper": 0.0, "unit": "m"}),
+        ):
+            with self.subTest(kind=kind, bounds=bounds):
+                def mutate(raw, payload, mate_type=kind, limits=bounds):
+                    raw["mates"][1].update({"type": mate_type, "limits": limits})
 
+                package = self.baseline()
+                self._native(package, mutate)
+                _passed, _errors, checks = self.check(package)
+                self.assertTrue(checks["discovery.graph"]["passed"], checks["discovery.graph"])
+
+    def test_joint_rebuild_passes_the_proven_root_owner_to_limit_resolution(self) -> None:
         package = self.baseline()
+
+        def mutate(raw, payload):
+            raw["datums"].append(
+                {"name": "CS_base_link", "owner": "", "array": copy.deepcopy(IDENTITY)}
+            )
+
         self._native(package, mutate)
-        _passed, _errors, checks = self.check(package)
-        self.assertTrue(checks["discovery.graph"]["passed"], checks["discovery.graph"])
+        payload = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
+        observed = []
+        original = native_discovery.limit_entity_owners
+
+        def resolve(mate, owner_for, *, assembly_owner=None):
+            observed.append(assembly_owner)
+            return original(mate, owner_for, assembly_owner=assembly_owner)
+
+        with mock.patch(
+            "description_pipeline.verification.native_discovery.limit_entity_owners",
+            side_effect=resolve,
+        ):
+            rebuild_joint_facts(payload, package, purpose="engineering")
+        self.assertEqual(observed, ["base_link"])
 
     # -------------------------------------------------- shaft and circle semantics
 

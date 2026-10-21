@@ -3142,15 +3142,101 @@ class PlatformStore:
             outcome = "unresolved"
         else:
             return
-        cursor = connection.cursor()
-        cursor.execute(_SETTLE_QUEUED_NATIVE, (run_id, stage))
+        if state in {"unresolved", "cancelled"}:
+            self._settle_bound_native_unknown(connection, run_id=run_id, stage=stage, stage_state=state)
+        else:
+            connection.cursor().execute(_SETTLE_QUEUED_NATIVE, (run_id, stage))
         if outcome == "unresolved":
+            cursor = connection.cursor()
             cursor.execute(_SETTLE_UNKNOWN, (run_id, stage))
             cursor.execute(_SET_RUN_UNRESOLVED, (run_id,))
             return
+        cursor = connection.cursor()
         cursor.execute(_SETTLE_OPERATIONS, (outcome, run_id, stage))
         if run_outcome is not None:
             cursor.execute(_SET_RUN_OUTCOME, (run_outcome, run_id))
+
+    def _settle_bound_native_unknown(self, connection, *, run_id: str, stage: str, stage_state: str) -> None:
+        """Close a running bound native operation without inventing an endpoint terminal fact.
+
+        A confirmed unresolved or cancelled stage proves the platform stage
+        boundary, not that a live endpoint side effect reached a terminal state.
+        The operation therefore becomes ``unresolved`` in both cases.  Its full
+        Airflow binding and the original stage receipt are retained in an
+        append-only event; a missing binding refuses before any write.
+        """
+
+        if stage_state not in {"unresolved", "cancelled"}:
+            raise PlatformStoreError("Only an unresolved or cancelled stage closes an unknown native owner")
+        cursor = connection.cursor()
+        cursor.execute(_LOCK_RUN_OPERATIONS, (run_id,))
+        operations = cursor.fetchall()
+        running = [
+            row
+            for row in operations
+            if row[2] == "native"
+            and row[3] == "running"
+            and (row[1] == stage or (row[1] == "discover" and stage == "capture"))
+        ]
+        if len(running) > 1:
+            raise PlatformStoreError("The stage carries multiple running bound native operations")
+        receipt = None
+        if running:
+            (
+                _operation_id,
+                _op_stage,
+                _kind,
+                _op_state,
+                dag_id,
+                dag_run_id,
+                task_id,
+                map_index,
+                _operation_key,
+            ) = running[0]
+            if not (
+                isinstance(dag_id, str)
+                and dag_id
+                and isinstance(dag_run_id, str)
+                and dag_run_id
+                and isinstance(task_id, str)
+                and task_id
+                and type(map_index) is int
+            ):
+                raise PlatformStoreError("The bound native operation lacks its Airflow task binding")
+            cursor.execute(_READ_STAGE_ROW, (run_id, stage))
+            stored = cursor.fetchone()
+            receipt = _stored_receipt(stored)
+            if not isinstance(receipt, dict):
+                raise PlatformStoreError("The stage carries no original receipt for the native closure")
+
+        cursor.execute(_SETTLE_QUEUED_NATIVE, (run_id, stage))
+        if not running:
+            return
+        operation_id, _op_stage, _kind, _op_state, dag_id, dag_run_id, task_id, map_index, operation_key = running[0]
+        cursor.execute(_SETTLE_NAMED_OPERATION, ("unresolved", operation_id, run_id))
+        if cursor.fetchone() is None:
+            raise PlatformStoreError("The bound native operation lost its running state to another writer")
+        self._insert_event(
+            connection,
+            run_id=run_id,
+            stage=stage,
+            kind="native",
+            operation_id=operation_id,
+            payload={
+                "binding_kind": "native_owner_closure",
+                "operation_key": operation_key,
+                "stage": stage,
+                "stage_state": stage_state,
+                "from_state": "running",
+                "to_state": "unresolved",
+                "reason": f"stage_{stage_state}_without_endpoint_terminal_proof",
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "task_id": task_id,
+                "map_index": map_index,
+                "receipt_sha256": digest(receipt),
+            },
+        )
 
     def _insert_event(self, connection, *, run_id: str, stage: str, kind: str, operation_id, payload) -> None:
         """Append one run event in the same transaction as the state change it describes."""
@@ -3464,6 +3550,158 @@ class PlatformStore:
             root=sealed_root,
         )
         return receipt
+
+    def completed_native_capture_recovery(
+        self,
+        *,
+        run_id: str,
+        operation_key: str,
+        params_digest: str,
+        owner_operation_id: str,
+    ) -> dict | None:
+        """Read an already committed native-capture maintenance result before rebuilding inputs.
+
+        This is the state-first no-op query for the maintenance entry: it uses only
+        the registered reconcile identity, the persisted stage rows and the owner
+        binding, never the derived tree or capture archive.  ``None`` means the
+        reconcile operation has not settled and the caller may continue its normal
+        preflight.  A settled reconcile must still prove the exact maintenance
+        shape; a partial or contradictory projection refuses instead of replaying
+        side effects or rebuilding the tree.
+        """
+
+        if not (
+            isinstance(operation_key, str)
+            and operation_key
+            and isinstance(params_digest, str)
+            and params_digest
+            and isinstance(owner_operation_id, str)
+            and owner_operation_id
+        ):
+            raise PlatformStoreError("The native capture replay query requires its operation identities")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(_READ_OPERATION_BINDING, (operation_key,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            (
+                operation_id,
+                state,
+                key,
+                digest_value,
+                bound_run,
+                stage,
+                kind,
+                dag_id,
+                dag_run_id,
+                task_id,
+                map_index,
+            ) = row
+            if (
+                bound_run != run_id
+                or key != operation_key
+                or stage != "discover"
+                or kind != "reconcile"
+                or digest_value != params_digest
+            ):
+                raise OperationConflictError("The native capture replay names another reconcile operation")
+            if state in {"queued", "running"}:
+                return None
+            if state != "succeeded":
+                raise PlatformStoreError(
+                    f"The native capture reconcile is {state!r}; it is not a completed state-first result"
+                )
+
+            cursor.execute(_READ_ORPHAN_OPERATION, (owner_operation_id, run_id))
+            owner = cursor.fetchone()
+            if owner is None:
+                raise PlatformStoreError("The native capture replay names no recorded native owner")
+            (
+                owner_stage,
+                owner_kind,
+                owner_state,
+                owner_dag,
+                owner_run,
+                owner_task,
+                owner_map,
+                owner_key,
+            ) = owner
+            if (
+                owner_stage != "discover"
+                or owner_kind != "native"
+                or owner_state != "failed"
+                or owner_task != "discover"
+                or owner_map != -1
+                or not isinstance(owner_dag, str)
+                or not owner_dag
+                or not isinstance(owner_run, str)
+                or not owner_run
+            ):
+                raise PlatformStoreError("The native capture replay has no terminal bound native owner")
+
+            cursor.execute(_READ_LAST_BINDING, (run_id, owner_operation_id))
+            binding_row = cursor.fetchone()
+            binding = binding_row[0] if binding_row is not None else None
+            if isinstance(binding, str):
+                try:
+                    binding = json.loads(binding)
+                except ValueError:
+                    binding = None
+            if not (
+                isinstance(binding, dict)
+                and binding.get("operation_key") == owner_key
+                and binding.get("reconciled_stage") == "discover"
+                and binding.get("reconciled_state") == "failed"
+                and binding.get("reported_stage") == "capture"
+                and binding.get("actual_stage") == "capture"
+                and binding.get("closure_shape") == "bound_native_capture_failed"
+                and binding.get("dag_id") == owner_dag
+                and binding.get("dag_run_id") == owner_run
+                and binding.get("task_id") == owner_task
+                and binding.get("map_index") == owner_map
+            ):
+                raise PlatformStoreError("The native capture replay has no matching owner closure evidence")
+
+            cursor.execute(_READ_STAGE_RECORDS, (run_id,))
+            stages = {
+                item[0]: {
+                    "stage": item[0],
+                    "state": item[1],
+                    "receipt": item[2],
+                    "checkpoint_uri": item[3],
+                    "reused_from_run": item[4],
+                    "original_executed_at": item[5],
+                    "updated_at": item[6],
+                }
+                for item in cursor.fetchall()
+            }
+            expected = {
+                "freeze": "completed",
+                "discover": "completed",
+                "capture": "failed",
+                "generate": "blocked",
+                "verify": "blocked",
+                "publish": "blocked",
+            }
+            if {name: record["state"] for name, record in stages.items()} != expected:
+                raise PlatformStoreError("The native capture replay does not match its terminal stage projection")
+            return {
+                "operation": {
+                    "operation_id": operation_id,
+                    "state": state,
+                    "operation_key": key,
+                    "params_digest": digest_value,
+                    "run_id": bound_run,
+                    "stage": stage,
+                    "kind": kind,
+                    "dag_id": dag_id,
+                    "dag_run_id": dag_run_id,
+                    "task_id": task_id,
+                    "map_index": map_index,
+                },
+                "stages": stages,
+            }
 
     # ------------------------------------------------------------- read side
 

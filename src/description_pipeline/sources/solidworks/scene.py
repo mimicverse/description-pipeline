@@ -10,12 +10,21 @@ joint definition is an error, not a default.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
-from collections.abc import Iterable, Sequence
 
 from .errors import ConfigError
 from .jsonio import read_json
+from .naming import (
+    DISPLAY_MATERIAL_FALLBACK_NAME,
+    DISPLAY_MATERIAL_FALLBACK_RGBA,
+    DISPLAY_MATERIAL_FALLBACK_RULE,
+    asset_namespace,
+    mesh_path,
+    visual_name,
+)
+from .native_limits import PREVIEW_POLICY_ID
 from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 SCENE_SCHEMA = "solidworks-to-urdf.scene/v1"
@@ -511,6 +520,9 @@ def build_scene(
     bodies = list(cfg.get("bodies") or [])
     if not bodies:
         raise ConfigError("native discovery must define the rigid bodies")
+    mesh_namespace = asset_namespace(
+        Path(str(cfg.get("assembly") or cfg.get("robot_name") or "robot")).name
+    )
 
     # Recheck the mass-mode contract against actual readings: documented_table must
     # cover every included component; CAD readings remain unchanged but carry warnings.
@@ -619,15 +631,36 @@ def build_scene(
             entry = geometry_by_component.get(reading.name)
             if entry is None:
                 continue
-            visuals.append(
-                {
-                    "kind": "mesh",
-                    "filename": entry["path"],
-                    "scale": [1.0, 1.0, 1.0],
-                    "xyz": list(reading.relative_translation),
-                    "rpy": list(rpy_from_matrix(reading.relative_rotation)),
-                }
-            )
+            if "rgba" in entry or "material" in entry:
+                raise ConfigError(
+                    "This capture schema has no independently verified CAD appearance record",
+                    {
+                        "component": reading.name,
+                        "material": entry.get("material"),
+                        "rgba": entry.get("rgba"),
+                    },
+                )
+            visual = {
+                "kind": "mesh",
+                "name": visual_name(reading.name, link=name),
+                "filename": entry["path"],
+                "sha256": entry.get("sha256"),
+                "mesh_name": mesh_path(
+                    str(entry.get("sha256") or ""),
+                    namespace=mesh_namespace,
+                ),
+                "material": DISPLAY_MATERIAL_FALLBACK_NAME,
+                "scale": [1.0, 1.0, 1.0],
+                "xyz": list(reading.relative_translation),
+                "rpy": list(rpy_from_matrix(reading.relative_rotation)),
+                "provenance": {
+                    "native_component": reading.name,
+                    "material_source": "platform_display_fallback",
+                    **DISPLAY_MATERIAL_FALLBACK_RULE,
+                },
+            }
+            visual["rgba"] = list(DISPLAY_MATERIAL_FALLBACK_RGBA)
+            visuals.append(visual)
         links.append(
             {
                 "id": body_id,
@@ -724,6 +757,9 @@ def build_scene(
         "unassigned_entities": sorted(set(placements) - included),
         "world_from_root": world_from_root,
     }
+    value_warnings = _value_warnings(cfg, bodies, links, joint_entries, frames)
+    if value_warnings:
+        scene_provenance["value_warnings"] = value_warnings
     if unverified_material:
         scene_provenance["warnings"] = _material_warnings(unverified_material, masses)
     return {
@@ -806,8 +842,29 @@ def _build_joints(
         limit_source = joint.get("limit_source")
         if isinstance(limit_source, str) and limit_source:
             entry["limit_source"] = limit_source
+        preview_policy = joint.get("preview_policy")
+        if isinstance(preview_policy, dict):
+            entry["provenance"]["preview_policy"] = dict(preview_policy)
         if movable:
             entry["axis"] = [float(value) for value in axis]
+            axis_provenance = joint.get("axis_provenance")
+            if isinstance(axis_provenance, dict):
+                for key in (
+                    "source",
+                    "native_direction",
+                    "parent_direction",
+                    "parent_axis",
+                    "assembly_direction",
+                    "delivered_local_axis",
+                    "direction_relation",
+                    "motion",
+                    "classification_source",
+                    "alignment",
+                    "rule_id",
+                    "rule_version",
+                ):
+                    if key in axis_provenance:
+                        entry["provenance"][f"axis.{key}"] = axis_provenance[key]
         limits = joint.get("limits")
         if limits:
             entry["limits"] = {str(key): float(value) for key, value in limits.items()}
@@ -818,6 +875,419 @@ def _build_joints(
             entry["dynamics"] = {str(key): float(value) for key, value in dynamics.items()}
         joints.append(entry)
     return joints
+
+
+def _value_warnings(
+    cfg: dict[str, Any],
+    bodies: Sequence[dict[str, Any]],
+    links: Sequence[dict[str, Any]],
+    joints: Sequence[dict[str, Any]],
+    frames: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe every delivered value whose provenance is not a direct native read."""
+
+    warnings: list[dict[str, Any]] = []
+    mappings = []
+    motion_unresolved = []
+    direction_unresolved = []
+    sign_reversals = []
+    preview_limits = []
+    visuals = []
+    mesh_paths = []
+    for body in bodies:
+        if body.get("source_name") and body["source_name"] != body.get("name"):
+            rule = body.get("name_rule") if isinstance(body.get("name_rule"), dict) else {}
+            mappings.append(
+                {
+                    "object_type": "link",
+                    "object": body["name"],
+                    "field": "name",
+                    "actual": body["name"],
+                    "source": f"CAD-derived interface naming for {body['source_name']}",
+                    "original": body["source_name"],
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD datum formatting"),
+                }
+            )
+    source_joints = cfg.get("joints") or []
+    for index, joint in enumerate(joints):
+        source_joint = source_joints[index] if index < len(source_joints) else {}
+        source_name = str(source_joint.get("source_name") or source_joint.get("name") or joint["name"])
+        if source_name != joint["name"]:
+            rule = source_joint.get("name_rule") if isinstance(source_joint.get("name_rule"), dict) else {}
+            mappings.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "name",
+                    "actual": joint["name"],
+                    "source": f"CAD-derived interface naming for {source_name}",
+                    "original": source_name,
+                    "rule_id": rule.get("rule_id", "naming.interface"),
+                    "rule_version": rule.get("rule_version", "naming-v1"),
+                    "reason": rule.get("reason", "CAD reference-axis formatting"),
+                }
+            )
+        provenance = source_joint.get("axis_provenance")
+        if isinstance(provenance, dict):
+            native_axis = provenance.get("native_direction")
+            output_axis = provenance.get("direction")
+            if (
+                provenance.get("direction_relation") == "author_sign_applied"
+                and isinstance(native_axis, list)
+                and isinstance(output_axis, list)
+                and len(native_axis) == 3
+                and len(output_axis) == 3
+                and all(
+                    abs(float(before) + float(after)) <= 1e-12
+                    for before, after in zip(native_axis, output_axis, strict=True)
+                )
+            ):
+                sign_reversals.append(
+                    {
+                        "object_type": "joint",
+                        "object": joint["name"],
+                        "field": "axis",
+                        "actual": joint["axis"],
+                        "source": "CAD author dp.joint.axis_sign",
+                        "original": native_axis,
+                        "rule_id": provenance.get("rule_id", "direction.native_axis_sign"),
+                        "rule_version": provenance.get("rule_version", "v1"),
+                        "reason": (
+                            "CAD author axis_sign selects the positive direction of the "
+                            "undirected shaft; q and ranges remain in author q"
+                        ),
+                        "native_joint_identity": source_name,
+                        "native_sign": provenance.get("native_sign"),
+                        "sign_reversal": provenance.get("sign_reversal"),
+                        "sign_warning": provenance.get("sign_warning"),
+                        "original_axis_assembly": native_axis,
+                        "output_axis_assembly": output_axis,
+                        "actual_child_axis": joint["axis"],
+                        "original_frame": provenance.get("original_frame", "assembly"),
+                        "output_frame": provenance.get("output_frame", "assembly"),
+                        "model_frame": "child",
+                        "q_sign": 1,
+                        "range_transform": "not_applied",
+                        "limits_before": source_joint.get("limits"),
+                        "limits_after": source_joint.get("limits"),
+                        "drive_before": source_joint.get("drive"),
+                        "drive_after": source_joint.get("drive"),
+                        "limits_status": "present" if source_joint.get("limits") is not None else "absent",
+                        "drive_status": "present" if source_joint.get("drive") is not None else "absent",
+                        "warning_does_not_authorize": True,
+                        "warning_does_not_replace_evidence": True,
+                    }
+                )
+            direction = {
+                "object_type": "joint",
+                "object": joint["name"],
+                "field": "axis",
+                "actual": joint["axis"],
+                "source": "CAD signed axis and versioned positive-motion rule",
+                "original": provenance.get("parent_axis"),
+                "rule_id": provenance.get("rule_id", "direction.positive_semantics"),
+                "rule_version": provenance.get("rule_version", "v3"),
+                "reason": provenance.get(
+                    "reason", provenance.get("direction_relation", provenance.get("status"))
+                ),
+                "motion": provenance.get("motion"),
+            }
+            if provenance.get("status", provenance.get("direction_relation")) != "local_class_aligned":
+                direction_unresolved.append(direction)
+        if source_joint.get("type") != "fixed" and not any(
+            word in {"roll", "pitch", "yaw"} for word in joint["name"].split("_")
+        ):
+            motion_unresolved.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "name",
+                    "actual": joint["name"],
+                    "source": "neutral joint naming",
+                    "original": source_name,
+                    "rule_id": "naming.joint_motion",
+                    "rule_version": "naming-v1",
+                    "reason": "motion classification unavailable",
+                }
+            )
+        if source_joint.get("limit_source") == "preview_policy":
+            policy = source_joint.get("preview_policy") or {}
+            preview_limits.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "limits",
+                    "actual": joint["limits"],
+                    "source": "inspection preview full-turn policy",
+                    "original": policy.get("author_limits"),
+                    "rule_id": PREVIEW_POLICY_ID,
+                    "rule_version": "v1",
+                    "reason": "inspection preview window; no native mechanical range is claimed",
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
+                }
+            )
+    for frame in cfg.get("frames") or []:
+        source_name = str(frame.get("source_name") or "")
+        native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
+        if source_name and native_suffix != frame.get("name"):
+            mappings.append(
+                {
+                    "object_type": "frame",
+                    "object": frame.get("name"),
+                    "field": "name",
+                    "actual": frame.get("name"),
+                    "source": f"CAD interface datum formatting for {frame.get('coordinate_system')}",
+                    "original": source_name,
+                    "rule_id": "naming.frame",
+                    "rule_version": "naming-v1",
+                    "reason": "CAD interface datum formatting",
+                }
+            )
+    for link in links:
+        for visual in link.get("visuals") or []:
+            visuals.append(
+                {
+                    "object_type": "visual",
+                    "object": visual["name"],
+                    "field": "name",
+                    "actual": visual["name"],
+                    "source": "native component identity formatting",
+                    "original": visual.get("provenance", {}).get("native_component"),
+                    "rule_id": "naming.visual",
+                    "rule_version": "naming-v1",
+                    "reason": "native component identity formatting",
+                }
+            )
+            mesh_paths.append(
+                {
+                    "object_type": "visual",
+                    "object": visual["name"],
+                    "field": "mesh filename",
+                    "actual": visual["mesh_name"],
+                    "source": "current capture content addressing",
+                    "original": visual.get("sha256"),
+                    "rule_id": "naming.mesh",
+                    "rule_version": "naming-v1",
+                    "reason": "current capture content addressing",
+                }
+            )
+    if mappings:
+        warnings.append(
+            {
+                "code": "naming.formatted_interface",
+                "message": "Link, joint, and frame names are deterministic formatting of native CAD identities.",
+                "objects": mappings,
+            }
+        )
+    if motion_unresolved:
+        warnings.append(
+            {
+                "code": "naming.motion_unresolved",
+                "message": "Joint names without a CAD motion classification retain a neutral name.",
+                "objects": motion_unresolved,
+            }
+        )
+    if direction_unresolved:
+        warnings.append(
+            {
+                "code": "direction.semantics_unresolved",
+                "message": "Authored CAD axes are preserved; functional positive motion is not proven.",
+                "objects": direction_unresolved,
+            }
+        )
+    if sign_reversals:
+        warnings.append(
+            {
+                "code": "direction.author_sign_applied",
+                "message": (
+                    "CAD author axis_sign selects the positive direction of the undirected "
+                    "shaft; q and ranges remain in author q."
+                ),
+                "objects": sign_reversals,
+            }
+        )
+    if preview_limits:
+        warnings.append(
+            {
+                "code": "limits.preview_policy",
+                "message": (
+                    "Inspection preview uses a versioned full-turn rotation window; "
+                    "no native mechanical range is claimed."
+                ),
+                "objects": preview_limits,
+            }
+        )
+    if visuals:
+        warnings.append(
+            {
+                "code": "naming.derived_visual",
+                "message": "Visual names are derived from the exact native component occurrence identity.",
+                "objects": visuals,
+            }
+        )
+    if mesh_paths:
+        warnings.append(
+            {
+                "code": "naming.content_addressed_mesh",
+                "message": "Mesh paths are derived from the current captured STL content digest.",
+                "objects": mesh_paths,
+            }
+        )
+    material_fallbacks = []
+    for link in links:
+        for visual in link.get("visuals") or []:
+            provenance = visual.get("provenance") or {}
+            if provenance.get("material_source") != "platform_display_fallback":
+                continue
+            material_fallbacks.append(
+                {
+                    "object_type": "visual",
+                    "object": visual["name"],
+                    "field": "material",
+                    "actual": {
+                        "name": visual.get("material"),
+                        "rgba": visual.get("rgba"),
+                    },
+                    "source": "platform display fallback; CAD appearance unobserved",
+                    "original": None,
+                    "rule_id": provenance.get("rule_id"),
+                    "rule_version": provenance.get("rule_version"),
+                    "reason": provenance.get("reason"),
+                }
+            )
+    if material_fallbacks:
+        warnings.append(
+            {
+                "code": "display.material_fallback",
+                "message": (
+                    "CAD appearance is unavailable; a platform display fallback is used "
+                    "without material semantics."
+                ),
+                "objects": material_fallbacks,
+            }
+        )
+    if cfg.get("robot_name_source") == "cad_filename_derived":
+        source_name = str(cfg.get("assembly") or "").replace("\\", "/").rsplit("/", 1)[-1]
+        warnings.append(
+            {
+                "code": "naming.formatted_robot_name",
+                "message": "The robot name is formatted from the native top-assembly filename.",
+                "objects": [
+                    {
+                        "object_type": "robot",
+                        "object": cfg.get("robot_name"),
+                        "field": "name",
+                        "actual": cfg.get("robot_name"),
+                        "source": "native top assembly filename formatting",
+                        "original": source_name,
+                        "rule_id": "naming.robot",
+                        "rule_version": "naming-v1",
+                        "reason": "native top assembly filename formatting",
+                    }
+                ],
+            }
+        )
+    geometry_objects = [
+        {
+            "object_type": "link",
+            "object": link["name"],
+            "fields": ["visual.xyz", "visual.rpy", "visual.filename", "visual.scale"],
+            "actual": "derived from native occurrence transforms and capture geometry",
+            "source": "native_derived",
+        }
+        for link in links
+    ]
+    geometry_objects.extend(
+        {
+            "object_type": "joint",
+            "object": joint["name"],
+            "fields": ["xyz", "rpy", "axis"],
+            "actual": "derived from native coordinate systems and axis declarations",
+            "source": "native_derived",
+        }
+        for joint in joints
+    )
+    geometry_objects.extend(
+        {
+            "object_type": "frame",
+            "object": frame["name"],
+            "fields": ["xyz", "rpy"],
+            "actual": "derived from native coordinate systems",
+            "source": "native_derived",
+        }
+        for frame in frames
+    )
+    if geometry_objects:
+        warnings.append(
+            {
+                "code": "geometry.derived_from_native",
+                "message": "Geometry, frame transforms and signed joint axes are derived from native evidence.",
+                "objects": geometry_objects,
+            }
+        )
+    warnings.append(
+        {
+            "code": "units.si_conversion",
+            "message": "Delivered values use SI units after conversion from native CAD units.",
+            "objects": [
+                {
+                    "object_type": "robot",
+                    "object": cfg.get("robot_name"),
+                    "field": "units",
+                    "actual": "SI",
+                    "source": "native_derived",
+                }
+            ],
+        }
+    )
+    physics_objects = [
+        {
+            "object_type": "link",
+            "object": link["name"],
+            "fields": ["inertial.mass", "inertial.xyz", "inertial.rpy", "inertial.inertia"],
+            "actual": "transformed or recombined from native readings",
+            "source": "native_derived",
+        }
+        for link in links
+        if link.get("inertial") is not None
+    ]
+    if physics_objects:
+        warnings.append(
+            {
+                "code": "physics.derived_from_native",
+                "message": "Link mass properties are transformed, translated or recombined from native readings.",
+                "objects": physics_objects,
+            }
+        )
+    constants = []
+    for link in links:
+        for visual in link.get("visuals") or []:
+            fields = ["scale"]
+            actual = {"scale": visual.get("scale")}
+            if visual.get("rgba"):
+                fields.append("material.rgba")
+                actual["rgba"] = visual["rgba"]
+            constants.append(
+                {
+                    "object_type": "visual",
+                    "object": visual["name"],
+                    "fields": fields,
+                    "actual": actual,
+                    "source": "display constant",
+                }
+            )
+    if constants:
+        warnings.append(
+            {
+                "code": "display.constant",
+                "message": "Display scale and material color are platform constants, not CAD readings.",
+                "objects": constants,
+            }
+        )
+    return warnings
 
 
 def _build_frames(

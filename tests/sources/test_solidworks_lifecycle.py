@@ -87,14 +87,28 @@ class SessionTests(unittest.TestCase):
     def test_capture_rebuild_is_in_memory_and_failure_blocks_measurement(self):
         backend = SolidWorksBackend()
         backend._capture_roots = [normalize_document_path("/snapshot/source")]
+        state = SimpleNamespace(NeedsRebuild2=1)
+        configuration = SimpleNamespace(
+            Name="Default",
+            NeedsRebuild=False,
+        )
         doc = SimpleNamespace(
-            ConfigurationManager=SimpleNamespace(ActiveConfiguration=SimpleNamespace(Name="Default")),
+            ConfigurationManager=SimpleNamespace(
+                ActiveConfiguration=configuration,
+            ),
+            Extension=state,
             GetSaveFlag=False,
             GetPathName="/snapshot/source/robot.SLDASM",
             IsOpenedReadOnly=True,
             Save=Mock(),
             ForceRebuild3=Mock(spec=["__call__"], return_value=True),
         )
+
+        def rebuild(_force):
+            state.NeedsRebuild2 = 0
+            return True
+
+        doc.ForceRebuild3.side_effect = rebuild
         refreshed = []
 
         def refresh(path):
@@ -102,18 +116,30 @@ class SessionTests(unittest.TestCase):
             return doc
 
         backend._document_by_path = refresh
-        rebuilt, result = backend._rebuild_capture_copy(doc, doc.GetPathName)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ):
+            rebuilt, result = backend._rebuild_capture_copy(doc, doc.GetPathName)
         self.assertIs(rebuilt, doc)
         self.assertEqual(result["scope"], "collected_copy_in_memory")
         self.assertFalse(result["saved_to_disk"])
         self.assertTrue(result["read_only"])
+        self.assertTrue(result["rebuild_performed"])
         doc.ForceRebuild3.assert_called_once_with(False)
         doc.Save.assert_not_called()
         self.assertEqual(refreshed, [doc.GetPathName])
+        state.NeedsRebuild2 = 1
+        doc.ForceRebuild3.side_effect = None
         doc.ForceRebuild3.return_value = False
-        with self.assertRaises(CadError) as caught:
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
             backend._rebuild_capture_copy(doc, doc.GetPathName)
         self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+        self.assertEqual(caught.exception.detail["path"], doc.GetPathName)
+        self.assertIs(caught.exception.detail["result"], False)
         self.assertEqual(refreshed, [doc.GetPathName])
 
     def test_loaded_references_must_also_be_read_only(self):

@@ -401,7 +401,13 @@ class LockAndScriptsTest(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(entries), 100)
         for line in entries:
-            self.assertRegex(line, r"^[A-Za-z0-9][A-Za-z0-9._-]*==[^\s]+ --hash=sha256:[0-9a-f]{64}  # \S+\.whl$")
+            self.assertRegex(
+                line,
+                r"^[A-Za-z0-9][A-Za-z0-9._-]*==[^\s]+(?: --hash=sha256:[0-9a-f]{64})+  # \S.*$",
+            )
+            hashes = re.findall(r" --hash=sha256:([0-9a-f]{64})", line)
+            self.assertTrue(hashes)
+            self.assertEqual(len(hashes), len(set(hashes)))
         joined = "\n".join(entries)
         for required in (
             "apache-airflow==3.3.2",

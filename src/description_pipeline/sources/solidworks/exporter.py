@@ -24,7 +24,6 @@ XSD = "http://www.w3.org/2001/XMLSchema"
 MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_ELEMENTS = 150_000
 MAX_DEPTH = 256
-_SNAKE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class ExporterDeclarationError(ValueError):
@@ -292,8 +291,8 @@ def decode_exporter_v14(raw_xml: str, exporter_version: float) -> dict:
         visited.add(element)
         contract.typed(element, "Link")
         name = contract.attribute(element, "NameAttribute", "name")
-        if not isinstance(name, str) or _SNAKE.fullmatch(name) is None or name in names:
-            _fail("declared link names must be unique exact snake_case", name)
+        if not isinstance(name, str) or not name or name in names:
+            _fail("declared link names must be non-empty and unique", name)
         names.add(name)
         if contract.member(element, "Parent") is not parent_element:
             _fail("the Link Parent reference disagrees with the Children tree", name)
@@ -311,8 +310,8 @@ def decode_exporter_v14(raw_xml: str, exporter_version: float) -> dict:
             if joint is None or joint["parent"] != parent_name or joint["child"] != name:
                 _fail("the declared joint endpoints disagree with the Link tree", name)
             joint_name = joint["name"]
-            if not isinstance(joint_name, str) or _SNAKE.fullmatch(joint_name) is None or joint_name in joints:
-                _fail("declared joint names must be unique exact snake_case", joint_name)
+            if not isinstance(joint_name, str) or not joint_name or joint_name in joints:
+                _fail("declared joint names must be non-empty and unique", joint_name)
             joints.add(joint_name)
         elif joint is not None and any(joint[key] not in (None, "") for key in ("name", "type", "parent", "child")):
             _fail("the root Link cannot declare an incoming joint", name)

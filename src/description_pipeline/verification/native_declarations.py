@@ -15,15 +15,23 @@ import re
 
 import numpy as np
 
+from ..interface_records import PURPOSE_INSPECTION_PREVIEW
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
 )
+from ..sources.solidworks.native_limits import (
+    PREVIEW_POLICY_ID,
+    PREVIEW_WINDOW_RAD,
+    limit_mate_scope,
+    native_limit_inventory_complete,
+    validate_native_limit,
+)
+from ..sources.solidworks.direction import canonicalize_axis
 from .solidworks_urdf import _axis, _cad_pose, _pose, _same_pose
 from .v14_declarations import DeclarationError, pid_hex, validate_boundary
 
 SCHEMA = "solidworks-to-urdf.native-declarations-verification/v1"
-_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def _require(condition, code, message, **detail):
@@ -39,6 +47,13 @@ def _selector(value):
 
 def _number(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def _all_zero_limits(limits) -> bool:
+    return isinstance(limits, dict) and all(
+        _number(limits.get(key)) and float(limits[key]) == 0.0
+        for key in ("lower", "upper", "effort", "velocity")
+    )
 
 
 def _leaves(components):
@@ -348,9 +363,11 @@ def _complete_membership(raw, components, members, leaves):
     return added, proofs, conflicts
 
 
-def verify_declarations(raw: dict, source: dict | None = None) -> dict:
+def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str | None = None) -> dict:
     """Audit raw native declaration evidence and, optionally, generated source claims."""
     checks, errors, diagnostics, state = [], [], [], {}
+    state["directions"] = {}
+    state["carried_axes"] = {}
 
     def check(identifier, callback):
         try:
@@ -398,9 +415,9 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             _require(isinstance(link, dict), "v14.topology", "a link tree contains a null link")
             name = link.get("name")
             _require(
-                isinstance(name, str) and _NAME.fullmatch(name) and name not in links,
+                isinstance(name, str) and bool(name) and name not in links,
                 "v14.topology",
-                "link names must be unique snake_case names",
+                "link names must be non-empty and unique",
                 name=name,
             )
             links[name] = link
@@ -423,9 +440,9 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 )
                 jname = joint.get("name")
                 _require(
-                    isinstance(jname, str) and _NAME.fullmatch(jname) and jname not in joints,
+                    isinstance(jname, str) and bool(jname) and jname not in joints,
                     "v14.topology",
-                    "joint names must be unique snake_case names",
+                    "joint names must be non-empty and unique",
                     joint=jname,
                 )
                 _require(
@@ -598,11 +615,88 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
         )
         return {}
 
+    def positive_direction(name, joint):
+        cached = state["directions"].get(name)
+        if cached is not None:
+            return cached
+        if joint.get("type") == "fixed":
+            return None
+        parent = state.get("frames", {}).get(joint.get("parent_link"))
+        child = state.get("frames", {}).get(joint.get("child_link"))
+        _require(
+            parent is not None and child is not None,
+            "v14.direction_frame_unread",
+            "positive motion needs readable parent and child mechanical frames",
+            joint=name,
+        )
+        try:
+            decision = canonicalize_axis(
+                name,
+                joint.get("axis"),
+                parent.reshape(16).tolist(),
+                child.reshape(16).tolist(),
+                joint_type=joint["type"],
+            )
+        except ValueError as error:
+            raise DeclarationError(
+                "v14.direction_invalid",
+                "positive-motion semantics could not be evaluated",
+                {"joint": name, "error": str(error)},
+            ) from error
+        local = np.asarray(joint.get("axis"), dtype=float)
+        if local.shape != (3,) or not np.isfinite(local).all() or not np.any(local):
+            raise DeclarationError(
+                "v14.direction_invalid",
+                "the declared child-frame axis is not a usable vector",
+                {"joint": name, "axis": joint.get("axis")},
+            )
+        assembly = np.asarray(child, dtype=float)[:3, :3] @ local
+        norm = float(np.linalg.norm(assembly))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            raise DeclarationError(
+                "v14.direction_invalid",
+                "the declared axis collapses in the assembly frame",
+                {"joint": name, "axis": joint.get("axis")},
+            )
+        decision["assembly_direction"] = (assembly / norm).tolist()
+        state["directions"][name] = decision
+        state["carried_axes"][name] = decision["delivered_local_axis"]
+        if decision["status"] != "local_class_aligned":
+            diagnostics.append(
+                {
+                    "code": "direction.semantics_unresolved",
+                    "blocking": False,
+                    "message": "the authored CAD axis is preserved; its motion class is not proven",
+                    "detail": {"joint": name, **decision},
+                }
+            )
+        return decision
+
     def joint_limits(name, joint):
         if joint["type"] == "fixed":
             return {"type": "fixed"}
+        positive_direction(name, joint)
         limits = joint.get("limit")
         _require(isinstance(limits, dict), "v14.limits", "moving joint has no authored limit record", joint=name)
+        raw_limits = dict(limits)
+        if joint["type"] == "continuous":
+            if any(raw_limits.get(key) is not None for key in ("lower", "upper")):
+                raise DeclarationError(
+                    "v14.native_limits_unexpected",
+                    "a continuous joint declares position limits",
+                    {"joint": name, "limits": raw_limits},
+                )
+            for mate in raw.get("mates") or []:
+                if not isinstance(mate, dict) or str(mate.get("name") or "").split("__", 1)[0] != name:
+                    continue
+                if mate.get("suppressed") is True:
+                    continue
+                if mate.get("is_advanced_mate") is True or mate.get("native_limit") is not None:
+                    raise DeclarationError(
+                        "v14.native_limits_unexpected",
+                        "a continuous joint has native position-limit evidence",
+                        {"joint": name, "mate": mate.get("name")},
+                    )
         invalid = [key for key in ("effort", "velocity") if not (_number(limits.get(key)) and limits[key] >= 0)]
         if joint["type"] in {"revolute", "prismatic"} and not (
             _number(limits.get("lower")) and _number(limits.get("upper")) and limits["lower"] <= limits["upper"]
@@ -616,8 +710,198 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             limits=limits,
             invalid=invalid,
         )
-        unqualified = [key for key in ("effort", "velocity") if limits[key] == 0]
-        if joint["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
+        native_limits = []
+        native_complete = True
+        if joint["type"] in {"revolute", "prismatic", "continuous"}:
+            child = joint["child_link"]
+            child_tree = {child}
+            parents = state.get("parents") or {}
+            while True:
+                expanded_tree = child_tree | {
+                    candidate for candidate, parent in parents.items() if parent in child_tree
+                }
+                if expanded_tree == child_tree:
+                    break
+                child_tree = expanded_tree
+            members = state.get("members") or {}
+            leaves = state.get("leaves") or set()
+
+            def owner_for(component: str) -> str | None:
+                expanded = _expanded(component, leaves)
+                owners = [body for body, body_members in members.items() if expanded and expanded <= body_members]
+                return owners[0] if len(owners) == 1 else None
+
+            parents = state.get("parents") or {}
+            roots = [link for link, parent in parents.items() if parent is None]
+            root_name = roots[0] if len(roots) == 1 else None
+            root_frame = state.get("frame_names", {}).get(root_name) if root_name is not None else None
+            ownerless_root = (
+                [
+                    datum
+                    for datum in raw.get("datums") or []
+                    if isinstance(datum, dict)
+                    and str(datum.get("name")) == root_frame
+                    and datum.get("owner") == ""
+                ]
+                if root_frame
+                else []
+            )
+            assembly_owner = root_name if root_name is not None and len(ownerless_root) == 1 else None
+
+            raw_mates = raw.get("mates")
+            if not isinstance(raw_mates, list):
+                native_complete = False
+                raw_mates = []
+            limit_types = {"distance", "angle", "limitdistance", "limitangle"}
+            for mate in raw_mates:
+                if not isinstance(mate, dict):
+                    native_complete = False
+                    continue
+                suppressed = mate.get("suppressed")
+                if type(suppressed) is not bool:
+                    native_complete = False
+                    continue
+                if suppressed:
+                    continue
+                mate_type = str(mate.get("type") or "").strip().lower()
+                if mate_type not in limit_types:
+                    continue
+                scope = limit_mate_scope(
+                    mate,
+                    owner_for,
+                    child_tree,
+                    name,
+                    parent_owner=str(joint["parent_link"]),
+                    assembly_owner=assembly_owner,
+                )
+                if scope == "unrelated":
+                    continue
+                if scope in {"claimed_unreadable", "claimed_same_side"}:
+                    native_complete = False
+                    continue
+                flag = mate.get("is_advanced_mate")
+                if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
+                    native_complete = False
+                    continue
+                if flag is not True:
+                    if mate.get("limits") is not None:
+                        native_complete = False
+                    continue
+                if mate_type not in {"limitangle", "limitdistance"}:
+                    native_complete = False
+                    continue
+                if joint["type"] == "continuous":
+                    raise DeclarationError(
+                        "v14.native_limits_unexpected",
+                        "a continuous joint has native position-limit evidence",
+                        {"joint": name, "mate": mate.get("name")},
+                    )
+                try:
+                    lower, upper, unit = validate_native_limit(mate, state.get("components"))
+                except ValueError:
+                    native_complete = False
+                    continue
+                expected_unit = "m" if joint["type"] == "prismatic" else "rad"
+                if unit != expected_unit:
+                    native_complete = False
+                    continue
+                if mate.get("error_code") != 0 or not isinstance(mate.get("limits"), dict):
+                    native_complete = False
+                    continue
+                native_limits.append(
+                    {
+                        "mate": str(mate.get("name") or "unknown"),
+                        "type": mate_type,
+                        "is_advanced_mate": flag,
+                        "limits": {"lower": lower, "upper": upper, "unit": unit},
+                    }
+                )
+            if not native_complete:
+                raise DeclarationError(
+                    "v14.native_limits_unreadable",
+                    "the native range observation is incomplete or unreadable",
+                    {"joint": name, "native": native_limits},
+                )
+        if joint["type"] in {"revolute", "prismatic"}:
+            ranges = {
+                (float(item["limits"]["lower"]), float(item["limits"]["upper"]))
+                for item in native_limits
+                if isinstance(item.get("limits"), dict)
+            }
+            if len(ranges) > 1:
+                raise DeclarationError(
+                    "v14.native_limits_conflict",
+                    "native range observations disagree for one joint",
+                    {"joint": name, "ranges": sorted(ranges)},
+                )
+            if ranges:
+                lower, upper = next(iter(ranges))
+                if not _all_zero_limits(limits) and (
+                    abs(float(limits["lower"]) - lower) > 1e-12
+                    or abs(float(limits["upper"]) - upper) > 1e-12
+                ):
+                    raise DeclarationError(
+                        "v14.native_limits_conflict",
+                        "native range disagrees with the saved author declaration",
+                        {"joint": name, "native": [lower, upper], "declared": raw_limits},
+                    )
+                limits = {
+                    "lower": lower,
+                    "upper": upper,
+                    "effort": raw_limits.get("effort"),
+                    "velocity": raw_limits.get("velocity"),
+                }
+                state.setdefault("effective_limits", {})[name] = dict(limits)
+                state.setdefault("effective_limit_sources", {})[name] = "native"
+            elif (
+                joint["type"] == "revolute"
+                and purpose == PURPOSE_INSPECTION_PREVIEW
+                and native_limit_inventory_complete(raw.get("mates"))
+                and _all_zero_limits(raw_limits)
+            ):
+                preview_limits = {
+                    "lower": -PREVIEW_WINDOW_RAD,
+                    "upper": PREVIEW_WINDOW_RAD,
+                }
+                for key in ("effort", "velocity"):
+                    if _number(raw_limits.get(key)) and raw_limits[key] >= 0:
+                        preview_limits[key] = raw_limits[key]
+                limits = preview_limits
+                state.setdefault("effective_limits", {})[name] = dict(limits)
+                state.setdefault("effective_limit_sources", {})[name] = "preview_policy"
+                state.setdefault("preview_policies", {})[name] = {
+                    "rule_id": PREVIEW_POLICY_ID,
+                    "rule_version": "v1",
+                    "window_rad": [-PREVIEW_WINDOW_RAD, PREVIEW_WINDOW_RAD],
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
+                    "author_limits": dict(raw_limits),
+                    "native_absence": "complete_mate_inventory_no_enabled_limit",
+                }
+                diagnostics.append(
+                    {
+                        "code": "v14.preview_policy",
+                        "blocking": False,
+                        "message": (
+                            "inspection preview uses the versioned full-turn rotation window; "
+                            "no engineering position range is established"
+                        ),
+                        "detail": {"joint": name, **state["preview_policies"][name]},
+                    }
+                )
+            elif _all_zero_limits(raw_limits):
+                raise DeclarationError(
+                    "v14.native_limits_missing",
+                    "the CAD has no active working range and the saved declaration is only a zero placeholder",
+                    {"joint": name, "declared": raw_limits},
+                )
+            else:
+                state.setdefault("effective_limits", {})[name] = dict(limits)
+                state.setdefault("effective_limit_sources", {})[name] = "declared_author"
+        if name in state.get("effective_limits", {}):
+            state["effective_limits"][name] = dict(limits)
+        unqualified = [key for key in ("effort", "velocity") if limits.get(key) == 0]
+        if joint["type"] in {"revolute", "prismatic"} and limits.get("lower") == limits.get("upper"):
             unqualified.append("degenerate_position_range")
         if unqualified:
             diagnostics.append(
@@ -625,14 +909,17 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                     "code": "v14.motion_unqualified",
                     "blocking": False,
                     "message": (
-                        "authored motion/drive values are zero or degenerate; consumers import the "
-                        "zero-range joint as unlimited while effort/velocity are dropped, so motion is "
-                        "unqualified and not robot-ready"
+                        "the exporter declaration's motion/drive values are zero or degenerate; consumers "
+                        "may import a zero-range joint as unlimited, so motion is unqualified and not robot-ready"
                     ),
                     "detail": {"joint": name, "values": unqualified, "limits": dict(limits)},
                 }
             )
-        return {"limits": limits}
+        return {
+            "limits": limits,
+            "declared_limits": raw_limits,
+            "limit_source": state.get("effective_limit_sources", {}).get(name, "declared_author"),
+        }
 
     def joint_geometry(name, joint):
         parent, child = joint["parent_link"], joint["child_link"]
@@ -666,11 +953,17 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
             for key, value in state["components"].items()
             if value["suppressed"] is False
         }
+        positive = positive_direction(name, joint)
+        carried = state["carried_axes"][name]
         details = _axis(
-            {"axis_reference": reference, "axis": joint.get("axis")}, candidates[0], components, state["frames"][child]
+            {"axis_reference": reference, "axis": carried}, candidates[0], components, state["frames"][child]
         )
         state.setdefault("axes", {})[name] = reference
-        return {**details, "origin_customized": origin["customized"]}
+        return {
+            **details,
+            "origin_customized": origin["customized"],
+            "direction": positive,
+        }
 
     def pose_diagnostics():
         from .native_discovery import _frames
@@ -805,17 +1098,25 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                 joint=name,
             )
             if saved["type"] != "fixed":
-                limits = saved["limit"]
+                limits = state.get("effective_limits", {}).get(name, saved["limit"])
                 if saved["type"] == "continuous":
                     limits = {key: limits[key] for key in ("effort", "velocity")}
                 _require(
                     observed.get("limits") == limits
-                    and observed.get("axis") == saved["axis"]
+                    and observed.get("axis") == state.get("carried_axes", {}).get(name)
                     and observed.get("axis_reference") == state["axes"].get(name),
                     "v14.claims",
                     "generated joint axis or operating values differ",
                     joint=name,
                 )
+                if saved["type"] in {"revolute", "prismatic"}:
+                    expected_source = state.get("effective_limit_sources", {}).get(name, "declared_author")
+                    _require(
+                        observed.get("limit_source", "declared_author") == expected_source,
+                        "v14.claims",
+                        "generated joint limit source differs from native evidence",
+                        joint=name,
+                    )
         return {"bodies": len(bodies), "joints": len(joints)}
 
     if check("declarations.binding", boundary) and check("declarations.topology", topology):
@@ -867,12 +1168,23 @@ def verify_declarations(raw: dict, source: dict | None = None) -> dict:
                     "type": joint["type"],
                     "parent": joint["parent_link"],
                     "child": joint["child_link"],
-                    "axis": joint.get("axis"),
+                    "axis": (state.get("carried_axes") or {}).get(name),
+                    "axis_provenance": (state.get("directions") or {}).get(name),
                     "axis_reference": (state.get("axes") or {}).get(name),
                     "limits": (
                         {key: joint["limit"][key] for key in ("effort", "velocity")}
                         if joint["type"] == "continuous" and isinstance(joint.get("limit"), dict)
-                        else joint.get("limit")
+                        else state.get("effective_limits", {}).get(name, joint.get("limit"))
+                    ),
+                    **(
+                        {"limit_source": state["effective_limit_sources"][name]}
+                        if name in state.get("effective_limit_sources", {})
+                        else {}
+                    ),
+                    **(
+                        {"preview_policy": state["preview_policies"][name]}
+                        if name in state.get("preview_policies", {})
+                        else {}
                     ),
                 }
                 for name, joint in sorted((state.get("joints") or {}).items())

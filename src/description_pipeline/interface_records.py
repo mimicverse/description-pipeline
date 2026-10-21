@@ -48,31 +48,10 @@ SCHEMA_VERSIONS = frozenset(
     value for name, value in vars(_schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
 )
 
-#: The bound finite preview-range declaration of an inspection-preview prismatic
-#: joint: one schema id and exact key set, owned with the other single-owner
-#: schemas so the release schema digest (IF-15) covers the structural shape.
-#: The semantic reconstruction stays in the discovery/verification modules: they
-#: consume these definitions and never re-type them.
-PREVIEW_RANGE_SCHEMA = "solidworks-to-urdf.preview-range/v1"
-PREVIEW_RANGE_KEYS = frozenset(
-    {
-        "schema_version",
-        "joint",
-        "instance",
-        "configuration",
-        "unit",
-        "zero",
-        "direction",
-        "purpose",
-        "lower",
-        "upper",
-    }
-)
-
 #: Every machine schema version this release knows: the single-owner schema ids
-#: plus the stage contract and the preview-range declaration.  Unknown versions
-#: are refused wherever a record quotes one (call bindings, manifests, ...).
-KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"], PREVIEW_RANGE_SCHEMA}
+#: plus the stage contract.  Unknown versions are refused wherever a record
+#: quotes one (call bindings, manifests, ...).
+KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
 
 #: The shipped schema definition sources the schema digest covers: the model
 #: document schema (structure and field rules of produced documents) and the two
@@ -370,13 +349,6 @@ CHECK_POLICY_V1 = {
     "schema_version": CHECK_POLICY_SCHEMA,
     "fixed_checks": sorted(FIXED_REQUIRED_CHECKS),
     "dynamic_expansions": [dict(rule) for rule in CHECK_POLICY_EXPANSIONS],
-    # The one owner of the inspection-preview window: value, applicability and
-    # the analytical sampling rule all live here, inside the same policy digest.
-    "preview": {
-        "revolute_window_rad": math.pi,
-        "applies_when": "inspection_preview_and_engineering_range_proven_missing_and_revolute",
-        "sampling": {"interval_fraction": 1.0},
-    },
     # The engineering-qualification facts (distinct from model-consistency facts):
     # per-joint range authority and drive sizing, plus the per-subject machine
     # qualification.  Only authoritative native/controlled evidence can establish
@@ -394,7 +366,7 @@ def validate_check_policy(policy) -> dict:
     code = "check_policy_invalid"
     _exact_keys(
         policy,
-        {"schema_version", "fixed_checks", "dynamic_expansions", "preview", "engineering_facts"},
+        {"schema_version", "fixed_checks", "dynamic_expansions", "engineering_facts"},
         code,
         "policy",
     )
@@ -417,29 +389,6 @@ def validate_check_policy(policy) -> dict:
             _require(isinstance(rule.get(key), str) and rule[key], code, {"where": f"{where}.{key}"})
         if "when" in rule:
             _require(isinstance(rule["when"], str) and rule["when"], code, {"where": f"{where}.when"})
-    preview = policy["preview"]
-    _exact_keys(preview, {"revolute_window_rad", "applies_when", "sampling"}, code, "preview")
-    radius = preview["revolute_window_rad"]
-    _require(
-        isinstance(radius, (int, float)) and not isinstance(radius, bool) and math.isfinite(radius) and radius > 0.0,
-        code,
-        {"where": "preview.revolute_window_rad"},
-    )
-    _require(
-        isinstance(preview["applies_when"], str) and preview["applies_when"].strip() != "",
-        code,
-        {"where": "preview.applies_when"},
-    )
-    _exact_keys(preview["sampling"], {"interval_fraction"}, code, "preview.sampling")
-    fraction = preview["sampling"]["interval_fraction"]
-    _require(
-        isinstance(fraction, (int, float))
-        and not isinstance(fraction, bool)
-        and math.isfinite(fraction)
-        and fraction > 0.0,
-        code,
-        {"where": "preview.sampling.interval_fraction"},
-    )
     facts = policy["engineering_facts"]
     _exact_keys(facts, {"per_joint", "per_subject"}, code, "engineering_facts")
     for key in ("per_joint", "per_subject"):
@@ -456,18 +405,6 @@ def validate_check_policy(policy) -> dict:
 
 
 validate_check_policy(CHECK_POLICY_V1)
-
-
-def preview_revolute_window_rad() -> float:
-    """The finite canonical inspection-preview window radius, read from the one policy."""
-
-    return float(CHECK_POLICY_V1["preview"]["revolute_window_rad"])
-
-
-def preview_sampling_interval_fraction() -> float:
-    """The analytical sampling fraction of the preview window, from the same policy."""
-
-    return float(CHECK_POLICY_V1["preview"]["sampling"]["interval_fraction"])
 
 
 def check_policy_digest() -> str:
