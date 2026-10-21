@@ -667,35 +667,13 @@ class NativeMeshObservationTests(unittest.TestCase):
 
     def test_vertex_cache_never_selects_edges_by_coordinate(self):
         original = copy.deepcopy(self.row)
-        itessellation = original["tessellation"]["itessellation"]
-        body = itessellation["bodies"][0]
-        internal_fin = next(fin for fin in body["fins"] if fin["classification"] == "internal_only")
-        vertices = {
-            vertex["vertex_id"]: vertex
-            for vertex in itessellation["vertices"]
-            if (vertex["body_type"], vertex["body_index"]) == (1, 0)
-        }
         edge = original["tessellation"]["native_edges"][0]
-        start_point = list(vertices[internal_fin["vertex_ids"][0]]["point_m"])
-        end_point = list(vertices[internal_fin["vertex_ids"][1]]["point_m"])
-        edge["start_point_m"] = start_point
-        edge["end_point_m"] = end_point
         edge["start_vertex_reference_sha256"] = hashlib.sha256(
-            struct.pack("<3f", *start_point)
+            b"persistent-edge-start"
         ).hexdigest()
         edge["end_vertex_reference_sha256"] = hashlib.sha256(
-            struct.pack("<3f", *end_point)
+            b"persistent-edge-end"
         ).hexdigest()
-        edge["curve_start_point_m"] = list(start_point)
-        edge["curve_end_point_m"] = list(end_point)
-        support.replace_curve_endpoint_evaluation(
-            edge["curve_endpoint_evaluations"]["start"],
-            start_point,
-        )
-        support.replace_curve_endpoint_evaluation(
-            edge["curve_endpoint_evaluations"]["end"],
-            end_point,
-        )
         self.row = original
         self.assertEqual(self.verify()["components"], 1)
 
@@ -991,10 +969,33 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
 
     def test_curved_native_edge_rejects_same_u_direction(self):
         tessellation, triangles = self.fixture()
-        _edge, fins = self.edge_fins(tessellation)
-        first = fins[0]
-        cofin = next(row for row in fins if row["fin_id"] == first["cofin_id"])
-        self.set_u(cofin, first["start_u"], first["end_u"])
+        _edge, external_fins = self.edge_fins(tessellation)
+        by_id = {
+            fin["fin_id"]: fin
+            for fin in tessellation["itessellation"]["bodies"][0]["fins"]
+        }
+        vertices = {
+            row["vertex_id"]: row["point_m"]
+            for row in tessellation["itessellation"]["vertices"]
+        }
+        for fin in by_id.values():
+            if fin["face_index"] == 1:
+                fin["vertex_ids"].reverse()
+        for fin in external_fins:
+            if fin["face_index"] != 1:
+                continue
+            cofin = by_id[fin["cofin_id"]]
+            self.set_u(fin, cofin["start_u"], cofin["end_u"])
+            support.replace_u_evidence(
+                fin["start_evidence"],
+                vertices[fin["vertex_ids"][0]],
+            )
+            support.replace_u_evidence(
+                fin["end_evidence"],
+                vertices[fin["vertex_ids"][1]],
+            )
+        for index in (3, 4, 5):
+            triangles[index] = tuple(reversed(triangles[index]))
         with self.assertRaisesRegex(PipelineError, "cofin/orientation is inconsistent"):
             self.parse(tessellation, triangles)
 

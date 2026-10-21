@@ -50,9 +50,8 @@ def packed_evaluate_status(value):
 
 
 class FakeVariant:
-    def __init__(self, value_type, value):
-        self.value_type = value_type
-        self.varianttype = value_type
+    def __init__(self, varianttype, value):
+        self.varianttype = varianttype
         self.value = value
 
 
@@ -103,7 +102,7 @@ def fake_read_end_params(curve):
         "is_closed": None,
         "is_periodic": None,
         "raw_outputs": [
-            {"value_type": item.value_type, "value": item.value}
+            {"value_type": item.varianttype, "value": item.value}
             for item in outputs
         ],
     }
@@ -551,7 +550,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
 
     def test_trimmed_domain_uses_containment_and_periodic_seam_lift(self):
-        contained = native_curve_domain_transform(
+        edge_local = native_curve_domain_transform(
             -10.0,
             10.0,
             1.0,
@@ -559,8 +558,9 @@ class NativeFinCaptureTests(unittest.TestCase):
             True,
             False,
         )
-        self.assertEqual(contained["status"], "contained")
-        self.assertEqual(contained["segments"], [[1.0, 2.0]])
+        self.assertEqual(edge_local["status"], "edge_local_nonperiodic")
+        self.assertEqual(edge_local["domain_basis"], "edge_curve_params3")
+        self.assertEqual(edge_local["segments"], [[1.0, 2.0]])
 
         wrapped = native_curve_domain_transform(
             0.0,
@@ -785,6 +785,75 @@ class NativeFinCaptureTests(unittest.TestCase):
             [0x4005, 0x4005, 0x400B, 0x400B],
         )
 
+    def test_get_end_params_requires_real_varianttype(self):
+        class VariantTypeOnly:
+            def __init__(self, varianttype, value):
+                self.varianttype = varianttype
+                self.value = value
+
+        class ValueTypeOnly:
+            def __init__(self, varianttype, value):
+                self.value_type = varianttype
+                self.value = value
+
+        curve = FakeCurve(-10.0, 10.0)
+        result = native_module._read_curve_end_params(
+            curve,
+            variant_factory=VariantTypeOnly,
+            vt_byref=0x4000,
+            vt_r8=5,
+            vt_bool=11,
+        )
+        self.assertEqual(
+            [item["value_type"] for item in result["raw_outputs"]],
+            [0x4005, 0x4005, 0x400B, 0x400B],
+        )
+
+        curve = FakeCurve(-10.0, 10.0)
+        result = native_module._read_curve_end_params(
+            curve,
+            variant_factory=ValueTypeOnly,
+            vt_byref=0x4000,
+            vt_r8=5,
+            vt_bool=11,
+        )
+        self.assertEqual(
+            [item["value_type"] for item in result["raw_outputs"]],
+            [None, None, None, None],
+        )
+
+    def test_nonperiodic_present_edge_uses_get_curve_params3_domain(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        edge.u_min = -0.0044499999945766125
+        edge.u_max = -1.4284990122115763e-18
+        edge.curve = FakeCurve(0.0, 0.004449999994576611)
+        edge.curve_start_point = [edge.u_min, 0.0, 0.0]
+        edge.curve_end_point = [edge.u_max, 0.0, 0.0]
+        edge.vertices = [
+            FakeVertex(tuple(edge.curve_start_point)),
+            FakeVertex(tuple(edge.curve_end_point)),
+        ]
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: tuple(edge.curve_start_point),
+            2: tuple(edge.curve_end_point),
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+
+        captured = self.capture(body, extension)
+
+        transform = captured["native_edge_rows"][0]["curve_domain_transform"]
+        self.assertEqual(transform["status"], "edge_local_nonperiodic")
+        self.assertEqual(transform["domain_basis"], "edge_curve_params3")
+        self.assertEqual(
+            (transform["lifted_start"], transform["lifted_end"]),
+            (edge.u_min, edge.u_max),
+        )
+        self.assertEqual(
+            (transform["underlying_start"], transform["underlying_end"]),
+            (0.0, 0.004449999994576611),
+        )
+
     def test_100_metre_closest_point_error_is_rejected_at_both_u_scales(self):
         fixture = Path(__file__).with_name(
             "native-u-metre-tolerance-counterexample.json"
@@ -925,7 +994,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(edge.sense_calls, 4)
         self.assertCountEqual(tessellation.cofin_calls, [100, 200])
         self.assertEqual(
-            [item.value_type for item in edge.curve.end_params_arguments],
+            [item.varianttype for item in edge.curve.end_params_arguments],
             [0x4005, 0x4005, 0x400B, 0x400B],
         )
         self.assertEqual(
@@ -1048,6 +1117,10 @@ class NativeFinCaptureTests(unittest.TestCase):
                 ],
                 [False, True],
             )
+            old_edge_points = {
+                tuple(edge["curve_start_point_m"]),
+                tuple(edge["curve_end_point_m"]),
+            }
             derived = copy.deepcopy(tessellation)
             derived_edge = derived["native_edges"][0]
             derived_edge.update(
@@ -1088,6 +1161,42 @@ class NativeFinCaptureTests(unittest.TestCase):
                     )
                 )
                 evaluation["point_error_m"] = 0.0
+            affected_vertices = set()
+            derived_fins = derived["itessellation"]["bodies"][0]["fins"]
+            for fin in derived_fins:
+                if fin["fin_id"] not in derived_edge["fin_ids"]:
+                    continue
+                for vertex_id, evidence in zip(
+                    fin["vertex_ids"],
+                    (fin["start_evidence"], fin["end_evidence"]),
+                    strict=True,
+                ):
+                    if native_u_equal(
+                        evidence["u"],
+                        derived_edge["u_min"],
+                    ) or native_u_equal(
+                        evidence["u"],
+                        derived_edge["u_max"],
+                    ):
+                        affected_vertices.add(vertex_id)
+                        evidence["closest_point_on_raw"][:3] = [0.0, 0.0, 0.0]
+                        evidence["evaluate_payload"][:3] = [0.0, 0.0, 0.0]
+                        evidence["point_tolerance_m"] = (
+                            native_point_roundtrip_tolerance(
+                                [0.0, 0.0, 0.0],
+                            )
+                        )
+                        evidence["closest_point_error_m"] = 0.0
+                        evidence["evaluate_point_error_m"] = 0.0
+                        evidence["closest_evaluate_error_m"] = 0.0
+            for vertex in derived["itessellation"]["vertices"]:
+                if vertex["vertex_id"] in affected_vertices:
+                    vertex["point_m"] = [0.0, 0.0, 0.0]
+            for index, triangle in enumerate(triangle_vertices):
+                triangle_vertices[index] = tuple(
+                    (0.0, 0.0, 0.0) if tuple(point) in old_edge_points else point
+                    for point in triangle
+                )
             derived_spans = parse_native_tessellation(
                 "part-1",
                 derived,

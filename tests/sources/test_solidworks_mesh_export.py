@@ -57,16 +57,16 @@ class FakeCurve:
             (is_closed, NATIVE_VT_BYREF_BOOL, False),
             (is_periodic, NATIVE_VT_BYREF_BOOL, False),
         ):
-            output.value_type = value_type
+            output.varianttype = value_type
             output.value = value
         return True
 
 
 def _read_fake_end_params(curve):
-    start = SimpleNamespace(value_type=None, value=None)
-    end = SimpleNamespace(value_type=None, value=None)
-    is_closed = SimpleNamespace(value_type=None, value=None)
-    is_periodic = SimpleNamespace(value_type=None, value=None)
+    start = SimpleNamespace(varianttype=None, value=None)
+    end = SimpleNamespace(varianttype=None, value=None)
+    is_closed = SimpleNamespace(varianttype=None, value=None)
+    is_periodic = SimpleNamespace(varianttype=None, value=None)
     success = curve.GetEndParams(start, end, is_closed, is_periodic)
     outputs = (start, end, is_closed, is_periodic)
     return {
@@ -78,7 +78,7 @@ def _read_fake_end_params(curve):
         "is_closed": is_closed.value,
         "is_periodic": is_periodic.value,
         "raw_outputs": [
-            {"value_type": output.value_type, "value": output.value}
+            {"value_type": output.varianttype, "value": output.value}
             for output in outputs
         ],
     }

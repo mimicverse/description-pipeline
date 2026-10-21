@@ -11,7 +11,7 @@ NATIVE_U_COVERAGE_COVERED = "covered"
 NATIVE_U_COVERAGE_UNCOVERED = "uncovered"
 NATIVE_U_COVERAGE_UNRESOLVED = "unresolved"
 NATIVE_POINT_ROUNDTRIP_RULE = "native-point-float32-adjacent-v2"
-NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-periodic-lift-v1"
+NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
 
 
@@ -292,6 +292,7 @@ def native_curve_domain_transform(
         "seam_wrapped": False,
         "segments": [],
         "status": "unresolved",
+        "domain_basis": "unresolved",
     }
     positive_start = edge_start if sense else -edge_end
     positive_end = edge_end if sense else -edge_start
@@ -317,27 +318,20 @@ def native_curve_domain_transform(
                     "lifted_end": positive_end,
                     "segments": [[positive_start, positive_end]],
                     "status": "contained_periodicity_unknown",
+                    "domain_basis": "underlying_curve_get_end_params",
                 }
             )
         return result
     if is_periodic is False:
-        if native_u_in_closed_interval(
-            positive_start,
-            curve_start,
-            curve_end,
-        ) and native_u_in_closed_interval(
-            positive_end,
-            curve_start,
-            curve_end,
-        ):
-            result.update(
-                {
-                    "lifted_start": positive_start,
-                    "lifted_end": positive_end,
-                    "segments": [[positive_start, positive_end]],
-                    "status": "contained",
-                }
-            )
+        result.update(
+            {
+                "lifted_start": edge_start,
+                "lifted_end": edge_end,
+                "segments": [[edge_start, edge_end]],
+                "status": "edge_local_nonperiodic",
+                "domain_basis": "edge_curve_params3",
+            }
+        )
         return result
 
     period = curve_end - curve_start
@@ -366,6 +360,7 @@ def native_curve_domain_transform(
             {
                 "segments": [[lifted_start, lifted_end]],
                 "status": "contained",
+                "domain_basis": "underlying_curve_get_end_params",
             }
         )
         return result
@@ -379,6 +374,7 @@ def native_curve_domain_transform(
                     [curve_start, wrapped_end],
                 ],
                 "status": "contained_seam_wrapped",
+                "domain_basis": "underlying_curve_get_end_params",
             }
         )
     return result

@@ -496,7 +496,7 @@ def _read_curve_end_params(
     outputs = (start, end, is_closed, is_periodic)
     evidence["raw_outputs"] = [
         {
-            "value_type": getattr(item, "value_type", None),
+            "value_type": getattr(item, "varianttype", None),
             "value": getattr(item, "value", None),
         }
         for item in outputs
@@ -4826,7 +4826,11 @@ class SolidWorksBackend(CadBackend):
                     and endpoint_evaluations_valid
                     and closure_error <= closure_tolerance
                     and curve_domain_transform["status"]
-                    in {"contained", "contained_seam_wrapped"}
+                    in {
+                        "contained",
+                        "contained_seam_wrapped",
+                        "edge_local_nonperiodic",
+                    }
                 )
                 if not endpoint_points_derived_from_curve:
                     raise CadError(
@@ -4865,7 +4869,11 @@ class SolidWorksBackend(CadBackend):
             if not both_absent and (
                 not endpoint_evaluations_valid
                 or curve_domain_transform["status"]
-                not in {"contained", "contained_seam_wrapped"}
+                not in {
+                    "contained",
+                    "contained_seam_wrapped",
+                    "edge_local_nonperiodic",
+                }
             ):
                 raise CadError(
                     "cad_native_tessellation_unreadable",

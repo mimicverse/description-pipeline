@@ -580,12 +580,32 @@ def parse_native_tessellation(
             edge["curve_sense"],
             end_params["is_periodic"],
         )
+        endpoint_states = {
+            "start": edge["start_vertex_state"],
+            "end": edge["end_vertex_state"],
+        }
+        if end_params["is_periodic"] is False:
+            allowed_transform_statuses = (
+                {"edge_local_nonperiodic"}
+                if (
+                    set(endpoint_states.values()) == {"present"}
+                    or (
+                        set(endpoint_states.values()) == {"absent"}
+                        and end_params["is_closed"] is True
+                    )
+                )
+                else set()
+            )
+        else:
+            allowed_transform_statuses = {
+                "contained",
+                "contained_seam_wrapped",
+            }
         _require(
             edge["curve_domain_transform"] == expected_transform
-            and expected_transform["status"]
-            in {"contained", "contained_seam_wrapped"},
+            and expected_transform["status"] in allowed_transform_statuses,
             component
-            + f": native edge {index} trimmed domain is outside its underlying curve domain",
+            + f": native edge {index} has no valid native curve-domain proof",
         )
         evaluations = edge["curve_endpoint_evaluations"]
         _require(
@@ -630,10 +650,6 @@ def parse_native_tessellation(
                 + f": native edge {index} {name} endpoint evaluation is not independently reproducible",
             )
 
-        endpoint_states = {
-            "start": edge["start_vertex_state"],
-            "end": edge["end_vertex_state"],
-        }
         if "read_failed" in endpoint_states.values():
             _require(
                 False,
@@ -1153,6 +1169,32 @@ def _parse_v3_itessellation(
                 component
                 + f": native tessellation v3 edge {reference} curve endpoints differ",
             )
+            evaluations = edge["curve_endpoint_evaluations"]
+            for edge_endpoint in ("start", "end"):
+                edge_evaluation = evaluations[edge_endpoint]
+                edge_point = tuple(edge_evaluation["payload"][:3])
+                for fin_id in actual:
+                    fin = evidence["fins"][fin_id]
+                    for fin_endpoint in ("start", "end"):
+                        fin_evaluation = fin[f"{fin_endpoint}_evidence"]
+                        if not native_u_equal(
+                            edge_evaluation["u"],
+                            fin_evaluation["u"],
+                        ):
+                            continue
+                        fin_point = tuple(fin_evaluation["evaluate_payload"][:3])
+                        point_tolerance = native_point_roundtrip_tolerance(
+                            edge_point,
+                            fin_point,
+                        )
+                        point_error = native_point_error(edge_point, fin_point)
+                        _require(
+                            point_error <= point_tolerance,
+                            component
+                            + f": native tessellation v3 edge {reference} "
+                            + f"{edge_endpoint} endpoint conflicts with fin {fin_id} "
+                            + f"{fin_endpoint} at the same U",
+                        )
             face_sense = {
                 row["face_index"]: row["EdgeInFaceSense"]["value"]
                 for row in edge["face_senses"]

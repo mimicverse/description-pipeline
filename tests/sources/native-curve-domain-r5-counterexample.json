@@ -1,0 +1,87 @@
+{
+  "candidate_head": "191f3c5a093053a6c3d054f78c7e8aaa233321a9",
+  "raw_sha256": "8d7dbedf2ce440c400b868f1c964806b8c154a9a8da3d6a6620f99b64a87ab4f",
+  "raw_path": "pass2.facet_observation.api_calls",
+  "first_failure": {
+    "edge_reference_sha256": "1a2c4e65ec1f154b32f55fc99299ecb17ae7af9bbb2de1aac84718048d53155d",
+    "sequence": {
+      "GetStartVertex": 11914,
+      "GetStartVertex_GetPoint": 11919,
+      "GetEndVertex": 11929,
+      "GetEndVertex_GetPoint": 11934,
+      "GetCurveParams3": 11965,
+      "UMinValue": 11970,
+      "UMaxValue": 11972,
+      "StartPoint": 11974,
+      "EndPoint": 11980,
+      "Sense": 11986,
+      "CurveType": 11988,
+      "GetEndParams": 11990,
+      "Evaluate2_start": 11996,
+      "Evaluate2_end": 12007
+    },
+    "edge_u": {
+      "u_min": -0.0044499999945766125,
+      "u_max": -1.4284990122115763e-18
+    },
+    "edge_endpoints_m": {
+      "start": [
+        0.005334659428148992,
+        0.005550000005423391,
+        0.0228
+      ],
+      "end": [
+        0.00533465849454075,
+        0.010000000000000002,
+        0.0228
+      ]
+    },
+    "curve_endpoints_m": {
+      "start": [
+        0.005334659428148992,
+        0.005550000005423391,
+        0.0228
+      ],
+      "end": [
+        0.00533465849454075,
+        0.010000000000000002,
+        0.0228
+      ]
+    },
+    "curve_sense": true,
+    "curve_type": 3001,
+    "curve_end_params": {
+      "success": true,
+      "start": 0.0,
+      "end": 0.004449999994576611,
+      "is_closed": false,
+      "is_periodic": false
+    },
+    "evaluate2": {
+      "start": {
+        "u": -0.0044499999945766125,
+        "point_m": [
+          0.005334659428148992,
+          0.00555000000542339,
+          0.0228
+        ],
+        "low32": 1
+      },
+      "end": {
+        "u": -1.4284990122115763e-18,
+        "point_m": [
+          0.005334657560932508,
+          0.00999999999999961,
+          0.0228
+        ],
+        "low32": 1
+      }
+    }
+  },
+  "expected": {
+    "status": "edge_local_nonperiodic",
+    "domain_basis": "edge_curve_params3",
+    "translation_constructed": false,
+    "underlying_curve_domain_retained": true
+  }
+}
