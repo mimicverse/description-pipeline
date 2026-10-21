@@ -76,7 +76,7 @@ class DeployMachineryTests(unittest.TestCase):
             "S-1-5-32-544",
             "solidworks-to-urdf.managed-root/v1",
             "user-approved-administrator-runtime",
-            "Get-ManagedEntriesSnapshot",
+            "Get-ManagedTreeSnapshot",
             "Assert-ServiceInherited",
             "PostflightScript",
         ):

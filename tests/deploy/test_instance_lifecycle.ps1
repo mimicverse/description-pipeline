@@ -337,7 +337,7 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
   Check 'windows_acl.bootstrap_transaction_source' (
     $bootstrapSource.Contains('PostflightScript') -and
-    $bootstrapSource.Contains('Get-ManagedEntriesSnapshot') -and
+    $bootstrapSource.Contains('Get-ManagedTreeSnapshot') -and
     $bootstrapSource.Contains('Assert-ServiceInherited') -and
     $bootstrapSource.Contains('Set-ManagedAcl $root $serviceSid') -and
     $bootstrapSource.Contains('managed_root_transaction_failed'))
@@ -364,14 +364,19 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     Remove-Item -LiteralPath $mismatchRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
   $rollbackRoot = Join-Path $driveRoot ('description-managed-rollback-' + [guid]::NewGuid().ToString('N'))
-  $null = New-Item -ItemType Directory -Path $rollbackRoot -Force
-  $rollbackChild = Join-Path $rollbackRoot 'child'
+  $rollbackChild = Join-Path $rollbackRoot 'endpoint-state/lifecycle/gen/runtime/site-packages'
   $null = New-Item -ItemType Directory -Path $rollbackChild -Force
-  $rollbackFile = Join-Path $rollbackChild 'payload.txt'
+  $rollbackFile = Join-Path $rollbackChild 'description_pipeline.py'
   [System.IO.File]::WriteAllText($rollbackFile, 'before', (New-Object System.Text.UTF8Encoding($false)))
   $rollbackBefore = Get-AclProjection $rollbackRoot
-  $rollbackChildBefore = Get-AclProjection $rollbackChild
+  $rollbackChildRestoreAcl = Get-Acl -LiteralPath $rollbackChild
   $rollbackFileBefore = Get-AclProjection $rollbackFile
+  $rollbackDeepAcl = New-Object System.Security.AccessControl.DirectorySecurity
+  $rollbackDeepAcl.SetOwner(
+    (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))
+  $rollbackDeepAcl.SetAccessRuleProtection($true, $false)
+  Set-Acl -LiteralPath $rollbackChild -AclObject $rollbackDeepAcl
+  $rollbackChildBefore = Get-AclProjection $rollbackChild
   $failureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
     'bootstrap-failing-postflight-' + [guid]::NewGuid().ToString('N') + '.ps1')
   [System.IO.File]::WriteAllText(
@@ -388,15 +393,18 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
       Join-Path $rollbackRoot '.description-managed-root.json')) -and
     (Get-AclProjection $rollbackRoot).projection_sha256 -eq $rollbackBefore.projection_sha256 -and
     (Get-AclProjection $rollbackChild).projection_sha256 -eq $rollbackChildBefore.projection_sha256 -and
-    (Get-AclProjection $rollbackFile).projection_sha256 -eq $rollbackFileBefore.projection_sha256 -and
     $rollbackReceipt.rollback.passed -eq $true) (
       'exit=' + [string]$rollbackExit +
       ' receipt=' + ($rollbackReceipt | ConvertTo-Json -Depth 8 -Compress))
+  Set-Acl -LiteralPath $rollbackChild -AclObject $rollbackChildRestoreAcl
+  Check 'windows_acl.bootstrap_deep_file_acl_rolls_back' (
+    (Get-AclProjection $rollbackFile).projection_sha256 -eq $rollbackFileBefore.projection_sha256)
   $emptyRoot = Join-Path $driveRoot ('description-managed-empty-' + [guid]::NewGuid().ToString('N'))
-  $emptyChild = Join-Path $emptyRoot 'empty-dacl-child'
+  $emptyChild = Join-Path $emptyRoot 'endpoint-state/lifecycle/gen/runtime/site-packages'
   $null = New-Item -ItemType Directory -Path $emptyChild -Force
+  $emptyFile = Join-Path $emptyChild 'description_pipeline.py'
+  [System.IO.File]::WriteAllText($emptyFile, 'package', (New-Object System.Text.UTF8Encoding($false)))
   $emptyChildBefore = Get-Acl -LiteralPath $emptyChild
-  $emptyRootBefore = Get-AclProjection $emptyRoot
   $emptyAcl = New-Object System.Security.AccessControl.DirectorySecurity
   $emptyAcl.SetOwner(
     (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))
@@ -406,12 +414,22 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     -ManagedRoot $emptyRoot -ServiceAccount $serviceSid)
   $emptyExit = $LASTEXITCODE
   $emptyReceipt = ($emptyOutput | Select-Object -Last 1) | ConvertFrom-Json
-  Check 'windows_acl.bootstrap_empty_dacl_fail_closed' (
-    $emptyExit -ne 0 -and
-    $emptyReceipt.passed -eq $false -and
-    -not (Test-Path -LiteralPath (
-      Join-Path $emptyRoot '.description-managed-root.json')) -and
-    (Get-AclProjection $emptyRoot).projection_sha256 -eq $emptyRootBefore.projection_sha256) (
+  $emptyRead = $false
+  try {
+    $stream = [System.IO.File]::OpenRead($emptyFile)
+    $stream.Dispose()
+    $emptyRead = $true
+  } catch {
+    $emptyRead = $false
+  }
+  Check 'windows_acl.bootstrap_deep_empty_dacl_repaired' (
+    $emptyExit -eq 0 -and
+    $emptyReceipt.passed -eq $true -and
+    $emptyRead -and
+    @((Get-AclProjection $emptyChild).rules | Where-Object {
+      $_.sid -eq $serviceSid -and
+      $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
+    }).Count -eq 1) (
       'exit=' + [string]$emptyExit +
       ' receipt=' + ($emptyReceipt | ConvertTo-Json -Depth 8 -Compress))
   Set-Acl -LiteralPath $emptyChild -AclObject $emptyChildBefore

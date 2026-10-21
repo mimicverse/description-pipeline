@@ -78,13 +78,17 @@ function Get-AclProjection([string]$path) {
     rules=$rules
   }
 }
-function Get-ManagedEntriesSnapshot([string]$root) {
-  $rows = New-Object System.Collections.Generic.List[object]
-  foreach ($child in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)) {
-    $path = $child.FullName
+function Get-ManagedTreeSnapshot(
+  [string]$root,
+  [string]$serviceSid,
+  [System.Collections.Generic.List[object]]$rows) {
+  $pending = New-Object 'System.Collections.Generic.Stack[string]'
+  $pending.Push($root)
+  while ($pending.Count -gt 0) {
+    $path = $pending.Pop()
     $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
     if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-      throw ('managed entry is a reparse point: ' + $path)
+      throw ('managed tree contains a reparse point: ' + $path)
     }
     $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
     $security = if ($item.PSIsContainer) {
@@ -102,8 +106,22 @@ function Get-ManagedEntriesSnapshot([string]$root) {
       security=$security
       projection=Get-AclProjection $path
     })
+    if ($item.PSIsContainer) {
+      $traversalAcl = Get-Acl -LiteralPath $path -ErrorAction Stop
+      $inheritance =
+        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+      foreach ($sid in @('S-1-5-18', 'S-1-5-32-544', $serviceSid)) {
+        $aclRule = New-Rule $sid (
+          [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance
+        [void]$traversalAcl.AddAccessRule($aclRule)
+      }
+      Set-Acl -LiteralPath $path -AclObject $traversalAcl -ErrorAction Stop
+      foreach ($child in @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)) {
+        $pending.Push($child.FullName)
+      }
+    }
   }
-  return @($rows)
 }
 function Set-ManagedAcl([string]$path, [string]$serviceSid) {
   $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
@@ -272,7 +290,7 @@ if (Test-Path -LiteralPath $markerPath) {
 }
 Assert-NoReparseAncestor $markerPath
 $rootAclBefore = $null
-$entriesBefore = $null
+$entriesBefore = New-Object System.Collections.Generic.List[object]
 $markerAclBefore = $null
 $markerCreated = $false
 $probePath = $null
@@ -280,7 +298,7 @@ $volumeBefore = (New-Object System.IO.DriveInfo -ArgumentList (
   [System.IO.Path]::GetPathRoot($root))).AvailableFreeSpace
 try {
   $rootAclBefore = Get-Acl -LiteralPath $root -ErrorAction Stop
-  $entriesBefore = @(Get-ManagedEntriesSnapshot $root)
+  Get-ManagedTreeSnapshot $root $serviceSid $entriesBefore
   if ($markerExisted) {
     $markerAclBefore = Get-Acl -LiteralPath $markerPath -ErrorAction Stop
   } else {
@@ -291,7 +309,9 @@ try {
     $markerCreated = $true
   }
 
-  $entriesBefore | ForEach-Object {
+  $entriesBefore |
+    Where-Object { (Normalize $_.path) -ne $root } |
+    ForEach-Object {
     Set-ManagedAcl ([string]$_.path) $serviceSid
   }
   Set-ManagedAcl $root $serviceSid
@@ -336,7 +356,9 @@ try {
     }
   }
   if ($null -ne $entriesBefore) {
-    foreach ($row in @($entriesBefore)) {
+    foreach ($row in @($entriesBefore | Sort-Object {
+        ([string]$_.path).Length
+      } -Descending)) {
       try {
         Set-Acl -LiteralPath ([string]$row.path) -AclObject $row.security -ErrorAction Stop
       } catch {
