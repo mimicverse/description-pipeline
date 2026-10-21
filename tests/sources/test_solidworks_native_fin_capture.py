@@ -33,6 +33,7 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
     _scope_face_rows,
     _scope_owner_key,
     _scope_vertex_rows,
+    _single_vertex_reference,
     _typed_reference_sha256,
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
@@ -3347,6 +3348,25 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertNotEqual(
             _com_object_identity(wrapper_a),
             _com_object_identity(SimpleNamespace(_oleobj_=object())),
+        )
+
+    def test_one_vertex_object_cannot_return_multiple_references(self):
+        with self.assertRaises(CadError) as caught:
+            _single_vertex_reference(
+                {
+                    "raw_references": {
+                        hashlib.sha256(b"raw-a").hexdigest(),
+                        hashlib.sha256(b"raw-b").hexdigest(),
+                    },
+                    "typed_references": {
+                        hashlib.sha256(b"typed-a").hexdigest(),
+                    },
+                },
+                {"component": "part-1"},
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "cad_persistent_reference_alias",
         )
 
     def test_scope_mapping_rejects_duplicate_topology_and_keeps_coincident_vertices(self):

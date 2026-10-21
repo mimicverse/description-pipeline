@@ -156,6 +156,18 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             native_gate_warning_diagnostics({"warnings": duplicate})
 
+        for field in (
+            "referenced_configuration",
+            "occurrence_scope",
+            "body_name",
+        ):
+            nulled = copy.deepcopy(raw_warnings())
+            nulled[0]["detail"][field] = None
+            with self.subTest(face_null=field), self.assertRaises(
+                PipelineError
+            ):
+                native_gate_warning_diagnostics({"warnings": nulled})
+
     def test_each_owner_group_requires_all_four_identical_warning_codes(
         self,
     ) -> None:
@@ -363,6 +375,38 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
 
         encoded = json.dumps(forged, sort_keys=True)
         self.assertIn("part-1:face:0/9", encoded)
+
+        missing_face_identity = diagnostics()
+        raw_missing_face_identity = raw_warnings()
+        for row in (*missing_face_identity, *raw_missing_face_identity):
+            detail = row["detail"]
+            detail["referenced_configuration"] = None
+            detail["occurrence_scope"] = None
+            detail["body_name"] = None
+        missing_quality = quality_report(
+            missing_face_identity,
+            raw_missing_face_identity,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(
+                root / "reports/quality.json",
+                missing_quality,
+            )
+            structural = build_structural_report({}, evidence_root=root)
+        self.assertIn(
+            "report.native_identity_warning_invalid",
+            {row["code"] for row in structural["findings"]},
+        )
+        with self.assertRaises(PortalError):
+            _quality_warnings(missing_quality)
+        with self.assertRaises(PipelineError):
+            _body(
+                "a" * 64,
+                "b" * 40,
+                missing_quality,
+                "engineering",
+            )
 
     def test_report_view_rejects_orphan_groups_and_partial_fields(self) -> None:
         first = raw_warnings()

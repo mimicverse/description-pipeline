@@ -511,6 +511,28 @@ def _scope_vertex_rows(edge_rows) -> list[dict]:
     ]
 
 
+def _single_vertex_reference(group: dict, base: dict) -> tuple[str, str]:
+    """One COM vertex must expose one raw and one typed persistent reference."""
+
+    raw_references = group.get("raw_references")
+    typed_references = group.get("typed_references")
+    if (
+        not isinstance(raw_references, set)
+        or len(raw_references) != 1
+        or not isinstance(typed_references, set)
+        or len(typed_references) != 1
+    ):
+        raise CadError(
+            "cad_persistent_reference_alias",
+            "one native vertex object returned multiple persistent references",
+            {
+                **base,
+                "reference_sha256": sorted(raw_references or ()),
+            },
+        )
+    return next(iter(raw_references)), next(iter(typed_references))
+
+
 def _scope_bijection(
     left: list[dict],
     right: list[dict],
@@ -5899,6 +5921,7 @@ class SolidWorksBackend(CadBackend):
                     {
                         "point_m": tuple(endpoint["point_m"]),
                         "raw_references": set(),
+                        "typed_references": set(),
                         "occurrences": [],
                     },
                 )
@@ -5911,11 +5934,20 @@ class SolidWorksBackend(CadBackend):
                 group["raw_references"].add(
                     endpoint["reference"]["raw_sha256"]
                 )
+                group["typed_references"].add(
+                    endpoint["reference"]["typed_sha256"]
+                )
                 group["occurrences"].append(
                     (edge_row["index"], order)
                 )
         vertices_by_point = {}
         for pointer, group in vertex_groups.items():
+            raw_reference, typed_reference = _single_vertex_reference(
+                group,
+                base,
+            )
+            group["raw_reference"] = raw_reference
+            group["typed_reference"] = typed_reference
             point_bits = tuple(
                 _binary64_bits(value) for value in group["point_m"]
             )
@@ -5937,7 +5969,7 @@ class SolidWorksBackend(CadBackend):
             key=lambda row: (row[0], row[1]),
         )
         vertex_raw_references = {
-            next(iter(vertex_groups[pointer]["raw_references"]))
+            vertex_groups[pointer]["raw_reference"]
             for _, _, pointer in ordered_vertices
         }
         vertex_aliased = (
@@ -5962,7 +5994,7 @@ class SolidWorksBackend(CadBackend):
                 pointer,
             ) in enumerate(ordered_vertices):
                 group = vertex_groups[pointer]
-                raw_sha256 = next(iter(group["raw_references"]))
+                raw_sha256 = group["raw_reference"]
                 witness = vertex_witnesses.get(vertex_index)
                 if (
                     not isinstance(witness, dict)
@@ -6297,12 +6329,8 @@ class SolidWorksBackend(CadBackend):
                 ordered_vertices
             ):
                 group = vertex_groups[pointer]
-                edge_index, endpoint_order = min(group["occurrences"])
-                endpoint = edge_rows[edge_index]["endpoints"][
-                    ("start", "end")[endpoint_order]
-                ]
-                typed_sha256 = endpoint["reference"]["typed_sha256"]
-                raw_sha256 = next(iter(group["raw_references"]))
+                typed_sha256 = group["typed_reference"]
+                raw_sha256 = group["raw_reference"]
                 vertex_identity_rows.append(
                     {
                         "vertex_index": vertex_index,

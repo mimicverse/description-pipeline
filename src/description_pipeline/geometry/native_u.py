@@ -122,6 +122,17 @@ def native_scope_warning_detail_is_valid(detail: object) -> bool:
             detail.get("body_name") is None
             or isinstance(detail["body_name"], str)
         )
+        and (
+            detail["entity_kind"] != "face"
+            or (
+                isinstance(detail["referenced_configuration"], str)
+                and bool(detail["referenced_configuration"])
+                and isinstance(detail["occurrence_scope"], str)
+                and detail["occurrence_scope"] == detail["component"]
+                and isinstance(detail["body_name"], str)
+                and bool(detail["body_name"])
+            )
+        )
         and isinstance(
             detail.get("mapping_source_part_document_sha256"),
             str,

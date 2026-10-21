@@ -386,6 +386,21 @@ def _failure_tree(run_dir: Path, stage: str) -> Path:
     return tree
 
 
+def _failure_products_exist(run_dir: Path, stage: str) -> bool:
+    """Whether the failed attempt produced any real file worth sealing."""
+
+    for name in ("input", "reports", "evidence"):
+        source = run_dir / name
+        if source.is_dir() and any(path.is_file() for path in source.rglob("*")):
+            return True
+    failed_stage = run_dir / "stages" / f"{stage}.failed"
+    return failed_stage.is_dir() and any(
+        path.is_file()
+        for path in failed_stage.rglob("*")
+        if path.name != "manifest.json"
+    )
+
+
 def _register_blocked_downstream(platform: PlatformStore, run_id: str, failed_stage: str) -> None:
     """Every unexecuted downstream stage records ``blocked`` once a stage fails.
 
@@ -440,7 +455,9 @@ def _converge_failed_stage(
             return current == "failed"
         if tree is None and products:
             try:
-                tree = _failure_tree(flow.RunPaths(store_root, run_id).run_dir, stage)
+                run_dir = flow.RunPaths(store_root, run_id).run_dir
+                if _failure_products_exist(run_dir, stage):
+                    tree = _failure_tree(run_dir, stage)
             except Exception:  # pragma: no cover - the shape-only registration stands
                 log.exception("failure-product snapshot unavailable run=%s stage=%s", run_id, stage)
                 tree = None
