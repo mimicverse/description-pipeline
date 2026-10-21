@@ -11,177 +11,11 @@ from pathlib import Path
 from . import _paths  # noqa: F401
 from . import support
 
+from description_pipeline.geometry.native_tessellation import parse_native_tessellation
 from description_pipeline.io import PipelineError
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.native_mesh_observations import verify_native_mesh_observations
-
-
-def binary_stl(count: int, *, owners: list[int] | None = None) -> bytes:
-    owners = owners or [0] * count
-    assert len(owners) == count
-    payload = bytearray(b"fixture".ljust(80, b" ") + struct.pack("<I", count))
-    for index in range(count):
-        x = float(index)
-        payload.extend(
-            struct.pack(
-                "<12fH",
-                0.0,
-                0.0,
-                1.0,
-                x,
-                0.0,
-                0.0,
-                x + 1.0,
-                0.0,
-                0.0,
-                x,
-                1.0,
-                0.0,
-                owners[index],
-            )
-        )
-    return bytes(payload)
-
-
-def binary_stl_triangles(payload: bytes) -> list[tuple[tuple[float, ...], ...]]:
-    count = struct.unpack_from("<I", payload, 80)[0]
-    return [
-        tuple(
-            struct.unpack_from("<3f", payload, 84 + 50 * triangle_index + 12 + 12 * vertex)
-            for vertex in range(3)
-        )
-        for triangle_index in range(count)
-    ]
-
-
-def itessellation_fixture(
-    spans: list[dict],
-    native_edges: list[dict],
-    stl_triangles: list[tuple[tuple[float, ...], ...]],
-) -> dict:
-    """Build strict body-local synthetic ITessellation evidence."""
-
-    body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
-    body_rows = []
-    vertex_rows = []
-    for body_type, body_index in body_keys:
-        body_key = (body_type, body_index)
-        body_spans = [
-            span
-            for span in spans
-            if (span["body_type"], span["body_index"]) == body_key
-        ]
-        next_facet_id = 1
-        next_fin_id = 1
-        next_vertex_id = 1
-        faces = []
-        facets = []
-        fins = []
-        facets_by_face = {}
-        for span in body_spans:
-            facet_ids = []
-            for local_index in range(span["triangle_count"]):
-                triangle_record_index = span["triangle_start"] + local_index
-                triangle = stl_triangles[triangle_record_index]
-                facet_id = next_facet_id
-                next_facet_id += 1
-                vertex_ids = [next_vertex_id, next_vertex_id + 1, next_vertex_id + 2]
-                next_vertex_id += 3
-                for vertex_id, point in zip(vertex_ids, triangle, strict=True):
-                    vertex_rows.append(
-                        {
-                            "body_type": body_type,
-                            "body_index": body_index,
-                            "vertex_id": vertex_id,
-                            "point_m": list(point),
-                        }
-                    )
-                fin_ids = [next_fin_id, next_fin_id + 1, next_fin_id + 2]
-                next_fin_id += 3
-                for fin_id, side in zip(
-                    fin_ids,
-                    (
-                        (vertex_ids[0], vertex_ids[1]),
-                        (vertex_ids[1], vertex_ids[2]),
-                        (vertex_ids[2], vertex_ids[0]),
-                    ),
-                    strict=True,
-                ):
-                    fins.append(
-                        {
-                            "fin_id": fin_id,
-                            "facet_id": facet_id,
-                            "face_index": span["face_index"],
-                            "vertex_ids": list(side),
-                            "edge_reference_sha256": None,
-                            "classification": "internal_only",
-                        }
-                    )
-                facet = {
-                    "facet_id": facet_id,
-                    "face_index": span["face_index"],
-                    "fin_ids": fin_ids,
-                    "vertex_ids": vertex_ids,
-                    "triangle_record_index": triangle_record_index,
-                }
-                facets.append(facet)
-                facets_by_face.setdefault(span["face_index"], []).append(facet)
-                facet_ids.append(facet_id)
-            faces.append(
-                {
-                    "face_index": span["face_index"],
-                    "facet_ids": facet_ids,
-                }
-            )
-
-        fins_by_id = {fin["fin_id"]: fin for fin in fins}
-        for edge in native_edges:
-            if (edge["body_type"], edge["body_index"]) != body_key:
-                continue
-            edge_fin_ids = []
-            for face_index in edge["face_indices"]:
-                candidates = facets_by_face.get(face_index, [])
-                if not candidates:
-                    continue
-                fin_id = next(
-                    fin_id
-                    for fin_id in candidates[0]["fin_ids"]
-                    if fins_by_id[fin_id]["classification"] == "internal_only"
-                )
-                fin = fins_by_id[fin_id]
-                fin["edge_reference_sha256"] = edge["edge_reference_sha256"]
-                fin["classification"] = "native_edge"
-                edge_fin_ids.append(fin_id)
-            edge["fin_ids"] = sorted(edge_fin_ids)
-
-        body_rows.append(
-            {
-                "body_type": body_type,
-                "body_index": body_index,
-                "body_reference_sha256": body_spans[0]["body_reference_sha256"],
-                "tessellate_result": True,
-                "facet_count": len(facets),
-                "fin_count": len(fins),
-                "vertex_count": next_vertex_id - 1,
-                "faces": faces,
-                "facets": facets,
-                "fins": fins,
-            }
-        )
-    vertex_rows.sort(
-        key=lambda row: (row["body_type"], row["body_index"], row["vertex_id"])
-    )
-    return {
-        "interface_iid": "{699C7492-DB56-4CC2-B7A2-9FFD56698434}",
-        "properties": {
-            "need_face_facet_map": True,
-            "need_edge_fin_map": True,
-            "need_vertex_params": True,
-        },
-        "bodies": body_rows,
-        "vertices": vertex_rows,
-    }
 
 
 class NativeMeshObservationTests(unittest.TestCase):
@@ -189,11 +23,41 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        triangle_owners = [1, 2, 3, 4, 5, 6, 8, 8, 9, 10, 11, 12]
-        self.stl_bytes = binary_stl(12, owners=triangle_owners)
+        center = (0.0, 0.0, 0.0)
+        axis_x = (1.0, 0.0, 0.0)
+        axis_y = (0.0, 1.0, 0.0)
+        axis_z = (0.0, 0.0, 1.0)
+        tetra_a = (3.0, 0.0, 0.0)
+        tetra_b = (4.0, 0.0, 0.0)
+        tetra_c = (3.0, 1.0, 0.0)
+        tetra_d = (3.0, 0.0, 1.0)
+        face_triangles = {
+            (0, 0): [(center, axis_x, axis_y)],
+            (0, 1): [(center, axis_y, axis_z)],
+            (0, 2): [(center, axis_z, axis_x)],
+            (1, 0): [(center, axis_x, axis_y)],
+            (1, 1): [(center, axis_y, axis_z)],
+            (1, 2): [(center, axis_z, axis_x)],
+            (2, 0): [],
+            (2, 1): [(center, axis_x, axis_y)],
+            (2, 2): [(axis_x, center, axis_z)],
+            (3, 0): [(tetra_a, tetra_c, tetra_b)],
+            (3, 1): [(tetra_a, tetra_b, tetra_d)],
+            (3, 2): [(tetra_b, tetra_c, tetra_d)],
+            (3, 3): [(tetra_a, tetra_d, tetra_c)],
+        }
+        face_owners = {
+            key: index
+            for index, key in enumerate(face_triangles, start=1)
+        }
+        triangles = [
+            triangle
+            for body_index in range(4)
+            for face_index in range(4)
+            for triangle in face_triangles.get((body_index, face_index), [])
+        ]
         stl_path = self.root / "evidence/geometry/fixture.stl"
         stl_path.parent.mkdir(parents=True, exist_ok=True)
-        stl_path.write_bytes(self.stl_bytes)
         support.write_target_delivery(
             self.root,
             capture={
@@ -212,18 +76,14 @@ class NativeMeshObservationTests(unittest.TestCase):
         )
         support.seal_delivery(self.root)
         counts = {
-            (1, 0, 0): 1,
-            (1, 0, 1): 1,
-            (1, 0, 2): 1,
-            (1, 1, 0): 1,
-            (1, 1, 1): 1,
-            (1, 1, 2): 1,
-            (1, 2, 0): 0,
-            (1, 2, 1): 2,
-            (1, 3, 0): 1,
-            (1, 3, 1): 1,
-            (1, 3, 2): 1,
-            (1, 3, 3): 1,
+            (1, body_index, face_index): len(face_triangles[(body_index, face_index)])
+            for body_index in range(4)
+            for face_index in range(4)
+            if (body_index, face_index) in face_triangles
+            and (
+                body_index < 3
+                or face_index < 4
+            )
         }
         spans = []
         start = 0
@@ -236,86 +96,101 @@ class NativeMeshObservationTests(unittest.TestCase):
                     "body_reference_sha256": hashlib.sha256(f"body-{body_index}".encode()).hexdigest(),
                     "face_index": face_index,
                     "face_reference_sha256": hashlib.sha256(f"face-{ordinal}".encode()).hexdigest(),
-                    "face_owner_id": ordinal + 1,
+                    "face_owner_id": face_owners[(body_index, face_index)],
                     "edge_references": [],
                     "triangle_start": start,
                     "triangle_count": count,
-                    "triangle_records_sha256": hashlib.sha256(
-                        self.stl_bytes[84 + 50 * start : 84 + 50 * (start + count)]
-                    ).hexdigest(),
+                    "triangle_records_sha256": "0" * 64,
                 }
             )
             start += count
-        shared_edge = hashlib.sha256(b"shared-edge").hexdigest()
-        spans[0]["edge_references"] = [shared_edge]
-        spans[1]["edge_references"] = [shared_edge]
-        native_edges = [
-            {
-                "body_type": 1,
-                "body_index": 0,
-                "edge_reference_sha256": shared_edge,
-                "start_vertex_reference_sha256": hashlib.sha256(b"vertex-0").hexdigest(),
-                "end_vertex_reference_sha256": hashlib.sha256(b"vertex-1").hexdigest(),
-                "start_point_m": [0.0, 0.0, 0.0],
-                "end_point_m": [1.0, 0.0, 0.0],
-                "face_indices": [0, 1],
-            }
-        ]
-        for body_index, face_index in ((1, 0), (2, 0), (3, 0)):
-            reference = hashlib.sha256(f"body-{body_index}-edge".encode()).hexdigest()
+        span_by_face = {
+            (span["body_index"], span["face_index"]): span
+            for span in spans
+        }
+        occurrences = {}
+        for (body_index, face_index), face_defs in face_triangles.items():
+            for triangle in face_defs:
+                for offset in range(3):
+                    start = triangle[offset]
+                    end = triangle[(offset + 1) % 3]
+                    key = (
+                        body_index,
+                        frozenset(
+                            (
+                                struct.pack("<3f", *start),
+                                struct.pack("<3f", *end),
+                            )
+                        ),
+                    )
+                    occurrences.setdefault(key, []).append(
+                        (body_index, face_index, start, end)
+                    )
+        native_edges = []
+        for ordinal, rows in enumerate(
+            sorted(
+                occurrences.values(),
+                key=lambda items: (
+                    items[0][0],
+                    items[0][1],
+                    struct.pack("<3f", *items[0][2]),
+                ),
+            ),
+            start=1,
+        ):
+            body_index = rows[0][0]
+            face_indices = sorted({row[1] for row in rows})
+            if len(face_indices) != 2:
+                continue
+            start = rows[0][2]
+            end = rows[0][3]
+            reference = hashlib.sha256(f"fixture-edge-{ordinal}".encode()).hexdigest()
             native_edges.append(
                 {
                     "body_type": 1,
                     "body_index": body_index,
                     "edge_reference_sha256": reference,
                     "start_vertex_reference_sha256": hashlib.sha256(
-                        f"body-{body_index}-vertex-0".encode()
+                        struct.pack("<3f", *start)
                     ).hexdigest(),
                     "end_vertex_reference_sha256": hashlib.sha256(
-                        f"body-{body_index}-vertex-1".encode()
+                        struct.pack("<3f", *end)
                     ).hexdigest(),
-                    "start_point_m": [0.0, float(body_index), 0.0],
-                    "end_point_m": [1.0, float(body_index), 0.0],
-                    "face_indices": [face_index],
+                    "start_point_m": list(start),
+                    "end_point_m": list(end),
+                    "face_indices": face_indices,
                 }
             )
-            span = next(
-                entry
-                for entry in spans
-                if entry["body_index"] == body_index
-                and entry["face_index"] == face_index
-            )
-            span["edge_references"].append(reference)
-        itessellation = itessellation_fixture(
+            for face_index in face_indices:
+                span_by_face[(body_index, face_index)]["edge_references"].append(
+                    reference
+                )
+        tessellation = support.native_tessellation_v3(
             spans,
             native_edges,
-            binary_stl_triangles(self.stl_bytes),
+            [
+                {
+                    "body_type": 1,
+                    "body_index": 2,
+                    "face_index": 0,
+                    "triangle_count": 0,
+                    "facet_count": 0,
+                    "area_m2": 2e-13,
+                    "tessellate_result": False,
+                    "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
+                }
+            ],
+            triangle_vertices=triangles,
         )
+        self.stl_bytes = tessellation.stl_bytes
+        stl_path.write_bytes(self.stl_bytes)
         self.row = {
             "component": "pcb",
             "path": "geometry/fixture.stl",
             "triangles": 12,
             "sha256": hashlib.sha256(self.stl_bytes).hexdigest(),
             "bodies": {"solid": 0, "sheet": 4},
-            "tessellation": {
-                "schema_version": NATIVE_TESSELLATION_SCHEMA,
-                "faces": 12,
-                "face_spans": spans,
-                "native_edges": native_edges,
-                "no_facets_faces": [
-                    {
-                        "body_type": 1,
-                        "body_index": 2,
-                        "face_index": 0,
-                        "triangle_count": 0,
-                        "facet_count": 0,
-                        "area_m2": 2e-13,
-                        "tessellate_result": False,
-                        "used_api": "IBody2.GetTessellation/ITessellation.Tessellate/GetFaceFacets",
-                    }
-                ],
-                "itessellation": itessellation,
-            },
+            "tessellation": tessellation,
         }
 
     def verify(self, capture_class: str = "cad"):
@@ -459,11 +334,21 @@ class NativeMeshObservationTests(unittest.TestCase):
             row["tessellation"]["no_facets_faces"] = []
 
         def edge_incidence_mismatch(row):
-            row["tessellation"]["native_edges"][0]["face_indices"] = [0]
+            edge = row["tessellation"]["native_edges"][0]
+            edge["face_indices"] = edge["face_indices"][:1]
+            edge["face_senses"] = edge["face_senses"][:1]
 
         def missing_reverse_edge_incidence(row):
-            shared = row["tessellation"]["native_edges"][0]["edge_reference_sha256"]
-            row["tessellation"]["face_spans"][1]["edge_references"].remove(shared)
+            edge = row["tessellation"]["native_edges"][0]
+            shared = edge["edge_reference_sha256"]
+            face_index = edge["face_indices"][1]
+            span = next(
+                item
+                for item in row["tessellation"]["face_spans"]
+                if item["body_index"] == edge["body_index"]
+                and item["face_index"] == face_index
+            )
+            span["edge_references"].remove(shared)
 
         def empty_edge_incidence(row):
             edge = row["tessellation"]["native_edges"][0]
@@ -532,6 +417,19 @@ class NativeMeshObservationTests(unittest.TestCase):
             for span in row["tessellation"]["face_spans"]:
                 if span["body_index"] == 3:
                     span["edge_references"] = []
+            body = next(
+                item
+                for item in row["tessellation"]["itessellation"]["bodies"]
+                if item["body_index"] == 3
+            )
+            for fin in body["fins"]:
+                fin["edge_reference_sha256"] = None
+                fin["classification"] = "internal_only"
+                fin["start_u"] = None
+                fin["end_u"] = None
+                fin["start_evidence"] = None
+                fin["end_evidence"] = None
+                fin["cofin_id"] = None
 
         cases = (
             ("legacy", legacy, "unknown or legacy"),
@@ -554,7 +452,7 @@ class NativeMeshObservationTests(unittest.TestCase):
             (
                 "boundary-shift",
                 boundary_shift_with_recomputed_digest,
-                "facet 2 has duplicate or misplaced triangle index",
+                "gap or overlaps",
             ),
             ("missing-body-edges", missing_body_edge_evidence, "topology evidence is unresolved"),
         )
@@ -641,12 +539,17 @@ class NativeMeshObservationTests(unittest.TestCase):
             fin_id = item["facets"][0]["fin_ids"][0]
             fin = next(fin for fin in item["fins"] if fin["fin_id"] == fin_id)
             fin["vertex_ids"].reverse()
+            fin["start_u"], fin["end_u"] = fin["end_u"], fin["start_u"]
+            fin["start_evidence"], fin["end_evidence"] = (
+                fin["end_evidence"],
+                fin["start_evidence"],
+            )
 
         cases = (
             ("misowned", misowned_facet, "has misowned facets"),
             ("three-fins", missing_fin, "facet 0 is malformed"),
             ("fin-vertices", duplicate_fin_vertex, "fin 0 is malformed"),
-            ("fin-sides", fin_side_from_other_facet, "not a directed three-cycle"),
+            ("fin-sides", fin_side_from_other_facet, "facet 1 is malformed"),
             ("reversed-fin", reversed_fin, "not a directed three-cycle"),
         )
         for label, mutate, message in cases:
@@ -751,8 +654,26 @@ class NativeMeshObservationTests(unittest.TestCase):
             if (vertex["body_type"], vertex["body_index"]) == (1, 0)
         }
         edge = original["tessellation"]["native_edges"][0]
-        edge["start_point_m"] = list(vertices[internal_fin["vertex_ids"][0]]["point_m"])
-        edge["end_point_m"] = list(vertices[internal_fin["vertex_ids"][1]]["point_m"])
+        start_point = list(vertices[internal_fin["vertex_ids"][0]]["point_m"])
+        end_point = list(vertices[internal_fin["vertex_ids"][1]]["point_m"])
+        edge["start_point_m"] = start_point
+        edge["end_point_m"] = end_point
+        edge["start_vertex_reference_sha256"] = hashlib.sha256(
+            struct.pack("<3f", *start_point)
+        ).hexdigest()
+        edge["end_vertex_reference_sha256"] = hashlib.sha256(
+            struct.pack("<3f", *end_point)
+        ).hexdigest()
+        edge["curve_start_point_m"] = list(start_point)
+        edge["curve_end_point_m"] = list(end_point)
+        support.replace_curve_endpoint_evaluation(
+            edge["curve_endpoint_evaluations"]["start"],
+            start_point,
+        )
+        support.replace_curve_endpoint_evaluation(
+            edge["curve_endpoint_evaluations"]["end"],
+            end_point,
+        )
         self.row = original
         self.assertEqual(self.verify()["components"], 1)
 
@@ -767,7 +688,7 @@ class NativeMeshObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "vertex count differs|vertex cache differs"):
             self.verify()
 
-    def test_directed_native_cycle_binds_float32_stl_vertices(self):
+    def test_shared_native_cycle_binds_float32_stl_vertices(self):
         original = copy.deepcopy(self.row)
         itessellation = original["tessellation"]["itessellation"]
         body = itessellation["bodies"][0]
@@ -794,36 +715,57 @@ class NativeMeshObservationTests(unittest.TestCase):
         }
         points = [list(rows[vertex_id]["point_m"]) for vertex_id in cycle]
 
+        def replace_vertex_points(tessellation, replacements):
+            vertex_rows = {
+                row["vertex_id"]: row
+                for row in tessellation["itessellation"]["vertices"]
+            }
+            for vertex_id, point in replacements.items():
+                vertex_rows[vertex_id]["point_m"] = list(point)
+            for body_row in tessellation["itessellation"]["bodies"]:
+                for fin in body_row["fins"]:
+                    for evidence_key, vertex_id in (
+                        ("start_evidence", fin["vertex_ids"][0]),
+                        ("end_evidence", fin["vertex_ids"][1]),
+                    ):
+                        evidence = fin[evidence_key]
+                        if evidence is not None and vertex_id in replacements:
+                            support.replace_u_evidence(
+                                evidence,
+                                replacements[vertex_id],
+                            )
+
         shifted = copy.deepcopy(original)
-        shifted_rows = {
-            row["vertex_id"]: row
-            for row in shifted["tessellation"]["itessellation"]["vertices"]
-            if (row["body_type"], row["body_index"]) == (1, 0)
-        }
-        shifted_rows[cycle[0]]["point_m"][0] += 100.0
+        shifted_point = list(points[0])
+        shifted_point[0] += 100.0
+        replace_vertex_points(
+            shifted["tessellation"],
+            {cycle[0]: shifted_point},
+        )
         self.row = shifted
         with self.assertRaisesRegex(PipelineError, "does not bind triangle record"):
             self.verify()
 
         rotated = copy.deepcopy(original)
-        rotated_rows = {
-            row["vertex_id"]: row
-            for row in rotated["tessellation"]["itessellation"]["vertices"]
-            if (row["body_type"], row["body_index"]) == (1, 0)
-        }
-        for index, vertex_id in enumerate(cycle):
-            rotated_rows[vertex_id]["point_m"] = points[(index - 1) % 3]
+        replace_vertex_points(
+            rotated["tessellation"],
+            {
+                vertex_id: points[(index - 1) % 3]
+                for index, vertex_id in enumerate(cycle)
+            },
+        )
         self.row = rotated
-        self.assertEqual(self.verify()["components"], 1)
+        with self.assertRaisesRegex(PipelineError, "does not bind triangle record"):
+            self.verify()
 
         reversed_points = copy.deepcopy(original)
-        reversed_rows = {
-            row["vertex_id"]: row
-            for row in reversed_points["tessellation"]["itessellation"]["vertices"]
-            if (row["body_type"], row["body_index"]) == (1, 0)
-        }
-        for index, vertex_id in enumerate(cycle):
-            reversed_rows[vertex_id]["point_m"] = points[-index]
+        replace_vertex_points(
+            reversed_points["tessellation"],
+            {
+                vertex_id: points[-index]
+                for index, vertex_id in enumerate(cycle)
+            },
+        )
         self.row = reversed_points
         with self.assertRaisesRegex(PipelineError, "does not bind triangle record"):
             self.verify()
@@ -851,45 +793,6 @@ class NativeMeshObservationTests(unittest.TestCase):
                     self.verify()
 
     def test_cross_body_vertex_identity_is_reported_without_welding_bodies(self):
-        original = copy.deepcopy(self.row)
-        shared_vertex = original["tessellation"]["native_edges"][0]["start_vertex_reference_sha256"]
-        for body_index, face_index in ((1, 0), (2, 1)):
-            edge_reference = hashlib.sha256(f"cross-body-{body_index}".encode()).hexdigest()
-            body = next(
-                body
-                for body in original["tessellation"]["itessellation"]["bodies"]
-                if body["body_index"] == body_index
-            )
-            fin = next(
-                fin
-                for fin in body["fins"]
-                if fin["face_index"] == face_index
-                and fin["classification"] == "internal_only"
-            )
-            fin["edge_reference_sha256"] = edge_reference
-            fin["classification"] = "native_edge"
-            original["tessellation"]["native_edges"].append(
-                {
-                    "body_type": 1,
-                    "body_index": body_index,
-                    "edge_reference_sha256": edge_reference,
-                    "start_vertex_reference_sha256": shared_vertex,
-                    "end_vertex_reference_sha256": hashlib.sha256(
-                        f"end-{body_index}".encode()
-                    ).hexdigest(),
-                    "start_point_m": [0.0, 0.0, 0.0],
-                    "end_point_m": [float(body_index), 0.0, 0.0],
-                    "face_indices": [face_index],
-                    "fin_ids": [fin["fin_id"]],
-                }
-            )
-            span = next(
-                entry
-                for entry in original["tessellation"]["face_spans"]
-                if entry["body_index"] == body_index and entry["face_index"] == face_index
-            )
-            span["edge_references"].append(edge_reference)
-        self.row = original
         result = self.verify()
         topology = result["topologies"][0]
         self.assertEqual(len(topology["bodies"]), 4)
@@ -898,4 +801,178 @@ class NativeMeshObservationTests(unittest.TestCase):
             [row["body_index"] for row in topology["bodies"]],
             [0, 1, 2, 3],
         )
+
+
+class CurvedNativeEdgeFixtureTests(unittest.TestCase):
+    def fixture(self):
+        def binary32(point):
+            return struct.unpack("<3f", struct.pack("<3f", *point))
+
+        start = binary32((0.0, 0.0, 0.0))
+        middle_a = binary32((0.25, 0.05, 0.0))
+        middle_b = binary32((0.75, 0.05, 0.0))
+        end = binary32((1.0, 0.0, 0.0))
+        face_0_apex = binary32((0.5, -0.5, 0.0))
+        face_1_apex = binary32((0.5, 0.5, 0.0))
+        triangles = [
+            (start, middle_a, face_0_apex),
+            (middle_a, middle_b, face_0_apex),
+            (middle_b, end, face_0_apex),
+            (end, middle_b, face_1_apex),
+            (middle_b, middle_a, face_1_apex),
+            (middle_a, start, face_1_apex),
+        ]
+        edge_reference = hashlib.sha256(b"curved-native-edge").hexdigest()
+        spans = []
+        for face_index in range(2):
+            spans.append(
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "body_name": "curved-body",
+                    "body_reference_sha256": hashlib.sha256(b"curved-body").hexdigest(),
+                    "face_index": face_index,
+                    "face_reference_sha256": hashlib.sha256(
+                        f"curved-face-{face_index}".encode()
+                    ).hexdigest(),
+                    "face_owner_id": face_index + 1,
+                    "edge_references": [edge_reference],
+                    "triangle_start": face_index * 3,
+                    "triangle_count": 3,
+                    "triangle_records_sha256": "0" * 64,
+                }
+            )
+        edge = {
+            "body_type": 0,
+            "body_index": 0,
+            "edge_reference_sha256": edge_reference,
+            "start_vertex_reference_sha256": hashlib.sha256(
+                struct.pack("<3f", *start)
+            ).hexdigest(),
+            "end_vertex_reference_sha256": hashlib.sha256(
+                struct.pack("<3f", *end)
+            ).hexdigest(),
+            "start_point_m": list(start),
+            "end_point_m": list(end),
+            "face_indices": [0, 1],
+            "u_min": 0.0,
+            "u_max": 1.0,
+            "curve_sense": True,
+            "curve_type": 1,
+        }
+        tessellation = support.native_tessellation_v3(
+            spans,
+            [edge],
+            triangle_vertices=triangles,
+        )
+        return tessellation, triangles
+
+    def parse(self, tessellation, triangles):
+        return parse_native_tessellation(
+            "curved-body",
+            tessellation,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+        )
+
+    def edge_fins(self, tessellation):
+        edge = tessellation["native_edges"][0]
+        fins = {
+            row["fin_id"]: row
+            for row in tessellation["itessellation"]["bodies"][0]["fins"]
+        }
+        return edge, [fins[fin_id] for fin_id in edge["fin_ids"]]
+
+    def set_u(self, fin, start_u, end_u):
+        fin["start_u"] = start_u
+        fin["end_u"] = end_u
+        for evidence, value in (
+            (fin["start_evidence"], start_u),
+            (fin["end_evidence"], end_u),
+        ):
+            evidence["u"] = value
+            evidence["closest_point_on_raw"][3] = value
+            evidence["parameter_raw"][0] = value
+
+    def test_curved_native_edge_allows_multiple_reciprocal_fins_per_face(self):
+        tessellation, triangles = self.fixture()
+        self.assertEqual(tessellation["schema_version"], NATIVE_TESSELLATION_SCHEMA)
+        self.assertEqual(len(tessellation["itessellation"]["vertices"]), 6)
+        faces = {}
+        for row in tessellation["itessellation"]["bodies"][0]["facets"]:
+            faces.setdefault(row["face_index"], set()).update(row["vertex_ids"])
+        self.assertGreaterEqual(
+            len(set.intersection(set().union(*faces.values()), *faces.values())),
+            4,
+        )
+        edge, fins = self.edge_fins(tessellation)
+        self.assertEqual(len(edge["fin_ids"]), 6)
+        self.assertEqual({row["face_index"] for row in fins}, {0, 1})
+        self.assertTrue(
+            all(
+                next(item for item in fins if item["fin_id"] == row["cofin_id"])[
+                    "cofin_id"
+                ]
+                == row["fin_id"]
+                for row in fins
+            )
+        )
+        intervals = sorted(
+            (min(row["start_u"], row["end_u"]), max(row["start_u"], row["end_u"]))
+            for row in fins
+        )
+        self.assertEqual(intervals[0][0], 0.0)
+        self.assertEqual(intervals[-1][1], 1.0)
+        self.assertTrue(
+            all(
+                intervals[index][1] >= intervals[index + 1][0]
+                for index in range(len(intervals) - 1)
+            )
+        )
+        internal = [
+            row
+            for row in tessellation["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "internal_only"
+        ]
+        self.assertTrue(internal)
+        self.assertTrue(
+            all(
+                row["start_u"] is None
+                and row["end_u"] is None
+                and row["cofin_id"] is None
+                for row in internal
+            )
+        )
+        self.assertEqual(len(self.parse(tessellation, triangles)), 2)
+
+    def test_curved_native_edge_rejects_u_gap(self):
+        tessellation, triangles = self.fixture()
+        _edge, fins = self.edge_fins(tessellation)
+        first = next(
+            row
+            for row in fins
+            if abs(row["start_u"] - 1.0 / 3.0) < 1e-12
+        )
+        cofin = next(row for row in fins if row["fin_id"] == first["cofin_id"])
+        self.set_u(first, 0.2, 0.4)
+        self.set_u(cofin, 0.4, 0.2)
+        with self.assertRaisesRegex(PipelineError, "U domain|U interval has a gap"):
+            self.parse(tessellation, triangles)
+
+    def test_curved_native_edge_rejects_missing_cofin(self):
+        tessellation, triangles = self.fixture()
+        _edge, fins = self.edge_fins(tessellation)
+        fins[0]["cofin_id"] = None
+        with self.assertRaisesRegex(PipelineError, "malformed|cofin"):
+            self.parse(tessellation, triangles)
+
+    def test_curved_native_edge_rejects_same_u_direction(self):
+        tessellation, triangles = self.fixture()
+        _edge, fins = self.edge_fins(tessellation)
+        first = fins[0]
+        cofin = next(row for row in fins if row["fin_id"] == first["cofin_id"])
+        self.set_u(cofin, first["start_u"], first["end_u"])
+        with self.assertRaisesRegex(PipelineError, "cofin/orientation is inconsistent"):
+            self.parse(tessellation, triangles)
 

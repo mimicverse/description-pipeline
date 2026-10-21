@@ -15,7 +15,9 @@ stays owned by the native owner.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import struct
 import sys
 import threading
 import types
@@ -26,6 +28,8 @@ from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
+
+from . import support
 
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
@@ -567,19 +571,159 @@ def _write(root: Path, name: str) -> Path:
 
 
 def _mesh_face(read_triangles, key: str):
+    try:
+        fixture_values = list(read_triangles(True))
+        fixture_readable = True
+    except Exception:  # noqa: BLE001 - the production read must surface this later
+        fixture_values = []
+        fixture_readable = False
     return types.SimpleNamespace(
         GetTessTriangles=read_triangles,
+        GetTessTriangleCount=lambda: len(fixture_values) // 9,
+        GetArea=lambda: 1.0,
         GetEdges=list,
+        GetBody=lambda: None,
         _persist_reference=f"fixture-face-{key}".encode(),
+        _fixture_values=fixture_values,
+        _fixture_readable=fixture_readable,
     )
 
 
 def _mesh_body(faces, key: str):
-    return types.SimpleNamespace(
+    faces = list(faces)
+    for face in faces:
+        if not hasattr(face, "GetTessTriangles"):
+            face._fixture_values = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+            face._fixture_readable = True
+            face.GetTessTriangles = lambda _quality, values=face._fixture_values: list(values)
+    triangles = [
+        tuple(
+            tuple(values[offset : offset + 3])
+            for offset in range(triangle_start, triangle_start + 9, 3)
+        )
+        for face in faces
+        for values in (list(face._fixture_values),)
+        for triangle_start in range(0, len(values), 9)
+    ]
+    spans = []
+    triangle_start = 0
+    body_reference = f"fixture-body-{key}".encode()
+    for face_index, face in enumerate(faces):
+        values = list(face._fixture_values)
+        triangle_count = len(values) // 9
+        record_points = [
+            point
+            for triangle in triangles[
+                triangle_start : triangle_start + triangle_count
+            ]
+            for point in triangle
+        ]
+        spans.append(
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "body_name": f"fixture-body-{key}",
+                "body_reference_sha256": hashlib.sha256(body_reference).hexdigest(),
+                "face_index": face_index,
+                "face_reference_sha256": hashlib.sha256(face._persist_reference).hexdigest(),
+                "face_owner_id": face_index + 1,
+                "edge_references": [],
+                "triangle_start": triangle_start,
+                "triangle_count": triangle_count,
+                "triangle_records_sha256": hashlib.sha256(
+                    b"".join(
+                        struct.pack("<3f", *point) for point in record_points
+                    )
+                ).hexdigest(),
+            }
+        )
+        triangle_start += triangle_count
+    tessellation = support.native_tessellation_v3(
+        spans,
+        [],
+        triangle_vertices=triangles,
+    )
+    cursor = 0
+    for span, face in zip(spans, faces, strict=True):
+        values = [
+            coordinate
+            for triangle in tessellation.triangle_vertices[
+                cursor : cursor + span["triangle_count"]
+            ]
+            for point in triangle
+            for coordinate in point
+        ]
+        cursor += span["triangle_count"]
+        if face._fixture_readable:
+            face.GetTessTriangles = lambda _quality, values=values: list(values)
+    body_graph = tessellation["itessellation"]["bodies"][0]
+    facets_by_face = {
+        face_index: row["facet_ids"]
+        for face_index, row in enumerate(body_graph["faces"])
+    }
+    facets_by_reference = {
+        hashlib.sha256(face._persist_reference).hexdigest(): facets_by_face[face_index]
+        for face_index, face in enumerate(faces)
+    }
+    fins_by_facet = {
+        row["facet_id"]: row["fin_ids"] for row in body_graph["facets"]
+    }
+    fin_vertices = {
+        row["fin_id"]: row["vertex_ids"] for row in body_graph["fins"]
+    }
+    vertex_points = {
+        row["vertex_id"]: row["point_m"]
+        for row in tessellation["itessellation"]["vertices"]
+    }
+    face_by_id = {id(face): index for index, face in enumerate(faces)}
+
+    class _MeshTessellation:
+        NeedFaceFacetMap = True
+        NeedEdgeFinMap = True
+        NeedVertexParams = True
+
+        def Tessellate(self):  # noqa: N802 - SolidWorks API name
+            return True
+
+        def GetFaceFacets(self, face):  # noqa: N802 - SolidWorks API name
+            values = facets_by_face.get(face_by_id.get(id(face)))
+            if values is None:
+                values = facets_by_reference[
+                    hashlib.sha256(face._persist_reference).hexdigest()
+                ]
+            return list(values)
+
+        def GetFacetFins(self, facet_id):  # noqa: N802 - SolidWorks API name
+            return list(fins_by_facet[facet_id])
+
+        def GetEdgeFins(self, _edge):  # noqa: N802 - SolidWorks API name
+            return []
+
+        def GetFinVertices(self, fin_id):  # noqa: N802 - SolidWorks API name
+            return list(fin_vertices[fin_id])
+
+        def GetVertexPoint(self, vertex_id):  # noqa: N802 - SolidWorks API name
+            return list(vertex_points[vertex_id])
+
+        def GetFacetCount(self):  # noqa: N802 - SolidWorks API name
+            return len(fins_by_facet)
+
+        def GetFinCount(self):  # noqa: N802 - SolidWorks API name
+            return len(fin_vertices)
+
+        def GetVertexCount(self):  # noqa: N802 - SolidWorks API name
+            return len(vertex_points)
+
+    body = types.SimpleNamespace(
         Name=f"fixture-body-{key}",
         GetFaces=lambda: list(faces),
-        _persist_reference=f"fixture-body-{key}".encode(),
+        GetEdges=list,
+        GetTessellation=lambda: _MeshTessellation(),
+        _persist_reference=body_reference,
     )
+    for face in faces:
+        face.GetBody = lambda body=body: body
+    return body
 
 
 @contextmanager
@@ -2043,7 +2187,7 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertEqual(result["radius_m"], 0.02)
             self.assertTrue(all(parent() is None for parents in lifetimes for parent in parents))
 
-    def test_face_read_failure_reports_the_exact_occurrence_and_completed_work(self):
+    def test_display_read_failure_is_isolated_from_the_tessellation_graph(self):
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
             backend, _, _, short, _ = self._configured_occurrences(root)
@@ -2055,11 +2199,11 @@ class CaptureSceneTests(unittest.TestCase):
             path = root / "failed.stl"
             with self.assertRaises(CadError) as caught:
                 backend.export_component_meshes({"part-short": path})["part-short"]
-            self.assertEqual(caught.exception.code, "cad_face_tessellation_unreadable")
+            self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
             self.assertEqual(caught.exception.detail["component"], "part-short")
             self.assertEqual(caught.exception.detail["face_index"], 1)
-            self.assertEqual(caught.exception.detail["completed_faces"], 1)
-            self.assertEqual(caught.exception.detail["api"], "IFace2.GetTessTriangles(True)")
+            self.assertEqual(caught.exception.detail["completed_faces"], 0)
+            self.assertEqual(caught.exception.detail["classification"], "empty")
             self.assertFalse(path.exists())
 
     def test_fresh_nested_occurrences_keep_duplicate_leaf_names_distinct(self):

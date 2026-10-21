@@ -8,7 +8,6 @@ portable role).  The control fixture is explicitly NOT native CAD qualification.
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import shutil
 import tempfile
@@ -98,37 +97,6 @@ class AxisFixtureBackend(support.FixtureCadBackend):
         entries = super().export_component_meshes(destinations, on_activity=on_activity)
         for info in entries.values():
             info["bodies"] = {"solid": 1, "sheet": 0}
-            payload = Path(info["written"]).read_bytes()
-            triangles = info["triangles"]
-            counts = [2] * 6
-            if sum(counts) != triangles:
-                raise AssertionError("the split fixture cube must carry twelve triangles")
-            spans = []
-            face_edges, native_edges = support.cube_native_edges()
-            start = 0
-            for face_index, count in enumerate(counts):
-                spans.append(
-                    {
-                        "body_type": 0,
-                        "body_index": 0,
-                        "body_name": "fixture-solid",
-                        "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
-                        "face_index": face_index,
-                        "face_reference_sha256": hashlib.sha256(f"fixture-face-{face_index}".encode()).hexdigest(),
-                        "face_owner_id": face_index + 1,
-                        "edge_references": face_edges[face_index],
-                        "triangle_start": start,
-                        "triangle_count": count,
-                        "triangle_records_sha256": hashlib.sha256(
-                            payload[84 + 50 * start : 84 + 50 * (start + count)]
-                        ).hexdigest(),
-                    }
-                )
-                start += count
-            info["tessellation"] = support.native_tessellation_v3(
-                spans,
-                native_edges,
-            )
         return entries
 
 
@@ -249,7 +217,11 @@ class SplitRoundtripTests(unittest.TestCase):
                 expected_inputs=prepared_files,
                 prior_events=events,
             )
-        self.assertIs(capture["native_complete"], True)
+        self.assertEqual(
+            capture["state"],
+            "native_complete",
+            capture.get("error"),
+        )
         self.assertIs(capture["passed"], False)
         archive = self.capture_output / transfer.CAPTURE_ARCHIVE
         manifest_path = self.capture_output / transfer.CAPTURE_MANIFEST

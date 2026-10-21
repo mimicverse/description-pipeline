@@ -196,6 +196,7 @@ def _run_scenario(root: Path) -> dict:
             rows = {row["id"]: row for row in quality.get("checks", [])}
             report["quality_failed_checks"] = failed
             report["allowed_control_failures"] = sorted(producer.CONTROL_LIMITS)
+            report["native_tessellation_gate"] = rows.get("geometry.native_tessellation", {})
             report["required_control_gates_pass"] = all(
                 rows.get(key, {}).get("passed") is True for key in producer.REQUIRED_CONTROL_GATES
             )
@@ -227,6 +228,7 @@ def _run_scenario(root: Path) -> dict:
                 and bool(failed)
                 and set(failed) <= producer.CONTROL_LIMITS
                 and not report.get("unexpected_verification_acceptance")
+                and report["native_tessellation_gate"].get("passed") is True
                 and report["required_control_gates_pass"]
                 and report["quality_subject_matches_generated"]
                 and stage.get("state") == "failed"
@@ -247,6 +249,9 @@ class CanonicalPlatformRoundtripTests(unittest.TestCase):
         self.assertEqual(report.get("admitted_state"), "capture_admitted", report)
         self.assertEqual(report.get("downloads"), 1, report)
         self.assertFalse(report.get("unexpected_verification_acceptance"), report)
+        self.assertNotIn("geometry.native_tessellation", producer.CONTROL_LIMITS)
+        self.assertIn("geometry.native_tessellation", producer.REQUIRED_CONTROL_GATES)
+        self.assertIs(report["native_tessellation_gate"].get("passed"), True, report)
         self.assertTrue(set(report["quality_failed_checks"]) <= producer.CONTROL_LIMITS, report)
         self.assertTrue(report["required_control_gates_pass"], report)
         self.assertTrue(report["quality_subject_matches_generated"], report)

@@ -1949,7 +1949,89 @@ class MeshChunkContractTests(unittest.TestCase):
             ((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
             ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
         ]
-        payload = self._mesh(triangles)
+        face_triangles = {0: (0, 1), 1: (2, 3)}
+        edge_occurrences = {}
+        for face_index, triangle_indices in face_triangles.items():
+            for triangle_index in triangle_indices:
+                triangle = triangles[triangle_index]
+                for offset in range(3):
+                    start = triangle[offset]
+                    end = triangle[(offset + 1) % 3]
+                    key = frozenset(
+                        (
+                            tuple(struct.pack("<3f", *start)),
+                            tuple(struct.pack("<3f", *end)),
+                        )
+                    )
+                    edge_occurrences.setdefault(key, []).append(
+                        (face_index, triangle_index, start, end)
+                    )
+        face_edges = {0: [], 1: []}
+        native_edges = []
+        for index, occurrences in enumerate(
+            sorted(edge_occurrences.values(), key=lambda rows: rows[0][1:]),
+            start=1,
+        ):
+            face_indices = sorted({row[0] for row in occurrences})
+            if len(face_indices) != 2:
+                continue
+            reference = hashlib.sha256(f"fixture-edge-{index}".encode()).hexdigest()
+            for face_index in face_indices:
+                face_edges[face_index].append(reference)
+            start = occurrences[0][2]
+            end = occurrences[0][3]
+            native_edges.append(
+                {
+                    "body_type": body_type,
+                    "body_index": 0,
+                    "edge_reference_sha256": reference,
+                    "start_vertex_reference_sha256": hashlib.sha256(
+                        struct.pack("<3f", *start)
+                    ).hexdigest(),
+                    "end_vertex_reference_sha256": hashlib.sha256(
+                        struct.pack("<3f", *end)
+                    ).hexdigest(),
+                    "start_point_m": list(start),
+                    "end_point_m": list(end),
+                    "face_indices": face_indices,
+                }
+            )
+        for references in face_edges.values():
+            references.sort()
+        face_spans = [
+            {
+                "body_type": body_type,
+                "body_index": 0,
+                "body_name": "fixture-body",
+                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
+                "face_index": 0,
+                "face_reference_sha256": hashlib.sha256(b"fixture-face-0").hexdigest(),
+                "face_owner_id": 1,
+                "edge_references": face_edges[0],
+                "triangle_start": 0,
+                "triangle_count": 2,
+                "triangle_records_sha256": "0" * 64,
+            },
+            {
+                "body_type": body_type,
+                "body_index": 0,
+                "body_name": "fixture-body",
+                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
+                "face_index": 1,
+                "face_reference_sha256": hashlib.sha256(b"fixture-face-1").hexdigest(),
+                "face_owner_id": 2,
+                "edge_references": face_edges[1],
+                "triangle_start": 2,
+                "triangle_count": 2,
+                "triangle_records_sha256": "0" * 64,
+            },
+        ]
+        tessellation = support.native_tessellation_v3(
+            face_spans,
+            native_edges,
+            triangle_vertices=triangles,
+        )
+        payload = tessellation.stl_bytes
         parts = self._parts(payload, limit)
         if mutate is not None:
             mutate(payload, parts)
@@ -1979,55 +2061,6 @@ class MeshChunkContractTests(unittest.TestCase):
             ],
             "collisions": [],
         }
-        edge_references = [
-            hashlib.sha256(f"fixture-edge-{index}".encode()).hexdigest()
-            for index in range(6)
-        ]
-        face_spans = [
-            {
-                "body_type": body_type,
-                "body_index": 0,
-                "body_name": "fixture-body",
-                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
-                "face_index": 0,
-                "face_reference_sha256": hashlib.sha256(b"fixture-face-0").hexdigest(),
-                "face_owner_id": 1,
-                "edge_references": edge_references,
-                "triangle_start": 0,
-                "triangle_count": 2,
-                "triangle_records_sha256": hashlib.sha256(payload[84:184]).hexdigest(),
-            },
-            {
-                "body_type": body_type,
-                "body_index": 0,
-                "body_name": "fixture-body",
-                "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
-                "face_index": 1,
-                "face_reference_sha256": hashlib.sha256(b"fixture-face-1").hexdigest(),
-                "face_owner_id": 2,
-                "edge_references": edge_references if body_type == 0 else [],
-                "triangle_start": 2,
-                "triangle_count": 2,
-                "triangle_records_sha256": hashlib.sha256(payload[184:284]).hexdigest(),
-            },
-        ]
-        native_edges = [
-            {
-                "body_type": body_type,
-                "body_index": 0,
-                "edge_reference_sha256": reference,
-                "start_vertex_reference_sha256": hashlib.sha256(
-                    f"fixture-vertex-{index}-a".encode()
-                ).hexdigest(),
-                "end_vertex_reference_sha256": hashlib.sha256(
-                    f"fixture-vertex-{index}-b".encode()
-                ).hexdigest(),
-                "start_point_m": [float(index), 0.0, 0.0],
-                "end_point_m": [float(index + 1), 0.0, 0.0],
-                "face_indices": [0, 1] if body_type == 0 else [0],
-            }
-            for index, reference in enumerate(edge_references)
-        ]
         geometry = {
             "pcb-1": {
                 "path": "geometry/0001_mesh.stl",
@@ -2036,10 +2069,7 @@ class MeshChunkContractTests(unittest.TestCase):
                 "scale": [1, 1, 1],
                 "xyz": [0, 0, 0],
                 "rpy": [0, 0, 0],
-                "tessellation": support.native_tessellation_v3(
-                    face_spans,
-                    native_edges,
-                ),
+                "tessellation": tessellation,
             }
         }
         components = {"pcb-1": np.identity(4)}

@@ -6,10 +6,20 @@ import copy
 import hashlib
 import os
 import struct
+from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
-from collections.abc import Sequence
 
+from description_pipeline.geometry.native_u import (
+    NATIVE_CURVE_DOMAIN_RULE,
+    NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_U_IDENTITY_RULE,
+    NATIVE_U_RESOLUTION_RULE,
+    native_curve_domain_transform,
+    native_evaluate2_evidence,
+    native_point_roundtrip_tolerance,
+)
 from description_pipeline.io import file_digest
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.errors import CadError
@@ -41,7 +51,9 @@ def write_binary_stl(
     return len(triangles)
 
 
-def cube_stl(path: Path, half: float = 0.02) -> int:
+def cube_triangles(
+    half: float = 0.02,
+) -> tuple[list[tuple[tuple[float, float, float], ...]], tuple[int, ...]]:
     corners = [(x, y, z) for x in (-half, half) for y in (-half, half) for z in (-half, half)]
     faces = [
         (0, 2, 3),
@@ -57,11 +69,15 @@ def cube_stl(path: Path, half: float = 0.02) -> int:
         (1, 3, 7),
         (1, 7, 5),
     ]
-    return write_binary_stl(
-        path,
+    return (
         [(corners[a], corners[b], corners[c]) for a, b, c in faces],
-        attributes=(1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6),
+        (1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6),
     )
+
+
+def cube_stl(path: Path, half: float = 0.02) -> int:
+    triangles, attributes = cube_triangles(half)
+    return write_binary_stl(path, triangles, attributes=attributes)
 
 
 def cube_native_edges(half: float = 0.02) -> tuple[dict[int, list[str]], list[dict]]:
@@ -124,39 +140,154 @@ def cube_native_edges(half: float = 0.02) -> tuple[dict[int, list[str]], list[di
 
 
 ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
+NATIVE_VT_BYREF_R8 = 0x4005
+NATIVE_VT_BYREF_BOOL = 0x400B
 
 
-def binary_stl_triangle_vertices(
-    payload: bytes,
-) -> list[tuple[tuple[float, float, float], ...]]:
-    """Read reference vertices from one closed binary STL payload."""
+class NativeTessellationV3Fixture(dict):
+    """A v3 envelope with the exact STL bytes generated from its facet graph."""
 
-    count = struct.unpack_from("<I", payload, 80)[0]
-    if len(payload) != 84 + 50 * count:
-        raise ValueError("binary STL payload has an inconsistent size")
-    return [
-        tuple(
-            struct.unpack_from(
-                "<3f",
-                payload,
-                84 + 50 * triangle_index + 12 + 12 * vertex_index,
-            )
-            for vertex_index in range(3)
-        )
-        for triangle_index in range(count)
-    ]
+    def __init__(
+        self,
+        envelope: dict[str, Any],
+        *,
+        stl_bytes: bytes,
+        triangle_vertices: Sequence[Sequence[Sequence[float]]],
+    ):
+        super().__init__(envelope)
+        self.stl_bytes = stl_bytes
+        self.triangle_vertices = [
+            tuple(tuple(float(value) for value in point) for point in triangle)
+            for triangle in triangle_vertices
+        ]
+
+
+def _binary32_point(point: Sequence[float]) -> tuple[float, float, float]:
+    values = tuple(float(value) for value in point)
+    if len(values) != 3:
+        raise ValueError("native tessellation point must have three coordinates")
+    return struct.unpack("<3f", struct.pack("<3f", *values))
+
+
+def _packed_evaluate2_success() -> float:
+    return struct.unpack("<d", struct.pack("<Q", 1))[0]
+
+
+def _evaluate2_evidence(
+    point: tuple[float, float, float],
+) -> tuple[list[float], dict[str, Any]]:
+    raw = [*point, 0.0, 0.0, 0.0, _packed_evaluate2_success()]
+    evidence = native_evaluate2_evidence(raw)
+    if (
+        evidence is None
+        or evidence["packed_status"]["parsed_success"] is not True
+    ):
+        raise ValueError("native Evaluate2 fixture status is not successful")
+    return evidence["payload"], evidence["packed_status"]
+
+
+def _u_evidence(
+    u_parameter: float,
+    point: tuple[float, float, float],
+) -> dict[str, Any]:
+    payload, packed_status = _evaluate2_evidence(point)
+    tolerance = native_point_roundtrip_tolerance(point, point, point)
+    return {
+        "u": u_parameter,
+        "rule_version": NATIVE_U_IDENTITY_RULE,
+        "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
+        "point_tolerance_m": tolerance,
+        "closest_point_error_m": 0.0,
+        "evaluate_point_error_m": 0.0,
+        "closest_evaluate_error_m": 0.0,
+        "closest_point_on_raw": [*point, u_parameter, 0.0],
+        "parameter_raw": [u_parameter, True],
+        "parameter_success_raw": True,
+        "parameter_success_raw_type": "bool",
+        "parameter_success_bit": 1,
+        "parameter_success_parsed": True,
+        "evaluate_payload": payload,
+        "evaluate_packed_status": packed_status,
+    }
+
+
+def _curve_endpoint_evaluation(
+    u_parameter: float,
+    point: Sequence[float],
+) -> dict[str, Any]:
+    expected = _binary32_point(point)
+    payload, packed_status = _evaluate2_evidence(expected)
+    evaluated = tuple(payload[:3])
+    return {
+        "u": u_parameter,
+        "payload": payload,
+        "packed_status": packed_status,
+        "error": None,
+        "point_tolerance_m": native_point_roundtrip_tolerance(
+            expected,
+            evaluated,
+        ),
+        "point_error_m": max(
+            abs(expected[index] - evaluated[index])
+            for index in range(3)
+        ),
+    }
+
+
+def replace_curve_endpoint_evaluation(
+    evaluation: dict[str, Any],
+    point: Sequence[float],
+) -> None:
+    """Rebind one fixture evaluation to a new expected native endpoint."""
+
+    evaluation.update(_curve_endpoint_evaluation(evaluation["u"], point))
+
+
+def replace_u_evidence(
+    evidence: dict[str, Any],
+    point: Sequence[float],
+) -> None:
+    """Rebind one fin endpoint proof to a changed native vertex point."""
+
+    evidence.update(_u_evidence(evidence["u"], _binary32_point(point)))
+
+
+def _curve_end_params(
+    start: float,
+    end: float,
+    *,
+    is_closed: bool,
+    is_periodic: bool,
+) -> dict[str, Any]:
+    return {
+        "call_form": "pywin32-byref-variant",
+        "success": True,
+        "error": None,
+        "start": start,
+        "end": end,
+        "is_closed": is_closed,
+        "is_periodic": is_periodic,
+        "raw_outputs": [
+            {"value_type": NATIVE_VT_BYREF_R8, "value": start},
+            {"value_type": NATIVE_VT_BYREF_R8, "value": end},
+            {"value_type": NATIVE_VT_BYREF_BOOL, "value": is_closed},
+            {"value_type": NATIVE_VT_BYREF_BOOL, "value": is_periodic},
+        ],
+    }
 
 
 def native_tessellation_v3(
     face_spans: Sequence[dict[str, Any]],
     native_edges: Sequence[dict[str, Any]],
     no_facets_faces: Sequence[dict[str, Any]] = (),
+    *,
     triangle_vertices: Sequence[Sequence[Sequence[float]]] | None = None,
-) -> dict[str, Any]:
-    """Build closed body-local ITessellation evidence for a native mesh fixture."""
+) -> NativeTessellationV3Fixture:
+    """Build one closed v3 graph and its byte-identical binary STL projection."""
 
     spans = copy.deepcopy(list(face_spans))
-    edges = copy.deepcopy(list(native_edges))
+    input_edges = copy.deepcopy(list(native_edges))
+    fixture_triangles = []
     body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
     evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
     body_rows = []
@@ -178,6 +309,10 @@ def native_tessellation_v3(
         faces = []
         facets = []
         fins = []
+        vertex_ids_by_point = {}
+        points_by_vertex_id = {}
+        vertex_ids_by_face = {}
+        fins_by_face = {}
         for span in body_spans:
             facet_ids = []
             for local_index in range(span["triangle_count"]):
@@ -193,17 +328,29 @@ def native_tessellation_v3(
                         raise ValueError("native tessellation triangle must have three vertices")
                 facet_id = next_facet_id
                 next_facet_id += 1
-                vertex_ids = [next_vertex_id, next_vertex_id + 1, next_vertex_id + 2]
-                next_vertex_id += 3
-                for vertex_id, point in zip(vertex_ids, points, strict=True):
-                    vertex_rows.append(
-                        {
-                            "body_type": body_type,
-                            "body_index": body_index,
-                            "vertex_id": vertex_id,
-                            "point_m": [float(coordinate) for coordinate in point],
-                        }
-                    )
+                vertex_ids = []
+                for point in points:
+                    point_key = _binary32_point(point)
+                    vertex_id = vertex_ids_by_point.get(point_key)
+                    if vertex_id is None:
+                        vertex_id = next_vertex_id
+                        next_vertex_id += 1
+                        vertex_ids_by_point[point_key] = vertex_id
+                        points_by_vertex_id[vertex_id] = point_key
+                        vertex_rows.append(
+                            {
+                                "body_type": body_type,
+                                "body_index": body_index,
+                                "vertex_id": vertex_id,
+                                "point_m": list(point_key),
+                            }
+                        )
+                    vertex_ids.append(vertex_id)
+                if len(set(vertex_ids)) != 3:
+                    raise ValueError("native tessellation facet needs three distinct binary32 vertices")
+                fixture_triangles.append(
+                    tuple(_binary32_point(point) for point in points)
+                )
                 fin_ids = [next_fin_id, next_fin_id + 1, next_fin_id + 2]
                 next_fin_id += 3
                 for fin_id, side in zip(
@@ -223,6 +370,11 @@ def native_tessellation_v3(
                             "vertex_ids": list(side),
                             "edge_reference_sha256": None,
                             "classification": "internal_only",
+                            "start_u": None,
+                            "end_u": None,
+                            "start_evidence": None,
+                            "end_evidence": None,
+                            "cofin_id": None,
                         }
                     )
                 facets.append(
@@ -230,9 +382,13 @@ def native_tessellation_v3(
                         "facet_id": facet_id,
                         "face_index": span["face_index"],
                         "fin_ids": fin_ids,
-                        "vertex_ids": vertex_ids,
+                        "vertex_ids": sorted(vertex_ids),
                         "triangle_record_index": triangle_record_index,
                     }
+                )
+                fins_by_face.setdefault(span["face_index"], []).extend(fin_ids)
+                vertex_ids_by_face.setdefault(span["face_index"], set()).update(
+                    vertex_ids
                 )
                 facet_ids.append(facet_id)
             faces.append(
@@ -246,35 +402,283 @@ def native_tessellation_v3(
             "faces": faces,
             "facets": facets,
             "fins": fins,
+            "fins_by_face": fins_by_face,
+            "vertex_ids_by_face": vertex_ids_by_face,
+            "vertex_ids_by_point": vertex_ids_by_point,
+            "points_by_vertex_id": points_by_vertex_id,
+            "assigned_fin_ids": set(),
         }
 
-    active_faces = {
-        (span["body_type"], span["body_index"], span["face_index"])
+    span_by_face = {
+        (span["body_type"], span["body_index"], span["face_index"]): span
         for span in spans
-        if span["triangle_count"] > 0
     }
-    for edge in edges:
+
+    def directed_path(
+        body: dict[str, Any],
+        face_index: int,
+        source: int,
+        target: int,
+        allowed_vertices: set[int],
+    ) -> list[dict[str, Any]] | None:
+        fins_by_id = {fin["fin_id"]: fin for fin in body["fins"]}
+        adjacency: dict[int, list[dict[str, Any]]] = {}
+        for fin_id in body["fins_by_face"].get(face_index, []):
+            if fin_id in body["assigned_fin_ids"]:
+                continue
+            fin = fins_by_id[fin_id]
+            if not set(fin["vertex_ids"]) <= allowed_vertices:
+                continue
+            adjacency.setdefault(fin["vertex_ids"][0], []).append(fin)
+        queue = deque([(source, ())])
+        while queue:
+            current, path = queue.popleft()
+            if current == target and path:
+                return list(path)
+            visited = {source, *(fin["vertex_ids"][1] for fin in path)}
+            for fin in adjacency.get(current, []):
+                destination = fin["vertex_ids"][1]
+                if destination not in visited:
+                    queue.append((destination, (*path, fin)))
+        return None
+
+    edge_rows = []
+    for edge in input_edges:
         body_key = (edge["body_type"], edge["body_index"])
         body = evidence_by_body[body_key]
-        edge_fin_ids = []
-        for face_index in sorted(set(edge["face_indices"])):
-            if (*body_key, face_index) not in active_faces:
-                continue
-            fin = next(
-                (
-                    item
-                    for item in body["fins"]
-                    if item["face_index"] == face_index
-                    and item["classification"] == "internal_only"
-                ),
-                None,
+        face_indices = sorted(edge["face_indices"])
+        active_faces = [
+            face_index
+            for face_index in face_indices
+            if span_by_face[(*body_key, face_index)]["triangle_count"] > 0
+        ]
+        paths_by_face = {}
+        if active_faces:
+            if len(active_faces) != 2:
+                raise ValueError("native edge fixture requires exactly two active cofaces")
+            source = body["vertex_ids_by_point"].get(_binary32_point(edge["start_point_m"]))
+            target = body["vertex_ids_by_point"].get(_binary32_point(edge["end_point_m"]))
+            if source is None or target is None or source == target:
+                raise ValueError("native edge endpoints are not shared body vertices")
+            shared_vertices = set.intersection(
+                *(body["vertex_ids_by_face"][face_index] for face_index in active_faces)
             )
-            if fin is None:
-                raise ValueError("native edge fixture exceeds the available facet sides")
-            fin["edge_reference_sha256"] = edge["edge_reference_sha256"]
-            fin["classification"] = "native_edge"
-            edge_fin_ids.append(fin["fin_id"])
-        edge["fin_ids"] = sorted(edge_fin_ids)
+            fins_by_id = {fin["fin_id"]: fin for fin in body["fins"]}
+            for face_index in active_faces:
+                direct = [
+                    fin
+                    for fin_id in body["fins_by_face"].get(face_index, [])
+                    for fin in (fins_by_id[fin_id],)
+                    if frozenset(fin["vertex_ids"]) == frozenset((source, target))
+                    and fin_id not in body["assigned_fin_ids"]
+                ]
+                if len(direct) == 1:
+                    path = direct
+                else:
+                    path = directed_path(
+                        body,
+                        face_index,
+                        source,
+                        target,
+                        shared_vertices,
+                    )
+                    if path is None:
+                        path = directed_path(
+                            body,
+                            face_index,
+                            target,
+                            source,
+                            shared_vertices,
+                        )
+                if not path:
+                    raise ValueError(f"native edge endpoint path is missing on face {face_index}")
+                paths_by_face[face_index] = path
+
+        u_min = float(edge.get("u_min", 0.0))
+        u_max = float(edge.get("u_max", 1.0))
+        if not u_min < u_max:
+            raise ValueError("native edge fixture U domain must be increasing")
+        edge_fin_ids = []
+        path_senses = {}
+        if active_faces:
+            first_face, second_face = active_faces
+            source = body["vertex_ids_by_point"][_binary32_point(edge["start_point_m"])]
+            first_path = paths_by_face[first_face]
+            if first_path[0]["vertex_ids"][0] != source:
+                first_path = list(reversed(first_path))
+                path_senses[first_face] = False
+            else:
+                path_senses[first_face] = True
+            canonical_segments = []
+            current = source
+            for fin in first_path:
+                if fin["vertex_ids"][0] == current:
+                    segment = tuple(fin["vertex_ids"])
+                elif fin["vertex_ids"][1] == current:
+                    segment = tuple(reversed(fin["vertex_ids"]))
+                else:
+                    raise ValueError("native edge face path is disconnected")
+                canonical_segments.append((segment, fin))
+                current = segment[1]
+            if current != body["vertex_ids_by_point"][_binary32_point(edge["end_point_m"])]:
+                raise ValueError("native edge face path does not reach its endpoint")
+            second_path = paths_by_face[second_face]
+            path_senses[second_face] = second_path[0]["vertex_ids"][0] == body[
+                "vertex_ids_by_point"
+            ][_binary32_point(edge["start_point_m"])]
+            second_by_segment = {}
+            for fin in second_path:
+                key = frozenset(fin["vertex_ids"])
+                if key in second_by_segment:
+                    raise ValueError("native edge coface has duplicate segment fins")
+                second_by_segment[key] = fin
+            if len(canonical_segments) != len(second_path):
+                raise ValueError("native edge cofaces have different segment counts")
+            step = (u_max - u_min) / len(canonical_segments)
+            for index, (segment, first_fin) in enumerate(canonical_segments):
+                second_fin = second_by_segment.get(frozenset(segment))
+                if second_fin is None:
+                    raise ValueError("native edge cofaces do not share segment endpoints")
+                if tuple(second_fin["vertex_ids"]) != tuple(
+                    reversed(first_fin["vertex_ids"])
+                ):
+                    raise ValueError("native edge coface fins run in the same direction")
+                low = u_min + step * index
+                high = u_min + step * (index + 1)
+                first_reversed = first_fin["vertex_ids"][0] != segment[0]
+                second_reversed = second_fin["vertex_ids"][0] != segment[0]
+                first_start_u = high if first_reversed else low
+                first_end_u = low if first_reversed else high
+                second_start_u = high if second_reversed else low
+                second_end_u = low if second_reversed else high
+                first_fin.update(
+                    {
+                        "edge_reference_sha256": edge["edge_reference_sha256"],
+                        "classification": "native_edge",
+                        "start_u": first_start_u,
+                        "end_u": first_end_u,
+                        "start_evidence": _u_evidence(
+                            first_start_u,
+                            body["points_by_vertex_id"][first_fin["vertex_ids"][0]],
+                        ),
+                        "end_evidence": _u_evidence(
+                            first_end_u,
+                            body["points_by_vertex_id"][first_fin["vertex_ids"][1]],
+                        ),
+                        "cofin_id": second_fin["fin_id"],
+                    }
+                )
+                second_fin.update(
+                    {
+                        "edge_reference_sha256": edge["edge_reference_sha256"],
+                        "classification": "native_edge",
+                        "start_u": second_start_u,
+                        "end_u": second_end_u,
+                        "start_evidence": _u_evidence(
+                            second_start_u,
+                            body["points_by_vertex_id"][second_fin["vertex_ids"][0]],
+                        ),
+                        "end_evidence": _u_evidence(
+                            second_end_u,
+                            body["points_by_vertex_id"][second_fin["vertex_ids"][1]],
+                        ),
+                        "cofin_id": first_fin["fin_id"],
+                    }
+                )
+                body["assigned_fin_ids"].update(
+                    {first_fin["fin_id"], second_fin["fin_id"]}
+                )
+                edge_fin_ids.extend((first_fin["fin_id"], second_fin["fin_id"]))
+
+        senses = {
+            face_index: path_senses.get(face_index, index % 2 == 1)
+            for index, face_index in enumerate(face_indices)
+        }
+        curve_sense = edge.get("curve_sense", True)
+        curve_closed = edge.get("curve_closed", False)
+        curve_periodic = edge.get("curve_periodic", False)
+        if type(curve_sense) is not bool or type(curve_closed) is not bool or type(
+            curve_periodic
+        ) is not bool:
+            raise ValueError("native edge curve flags must be booleans")
+        curve_start_point = _binary32_point(edge["start_point_m"])
+        curve_end_point = _binary32_point(edge["end_point_m"])
+        evaluation_points = (
+            (curve_start_point, curve_end_point)
+            if curve_sense
+            else (curve_end_point, curve_start_point)
+        )
+        curve_domain_transform = native_curve_domain_transform(
+            u_min,
+            u_max,
+            u_min,
+            u_max,
+            curve_sense,
+            curve_periodic,
+        )
+        if curve_domain_transform["rule_version"] != NATIVE_CURVE_DOMAIN_RULE:
+            raise ValueError("native curve domain rule differs")
+        edge_rows.append(
+            {
+                "body_type": body_key[0],
+                "body_index": body_key[1],
+                "edge_reference_sha256": edge["edge_reference_sha256"],
+                "start_vertex_reference_sha256": edge["start_vertex_reference_sha256"],
+                "end_vertex_reference_sha256": edge["end_vertex_reference_sha256"],
+                "start_point_m": [float(value) for value in edge["start_point_m"]],
+                "end_point_m": [float(value) for value in edge["end_point_m"]],
+                "start_vertex_error": None,
+                "end_vertex_error": None,
+                "start_point_error": None,
+                "end_point_error": None,
+                "start_vertex_state": "present",
+                "end_vertex_state": "present",
+                "start_reference_error": None,
+                "end_reference_error": None,
+                "face_indices": face_indices,
+                "fin_ids": sorted(edge_fin_ids),
+                "u_min": u_min,
+                "u_max": u_max,
+                "curve_start_point_m": list(curve_start_point),
+                "curve_end_point_m": list(curve_end_point),
+                "curve_sense": curve_sense,
+                "curve_type": edge.get("curve_type", 0),
+                "curve_closed": curve_closed,
+                "curve_periodic": curve_periodic,
+                "curve_end_params": _curve_end_params(
+                    u_min,
+                    u_max,
+                    is_closed=curve_closed,
+                    is_periodic=curve_periodic,
+                ),
+                "curve_domain_transform": curve_domain_transform,
+                "curve_endpoint_evaluations": {
+                    "start": _curve_endpoint_evaluation(
+                        u_min,
+                        evaluation_points[0],
+                    ),
+                    "end": _curve_endpoint_evaluation(
+                        u_max,
+                        evaluation_points[1],
+                    ),
+                },
+                "endpoint_points_derived_from_curve": False,
+                "face_senses": [
+                    {
+                        "face_index": face_index,
+                        "EdgeInFaceSense": {
+                            "value": senses[face_index],
+                            "error": None,
+                        },
+                        "IEdgeInFaceSense2": {
+                            "value": senses[face_index],
+                            "error": None,
+                        },
+                    }
+                    for face_index in face_indices
+                ],
+            }
+        )
 
     for body_type, body_index in body_keys:
         body_key = (body_type, body_index)
@@ -287,9 +691,7 @@ def native_tessellation_v3(
                 "tessellate_result": True,
                 "facet_count": len(body["facets"]),
                 "fin_count": len(body["fins"]),
-                "vertex_count": sum(
-                    len(facet["vertex_ids"]) for facet in body["facets"]
-                ),
+                "vertex_count": len(body["vertex_ids_by_point"]),
                 "faces": body["faces"],
                 "facets": body["facets"],
                 "fins": body["fins"],
@@ -299,14 +701,62 @@ def native_tessellation_v3(
     vertex_rows.sort(
         key=lambda row: (row["body_type"], row["body_index"], row["vertex_id"])
     )
-    return {
+    native_fin_count = sum(
+        fin["classification"] == "native_edge"
+        for body in body_rows
+        for fin in body["fins"]
+    )
+    u_observations = native_fin_count * 2
+    expected_triangles = sum(span["triangle_count"] for span in spans)
+    if len(fixture_triangles) != expected_triangles:
+        raise ValueError("native tessellation triangle projection is incomplete")
+    stl_payload = bytearray(
+        b"native-tessellation-v3 fixture".ljust(80, b" ")
+        + struct.pack("<I", len(fixture_triangles))
+    )
+    cursor = 0
+    for face_index, span in enumerate(spans):
+        owner_id = span.get("face_owner_id")
+        if owner_id is None:
+            owner_id = face_index + 1
+            span["face_owner_id"] = owner_id
+        record_start = len(stl_payload)
+        for triangle in fixture_triangles[
+            cursor : cursor + span["triangle_count"]
+        ]:
+            stl_payload.extend(
+                struct.pack(
+                    "<12fH",
+                    0.0,
+                    0.0,
+                    0.0,
+                    *(coordinate for point in triangle for coordinate in point),
+                    owner_id,
+                )
+            )
+        span["triangle_records_sha256"] = hashlib.sha256(
+            bytes(stl_payload[record_start:])
+        ).hexdigest()
+        cursor += span["triangle_count"]
+    stl_bytes = bytes(stl_payload)
+    envelope = {
         "schema_version": NATIVE_TESSELLATION_SCHEMA,
         "faces": len(spans),
         "face_spans": spans,
-        "native_edges": edges,
+        "native_edges": edge_rows,
         "no_facets_faces": copy.deepcopy(list(no_facets_faces)),
         "itessellation": {
             "interface_iid": ITESSELLATION_IID,
+            "u_rule_version": NATIVE_U_IDENTITY_RULE,
+            "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
+            "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
+            "u_observation_stats": {
+                "unique_observations": u_observations,
+                "cache_hits": 0,
+                "get_closest_point_on_calls": u_observations,
+                "get_parameter_calls": u_observations,
+                "evaluate2_calls": u_observations,
+            },
             "properties": {
                 "need_face_facet_map": True,
                 "need_edge_fin_map": True,
@@ -316,6 +766,11 @@ def native_tessellation_v3(
             "vertices": vertex_rows,
         },
     }
+    return NativeTessellationV3Fixture(
+        envelope,
+        stl_bytes=stl_bytes,
+        triangle_vertices=fixture_triangles,
+    )
 
 
 def _matrix16(values: Sequence[float]) -> Matrix:
@@ -833,10 +1288,8 @@ class FixtureCadBackend(CadBackend):
                         "total": total,
                     }
                 )
-            triangles = cube_stl(Path(dest_path))
-            self.exported.append(str(dest_path))
-            payload = Path(dest_path).read_bytes()
             face_edges, native_edges = cube_native_edges()
+            mesh_triangles, _attributes = cube_triangles()
             spans = []
             start = 0
             for face_index in range(6):
@@ -855,19 +1308,24 @@ class FixtureCadBackend(CadBackend):
                         "edge_references": face_edges[face_index],
                         "triangle_start": start,
                         "triangle_count": count,
-                        "triangle_records_sha256": hashlib.sha256(
-                            payload[84 + 50 * start : 84 + 50 * (start + count)]
-                        ).hexdigest(),
+                        "triangle_records_sha256": "0" * 64,
                     }
                 )
                 start += count
+            tessellation = native_tessellation_v3(
+                spans,
+                native_edges,
+                triangle_vertices=mesh_triangles,
+            )
+            Path(dest_path).write_bytes(tessellation.stl_bytes)
+            self.exported.append(str(dest_path))
             entries[component] = {
                 "component": component,
                 "written": dest_path,
                 "used_api": "fixture",
-                "triangles": triangles,
+                "triangles": len(mesh_triangles),
                 "bodies": {"solid": 1, "sheet": 0},
-                "tessellation": native_tessellation_v3(spans, native_edges),
+                "tessellation": tessellation,
             }
         return entries
 

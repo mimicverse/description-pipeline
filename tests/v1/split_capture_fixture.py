@@ -52,6 +52,7 @@ REQUIRED_CONTROL_GATES = (
     "urdf.topology",
     "consumer.urdf",
     "verification.complete",
+    "geometry.native_tessellation",
 )
 
 QUALIFICATION = "control-fixture; not native CAD qualification"
@@ -161,10 +162,20 @@ def build_fixture_capture(
             expected_inputs=prepared_files,
             prior_events=events,
         )
-    if capture.get("native_complete") is not True:
+    if capture.get("state") != "native_complete" or capture.get("passed") is not False:
         raise RuntimeError(f"the control fixture capture did not complete: {capture.get('error')}")
     archive = capture_output / transfer.CAPTURE_ARCHIVE
     manifest = capture_output / transfer.CAPTURE_MANIFEST
+    archive_receipt = capture.get("capture_archive")
+    if not isinstance(archive_receipt, dict):
+        raise RuntimeError("the control fixture capture carries no archive receipt")
+    if (
+        archive_receipt.get("name") != transfer.CAPTURE_ARCHIVE
+        or archive_receipt.get("sha256") != file_digest(archive)
+        or archive_receipt.get("size") != archive.stat().st_size
+        or archive_receipt.get("manifest_sha256") != file_digest(manifest)
+    ):
+        raise RuntimeError("the control fixture capture archive receipt does not bind its bytes")
     return {
         "run_id": run_id,
         "handoff_sha256": handoff,
@@ -174,13 +185,9 @@ def build_fixture_capture(
         "native_tool": tool,
         "archive": archive,
         "manifest": manifest,
-        # The exact capture-archive receipt the Windows endpoint serves for native_complete.
-        "receipt": {
-            "name": transfer.CAPTURE_ARCHIVE,
-            "sha256": file_digest(archive),
-            "size": archive.stat().st_size,
-            "manifest_sha256": file_digest(manifest),
-        },
+        # The exact capture-archive receipt the Windows endpoint serves at its
+        # native_complete boundary is the producer's own schema, not a twin.
+        "receipt": archive_receipt,
         "native_stages": json.loads((capture_output / "reports/native-stages.json").read_text(encoding="utf-8")),
         "qualification": QUALIFICATION,
     }

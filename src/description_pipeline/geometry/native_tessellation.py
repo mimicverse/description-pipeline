@@ -8,8 +8,21 @@ import struct
 
 from ..io import PipelineError
 from ..schemas import NATIVE_TESSELLATION_SCHEMA
+from .native_u import (
+    NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_U_IDENTITY_RULE,
+    NATIVE_U_RESOLUTION_RULE,
+    native_get_parameter_success,
+    native_point_error,
+    native_point_roundtrip_tolerance,
+    native_u_equal,
+    native_u_in_closed_interval,
+    native_u_intervals_cover,
+    native_curve_domain_transform,
+)
 
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+NATIVE_TESSELLATION_V3_SCHEMA = NATIVE_TESSELLATION_SCHEMA
 ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
 
 
@@ -20,6 +33,164 @@ def _require(condition: bool, message: str) -> None:
 
 def _integer(value) -> bool:
     return type(value) is int
+
+
+def _valid_evaluate2_packed_status(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "raw_type",
+        "raw_bits_u64",
+        "high32",
+        "low32",
+        "parsed_success",
+    }:
+        return False
+    bits = value["raw_bits_u64"]
+    return (
+        value["raw_type"] in {"int", "float"}
+        and _integer(bits)
+        and 0 <= bits <= 0xFFFFFFFFFFFFFFFF
+        and value["high32"] == (bits >> 32) & 0xFFFFFFFF
+        and value["low32"] == bits & 0xFFFFFFFF
+        and value["low32"] == 1
+        and value["parsed_success"] is True
+    )
+
+
+def _valid_u_evidence(value: object, u_parameter: object, endpoint_point: object) -> bool:
+    """Validate one retained GetClosestPointOn/GetParameter/Evaluate2 proof."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "u",
+        "rule_version",
+        "point_roundtrip_rule",
+        "point_tolerance_m",
+        "closest_point_error_m",
+        "evaluate_point_error_m",
+        "closest_evaluate_error_m",
+        "closest_point_on_raw",
+        "parameter_raw",
+        "parameter_success_raw",
+        "parameter_success_raw_type",
+        "parameter_success_bit",
+        "parameter_success_parsed",
+        "evaluate_payload",
+        "evaluate_packed_status",
+    }:
+        return False
+    closest = value["closest_point_on_raw"]
+    parameter = value["parameter_raw"]
+    evaluated = value["evaluate_payload"]
+    numeric = (int, float)
+    if (
+        not isinstance(endpoint_point, (list, tuple))
+        or len(endpoint_point) != 3
+        or not all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in endpoint_point
+        )
+        or not isinstance(closest, list)
+        or len(closest) != 5
+        or not all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in closest
+        )
+        or not isinstance(evaluated, list)
+        or len(evaluated) != 6
+        or not all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in evaluated
+        )
+    ):
+        return False
+    closest_point = tuple(closest[:3])
+    evaluated_point = tuple(evaluated[:3])
+    expected_point = tuple(float(item) for item in endpoint_point)
+    computed_tolerance = native_point_roundtrip_tolerance(
+        expected_point,
+        closest_point,
+        evaluated_point,
+    )
+    closest_error = native_point_error(expected_point, closest_point)
+    evaluate_error = native_point_error(expected_point, evaluated_point)
+    closest_evaluate_error = native_point_error(
+        closest_point,
+        evaluated_point,
+    )
+    finite_values = (
+        value["u"],
+        value["point_tolerance_m"],
+        value["closest_point_error_m"],
+        value["evaluate_point_error_m"],
+        value["closest_evaluate_error_m"],
+    )
+    return (
+        value["rule_version"] == NATIVE_U_IDENTITY_RULE
+        and value["point_roundtrip_rule"] == NATIVE_POINT_ROUNDTRIP_RULE
+        and all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in finite_values
+        )
+        and value["point_tolerance_m"] >= 0.0
+        and value["point_tolerance_m"] == computed_tolerance
+        and value["closest_point_error_m"] == closest_error
+        and value["evaluate_point_error_m"] == evaluate_error
+        and value["closest_evaluate_error_m"] == closest_evaluate_error
+        and max(closest_error, evaluate_error, closest_evaluate_error)
+        <= computed_tolerance
+        and type(u_parameter) in numeric
+        and native_u_equal(value["u"], u_parameter)
+        and isinstance(parameter, list)
+        and len(parameter) == 2
+        and type(parameter[0]) in numeric
+        and math.isfinite(float(parameter[0]))
+        and native_get_parameter_success(parameter[1]) is True
+        and value["parameter_success_raw"] == parameter[1]
+        and value["parameter_success_raw_type"] == type(parameter[1]).__name__
+        and value["parameter_success_bit"] == 1
+        and value["parameter_success_parsed"] is True
+        and native_u_equal(parameter[0], closest[3])
+        and native_u_equal(parameter[0], value["u"])
+        and _valid_evaluate2_packed_status(
+            value["evaluate_packed_status"]
+        )
+    )
+
+
+def _valid_curve_endpoint_evaluation(value: object, u_parameter: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "u",
+        "payload",
+        "packed_status",
+        "error",
+        "point_tolerance_m",
+        "point_error_m",
+    }:
+        return False
+    if type(value["u"]) not in (int, float) or not native_u_equal(
+        value["u"],
+        u_parameter,
+    ):
+        return False
+    if value["error"] is not None:
+        return False
+    payload = value["payload"]
+    tolerance = value["point_tolerance_m"]
+    error_m = value["point_error_m"]
+    return (
+        isinstance(payload, list)
+        and len(payload) == 6
+        and all(
+            type(value) in (int, float) and math.isfinite(float(value))
+            for value in payload
+        )
+        and _valid_evaluate2_packed_status(value["packed_status"])
+        and type(tolerance) in (int, float)
+        and type(error_m) in (int, float)
+        and math.isfinite(float(tolerance))
+        and math.isfinite(float(error_m))
+        and tolerance >= 0.0
+        and error_m <= tolerance
+    )
 
 
 def parse_native_tessellation(
@@ -44,7 +215,7 @@ def parse_native_tessellation(
         component + ": unknown or legacy tessellation accounting",
     )
     _require(
-        tessellation["schema_version"] == NATIVE_TESSELLATION_SCHEMA,
+        tessellation["schema_version"] == NATIVE_TESSELLATION_V3_SCHEMA,
         component + ": unsupported native tessellation schema",
     )
     spans = tessellation["face_spans"]
@@ -197,8 +368,29 @@ def parse_native_tessellation(
         "end_vertex_reference_sha256",
         "start_point_m",
         "end_point_m",
+        "start_vertex_error",
+        "end_vertex_error",
+        "start_point_error",
+        "end_point_error",
+        "start_vertex_state",
+        "end_vertex_state",
+        "start_reference_error",
+        "end_reference_error",
         "face_indices",
         "fin_ids",
+        "u_min",
+        "u_max",
+        "curve_start_point_m",
+        "curve_end_point_m",
+        "curve_sense",
+        "curve_type",
+        "curve_closed",
+        "curve_periodic",
+        "curve_end_params",
+        "curve_domain_transform",
+        "curve_endpoint_evaluations",
+        "endpoint_points_derived_from_curve",
+        "face_senses",
     }
     edge_owners = {}
     seen_edges = set()
@@ -209,6 +401,18 @@ def parse_native_tessellation(
             component + f": native edge {index} has an unknown shape",
         )
         reference = edge["edge_reference_sha256"]
+        start_reference = edge["start_vertex_reference_sha256"]
+        end_reference = edge["end_vertex_reference_sha256"]
+        start_point = edge["start_point_m"]
+        end_point = edge["end_point_m"]
+        endpoint_errors = (
+            edge["start_vertex_error"],
+            edge["end_vertex_error"],
+            edge["start_point_error"],
+            edge["end_point_error"],
+            edge["start_reference_error"],
+            edge["end_reference_error"],
+        )
         _require(
             _integer(edge["body_type"])
             and edge["body_type"] in (0, 1)
@@ -216,45 +420,329 @@ def parse_native_tessellation(
             and edge["body_index"] >= 0
             and isinstance(reference, str)
             and bool(HEX64.fullmatch(reference))
-            and isinstance(edge["start_vertex_reference_sha256"], str)
-            and bool(HEX64.fullmatch(edge["start_vertex_reference_sha256"]))
-            and isinstance(edge["end_vertex_reference_sha256"], str)
-            and bool(HEX64.fullmatch(edge["end_vertex_reference_sha256"]))
-            and isinstance(edge["start_point_m"], list)
-            and len(edge["start_point_m"]) == 3
-            and all(
-                type(value) in (int, float) and math.isfinite(value)
-                for value in edge["start_point_m"]
+            and (
+                start_reference is None
+                or (
+                    isinstance(start_reference, str)
+                    and bool(HEX64.fullmatch(start_reference))
+                )
             )
-            and isinstance(edge["end_point_m"], list)
-            and len(edge["end_point_m"]) == 3
-            and all(
-                type(value) in (int, float) and math.isfinite(value)
-                for value in edge["end_point_m"]
+            and (
+                end_reference is None
+                or (
+                    isinstance(end_reference, str)
+                    and bool(HEX64.fullmatch(end_reference))
+                )
             )
+            and (
+                start_point is None
+                or (
+                    isinstance(start_point, list)
+                    and len(start_point) == 3
+                    and all(
+                        type(value) in (int, float)
+                        and math.isfinite(value)
+                        for value in start_point
+                    )
+                )
+            )
+            and (
+                end_point is None
+                or (
+                    isinstance(end_point, list)
+                    and len(end_point) == 3
+                    and all(
+                        type(value) in (int, float)
+                        and math.isfinite(value)
+                        for value in end_point
+                    )
+                )
+            )
+            and all(
+                error is None or isinstance(error, str)
+                for error in endpoint_errors
+            )
+            and edge["start_vertex_state"]
+            in {"present", "absent", "read_failed"}
+            and edge["end_vertex_state"]
+            in {"present", "absent", "read_failed"}
+            and type(edge["endpoint_points_derived_from_curve"]) is bool
             and isinstance(edge["face_indices"], list)
             and bool(edge["face_indices"])
             and edge["face_indices"] == sorted(set(edge["face_indices"]))
             and all(_integer(value) and value >= 0 for value in edge["face_indices"])
             and isinstance(edge["fin_ids"], list)
             and edge["fin_ids"] == sorted(set(edge["fin_ids"]))
-            and all(_integer(value) and value >= 0 for value in edge["fin_ids"]),
+            and all(_integer(value) and value >= 0 for value in edge["fin_ids"])
+            and type(edge["u_min"]) in (int, float)
+            and type(edge["u_max"]) in (int, float)
+            and math.isfinite(edge["u_min"])
+            and math.isfinite(edge["u_max"])
+            and edge["u_min"] < edge["u_max"]
+            and isinstance(edge["curve_start_point_m"], list)
+            and len(edge["curve_start_point_m"]) == 3
+            and all(
+                type(value) in (int, float)
+                and math.isfinite(value)
+                for value in edge["curve_start_point_m"]
+            )
+            and isinstance(edge["curve_end_point_m"], list)
+            and len(edge["curve_end_point_m"]) == 3
+            and all(
+                type(value) in (int, float)
+                and math.isfinite(value)
+                for value in edge["curve_end_point_m"]
+            )
+            and type(edge["curve_sense"]) is bool
+            and _integer(edge["curve_type"])
+            and edge["curve_type"] >= 0
+            and isinstance(edge["curve_end_params"], dict)
+            and isinstance(edge["curve_domain_transform"], dict)
+            and isinstance(edge["face_senses"], list),
             component + f": native edge {index} is malformed",
         )
+        end_params = edge["curve_end_params"]
+        _require(
+            set(end_params)
+            == {
+                "call_form",
+                "success",
+                "error",
+                "start",
+                "end",
+                "is_closed",
+                "is_periodic",
+                "raw_outputs",
+            },
+            component
+            + f": native edge {index} periodicity shape is unsupported",
+        )
+        if end_params["success"] is True:
+            _require(
+                end_params["call_form"] == "pywin32-byref-variant"
+                and end_params["error"] is None
+                and type(end_params["start"]) in (int, float)
+                and type(end_params["end"]) in (int, float)
+                and math.isfinite(end_params["start"])
+                and math.isfinite(end_params["end"])
+                and type(end_params["is_closed"]) is bool
+                and type(end_params["is_periodic"]) is bool
+                and edge["curve_closed"] is end_params["is_closed"]
+                and edge["curve_periodic"] is end_params["is_periodic"],
+                component
+                + f": native edge {index} curve periodicity is inconsistent",
+            )
+        else:
+            _require(
+                end_params["success"] is False
+                and isinstance(end_params["error"], str)
+                and bool(end_params["error"])
+                and end_params["start"] is None
+                and end_params["end"] is None
+                and end_params["is_closed"] is None
+                and end_params["is_periodic"] is None
+                and end_params["call_form"] == "pywin32-byref-variant"
+                and edge["curve_closed"] is None
+                and edge["curve_periodic"] is None
+                and end_params["raw_outputs"] == [],
+                component
+                + f": native edge {index} unreadable periodicity is not explicit",
+            )
+        if end_params["success"] is True:
+            raw_outputs = end_params["raw_outputs"]
+            _require(
+                isinstance(raw_outputs, list)
+                and len(raw_outputs) == 4
+                and all(
+                    isinstance(row, dict)
+                    and set(row) == {"value_type", "value"}
+                    for row in raw_outputs
+                )
+                and [row["value_type"] for row in raw_outputs]
+                == [0x4005, 0x4005, 0x400B, 0x400B]
+                and raw_outputs[0]["value"] == end_params["start"]
+                and raw_outputs[1]["value"] == end_params["end"]
+                and raw_outputs[2]["value"] is end_params["is_closed"]
+                and raw_outputs[3]["value"] is end_params["is_periodic"],
+                component
+                + f": native edge {index} periodicity raw result differs",
+            )
+        _require(
+            end_params["success"] is True,
+            component
+            + f": native edge {index} periodicity is unresolved",
+        )
+        expected_transform = native_curve_domain_transform(
+            end_params["start"],
+            end_params["end"],
+            edge["u_min"],
+            edge["u_max"],
+            edge["curve_sense"],
+            end_params["is_periodic"],
+        )
+        _require(
+            edge["curve_domain_transform"] == expected_transform
+            and expected_transform["status"]
+            in {"contained", "contained_seam_wrapped"},
+            component
+            + f": native edge {index} trimmed domain is outside its underlying curve domain",
+        )
+        evaluations = edge["curve_endpoint_evaluations"]
+        _require(
+            isinstance(evaluations, dict)
+            and set(evaluations) == {"start", "end"}
+            and _valid_curve_endpoint_evaluation(
+                evaluations["start"],
+                edge["u_min"],
+            )
+            and _valid_curve_endpoint_evaluation(
+                evaluations["end"],
+                edge["u_max"],
+            ),
+            component
+            + f": native edge {index} curve endpoint evaluation is malformed",
+        )
+        expected_evaluation_points = (
+            (edge["curve_start_point_m"], edge["curve_end_point_m"])
+            if edge["curve_sense"]
+            else (edge["curve_end_point_m"], edge["curve_start_point_m"])
+        )
+        for name, expected_point in zip(
+            ("start", "end"),
+            expected_evaluation_points,
+            strict=True,
+        ):
+            evaluation = evaluations[name]
+            evaluated_point = evaluation["payload"][:3]
+            computed_tolerance = native_point_roundtrip_tolerance(
+                expected_point,
+                evaluated_point,
+            )
+            computed_error = native_point_error(
+                expected_point,
+                evaluated_point,
+            )
+            _require(
+                evaluation["point_tolerance_m"] == computed_tolerance
+                and evaluation["point_error_m"] == computed_error
+                and computed_error <= computed_tolerance,
+                component
+                + f": native edge {index} {name} endpoint evaluation is not independently reproducible",
+            )
+
+        endpoint_states = {
+            "start": edge["start_vertex_state"],
+            "end": edge["end_vertex_state"],
+        }
+        if "read_failed" in endpoint_states.values():
+            _require(
+                False,
+                component + f": native edge {index} present vertex failed GetPoint",
+            )
+        absent_count = sum(
+            state == "absent" for state in endpoint_states.values()
+        )
+        if absent_count == 1:
+            _require(
+                False,
+                component + f": native edge {index} has one absent endpoint",
+            )
+        if absent_count == 2:
+            start_evaluated = tuple(evaluations["start"]["payload"][:3])
+            end_evaluated = tuple(evaluations["end"]["payload"][:3])
+            closure_tolerance = native_point_roundtrip_tolerance(
+                start_evaluated,
+                end_evaluated,
+            )
+            closure_error = native_point_error(
+                start_evaluated,
+                end_evaluated,
+            )
+            _require(
+                edge["endpoint_points_derived_from_curve"] is True
+                and end_params["is_closed"] is True
+                and start_reference is None
+                and end_reference is None
+                and start_point is None
+                and end_point is None
+                and edge["start_point_error"] == "vertex_absent"
+                and edge["end_point_error"] == "vertex_absent"
+                and closure_error <= closure_tolerance,
+                component
+                + f": native edge {index} absent endpoints lack closed-curve derivation",
+            )
+        else:
+            _require(
+                edge["endpoint_points_derived_from_curve"] is False
+                and isinstance(start_reference, str)
+                and isinstance(end_reference, str)
+                and isinstance(start_point, list)
+                and isinstance(end_point, list)
+                and edge["start_point_error"] is None
+                and edge["end_point_error"] is None,
+                component
+                + f": native edge {index} present endpoint evidence is incomplete",
+            )
         body_key = (edge["body_type"], edge["body_index"])
         _require(body_key in expected_bodies, component + f": native edge {index} names an unknown body")
         _require(reference not in seen_edges, component + f": native edge {index} is duplicated")
         seen_edges.add(reference)
         for vertex_reference, point in (
-            (edge["start_vertex_reference_sha256"], edge["start_point_m"]),
-            (edge["end_vertex_reference_sha256"], edge["end_point_m"]),
+            (start_reference, start_point),
+            (end_reference, end_point),
         ):
+            if vertex_reference is None or point is None:
+                continue
             observed = vertex_points.setdefault(vertex_reference, tuple(point))
             _require(
                 observed == tuple(point),
                 component + f": native vertex {vertex_reference} binds multiple coordinates",
             )
         edge_owners[reference] = (body_key, set(edge["face_indices"]))
+        face_senses = edge["face_senses"]
+        _require(
+            len(face_senses) == len(edge["face_indices"])
+            and [
+                row.get("face_index") if isinstance(row, dict) else None
+                for row in face_senses
+            ]
+            == edge["face_indices"],
+            component + f": native edge {index} face-sense inventory is inconsistent",
+        )
+        sense_values = []
+        for row in face_senses:
+            _require(
+                isinstance(row, dict)
+                and set(row)
+                == {
+                    "face_index",
+                    "EdgeInFaceSense",
+                    "IEdgeInFaceSense2",
+                },
+                component + f": native edge {index} face-sense row is malformed",
+            )
+            values = []
+            for method in ("EdgeInFaceSense", "IEdgeInFaceSense2"):
+                observation = row[method]
+                _require(
+                    isinstance(observation, dict)
+                    and set(observation) == {"value", "error"}
+                    and observation["error"] is None
+                    and type(observation["value"]) is bool,
+                    component
+                    + f": native edge {index} orientation is unreadable",
+                )
+                values.append(observation["value"])
+            _require(
+                values[0] is values[1],
+                component
+                + f": native edge {index} orientation methods disagree",
+            )
+            sense_values.append(values[0])
+        _require(
+            len(sense_values) == 1 or sense_values[0] is not sense_values[1],
+            component + f": native edge {index} cofaces have the same orientation",
+        )
         _require(
             all((*body_key, face_index) in face_edge_references for face_index in edge_owners[reference][1]),
             component + f": native edge {index} names an unknown face",
@@ -318,12 +806,52 @@ def _parse_v3_itessellation(
 
     _require(
         isinstance(value, dict)
-        and set(value) == {"interface_iid", "properties", "bodies", "vertices"},
+        and set(value)
+        == {
+            "interface_iid",
+            "u_rule_version",
+            "u_resolution_rule",
+            "point_roundtrip_rule",
+            "properties",
+            "bodies",
+            "vertices",
+            "u_observation_stats",
+        },
         component + ": native tessellation v3 ITessellation evidence is missing",
     )
     _require(
         value["interface_iid"] == ITESSELLATION_IID,
         component + ": native tessellation v3 ITessellation interface is unsupported",
+    )
+    _require(
+        value["u_rule_version"] == NATIVE_U_IDENTITY_RULE,
+        component + ": native U identity rule is unsupported",
+    )
+    _require(
+        value["u_resolution_rule"] == NATIVE_U_RESOLUTION_RULE,
+        component + ": native U resolution rule is unsupported",
+    )
+    _require(
+        value["point_roundtrip_rule"] == NATIVE_POINT_ROUNDTRIP_RULE,
+        component + ": native point round-trip rule is unsupported",
+    )
+    stats = value["u_observation_stats"]
+    _require(
+        isinstance(stats, dict)
+        and set(stats)
+        == {
+            "unique_observations",
+            "cache_hits",
+            "get_closest_point_on_calls",
+            "get_parameter_calls",
+            "evaluate2_calls",
+        }
+        and all(_integer(item) and item >= 0 for item in stats.values())
+        and stats["get_closest_point_on_calls"]
+        == stats["unique_observations"]
+        and stats["get_parameter_calls"] == stats["unique_observations"]
+        and stats["evaluate2_calls"] == stats["unique_observations"],
+        component + ": native U observation statistics are inconsistent",
     )
     properties = value["properties"]
     expected_properties = (
@@ -491,6 +1019,30 @@ def _parse_v3_itessellation(
             cached == referenced,
             component + ": native tessellation v3 vertex cache differs from fin vertices",
         )
+        for fin in evidence["fins"].values():
+            if fin["classification"] == "internal_only":
+                continue
+            for vertex_id, u_value, evidence_value in (
+                (
+                    fin["vertex_ids"][0],
+                    fin["start_u"],
+                    fin["start_evidence"],
+                ),
+                (
+                    fin["vertex_ids"][1],
+                    fin["end_u"],
+                    fin["end_evidence"],
+                ),
+            ):
+                _require(
+                    _valid_u_evidence(
+                        evidence_value,
+                        u_value,
+                        vertices[(body_key, vertex_id)],
+                    ),
+                    component
+                    + f": native fin {fin['fin_id']} U evidence is not independently reproducible",
+                )
         cycles = _validate_facet_side_coverage(component, body_key, evidence)
         if triangle_vertices is not None:
             _validate_facet_stl_binding(
@@ -526,6 +1078,87 @@ def _parse_v3_itessellation(
                 component
                 + f": native tessellation v3 edge {reference} fin_ids are not bidirectional",
             )
+            u_min = float(edge["u_min"])
+            u_max = float(edge["u_max"])
+            intervals_by_face = {}
+            for fin_id in actual:
+                fin = evidence["fins"][fin_id]
+                start_u = float(fin["start_u"])
+                end_u = float(fin["end_u"])
+                _require(
+                    native_u_in_closed_interval(start_u, u_min, u_max)
+                    and native_u_in_closed_interval(end_u, u_min, u_max)
+                    and start_u != end_u,
+                    component
+                    + f": native tessellation v3 edge {reference} fin {fin_id} U is invalid",
+                )
+                intervals_by_face.setdefault(
+                    fin["face_index"],
+                    [],
+                ).append((min(start_u, end_u), max(start_u, end_u)))
+            for face_index, intervals in intervals_by_face.items():
+                _require(
+                    native_u_intervals_cover(intervals, u_min, u_max),
+                    component
+                    + f": native tessellation v3 edge {reference} face {face_index} does not cover its U domain",
+                )
+            curve_points = {
+                tuple(_float32(value) for value in edge["curve_start_point_m"]),
+                tuple(_float32(value) for value in edge["curve_end_point_m"]),
+            }
+            endpoint_points = (
+                edge["start_point_m"],
+                edge["end_point_m"],
+            )
+            if all(point is not None for point in endpoint_points):
+                edge_points = {
+                    tuple(_float32(value) for value in point)
+                    for point in endpoint_points
+                }
+            else:
+                evaluations = edge["curve_endpoint_evaluations"]
+                edge_points = {
+                    tuple(
+                        _float32(value)
+                        for value in evaluations[name]["payload"][:3]
+                    )
+                    for name in ("start", "end")
+                }
+            _require(
+                curve_points == edge_points,
+                component
+                + f": native tessellation v3 edge {reference} curve endpoints differ",
+            )
+            face_sense = {
+                row["face_index"]: row["EdgeInFaceSense"]["value"]
+                for row in edge["face_senses"]
+            }
+            for fin_id in actual:
+                fin = evidence["fins"][fin_id]
+                cofin_id = fin["cofin_id"]
+                _require(
+                    cofin_id in actual and cofin_id != fin_id,
+                    component
+                    + f": native tessellation v3 fin {fin_id} has no distinct cofin",
+                )
+                cofin = evidence["fins"][cofin_id]
+                _require(
+                    cofin["cofin_id"] == fin_id
+                    and cofin["face_index"] != fin["face_index"]
+                    and tuple(cofin["vertex_ids"])
+                    == tuple(reversed(fin["vertex_ids"]))
+                    and (
+                        (fin["end_u"] - fin["start_u"])
+                        * (cofin["end_u"] - cofin["start_u"])
+                        < 0.0
+                    )
+                    and native_u_equal(fin["start_u"], cofin["end_u"])
+                    and native_u_equal(fin["end_u"], cofin["start_u"])
+                    and face_sense[fin["face_index"]]
+                    is not face_sense[cofin["face_index"]],
+                    component
+                    + f": native tessellation v3 fin {fin_id} cofin/orientation is inconsistent",
+                )
             fin_faces = {
                 evidence["fins"][fin_id]["face_index"] for fin_id in actual
             }
@@ -691,6 +1324,11 @@ def _parse_itessellation_body(
                 "vertex_ids",
                 "edge_reference_sha256",
                 "classification",
+                "start_u",
+                "end_u",
+                "start_evidence",
+                "end_evidence",
+                "cofin_id",
             },
             component + f": native tessellation v3 fin {index} has an unknown shape",
         )
@@ -700,6 +1338,11 @@ def _parse_itessellation_body(
         vertex_ids = fin["vertex_ids"]
         reference = fin["edge_reference_sha256"]
         classification = fin["classification"]
+        start_u = fin["start_u"]
+        end_u = fin["end_u"]
+        start_evidence = fin["start_evidence"]
+        end_evidence = fin["end_evidence"]
+        cofin_id = fin["cofin_id"]
         _require(
             _integer(fin_id)
             and fin_id >= 0
@@ -711,11 +1354,25 @@ def _parse_itessellation_body(
             and len(set(vertex_ids)) == 2
             and all(_integer(vertex_id) and vertex_id >= 0 for vertex_id in vertex_ids)
             and (
-                (reference is None and classification == "internal_only")
-                or (
+                (
                     isinstance(reference, str)
                     and bool(HEX64.fullmatch(reference))
                     and classification == "native_edge"
+                    and type(start_u) in (int, float)
+                    and type(end_u) in (int, float)
+                    and math.isfinite(start_u)
+                    and math.isfinite(end_u)
+                    and _integer(cofin_id)
+                    and cofin_id >= 0
+                )
+                or (
+                    reference is None
+                    and classification == "internal_only"
+                    and start_u is None
+                    and end_u is None
+                    and start_evidence is None
+                    and end_evidence is None
+                    and cofin_id is None
                 )
             ),
             component + f": native tessellation v3 fin {index} is malformed or unclassified",
@@ -737,6 +1394,11 @@ def _parse_itessellation_body(
             "vertex_ids": tuple(vertex_ids),
             "edge_reference_sha256": reference,
             "classification": classification,
+            "start_u": start_u,
+            "end_u": end_u,
+            "start_evidence": start_evidence,
+            "end_evidence": end_evidence,
+            "cofin_id": cofin_id,
         }
     _require(
         set(facet_fin_membership)
