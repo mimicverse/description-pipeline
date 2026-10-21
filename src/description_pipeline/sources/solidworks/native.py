@@ -2838,37 +2838,6 @@ class _NativeReferenceRegistry:
         self.identity_owners[identity_sha256] = recorded_owner
         self.raw_owners[kind].setdefault(raw_sha256, []).append(recorded_owner)
 
-    def validate_scope_kind(self, kind: str) -> None:
-        records = {
-            owner["typed_sha256"]: owner
-            for owners in self.raw_owners[kind].values()
-            for owner in owners
-        }
-        if len(records) <= 1:
-            return
-        identities_by_raw = {
-            raw_sha256: {
-                owner["typed_sha256"]
-                for owner in owners
-            }
-            for raw_sha256, owners in self.raw_owners[kind].items()
-        }
-        aliased = {
-            raw_sha256
-            for raw_sha256, identities in identities_by_raw.items()
-            if len(identities) > 1
-        }
-        if aliased and len(identities_by_raw) != 1:
-            raise CadError(
-                "cad_persistent_reference_alias",
-                "scope-local identities mix aliased and distinct native references",
-                {
-                    "kind": kind,
-                    "aliased_reference_sha256": sorted(aliased),
-                    "reference_sha256": sorted(identities_by_raw),
-                },
-            )
-
     def alias_audit(self) -> dict[str, tuple[str, ...]]:
         return {
             kind: tuple(
