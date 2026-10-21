@@ -70,6 +70,23 @@ def _span_digests(path: Path, spans: list[dict]) -> None:
             )
 
 
+def _stl_triangle_vertices(path: Path, triangles: int) -> list[tuple[tuple[float, float, float], ...]]:
+    """Read the binary STL vertices independently of CAD tessellation objects."""
+
+    data = path.read_bytes()
+    _require(
+        len(data) == 84 + 50 * triangles,
+        "native STL bytes do not match the recorded triangle count",
+    )
+    return [
+        tuple(
+            struct.unpack_from("<3f", data, 84 + 50 * triangle_index + 12 + 12 * index)
+            for index in range(3)
+        )
+        for triangle_index in range(triangles)
+    ]
+
+
 def verify_native_mesh_observations(bundle: Path) -> dict:
     manifest = verify_snapshot(Path(bundle) / "evidence")
     native = ((manifest.get("identity") or {}).get("capture") or {}).get("evidence_class") == "cad"
@@ -95,14 +112,20 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
             all(type(count) is int and count >= 0 for count in bodies.values()), component + ": invalid body counts"
         )
         _require(sum(bodies.values()) > 0, component + ": no native bodies recorded")
-        spans = parse_native_tessellation(component, tessellation, bodies, triangles)
+        path = _stl_binding(bundle, entry, triangles)
+        spans = parse_native_tessellation(
+            component,
+            tessellation,
+            bodies,
+            triangles,
+            _stl_triangle_vertices(path, triangles),
+        )
         topology = summarize_native_topology(tessellation, spans)
         _require(
             topology["status"] == "evidence_complete",
             component + ": native body-local topology evidence is unresolved",
         )
         topologies.append({"component": component, **topology})
-        path = _stl_binding(bundle, entry, triangles)
         _span_digests(path, spans)
         seen = set()
         base = {"body_type", "body_index", "face_index", "triangle_count", "area_m2", "used_api"}

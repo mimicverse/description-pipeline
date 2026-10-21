@@ -16,7 +16,6 @@ import numpy as np
 
 from description_pipeline.interface_records import CHECK_POLICY_V1, validate_qualification
 from description_pipeline.io import PipelineError, canonical, write_json
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks import verify as oracle
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification import solidworks_urdf as quality
@@ -2037,13 +2036,10 @@ class MeshChunkContractTests(unittest.TestCase):
                 "scale": [1, 1, 1],
                 "xyz": [0, 0, 0],
                 "rpy": [0, 0, 0],
-                "tessellation": {
-                    "schema_version": NATIVE_TESSELLATION_SCHEMA,
-                    "faces": 2,
-                    "face_spans": face_spans,
-                    "native_edges": native_edges,
-                    "no_facets_faces": [],
-                },
+                "tessellation": support.native_tessellation_v3(
+                    face_spans,
+                    native_edges,
+                ),
             }
         }
         components = {"pcb-1": np.identity(4)}

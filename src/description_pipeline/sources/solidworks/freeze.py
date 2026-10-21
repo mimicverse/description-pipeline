@@ -2035,12 +2035,14 @@ def _export_geometry(
                 "face_spans",
                 "native_edges",
                 "no_facets_faces",
+                "itessellation",
             }
             or tessellation.get("schema_version") != NATIVE_TESSELLATION_SCHEMA
             or not isinstance(tessellation.get("faces"), int)
             or not isinstance(tessellation.get("face_spans"), list)
             or not isinstance(tessellation.get("native_edges"), list)
             or not isinstance(tessellation.get("no_facets_faces"), list)
+            or not isinstance(tessellation.get("itessellation"), dict)
         ):
             raise BridgeError(
                 "cad_mesh_export_failed",

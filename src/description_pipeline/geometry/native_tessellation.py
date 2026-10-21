@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 import re
+import struct
 
 from ..io import PipelineError
 from ..schemas import NATIVE_TESSELLATION_SCHEMA
 
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
 
 
 def _require(condition: bool, message: str) -> None:
@@ -25,6 +27,7 @@ def parse_native_tessellation(
     tessellation: object,
     bodies: dict,
     triangles: int,
+    triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None = None,
 ) -> list[dict]:
     """Validate the one current tessellation schema and return its face spans."""
 
@@ -36,6 +39,7 @@ def parse_native_tessellation(
             "face_spans",
             "native_edges",
             "no_facets_faces",
+            "itessellation",
         },
         component + ": unknown or legacy tessellation accounting",
     )
@@ -74,6 +78,8 @@ def parse_native_tessellation(
     face_keys = set()
     bodies_by_face = {}
     face_edge_references = {}
+    face_spans_by_key = {}
+    spans_by_body = {}
     for index, span in enumerate(spans):
         _require(
             isinstance(span, dict) and set(span) == required,
@@ -155,6 +161,8 @@ def parse_native_tessellation(
         _require(face_key not in face_keys, component + f": duplicate native face {face_key}")
         face_keys.add(face_key)
         bodies_by_face.setdefault(body_key, []).append(face_index)
+        face_spans_by_key[face_key] = span
+        spans_by_body.setdefault(body_key, []).append(span)
         face_edge_references[face_key] = set(edge_references)
         previous = order
         next_start += count
@@ -190,6 +198,7 @@ def parse_native_tessellation(
         "start_point_m",
         "end_point_m",
         "face_indices",
+        "fin_ids",
     }
     edge_owners = {}
     seen_edges = set()
@@ -226,7 +235,10 @@ def parse_native_tessellation(
             and isinstance(edge["face_indices"], list)
             and bool(edge["face_indices"])
             and edge["face_indices"] == sorted(set(edge["face_indices"]))
-            and all(_integer(value) and value >= 0 for value in edge["face_indices"]),
+            and all(_integer(value) and value >= 0 for value in edge["face_indices"])
+            and isinstance(edge["fin_ids"], list)
+            and edge["fin_ids"] == sorted(set(edge["fin_ids"]))
+            and all(_integer(value) and value >= 0 for value in edge["fin_ids"]),
             component + f": native edge {index} is malformed",
         )
         body_key = (edge["body_type"], edge["body_index"])
@@ -277,7 +289,551 @@ def parse_native_tessellation(
         ),
         component + ": body, face, edge and vertex identities must not alias",
     )
+    _parse_v3_itessellation(
+        component,
+        tessellation["itessellation"],
+        spans_by_body,
+        face_spans_by_key,
+        native_edges,
+        body_references,
+        expected_bodies,
+        triangles,
+        triangle_vertices,
+    )
     return spans
+
+
+def _parse_v3_itessellation(
+    component: str,
+    value: object,
+    spans_by_body: dict,
+    face_spans_by_key: dict,
+    native_edges: list[dict],
+    body_references: dict,
+    expected_bodies: set,
+    triangles: int,
+    triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None,
+) -> None:
+    """Validate body-local ITessellation facet/fin evidence fail closed."""
+
+    _require(
+        isinstance(value, dict)
+        and set(value) == {"interface_iid", "properties", "bodies", "vertices"},
+        component + ": native tessellation v3 ITessellation evidence is missing",
+    )
+    _require(
+        value["interface_iid"] == ITESSELLATION_IID,
+        component + ": native tessellation v3 ITessellation interface is unsupported",
+    )
+    properties = value["properties"]
+    expected_properties = (
+        "need_face_facet_map",
+        "need_edge_fin_map",
+        "need_vertex_params",
+    )
+    _require(
+        isinstance(properties, dict)
+        and set(properties) == set(expected_properties)
+        and all(
+            type(properties[key]) is bool and properties[key]
+            for key in expected_properties
+        ),
+        component + ": native tessellation v3 ITessellation properties are incomplete",
+    )
+    if triangle_vertices is not None:
+        _require(
+            isinstance(triangle_vertices, list)
+            and len(triangle_vertices) == triangles
+            and all(
+                isinstance(triangle, (list, tuple))
+                and len(triangle) == 3
+                and all(
+                    isinstance(point, (list, tuple))
+                    and len(point) == 3
+                    and all(
+                        type(coordinate) in (int, float)
+                        and math.isfinite(coordinate)
+                        for coordinate in point
+                    )
+                    for point in triangle
+                )
+                for triangle in triangle_vertices
+            ),
+            component + ": native STL triangle vertices are unavailable for v3 binding",
+        )
+    raw_bodies = value["bodies"]
+    _require(
+        isinstance(raw_bodies, list) and bool(raw_bodies),
+        component + ": native tessellation v3 body evidence is missing",
+    )
+
+    body_evidence = {}
+    body_counts = {}
+    previous_body = None
+    for index, body in enumerate(raw_bodies):
+        _require(
+            isinstance(body, dict)
+            and set(body)
+            == {
+                "body_type",
+                "body_index",
+                "body_reference_sha256",
+                "tessellate_result",
+                "facet_count",
+                "fin_count",
+                "vertex_count",
+                "faces",
+                "facets",
+                "fins",
+            },
+            component + f": native tessellation v3 body {index} has an unknown shape",
+        )
+        body_key = (body["body_type"], body["body_index"])
+        _require(
+            _integer(body_key[0])
+            and body_key[0] in (0, 1)
+            and _integer(body_key[1])
+            and body_key[1] >= 0
+            and body_key in expected_bodies,
+            component + f": native tessellation v3 body {index} is unknown",
+        )
+        _require(
+            previous_body is None or body_key > previous_body,
+            component + f": native tessellation v3 body {index} is duplicated or unordered",
+        )
+        previous_body = body_key
+        _require(
+            body["body_reference_sha256"] == body_references[body_key]
+            and body["tessellate_result"] is True
+            and _integer(body["facet_count"])
+            and body["facet_count"] >= 0
+            and _integer(body["fin_count"])
+            and body["fin_count"] >= 0
+            and _integer(body["vertex_count"])
+            and body["vertex_count"] >= 0
+            and isinstance(body["faces"], list)
+            and isinstance(body["facets"], list)
+            and isinstance(body["fins"], list),
+            component + f": native tessellation v3 body {body_key} is incomplete",
+        )
+        body_evidence[body_key] = _parse_itessellation_body(
+            component,
+            body,
+            spans_by_body[body_key],
+            face_spans_by_key,
+        )
+        body_counts[body_key] = {
+            "facet_count": body["facet_count"],
+            "fin_count": body["fin_count"],
+            "vertex_count": body["vertex_count"],
+        }
+    _require(
+        set(body_evidence) == expected_bodies,
+        component + ": native tessellation v3 evidence does not cover every body",
+    )
+
+    raw_vertices = value["vertices"]
+    _require(
+        isinstance(raw_vertices, list),
+        component + ": native tessellation v3 vertex point cache is missing",
+    )
+    vertices = {}
+    previous_vertex = None
+    for index, vertex in enumerate(raw_vertices):
+        _require(
+            isinstance(vertex, dict)
+            and set(vertex) == {"body_type", "body_index", "vertex_id", "point_m"},
+            component + f": native tessellation v3 vertex {index} has an unknown shape",
+        )
+        body_key = (vertex["body_type"], vertex["body_index"])
+        vertex_id = vertex["vertex_id"]
+        point = vertex["point_m"]
+        _require(
+            body_key in body_evidence
+            and _integer(vertex_id)
+            and vertex_id >= 0
+            and isinstance(point, list)
+            and len(point) == 3
+            and all(
+                type(coordinate) in (int, float) and math.isfinite(coordinate)
+                for coordinate in point
+            ),
+            component + f": native tessellation v3 vertex {index} is malformed",
+        )
+        order = (*body_key, vertex_id)
+        _require(
+            previous_vertex is None or order > previous_vertex,
+            component + f": native tessellation v3 vertex {index} is duplicated or unordered",
+        )
+        previous_vertex = order
+        vertices[(body_key, vertex_id)] = tuple(point)
+
+    for body_key, evidence in body_evidence.items():
+        _require(
+            len(evidence["facets"]) == body_counts[body_key]["facet_count"],
+            component + f": native tessellation v3 facet count differs for body {body_key}",
+        )
+        _require(
+            len(evidence["fins"]) == body_counts[body_key]["fin_count"],
+            component + f": native tessellation v3 fin count differs for body {body_key}",
+        )
+        cached = {vertex_id for owner, vertex_id in vertices if owner == body_key}
+        referenced = {
+            vertex_id
+            for fin in evidence["fins"].values()
+            for vertex_id in fin["vertex_ids"]
+        }
+        _require(
+            len(cached) == body_counts[body_key]["vertex_count"],
+            component + f": native tessellation v3 vertex count differs for body {body_key}",
+        )
+        _require(
+            cached == referenced,
+            component + ": native tessellation v3 vertex cache differs from fin vertices",
+        )
+        cycles = _validate_facet_side_coverage(component, body_key, evidence)
+        if triangle_vertices is not None:
+            _validate_facet_stl_binding(
+                component,
+                body_key,
+                evidence,
+                cycles,
+                vertices,
+                triangle_vertices,
+            )
+
+    edges_by_body = {}
+    for edge in native_edges:
+        edges_by_body.setdefault((edge["body_type"], edge["body_index"]), {})[
+            edge["edge_reference_sha256"]
+        ] = edge
+    for body_key, evidence in body_evidence.items():
+        fins_by_edge_reference = {}
+        for fin in evidence["fins"].values():
+            reference = fin["edge_reference_sha256"]
+            if reference is not None:
+                fins_by_edge_reference.setdefault(reference, set()).add(fin["fin_id"])
+        body_edges = edges_by_body.get(body_key, {})
+        _require(
+            set(fins_by_edge_reference) <= set(body_edges),
+            component + f": native tessellation v3 edge references differ for body {body_key}",
+        )
+        for reference, edge in body_edges.items():
+            declared = set(edge["fin_ids"])
+            actual = fins_by_edge_reference.get(reference, set())
+            _require(
+                declared == actual,
+                component
+                + f": native tessellation v3 edge {reference} fin_ids are not bidirectional",
+            )
+            fin_faces = {
+                evidence["fins"][fin_id]["face_index"] for fin_id in actual
+            }
+            active_faces = {
+                face_index
+                for face_index in edge["face_indices"]
+                if face_spans_by_key[(*body_key, face_index)]["triangle_count"] > 0
+            }
+            _require(
+                fin_faces == active_faces,
+                component
+                + f": native tessellation v3 edge {reference} does not cover its tessellated faces",
+            )
+            _require(
+                bool(active_faces)
+                or all(
+                    face_spans_by_key[(*body_key, face_index)]["triangle_count"] == 0
+                    for face_index in edge["face_indices"]
+                ),
+                component
+                + f": native tessellation v3 edge {reference} has no fin without an untessellated face",
+            )
+
+
+def _parse_itessellation_body(
+    component: str,
+    body: dict,
+    spans: list[dict],
+    face_spans_by_key: dict,
+) -> dict:
+    body_key = (body["body_type"], body["body_index"])
+    face_spans = {span["face_index"]: span for span in spans}
+    faces = {}
+    previous_face = None
+    for index, face in enumerate(body["faces"]):
+        _require(
+            isinstance(face, dict)
+            and set(face) == {"face_index", "facet_ids"},
+            component + f": native tessellation v3 face {index} has an unknown shape",
+        )
+        face_index = face["face_index"]
+        facet_ids = face["facet_ids"]
+        _require(
+            _integer(face_index)
+            and face_index in face_spans
+            and isinstance(facet_ids, list)
+            and facet_ids == sorted(set(facet_ids))
+            and all(_integer(facet_id) and facet_id >= 0 for facet_id in facet_ids)
+            and (previous_face is None or face_index > previous_face),
+            component + f": native tessellation v3 face {index} is malformed",
+        )
+        previous_face = face_index
+        faces[face_index] = set(facet_ids)
+    _require(
+        set(faces) == set(face_spans),
+        component + f": native tessellation v3 body {body_key} does not cover every face",
+    )
+
+    facets = {}
+    previous_facet = None
+    used_triangle_records = set()
+    for index, facet in enumerate(body["facets"]):
+        _require(
+            isinstance(facet, dict)
+            and set(facet)
+            == {
+                "facet_id",
+                "face_index",
+                "fin_ids",
+                "vertex_ids",
+                "triangle_record_index",
+            },
+            component + f": native tessellation v3 facet {index} has an unknown shape",
+        )
+        facet_id = facet["facet_id"]
+        face_index = facet["face_index"]
+        fin_ids = facet["fin_ids"]
+        vertex_ids = facet["vertex_ids"]
+        triangle_record_index = facet["triangle_record_index"]
+        _require(
+            _integer(facet_id)
+            and facet_id >= 0
+            and (previous_facet is None or facet_id > previous_facet)
+            and face_index in faces
+            and facet_id in faces[face_index]
+            and isinstance(fin_ids, list)
+            and len(fin_ids) == 3
+            and fin_ids == sorted(set(fin_ids))
+            and all(_integer(fin_id) and fin_id >= 0 for fin_id in fin_ids)
+            and isinstance(vertex_ids, list)
+            and len(vertex_ids) == 3
+            and vertex_ids == sorted(set(vertex_ids))
+            and all(_integer(vertex_id) and vertex_id >= 0 for vertex_id in vertex_ids)
+            and _integer(triangle_record_index)
+            and triangle_record_index >= 0,
+            component + f": native tessellation v3 facet {index} is malformed",
+        )
+        previous_facet = facet_id
+        span = face_spans_by_key[(*body_key, face_index)]
+        expected_records = range(
+            span["triangle_start"],
+            span["triangle_start"] + span["triangle_count"],
+        )
+        _require(
+            triangle_record_index in expected_records
+            and triangle_record_index not in used_triangle_records,
+            component
+            + f": native tessellation v3 facet {facet_id} has duplicate or misplaced triangle index",
+        )
+        used_triangle_records.add(triangle_record_index)
+        facets[facet_id] = {
+            "facet_id": facet_id,
+            "face_index": face_index,
+            "fin_ids": tuple(fin_ids),
+            "vertex_ids": tuple(vertex_ids),
+            "triangle_record_index": triangle_record_index,
+        }
+
+    expected_triangle_records = {
+        triangle_index
+        for span in spans
+        for triangle_index in range(
+            span["triangle_start"],
+            span["triangle_start"] + span["triangle_count"],
+        )
+    }
+    _require(
+        used_triangle_records == expected_triangle_records,
+        component + f": native tessellation v3 body {body_key} does not cover every triangle record",
+    )
+    _require(
+        {
+            facet_id
+            for facet_ids in faces.values()
+            for facet_id in facet_ids
+        }
+        == set(facets),
+        component + f": native tessellation v3 body {body_key} face-to-facet map is not closed",
+    )
+    for face_index, facet_ids in faces.items():
+        _require(
+            facet_ids
+            == {
+                facet_id
+                for facet_id, facet in facets.items()
+                if facet["face_index"] == face_index
+            },
+            component
+            + f": native tessellation v3 body {body_key} face {face_index} has misowned facets",
+        )
+
+    fins = {}
+    previous_fin = None
+    facet_fin_membership = {}
+    for index, fin in enumerate(body["fins"]):
+        _require(
+            isinstance(fin, dict)
+            and set(fin)
+            == {
+                "fin_id",
+                "facet_id",
+                "face_index",
+                "vertex_ids",
+                "edge_reference_sha256",
+                "classification",
+            },
+            component + f": native tessellation v3 fin {index} has an unknown shape",
+        )
+        fin_id = fin["fin_id"]
+        facet_id = fin["facet_id"]
+        face_index = fin["face_index"]
+        vertex_ids = fin["vertex_ids"]
+        reference = fin["edge_reference_sha256"]
+        classification = fin["classification"]
+        _require(
+            _integer(fin_id)
+            and fin_id >= 0
+            and (previous_fin is None or fin_id > previous_fin)
+            and facet_id in facets
+            and face_index == facets[facet_id]["face_index"]
+            and isinstance(vertex_ids, list)
+            and len(vertex_ids) == 2
+            and len(set(vertex_ids)) == 2
+            and all(_integer(vertex_id) and vertex_id >= 0 for vertex_id in vertex_ids)
+            and (
+                (reference is None and classification == "internal_only")
+                or (
+                    isinstance(reference, str)
+                    and bool(HEX64.fullmatch(reference))
+                    and classification == "native_edge"
+                )
+            ),
+            component + f": native tessellation v3 fin {index} is malformed or unclassified",
+        )
+        previous_fin = fin_id
+        _require(
+            fin_id in facets[facet_id]["fin_ids"],
+            component + f": native tessellation v3 fin {fin_id} is absent from its facet",
+        )
+        previous = facet_fin_membership.setdefault(fin_id, facet_id)
+        _require(
+            previous == facet_id,
+            component + f": native tessellation v3 fin {fin_id} belongs to multiple facets",
+        )
+        fins[fin_id] = {
+            "fin_id": fin_id,
+            "facet_id": facet_id,
+            "face_index": face_index,
+            "vertex_ids": tuple(vertex_ids),
+            "edge_reference_sha256": reference,
+            "classification": classification,
+        }
+    _require(
+        set(facet_fin_membership)
+        == {
+            fin_id
+            for facet in facets.values()
+            for fin_id in facet["fin_ids"]
+        },
+        component + f": native tessellation v3 body {body_key} facet-to-fin map is not closed",
+    )
+    return {"faces": faces, "facets": facets, "fins": fins}
+
+
+def _validate_facet_side_coverage(
+    component: str,
+    body_key: tuple[int, int],
+    evidence: dict,
+) -> dict[int, tuple[int, int, int]]:
+    """Require each facet's directed fins to form one unique three-cycle."""
+
+    cycles = {}
+    for facet in evidence["facets"].values():
+        facet_vertices = set(facet["vertex_ids"])
+        fin_ids = facet["fin_ids"]
+        fins = [evidence["fins"][fin_id] for fin_id in fin_ids]
+        starts = [fin["vertex_ids"][0] for fin in fins]
+        ends = [fin["vertex_ids"][1] for fin in fins]
+        _require(
+            set(starts) == facet_vertices
+            and set(ends) == facet_vertices
+            and len(set(starts)) == 3
+            and len(set(ends)) == 3,
+            component
+            + f": native tessellation v3 facet {facet['facet_id']} is not a directed three-cycle",
+        )
+        cycle = [fins[0]["vertex_ids"][0]]
+        current = fins[0]
+        used = set()
+        for _ in range(3):
+            _require(
+                current["fin_id"] not in used,
+                component
+                + f": native tessellation v3 facet {facet['facet_id']} repeats a directed fin",
+            )
+            used.add(current["fin_id"])
+            cycle.append(current["vertex_ids"][1])
+            matches = [
+                fin
+                for fin in fins
+                if fin["vertex_ids"][0] == current["vertex_ids"][1]
+            ]
+            _require(
+                len(matches) == 1,
+                component
+                + f": native tessellation v3 facet {facet['facet_id']} has an ambiguous directed cycle",
+            )
+            current = matches[0]
+        _require(
+            current["fin_id"] == fins[0]["fin_id"]
+            and cycle[0] == cycle[-1]
+            and len(set(cycle[:-1])) == 3,
+            component
+            + f": native tessellation v3 facet {facet['facet_id']} does not form one directed three-cycle",
+        )
+        cycles[facet["facet_id"]] = (cycle[0], cycle[1], cycle[2])
+    return cycles
+
+
+def _float32(value: float) -> float:
+    """Apply the manifest's public binary32 rule with round-to-nearest-even."""
+
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _validate_facet_stl_binding(
+    component: str,
+    body_key: tuple[int, int],
+    evidence: dict,
+    cycles: dict[int, tuple[int, int, int]],
+    vertices: dict,
+    triangle_vertices: list,
+) -> None:
+    """Bind the directed native facet cycle to its exact binary STL record."""
+
+    for facet in evidence["facets"].values():
+        native = [
+            tuple(_float32(coordinate) for coordinate in vertices[(body_key, vertex_id)])
+            for vertex_id in cycles[facet["facet_id"]]
+        ]
+        record = triangle_vertices[facet["triangle_record_index"]]
+        stl = [tuple(float(coordinate) for coordinate in point) for point in record]
+        _require(
+            any(native == stl[offset:] + stl[:offset] for offset in range(3)),
+            component
+            + f": native tessellation v3 facet {facet['facet_id']} does not bind "
+            + f"triangle record {facet['triangle_record_index']}",
+        )
 
 
 def summarize_native_topology(tessellation: dict, spans: list[dict]) -> dict:

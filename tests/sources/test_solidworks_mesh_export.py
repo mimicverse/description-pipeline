@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import shutil
 import tempfile
 import threading
@@ -11,9 +12,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
+from . import support
 
 from description_pipeline.geometry.stl import read as read_stl  # noqa: E402
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA  # noqa: E402
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     FACE_READ_RETRY_ATTEMPTS,
@@ -915,10 +916,8 @@ class NoFullScanExportTests(unittest.TestCase):
                         "written": destination,
                         "used_api": "fixture",
                         "bodies": {"solid": 1, "sheet": 0},
-                        "tessellation": {
-                            "schema_version": NATIVE_TESSELLATION_SCHEMA,
-                            "faces": 1,
-                            "face_spans": [
+                        "tessellation": support.native_tessellation_v3(
+                            [
                                 {
                                     "body_type": 0,
                                     "body_index": 0,
@@ -933,9 +932,8 @@ class NoFullScanExportTests(unittest.TestCase):
                                     "triangle_records_sha256": hashlib.sha256(payload[84:]).hexdigest(),
                                 }
                             ],
-                            "native_edges": [],
-                            "no_facets_faces": [],
-                        },
+                            [],
+                        ),
                     }
                 return entries
 
@@ -952,4 +950,80 @@ class NoFullScanExportTests(unittest.TestCase):
         })
         self.assertEqual(row["triangles"], 2)
         self.assertEqual(row["sha256"], hashlib.sha256(payload).hexdigest())
+
+    def test_export_rejects_five_key_v2_and_non_mapping_itessellation(self):
+        import hashlib
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from importlib import import_module
+
+        freeze_module = import_module("description_pipeline.sources.solidworks.freeze")
+        payload = self._planar_stl()
+        span = {
+            "body_type": 0,
+            "body_index": 0,
+            "body_name": "fixture",
+            "body_reference_sha256": "1" * 64,
+            "face_index": 0,
+            "face_reference_sha256": "2" * 64,
+            "face_owner_id": 1,
+            "edge_references": [],
+            "triangle_start": 0,
+            "triangle_count": 2,
+            "triangle_records_sha256": hashlib.sha256(payload[84:]).hexdigest(),
+        }
+        valid = support.native_tessellation_v3([span], [])
+        five_key = {
+            key: value
+            for key, value in valid.items()
+            if key != "itessellation"
+        }
+        legacy_v2 = {
+            **valid,
+            "schema_version": "solidworks-to-urdf.native-tessellation/v2",
+        }
+        non_mapping = {**valid, "itessellation": []}
+
+        for label, tessellation in (
+            ("five-key", five_key),
+            ("v2", legacy_v2),
+            ("non-mapping", non_mapping),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+
+                def backend_for(value):
+                    class Backend:
+                        def export_component_meshes(self, destinations, on_activity=None):
+                            entries = {}
+                            for component, destination in destinations.items():
+                                Path(destination).write_bytes(payload)
+                                entries[component] = {
+                                    "component": component,
+                                    "written": destination,
+                                    "used_api": "fixture",
+                                    "bodies": {"solid": 1, "sheet": 0},
+                                    "tessellation": copy.deepcopy(value),
+                                }
+                            return entries
+
+                    return Backend()
+
+                with (
+                    mock.patch(
+                        "description_pipeline.geometry.stl.read",
+                        side_effect=AssertionError("full scan"),
+                    ),
+                    self.assertRaisesRegex(
+                        freeze_module.BridgeError,
+                        "complete face-span evidence",
+                    ),
+                ):
+                    freeze_module._export_geometry(
+                        backend_for(tessellation),
+                        {"assembly": "robot.SLDASM"},
+                        Path(tmp) / "evidence" / "geometry",
+                        ["pcb-1"],
+                    )
 

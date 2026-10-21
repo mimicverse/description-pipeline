@@ -22,7 +22,6 @@ from description_pipeline.io import digest
 from description_pipeline.interface_records import PURPOSE_ENGINEERING
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
-from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
@@ -126,13 +125,10 @@ class AxisFixtureBackend(support.FixtureCadBackend):
                     }
                 )
                 start += count
-            info["tessellation"] = {
-                "schema_version": NATIVE_TESSELLATION_SCHEMA,
-                "faces": 6,
-                "face_spans": spans,
-                "native_edges": native_edges,
-                "no_facets_faces": [],
-            }
+            info["tessellation"] = support.native_tessellation_v3(
+                spans,
+                native_edges,
+            )
         return entries
 
 

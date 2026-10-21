@@ -123,6 +123,201 @@ def cube_native_edges(half: float = 0.02) -> tuple[dict[int, list[str]], list[di
     return face_edges, native_edges
 
 
+ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
+
+
+def binary_stl_triangle_vertices(
+    payload: bytes,
+) -> list[tuple[tuple[float, float, float], ...]]:
+    """Read reference vertices from one closed binary STL payload."""
+
+    count = struct.unpack_from("<I", payload, 80)[0]
+    if len(payload) != 84 + 50 * count:
+        raise ValueError("binary STL payload has an inconsistent size")
+    return [
+        tuple(
+            struct.unpack_from(
+                "<3f",
+                payload,
+                84 + 50 * triangle_index + 12 + 12 * vertex_index,
+            )
+            for vertex_index in range(3)
+        )
+        for triangle_index in range(count)
+    ]
+
+
+def native_tessellation_v3(
+    face_spans: Sequence[dict[str, Any]],
+    native_edges: Sequence[dict[str, Any]],
+    no_facets_faces: Sequence[dict[str, Any]] = (),
+    triangle_vertices: Sequence[Sequence[Sequence[float]]] | None = None,
+) -> dict[str, Any]:
+    """Build closed body-local ITessellation evidence for a native mesh fixture."""
+
+    spans = copy.deepcopy(list(face_spans))
+    edges = copy.deepcopy(list(native_edges))
+    body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
+    evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
+    body_rows = []
+    vertex_rows = []
+    next_facet_id = 1
+    next_fin_id = 1
+    next_vertex_id = 1
+
+    for body_type, body_index in body_keys:
+        body_key = (body_type, body_index)
+        body_spans = sorted(
+            (
+                span
+                for span in spans
+                if (span["body_type"], span["body_index"]) == body_key
+            ),
+            key=lambda span: span["face_index"],
+        )
+        faces = []
+        facets = []
+        fins = []
+        for span in body_spans:
+            facet_ids = []
+            for local_index in range(span["triangle_count"]):
+                triangle_record_index = span["triangle_start"] + local_index
+                if triangle_vertices is None:
+                    points = [
+                        [float(triangle_record_index), float(vertex_index), 0.0]
+                        for vertex_index in range(3)
+                    ]
+                else:
+                    points = triangle_vertices[triangle_record_index]
+                    if len(points) != 3:
+                        raise ValueError("native tessellation triangle must have three vertices")
+                facet_id = next_facet_id
+                next_facet_id += 1
+                vertex_ids = [next_vertex_id, next_vertex_id + 1, next_vertex_id + 2]
+                next_vertex_id += 3
+                for vertex_id, point in zip(vertex_ids, points, strict=True):
+                    vertex_rows.append(
+                        {
+                            "body_type": body_type,
+                            "body_index": body_index,
+                            "vertex_id": vertex_id,
+                            "point_m": [float(coordinate) for coordinate in point],
+                        }
+                    )
+                fin_ids = [next_fin_id, next_fin_id + 1, next_fin_id + 2]
+                next_fin_id += 3
+                for fin_id, side in zip(
+                    fin_ids,
+                    (
+                        (vertex_ids[0], vertex_ids[1]),
+                        (vertex_ids[1], vertex_ids[2]),
+                        (vertex_ids[2], vertex_ids[0]),
+                    ),
+                    strict=True,
+                ):
+                    fins.append(
+                        {
+                            "fin_id": fin_id,
+                            "facet_id": facet_id,
+                            "face_index": span["face_index"],
+                            "vertex_ids": list(side),
+                            "edge_reference_sha256": None,
+                            "classification": "internal_only",
+                        }
+                    )
+                facets.append(
+                    {
+                        "facet_id": facet_id,
+                        "face_index": span["face_index"],
+                        "fin_ids": fin_ids,
+                        "vertex_ids": vertex_ids,
+                        "triangle_record_index": triangle_record_index,
+                    }
+                )
+                facet_ids.append(facet_id)
+            faces.append(
+                {
+                    "face_index": span["face_index"],
+                    "facet_ids": facet_ids,
+                }
+            )
+        evidence_by_body[body_key] = {
+            "spans": body_spans,
+            "faces": faces,
+            "facets": facets,
+            "fins": fins,
+        }
+
+    active_faces = {
+        (span["body_type"], span["body_index"], span["face_index"])
+        for span in spans
+        if span["triangle_count"] > 0
+    }
+    for edge in edges:
+        body_key = (edge["body_type"], edge["body_index"])
+        body = evidence_by_body[body_key]
+        edge_fin_ids = []
+        for face_index in sorted(set(edge["face_indices"])):
+            if (*body_key, face_index) not in active_faces:
+                continue
+            fin = next(
+                (
+                    item
+                    for item in body["fins"]
+                    if item["face_index"] == face_index
+                    and item["classification"] == "internal_only"
+                ),
+                None,
+            )
+            if fin is None:
+                raise ValueError("native edge fixture exceeds the available facet sides")
+            fin["edge_reference_sha256"] = edge["edge_reference_sha256"]
+            fin["classification"] = "native_edge"
+            edge_fin_ids.append(fin["fin_id"])
+        edge["fin_ids"] = sorted(edge_fin_ids)
+
+    for body_type, body_index in body_keys:
+        body_key = (body_type, body_index)
+        body = evidence_by_body[body_key]
+        body_rows.append(
+            {
+                "body_type": body_type,
+                "body_index": body_index,
+                "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
+                "tessellate_result": True,
+                "facet_count": len(body["facets"]),
+                "fin_count": len(body["fins"]),
+                "vertex_count": sum(
+                    len(facet["vertex_ids"]) for facet in body["facets"]
+                ),
+                "faces": body["faces"],
+                "facets": body["facets"],
+                "fins": body["fins"],
+            }
+        )
+
+    vertex_rows.sort(
+        key=lambda row: (row["body_type"], row["body_index"], row["vertex_id"])
+    )
+    return {
+        "schema_version": NATIVE_TESSELLATION_SCHEMA,
+        "faces": len(spans),
+        "face_spans": spans,
+        "native_edges": edges,
+        "no_facets_faces": copy.deepcopy(list(no_facets_faces)),
+        "itessellation": {
+            "interface_iid": ITESSELLATION_IID,
+            "properties": {
+                "need_face_facet_map": True,
+                "need_edge_fin_map": True,
+                "need_vertex_params": True,
+            },
+            "bodies": body_rows,
+            "vertices": vertex_rows,
+        },
+    }
+
+
 def _matrix16(values: Sequence[float]) -> Matrix:
     """Coerce a sequence to the 4x4 row-major matrix shape the protocol declares."""
 
@@ -672,13 +867,7 @@ class FixtureCadBackend(CadBackend):
                 "used_api": "fixture",
                 "triangles": triangles,
                 "bodies": {"solid": 1, "sheet": 0},
-                "tessellation": {
-                    "schema_version": NATIVE_TESSELLATION_SCHEMA,
-                    "faces": 6,
-                    "face_spans": spans,
-                    "native_edges": native_edges,
-                    "no_facets_faces": [],
-                },
+                "tessellation": native_tessellation_v3(spans, native_edges),
             }
         return entries
 

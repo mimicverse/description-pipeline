@@ -9,6 +9,7 @@ import unittest
 from description_pipeline.io import file_digest, write_json
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.structural_report import write_structural_report
+from tests.sources import support
 
 
 class StructuralReportTests(unittest.TestCase):
@@ -790,25 +791,20 @@ class StructuralReportTests(unittest.TestCase):
                 "component": "arm-1",
                 "triangles": 12,
                 "bodies": {"solid": 3, "sheet": 0},
-                "tessellation": {
-                    "schema_version": NATIVE_TESSELLATION_SCHEMA,
-                    "faces": 12,
-                    "face_spans": solid_spans,
-                    "native_edges": [],
-                    "no_facets_faces": [],
-                },
+                "tessellation": support.native_tessellation_v3(
+                    solid_spans,
+                    [],
+                ),
             },
             {
                 "component": "board-1",
                 "triangles": 5,
                 "bodies": {"solid": 0, "sheet": 6},
-                "tessellation": {
-                    "schema_version": NATIVE_TESSELLATION_SCHEMA,
-                    "faces": 5 + len(rows),
-                    "face_spans": sheet_spans,
-                    "native_edges": [],
-                    "no_facets_faces": rows,
-                },
+                "tessellation": support.native_tessellation_v3(
+                    sheet_spans,
+                    [],
+                    rows,
+                ),
             },
         ]
 
@@ -871,6 +867,55 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("native area is 1.8716e-13", findings[0]["message"])
             self.assertIn("without claiming zero area", findings[0]["message"])
             self.assertEqual(report["summary"]["blockers"], 0)
+
+    def test_v3_untessellated_warning_is_not_masked_and_missing_evidence_fails_closed(self):
+        row = self._untessellated_row()
+        geometry = self._geometry_list([row])
+        tessellation = geometry[1]["tessellation"]
+        self.assertEqual(tessellation["schema_version"], NATIVE_TESSELLATION_SCHEMA)
+        self.assertEqual(
+            set(tessellation),
+            {
+                "schema_version",
+                "faces",
+                "face_spans",
+                "native_edges",
+                "no_facets_faces",
+                "itessellation",
+            },
+        )
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "evidence/raw/geometry.json", geometry)
+            pins = write_structural_report(
+                root,
+                {"run_id": "m3", "state": "verified"},
+                evidence_root=root,
+            )
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            self.assertIn(
+                "cad_sheet_face_untessellated",
+                [item["code"] for item in report["findings"]],
+            )
+            self.assertNotIn(
+                "report.geometry_metadata_invalid",
+                [item["code"] for item in report["findings"]],
+            )
+
+        geometry[1]["tessellation"].pop("itessellation")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "evidence/raw/geometry.json", geometry)
+            pins = write_structural_report(
+                root,
+                {"run_id": "m3", "state": "failed"},
+                evidence_root=root,
+            )
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            codes = [item["code"] for item in report["findings"]]
+            self.assertIn("report.geometry_metadata_invalid", codes)
+            self.assertNotIn("cad_sheet_face_untessellated", codes)
 
     def test_untessellated_sheet_metadata_fails_closed_outside_schema(self):
         probe = self._untessellated_row(area_m2=1.8716e-13)
