@@ -17,6 +17,7 @@ from unittest.mock import patch
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.geometry.native_tessellation import (  # noqa: E402
+    _valid_u_evidence,
     parse_native_tessellation,
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
@@ -1728,6 +1729,65 @@ class NativeFinCaptureTests(unittest.TestCase):
             )
 
         self.assertIn("U evidence is not independently reproducible", str(caught.exception))
+
+    def test_parser_boundary_tolerance_uses_projected_point_across_binade(self):
+        projected = (0.0, 0.0, 0.0)
+        source = (1e-7, 0.0, 0.0)
+        opposite = (0.0, 0.0, 0.0)
+        projected_tolerance = native_curve_endpoint_operation_tolerance(
+            projected,
+            projected,
+            opposite,
+        )
+        source_tolerance = native_curve_endpoint_operation_tolerance(
+            source,
+            projected,
+            opposite,
+        )
+        projection_error = native_point_error(source, projected)
+        payload = [*projected, 0.0, 0.0, 0.0]
+        packed_status = native_evaluate2_evidence(
+            [*payload, packed_evaluate_status(1)]
+        )["packed_status"]
+        success = packed_evaluate_status(1)
+        evidence = {
+            "u": 0.0,
+            "u_parameter_rule": "native-u-point-parameter-authoritative-v2",
+            "rule_version": NATIVE_U_IDENTITY_RULE,
+            "point_roundtrip_rule": (
+                "native-curve-endpoint-float32-operation-v4"
+            ),
+            "projection_rule": "tessellation-edge-projection-v1",
+            "projection_tolerance_m": 50e-6,
+            "source_point_m": list(source),
+            "projection_error_m": projection_error,
+            "point_tolerance_m": projected_tolerance,
+            "closest_point_error_m": projection_error,
+            "evaluate_point_error_m": 0.0,
+            "closest_evaluate_error_m": 0.0,
+            "closest_point_on_raw": [*projected, 0.0, 0.0],
+            "parameter_input_point_m": list(projected),
+            "parameter_raw": [0.0, success],
+            "parameter_success_raw": success,
+            "parameter_success_raw_type": type(success).__name__,
+            "parameter_success_bit": 1,
+            "parameter_success_parsed": True,
+            "evaluate_payload": payload,
+            "evaluate_packed_status": packed_status,
+        }
+
+        self.assertNotEqual(projected_tolerance, source_tolerance)
+        self.assertTrue(
+            _valid_u_evidence(
+                evidence,
+                0.0,
+                source,
+                0.0,
+                1.0,
+                opposite,
+                opposite,
+            )
+        )
 
     def test_parser_rejects_group_333_operation_bound_overshoot(self):
         evidence, triangles = self.group_333_tessellation()

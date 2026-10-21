@@ -171,14 +171,14 @@ def _valid_u_evidence(
         return False
     if native_u_equal(value["u"], domain_lower):
         computed_tolerance = native_curve_endpoint_operation_tolerance(
-            expected_point,
+            closest_point,
             evaluated_point,
             curve_end,
         )
         point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
     elif native_u_equal(value["u"], domain_upper):
         computed_tolerance = native_curve_endpoint_operation_tolerance(
-            expected_point,
+            closest_point,
             evaluated_point,
             curve_start,
         )
