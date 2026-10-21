@@ -332,11 +332,20 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     -ManagedRoot $rollbackRoot -ServiceAccount $serviceSid)
   $rollbackExit = $LASTEXITCODE
   $rollbackReceipt = ($rollbackOutput | Select-Object -Last 1) | ConvertFrom-Json
+  $rollbackMarkerExists = Test-Path -LiteralPath (
+    Join-Path $rollbackRoot '.description-managed-root.json')
+  $rollbackAclStable = (
+    (Get-AclProjection $rollbackRoot).projection_sha256 -eq
+      $rollbackBefore.projection_sha256)
   Check 'windows_acl.bootstrap_new_marker_rolls_back' (
     $rollbackExit -ne 0 -and
-    -not (Test-Path -LiteralPath (Join-Path $rollbackRoot '.description-managed-root.json')) -and
-    (Get-AclProjection $rollbackRoot).projection_sha256 -eq $rollbackBefore.projection_sha256 -and
-    $rollbackReceipt.rollback.passed -eq $true)
+    -not $rollbackMarkerExists -and
+    $rollbackAclStable -and
+    $rollbackReceipt.rollback.passed -eq $true) (
+      'exit=' + [string]$rollbackExit +
+      ' marker=' + [string]$rollbackMarkerExists +
+      ' acl_stable=' + [string]$rollbackAclStable +
+      ' receipt=' + ($rollbackReceipt | ConvertTo-Json -Depth 8 -Compress))
   Remove-Item -LiteralPath $failureScript -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $rollbackRoot -Recurse -Force -ErrorAction SilentlyContinue
   $badTokenAcl = Get-Acl -LiteralPath $tokenPath
