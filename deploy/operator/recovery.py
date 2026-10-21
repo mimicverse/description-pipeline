@@ -4593,6 +4593,56 @@ def _validate_windows_acl_projection(value: object, label: str) -> None:
     )
 
 
+def _validate_windows_acl_policy(
+    projection: dict,
+    *,
+    label: str,
+    service_sid: str,
+    service_rights: int,
+    directory: bool,
+    non_inheriting: bool = False,
+    protected: bool = True,
+) -> None:
+    """Require the explicit SYSTEM/Administrators/service DACL used at install time."""
+
+    system_sid = "S-1-5-18"
+    administrators_sid = "S-1-5-32-544"
+    inheritance = 0 if non_inheriting or not directory else 3
+    expected = {
+        system_sid: 2032127,
+        administrators_sid: 2032127,
+        service_sid: service_rights,
+    }
+    rules = projection["rules"]
+    require(
+        projection["owner_sid"] == administrators_sid
+        and projection["protected"] is protected
+        and len(rules) == len(expected),
+        "windows_managed_acl_policy_invalid",
+        f"{label} does not carry the administrator-owned protected boundary",
+    )
+    seen = set()
+    for index, rule in enumerate(rules):
+        sid = rule["sid"]
+        require(
+            sid in expected
+            and sid not in seen
+            and rule["access_type"] == "Allow"
+            and rule["rights"] == expected[sid]
+            and rule["inherited"] is (not protected)
+            and rule["inheritance"] == inheritance
+            and rule["propagation"] == 0,
+            "windows_managed_acl_policy_invalid",
+            f"{label}.rules[{index}] is outside the minimum permission matrix",
+        )
+        seen.add(sid)
+    require(
+        seen == set(expected),
+        "windows_managed_acl_policy_invalid",
+        f"{label} misses a required SID",
+    )
+
+
 def _validate_windows_recovery_state(document: object) -> dict:
     state = _exact_keys(
         document,
@@ -4688,6 +4738,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
         state["identity"],
         {
             "operator_sid",
+            "service_non_administrator",
             "endpoint_root",
             "config_path",
             "config_sha256",
@@ -4701,14 +4752,14 @@ def _validate_windows_recovery_state(document: object) -> dict:
             "install_id_path",
             "install_id",
             "release_identity_sha256",
-            "user_environment",
+            "domain_environment",
         },
         "windows state identity",
     )
     require(
-        identity["operator_sid"] == principal["sid"],
-        "windows_operator_principal_mismatch",
-        "the SSH operator and task principal SIDs differ",
+        identity["service_non_administrator"] is True,
+        "windows_service_identity_elevated",
+        "the Windows task service identity is not proven non-administrative",
     )
     for key in ("config_sha256", "config_digest", "token_sha256", "release_identity_sha256"):
         require(
@@ -4773,9 +4824,10 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "Windows endpoint port is malformed",
     )
     require(
-        isinstance(identity["user_environment"], dict)
-        and identity["user_environment"].get("DESCRIPTION_ENDPOINT_ROOT") == identity["endpoint_root"]
-        and identity["user_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE")
+        isinstance(identity["domain_environment"], dict)
+        and identity["domain_environment"].get("scope") == "machine"
+        and identity["domain_environment"].get("DESCRIPTION_ENDPOINT_ROOT") == identity["endpoint_root"]
+        and identity["domain_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE")
         == Path(identity["state_root"]).as_posix() + "/cad-ownership.json",
         "windows_recovery_state_invalid",
         "Windows account environment pins are not canonical",
@@ -4783,11 +4835,16 @@ def _validate_windows_recovery_state(document: object) -> dict:
     acl = _exact_keys(
         state["acl"],
         {
+            "common_parent",
+            "managed_root_marker",
+            "lifecycle_root",
+            "endpoint_secrets_root",
             "task_file",
             "endpoint_config",
             "endpoint_token",
             "install_id",
             "cad_ownership",
+            "cad_lease",
             "roots",
         },
         "windows state acl",
@@ -4807,15 +4864,49 @@ def _validate_windows_recovery_state(document: object) -> dict:
             continue
         if value is None:
             require(
-                name == "cad_ownership",
+                name in {"cad_ownership", "cad_lease"},
                 "windows_recovery_state_invalid",
-                "only an absent CAD ledger may have a null ACL",
+                "only absent CAD ownership files may have a null ACL",
             )
             continue
         _validate_windows_acl_projection(
             value,
             f"windows state acl.{name}",
         )
+    service_sid = principal["sid"]
+    policies = (
+        ("common_parent", acl["common_parent"], 197055, True, True),
+        ("managed_root_marker", acl["managed_root_marker"], 131209, False, False),
+        ("lifecycle_root", acl["lifecycle_root"], 197055, True, False),
+        ("endpoint_secrets_root", acl["endpoint_secrets_root"], 131241, True, False),
+        ("task_file", acl["task_file"], 131209, False, False),
+        ("endpoint_config", acl["endpoint_config"], 131209, False, False),
+        ("endpoint_token", acl["endpoint_token"], 131209, False, False),
+        ("install_id", acl["install_id"], 131209, False, False),
+        ("package_root", roots_acl["package_root"], 197055, True, False),
+        ("output_root", roots_acl["output_root"], 197055, True, False),
+        ("state_root", roots_acl["state_root"], 197055, True, False),
+        ("endpoint_root", roots_acl["endpoint_root"], 131241, True, False),
+    )
+    for name, projection, rights, directory, non_inheriting in policies:
+        _validate_windows_acl_policy(
+            projection,
+            label=f"windows state acl.{name}",
+            service_sid=service_sid,
+            service_rights=rights,
+            directory=directory,
+            non_inheriting=non_inheriting,
+        )
+    for name in ("cad_ownership", "cad_lease"):
+        if acl[name] is not None:
+            _validate_windows_acl_policy(
+                acl[name],
+                label=f"windows state acl.{name}",
+                service_sid=service_sid,
+                service_rights=197055,
+                directory=False,
+                protected=False,
+            )
     cad = _exact_keys(
         state["cad"],
         {
@@ -4884,7 +4975,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
         )
         roles.add(row["role"])
     require(
-        {"task_xml", "endpoint_config", "endpoint_token", "install_id"} <= roles,
+        {"task_xml", "managed_root_marker", "endpoint_config", "endpoint_token", "install_id"} <= roles,
         "windows_recovery_state_invalid",
         "Windows recovery does not cover its required files",
     )
@@ -4892,6 +4983,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
         roles
         <= {
             "task_xml",
+            "managed_root_marker",
             "endpoint_config",
             "endpoint_token",
             "install_id",
@@ -4902,6 +4994,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
     )
     expected_role_members = {
         "task_xml": "task.xml",
+        "managed_root_marker": "managed-root.json",
         "endpoint_config": "endpoint.json",
         "endpoint_token": "token",
         "install_id": "install-id",

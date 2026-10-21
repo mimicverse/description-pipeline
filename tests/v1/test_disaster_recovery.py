@@ -48,14 +48,17 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
     config = b'{"schema_version":"solidworks-to-urdf.endpoint/v1"}\n'
     token = b"t" * 64 + b"\n"
     install_id = b"win-" + b"1" * 32 + b"\n"
+    marker = b'{"schema_version":"solidworks-to-urdf.managed-root/v1"}'
     generation = "C:/description/lifecycle/win-11111111111111111111111111111111/generation"
     paths = {
+        "managed_root_marker": "C:/description/.description-managed-root.json",
         "endpoint_config": generation + "/endpoint.json",
         "endpoint_token": "C:/description/state/endpoint.token",
         "install_id": "C:/description/state/install-id",
     }
     payloads = {
         "task.xml": task_xml,
+        "managed-root.json": marker,
         "endpoint.json": config,
         "token": token,
         "install-id": install_id,
@@ -68,6 +71,13 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             "member": "task.xml",
             "bytes": len(task_xml),
             "sha256": hashes["task.xml"],
+        },
+        {
+            "role": "managed_root_marker",
+            "path": paths["managed_root_marker"],
+            "member": "managed-root.json",
+            "bytes": len(marker),
+            "sha256": hashes["managed-root.json"],
         },
         {
             "role": "endpoint_config",
@@ -92,38 +102,56 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         },
     ]
 
-    def acl_projection(seed: str) -> dict:
+    def acl_projection(
+        seed: str,
+        *,
+        service_rights: int = 2032127,
+        directory: bool = False,
+        non_inheriting: bool = False,
+    ) -> dict:
         del seed
+        inheritance = 3 if directory and not non_inheriting else 0
+        rules = [
+            {
+                "sid": sid,
+                "access_type": "Allow",
+                "rights": rights,
+                "inherited": False,
+                "inheritance": inheritance,
+                "propagation": 0,
+            }
+            for sid, rights in (
+                ("S-1-5-18", 2032127),
+                ("S-1-5-21-1", service_rights),
+                ("S-1-5-32-544", 2032127),
+            )
+        ]
         projection = {
-            "owner_sid": "S-1-5-21-1",
+            "owner_sid": "S-1-5-32-544",
             "group_sid": "S-1-5-18",
             "protected": True,
-            "sddl": "O:S-1-5-21-1G:S-1-5-18D:P(A;;FA;;;S-1-5-21-1)",
-            "rules": [
-                {
-                    "sid": "S-1-5-21-1",
-                    "access_type": "Allow",
-                    "rights": 2032127,
-                    "inherited": False,
-                    "inheritance": 0,
-                    "propagation": 0,
-                }
-            ],
+            "sddl": "O:S-1-5-32-544G:S-1-5-18D:PAI",
+            "rules": rules,
         }
         projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
         return projection
 
     acl = {
-        "task_file": acl_projection("a"),
-        "endpoint_config": acl_projection("b"),
-        "endpoint_token": acl_projection("c"),
-        "install_id": acl_projection("d"),
+        "common_parent": acl_projection("0", service_rights=197055, directory=True, non_inheriting=True),
+        "managed_root_marker": acl_projection("3", service_rights=131209),
+        "lifecycle_root": acl_projection("4", service_rights=197055, directory=True),
+        "endpoint_secrets_root": acl_projection("5", service_rights=131241, directory=True),
+        "task_file": acl_projection("a", service_rights=131209),
+        "endpoint_config": acl_projection("b", service_rights=131209),
+        "endpoint_token": acl_projection("c", service_rights=131209),
+        "install_id": acl_projection("d", service_rights=131209),
         "cad_ownership": None,
+        "cad_lease": None,
         "roots": {
-            "package_root": acl_projection("e"),
-            "output_root": acl_projection("f"),
-            "state_root": acl_projection("1"),
-            "endpoint_root": acl_projection("2"),
+            "package_root": acl_projection("e", service_rights=197055, directory=True),
+            "output_root": acl_projection("f", service_rights=197055, directory=True),
+            "state_root": acl_projection("1", service_rights=197055, directory=True),
+            "endpoint_root": acl_projection("2", service_rights=131241, directory=True),
         },
     }
     state = {
@@ -153,6 +181,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         },
         "identity": {
             "operator_sid": "S-1-5-21-1",
+            "service_non_administrator": True,
             "endpoint_root": generation,
             "config_path": paths["endpoint_config"],
             "config_sha256": hashes["endpoint.json"],
@@ -166,9 +195,10 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             "install_id_path": paths["install_id"],
             "install_id": "win-" + "1" * 32,
             "release_identity_sha256": "3" * 64,
-            "user_environment": {
+            "domain_environment": {
                 "DESCRIPTION_ENDPOINT_ROOT": generation,
                 "DESCRIPTION_CAD_OWNERSHIP_FILE": "C:/description/state/cad-ownership.json",
+                "scope": "machine",
             },
         },
         "files": files,
@@ -2828,6 +2858,13 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ]
             projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
 
+        def remove_service_acl_rule(state):
+            projection = state["acl"]["endpoint_token"]
+            projection["rules"] = [
+                rule for rule in projection["rules"] if rule["sid"] != "S-1-5-21-1"
+            ]
+            projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
+
         cases = (
             (
                 "started",
@@ -2835,9 +2872,9 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "windows_task_not_disabled",
             ),
             (
-                "principal",
-                lambda state: state["identity"].update(operator_sid="S-1-5-21-9"),
-                "windows_operator_principal_mismatch",
+                "service_elevated",
+                lambda state: state["identity"].update(service_non_administrator=False),
+                "windows_service_identity_elevated",
             ),
             (
                 "logon",
@@ -2868,6 +2905,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "acl_rule_order",
                 reverse_acl_rules,
                 "windows_recovery_state_invalid",
+            ),
+            (
+                "acl_policy",
+                remove_service_acl_rule,
+                "windows_managed_acl_policy_invalid",
             ),
             (
                 "path",

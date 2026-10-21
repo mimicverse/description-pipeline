@@ -624,14 +624,15 @@ function Stop-Endpoint([object]$binding) {
   Die 'stop_failed' 'the old endpoint still listens or leaves a writing process under the generation/state root; refusing to switch'
 }
 
-# The execution account's canonical domain pins: the endpoint service and same-host independent
-# calls resolve the one CAD domain through these; an existing pin may only restate the bound
-# canonical path - never create a second domain or silently re-point the served generation.
+# The host-wide canonical domain pins: one managed Windows host is one CAD/resource domain, so
+# the administrator operator and the non-administrator endpoint service must resolve identical
+# values. An existing pin may only restate the bound canonical path - never create a second
+# domain or silently re-point the served generation.
 function Get-AccountEnvironment([string]$Name) {
-  return [string][Environment]::GetEnvironmentVariable($Name, 'User')
+  return [string][Environment]::GetEnvironmentVariable($Name, 'Machine')
 }
 function Set-AccountEnvironment([string]$Name, [string]$Value) {
-  [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
+  [Environment]::SetEnvironmentVariable($Name, $Value, 'Machine')
 }
 function Domain-OwnershipPath([string]$StateRoot) {
   return (Join-Path $StateRoot 'cad-ownership.json')
@@ -771,18 +772,106 @@ function Set-AclProjection([string]$Path, $Projection) {
   $security.SetSecurityDescriptorSddlForm([string]$Projection.sddl, $sections)
   Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
 }
+function Get-ManagedAdministratorsSid { return 'S-1-5-32-544' }
+function Get-ManagedSystemSid { return 'S-1-5-18' }
+function Assert-ManagedOperatorIsAdministrator {
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = New-Object System.Security.Principal.WindowsPrincipal -ArgumentList $identity
+  if (-not $principal.IsInRole(
+      [System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Die 'windows_operator_not_administrator' 'the deployment operator is not an administrator'
+  }
+  return $identity.User.Value
+}
+function Assert-ManagedServiceIsNonAdministrator([string]$ServiceSid) {
+  $expectedSid = Resolve-Sid $ServiceSid
+  $operatorSid = Assert-ManagedOperatorIsAdministrator
+  if ($operatorSid -eq $expectedSid) {
+    Die 'windows_service_operator_not_separated' 'the deployment operator and endpoint service identity must differ'
+  }
+  try {
+    $localUser = Get-LocalUser -SID $expectedSid -ErrorAction Stop
+  } catch {
+    Die 'windows_service_identity_not_local' ('the endpoint service SID is not a local user: ' + $expectedSid)
+  }
+  if ($null -eq $localUser -or -not [bool]$localUser.Enabled) {
+    Die 'windows_service_identity_invalid' 'the endpoint service local user is missing or disabled'
+  }
+  $members = @{}
+  foreach ($group in @(Get-LocalGroup -ErrorAction Stop)) {
+    $groupSid = [string]$group.SID.Value
+    $members[$groupSid] = @(
+      Get-LocalGroupMember -Group $groupSid -ErrorAction SilentlyContinue |
+        ForEach-Object { [string]$_.SID.Value }
+    )
+  }
+  $subjects = @{}
+  $subjects[$expectedSid] = $true
+  do {
+    $changed = $false
+    foreach ($groupSid in @($members.Keys)) {
+      if ($subjects.ContainsKey($groupSid)) { continue }
+      if (@($members[$groupSid] | Where-Object { $subjects.ContainsKey($_) }).Count -gt 0) {
+        $subjects[$groupSid] = $true
+        $changed = $true
+      }
+    }
+  } while ($changed)
+  if ($subjects.ContainsKey((Get-ManagedAdministratorsSid))) {
+    Die 'windows_service_identity_elevated' 'the endpoint service identity is a member of Administrators'
+  }
+  return $expectedSid
+}
+function Assert-ManagedServiceEnvironmentUnpinned([string]$ServiceSid) {
+  $expectedSid = Resolve-Sid $ServiceSid
+  $environmentKey = 'Registry::HKEY_USERS\' + $expectedSid + '\Environment'
+  if (-not (Test-Path -LiteralPath $environmentKey)) {
+    Die 'windows_service_environment_unavailable' 'the interactive endpoint service account has no loaded user environment'
+  }
+  $serviceEnvironment = Get-ItemProperty -LiteralPath $environmentKey -ErrorAction Stop
+  foreach ($name in @('DESCRIPTION_ENDPOINT_ROOT', 'DESCRIPTION_CAD_OWNERSHIP_FILE')) {
+    if ($serviceEnvironment.PSObject.Properties.Name -contains $name) {
+      Die 'windows_service_environment_override' (
+        'the endpoint service account carries a user environment override for ' + $name)
+    }
+  }
+}
 function Get-ManagedServiceSid($Task) {
   $serviceSid = Resolve-Sid ([string]$Task.Principal.UserId)
-  $operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  if ($operatorSid -ne $serviceSid) {
-    Die 'windows_operator_principal_mismatch' 'the SSH account differs from the task principal'
-  }
+  $serviceSid = Assert-ManagedServiceIsNonAdministrator $serviceSid
+  Assert-ManagedServiceEnvironmentUnpinned $serviceSid
   return $serviceSid
 }
-function Assert-ManagedAcl([string]$Path, [string]$ServiceSid, [switch]$Recurse) {
+function New-ManagedAccessRule(
+  [string]$Sid,
+  [System.Security.AccessControl.FileSystemRights]$Rights,
+  [System.Security.AccessControl.InheritanceFlags]$Inheritance) {
+  $sidObject = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $Sid
+  return New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+    $sidObject,
+    $Rights,
+    $Inheritance,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+}
+function Assert-ManagedAcl(
+  [string]$Path,
+  [string]$ServiceSid,
+  [string]$ServiceRights,
+  [bool]$Protected,
+  [switch]$NonInheriting,
+  [switch]$AllowServiceOwner,
+  [switch]$Recurse) {
   $pending = New-Object 'System.Collections.Generic.Stack[string]'
   $pending.Push([System.IO.Path]::GetFullPath($Path))
   $expectedSid = Resolve-Sid $ServiceSid
+  $administratorsSid = Get-ManagedAdministratorsSid
+  $systemSid = Get-ManagedSystemSid
+  $expectedRights = @{
+    $systemSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
+    $administratorsSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
+    $expectedSid = [long][System.Security.AccessControl.FileSystemRights]$ServiceRights
+  }
   while ($pending.Count -gt 0) {
     $current = $pending.Pop()
     $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
@@ -790,7 +879,7 @@ function Assert-ManagedAcl([string]$Path, [string]$ServiceSid, [switch]$Recurse)
       Die 'windows_managed_acl_unsafe' ('a managed ACL path is a reparse point: ' + $current)
     }
     $projection = Get-AclProjection $current
-    $expectedInheritance = if ($item.PSIsContainer) {
+    $expectedInheritance = if ($item.PSIsContainer -and -not $NonInheriting) {
       [int](
         [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
         [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
@@ -799,16 +888,23 @@ function Assert-ManagedAcl([string]$Path, [string]$ServiceSid, [switch]$Recurse)
       [int][System.Security.AccessControl.InheritanceFlags]::None
     }
     $rules = @($projection.rules)
-    if ($projection.owner_sid -ne $expectedSid -or
-        -not [bool]$projection.protected -or
-        $rules.Count -ne 1 -or
-        [string]$rules[0].sid -ne $expectedSid -or
-        [string]$rules[0].access_type -ne 'Allow' -or
-        [long]$rules[0].rights -ne [long][System.Security.AccessControl.FileSystemRights]::FullControl -or
-        [bool]$rules[0].inherited -or
-        [int]$rules[0].inheritance -ne $expectedInheritance -or
-        [int]$rules[0].propagation -ne 0) {
-      Die 'windows_managed_acl_invalid' ('the managed path does not have the one-owner full-control ACL: ' + $current)
+    $invalid = ($projection.owner_sid -ne $administratorsSid -and
+        -not ($AllowServiceOwner -and $projection.owner_sid -eq $expectedSid)) -or
+      [bool]$projection.protected -ne $Protected -or
+      $rules.Count -ne 3
+    foreach ($rule in $rules) {
+      if ($rule.access_type -ne 'Allow' -or
+          -not $expectedRights.ContainsKey([string]$rule.sid) -or
+          [long]$rule.rights -ne [long]$expectedRights[[string]$rule.sid] -or
+          [int]$rule.inheritance -ne $expectedInheritance -or
+          [int]$rule.propagation -ne 0 -or
+          ($Protected -and [bool]$rule.inherited) -or
+          ((-not $Protected) -and -not [bool]$rule.inherited)) {
+        $invalid = $true
+      }
+    }
+    if ($invalid) {
+      Die 'windows_managed_acl_invalid' ('the managed path does not match its minimum permission matrix: ' + $current)
     }
     if ($Recurse -and $item.PSIsContainer) {
       foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
@@ -817,10 +913,19 @@ function Assert-ManagedAcl([string]$Path, [string]$ServiceSid, [switch]$Recurse)
     }
   }
 }
-function Set-ManagedAcl([string]$Path, [string]$ServiceSid, [switch]$Recurse) {
+function Set-ManagedAcl(
+  [string]$Path,
+  [string]$ServiceSid,
+  [string]$ServiceRights,
+  [bool]$Protected,
+  [switch]$NonInheriting,
+  [switch]$AllowServiceOwner,
+  [switch]$Recurse) {
   $pending = New-Object 'System.Collections.Generic.Stack[string]'
   $pending.Push([System.IO.Path]::GetFullPath($Path))
   $expectedSid = Resolve-Sid $ServiceSid
+  $administratorsSid = Get-ManagedAdministratorsSid
+  $systemSid = Get-ManagedSystemSid
   while ($pending.Count -gt 0) {
     $current = $pending.Pop()
     $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
@@ -828,31 +933,33 @@ function Set-ManagedAcl([string]$Path, [string]$ServiceSid, [switch]$Recurse) {
       Die 'windows_managed_acl_unsafe' ('a managed ACL path is a reparse point: ' + $current)
     }
     $acl = Get-Acl -LiteralPath $current -ErrorAction Stop
-    $sidObject = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $expectedSid
-    $acl.SetOwner($sidObject)
-    $acl.SetAccessRuleProtection($true, $false)
+    $administratorsObject = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $administratorsSid
+    $acl.SetOwner($administratorsObject)
+    $acl.SetAccessRuleProtection($Protected, (-not $Protected))
     foreach ($rule in @($acl.GetAccessRules(
         $true,
         $false,
         [System.Security.Principal.SecurityIdentifier]))) {
       [void]$acl.RemoveAccessRuleSpecific($rule)
     }
-    if ($item.PSIsContainer) {
+    if ($item.PSIsContainer -and -not $NonInheriting) {
       $inheritance =
         [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
         [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
     } else {
       $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
     }
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
-      $sidObject,
-      [System.Security.AccessControl.FileSystemRights]::FullControl,
-      $inheritance,
-      [System.Security.AccessControl.PropagationFlags]::None,
-      [System.Security.AccessControl.AccessControlType]::Allow)
-    [void]$acl.AddAccessRule($rule)
+    if ($Protected) {
+      [void]$acl.AddAccessRule((New-ManagedAccessRule $systemSid (
+        [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
+      [void]$acl.AddAccessRule((New-ManagedAccessRule $administratorsSid (
+        [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
+      [void]$acl.AddAccessRule((New-ManagedAccessRule $expectedSid (
+        [System.Security.AccessControl.FileSystemRights]$ServiceRights) $inheritance))
+    }
     Set-Acl -LiteralPath $current -AclObject $acl -ErrorAction Stop
-    Assert-ManagedAcl $current $expectedSid
+    Assert-ManagedAcl $current $expectedSid $ServiceRights $Protected `
+      -NonInheriting:$NonInheriting -AllowServiceOwner:$AllowServiceOwner
     if ($Recurse -and $item.PSIsContainer) {
       foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
         $pending.Push($child.FullName)
@@ -923,7 +1030,7 @@ function Get-ManagedCommonParent([string[]]$Paths) {
   }
   $systemRoot = (Normalize-PathIdentity (
     [System.IO.Path]::GetFullPath([string]$env:SystemRoot))).TrimEnd('/')
-  if ($common -in $specialRoots -or (Test-ManagedPathWithin $common $systemRoot)) {
+  if (@($specialRoots | Where-Object { Test-ManagedPathWithin $common $_ }).Count -gt 0) {
     Die 'windows_managed_acl_boundary_invalid' ('the managed common parent is too broad: ' + $common)
   }
   Assert-NoReparseAncestor $common
@@ -937,41 +1044,143 @@ function Get-ManagedCommonParent([string[]]$Paths) {
   }
   return $common
 }
-function Get-ManagedEndpointAclRows($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath) {
+function Get-ManagedEndpointAclRows(
+  $Config,
+  [string]$EndpointRoot,
+  [string]$ConfigPath,
+  [string]$InstallIdPath,
+  [string]$TaskFile = '') {
   $paths = @(Get-ManagedEndpointPaths $Config $EndpointRoot $ConfigPath $InstallIdPath)
   $common = Get-ManagedCommonParent $paths
+  $managedRootMarker = Join-Path $common '.description-managed-root.json'
+  $expectedMarker = '{"schema_version":"solidworks-to-urdf.managed-root/v1"}'
+  if (-not (Test-Path -LiteralPath $managedRootMarker -PathType Leaf) -or
+      (Read-Utf8Text $managedRootMarker).Trim() -ne $expectedMarker) {
+    Die 'windows_managed_acl_marker_missing' (
+      'the common parent is not marked for exclusive description-pipeline management: ' + $common)
+  }
+  $stateRoot = Normalize-PathIdentity ([string]$Config.state_root)
+  $lifecycleRoot = Normalize-PathIdentity (
+    [System.IO.Path]::Combine([string]$Config.state_root, 'lifecycle'))
+  $secretRoot = Normalize-PathIdentity (
+    [System.IO.Path]::GetDirectoryName([string]$Config.token_file))
+  foreach ($writable in @(
+      [string]$Config.package_root,
+      [string]$Config.output_root,
+      $stateRoot,
+      $lifecycleRoot,
+      $EndpointRoot,
+      $common)) {
+    if ((Normalize-PathIdentity $writable) -eq $secretRoot) {
+      Die 'windows_managed_acl_secret_root_unsafe' 'the token directory is also a writable managed root'
+    }
+  }
   $rows = @()
   $seen = @{}
-  $managedPaths = @()
-  $managedPaths += $common
-  $managedPaths += $paths
-  foreach ($path in $managedPaths) {
-    $normalized = (Normalize-PathIdentity $path).TrimEnd('/')
+  $rules = @(
+    @{role='common_parent'; path=$common; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$true; required=$true},
+    @{role='managed_root_marker'; path=$managedRootMarker; service_rights='Read'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='package_root'; path=$Config.package_root; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='output_root'; path=$Config.output_root; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='state_root'; path=$stateRoot; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='lifecycle_root'; path=$lifecycleRoot; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='endpoint_secrets_root'; path=$secretRoot; service_rights='ReadAndExecute'; protected=$true; recurse=$true; non_inheriting=$false; required=$true},
+    @{role='endpoint_root'; path=$EndpointRoot; service_rights='ReadAndExecute'; protected=$true; recurse=$true; non_inheriting=$false; required=$true},
+    @{role='endpoint_config'; path=$ConfigPath; service_rights='Read'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='endpoint_token'; path=$Config.token_file; service_rights='Read'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='install_id'; path=$InstallIdPath; service_rights='Read'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
+    @{role='cad_ownership'; path=([System.IO.Path]::Combine($stateRoot, 'cad-ownership.json')); service_rights='Modify'; protected=$false; recurse=$false; non_inheriting=$false; allow_service_owner=$true; required=$false},
+    @{role='cad_lease'; path=([System.IO.Path]::Combine($stateRoot, 'cad-ownership.json.lease')); service_rights='Modify'; protected=$false; recurse=$false; non_inheriting=$false; allow_service_owner=$true; required=$false}
+  )
+  if ($TaskFile) {
+    $rules += @{
+      role='task_file'
+      path=$TaskFile
+      service_rights='Read'
+      protected=$true
+      recurse=$false
+      non_inheriting=$false
+      required=$true
+    }
+  }
+  foreach ($rule in $rules) {
+    $normalized = (Normalize-PathIdentity ([string]$rule.path)).TrimEnd('/')
     $key = $normalized.ToLowerInvariant()
     if (-not $seen.ContainsKey($key)) {
-      $seen[$key] = $true
+      $seen[$key] = $rule
       $rows += [pscustomobject]@{
+        role=[string]$rule.role
         path=$normalized
-        recurse=($normalized -eq $common)
+        service_rights=[string]$rule.service_rights
+        protected=[bool]$rule.protected
+        recurse=[bool]$rule.recurse
+        non_inheriting=[bool]$rule.non_inheriting
+        allow_service_owner=[bool]$rule.allow_service_owner
+        required=[bool]$rule.required
       }
+    } elseif (
+        $seen[$key].service_rights -ne $rule.service_rights -or
+        [bool]$seen[$key].protected -ne [bool]$rule.protected) {
+      Die 'windows_managed_acl_policy_conflict' ('one managed path has conflicting ACL policies: ' + $normalized)
     }
   }
   return $rows
 }
-function Set-ManagedEndpointAcls($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$ServiceSid) {
-  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath)) {
+function Set-ManagedEndpointAcls(
+  $Config,
+  [string]$EndpointRoot,
+  [string]$ConfigPath,
+  [string]$InstallIdPath,
+  [string]$ServiceSid,
+  [string]$TaskFile = '') {
+  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
     if (-not (Test-Path -LiteralPath $row.path)) {
-      Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
+      if ($row.required) {
+        Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
+      }
+      continue
     }
-    Set-ManagedAcl $row.path $ServiceSid -Recurse:$row.recurse
+    Set-ManagedAcl $row.path $ServiceSid $row.service_rights $row.protected `
+      -NonInheriting:$row.non_inheriting -AllowServiceOwner:$row.allow_service_owner `
+      -Recurse:$row.recurse
   }
 }
-function Assert-ManagedEndpointAcls($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$ServiceSid) {
-  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath)) {
+function Assert-ManagedEndpointAcls(
+  $Config,
+  [string]$EndpointRoot,
+  [string]$ConfigPath,
+  [string]$InstallIdPath,
+  [string]$ServiceSid,
+  [string]$TaskFile = '') {
+  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
     if (-not (Test-Path -LiteralPath $row.path)) {
-      Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
+      if ($row.required) {
+        Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
+      }
+      continue
     }
-    Assert-ManagedAcl $row.path $ServiceSid -Recurse:$row.recurse
+    Assert-ManagedAcl $row.path $ServiceSid $row.service_rights $row.protected `
+      -NonInheriting:$row.non_inheriting -AllowServiceOwner:$row.allow_service_owner `
+      -Recurse:$row.recurse
+  }
+}
+function Get-ManagedAclProjectionForRole($Acl, [string]$Role) {
+  switch ($Role) {
+    'common_parent' { return $Acl.common_parent }
+    'managed_root_marker' { return $Acl.managed_root_marker }
+    'lifecycle_root' { return $Acl.lifecycle_root }
+    'endpoint_secrets_root' { return $Acl.endpoint_secrets_root }
+    'task_file' { return $Acl.task_file }
+    'endpoint_config' { return $Acl.endpoint_config }
+    'endpoint_token' { return $Acl.endpoint_token }
+    'install_id' { return $Acl.install_id }
+    'cad_ownership' { return $Acl.cad_ownership }
+    'cad_lease' { return $Acl.cad_lease }
+    'package_root' { return $Acl.roots.package_root }
+    'output_root' { return $Acl.roots.output_root }
+    'state_root' { return $Acl.roots.state_root }
+    'endpoint_root' { return $Acl.roots.endpoint_root }
+    default { Die 'windows_recovery_state_invalid' ('unknown Windows ACL role: ' + $Role) }
   }
 }
 function Get-TaskFilePath($Task) {
@@ -1042,11 +1251,9 @@ function Get-TaskProjection($Task) {
   if (@($Task.Actions).Count -ne 1) {
     Die 'windows_action_invalid' 'the Windows task must carry exactly one action'
   }
-  $principalSid = Resolve-Sid ([string]$Task.Principal.UserId)
-  $operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  if ($operatorSid -ne $principalSid) {
-    Die 'windows_operator_principal_mismatch' 'the SSH account differs from the task principal'
-  }
+  $principalSid = Assert-ManagedServiceIsNonAdministrator (
+    Resolve-Sid ([string]$Task.Principal.UserId))
+  Assert-ManagedServiceEnvironmentUnpinned $principalSid
   $xml = [xml](Export-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath)
   $xmlText = [string]$xml.OuterXml
   $passwordNodes = @($xml.SelectNodes('//*[local-name()="Password" and string-length(normalize-space(.)) > 0]'))
@@ -1215,6 +1422,7 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
   }
   return [ordered]@{
     operator_sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    service_non_administrator = $true
     endpoint_root = Normalize-PathIdentity $generation
     config_path = Normalize-PathIdentity $configPath
     config_sha256 = Sha256 $configPath
@@ -1229,9 +1437,10 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
     install_id = $installId
     release_identity_sha256 = Get-ReleaseIdentitySha256 $release
     release = $release
-    user_environment = [ordered]@{
+    domain_environment = [ordered]@{
       DESCRIPTION_ENDPOINT_ROOT = Get-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT'
       DESCRIPTION_CAD_OWNERSHIP_FILE = Get-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE'
+      scope = 'machine'
     }
   }
 }
@@ -1364,9 +1573,14 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
       ([string]$cad.lease_path))) {
     Assert-NoReparseAncestor $path
   }
+  $configDocument = Read-Json ([string]$identity.config_path)
+  $managedPaths = @(Get-ManagedEndpointPaths $configDocument $identity.endpoint_root `
+    $identity.config_path $identity.install_id_path)
+  $managedCommonParent = Get-ManagedCommonParent $managedPaths
+  $managedRootMarker = Join-Path $managedCommonParent '.description-managed-root.json'
   Assert-ManagedEndpointAcls $configDocument ([string]$identity.endpoint_root) `
     ([string]$identity.config_path) ([string]$identity.install_id_path) `
-    ([string]$taskProjection.principal.sid)
+    ([string]$taskProjection.principal.sid) $taskFile
   $taskXmlEncoding = New-Object System.Text.UTF8Encoding($false)
   $taskXmlText = [string]$taskProjection.xml
   $taskXmlBytes = $taskXmlEncoding.GetBytes($taskXmlText)
@@ -1378,6 +1592,7 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
       bytes = [long]$taskXmlBytes.Length
       sha256 = Get-BytesSha256 $taskXmlBytes
     },
+    (Get-RecoveryFileRow 'managed_root_marker' $managedRootMarker 'managed-root.json'),
     (Get-RecoveryFileRow 'endpoint_config' ([string]$identity.config_path) 'endpoint.json'),
     (Get-RecoveryFileRow 'endpoint_token' ([string]$identity.token_path) 'token'),
     (Get-RecoveryFileRow 'install_id' ([string]$identity.install_id_path) 'install-id')
@@ -1385,17 +1600,29 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
   if ([bool]$cad.ledger_present) {
     $files += Get-RecoveryFileRow 'cad_ownership' ([string]$cad.ownership_path) 'cad-ownership.json'
   }
+  $aclByRole = @{}
+  foreach ($row in @(Get-ManagedEndpointAclRows $configDocument $identity.endpoint_root `
+      $identity.config_path $identity.install_id_path $taskFile)) {
+    if (Test-Path -LiteralPath $row.path) {
+      $aclByRole[[string]$row.role] = Get-AclProjection $row.path
+    }
+  }
   $acl = [ordered]@{
-    task_file = Get-AclProjection $taskFile
-    endpoint_config = Get-AclProjection ([string]$identity.config_path)
-    endpoint_token = Get-AclProjection ([string]$identity.token_path)
-    install_id = Get-AclProjection ([string]$identity.install_id_path)
-    cad_ownership = $(if ([bool]$cad.ledger_present) { Get-AclProjection ([string]$cad.ownership_path) } else { $null })
+    common_parent = $aclByRole['common_parent']
+    managed_root_marker = $aclByRole['managed_root_marker']
+    lifecycle_root = $aclByRole['lifecycle_root']
+    endpoint_secrets_root = $aclByRole['endpoint_secrets_root']
+    task_file = $aclByRole['task_file']
+    endpoint_config = $aclByRole['endpoint_config']
+    endpoint_token = $aclByRole['endpoint_token']
+    install_id = $aclByRole['install_id']
+    cad_ownership = $aclByRole['cad_ownership']
+    cad_lease = $aclByRole['cad_lease']
     roots = [ordered]@{
-      package_root = Get-AclProjection ([string]$identity.package_root)
-      output_root = Get-AclProjection ([string]$identity.output_root)
-      state_root = Get-AclProjection ([string]$identity.state_root)
-      endpoint_root = Get-AclProjection ([string]$identity.endpoint_root)
+      package_root = $aclByRole['package_root']
+      output_root = $aclByRole['output_root']
+      state_root = $aclByRole['state_root']
+      endpoint_root = $aclByRole['endpoint_root']
     }
   }
   $state = [ordered]@{
@@ -1415,6 +1642,7 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
     }
     identity = [ordered]@{
       operator_sid = $identity.operator_sid
+      service_non_administrator = $identity.service_non_administrator
       endpoint_root = $identity.endpoint_root
       config_path = $identity.config_path
       config_sha256 = $identity.config_sha256
@@ -1428,7 +1656,7 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
       install_id_path = $identity.install_id_path
       install_id = $identity.install_id
       release_identity_sha256 = $identity.release_identity_sha256
-      user_environment = $identity.user_environment
+      domain_environment = $identity.domain_environment
     }
     files = $files
     acl = $acl
@@ -1694,6 +1922,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       foreach ($row in @($state.files)) {
         if ($row.role -eq 'task_xml') { continue }
         $acl = switch ($row.role) {
+          'managed_root_marker' { $state.acl.managed_root_marker }
           'endpoint_config' { $state.acl.endpoint_config }
           'endpoint_token' { $state.acl.endpoint_token }
           'install_id' { $state.acl.install_id }
@@ -1715,14 +1944,23 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
         $ownedTask = $true
         Disable-ManagedTask ([string]$Binding.task_name) ([string]$Binding.task_path)
       }
-      Set-AclProjection (Join-Path $env:SystemRoot ('System32\Tasks\' + ([string]$Binding.task_path).TrimStart('\') + [string]$Binding.task_name)) $state.acl.task_file
-      Set-AclProjection ([string]$state.identity.package_root) $state.acl.roots.package_root
-      Set-AclProjection ([string]$state.identity.output_root) $state.acl.roots.output_root
-      Set-AclProjection ([string]$state.identity.state_root) $state.acl.roots.state_root
-      Set-AclProjection ([string]$state.identity.endpoint_root) $state.acl.roots.endpoint_root
+      $configDocument = Read-Json ([string]$state.identity.config_path)
+      $taskFile = Join-Path $env:SystemRoot ('System32\Tasks\' + ([string]$Binding.task_path).TrimStart('\') + [string]$Binding.task_name)
+      foreach ($row in @(Get-ManagedEndpointAclRows $configDocument $state.identity.endpoint_root `
+          $state.identity.config_path $state.identity.install_id_path $taskFile)) {
+        $projection = Get-ManagedAclProjectionForRole $state.acl $row.role
+        if (-not (Test-Path -LiteralPath $row.path)) {
+          if ($null -eq $projection) { continue }
+          Die 'windows_endpoint_not_provisioned' ('an ACL restore path is missing: ' + $row.path)
+        }
+        if ($null -eq $projection) {
+          Die 'windows_recovery_state_invalid' ('a present managed path has no archived ACL: ' + $row.path)
+        }
+        Set-AclProjection $row.path $projection
+      }
       Assert-ManagedEndpointAcls $configDocument ([string]$state.identity.endpoint_root) `
         ([string]$state.identity.config_path) ([string]$state.identity.install_id_path) `
-        ([string]$state.task.principal.sid)
+        ([string]$state.task.principal.sid) $taskFile
       Set-DomainPins ([string]$state.identity.state_root) ([string]$state.identity.endpoint_root)
     }
     $current = Get-RecoveryCurrentState ([string]$Binding.ssh_host) ([string]$Binding.task_path) ([string]$Binding.task_name)
@@ -1777,6 +2015,14 @@ function Invoke-RecoveryResume($Binding) {
     Die 'windows_resume_identity_mismatch' 'the Windows endpoint identity differs from the active install record'
   }
   $cad = Get-RecoveryCadState $identity
+  $configDocument = Read-Json ([string]$identity.config_path)
+  $taskFile = Get-TaskFilePath $task
+  Set-ManagedEndpointAcls $configDocument ([string]$identity.endpoint_root) `
+    ([string]$identity.config_path) ([string]$identity.install_id_path) `
+    ([string]$projection.principal.sid) $taskFile
+  Assert-ManagedEndpointAcls $configDocument ([string]$identity.endpoint_root) `
+    ([string]$identity.config_path) ([string]$identity.install_id_path) `
+    ([string]$projection.principal.sid) $taskFile
   if ($projection.state -eq 'Running') {
     $settled = Wait-Settled ([string]$identity.config_path) $Binding
   } elseif ($projection.state -eq 'Disabled') {
@@ -1880,15 +2126,16 @@ if ($Verb -eq 'stage') {
   $serviceSid = Get-ManagedServiceSid $task
   $runningEndpointRoot = Split-Path -Parent $runningConfig
   $runningInstallIdPath = Join-Path ([string]$runningDocument.state_root) 'install-id'
+  $runningTaskFile = Get-TaskFilePath $task
   Set-ManagedEndpointAcls $runningDocument $runningEndpointRoot $runningConfig `
-    $runningInstallIdPath $serviceSid
+    $runningInstallIdPath $serviceSid $runningTaskFile
   # The canonical domain pins are validated now (an existing pin may only restate the canonical
   # path and the served generation); stage only plans them - promote performs the switch.
   $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $runningConfig)
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
   New-Item -ItemType Directory -Path $StageDir | Out-Null
-  Set-ManagedAcl $StageDir $serviceSid -Recurse
+  Set-ManagedAcl $StageDir $serviceSid 'ReadAndExecute' $true -Recurse
   Expand-Archive -LiteralPath $archive -DestinationPath $StageDir
   $files = Read-Json (Join-Path $StageDir 'files.json')
   foreach ($name in $files.PSObject.Properties.Name) {
@@ -1934,9 +2181,9 @@ if ($Verb -eq 'stage') {
   $expected = [string]$candidateInfo.config_digest
   $candidateDocument = Read-Json (Config-Path $StageDir)
   Set-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
-    $runningInstallIdPath $serviceSid
+    $runningInstallIdPath $serviceSid $runningTaskFile
   Assert-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
-    $runningInstallIdPath $serviceSid
+    $runningInstallIdPath $serviceSid $runningTaskFile
   Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{
     expected=$true; at=(Get-Date).ToUniversalTime().ToString('o'); source_config=$runningConfig;
     source_config_sha256=[string]$candidateInfo.source_sha256;
@@ -1982,10 +2229,11 @@ if ($Verb -eq 'promote') {
   $serviceSid = Get-ManagedServiceSid $task
   $candidateDocument = Read-Json (Config-Path $StageDir)
   $installIdPath = Join-Path ([string]$candidateDocument.state_root) 'install-id'
+  $taskFile = Get-TaskFilePath $task
   Set-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
-    $installIdPath $serviceSid
+    $installIdPath $serviceSid $taskFile
   Assert-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
-    $installIdPath $serviceSid
+    $installIdPath $serviceSid $taskFile
   $sourceExecute = $task.Actions[0].Execute
   $sourceConfig = $previousConfig
   Stop-Endpoint $binding
@@ -2007,7 +2255,7 @@ if ($Verb -eq 'promote') {
   # new generation; a failed promotion restores the previous values below.
   Set-DomainPins $binding.state_root $StageDir
   Assert-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
-    $installIdPath $serviceSid
+    $installIdPath $serviceSid $taskFile
   try {
     $started = Start-OrRefuse (Config-Path $StageDir) $binding $StageDir $promotions
     $settled = $started.settled
@@ -2064,11 +2312,12 @@ if ($Verb -eq 'rollback') {
   $serviceSid = Get-ManagedServiceSid $restored
   $restoredDocument = Read-Json $previousConfig
   $installIdPath = Join-Path ([string]$restoredDocument.state_root) 'install-id'
+  $restoredTaskFile = Get-TaskFilePath $restored
   Set-ManagedEndpointAcls $restoredDocument (Split-Path -Parent $previousConfig) `
-    $previousConfig $installIdPath $serviceSid
+    $previousConfig $installIdPath $serviceSid $restoredTaskFile
   Set-DomainPins $binding.state_root (Split-Path -Parent $previousConfig)
   Assert-ManagedEndpointAcls $restoredDocument (Split-Path -Parent $previousConfig) `
-    $previousConfig $installIdPath $serviceSid
+    $previousConfig $installIdPath $serviceSid $restoredTaskFile
   Start-ScheduledTask -TaskName $binding.task_name
   try { $health = Health-Probe $previousConfig $binding } catch {
     Write-Receipt (Join-Path $promotions 'failed-rollback.json') @{

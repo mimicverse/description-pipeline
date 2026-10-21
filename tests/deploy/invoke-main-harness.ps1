@@ -102,16 +102,17 @@ function Register-ScheduledTask {
 }
 function Get-ManagedServiceSid { param($Task) return 'S-1-5-21-offline-harness' }
 function Set-ManagedAcl {
-  param([string]$Path, [string]$ServiceSid, [switch]$Recurse)
+  param([string]$Path, [string]$ServiceSid, [string]$ServiceRights, [bool]$Protected, [switch]$Recurse)
   $script:Calls.Add('managed-acl:' + $Path)
 }
 function Set-ManagedEndpointAcls {
-  param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$ServiceSid)
+  param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$ServiceSid, [string]$TaskFile)
   $script:Calls.Add('managed-endpoint-acl:' + $EndpointRoot)
 }
 function Assert-ManagedEndpointAcls {
-  param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$ServiceSid)
+  param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$ServiceSid, [string]$TaskFile)
 }
+function Get-TaskFilePath { param($Task) return (Join-Path $Root 'task.xml') }
 function Get-Process {
   [CmdletBinding()] param([int]$Id)
   if ($Scenario -eq 'unknown_owner') {
