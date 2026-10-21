@@ -288,6 +288,7 @@ expected = json.loads(base64.b64decode(match.group(1)).decode())
 sample = {
     "task_name": expected["task_name"],
     "task_state": "Running",
+    "last_task_result": 267009,
     "listener_pid": 4242,
     "process_start_utc": "2026-10-21T00:00:00Z",
     "install_id": expected["install_id"],
@@ -1924,6 +1925,7 @@ class LifecycleTests(unittest.TestCase):
                     "sample": {
                         "task_name": "description-e2e-endpoint",
                         "task_state": task_state,
+                        "last_task_result": 267009,
                         "listener_pid": 4242,
                         "process_start_utc": "2026-10-21T00:00:00Z",
                         "install_id": identity["install_id"],
@@ -1978,6 +1980,9 @@ class LifecycleTests(unittest.TestCase):
                 0,
                 missing.stdout + missing.stderr,
             )
+            control = CONTROL.read_text(encoding="utf-8")
+            self.assertNotIn("LastTaskResult -ne 0", control)
+            self.assertIn("$task.State -ne 'Running'", control)
 
     def test_portal_unit_injects_the_derived_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

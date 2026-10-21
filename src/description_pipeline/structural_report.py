@@ -489,14 +489,23 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
         else None
     )
     native_gate_warnings = None
+    native_gate_passed = False
     if isinstance(quality, dict) and isinstance(quality.get("checks"), list):
         for check in quality["checks"]:
             if (
                 isinstance(check, dict)
                 and check.get("id") == "geometry.native_tessellation"
-                and isinstance(check.get("details"), dict)
             ):
-                warnings = check["details"].get("warnings")
+                native_gate_passed = (
+                    check.get("state") == "passed"
+                    or check.get("passed") is True
+                )
+                details = check.get("details")
+                warnings = (
+                    details.get("warnings")
+                    if isinstance(details, dict)
+                    else None
+                )
                 if isinstance(warnings, list):
                     native_gate_warnings = warnings
                 break
@@ -526,12 +535,16 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                 and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
             ]
             if (
-                native_scope or raw_scope
-            ) and (
-                native_gate_warnings is None
-                or not native_scope_warning_details_match(
-                    native_scope,
-                    native_gate_warnings,
+                native_gate_passed
+                and native_gate_warnings is None
+            ) or (
+                (native_scope or raw_scope)
+                and (
+                    native_gate_warnings is None
+                    or not native_scope_warning_details_match(
+                        native_scope,
+                        native_gate_warnings,
+                    )
                 )
             ):
                 entries.append(

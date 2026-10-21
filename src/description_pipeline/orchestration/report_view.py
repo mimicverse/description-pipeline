@@ -836,6 +836,7 @@ def _recorded_warnings(
         and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
     scope_compared = False
+    native_gate_seen = False
     if stage.get("id") == "discover":
         warnings.extend(
             _warning_row(stage, item)
@@ -844,6 +845,10 @@ def _recorded_warnings(
         )
     for row in rows:
         details = row.get("raw_details")
+        if row.get("id") == "geometry.native_tessellation" and row.get(
+            "state"
+        ) == "passed":
+            native_gate_seen = True
         recorded = details.get("warnings") if isinstance(details, dict) else None
         if isinstance(recorded, list):
             raw_scope = [
@@ -876,12 +881,20 @@ def _recorded_warnings(
             warnings.extend(
                 _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
             )
+        elif row.get("id") == "geometry.native_tessellation" and row.get(
+            "state"
+        ) == "passed":
+            raise PipelineError(
+                "Passed native tessellation gate carries no warning list"
+            )
         diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
         if isinstance(diagnostics, list):
             warnings.extend(
                 _warning_row(stage, item) for item in diagnostics if isinstance(item, dict) and item.get("code")
             )
-    if native_diagnostics and not scope_compared:
+    if native_diagnostics and (
+        not scope_compared or not native_gate_seen
+    ):
         raise PipelineError(
             "Native scope diagnostics have no matching gate warnings"
         )

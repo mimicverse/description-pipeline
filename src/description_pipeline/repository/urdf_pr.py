@@ -498,13 +498,22 @@ def _native_scope_warning_rows(report: dict) -> list[dict]:
         and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
     native_gate_warnings = None
+    native_gate_passed = False
     for check in report.get("checks") or []:
         if (
             isinstance(check, dict)
             and check.get("id") == "geometry.native_tessellation"
-            and isinstance(check.get("details"), dict)
         ):
-            warnings = check["details"].get("warnings")
+            native_gate_passed = (
+                check.get("state") == "passed"
+                or check.get("passed") is True
+            )
+            details = check.get("details")
+            warnings = (
+                details.get("warnings")
+                if isinstance(details, dict)
+                else None
+            )
             if isinstance(warnings, list):
                 native_gate_warnings = warnings
             break
@@ -527,11 +536,14 @@ def _native_scope_warning_rows(report: dict) -> list[dict]:
                 if item["code"] in NATIVE_SCOPE_IDENTITY_WARNING_CODES
             ]
             break
-    if (rows or raw_scope) and (
-        native_gate_warnings is None
-        or not native_scope_warning_details_match(
-            rows,
-            native_gate_warnings,
+    if (native_gate_passed and native_gate_warnings is None) or (
+        (rows or raw_scope)
+        and (
+            native_gate_warnings is None
+            or not native_scope_warning_details_match(
+                rows,
+                native_gate_warnings,
+            )
         )
     ):
         raise PipelineError("Native scope warning projection is incomplete or forged")

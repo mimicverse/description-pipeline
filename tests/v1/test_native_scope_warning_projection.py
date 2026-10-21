@@ -208,6 +208,51 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             [],
         )
 
+    def test_a_passed_gate_must_explicitly_carry_its_warning_list(
+        self,
+    ) -> None:
+        for details in ({}, {"warnings": "not-a-list"}):
+            quality = {
+                "checks": [
+                    {
+                        "id": "geometry.native_tessellation",
+                        "state": "passed",
+                        "passed": True,
+                        "details": details,
+                    }
+                ],
+                "diagnostics": [],
+                "qualifications": [],
+            }
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_json(root / "reports/quality.json", quality)
+                structural = build_structural_report(
+                    {},
+                    evidence_root=root,
+                )
+            self.assertIn(
+                "report.native_identity_warning_invalid",
+                {row["code"] for row in structural["findings"]},
+            )
+            with self.assertRaises(PortalError):
+                _quality_warnings(quality)
+            with self.assertRaises(PipelineError):
+                _body("a" * 64, "b" * 40, quality, "engineering")
+            with self.assertRaises(PipelineError):
+                _recorded_warnings(
+                    {"id": "verify", "name": "Verify"},
+                    [],
+                    [
+                        {
+                            "id": "geometry.native_tessellation",
+                            "state": "passed",
+                            "raw_details": details,
+                        }
+                    ],
+                    [],
+                )
+
     def test_structural_portal_report_view_and_pr_keep_object_location(
         self,
     ) -> None:
@@ -258,7 +303,13 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         view = _recorded_warnings(
             {"id": "verify", "name": "Verify"},
             [],
-            [{"raw_details": {"warnings": raw_warnings()}}],
+            [
+                {
+                    "id": "geometry.native_tessellation",
+                    "state": "passed",
+                    "raw_details": {"warnings": raw_warnings()},
+                }
+            ],
             rows,
         )
         self.assertEqual(
@@ -338,7 +389,13 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             _recorded_warnings(
                 {"id": "verify", "name": "Verify"},
                 [],
-                [{"raw_details": {"warnings": raw}}],
+                [
+                    {
+                        "id": "geometry.native_tessellation",
+                        "state": "passed",
+                        "raw_details": {"warnings": raw},
+                    }
+                ],
                 complete[:4],
             )
 
@@ -350,7 +407,13 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             _recorded_warnings(
                 {"id": "verify", "name": "Verify"},
                 [],
-                [{"raw_details": {"warnings": missing}}],
+                [
+                    {
+                        "id": "geometry.native_tessellation",
+                        "state": "passed",
+                        "raw_details": {"warnings": missing},
+                    }
+                ],
                 forged,
             )
 
@@ -358,7 +421,13 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
             _recorded_warnings(
                 {"id": "verify", "name": "Verify"},
                 [],
-                [{"raw_details": {"warnings": first}}],
+                [
+                    {
+                        "id": "geometry.native_tessellation",
+                        "state": "passed",
+                        "raw_details": {"warnings": first},
+                    }
+                ],
                 complete[:1],
             )
 
