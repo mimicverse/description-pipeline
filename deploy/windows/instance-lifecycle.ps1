@@ -920,7 +920,12 @@ function Set-ManagedAcl(
   [string]$Path,
   [bool]$Protected,
   [switch]$NonInheriting,
+  [switch]$AllowServiceOwner,
   [switch]$Recurse) {
+  if ($AllowServiceOwner) {
+    Die 'windows_managed_acl_service_ace_refused' (
+      'the administrator runtime is authorized through Administrators; service-specific ACL entries are forbidden')
+  }
   $pending = New-Object 'System.Collections.Generic.Stack[string]'
   $pending.Push([System.IO.Path]::GetFullPath($Path))
   $administratorsSid = Get-ManagedAdministratorsSid

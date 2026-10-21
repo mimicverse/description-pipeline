@@ -41,11 +41,16 @@ class DeployMachineryTests(unittest.TestCase):
             self.assertEqual(endpoint_template_targets_violations(Path(temporary)), ["sample.json"])
 
     def test_windows_lifecycle_is_one_bound_script(self) -> None:
-        # The isolated instance has exactly one lifecycle script plus the documented minimal
-        # configuration example; the legacy candidate harness and the launcher are gone.
+        # The isolated instance has one lifecycle script, one explicit managed-root bootstrap,
+        # and the documented minimal configuration example; the legacy candidate harness and
+        # launcher remain gone.
         self.assertEqual(
             {path.name for path in WINDOWS.iterdir() if path.is_file()},
-            {"endpoint.example.json", "instance-lifecycle.ps1"},
+            {
+                "bootstrap-managed-root.ps1",
+                "endpoint.example.json",
+                "instance-lifecycle.ps1",
+            },
         )
         script = (WINDOWS / "instance-lifecycle.ps1").read_text(encoding="utf-8")
         for marker in (
@@ -63,6 +68,18 @@ class DeployMachineryTests(unittest.TestCase):
             self.assertIn(marker, script)
         for forbidden in ("description-v1-review", "GH_CONFIG", "description-v1-endpoint", "native-product"):
             self.assertNotIn(forbidden, script)
+        bootstrap = (WINDOWS / "bootstrap-managed-root.ps1").read_text(encoding="utf-8")
+        for marker in (
+            "ManagedRoot",
+            "ServiceAccount",
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "solidworks-to-urdf.managed-root/v1",
+            "user-approved-administrator-runtime",
+        ):
+            self.assertIn(marker, bootstrap)
+        for forbidden in ("description-v1-review", "GH_CONFIG", "description-v1-endpoint", "native-product"):
+            self.assertNotIn(forbidden, bootstrap)
 
     def test_endpoint_example_is_the_documented_minimum(self) -> None:
         path = WINDOWS / "endpoint.example.json"

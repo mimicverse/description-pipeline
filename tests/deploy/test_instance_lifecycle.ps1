@@ -81,6 +81,12 @@ Check 'wording.windows_managed_acl' ($source.Contains('Set-ManagedEndpointAcls')
   $source.Contains('user-approved-administrator-runtime') -and
   $source.Contains('windows_managed_acl_marker_missing') -and
   $source.Contains('solidworks-to-urdf.managed-root/v1'))
+$harnessPath = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'
+$harnessSource = Get-Content -LiteralPath $harnessPath -Raw
+Check 'wording.harness_acl_signature' (
+  $harnessSource.Contains('[switch]$AllowServiceOwner') -and
+  -not $harnessSource.Contains('[string]$ServiceRights') -and
+  -not $harnessSource.Contains('[string]$ServiceSid, [string]$TaskFile'))
 Check 'wording.windows_recovery_identity' ($source.Contains('config_digest') -and
   $source.Contains('release_identity_sha256') -and $source.Contains('install_id') -and
   $source.Contains('script_sha256'))
@@ -221,6 +227,10 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $bootstrapReceipt = ($bootstrapOutput | Select-Object -Last 1) | ConvertFrom-Json
   Check 'windows_acl.bootstrap_marker' ($bootstrapReceipt.passed -eq $true -and
     $bootstrapReceipt.service_sid -eq $serviceSid -and
+    $bootstrapReceipt.managed_runtime.sid -eq $serviceSid -and
+    $bootstrapReceipt.managed_runtime.administrator -eq $true -and
+    $bootstrapReceipt.managed_runtime.privilege_qualification -eq 'user-approved-administrator-runtime' -and
+    $bootstrapReceipt.managed_runtime.acl_ace -eq $false -and
     (Test-Path -LiteralPath (Join-Path $aclRoot '.description-managed-root.json') -PathType Leaf))
   Check 'windows_acl.bootstrap_marker_acl' (@($bootstrapReceipt.marker_acl.rules | Where-Object {
     $_.sid -in @('S-1-5-18', 'S-1-5-32-544') -and
@@ -289,6 +299,46 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
       }).Count -eq 2
   }
   Check 'windows_acl.administrators_system_only' (@($managedAclChecks | Where-Object { -not $_ }).Count -eq 0)
+  $bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
+  $rootSetAcl = 'Set-Acl -LiteralPath $root -AclObject $rootAcl -ErrorAction Stop'
+  Check 'windows_acl.bootstrap_failure_injection_anchor' (
+    ([regex]::Matches($bootstrapSource, [regex]::Escape($rootSetAcl))).Count -eq 1)
+  $failureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'bootstrap-injected-failure-' + [guid]::NewGuid().ToString('N') + '.ps1')
+  [System.IO.File]::WriteAllText(
+    $failureScript,
+    $bootstrapSource.Replace(
+      $rootSetAcl,
+      "throw 'injected root ACL failure'"),
+    (New-Object System.Text.UTF8Encoding($false)))
+  $powershellExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  $markerBeforeFailure = Get-AclProjection $markerPath
+  $rootBeforeFailure = Get-AclProjection $aclRoot
+  $failureOutput = @(& $powershellExe -NoProfile -File $failureScript `
+    -ManagedRoot $aclRoot -ServiceAccount $serviceSid)
+  $failureExit = $LASTEXITCODE
+  $failureReceipt = ($failureOutput | Select-Object -Last 1) | ConvertFrom-Json
+  Check 'windows_acl.bootstrap_failure_rolls_back' (
+    $failureExit -ne 0 -and
+    $failureReceipt.passed -eq $false -and
+    $failureReceipt.rollback.passed -eq $true -and
+    (Get-AclProjection $markerPath).projection_sha256 -eq $markerBeforeFailure.projection_sha256 -and
+    (Get-AclProjection $aclRoot).projection_sha256 -eq $rootBeforeFailure.projection_sha256)
+  $rollbackRoot = Join-Path $driveRoot (
+    'description-managed-rollback-' + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $rollbackRoot -Force
+  $rollbackBefore = Get-AclProjection $rollbackRoot
+  $rollbackOutput = @(& $powershellExe -NoProfile -File $failureScript `
+    -ManagedRoot $rollbackRoot -ServiceAccount $serviceSid)
+  $rollbackExit = $LASTEXITCODE
+  $rollbackReceipt = ($rollbackOutput | Select-Object -Last 1) | ConvertFrom-Json
+  Check 'windows_acl.bootstrap_new_marker_rolls_back' (
+    $rollbackExit -ne 0 -and
+    -not (Test-Path -LiteralPath (Join-Path $rollbackRoot '.description-managed-root.json')) -and
+    (Get-AclProjection $rollbackRoot).projection_sha256 -eq $rollbackBefore.projection_sha256 -and
+    $rollbackReceipt.rollback.passed -eq $true)
+  Remove-Item -LiteralPath $failureScript -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $rollbackRoot -Recurse -Force -ErrorAction SilentlyContinue
   $badTokenAcl = Get-Acl -LiteralPath $tokenPath
   [void]$badTokenAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
     $authenticated,
@@ -715,6 +765,14 @@ Check 'outer.stage_legacy_targets_refused' (($outer.message -match 'endpoint_con
 $outer = Invoke-Outer 'stage_duplicate_key_refused'
 Check 'outer.stage_duplicate_key_refused' (($outer.message -match 'endpoint_config_duplicate_keys') -and
   (@($outer.calls).Count -eq 0))
+
+$outer = Invoke-Outer 'stage_acl_boundary'
+$stageAclCalls = @($outer.calls | Where-Object {
+  $_ -like 'managed-acl:*staged:protected=True:non-inheriting=False:allow-service-owner=False:recurse=True'
+})
+Check 'outer.stage_acl_boundary_signature' (
+  ($outer.message -match 'injected_stage_acl_boundary') -and
+  $stageAclCalls.Count -eq 1)
 
 $outer = Invoke-Outer 'promote_candidate_mismatch'
 Check 'outer.promote_candidate_mismatch' (($outer.message -match 'candidate_config_mismatch') -and
