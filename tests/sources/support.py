@@ -16,6 +16,7 @@ from description_pipeline.geometry.native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
+    NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_domain_transform,
     native_curve_endpoint_operation_tolerance,
@@ -220,6 +221,7 @@ def _u_evidence(
     tolerance = native_point_roundtrip_tolerance(point, point, point)
     return {
         "u": u_parameter,
+        "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
         "rule_version": NATIVE_U_IDENTITY_RULE,
         "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
         "point_tolerance_m": tolerance,

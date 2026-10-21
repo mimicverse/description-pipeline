@@ -1349,6 +1349,64 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertIn("does not reproduce the fin endpoint", caught.exception.message)
 
+    def test_get_parameter_is_authoritative_when_closest_u_differs(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        _start, _end, evaluated_start, _evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        auxiliary_closest_u = (edge.u_min + edge.u_max) / 2
+
+        def closest_u(point):
+            return (
+                auxiliary_closest_u
+                if point == evaluated_start
+                else edge.u_max
+            )
+
+        edge.GetClosestPointOn = lambda x, y, z: [
+            x,
+            y,
+            z,
+            closest_u((x, y, z)),
+            0.0,
+        ]
+        edge.GetParameter = lambda x, y, z: [
+            edge.u_min if (x, y, z) == evaluated_start else edge.u_max,
+            packed_evaluate_status(1),
+        ]
+
+        captured = self.capture(body, extension)
+
+        start_evidence = captured["itessellation_body"]["fins"][0][
+            "start_evidence"
+        ]
+        self.assertEqual(start_evidence["u"], edge.u_min)
+        self.assertEqual(
+            start_evidence["u_parameter_rule"],
+            "native-u-point-parameter-authoritative-v1",
+        )
+        self.assertNotEqual(
+            start_evidence["u"],
+            start_evidence["closest_point_on_raw"][3],
+        )
+
+    def test_get_parameter_u_outside_edge_domain_is_rejected(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        _start, _end, evaluated_start, _evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        edge.GetParameter = lambda x, y, z: [
+            edge.u_max + 1.0
+            if (x, y, z) == evaluated_start
+            else edge.u_max,
+            packed_evaluate_status(1),
+        ]
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        self.assertIn("outside the edge domain", caught.exception.message)
+
     def test_parser_accepts_group_333_operation_bound(self):
         evidence, triangles = self.group_333_tessellation()
 
@@ -1361,6 +1419,34 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
 
         self.assertEqual(len(spans), 2)
+
+    def test_parser_uses_point_parameter_when_closest_u_is_auxiliary(self):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        fins = evidence["itessellation"]["bodies"][0]["fins"]
+        fin = next(
+            row
+            for row in fins
+            if native_u_equal(row["start_evidence"]["u"], edge["u_min"])
+        )
+        fin_evidence = fin["start_evidence"]
+        fin_evidence["closest_point_on_raw"][3] = (
+            edge["u_min"] + edge["u_max"]
+        ) / 2
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+        )
+
+        self.assertEqual(len(spans), 2)
+        self.assertNotEqual(
+            fin_evidence["u"],
+            fin_evidence["closest_point_on_raw"][3],
+        )
 
     def test_parser_rejects_group_333_operation_bound_overshoot(self):
         evidence, triangles = self.group_333_tessellation()

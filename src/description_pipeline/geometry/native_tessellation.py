@@ -12,6 +12,7 @@ from .native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
+    NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
@@ -64,6 +65,7 @@ def _valid_u_evidence(value: object, u_parameter: object, endpoint_point: object
 
     if not isinstance(value, dict) or set(value) != {
         "u",
+        "u_parameter_rule",
         "rule_version",
         "point_roundtrip_rule",
         "point_tolerance_m",
@@ -128,6 +130,7 @@ def _valid_u_evidence(value: object, u_parameter: object, endpoint_point: object
     )
     return (
         value["rule_version"] == NATIVE_U_IDENTITY_RULE
+        and value["u_parameter_rule"] == NATIVE_U_POINT_PARAMETER_RULE
         and value["point_roundtrip_rule"] == NATIVE_POINT_ROUNDTRIP_RULE
         and all(
             type(item) in numeric and math.isfinite(float(item))
@@ -151,7 +154,6 @@ def _valid_u_evidence(value: object, u_parameter: object, endpoint_point: object
         and value["parameter_success_raw_type"] == type(parameter[1]).__name__
         and value["parameter_success_bit"] == 1
         and value["parameter_success_parsed"] is True
-        and native_u_equal(parameter[0], closest[3])
         and native_u_equal(parameter[0], value["u"])
         and _valid_evaluate2_packed_status(
             value["evaluate_packed_status"]

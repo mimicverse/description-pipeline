@@ -26,6 +26,7 @@ from ...geometry.native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
+    NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
@@ -5288,8 +5289,7 @@ class SolidWorksBackend(CadBackend):
                 )
             parameter_u = float(parameter[0])
             if (
-                not native_u_equal(parameter_u, closest_u)
-                or not native_u_in_closed_interval(
+                not native_u_in_closed_interval(
                     parameter_u,
                     domain["u_min"],
                     domain["u_max"],
@@ -5297,7 +5297,7 @@ class SolidWorksBackend(CadBackend):
             ):
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "GetParameter and GetClosestPointOn disagree on endpoint U",
+                    "GetParameter endpoint U is outside the edge domain",
                     {
                         **base,
                         "fin_id": fin_id,
@@ -5368,6 +5368,7 @@ class SolidWorksBackend(CadBackend):
                 )
             return {
                 "u": parameter_u,
+                "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
                 "rule_version": NATIVE_U_IDENTITY_RULE,
                 "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
                 "point_tolerance_m": point_tolerance,
