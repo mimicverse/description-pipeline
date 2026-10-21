@@ -93,6 +93,8 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 原生曲线端点与 `Evaluate2` 的一致性采用版本化 curve-operation 误差界：对端点 `E`、求值点 `Q` 和曲线另一端点 `O`，允许界由 `pair(E,Q) + pair(E,O)` 组成，其中 `pair` 是两个有限 XYZ 点逐坐标 binary32 邻接界之和的最大值。producer 与独立 parser 使用同一规则；该界不放宽 U 域、持久引用、拓扑端点、fin/cofin 或同 U 证据，也不允许把任何端点跳过验证。
 
+原生 tessellation fin 端点采用版本化 `tessellation-edge-projection-v1` 绑定：保留原始顶点 `q`，先以 `GetClosestPointOn(q)` 取得边上的投影点 `p_on`，并要求 `q` 到 `p_on` 的最大坐标差不超过 `5e-5 m`（50 µm）；`GetParameter` 和 `Evaluate2` 均以 `p_on` 为输入。`p_on` 与 `Evaluate2` 点在内部参数使用 v3 点界，在原生 edge 边界参数使用上述 curve-operation v4 界。原始顶点、投影点、求值点、U、投影误差和规则版本均须留证并由 parser 独立复算；投影仅用于参数与证据绑定，不得替换交付网格顶点或放宽 50 µm 表面验收。
+
 <a id="qualification"></a>
 ## 警告与资格
 
