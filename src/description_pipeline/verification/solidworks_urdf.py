@@ -22,6 +22,10 @@ import numpy as np
 
 from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
+from ..geometry.native_u import (
+    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_diagnostic_is_valid,
+)
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
@@ -1907,6 +1911,66 @@ def _point_inside_triangle_component(point, points, faces, component) -> bool:
     return abs(solid_angle) > 2.0 * math.pi
 
 
+def native_gate_warning_diagnostics(details: dict) -> list[dict]:
+    """Project verified native-gate warnings into the quality report."""
+
+    warnings = details.get("warnings")
+    _require(isinstance(warnings, list), "Native tessellation warnings are unreadable")
+    projected = []
+    scope_codes = set()
+    for warning in warnings:
+        _require(
+            isinstance(warning, dict) and isinstance(warning.get("code"), str),
+            "Native tessellation warning has no code",
+        )
+        code = warning["code"]
+        if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
+            scope_codes.add(code)
+        detail = warning.get("detail")
+        if not isinstance(detail, dict):
+            detail = {
+                key: value
+                for key, value in warning.items()
+                if key
+                not in {
+                    "code",
+                    "blocking",
+                    "severity",
+                    "message",
+                    "object",
+                    "detail",
+                }
+            }
+        item = {
+            "code": code,
+            "blocking": False,
+            "severity": "warning",
+            "message": str(
+                warning.get("message")
+                or f"Native tessellation recorded {code}"
+            ),
+            "object": str(
+                warning.get("object")
+                or detail.get("component")
+                or detail.get("document")
+                or ""
+            ),
+            "detail": detail,
+        }
+        if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
+            _require(
+                native_scope_warning_diagnostic_is_valid(item),
+                "Native scope warning is missing its object location",
+            )
+        projected.append(item)
+    _require(
+        not scope_codes
+        or scope_codes == NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+        "Native scope warning projection is incomplete",
+    )
+    return projected
+
+
 def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
     """Recompute the quality report without reading the saved quality decision.
 
@@ -1933,7 +1997,13 @@ def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:
         source = definition["source"]
         from .native_mesh_observations import verify_native_mesh_observations
 
-        gates.add("geometry.native_tessellation", lambda: verify_native_mesh_observations(root))
+        def _verify_native_tessellation():
+            native_details = verify_native_mesh_observations(root)
+            projected = native_gate_warning_diagnostics(native_details)
+            diagnostics.extend(projected)
+            return native_details
+
+        gates.add("geometry.native_tessellation", _verify_native_tessellation)
         gates.add("source.coverage", lambda: _entities(source, raw, model))
         gates.add(
             "verification.complete",

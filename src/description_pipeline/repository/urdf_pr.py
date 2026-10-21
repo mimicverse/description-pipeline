@@ -26,10 +26,15 @@ import time
 from pathlib import Path
 
 from ..delivery import check_layout, read_delivery_manifest, read_source_record, subject_digest
+from ..geometry.native_u import (
+    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_diagnostic_is_valid,
+)
 from ..interface_records import REQUEST_PURPOSES, validate_source_record
 from ..io import PipelineError, acquire_process_lock, confined, file_digest
 from ..request_evidence import read_request_evidence
 from ..stages import record_check
+from ..verification.solidworks_urdf import native_gate_warning_diagnostics
 
 #: The target delivery tree (contracts delivery format and digest): manifest.json is the
 #: subject manifest, tool.json carries the tool identity, reports/ holds only the
@@ -480,6 +485,40 @@ def _stage_commit(bundle: Path, worktree: Path, subject: str, message: str) -> t
     return commit, False
 
 
+def _native_scope_warning_rows(report: dict) -> list[dict]:
+    """The complete native-scope warning projection, or no alias warning rows."""
+
+    diagnostics = report.get("diagnostics", [])
+    if not isinstance(diagnostics, list):
+        raise PipelineError("Quality diagnostics are malformed")
+    rows = [
+        item
+        for item in diagnostics
+        if isinstance(item, dict)
+        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    if not rows:
+        for check in report.get("checks") or []:
+            if not isinstance(check, dict) or check.get("id") != "geometry.native_tessellation":
+                continue
+            details = check.get("details")
+            if not isinstance(details, dict):
+                raise PipelineError("Native tessellation warning details are malformed")
+            rows = [
+                item
+                for item in native_gate_warning_diagnostics(details)
+                if item["code"] in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+            ]
+            break
+    if rows and (
+        {item.get("code") for item in rows}
+        != NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        or any(not native_scope_warning_diagnostic_is_valid(item) for item in rows)
+    ):
+        raise PipelineError("Native scope warning projection is incomplete or forged")
+    return rows
+
+
 def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
     checks = report.get("checks") or []
     # Every (fact_id, scope, object_id) identity prints independently in a stable
@@ -526,6 +565,13 @@ def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
         for row in (provenance.get("direction_sign_warnings") or [])
         if isinstance(row, dict)
     )
+    native_scope_lines = "".join(
+        f"- native scope identity `{row['code']}`: object `{row['object']}`; "
+        f"object_indices={json.dumps(row['detail']['object_indices'], separators=(',', ':'))}; "
+        f"field=`{row['detail']['field']}`; rule=`{row['detail']['rule_version']}`; "
+        "persistent=false\n"
+        for row in _native_scope_warning_rows(report)
+    )
     return (
         f"Automatic SolidWorks-to-URDF publication.\n\n"
         f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
@@ -533,21 +579,19 @@ def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
         f"- verifier: recomputed, passed ({len(checks)} checks)\n"
         f"{provenance_line}"
         f"{sign_lines}"
+        f"{native_scope_lines}"
         f"{qualification_lines}"
     )
 
 
-def _pr(
+def _open_pr_matches(
     repository: Path,
     slug: str,
     base: str,
     branch: str,
-    subject: str,
-    commit: str,
-    report: dict,
-    purpose: str,
-    message: str | None,
-) -> tuple[str, str]:
+) -> list[dict]:
+    """Every exact open PR for one base/head pair, without changing GitHub."""
+
     listing = json.loads(
         _gh(
             repository,
@@ -562,13 +606,44 @@ def _pr(
             "--state",
             "open",
             "--json",
-            "url,number,baseRefName,headRefName",
+            "url,number,baseRefName,headRefName,headRefOid,state,isCrossRepository",
         )
         or "[]"
     )
-    matches = [item for item in listing if item.get("baseRefName") == base and item.get("headRefName") == branch]
+    if not isinstance(listing, list) or any(
+        not isinstance(item, dict)
+        or type(item.get("number")) is not int
+        or item["number"] <= 0
+        or not isinstance(item.get("url"), str)
+        or item.get("state") != "OPEN"
+        or item.get("isCrossRepository") is not False
+        or not isinstance(item.get("headRefOid"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", item["headRefOid"]) is None
+        for item in listing
+    ):
+        raise PrError("pr_listing_invalid", None)
+    return [
+        item
+        for item in listing
+        if item.get("baseRefName") == base
+        and item.get("headRefName") == branch
+    ]
+
+
+def _pr(
+    repository: Path,
+    slug: str,
+    base: str,
+    branch: str,
+    subject: str,
+    commit: str,
+    report: dict,
+    purpose: str,
+    message: str | None,
+) -> tuple[str, str]:
+    matches = _open_pr_matches(repository, slug, base, branch)
     if len(matches) > 1:
-        raise PrError("pr_ambiguous", [item["url"] for item in matches])
+        raise PrError("pr_ambiguous", matches)
     title = message.splitlines()[0] if message else f"SolidWorks-to-URDF bundle ({commit[:12]})"
     body = _body(subject, commit, report, purpose)
     with tempfile.NamedTemporaryFile(
@@ -683,6 +758,9 @@ def submit_bundle(
         if _git(repository, "status", "--porcelain").stdout.strip():
             raise PrError("dirty_repository", "commit, stash or remove unrelated changes first")
         subject, report = _verify(bundle)
+        open_prs = _open_pr_matches(repository, slug, base, branch)
+        if len(open_prs) > 1:
+            raise PrError("pr_ambiguous_before_write", open_prs)
         observed(
             "publication.inputs",
             "passed",
@@ -861,6 +939,15 @@ def submit_bundle(
         return result
     except PrError as error:
         observed(phase, "failed", {"error": error.code, "detail": error.detail})
+        if error.code == "pr_ambiguous" and pushed:
+            return _unresolved(
+                "pr_ambiguous_after_push",
+                error.detail,
+                commit=pushed,
+                branch=branch,
+                subject=subject,
+                base=base,
+            )
         return {
             "state": "failed",
             "error": error.code,

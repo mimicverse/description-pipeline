@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 import struct
+from collections import defaultdict
 
 from ..io import PipelineError
 from ..schemas import NATIVE_TESSELLATION_SCHEMA
@@ -19,8 +20,10 @@ from .native_u import (
     NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_IDENTITY_POLICY_RULE,
+    NATIVE_PART_WITNESS_DERIVED,
     NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
+    NATIVE_TOPOLOGY_IDENTITY_DERIVED,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_CLOSEST_FALLBACK_RULE,
@@ -60,6 +63,25 @@ def _binary64_hex(value: object) -> bool:
     )
 
 
+def native_mapped_witnesses_are_global_unique(
+    rows: list[dict],
+    index_field: str,
+    reference_field: str,
+) -> bool:
+    """Whether mapped part witnesses are unique across every component body."""
+
+    witnesses = [
+        (
+            row["identity"]["mapping_source_body_reference_sha256"],
+            row["identity"][index_field],
+            row["identity"][reference_field],
+        )
+        for row in rows
+        if row["identity"] is not None
+    ]
+    return len(witnesses) == len(set(witnesses))
+
+
 def _valid_scope_identity(
     value: object,
     *,
@@ -92,6 +114,7 @@ def _valid_scope_identity(
             "raw_component_reference_sha256",
             "raw_component_reference_kind",
             "mapping_source_part_document_sha256",
+            "mapping_source_body_reference_sha256",
             "mapping_source_face_index",
             "mapped_source_face_persistent_reference_sha256",
             "mapping_method",
@@ -113,6 +136,7 @@ def _valid_scope_identity(
             "adjacent_mapped_face_ids",
             "topology_signature_sha256",
             "mapping_source_part_document_sha256",
+            "mapping_source_body_reference_sha256",
             "mapping_source_edge_index",
             "mapping_source_edge_persistent_reference_sha256",
             "mapping_method",
@@ -124,9 +148,11 @@ def _valid_scope_identity(
             "native_vertex_index",
             "point_binary64_hex",
             "coincident_occurrence_index",
-            "incident_edge_identity_sha256",
+            "incident_mapped_edge_indices",
+            "incident_mapped_edge_reference_sha256",
             "topology_signature_sha256",
             "mapping_source_part_document_sha256",
+            "mapping_source_body_reference_sha256",
             "mapping_source_vertex_index",
             "mapped_source_vertex_persistent_reference_sha256",
             "mapping_method",
@@ -147,7 +173,12 @@ def _valid_scope_identity(
         and isinstance(warnings, list)
         and warnings == sorted(set(warnings))
         and set(warnings)
-        == expected_warnings | {NATIVE_COMPONENT_REFERENCE_ALIASED}
+        == expected_warnings
+        | {
+            NATIVE_COMPONENT_REFERENCE_ALIASED,
+            NATIVE_PART_WITNESS_DERIVED,
+            NATIVE_TOPOLOGY_IDENTITY_DERIVED,
+        }
         and (
             kind != "face"
             or (
@@ -210,6 +241,14 @@ def _valid_scope_identity(
                 and bool(
                     HEX64.fullmatch(
                         value["mapping_source_part_document_sha256"]
+                    )
+                )
+                and isinstance(
+                    value["mapping_source_body_reference_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["mapping_source_body_reference_sha256"]
                     )
                 )
                 and isinstance(
@@ -337,6 +376,14 @@ def _valid_scope_identity(
                 )
                 and _integer(value["mapping_source_edge_index"])
                 and value["mapping_source_edge_index"] >= 0
+                and isinstance(
+                    value["mapping_source_body_reference_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["mapping_source_body_reference_sha256"]
+                    )
+                )
                 and value["mapping_source_part_document_sha256"]
                 == value["source_document_sha256"]
                 and value["mapping_method"]
@@ -362,12 +409,36 @@ def _valid_scope_identity(
                 )
                 and _integer(value["coincident_occurrence_index"])
                 and value["coincident_occurrence_index"] >= 0
-                and isinstance(value["incident_edge_identity_sha256"], list)
-                and value["incident_edge_identity_sha256"]
-                == sorted(set(value["incident_edge_identity_sha256"]))
+                and isinstance(
+                    value["incident_mapped_edge_indices"], list
+                )
+                and value["incident_mapped_edge_indices"]
+                == sorted(set(value["incident_mapped_edge_indices"]))
+                and all(
+                    _integer(item) and item >= 0
+                    for item in value["incident_mapped_edge_indices"]
+                )
+                and isinstance(
+                    value[
+                        "incident_mapped_edge_reference_sha256"
+                    ],
+                    list,
+                )
+                and value[
+                    "incident_mapped_edge_reference_sha256"
+                ]
+                == sorted(
+                    set(
+                        value[
+                            "incident_mapped_edge_reference_sha256"
+                        ]
+                    )
+                )
                 and all(
                     isinstance(item, str) and bool(HEX64.fullmatch(item))
-                    for item in value["incident_edge_identity_sha256"]
+                    for item in value[
+                        "incident_mapped_edge_reference_sha256"
+                    ]
                 )
                 and isinstance(value["topology_signature_sha256"], str)
                 and bool(
@@ -379,6 +450,14 @@ def _valid_scope_identity(
                 and bool(
                     HEX64.fullmatch(
                         value["mapping_source_part_document_sha256"]
+                    )
+                )
+                and isinstance(
+                    value["mapping_source_body_reference_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["mapping_source_body_reference_sha256"]
                     )
                 )
                 and _integer(value["mapping_source_vertex_index"])
@@ -795,6 +874,7 @@ def parse_native_tessellation(
         "body_index",
         "body_name",
         "body_reference_sha256",
+        "native_body_reference_sha256",
         "face_index",
         "face_reference_sha256",
         "native_face_reference_sha256",
@@ -829,6 +909,7 @@ def parse_native_tessellation(
         count = span["triangle_count"]
         body_name = span["body_name"]
         body_reference = span["body_reference_sha256"]
+        native_body_reference = span["native_body_reference_sha256"]
         face_reference = span["face_reference_sha256"]
         native_face_reference = span["native_face_reference_sha256"]
         face_identity_mode = span["face_identity_mode"]
@@ -894,6 +975,8 @@ def parse_native_tessellation(
             and bool(body_name)
             and isinstance(body_reference, str)
             and bool(HEX64.fullmatch(body_reference))
+            and isinstance(native_body_reference, str)
+            and bool(HEX64.fullmatch(native_body_reference))
             and isinstance(face_reference, str)
             and bool(HEX64.fullmatch(face_reference))
             and isinstance(native_face_reference, str)
@@ -1139,6 +1222,23 @@ def parse_native_tessellation(
                 + "without an alias",
             )
         else:
+            _parameter_endpoints, topology_endpoints = (
+                native_curve_endpoint_roles(
+                    edge["curve_start_point_m"],
+                    edge["curve_end_point_m"],
+                    edge["curve_sense"],
+                )
+            )
+            identity_start_point = (
+                start_point
+                if start_point is not None
+                else topology_endpoints[0]
+            )
+            identity_end_point = (
+                end_point
+                if end_point is not None
+                else topology_endpoints[1]
+            )
             adjacent_face_identities = [
                 face_spans_by_key[(*body_key, face_index)][
                     "face_identity"
@@ -1158,14 +1258,22 @@ def parse_native_tessellation(
             )
             expected_topology = native_scope_identity_sha256(
                 {
-                    "start_point_binary64": [
-                        struct.pack("<d", float(value)).hex()
-                        for value in start_point
-                    ],
-                    "end_point_binary64": [
-                        struct.pack("<d", float(value)).hex()
-                        for value in end_point
-                    ],
+                    "start_point_binary64": (
+                        None
+                        if start_point is None
+                        else [
+                            struct.pack("<d", float(value)).hex()
+                            for value in start_point
+                        ]
+                    ),
+                    "end_point_binary64": (
+                        None
+                        if end_point is None
+                        else [
+                            struct.pack("<d", float(value)).hex()
+                            for value in end_point
+                        ]
+                    ),
                     "curve_u_min_binary64": struct.pack(
                         "<d", float(edge["u_min"])
                     ).hex(),
@@ -1197,12 +1305,12 @@ def parse_native_tessellation(
                 and identity["start_point_binary64_hex"]
                 == [
                     struct.pack("<d", float(value)).hex()
-                    for value in start_point
+                    for value in identity_start_point
                 ]
                 and identity["end_point_binary64_hex"]
                 == [
                     struct.pack("<d", float(value)).hex()
-                    for value in end_point
+                    for value in identity_end_point
                 ]
                 and identity["start_vertex_reference_sha256"]
                 == edge["start_vertex_reference_sha256"]
@@ -1580,37 +1688,37 @@ def _parse_itessellation_evidence(
         "bodies",
         "vertices",
         "solidworks_vertex_identities",
-        "u_observation_stats",
-    }
-    optional_alias_keys = {
         "reference_alias_audit",
         "cross_kind_raw_aliases",
+        "u_observation_stats",
     }
     _require(
         isinstance(value, dict)
-        and required <= set(value)
-        and set(value) <= required | optional_alias_keys,
+        and set(value) == required,
         component + ": native ITessellation evidence is missing",
     )
-    if "reference_alias_audit" in value:
-        audit = value["reference_alias_audit"]
-        _require(
-            isinstance(audit, dict)
-            and set(audit) == {"body", "face", "edge", "vertex"}
+    audit = value["reference_alias_audit"]
+    _require(
+        isinstance(audit, dict)
+        and set(audit) == {"body", "face", "edge", "vertex"}
+        and all(
+            isinstance(references, list)
+            and references == sorted(set(references))
             and all(
-                isinstance(references, list)
-                and references == sorted(set(references))
-                and all(
-                    isinstance(reference, str)
-                    and bool(HEX64.fullmatch(reference))
-                    for reference in references
-                )
-                for references in audit.values()
-            ),
-            component + ": native persistent-reference alias audit is malformed",
-        )
-    if "cross_kind_raw_aliases" in value:
-        aliases = value["cross_kind_raw_aliases"]
+                isinstance(reference, str)
+                and bool(HEX64.fullmatch(reference))
+                for reference in references
+            )
+            for references in audit.values()
+        ),
+        component + ": native persistent-reference alias audit is malformed",
+    )
+    aliases = value["cross_kind_raw_aliases"]
+    _require(
+        isinstance(aliases, list),
+        component + ": native cross-kind raw alias audit is missing",
+    )
+    if aliases is not None:
         base_owner_keys = {
             "kind",
             "component",
@@ -1971,9 +2079,13 @@ def _parse_itessellation_evidence(
                 for value in point
             ]
             and identity["owner_scope_key"]
-            == spans_by_body[body_key][0]["face_identity"][
-                "owner_scope_key"
-            ]
+            == (
+                spans_by_body[body_key][0]["face_identity"][
+                    "owner_scope_key"
+                ]
+                if spans_by_body[body_key][0]["face_identity"] is not None
+                else identity["owner_scope_key"]
+            )
             and row["identity_sha256"]
             == native_scope_identity_sha256(identity)
         )
@@ -2016,17 +2128,39 @@ def _parse_itessellation_evidence(
         scope_vertex_keys.add(
             (*body_key, row["identity_sha256"])
         )
-        incident_edges = (
-            [
-                edges_by_owner_reference.get(
-                    (*body_key, reference)
+        if identity is not None:
+            scope_edges_by_source = {
+                (
+                    edge["body_type"],
+                    edge["body_index"],
+                    edge["edge_identity"]["mapping_source_edge_index"],
+                ): edge
+                for edge in native_edges
+                if edge["edge_identity"] is not None
+            }
+            incident_edges = []
+            for edge_index, edge_reference in zip(
+                identity["incident_mapped_edge_indices"],
+                identity[
+                    "incident_mapped_edge_reference_sha256"
+                ],
+                strict=True,
+            ):
+                edge = scope_edges_by_source.get(
+                    (*body_key, edge_index)
                 )
-                for reference in identity[
-                    "incident_edge_identity_sha256"
-                ]
-            ]
-            if identity is not None
-            else [
+                _require(
+                    edge is not None
+                    and edge["edge_identity"][
+                        "mapping_source_edge_persistent_reference_sha256"
+                    ]
+                    == edge_reference,
+                    component
+                    + f": native scope-local vertex {index} names an unknown mapped edge",
+                )
+                incident_edges.append(edge)
+        else:
+            incident_edges = [
                 edge
                 for (edge_body_type, edge_body_index, _), edge
                 in edges_by_owner_reference.items()
@@ -2037,13 +2171,24 @@ def _parse_itessellation_evidence(
                     edge["end_vertex_reference_sha256"],
                 }
             ]
-        )
         _require(
             incident_edges
             and all(edge is not None for edge in incident_edges)
             and (
-                identity is not None
-                or all(
+                (
+                    identity is not None
+                    and all(
+                        row["identity_sha256"]
+                        in {
+                            edge["start_vertex_reference_sha256"],
+                            edge["end_vertex_reference_sha256"],
+                        }
+                        for edge in incident_edges
+                    )
+                )
+                or (
+                    identity is None
+                    and all(
                     (
                         edge["start_vertex_reference_sha256"]
                         == row["identity_sha256"]
@@ -2053,6 +2198,7 @@ def _parse_itessellation_evidence(
                         == row["identity_sha256"]
                     )
                     for edge in incident_edges
+                    )
                 )
             ),
             component
@@ -2168,19 +2314,18 @@ def _parse_itessellation_evidence(
         }
         for row in raw_scope_vertices
     ]
-    scope_owner_keys = [
-        row["identity"]["owner_scope_key"]
-        for row in [*face_alias_rows, *edge_alias_rows, *vertex_alias_rows]
-        if row["identity"] is not None
-    ]
+    owners_by_body = {}
+    for row in [*face_alias_rows, *edge_alias_rows, *vertex_alias_rows]:
+        if row["identity"] is None:
+            continue
+        owners_by_body.setdefault(
+            (row["body_type"], row["body_index"]),
+            set(),
+        ).add(row["identity"]["owner_scope_key"])
     _require(
-        not scope_owner_keys
-        or all(
-            owner == scope_owner_keys[0]
-            for owner in scope_owner_keys[1:]
-        ),
+        all(len(keys) == 1 for keys in owners_by_body.values()),
         component
-        + ": native scope-local identities disagree on their owner scope",
+        + ": native scope-local identities disagree on one body scope",
     )
     scope_part_documents = {
         row["identity"]["mapping_source_part_document_sha256"]
@@ -2203,6 +2348,92 @@ def _parse_itessellation_evidence(
         or scope_part_documents == face_scope_source_documents,
         component
         + ": the part witness does not match the frozen source document",
+    )
+    expected_cross_kind_owners = defaultdict(list)
+    for body_key, body_spans in spans_by_body.items():
+        first_span = body_spans[0]
+        base_owner = {
+            "component": component,
+            "body_type": body_key[0],
+            "body_index": body_key[1],
+        }
+        expected_cross_kind_owners[
+            first_span["native_body_reference_sha256"]
+        ].append(
+            {
+                "kind": "body",
+                **base_owner,
+                "typed_sha256": first_span["body_reference_sha256"],
+            }
+        )
+        for span in body_spans:
+            expected_cross_kind_owners[
+                span["native_face_reference_sha256"]
+            ].append(
+                {
+                    "kind": "face",
+                    **base_owner,
+                    "face_index": span["face_index"],
+                    "typed_sha256": span["face_reference_sha256"],
+                }
+            )
+    for edge_index, edge in enumerate(native_edges):
+        expected_cross_kind_owners[
+            edge["native_edge_reference_sha256"]
+        ].append(
+            {
+                "kind": "edge",
+                "component": component,
+                "body_type": edge["body_type"],
+                "body_index": edge["body_index"],
+                "edge_index": edge_index,
+                "typed_sha256": edge["edge_reference_sha256"],
+            }
+        )
+    for row in raw_scope_vertices:
+        expected_cross_kind_owners[row["native_reference_sha256"]].append(
+            {
+                "kind": "vertex",
+                "component": component,
+                "body_type": row["body_type"],
+                "body_index": row["body_index"],
+                "vertex_index": row["vertex_index"],
+                "typed_sha256": row["identity_sha256"],
+            }
+        )
+
+    def cross_kind_owner_key(owner):
+        return (
+            str(owner.get("component", "")),
+            int(owner.get("body_type", -1)),
+            int(owner.get("body_index", -1)),
+            str(owner["kind"]),
+            int(owner.get("face_index", -1)),
+            int(owner.get("edge_index", -1)),
+            str(owner.get("endpoint", "")),
+        )
+
+    expected_cross_kind_aliases = [
+        {
+            "raw_sha256": raw_sha256,
+            "owners": sorted(owners, key=cross_kind_owner_key),
+        }
+        for raw_sha256, owners in sorted(
+            expected_cross_kind_owners.items()
+        )
+        if len({owner["kind"] for owner in owners}) > 1
+    ]
+    actual_cross_kind_aliases = [
+        {
+            "raw_sha256": row["raw_sha256"],
+            "owners": row["owners"],
+        }
+        for row in aliases
+    ]
+    _require(
+        actual_cross_kind_aliases == expected_cross_kind_aliases,
+        component
+        + ": native cross-kind raw alias audit differs from raw references",
     )
     for entity_kind, rows, index_field, reference_field in (
         (
@@ -2251,12 +2482,45 @@ def _parse_itessellation_evidence(
                 + f": {entity_kind} part witness mapping is not one-to-one "
                 + f"for body {body_key}",
             )
+        _require(
+            native_mapped_witnesses_are_global_unique(
+                rows,
+                index_field,
+                reference_field,
+            ),
+            component
+            + f": {entity_kind} part witness repeats across bodies",
+        )
     if native_identity_warnings is not None:
         grouped_warnings = {}
-        for entity_kind, rows, index_field in (
-            ("face", face_alias_rows, "native_face_index"),
-            ("edge", edge_alias_rows, "native_edge_index"),
-            ("vertex", vertex_alias_rows, "native_vertex_index"),
+        for (
+            entity_kind,
+            rows,
+            index_field,
+            identity_index_field,
+            mapped_reference_field,
+        ) in (
+            (
+                "face",
+                face_alias_rows,
+                "native_face_index",
+                "mapping_source_face_index",
+                "mapped_source_face_persistent_reference_sha256",
+            ),
+            (
+                "edge",
+                edge_alias_rows,
+                "native_edge_index",
+                "mapping_source_edge_index",
+                "mapping_source_edge_persistent_reference_sha256",
+            ),
+            (
+                "vertex",
+                vertex_alias_rows,
+                "native_vertex_index",
+                "mapping_source_vertex_index",
+                "mapped_source_vertex_persistent_reference_sha256",
+            ),
         ):
             for row in rows:
                 identity = row["identity"]
@@ -2285,14 +2549,88 @@ def _parse_itessellation_evidence(
                             "rule_version": NATIVE_SCOPE_IDENTITY_RULE,
                             "object_indices": [],
                             "field": "identity.warnings",
+                            "native_reference_sha256": row[
+                                "native_reference_sha256"
+                            ],
+                            "source_document_sha256": identity[
+                                "source_document_sha256"
+                            ],
+                            "referenced_configuration": identity.get(
+                                "referenced_configuration"
+                            ),
+                            "occurrence_scope": identity.get(
+                                "occurrence_scope"
+                            ),
+                            "body_name": identity.get("body_name"),
+                            "mapping_source_part_document_sha256": identity[
+                                "mapping_source_part_document_sha256"
+                            ],
+                            "mapping_source_body_reference_sha256": identity[
+                                "mapping_source_body_reference_sha256"
+                            ],
+                            "mapped_source_indices": [],
+                            "mapped_source_persistent_reference_sha256": [],
+                            "topology_signature_sha256s": [],
                         },
                     )
                     group["object_indices"].append(identity[index_field])
+                    group["mapped_source_indices"].append(
+                        identity[identity_index_field]
+                    )
+                    group[
+                        "mapped_source_persistent_reference_sha256"
+                    ].append(identity[mapped_reference_field])
+                    group["topology_signature_sha256s"].append(
+                        identity["topology_signature_sha256"]
+                    )
         for key in sorted(grouped_warnings):
             group = grouped_warnings[key]
             group["object_indices"] = sorted(
                 set(group["object_indices"])
             )
+            group["mapped_source_indices"] = sorted(
+                set(group["mapped_source_indices"])
+            )
+            group[
+                "mapped_source_persistent_reference_sha256"
+            ] = sorted(
+                set(
+                    group[
+                        "mapped_source_persistent_reference_sha256"
+                    ]
+                )
+            )
+            group["topology_signature_sha256s"] = sorted(
+                set(group["topology_signature_sha256s"])
+            )
+            group["object"] = (
+                f"{group['component']}:{group['entity_kind']}:"
+                f"{group['body_type']}/{group['body_index']}"
+            )
+            group["detail"] = {
+                name: group[name]
+                for name in (
+                    "component",
+                    "entity_kind",
+                    "body_type",
+                    "body_index",
+                    "owner_scope_key",
+                    "persistent",
+                    "rule_version",
+                    "object_indices",
+                    "field",
+                    "native_reference_sha256",
+                    "source_document_sha256",
+                    "referenced_configuration",
+                    "occurrence_scope",
+                    "body_name",
+                    "mapping_source_part_document_sha256",
+                    "mapping_source_body_reference_sha256",
+                    "mapped_source_indices",
+                    "mapped_source_persistent_reference_sha256",
+                    "topology_signature_sha256s",
+                )
+            }
             native_identity_warnings.append(group)
     expected_aliases = {
         "face": expected_body_aliases("face", face_alias_rows),

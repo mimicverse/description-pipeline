@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,13 +21,16 @@ from . import _paths, support  # noqa: F401  (import side effect: sys.path)
 from description_pipeline.geometry.native_tessellation import (  # noqa: E402
     _finite_fin_intervals,
     _valid_u_evidence,
+    native_mapped_witnesses_are_global_unique,
     parse_native_tessellation,
 )
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     _NativeReferenceRegistry,
     _com_object_identity,
     _scope_bijection,
+    _scope_edge_rows,
     _scope_edge_mapping_key,
+    _scope_face_rows,
     _scope_owner_key,
     _scope_vertex_rows,
     _typed_reference_sha256,
@@ -35,6 +39,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_COLLAPSED_U_FIN_RULE,
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
+    NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_IDENTITY_RULE,
     native_binary32_spacing,
@@ -3419,6 +3424,147 @@ class NativeFinCaptureTests(unittest.TestCase):
                 [copy.deepcopy(first)],
             )
 
+    def test_scope_snapshot_accepts_only_both_absent_closed_endpoints(self):
+        body, _face_10, _face_20, edge, _tessellation, extension = (
+            self.fixture()
+        )
+        face_rows = _scope_face_rows(body.faces, extension)
+        edge.vertices = [None, None]
+        edge.curve = FakeCurve(0.0, 1.0, is_closed=True)
+        with patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            rows = _scope_edge_rows(body, extension, face_rows)
+        self.assertEqual(
+            {
+                rows[0]["endpoints"]["start"]["state"],
+                rows[0]["endpoints"]["end"]["state"],
+            },
+            {"absent"},
+        )
+        self.assertEqual(_scope_vertex_rows(rows), [])
+        _scope_edge_mapping_key(rows[0], rows[0]["face_indices"])
+
+        edge.vertices = [FakeVertex((0.0, 0.0, 0.0)), None]
+        with patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ), self.assertRaises(ValueError):
+            _scope_edge_rows(body, extension, face_rows)
+
+    def test_part_identity_witness_is_globally_unique_across_bodies(self):
+        reference = hashlib.sha256(b"shared-part-witness").hexdigest()
+        rows = [
+            {
+                "identity": {
+                    "mapping_source_body_reference_sha256": reference,
+                    "mapping_source_face_index": 0,
+                    "mapped_source_face_persistent_reference_sha256":
+                        hashlib.sha256(b"part-face-0").hexdigest(),
+                }
+            },
+            {
+                "identity": {
+                    "mapping_source_body_reference_sha256": reference,
+                    "mapping_source_face_index": 1,
+                    "mapped_source_face_persistent_reference_sha256":
+                        hashlib.sha256(b"part-face-1").hexdigest(),
+                }
+            },
+        ]
+        self.assertTrue(
+            native_mapped_witnesses_are_global_unique(
+                rows,
+                "mapping_source_face_index",
+                "mapped_source_face_persistent_reference_sha256",
+            )
+        )
+        rows[1]["identity"][
+            "mapped_source_face_persistent_reference_sha256"
+        ] = rows[0]["identity"][
+            "mapped_source_face_persistent_reference_sha256"
+        ]
+        rows[1]["identity"]["mapping_source_face_index"] = 0
+        self.assertFalse(
+            native_mapped_witnesses_are_global_unique(
+                rows,
+                "mapping_source_face_index",
+                "mapped_source_face_persistent_reference_sha256",
+            )
+        )
+
+    def test_scope_witness_stays_in_the_owned_document_session(self):
+        body, _face_10, _face_20, _edge, _tessellation, extension = (
+            self.fixture()
+        )
+
+        class OwnedDocument:
+            Extension = extension
+
+            def OpenDoc6(self, *_args):  # noqa: N802 - SolidWorks API name
+                raise AssertionError("the witness path must not open a document")
+
+            def CloseDoc(self, *_args):  # noqa: N802 - SolidWorks API name
+                raise AssertionError("the witness path must not close the document")
+
+        document = OwnedDocument()
+        backend = SolidWorksBackend()
+        document_key = object()
+        captured = []
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "witness.SLDPRT"
+            source.write_bytes(b"frozen source")
+            backend._source_components = {
+                "part-1": (document_key, "Default")
+            }
+            backend._source_documents = {
+                document_key: (
+                    str(source),
+                    "source",
+                    "Default",
+                    document,
+                )
+            }
+
+            def captured_document(*args):
+                captured.append(args)
+                return document
+
+            backend._captured_document = captured_document
+            with patch.object(
+                native_module,
+                "_part_bodies",
+                lambda *_args: [body],
+            ), patch.object(
+                native_module,
+                "_temporary_configuration",
+                lambda *_args, **_kwargs: nullcontext(
+                    (document, "Default")
+                ),
+            ):
+                witnesses = backend._scope_witnesses_for_body(
+                    "part-1",
+                    0,
+                    0,
+                    body,
+                    body.faces,
+                )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            set(witnesses),
+            {"face", "edge", "vertex"},
+        )
+        self.assertEqual(
+            backend.notes["scope_witness:part-1:0:0"][
+                "document_ownership"
+            ],
+            "existing_owned_session_no_close",
+        )
+
     def test_same_kind_edge_alias_uses_mapped_scope_identity(self):
         triangles = []
         spans = []
@@ -3457,6 +3603,9 @@ class NativeFinCaptureTests(unittest.TestCase):
         shared_edge_reference = hashlib.sha256(
             b"body-scope-edge-alias"
         ).hexdigest()
+        shared_vertex_reference = hashlib.sha256(
+            b"body-scope-vertex-alias"
+        ).hexdigest()
         native_edges = []
         for edge_index, first_face in enumerate((0, 2)):
             origin = float((edge_index) * 10)
@@ -3465,12 +3614,10 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "body_type": 0,
                     "body_index": 0,
                     "edge_reference_sha256": shared_edge_reference,
-                    "start_vertex_reference_sha256": hashlib.sha256(
-                        f"edge-alias-start-{edge_index}".encode()
-                    ).hexdigest(),
-                    "end_vertex_reference_sha256": hashlib.sha256(
-                        f"edge-alias-end-{edge_index}".encode()
-                    ).hexdigest(),
+                    "start_vertex_reference_sha256":
+                        shared_vertex_reference,
+                    "end_vertex_reference_sha256":
+                        shared_vertex_reference,
                     "start_point_m": [origin, 0.0, 0.0],
                     "end_point_m": [origin + 1.0, 0.0, 0.0],
                     "face_indices": [first_face, first_face + 1],
@@ -3486,6 +3633,9 @@ class NativeFinCaptureTests(unittest.TestCase):
             triangle_vertices=triangles,
         )
         source_sha256 = "a" * 64
+        part_body_reference = hashlib.sha256(
+            b"edge-alias-part-body"
+        ).hexdigest()
         owner_scope = {
             "occurrence": "edge-alias",
             "source_document_path": "C:/edge-alias.SLDPRT",
@@ -3501,11 +3651,109 @@ class NativeFinCaptureTests(unittest.TestCase):
             body_index=0,
             body_name="edge-alias-body",
         )
+        vertex_rows = evidence["itessellation"][
+            "solidworks_vertex_identities"
+        ]
+        vertex_identity_by_point = {}
+        for vertex_index, row in enumerate(vertex_rows):
+            point = row["point_m"]
+            incident_edges = []
+            for edge_index, edge in enumerate(evidence["native_edges"]):
+                if (
+                    point == edge["start_point_m"]
+                    or point == edge["end_point_m"]
+                ):
+                    incident_edges.append(edge_index)
+            incident_part_edges = sorted(incident_edges)
+            incident_part_references = sorted(
+                hashlib.sha256(
+                    f"part-edge-{edge_index}".encode()
+                ).hexdigest()
+                for edge_index in incident_part_edges
+            )
+            point_bits = [
+                struct.pack("<d", float(value)).hex()
+                for value in point
+            ]
+            topology_key = {
+                "point_binary64": point_bits,
+                "coincident_occurrence_index": 0,
+                "incident_mapped_edge_indices": incident_part_edges,
+                "incident_mapped_edge_reference_sha256":
+                    incident_part_references,
+            }
+            identity = {
+                "rule_version": "native-scope-entity-id-v1",
+                "entity_kind": "vertex",
+                "identity_kind": "mapped_scope_local",
+                "persistent": False,
+                "owner_scope_key": owner_scope_key,
+                "source_document_sha256": source_sha256,
+                "native_vertex_index": vertex_index,
+                "point_binary64_hex": point_bits,
+                "coincident_occurrence_index": 0,
+                "incident_mapped_edge_indices": incident_part_edges,
+                "incident_mapped_edge_reference_sha256":
+                    incident_part_references,
+                "topology_signature_sha256":
+                    native_scope_identity_sha256(topology_key),
+                "mapping_source_part_document_sha256": source_sha256,
+                "mapping_source_body_reference_sha256":
+                    part_body_reference,
+                "mapping_source_vertex_index": vertex_index,
+                "mapped_source_vertex_persistent_reference_sha256":
+                    hashlib.sha256(
+                        f"part-vertex-{vertex_index}".encode()
+                    ).hexdigest(),
+                "mapping_method": NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
+                "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
+                "warnings": [
+                    "cad_component_persistent_reference_aliased",
+                    "cad_part_identity_witness_derived",
+                    "cad_scope_local_identity_derived",
+                    "cad_topology_identity_derived",
+                ],
+            }
+            identity_sha256 = native_scope_identity_sha256(identity)
+            row.update(
+                {
+                    "identity_mode": "native-scope-entity-id-v1",
+                    "identity": identity,
+                    "identity_sha256": identity_sha256,
+                    "native_reference_sha256":
+                        shared_vertex_reference,
+                }
+            )
+            vertex_identity_by_point[tuple(point)] = identity_sha256
+        for edge in evidence["native_edges"]:
+            for endpoint in ("start", "end"):
+                point = tuple(edge[f"{endpoint}_point_m"])
+                edge[f"{endpoint}_vertex_reference_sha256"] = (
+                    vertex_identity_by_point[point]
+                )
+
         fins = {
             row["fin_id"]: row
             for row in evidence["itessellation"]["bodies"][0]["fins"]
         }
         for edge_index, edge in enumerate(evidence["native_edges"]):
+            _parameter_endpoints, topology_endpoints = (
+                native_curve_endpoint_roles(
+                    edge["curve_start_point_m"],
+                    edge["curve_end_point_m"],
+                    edge["curve_sense"],
+                )
+            )
+            identity_start_point = (
+                edge["start_point_m"]
+                if edge["start_point_m"] is not None
+                else topology_endpoints[0]
+            )
+            identity_end_point = (
+                edge["end_point_m"]
+                if edge["end_point_m"] is not None
+                else topology_endpoints[1]
+            )
             edge_identity = {
                 "rule_version": "native-scope-entity-id-v1",
                 "entity_kind": "edge",
@@ -3516,11 +3764,11 @@ class NativeFinCaptureTests(unittest.TestCase):
                 "native_edge_index": edge_index,
                 "start_point_binary64_hex": [
                     struct.pack("<d", float(value)).hex()
-                    for value in edge["start_point_m"]
+                    for value in identity_start_point
                 ],
                 "end_point_binary64_hex": [
                     struct.pack("<d", float(value)).hex()
-                    for value in edge["end_point_m"]
+                    for value in identity_end_point
                 ],
                 "start_vertex_reference_sha256": edge[
                     "start_vertex_reference_sha256"
@@ -3538,6 +3786,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 "curve_periodic": edge["curve_periodic"],
                 "adjacent_mapped_face_ids": edge["face_indices"],
                 "mapping_source_part_document_sha256": source_sha256,
+                "mapping_source_body_reference_sha256": part_body_reference,
                 "mapping_source_edge_index": edge_index,
                 "mapping_source_edge_persistent_reference_sha256": hashlib.sha256(
                     f"part-edge-{edge_index}".encode()
@@ -3546,15 +3795,27 @@ class NativeFinCaptureTests(unittest.TestCase):
                 "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
                 "warnings": [
                     "cad_component_persistent_reference_aliased",
+                    "cad_part_identity_witness_derived",
                     "cad_scope_local_identity_derived",
+                    "cad_topology_identity_derived",
                 ],
             }
             mapping_row = {
                 "endpoints": {
                     "start": {
+                        "state": (
+                            "present"
+                            if edge["start_point_m"] is not None
+                            else "absent"
+                        ),
                         "point_m": edge["start_point_m"],
                     },
                     "end": {
+                        "state": (
+                            "present"
+                            if edge["end_point_m"] is not None
+                            else "absent"
+                        ),
                         "point_m": edge["end_point_m"],
                     },
                 },
@@ -3587,7 +3848,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             "body": [],
             "face": [],
             "edge": [shared_edge_reference],
-            "vertex": [],
+            "vertex": [shared_vertex_reference],
         }
         identity_warnings = []
         parse_native_tessellation(
@@ -3600,7 +3861,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         self.assertEqual(
             {row["entity_kind"] for row in identity_warnings},
-            {"edge"},
+            {"edge", "vertex"},
         )
 
     def test_same_kind_alias_uses_scope_local_identity(self):
@@ -3635,6 +3896,9 @@ class NativeFinCaptureTests(unittest.TestCase):
         document_key = object()
         source_path = Path(__file__).resolve()
         source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        part_body_reference = hashlib.sha256(
+            b"part-body-witness"
+        ).hexdigest()
         backend._source_components = {"part-1": (document_key, "Default")}
         backend._source_documents = {
             document_key: (
@@ -3648,6 +3912,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             "face": {
                 index: {
                     "part_document_sha256": source_sha256,
+                    "part_body_reference_sha256": part_body_reference,
                     "face_index": index,
                     "persistent_reference_sha256": hashlib.sha256(
                         f"part-face-{index}".encode()
@@ -3708,7 +3973,9 @@ class NativeFinCaptureTests(unittest.TestCase):
             },
             {
                 "cad_component_persistent_reference_aliased",
+                "cad_part_identity_witness_derived",
                 "cad_scope_local_identity_derived",
+                "cad_topology_identity_derived",
             },
         )
         self.assertTrue(
@@ -3780,9 +4047,21 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "cad_component_persistent_reference_aliased"
                 ),
             ),
+            lambda value: mutate_identity(
+                value,
+                lambda identity: identity["warnings"].append(
+                    "cad_unexpected_scope_identity_warning"
+                ),
+            ),
             lambda value: value["itessellation"][
                 "reference_alias_audit"
             ].__setitem__("face", []),
+            lambda value: value["itessellation"].__setitem__(
+                "cross_kind_raw_aliases", None
+            ),
+            lambda value: value["itessellation"].pop(
+                "cross_kind_raw_aliases"
+            ),
             lambda value: value["face_spans"][1].update(
                 {
                     "face_identity_mode": (

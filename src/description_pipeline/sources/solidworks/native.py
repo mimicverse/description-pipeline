@@ -28,6 +28,7 @@ from ...geometry.native_u import (
     NATIVE_COMPONENT_REFERENCE_ALIASED,
     NATIVE_FACE_IDENTITY_KEY_RULE,
     NATIVE_IDENTITY_POLICY_RULE,
+    NATIVE_PART_WITNESS_DERIVED,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_SCOPE_IDENTITY_RULE,
@@ -35,6 +36,7 @@ from ...geometry.native_u import (
     NATIVE_SCOPE_MAPPING_METHOD,
     NATIVE_SCOPE_SOURCE_AUTHORITY,
     NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
+    NATIVE_TOPOLOGY_IDENTITY_DERIVED,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_CLOSEST_FALLBACK_RULE,
@@ -5677,6 +5679,7 @@ class SolidWorksBackend(CadBackend):
                 or set(witness)
                 != {
                     "part_document_sha256",
+                    "part_body_reference_sha256",
                     "face_index",
                     "persistent_reference_sha256",
                 }
@@ -5731,6 +5734,9 @@ class SolidWorksBackend(CadBackend):
                 "mapping_source_part_document_sha256": witness[
                     "part_document_sha256"
                 ],
+                "mapping_source_body_reference_sha256": witness[
+                    "part_body_reference_sha256"
+                ],
                 "mapping_source_face_index": witness["face_index"],
                 "mapped_source_face_persistent_reference_sha256": witness[
                     "persistent_reference_sha256"
@@ -5739,7 +5745,9 @@ class SolidWorksBackend(CadBackend):
                 "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
                 "warnings": [
                     NATIVE_COMPONENT_REFERENCE_ALIASED,
+                    NATIVE_PART_WITNESS_DERIVED,
                     NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
+                    NATIVE_TOPOLOGY_IDENTITY_DERIVED,
                 ],
             }
             identity_sha256 = native_scope_identity_sha256(identity)
@@ -5877,6 +5885,189 @@ class SolidWorksBackend(CadBackend):
             )
         if edge_aliased:
             _require_scope_owner(owner_scope, base)
+
+        vertex_groups = {}
+        for edge_row in edge_rows:
+            for order, endpoint_name in enumerate(("start", "end")):
+                endpoint = edge_row["endpoints"][endpoint_name]
+                if endpoint["state"] != "present":
+                    continue
+                pointer = endpoint["object_pointer"]
+                group = vertex_groups.setdefault(
+                    pointer,
+                    {
+                        "point_m": tuple(endpoint["point_m"]),
+                        "raw_references": set(),
+                        "occurrences": [],
+                    },
+                )
+                if tuple(endpoint["point_m"]) != group["point_m"]:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "one native vertex object returned different points",
+                        {**base, "edge_index": edge_row["index"]},
+                    )
+                group["raw_references"].add(
+                    endpoint["reference"]["raw_sha256"]
+                )
+                group["occurrences"].append(
+                    (edge_row["index"], order)
+                )
+        vertices_by_point = {}
+        for pointer, group in vertex_groups.items():
+            point_bits = tuple(
+                _binary64_bits(value) for value in group["point_m"]
+            )
+            vertices_by_point.setdefault(point_bits, []).append(
+                (min(group["occurrences"]), pointer)
+            )
+        for rows in vertices_by_point.values():
+            rows.sort()
+        ordered_vertices = sorted(
+            (
+                (
+                    point_bits,
+                    occurrence,
+                    pointer,
+                )
+                for point_bits, rows in vertices_by_point.items()
+                for occurrence, (_, pointer) in enumerate(rows)
+            ),
+            key=lambda row: (row[0], row[1]),
+        )
+        vertex_raw_references = {
+            next(iter(vertex_groups[pointer]["raw_references"]))
+            for _, _, pointer in ordered_vertices
+        }
+        vertex_aliased = (
+            len(ordered_vertices) > 1
+            and len(vertex_raw_references) < len(ordered_vertices)
+        )
+        if vertex_aliased and len(vertex_raw_references) != 1:
+            raise CadError(
+                "cad_persistent_reference_alias",
+                "native vertex references mix aliased and distinct values",
+                {**base, "reference_sha256": sorted(vertex_raw_references)},
+            )
+        precomputed_vertex_identity_rows = []
+        if vertex_aliased:
+            _require_scope_owner(owner_scope, base)
+            vertex_witnesses = get_witness_rows().get("vertex", {})
+            edge_witnesses = get_witness_rows().get("edge", {})
+            for vertex_index, (
+                point_bits,
+                coincident_ordinal,
+                pointer,
+            ) in enumerate(ordered_vertices):
+                group = vertex_groups[pointer]
+                raw_sha256 = next(iter(group["raw_references"]))
+                witness = vertex_witnesses.get(vertex_index)
+                if (
+                    not isinstance(witness, dict)
+                    or set(witness)
+                    != {
+                        "part_document_sha256",
+                        "part_body_reference_sha256",
+                        "vertex_index",
+                        "persistent_reference_sha256",
+                    }
+                ):
+                    raise CadError(
+                        "cad_scope_witness_unavailable",
+                        "an aliased native vertex has no frozen part witness",
+                        {**base, "vertex_index": vertex_index},
+                    )
+                incident_component_edges = sorted({
+                    edge_index
+                    for edge_index, _ in group["occurrences"]
+                })
+                incident_part_edges = sorted(
+                    edge_witnesses[edge_index]["edge_index"]
+                    for edge_index in incident_component_edges
+                )
+                incident_part_edge_references = sorted(
+                    edge_witnesses[edge_index][
+                        "persistent_reference_sha256"
+                    ]
+                    for edge_index in incident_component_edges
+                )
+                topology_key = {
+                    "point_binary64": list(point_bits),
+                    "coincident_occurrence_index": coincident_ordinal,
+                    "incident_mapped_edge_indices": incident_part_edges,
+                    "incident_mapped_edge_reference_sha256":
+                        incident_part_edge_references,
+                }
+                identity = {
+                    "rule_version": NATIVE_SCOPE_IDENTITY_RULE,
+                    "entity_kind": "vertex",
+                    "identity_kind": "mapped_scope_local",
+                    "persistent": False,
+                    "owner_scope_key": _scope_owner_key(
+                        owner_scope,
+                        body_type=body_type,
+                        body_index=body_index,
+                        body_name=body_name,
+                    ),
+                    "source_document_sha256": owner_scope[
+                        "source_document_sha256"
+                    ],
+                    "native_vertex_index": vertex_index,
+                    "point_binary64_hex": list(point_bits),
+                    "coincident_occurrence_index": coincident_ordinal,
+                    "incident_mapped_edge_indices": incident_part_edges,
+                    "incident_mapped_edge_reference_sha256":
+                        incident_part_edge_references,
+                    "topology_signature_sha256":
+                        native_scope_identity_sha256(topology_key),
+                    "mapping_source_part_document_sha256": witness[
+                        "part_document_sha256"
+                    ],
+                    "mapping_source_body_reference_sha256": witness[
+                        "part_body_reference_sha256"
+                    ],
+                    "mapping_source_vertex_index": witness["vertex_index"],
+                    "mapped_source_vertex_persistent_reference_sha256":
+                        witness["persistent_reference_sha256"],
+                    "mapping_method": NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
+                    "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
+                    "warnings": [
+                        NATIVE_COMPONENT_REFERENCE_ALIASED,
+                        NATIVE_PART_WITNESS_DERIVED,
+                        NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
+                        NATIVE_TOPOLOGY_IDENTITY_DERIVED,
+                    ],
+                }
+                identity_sha256 = native_scope_identity_sha256(identity)
+                precomputed_vertex_identity_rows.append(
+                    {
+                        "vertex_index": vertex_index,
+                        "point_m": list(group["point_m"]),
+                        "identity_mode": NATIVE_SCOPE_IDENTITY_RULE,
+                        "native_reference_sha256": raw_sha256,
+                        "identity": identity,
+                        "identity_sha256": identity_sha256,
+                    }
+                )
+                registry.claim_scope(
+                    kind="vertex",
+                    raw_sha256=raw_sha256,
+                    identity_sha256=identity_sha256,
+                    owner={
+                        "kind": "vertex",
+                        **base,
+                        "vertex_index": vertex_index,
+                    },
+                    base=base,
+                )
+                for edge_index, endpoint_order in group["occurrences"]:
+                    endpoint_name = ("start", "end")[endpoint_order]
+                    endpoint = edge_rows[edge_index]["endpoints"][
+                        endpoint_name
+                    ]
+                    endpoint["reference"]["typed_sha256"] = identity_sha256
+                    endpoint["identity"] = identity
+
         edge_identity_by_legacy = {}
         edge_topology_keys = {}
         for edge_row in edge_rows:
@@ -5982,6 +6173,7 @@ class SolidWorksBackend(CadBackend):
                 or set(witness)
                 != {
                     "part_document_sha256",
+                    "part_body_reference_sha256",
                     "edge_index",
                     "persistent_reference_sha256",
                 }
@@ -6039,6 +6231,9 @@ class SolidWorksBackend(CadBackend):
                 "mapping_source_part_document_sha256": witness[
                     "part_document_sha256"
                 ],
+                "mapping_source_body_reference_sha256": witness[
+                    "part_body_reference_sha256"
+                ],
                 "mapping_source_edge_index": witness["edge_index"],
                 "mapping_source_edge_persistent_reference_sha256": witness[
                     "persistent_reference_sha256"
@@ -6047,7 +6242,9 @@ class SolidWorksBackend(CadBackend):
                 "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
                 "warnings": [
                     NATIVE_COMPONENT_REFERENCE_ALIASED,
+                    NATIVE_PART_WITNESS_DERIVED,
                     NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
+                    NATIVE_TOPOLOGY_IDENTITY_DERIVED,
                 ],
             }
             identity_sha256 = native_scope_identity_sha256(identity)
@@ -6071,99 +6268,7 @@ class SolidWorksBackend(CadBackend):
                 legacy_identity,
             )
 
-        vertex_groups = {}
-        for edge_row in edge_rows:
-            for order, endpoint_name in enumerate(("start", "end")):
-                endpoint = edge_row["endpoints"][endpoint_name]
-                pointer = endpoint["object_pointer"]
-                reference = endpoint["reference"]
-                if pointer is None or reference is None:
-                    continue
-                group = vertex_groups.setdefault(
-                    pointer,
-                    {
-                        "point_m": tuple(endpoint["point_m"]),
-                        "raw_references": set(),
-                        "incident_edges": set(),
-                        "occurrences": [],
-                    },
-                )
-                if tuple(endpoint["point_m"]) != group["point_m"]:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "one native vertex object returned different points",
-                        {
-                            **base,
-                            "edge_index": edge_row["index"],
-                            "endpoint": endpoint_name,
-                        },
-                    )
-                group["raw_references"].add(reference["raw_sha256"])
-                group["incident_edges"].add(
-                    edge_row["reference"]["typed_sha256"]
-                )
-                group["occurrences"].append(
-                    (edge_row["index"], order)
-                )
-        for pointer, group in vertex_groups.items():
-            if len(group["raw_references"]) != 1:
-                raise CadError(
-                    "cad_persistent_reference_alias",
-                    "one native vertex object has multiple references",
-                    {
-                        **base,
-                        "object_index": pointer,
-                        "reference_sha256": sorted(
-                            group["raw_references"]
-                        ),
-                    },
-                )
-        vertices_by_point = {}
-        for pointer, group in vertex_groups.items():
-            point_bits = tuple(
-                _binary64_bits(value) for value in group["point_m"]
-            )
-            vertices_by_point.setdefault(point_bits, []).append(
-                (min(group["occurrences"]), pointer)
-            )
-        for rows in vertices_by_point.values():
-            rows.sort()
-        ordered_vertices = sorted(
-            (
-                (
-                    tuple(
-                        _binary64_bits(value)
-                        for value in group["point_m"]
-                    ),
-                    occurrence,
-                    pointer,
-                )
-                for point_bits, rows in vertices_by_point.items()
-                for occurrence, (_, pointer) in enumerate(rows)
-                for group in (vertex_groups[pointer],)
-            ),
-            key=lambda row: (row[0], row[1]),
-        )
-        vertex_raw_references = {
-            next(iter(vertex_groups[pointer]["raw_references"]))
-            for _, _, pointer in ordered_vertices
-        }
-        vertex_aliased = (
-            len(ordered_vertices) > 1
-            and len(vertex_raw_references) < len(ordered_vertices)
-        )
-        if vertex_aliased and len(vertex_raw_references) != 1:
-            raise CadError(
-                "cad_persistent_reference_alias",
-                "native vertex references mix aliased and distinct values",
-                {
-                    **base,
-                    "reference_sha256": sorted(vertex_raw_references),
-                },
-            )
-        if vertex_aliased:
-            _require_scope_owner(owner_scope, base)
-        vertex_identity_rows = []
+        vertex_identity_rows = list(precomputed_vertex_identity_rows)
         if not vertex_aliased:
             for vertex_index, (_, _, pointer) in enumerate(
                 ordered_vertices
@@ -6174,21 +6279,20 @@ class SolidWorksBackend(CadBackend):
                     ("start", "end")[endpoint_order]
                 ]
                 typed_sha256 = endpoint["reference"]["typed_sha256"]
+                raw_sha256 = next(iter(group["raw_references"]))
                 vertex_identity_rows.append(
                     {
                         "vertex_index": vertex_index,
                         "point_m": list(group["point_m"]),
                         "identity_mode": NATIVE_PERSISTENT_IDENTITY_RULE,
-                        "native_reference_sha256": next(
-                            iter(group["raw_references"])
-                        ),
+                        "native_reference_sha256": raw_sha256,
                         "identity": None,
                         "identity_sha256": typed_sha256,
                     }
                 )
                 registry.claim(
                     kind="vertex",
-                    raw_sha256=next(iter(group["raw_references"])),
+                    raw_sha256=raw_sha256,
                     typed_sha256=typed_sha256,
                     owner={
                         "kind": "vertex",
@@ -6197,106 +6301,6 @@ class SolidWorksBackend(CadBackend):
                     },
                     base=base,
                 )
-        else:
-            for vertex_index, (
-                point_bits,
-                coincident_ordinal,
-                pointer,
-            ) in enumerate(ordered_vertices):
-                group = vertex_groups[pointer]
-                raw_sha256 = next(iter(group["raw_references"]))
-                topology_key = {
-                    "point_binary64": list(point_bits),
-                    "coincident_occurrence_index": coincident_ordinal,
-                    "incident_edge_identity_sha256": sorted(
-                        group["incident_edges"]
-                    ),
-                }
-                witness = (
-                    get_witness_rows().get("vertex", {}).get(
-                        vertex_index
-                    )
-                )
-                if (
-                    not isinstance(witness, dict)
-                    or set(witness)
-                    != {
-                        "part_document_sha256",
-                        "vertex_index",
-                        "persistent_reference_sha256",
-                    }
-                ):
-                    raise CadError(
-                        "cad_scope_witness_unavailable",
-                        "an aliased native vertex has no frozen part witness",
-                        {**base, "vertex_index": vertex_index},
-                    )
-                identity = {
-                    "rule_version": NATIVE_SCOPE_IDENTITY_RULE,
-                    "entity_kind": "vertex",
-                    "identity_kind": "mapped_scope_local",
-                    "persistent": False,
-                    "owner_scope_key": _scope_owner_key(
-                        owner_scope,
-                        body_type=body_type,
-                        body_index=body_index,
-                        body_name=body_name,
-                    ),
-                    "source_document_sha256": owner_scope[
-                        "source_document_sha256"
-                    ],
-                    "native_vertex_index": vertex_index,
-                    "point_binary64_hex": list(point_bits),
-                    "coincident_occurrence_index": coincident_ordinal,
-                    "incident_edge_identity_sha256": sorted(
-                        group["incident_edges"]
-                    ),
-                    "topology_signature_sha256": native_scope_identity_sha256(
-                        topology_key
-                    ),
-                    "mapping_source_part_document_sha256": witness[
-                        "part_document_sha256"
-                    ],
-                    "mapping_source_vertex_index": witness["vertex_index"],
-                    "mapped_source_vertex_persistent_reference_sha256": witness[
-                        "persistent_reference_sha256"
-                    ],
-                    "mapping_method": NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
-                    "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
-                    "warnings": [
-                        NATIVE_COMPONENT_REFERENCE_ALIASED,
-                        NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
-                    ],
-                }
-                identity_sha256 = native_scope_identity_sha256(identity)
-                vertex_identity_rows.append(
-                    {
-                        "vertex_index": vertex_index,
-                        "point_m": list(group["point_m"]),
-                        "identity_mode": NATIVE_SCOPE_IDENTITY_RULE,
-                        "native_reference_sha256": raw_sha256,
-                        "identity": identity,
-                        "identity_sha256": identity_sha256,
-                    }
-                )
-                registry.claim_scope(
-                    kind="vertex",
-                    raw_sha256=raw_sha256,
-                    identity_sha256=identity_sha256,
-                    owner={
-                        "kind": "vertex",
-                        **base,
-                        "vertex_index": vertex_index,
-                    },
-                    base=base,
-                )
-                for edge_index, endpoint_order in group["occurrences"]:
-                    endpoint_name = ("start", "end")[endpoint_order]
-                    endpoint = edge_rows[edge_index]["endpoints"][
-                        endpoint_name
-                    ]
-                    endpoint["reference"]["typed_sha256"] = identity_sha256
-                    endpoint["identity"] = identity
 
         edge_by_reference = {
             row["reference"]["typed_sha256"]: row for row in edge_rows
@@ -6980,6 +6984,12 @@ class SolidWorksBackend(CadBackend):
                         "the frozen part body is missing or ambiguous"
                     )
                 part_body = _dynamic(part_bodies[0])
+                part_body_reference_sha256 = (
+                    _persistent_reference_sha256(
+                        part_extension,
+                        part_body,
+                    )
+                )
                 part_faces = _as_list(_member(part_body, "GetFaces"))
                 if len(part_faces) != len(faces):
                     raise ValueError(
@@ -6998,6 +7008,10 @@ class SolidWorksBackend(CadBackend):
                     component_face_rows,
                     part_face_rows,
                 )
+                face_index_map = {
+                    row["mapping_index"]: face_map[row["mapping_key"]]
+                    for row in component_face_rows
+                }
 
                 component_edge_rows = _scope_edge_rows(
                     body,
@@ -7014,7 +7028,7 @@ class SolidWorksBackend(CadBackend):
                     row["mapping_key"] = _scope_edge_mapping_key(
                         row,
                         sorted(
-                            face_map[face_index]
+                            face_index_map[face_index]
                             for face_index in row["face_indices"]
                         ),
                     )
@@ -7028,6 +7042,10 @@ class SolidWorksBackend(CadBackend):
                     component_edge_rows,
                     part_edge_rows,
                 )
+                edge_index_map = {
+                    row["mapping_index"]: edge_map[row["mapping_key"]]
+                    for row in component_edge_rows
+                }
                 component_vertex_rows = _scope_vertex_rows(
                     component_edge_rows
                 )
@@ -7036,6 +7054,10 @@ class SolidWorksBackend(CadBackend):
                     component_vertex_rows,
                     part_vertex_rows,
                 )
+                vertex_index_map = {
+                    row["mapping_index"]: vertex_map[row["mapping_key"]]
+                    for row in component_vertex_rows
+                }
 
                 if (
                     len({
@@ -7083,32 +7105,38 @@ class SolidWorksBackend(CadBackend):
             "face": {
                 component_index: {
                     "part_document_sha256": source_sha256_after,
+                    "part_body_reference_sha256":
+                        part_body_reference_sha256,
                     "face_index": part_index,
                     "persistent_reference_sha256": part_face_rows[
                         part_index
                     ]["reference_sha256"],
                 }
-                for component_index, part_index in face_map.items()
+                for component_index, part_index in face_index_map.items()
             },
             "edge": {
                 component_index: {
                     "part_document_sha256": source_sha256_after,
+                    "part_body_reference_sha256":
+                        part_body_reference_sha256,
                     "edge_index": part_index,
                     "persistent_reference_sha256": part_edge_rows[
                         part_index
                     ]["reference_sha256"],
                 }
-                for component_index, part_index in edge_map.items()
+                for component_index, part_index in edge_index_map.items()
             },
             "vertex": {
                 component_index: {
                     "part_document_sha256": source_sha256_after,
+                    "part_body_reference_sha256":
+                        part_body_reference_sha256,
                     "vertex_index": part_index,
                     "persistent_reference_sha256": part_vertex_rows[
                         part_index
                     ]["reference_sha256"],
                 }
-                for component_index, part_index in vertex_map.items()
+                for component_index, part_index in vertex_index_map.items()
             },
         }
         self.notes[
@@ -7120,9 +7148,9 @@ class SolidWorksBackend(CadBackend):
             "source_document_sha256": source_sha256_after,
             "referenced_configuration": referenced_configuration,
             "component_body_name": body_name,
-            "face_count": len(face_map),
-            "edge_count": len(edge_map),
-            "vertex_count": len(vertex_map),
+            "face_count": len(face_index_map),
+            "edge_count": len(edge_index_map),
+            "vertex_count": len(vertex_index_map),
             "status": "bidirectional_one_to_one",
             "document_ownership": "existing_owned_session_no_close",
         }
@@ -7351,6 +7379,9 @@ class SolidWorksBackend(CadBackend):
                         "body_reference_sha256": graph["body_reference"][
                             "typed_sha256"
                         ],
+                        "native_body_reference_sha256": graph[
+                            "body_reference"
+                        ]["raw_sha256"],
                         "face_index": face_index,
                         "face_reference_sha256": face_row["reference"][
                             "typed_sha256"

@@ -49,6 +49,10 @@ from ..stages import (
     activity_view,
     stage_view,
 )
+from ..geometry.native_u import (
+    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    native_scope_warning_diagnostic_is_valid,
+)
 from .airflow_client import (
     EndpointConfig,
     EndpointError,
@@ -292,19 +296,42 @@ def _quality_warnings(report: dict | None) -> list[dict]:
     """The displayable non-blocking diagnostics of the registered quality report."""
 
     warnings: list[dict] = []
-    for item in _registered_source_rows(report or {}, "diagnostics", code_required=True):
+    diagnostics = _registered_source_rows(
+        report or {},
+        "diagnostics",
+        code_required=True,
+    )
+    native_scope = [
+        item
+        for item in diagnostics
+        if str(item["code"]) in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+    ]
+    if native_scope and (
+        {str(item["code"]) for item in native_scope}
+        != NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        or any(
+            not native_scope_warning_diagnostic_is_valid(item)
+            for item in native_scope
+        )
+    ):
+        raise PortalError(
+            HTTPStatus.BAD_GATEWAY,
+            "Registered native identity warning projection is incomplete or forged",
+        )
+    for item in diagnostics:
+        code = str(item["code"])
         if item.get("blocking") is not False:
             # Only an explicit non-blocking diagnostic is a warning.  A
             # missing or unknown flag must never be downgraded silently.
             continue
         warning = {
             "source": "quality",
-            "code": str(item["code"]),
+            "code": code,
             "object": str(item.get("object") or ""),
             "message": str(item.get("message") or ""),
             "detail": item.get("detail"),
         }
-        for key in ("blocking", "objects"):
+        for key in ("blocking", "severity", "objects"):
             if key in item:
                 warning[key] = item[key]
         warnings.append(warning)

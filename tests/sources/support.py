@@ -372,6 +372,10 @@ def native_tessellation_fixture(
     input_edges = copy.deepcopy(list(native_edges))
     for span in spans:
         span.setdefault(
+            "native_body_reference_sha256",
+            span["body_reference_sha256"],
+        )
+        span.setdefault(
             "native_face_reference_sha256",
             span["face_reference_sha256"],
         )
@@ -849,22 +853,25 @@ def native_tessellation_fixture(
             point = edge[f"{endpoint}_point_m"]
             if reference is None or point is None:
                 continue
-            key = (*body_key, reference)
+            key = (
+                *body_key,
+                reference,
+                *(
+                    struct.pack("<d", float(value)).hex()
+                    for value in point
+                ),
+            )
             previous = vertex_identity_by_key.get(key)
             if previous is not None:
-                if previous != point:
-                    raise ValueError(
-                        "fixture vertex reference has inconsistent points"
-                    )
                 continue
             vertex_identity_by_key[key] = point
     next_vertex_index = {}
-    for body_key, reference, point in sorted(
+    for body_key, reference, _point_bits, point in sorted(
         (
-            (key[:2], key[2], value)
+            (key[:2], key[2], key[3:], value)
             for key, value in vertex_identity_by_key.items()
         ),
-        key=lambda item: (item[0], item[1]),
+        key=lambda item: (item[0], item[1], item[2]),
     ):
         vertex_index = next_vertex_index.get(body_key, 0)
         next_vertex_index[body_key] = vertex_index + 1
@@ -932,6 +939,13 @@ def native_tessellation_fixture(
                 "evaluate2_calls": u_observations,
             },
             "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
+            "reference_alias_audit": {
+                "body": [],
+                "face": [],
+                "edge": [],
+                "vertex": [],
+            },
+            "cross_kind_raw_aliases": [],
             "bodies": body_rows,
             "vertices": vertex_rows,
             "solidworks_vertex_identities": solidworks_vertex_identities,

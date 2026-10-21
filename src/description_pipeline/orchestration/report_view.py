@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import PureWindowsPath
 
+from ..geometry.native_u import NATIVE_SCOPE_IDENTITY_WARNING_CODES
 from ..stages import FIXED_REQUIRED_CHECKS, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
@@ -103,6 +104,10 @@ _DISCOVERY_CODE_LABELS = {
 
 #: Readable names for verifier diagnostics carried on check details (recorded warnings).
 _DIAGNOSTIC_CODE_LABELS = {
+    "cad_component_persistent_reference_aliased": "CAD component persistent reference is aliased (diagnostic)",
+    "cad_scope_local_identity_derived": "Scope-local native identity is derived (diagnostic)",
+    "cad_part_identity_witness_derived": "Part identity witness is derived (diagnostic)",
+    "cad_topology_identity_derived": "Topology identity is derived (diagnostic)",
     "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
     "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
@@ -736,6 +741,19 @@ _WARNING_DETAIL_KEYS = (
     "mass_kg",
     "masses",
     "objects",
+    "component",
+    "entity_kind",
+    "body_type",
+    "body_index",
+    "owner_scope_key",
+    "object_indices",
+    "field",
+    "native_reference_sha256",
+    "mapping_source_part_document_sha256",
+    "mapping_source_body_reference_sha256",
+    "mapped_source_indices",
+    "mapped_source_persistent_reference_sha256",
+    "topology_signature_sha256s",
 )
 _WARNING_RESIDUAL_KEYS = ("max_abs_residual", "max_normalized_residual", "threshold")
 
@@ -745,6 +763,7 @@ def _warning_row(stage: dict, item: dict) -> dict:
 
     code = str(item.get("code") or "")
     detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    context = {**item, **detail}
     row: dict = {
         "stage": stage.get("id"),
         "stage_name": stage.get("name"),
@@ -753,13 +772,32 @@ def _warning_row(stage: dict, item: dict) -> dict:
         "state_label": "Warning",
         "blocking": False,
     }
-    object_id = item.get("object") or (f"joint:{detail['joint']}" if detail.get("joint") else None)
+    object_id = (
+        item.get("object")
+        or (f"joint:{detail['joint']}" if detail.get("joint") else None)
+        or (
+            f"{context['component']}:{context['entity_kind']}:"
+            f"{context['body_type']}/{context['body_index']}"
+            if all(
+                key in context
+                for key in (
+                    "component",
+                    "entity_kind",
+                    "body_type",
+                    "body_index",
+                )
+            )
+            else context.get("component")
+        )
+    )
     if object_id:
         row["object"] = str(object_id)
     if item.get("message"):
-        row["message"] = str(item.get("message"))
+        row["message"] = str(item["message"])
+    elif code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
+        row["message"] = str(row["label"])
     for key in _WARNING_DETAIL_KEYS:
-        value = detail.get(key)
+        value = context.get(key)
         if value is not None:
             # Authored zeros (for example an equal zero joint range) stay exact values.
             row[key] = value

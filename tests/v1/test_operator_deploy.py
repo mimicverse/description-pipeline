@@ -2741,7 +2741,7 @@ class InstallOrderingTests(unittest.TestCase):
             binary.rename(work / "saved-nginx")
             operatorctl = ["bash", str(release / "operator" / "operatorctl.sh")]
             config = str(release.parent / "platform.json")
-            for verb, expect_failure in (("status", False), ("health", True)):
+            for verb, expect_failure in (("status", True), ("health", True)):
                 with self.subTest(verb=verb):
                     order.write_text("", encoding="utf-8")
                     before = tree_state(work)

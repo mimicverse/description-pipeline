@@ -1615,8 +1615,14 @@ case "$ACTION" in
     ;;
   status)
     load_installed
-    drift_check || true
-    systemctl --user is-active "${UNITS[@]}" || true
+    STATUS_RC=0
+    drift_check || STATUS_RC=1
+    for unit in "${UNITS[@]}"; do
+      state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+      printf '%s %s\n' "$unit" "${state:-unknown}"
+      [ "$state" = "active" ] || STATUS_RC=1
+    done
+    exit "$STATUS_RC"
     ;;
   health)
     load_installed

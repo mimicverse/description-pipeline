@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import struct
 
 NATIVE_U_IDENTITY_RULE = "native-u-identity-128ulp-v1"
@@ -43,6 +44,65 @@ NATIVE_SCOPE_SOURCE_AUTHORITY = (
 NATIVE_FACE_IDENTITY_KEY_RULE = "native-face-area-bbox-exact-v1"
 NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED = "cad_scope_local_identity_derived"
 NATIVE_COMPONENT_REFERENCE_ALIASED = "cad_component_persistent_reference_aliased"
+NATIVE_PART_WITNESS_DERIVED = "cad_part_identity_witness_derived"
+NATIVE_TOPOLOGY_IDENTITY_DERIVED = "cad_topology_identity_derived"
+NATIVE_SCOPE_IDENTITY_WARNING_CODES = frozenset(
+    {
+        NATIVE_COMPONENT_REFERENCE_ALIASED,
+        NATIVE_PART_WITNESS_DERIVED,
+        NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
+        NATIVE_TOPOLOGY_IDENTITY_DERIVED,
+    }
+)
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def native_scope_warning_detail_is_valid(detail: object) -> bool:
+    """Whether one projected native-scope warning fully locates its object."""
+
+    return (
+        isinstance(detail, dict)
+        and isinstance(detail.get("component"), str)
+        and bool(detail["component"])
+        and detail.get("entity_kind") in {"face", "edge", "vertex"}
+        and type(detail.get("body_type")) is int
+        and detail["body_type"] in {0, 1}
+        and type(detail.get("body_index")) is int
+        and detail["body_index"] >= 0
+        and isinstance(detail.get("owner_scope_key"), str)
+        and bool(_HEX64.fullmatch(detail["owner_scope_key"]))
+        and detail.get("persistent") is False
+        and detail.get("rule_version") == NATIVE_SCOPE_IDENTITY_RULE
+        and isinstance(detail.get("object_indices"), list)
+        and detail["object_indices"]
+        == sorted(set(detail["object_indices"]))
+        and all(
+            type(index) is int and index >= 0
+            for index in detail["object_indices"]
+        )
+        and detail.get("field") == "identity.warnings"
+    )
+
+
+def native_scope_warning_diagnostic_is_valid(item: object) -> bool:
+    """Whether one quality diagnostic is a complete non-blocking scope warning."""
+
+    return (
+        isinstance(item, dict)
+        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        and item.get("blocking") is False
+        and isinstance(item.get("message"), str)
+        and bool(item["message"].strip())
+        and isinstance(item.get("object"), str)
+        and native_scope_warning_detail_is_valid(item.get("detail"))
+        and item["object"]
+        == (
+            f"{item['detail']['component']}:"
+            f"{item['detail']['entity_kind']}:"
+            f"{item['detail']['body_type']}/"
+            f"{item['detail']['body_index']}"
+        )
+    )
 
 
 def native_scope_identity_sha256(value: dict) -> str:
