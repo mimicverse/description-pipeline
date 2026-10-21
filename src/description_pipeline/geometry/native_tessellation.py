@@ -173,7 +173,15 @@ def _valid_u_evidence(
         or projection_error > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
     ):
         return False
-    if native_u_equal(value["u"], domain_lower):
+    parameter_success = native_get_parameter_success(
+        parameter[1]
+    ) if isinstance(parameter, list) and len(parameter) == 2 else None
+    if parameter_success is False:
+        computed_tolerance = (
+            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+        )
+        point_roundtrip_rule = NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
+    elif native_u_equal(value["u"], domain_lower):
         computed_tolerance = native_curve_endpoint_operation_tolerance(
             closest_point,
             evaluated_point,
@@ -210,9 +218,6 @@ def _valid_u_evidence(
         value["source_evaluate_error_m"],
         value["closest_evaluate_error_m"],
     )
-    parameter_success = native_get_parameter_success(
-        parameter[1]
-    ) if isinstance(parameter, list) and len(parameter) == 2 else None
     fallback = parameter_success is False
     expected_u_rule = (
         NATIVE_U_CLOSEST_FALLBACK_RULE

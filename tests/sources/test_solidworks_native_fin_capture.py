@@ -1543,6 +1543,12 @@ class NativeFinCaptureTests(unittest.TestCase):
         _start, _end, evaluated_start, _evaluated_end = (
             self.configure_group_333(edge, tessellation)
         )
+        fallback_evaluation = (
+            evaluated_start[0] + 5e-6,
+            evaluated_start[1],
+            evaluated_start[2],
+        )
+        edge.evaluate_u_points[edge.u_min] = fallback_evaluation
         edge.GetParameter = lambda x, y, z: [
             edge.u_min if (x, y, z) == evaluated_start else edge.u_max,
             0.0 if (x, y, z) == evaluated_start else packed_evaluate_status(1),
@@ -1565,8 +1571,31 @@ class NativeFinCaptureTests(unittest.TestCase):
             "closest_point_fallback",
         )
         self.assertEqual(evidence["fallback_reason"], "get_parameter_false")
+        self.assertGreaterEqual(evidence["source_evaluate_error_m"], 4.9e-6)
+        self.assertEqual(
+            evidence["point_roundtrip_rule"],
+            "tessellation-edge-projection-v1",
+        )
         self.assertEqual(evidence["parameter_success_bit"], 0)
         self.assertIs(evidence["parameter_success_parsed"], False)
+
+    def test_closest_fallback_over_50_micrometre_evaluation_is_rejected(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        _start, _end, evaluated_start, _evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        edge.evaluate_u_points[edge.u_min] = (
+            evaluated_start[0] + 60e-6,
+            evaluated_start[1],
+            evaluated_start[2],
+        )
+        edge.GetParameter = lambda x, y, z: [
+            edge.u_min if (x, y, z) == evaluated_start else edge.u_max,
+            0.0 if (x, y, z) == evaluated_start else packed_evaluate_status(1),
+        ]
+
+        with self.assertRaises(CadError):
+            self.capture(body, extension)
 
     def test_parser_accepts_group_333_operation_bound(self):
         evidence, triangles = self.group_333_tessellation()
@@ -1849,6 +1878,10 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         fin_evidence["parameter_u_source"] = "closest_point_fallback"
         fin_evidence["fallback_reason"] = "get_parameter_false"
+        fin_evidence["point_roundtrip_rule"] = (
+            "tessellation-edge-projection-v1"
+        )
+        fin_evidence["point_tolerance_m"] = 50e-6
 
         spans = parse_native_tessellation(
             "part-1",

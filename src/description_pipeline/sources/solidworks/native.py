@@ -5359,7 +5359,14 @@ class SolidWorksBackend(CadBackend):
             evaluated_point = _binary64_xyz(
                 evaluate_evidence["payload"][:3]
             )
-            if native_u_equal(parameter_u, domain["u_min"]):
+            if parameter_success is False:
+                point_tolerance = (
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+                )
+                point_roundtrip_rule = (
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
+                )
+            elif native_u_equal(parameter_u, domain["u_min"]):
                 point_tolerance = native_curve_endpoint_operation_tolerance(
                     closest_point,
                     evaluated_point,
