@@ -120,6 +120,11 @@ foreach ($rights in @(
     (Get-ManagedComparableRights ([long]($rights -bor [System.Security.AccessControl.FileSystemRights]::Synchronize))) -eq
       (Get-ManagedComparableRights ([long]$rights)))
 }
+Check 'windows_acl.regular_file_read_execute_is_read' (
+  (Get-ManagedComparableRights (
+    [long][System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -RegularFile) -eq
+  (Get-ManagedComparableRights (
+    [long][System.Security.AccessControl.FileSystemRights]::Read) -RegularFile))
 Check 'windows_recovery.net_tcp_no_match' (Test-NetTcpNoMatchError ([pscustomobject]@{
   CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
   FullyQualifiedErrorId='CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'
@@ -236,7 +241,8 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     (Test-Path -LiteralPath (Join-Path $aclRoot '.description-managed-root.json') -PathType Leaf))
   Check 'windows_acl.bootstrap_marker_acl' (@($bootstrapReceipt.marker_acl.rules | Where-Object {
     $_.sid -eq $localUser.SID.Value -and
-    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Read -and
+    (Get-ManagedComparableRights ([long]$_.rights) -RegularFile) -eq
+      (Get-ManagedComparableRights ([long][System.Security.AccessControl.FileSystemRights]::Read) -RegularFile) -and
     -not $_.inherited
   }).Count -eq 1 -and @($bootstrapReceipt.marker_acl.rules | Where-Object {
     $_.sid -in @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-4')

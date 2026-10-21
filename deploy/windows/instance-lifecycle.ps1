@@ -855,10 +855,15 @@ function New-ManagedAccessRule(
     [System.Security.AccessControl.PropagationFlags]::None,
     [System.Security.AccessControl.AccessControlType]::Allow)
 }
-function Get-ManagedComparableRights([long]$Rights) {
+function Get-ManagedComparableRights([long]$Rights, [switch]$RegularFile) {
   # The filesystem persists this generic mapping bit on ACEs; the project matrix compares
-  # semantic file rights and intentionally ignores only this bit.
-  return [long]$Rights -band [long]0xFFEFFFFF
+  # semantic file rights and intentionally ignores this bit. Regular files cannot persist
+  # ExecuteFile as a distinct effective bit, so ReadAndExecute compares as Read only there.
+  $comparable = [long]$Rights -band [long]0xFFEFFFFF
+  if ($RegularFile) {
+    $comparable = $comparable -band [long]0xFFFFFFDF
+  }
+  return $comparable
 }
 function Assert-ManagedAcl(
   [string]$Path,
@@ -906,8 +911,8 @@ function Assert-ManagedAcl(
       if ($rule.access_type -ne 'Allow' -or
           $seenRuleSids.ContainsKey($ruleSid) -or
           -not $expectedRights.ContainsKey($ruleSid) -or
-          (Get-ManagedComparableRights ([long]$rule.rights)) -ne
-            (Get-ManagedComparableRights ([long]$expectedRights[$ruleSid])) -or
+          (Get-ManagedComparableRights ([long]$rule.rights) -RegularFile:(-not [bool]$item.PSIsContainer)) -ne
+            (Get-ManagedComparableRights ([long]$expectedRights[$ruleSid]) -RegularFile:(-not [bool]$item.PSIsContainer)) -or
           [int]$rule.inheritance -ne $expectedInheritance -or
           [int]$rule.propagation -ne 0 -or
           ($Protected -and [bool]$rule.inherited) -or

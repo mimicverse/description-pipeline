@@ -4612,7 +4612,8 @@ def _validate_windows_acl_policy(
     administrators_sid = "S-1-5-32-544"
 
     def comparable(rights: int) -> int:
-        return int(rights) & 0xFFEFFFFF
+        value = int(rights) & 0xFFEFFFFF
+        return value if directory else value & 0xFFFFFFDF
 
     inheritance = 0 if non_inheriting or not directory else 3
     expected = {
