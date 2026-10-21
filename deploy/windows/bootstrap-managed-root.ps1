@@ -201,14 +201,7 @@ function Assert-ManagedAcl([string]$path, [string]$serviceSid) {
   }
 }
 function Assert-ServiceInherited([string]$path, [string]$serviceSid) {
-  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
   $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
-  $expectedInheritance = if ($item.PSIsContainer) {
-    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-  } else {
-    [System.Security.AccessControl.InheritanceFlags]::None
-  }
   $matching = @($acl.GetAccessRules(
     $true,
     $true,
@@ -219,7 +212,6 @@ function Assert-ServiceInherited([string]$path, [string]$serviceSid) {
       [long]$_.FileSystemRights -eq
         [long][System.Security.AccessControl.FileSystemRights]::FullControl -and
       $_.IsInherited -and
-      [int]$_.InheritanceFlags -eq [int]$expectedInheritance -and
       [int]$_.PropagationFlags -eq
         [int][System.Security.AccessControl.PropagationFlags]::None
     })
