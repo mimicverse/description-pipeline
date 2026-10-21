@@ -334,6 +334,11 @@ def _scope_edge_rows(body, extension, face_rows) -> list[dict]:
             endpoints[endpoint] = {
                 "state": "present",
                 "object_pointer": _com_object_pointer(vertex),
+                # Keep the dispatch alive for the complete witness scan.  Without
+                # this owner, SolidWorks may recycle the COM pointer after this
+                # endpoint wrapper is released and a later edge can appear to
+                # reuse the same pointer for a different vertex.
+                "native_object": vertex,
                 "reference_sha256": _persistent_reference_sha256(
                     extension,
                     vertex,

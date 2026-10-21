@@ -3475,6 +3475,26 @@ class NativeFinCaptureTests(unittest.TestCase):
         ), self.assertRaises(ValueError):
             _scope_edge_rows(body, extension, face_rows)
 
+    def test_scope_mapping_retains_live_vertex_dispatches(self):
+        body, _face_10, _face_20, edge, _tessellation, extension = (
+            self.fixture()
+        )
+        face_rows = _scope_face_rows(body.faces, extension)
+        with patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            rows = _scope_edge_rows(body, extension, face_rows)
+        self.assertIs(
+            rows[0]["endpoints"]["start"]["native_object"],
+            edge.vertices[0],
+        )
+        self.assertIs(
+            rows[0]["endpoints"]["end"]["native_object"],
+            edge.vertices[1],
+        )
+
     def test_part_identity_witness_is_globally_unique_across_bodies(self):
         reference = hashlib.sha256(b"shared-part-witness").hexdigest()
         rows = [
