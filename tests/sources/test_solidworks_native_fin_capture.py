@@ -1860,6 +1860,100 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(len(spans), 2)
 
+    def test_parser_rejects_fallback_with_source_evaluate_error_over_50_micrometres(self):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(row["start_u"], edge["u_min"])
+        )
+        fin_evidence = fin["start_evidence"]
+        source = list(fin_evidence["source_point_m"])
+        source[0] += 60e-6
+        fin_evidence["source_point_m"] = source
+        fin_evidence["projection_error_m"] = 60e-6
+        fin_evidence["closest_point_error_m"] = 60e-6
+        fin_evidence["source_evaluate_error_m"] = 60e-6
+        fin_evidence["parameter_raw"][1] = 0.0
+        fin_evidence["parameter_success_raw"] = 0.0
+        fin_evidence["parameter_success_raw_type"] = "float"
+        fin_evidence["parameter_success_bit"] = 0
+        fin_evidence["parameter_success_parsed"] = False
+        fin_evidence["u_parameter_rule"] = (
+            "native-u-closest-point-fallback-v1"
+        )
+        fin_evidence["parameter_u_source"] = "closest_point_fallback"
+        fin_evidence["fallback_reason"] = "get_parameter_false"
+
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                None,
+            )
+
+    def test_parser_rejects_fallback_with_closest_u_outside_domain(self):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+        )
+        fin_evidence = fin["start_evidence"]
+        fin_evidence["closest_point_on_raw"][3] = edge["u_max"] + 1.0
+        fin_evidence["parameter_raw"][1] = 0.0
+        fin_evidence["parameter_success_raw"] = 0.0
+        fin_evidence["parameter_success_raw_type"] = "float"
+        fin_evidence["parameter_success_bit"] = 0
+        fin_evidence["parameter_success_parsed"] = False
+        fin_evidence["u_parameter_rule"] = (
+            "native-u-closest-point-fallback-v1"
+        )
+        fin_evidence["parameter_u_source"] = "closest_point_fallback"
+        fin_evidence["fallback_reason"] = "get_parameter_false"
+
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                None,
+            )
+
+    def test_parser_rejects_fallback_with_malformed_parameter_result(self):
+        evidence, triangles = self.group_333_tessellation()
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+        )
+        fin_evidence = fin["start_evidence"]
+        fin_evidence["parameter_raw"] = [fin_evidence["u"]]
+        fin_evidence["parameter_success_raw"] = 0.0
+        fin_evidence["parameter_success_raw_type"] = "float"
+        fin_evidence["parameter_success_bit"] = 0
+        fin_evidence["parameter_success_parsed"] = False
+        fin_evidence["u_parameter_rule"] = (
+            "native-u-closest-point-fallback-v1"
+        )
+        fin_evidence["parameter_u_source"] = "closest_point_fallback"
+        fin_evidence["fallback_reason"] = "get_parameter_false"
+
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                None,
+            )
+
     def test_parser_rejects_group_333_operation_bound_overshoot(self):
         evidence, triangles = self.group_333_tessellation()
         evaluation = evidence["native_edges"][0][
