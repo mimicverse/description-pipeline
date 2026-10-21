@@ -1448,6 +1448,28 @@ class NativeFinCaptureTests(unittest.TestCase):
             fin_evidence["closest_point_on_raw"][3],
         )
 
+    def test_parser_rejects_auxiliary_closest_u_outside_edge_domain(self):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        fins = evidence["itessellation"]["bodies"][0]["fins"]
+        fin = next(
+            row
+            for row in fins
+            if native_u_equal(row["start_evidence"]["u"], edge["u_min"])
+        )
+        fin["start_evidence"]["closest_point_on_raw"][3] = edge["u_max"] + 1.0
+
+        with self.assertRaises(PipelineError) as caught:
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+        self.assertIn("U evidence is not independently reproducible", str(caught.exception))
+
     def test_parser_rejects_group_333_operation_bound_overshoot(self):
         evidence, triangles = self.group_333_tessellation()
         evaluation = evidence["native_edges"][0][

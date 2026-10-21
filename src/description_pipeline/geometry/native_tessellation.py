@@ -60,7 +60,13 @@ def _valid_evaluate2_packed_status(value: object) -> bool:
     )
 
 
-def _valid_u_evidence(value: object, u_parameter: object, endpoint_point: object) -> bool:
+def _valid_u_evidence(
+    value: object,
+    u_parameter: object,
+    endpoint_point: object,
+    domain_lower: object,
+    domain_upper: object,
+) -> bool:
     """Validate one retained GetClosestPointOn/GetParameter/Evaluate2 proof."""
 
     if not isinstance(value, dict) or set(value) != {
@@ -150,11 +156,21 @@ def _valid_u_evidence(value: object, u_parameter: object, endpoint_point: object
         and type(parameter[0]) in numeric
         and math.isfinite(float(parameter[0]))
         and native_get_parameter_success(parameter[1]) is True
+        and native_u_in_closed_interval(
+            closest[3],
+            domain_lower,
+            domain_upper,
+        )
         and value["parameter_success_raw"] == parameter[1]
         and value["parameter_success_raw_type"] == type(parameter[1]).__name__
         and value["parameter_success_bit"] == 1
         and value["parameter_success_parsed"] is True
         and native_u_equal(parameter[0], value["u"])
+        and native_u_in_closed_interval(
+            parameter[0],
+            domain_lower,
+            domain_upper,
+        )
         and _valid_evaluate2_packed_status(
             value["evaluate_packed_status"]
         )
@@ -1071,9 +1087,21 @@ def _parse_v3_itessellation(
             cached == referenced,
             component + ": native tessellation v3 vertex cache differs from fin vertices",
         )
+        edge_domains = {
+            edge["edge_reference_sha256"]: (edge["u_min"], edge["u_max"])
+            for edge in native_edges
+            if edge["body_type"] == body_key[0]
+            and edge["body_index"] == body_key[1]
+        }
         for fin in evidence["fins"].values():
             if fin["classification"] == "internal_only":
                 continue
+            domain = edge_domains.get(fin["edge_reference_sha256"])
+            _require(
+                domain is not None,
+                component
+                + f": native fin {fin['fin_id']} has no captured edge domain",
+            )
             for vertex_id, u_value, evidence_value in (
                 (
                     fin["vertex_ids"][0],
@@ -1091,6 +1119,8 @@ def _parse_v3_itessellation(
                         evidence_value,
                         u_value,
                         vertices[(body_key, vertex_id)],
+                        domain[0],
+                        domain[1],
                     ),
                     component
                     + f": native fin {fin['fin_id']} U evidence is not independently reproducible",
