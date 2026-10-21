@@ -107,7 +107,7 @@ def parse_native_tessellation(
             and isinstance(face_reference, str)
             and bool(HEX64.fullmatch(face_reference))
             and _integer(face_owner_id)
-            and 0 < face_owner_id < 0xFFFF
+            and 0 < face_owner_id <= 0xFFFF
             and isinstance(edge_references, list)
             and len(edge_references) == len(set(edge_references))
             and all(
@@ -256,16 +256,14 @@ def parse_native_tessellation(
                 and face_key[2] in owner[1],
                 component + f": face {face_key} has no matching native edge incidence for {reference}",
             )
-    _require(
-        all(
-            any(
+    for reference, (body_key, face_indices) in edge_owners.items():
+        _require(
+            all(
                 reference in face_edge_references[(*body_key, face_index)]
                 for face_index in face_indices
-            )
-            for reference, (body_key, face_indices) in edge_owners.items()
-        ),
-        component + ": native edge incidence is not bound to its faces",
-    )
+            ),
+            component + ": native edge incidence is not bound to every declared face",
+        )
     _require(
         not (
             set(body_references.values())

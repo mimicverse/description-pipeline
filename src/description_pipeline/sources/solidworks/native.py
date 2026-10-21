@@ -4656,7 +4656,7 @@ class SolidWorksBackend(CadBackend):
                         }
                     )
                 tessellation["no_facets_faces"].extend(body_evidence["no_facets_faces"])
-        if len(tessellation["face_spans"]) >= 0xFFFF:
+        if len(tessellation["face_spans"]) > 0xFFFF:
             raise CadError(
                 "cad_mesh_export_failed",
                 "the component carries more face owners than a binary STL attribute can bind",

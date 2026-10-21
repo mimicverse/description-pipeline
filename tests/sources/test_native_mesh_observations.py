@@ -316,6 +316,10 @@ class NativeMeshObservationTests(unittest.TestCase):
         def edge_incidence_mismatch(row):
             row["tessellation"]["native_edges"][0]["face_indices"] = [0]
 
+        def missing_reverse_edge_incidence(row):
+            shared = row["tessellation"]["native_edges"][0]["edge_reference_sha256"]
+            row["tessellation"]["face_spans"][1]["edge_references"].remove(shared)
+
         def role_identity_alias(row):
             face_reference = row["tessellation"]["face_spans"][0]["face_reference_sha256"]
             edge = row["tessellation"]["native_edges"][0]
@@ -379,6 +383,11 @@ class NativeMeshObservationTests(unittest.TestCase):
             ("stl-digest", wrong_stl_digest, "STL bytes do not bind"),
             ("facetless", missing_facetless_row, "differs from zero-length"),
             ("edge-incidence", edge_incidence_mismatch, "no matching native edge incidence"),
+            (
+                "edge-reverse-incidence",
+                missing_reverse_edge_incidence,
+                "not bound to every declared face",
+            ),
             ("role-alias", role_identity_alias, "identities must not alias"),
             ("vertex-role-alias", vertex_role_alias, "identities must not alias"),
             ("vertex-coordinate-conflict", vertex_coordinate_conflict, "multiple coordinates"),
