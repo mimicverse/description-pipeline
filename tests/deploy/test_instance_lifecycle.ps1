@@ -84,7 +84,8 @@ Check 'wording.windows_managed_acl' ($source.Contains('Set-ManagedEndpointAcls')
 $harnessPath = Join-Path $PSScriptRoot 'invoke-main-harness.ps1'
 $harnessSource = Get-Content -LiteralPath $harnessPath -Raw
 Check 'wording.harness_acl_signature' (
-  $harnessSource.Contains('[switch]$AllowServiceOwner') -and
+  $harnessSource.Contains('[string]$ServiceSid') -and
+  -not $harnessSource.Contains('[switch]$AllowServiceOwner') -and
   -not $harnessSource.Contains('[string]$ServiceRights') -and
   -not $harnessSource.Contains('[string]$ServiceSid, [string]$TaskFile'))
 Check 'wording.windows_recovery_identity' ($source.Contains('config_digest') -and
@@ -230,15 +231,49 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     $bootstrapReceipt.managed_runtime.sid -eq $serviceSid -and
     $bootstrapReceipt.managed_runtime.administrator -eq $true -and
     $bootstrapReceipt.managed_runtime.privilege_qualification -eq 'user-approved-administrator-runtime' -and
-    $bootstrapReceipt.managed_runtime.acl_ace -eq $false -and
+    $bootstrapReceipt.managed_runtime.acl_ace -eq $true -and
     (Test-Path -LiteralPath (Join-Path $aclRoot '.description-managed-root.json') -PathType Leaf))
   Check 'windows_acl.bootstrap_marker_acl' (@($bootstrapReceipt.marker_acl.rules | Where-Object {
-    $_.sid -in @('S-1-5-18', 'S-1-5-32-544') -and
+    $_.sid -in @('S-1-5-18', 'S-1-5-32-544', $serviceSid) -and
     $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl -and
     -not $_.inherited
-  }).Count -eq 2 -and @($bootstrapReceipt.marker_acl.rules | Where-Object {
+  }).Count -eq 3 -and @($bootstrapReceipt.marker_acl.rules | Where-Object {
     $_.sid -in @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-4')
   }).Count -eq 0)
+  Check 'windows_acl.bootstrap_existing_service_access' (@(
+      (Get-AclProjection $packageChild).rules | Where-Object {
+        $_.sid -eq $serviceSid -and
+        $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
+      }).Count -eq 1)
+  $packageRead = $false
+  try {
+    $stream = [System.IO.File]::OpenRead($packageChild)
+    $stream.Dispose()
+    $packageRead = $true
+  } catch {
+    $packageRead = $false
+  }
+  Check 'windows_acl.bootstrap_existing_service_read' $packageRead
+  $inheritedProbe = Join-Path $aclRoot 'bootstrap-inherited-probe'
+  $null = New-Item -ItemType Directory -Path $inheritedProbe -ErrorAction Stop
+  $inheritedFile = Join-Path $inheritedProbe 'payload.txt'
+  [System.IO.File]::WriteAllText(
+    $inheritedFile,
+    'service-access',
+    (New-Object System.Text.UTF8Encoding($false)))
+  Check 'windows_acl.bootstrap_new_child_inherits_service' (@(
+      (Get-AclProjection $inheritedProbe).rules | Where-Object {
+        $_.sid -eq $serviceSid -and
+        $_.inherited -and
+        $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
+      }).Count -eq 1)
+  Check 'windows_acl.bootstrap_new_file_inherits_service' (@(
+      (Get-AclProjection $inheritedFile).rules | Where-Object {
+        $_.sid -eq $serviceSid -and
+        $_.inherited -and
+        $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
+      }).Count -eq 1)
+  Remove-Item -LiteralPath $inheritedProbe -Recurse -Force -ErrorAction SilentlyContinue
   $operatorAuthorization = Get-ManagedServiceAuthorization $serviceSid
   Check 'windows_acl.administrator_runtime_allowed' (
     $operatorAuthorization.administrator -eq $true)
@@ -257,8 +292,8 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $commonRows = @($aclRows | Where-Object {
     (Normalize-PathIdentity ([string]$_.path)) -eq (Normalize-PathIdentity $commonParent)
   })
-  Check 'windows_acl.common_parent_non_inheriting' ($commonRows.Count -eq 1 -and
-    (-not $commonRows[0].recurse) -and $commonRows[0].non_inheriting)
+  Check 'windows_acl.common_parent_inheriting' ($commonRows.Count -eq 1 -and
+    (-not $commonRows[0].recurse) -and (-not $commonRows[0].non_inheriting))
   $authenticated = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-11'
   $broadAcl = Get-Acl -LiteralPath $aclRoot
   $broadRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
@@ -292,36 +327,20 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     $endpointRoot
   ) | ForEach-Object {
     $rules = @((Get-AclProjection $_).rules)
-    @($rules).Count -eq 2 -and
+    @($rules).Count -eq 3 -and
       @($rules | Where-Object {
-        $_.sid -in @('S-1-5-18', 'S-1-5-32-544') -and
+        $_.sid -in @('S-1-5-18', 'S-1-5-32-544', $serviceSid) -and
         $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
-      }).Count -eq 2
+      }).Count -eq 3
   }
-  Check 'windows_acl.administrators_system_only' (@($managedAclChecks | Where-Object { -not $_ }).Count -eq 0)
+  Check 'windows_acl.managed_principals_only' (@($managedAclChecks | Where-Object { -not $_ }).Count -eq 0)
   $bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
-  $rootSetAcl = 'Set-Acl -LiteralPath $root -AclObject $rootAcl -ErrorAction Stop'
-  Check 'windows_acl.bootstrap_failure_injection_anchor' (
-    ([regex]::Matches($bootstrapSource, [regex]::Escape($rootSetAcl))).Count -eq 1)
-  $failureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
-    'bootstrap-injected-failure-' + [guid]::NewGuid().ToString('N') + '.ps1')
-  $rootAssert = 'Assert-ManagedAcl $root'
-  Check 'windows_acl.bootstrap_post_root_failure_injection_anchor' (
-    ([regex]::Matches($bootstrapSource, [regex]::Escape($rootAssert))).Count -eq 1)
-  $postRootFailureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
-    'bootstrap-post-root-failure-' + [guid]::NewGuid().ToString('N') + '.ps1')
-  [System.IO.File]::WriteAllText(
-    $failureScript,
-    $bootstrapSource.Replace(
-      $rootSetAcl,
-      "throw 'injected root ACL failure'"),
-    (New-Object System.Text.UTF8Encoding($false)))
-  [System.IO.File]::WriteAllText(
-    $postRootFailureScript,
-    $bootstrapSource.Replace(
-      $rootAssert,
-      "throw 'injected post-root ACL failure'"),
-    (New-Object System.Text.UTF8Encoding($false)))
+  Check 'windows_acl.bootstrap_transaction_source' (
+    $bootstrapSource.Contains('PostflightScript') -and
+    $bootstrapSource.Contains('Get-ManagedTreeSnapshot') -and
+    $bootstrapSource.Contains('Assert-ServiceInherited') -and
+    $bootstrapSource.Contains('Set-ManagedAcl $root $serviceSid') -and
+    $bootstrapSource.Contains('managed_root_transaction_failed'))
   $powershellExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
   $otherLocalUser = Get-LocalUser | Where-Object {
     [string]$_.SID.Value -ne $serviceSid
@@ -344,42 +363,78 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
         $mismatchBefore.projection_sha256)
     Remove-Item -LiteralPath $mismatchRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
-  $markerBeforeFailure = Get-AclProjection $markerPath
-  $rootBeforeFailure = Get-AclProjection $aclRoot
-  $failureOutput = @(& $powershellExe -NoProfile -File $failureScript `
-    -ManagedRoot $aclRoot -ServiceAccount $serviceSid)
-  $failureExit = $LASTEXITCODE
-  $failureReceipt = ($failureOutput | Select-Object -Last 1) | ConvertFrom-Json
-  Check 'windows_acl.bootstrap_failure_rolls_back' (
-    $failureExit -ne 0 -and
-    $failureReceipt.passed -eq $false -and
-    $failureReceipt.rollback.passed -eq $true -and
-    (Get-AclProjection $markerPath).projection_sha256 -eq $markerBeforeFailure.projection_sha256 -and
-    (Get-AclProjection $aclRoot).projection_sha256 -eq $rootBeforeFailure.projection_sha256)
-  $rollbackRoot = Join-Path $driveRoot (
-    'description-managed-rollback-' + [guid]::NewGuid().ToString('N'))
-  $null = New-Item -ItemType Directory -Path $rollbackRoot -Force
+  $rollbackRoot = Join-Path $driveRoot ('description-managed-rollback-' + [guid]::NewGuid().ToString('N'))
+  $rollbackChild = Join-Path $rollbackRoot 'endpoint-state/lifecycle/gen/runtime/site-packages'
+  $null = New-Item -ItemType Directory -Path $rollbackChild -Force
+  $rollbackFile = Join-Path $rollbackChild 'description_pipeline.py'
+  [System.IO.File]::WriteAllText($rollbackFile, 'before', (New-Object System.Text.UTF8Encoding($false)))
   $rollbackBefore = Get-AclProjection $rollbackRoot
-  $rollbackOutput = @(& $powershellExe -NoProfile -File $postRootFailureScript `
-    -ManagedRoot $rollbackRoot -ServiceAccount $serviceSid)
+  $rollbackChildRestoreAcl = Get-Acl -LiteralPath $rollbackChild
+  $rollbackFileBefore = Get-AclProjection $rollbackFile
+  $rollbackDeepAcl = New-Object System.Security.AccessControl.DirectorySecurity
+  $rollbackDeepAcl.SetOwner(
+    (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))
+  $rollbackDeepAcl.SetAccessRuleProtection($true, $false)
+  Set-Acl -LiteralPath $rollbackChild -AclObject $rollbackDeepAcl
+  $rollbackChildBefore = Get-AclProjection $rollbackChild
+  $failureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'bootstrap-failing-postflight-' + [guid]::NewGuid().ToString('N') + '.ps1')
+  [System.IO.File]::WriteAllText(
+    $failureScript,
+    "exit 7`n",
+    (New-Object System.Text.UTF8Encoding($false)))
+  $rollbackOutput = @(& $powershellExe -NoProfile -File $bootstrapScript `
+    -ManagedRoot $rollbackRoot -ServiceAccount $serviceSid -PostflightScript $failureScript)
   $rollbackExit = $LASTEXITCODE
   $rollbackReceipt = ($rollbackOutput | Select-Object -Last 1) | ConvertFrom-Json
-  $rollbackMarkerExists = Test-Path -LiteralPath (
-    Join-Path $rollbackRoot '.description-managed-root.json')
-  $rollbackAclStable = (
-    (Get-AclProjection $rollbackRoot).projection_sha256 -eq
-      $rollbackBefore.projection_sha256)
-  Check 'windows_acl.bootstrap_new_marker_rolls_back' (
+  Check 'windows_acl.bootstrap_postflight_failure_rolls_back' (
     $rollbackExit -ne 0 -and
-    -not $rollbackMarkerExists -and
-    $rollbackAclStable -and
+    -not (Test-Path -LiteralPath (
+      Join-Path $rollbackRoot '.description-managed-root.json')) -and
+    (Get-AclProjection $rollbackRoot).projection_sha256 -eq $rollbackBefore.projection_sha256 -and
+    (Get-AclProjection $rollbackChild).projection_sha256 -eq $rollbackChildBefore.projection_sha256 -and
     $rollbackReceipt.rollback.passed -eq $true) (
       'exit=' + [string]$rollbackExit +
-      ' marker=' + [string]$rollbackMarkerExists +
-      ' acl_stable=' + [string]$rollbackAclStable +
       ' receipt=' + ($rollbackReceipt | ConvertTo-Json -Depth 8 -Compress))
+  Set-Acl -LiteralPath $rollbackChild -AclObject $rollbackChildRestoreAcl
+  Check 'windows_acl.bootstrap_deep_file_acl_rolls_back' (
+    (Get-AclProjection $rollbackFile).projection_sha256 -eq $rollbackFileBefore.projection_sha256)
+  $emptyRoot = Join-Path $driveRoot ('description-managed-empty-' + [guid]::NewGuid().ToString('N'))
+  $emptyChild = Join-Path $emptyRoot 'endpoint-state/lifecycle/gen/runtime/site-packages'
+  $null = New-Item -ItemType Directory -Path $emptyChild -Force
+  $emptyFile = Join-Path $emptyChild 'description_pipeline.py'
+  [System.IO.File]::WriteAllText($emptyFile, 'package', (New-Object System.Text.UTF8Encoding($false)))
+  $emptyChildBefore = Get-Acl -LiteralPath $emptyChild
+  $emptyAcl = New-Object System.Security.AccessControl.DirectorySecurity
+  $emptyAcl.SetOwner(
+    (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))
+  $emptyAcl.SetAccessRuleProtection($true, $false)
+  Set-Acl -LiteralPath $emptyChild -AclObject $emptyAcl
+  $emptyOutput = @(& $powershellExe -NoProfile -File $bootstrapScript `
+    -ManagedRoot $emptyRoot -ServiceAccount $serviceSid)
+  $emptyExit = $LASTEXITCODE
+  $emptyReceipt = ($emptyOutput | Select-Object -Last 1) | ConvertFrom-Json
+  $emptyRead = $false
+  try {
+    $stream = [System.IO.File]::OpenRead($emptyFile)
+    $stream.Dispose()
+    $emptyRead = $true
+  } catch {
+    $emptyRead = $false
+  }
+  Check 'windows_acl.bootstrap_deep_empty_dacl_repaired' (
+    $emptyExit -eq 0 -and
+    $emptyReceipt.passed -eq $true -and
+    $emptyRead -and
+    @((Get-AclProjection $emptyChild).rules | Where-Object {
+      $_.sid -eq $serviceSid -and
+      $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
+    }).Count -eq 1) (
+      'exit=' + [string]$emptyExit +
+      ' receipt=' + ($emptyReceipt | ConvertTo-Json -Depth 8 -Compress))
+  Set-Acl -LiteralPath $emptyChild -AclObject $emptyChildBefore
+  Remove-Item -LiteralPath $emptyRoot -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $failureScript -Force -ErrorAction SilentlyContinue
-  Remove-Item -LiteralPath $postRootFailureScript -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $rollbackRoot -Recurse -Force -ErrorAction SilentlyContinue
   $badTokenAcl = Get-Acl -LiteralPath $tokenPath
   [void]$badTokenAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
@@ -810,7 +865,7 @@ Check 'outer.stage_duplicate_key_refused' (($outer.message -match 'endpoint_conf
 
 $outer = Invoke-Outer 'stage_acl_boundary'
 $stageAclCalls = @($outer.calls | Where-Object {
-  $_ -like 'managed-acl:*staged:protected=True:non-inheriting=False:allow-service-owner=False:recurse=True'
+  $_ -like 'managed-acl:*staged:protected=True:service-sid=*:non-inheriting=False:recurse=True'
 })
 Check 'outer.stage_acl_boundary_signature' (
   ($outer.message -match 'injected_stage_acl_boundary') -and

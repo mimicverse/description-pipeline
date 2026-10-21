@@ -76,6 +76,9 @@ class DeployMachineryTests(unittest.TestCase):
             "S-1-5-32-544",
             "solidworks-to-urdf.managed-root/v1",
             "user-approved-administrator-runtime",
+            "Get-ManagedTreeSnapshot",
+            "Assert-ServiceInherited",
+            "PostflightScript",
         ):
             self.assertIn(marker, bootstrap)
         for forbidden in ("description-v1-review", "GH_CONFIG", "description-v1-endpoint", "native-product"):
