@@ -866,6 +866,19 @@ class NativeFinCaptureTests(unittest.TestCase):
                 is_periodic=True,
                 is_closed=True,
             )
+        for near_half in (
+            math.nextafter(math.pi, 0.0),
+            math.nextafter(math.pi, upper),
+        ):
+            with self.subTest(near_half=near_half), self.assertRaises(ValueError):
+                native_fin_interval(
+                    0.0,
+                    near_half,
+                    0.0,
+                    upper,
+                    is_periodic=True,
+                    is_closed=True,
+                )
 
     def test_ninety_percent_leading_gap_counterexample_is_rejected(self):
         fixture = Path(__file__).with_name(

@@ -147,14 +147,16 @@ def native_fin_interval(
     period = upper_value - lower_value
     direct_width = direct[1] - direct[0]
     complement_width = period - direct_width
+    if native_u_equal(direct_width, complement_width):
+        raise ValueError(
+            "periodic fin interval is ambiguous at half the edge domain"
+        )
     if direct_width < complement_width:
         return [direct]
-    if complement_width < direct_width:
-        return [
-            (direct[1], upper_value),
-            (lower_value, direct[0]),
-        ]
-    raise ValueError("periodic fin interval is ambiguous at half the edge domain")
+    return [
+        (direct[1], upper_value),
+        (lower_value, direct[0]),
+    ]
 
 
 def native_boolean_success(value: object) -> bool | None:
