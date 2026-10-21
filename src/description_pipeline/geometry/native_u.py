@@ -20,6 +20,7 @@ NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
     "tessellation-edge-projection-v1"
 )
 NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M = 50e-6
+NATIVE_PERIODIC_FIN_INTERVAL_RULE = "native-periodic-fin-interval-v1"
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
 
@@ -117,6 +118,43 @@ def native_u_intervals_cover(
         native_u_coverage_status(intervals, lower, upper)
         == NATIVE_U_COVERAGE_COVERED
     )
+
+
+def native_fin_interval(
+    start: float | int,
+    end: float | int,
+    lower: float | int,
+    upper: float | int,
+    *,
+    is_periodic: bool,
+    is_closed: bool,
+) -> list[tuple[float, float]]:
+    """Return the native fin interval without confusing a seam segment for its complement."""
+
+    start_value = _native_u(start)
+    end_value = _native_u(end)
+    lower_value = _native_u(lower)
+    upper_value = _native_u(upper)
+    if (
+        lower_value >= upper_value
+        or not native_u_in_closed_interval(start_value, lower_value, upper_value)
+        or not native_u_in_closed_interval(end_value, lower_value, upper_value)
+    ):
+        raise ValueError("fin endpoints must lie inside a non-empty edge domain")
+    direct = (min(start_value, end_value), max(start_value, end_value))
+    if not (is_periodic and is_closed):
+        return [direct]
+    period = upper_value - lower_value
+    direct_width = direct[1] - direct[0]
+    complement_width = period - direct_width
+    if direct_width < complement_width:
+        return [direct]
+    if complement_width < direct_width:
+        return [
+            (direct[1], upper_value),
+            (lower_value, direct[0]),
+        ]
+    raise ValueError("periodic fin interval is ambiguous at half the edge domain")
 
 
 def native_boolean_success(value: object) -> bool | None:

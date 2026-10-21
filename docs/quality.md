@@ -97,6 +97,8 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 当且仅当 `GetParameter(p_on)` 返回严格失败（原值 0/false、packed low32 为 0）时，可采用版本化 `native-u-closest-point-fallback-v1`：使用 `GetClosestPointOn` 返回的有限且位于 edge U 域内的参数，要求 `Evaluate2` packed 成功，并要求 `p_on` 到求值点以及原始 `q` 到求值点的最大坐标差均不超过 50 µm；该 fallback 的点规则明确标为 `tessellation-edge-projection-v1`。失败状态、原始类型、位值、最近点参数、求值点及 fallback 原因必须全部保留；`GetParameter` 成功时始终以其参数为权威，不得用 closest U 覆盖，并继续使用 v3/边界 v4 规则。若最近 U 越域、`Evaluate2` 不闭合或任何覆盖、cofin、拓扑检查失败，结果仍为 unresolved。
 
+native edge 的 U 覆盖仍按每个实际三角面分别严格验收。对 closed+periodic edge 中跨越参数缝的 fin，采用版本化 `native-periodic-fin-interval-v1`：在 edge `[u_min,u_max]` 内比较直接区间与补区间，只有较短且无歧义的一侧可作为该 tessellation 段的覆盖证据，另一侧表示为沿 seam 的两段；半个 edge 域的歧义区间必须 unresolved。原始 fin start/end、面归属、cofin 反向关系及全部 fin 端点域检查均保留，不得用 edge-wide 并集放宽单面覆盖。
+
 <a id="qualification"></a>
 ## 警告与资格
 

@@ -34,6 +34,7 @@ from ...geometry.native_u import (
     native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
     native_evaluate2_evidence,
+    native_fin_interval,
     native_get_parameter_success,
     native_point_error,
     native_point_roundtrip_tolerance,
@@ -5551,10 +5552,18 @@ class SolidWorksBackend(CadBackend):
                 for fin_id in edge_row["fin_ids"]:
                     fin = fins_by_id[fin_id]
                     face_index = facets[fin["facet_id"]]["face_index"]
-                    intervals_by_face.setdefault(face_index, []).append(
-                        (
-                            min(fin["start_u"], fin["end_u"]),
-                            max(fin["start_u"], fin["end_u"]),
+                    intervals_by_face.setdefault(face_index, []).extend(
+                        native_fin_interval(
+                            fin["start_u"],
+                            fin["end_u"],
+                            edge_row["curve"]["u_min"],
+                            edge_row["curve"]["u_max"],
+                            is_periodic=edge_row["curve_end_params"][
+                                "is_periodic"
+                            ],
+                            is_closed=edge_row["curve_end_params"][
+                                "is_closed"
+                            ],
                         )
                     )
                 for face_index, intervals in intervals_by_face.items():

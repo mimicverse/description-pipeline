@@ -19,6 +19,7 @@ from .native_u import (
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
+    native_fin_interval,
     native_get_parameter_success,
     native_point_error,
     native_point_roundtrip_tolerance,
@@ -1282,10 +1283,16 @@ def _parse_v3_itessellation(
                     component
                     + f": native tessellation v3 edge {reference} fin {fin_id} U is invalid",
                 )
-                intervals_by_face.setdefault(
-                    fin["face_index"],
-                    [],
-                ).append((min(start_u, end_u), max(start_u, end_u)))
+                intervals_by_face.setdefault(fin["face_index"], []).extend(
+                    native_fin_interval(
+                        start_u,
+                        end_u,
+                        u_min,
+                        u_max,
+                        is_periodic=edge["curve_periodic"],
+                        is_closed=edge["curve_closed"],
+                    )
+                )
             for face_index, intervals in intervals_by_face.items():
                 _require(
                     native_u_intervals_cover(intervals, u_min, u_max),

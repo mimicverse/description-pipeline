@@ -29,6 +29,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     native_evaluate2_evidence,
     native_evaluate2_success,
     native_float32_adjacency_bound,
+    native_fin_interval,
     native_get_parameter_success,
     native_point_error,
     native_point_roundtrip_tolerance,
@@ -818,6 +819,53 @@ class NativeFinCaptureTests(unittest.TestCase):
             tolerance,
             native_point_error(end, evaluated_end),
         )
+
+    def test_periodic_fin_interval_normalizes_seam_and_rejects_ambiguity(self):
+        upper = 2.0 * math.pi
+        seam = upper - 0.120830486676529
+
+        self.assertEqual(
+            native_fin_interval(
+                0.0,
+                seam,
+                0.0,
+                upper,
+                is_periodic=True,
+                is_closed=True,
+            ),
+            [(seam, upper), (0.0, 0.0)],
+        )
+        self.assertEqual(
+            native_fin_interval(
+                seam,
+                0.0,
+                0.0,
+                upper,
+                is_periodic=True,
+                is_closed=True,
+            ),
+            [(seam, upper), (0.0, 0.0)],
+        )
+        self.assertEqual(
+            native_fin_interval(
+                0.0,
+                0.120830486676529,
+                0.0,
+                upper,
+                is_periodic=True,
+                is_closed=True,
+            ),
+            [(0.0, 0.120830486676529)],
+        )
+        with self.assertRaises(ValueError):
+            native_fin_interval(
+                0.0,
+                math.pi,
+                0.0,
+                upper,
+                is_periodic=True,
+                is_closed=True,
+            )
 
     def test_ninety_percent_leading_gap_counterexample_is_rejected(self):
         fixture = Path(__file__).with_name(
