@@ -10,6 +10,7 @@ from ..io import PipelineError
 from ..schemas import NATIVE_TESSELLATION_SCHEMA
 from .native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
+    NATIVE_COLLAPSED_U_FIN_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
@@ -332,6 +333,43 @@ def _write_only_sense_error(value: object) -> bool:
         and value.startswith("com_error:")
         and "(61836," in value
     )
+
+
+def _finite_fin_intervals(
+    *,
+    fin_id: int,
+    start_u: float,
+    end_u: float,
+    start_point: object,
+    end_point: object,
+    u_min: float,
+    u_max: float,
+    is_periodic: bool,
+    is_closed: bool,
+    component: str,
+    reference: str,
+) -> tuple[list[tuple[float, float]], float | None]:
+    """Return coverage intervals, or the bounded span of a collapsed-U fin."""
+
+    if not native_u_equal(start_u, end_u):
+        return (
+            native_fin_interval(
+                start_u,
+                end_u,
+                u_min,
+                u_max,
+                is_periodic=is_periodic,
+                is_closed=is_closed,
+            ),
+            None,
+        )
+    span = native_point_error(start_point, end_point)
+    _require(
+        0.0 < span <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+        component
+        + f": native tessellation v3 edge {reference} fin {fin_id} collapsed U span is invalid",
+    )
+    return [], span
 
 
 def parse_native_tessellation(
@@ -1291,26 +1329,43 @@ def _parse_v3_itessellation(
             u_min = float(edge["u_min"])
             u_max = float(edge["u_max"])
             intervals_by_face = {}
+            collapsed_fin_span = {}
             for fin_id in actual:
                 fin = evidence["fins"][fin_id]
                 start_u = float(fin["start_u"])
                 end_u = float(fin["end_u"])
                 _require(
                     native_u_in_closed_interval(start_u, u_min, u_max)
-                    and native_u_in_closed_interval(end_u, u_min, u_max)
-                    and start_u != end_u,
+                    and native_u_in_closed_interval(end_u, u_min, u_max),
                     component
                     + f": native tessellation v3 edge {reference} fin {fin_id} U is invalid",
                 )
+                fin_start = vertices[(body_key, fin["vertex_ids"][0])]
+                fin_end = vertices[(body_key, fin["vertex_ids"][1])]
+                intervals, span = _finite_fin_intervals(
+                    fin_id=fin_id,
+                    start_u=start_u,
+                    end_u=end_u,
+                    start_point=fin_start,
+                    end_point=fin_end,
+                    u_min=u_min,
+                    u_max=u_max,
+                    is_periodic=edge["curve_periodic"],
+                    is_closed=edge["curve_closed"],
+                    component=component,
+                    reference=reference,
+                )
+                if span is not None:
+                    collapsed_fin_span[fin_id] = span
+                    fin["u_resolution_rule"] = NATIVE_COLLAPSED_U_FIN_RULE
+                    fin["u_resolution_span_m"] = span
+                    fin["u_resolution_warning"] = "native_fin_u_collapsed"
+                    continue
+                fin.pop("u_resolution_rule", None)
+                fin.pop("u_resolution_span_m", None)
+                fin.pop("u_resolution_warning", None)
                 intervals_by_face.setdefault(fin["face_index"], []).extend(
-                    native_fin_interval(
-                        start_u,
-                        end_u,
-                        u_min,
-                        u_max,
-                        is_periodic=edge["curve_periodic"],
-                        is_closed=edge["curve_closed"],
-                    )
+                    intervals
                 )
             for face_index, intervals in intervals_by_face.items():
                 _require(
@@ -1425,6 +1480,14 @@ def _parse_v3_itessellation(
                     fin_end,
                     cofin_start,
                 )
+                fin_collapsed = fin_id in collapsed_fin_span
+                cofin_collapsed = cofin_id in collapsed_fin_span
+                collapsed_pair = fin_collapsed and cofin_collapsed
+                _require(
+                    fin_collapsed is cofin_collapsed,
+                    component
+                    + f": native tessellation v3 fin {fin_id} has partial U collapse",
+                )
                 _require(
                     cofin["cofin_id"] == fin_id
                     and cofin["face_index"] != fin["face_index"]
@@ -1433,9 +1496,20 @@ def _parse_v3_itessellation(
                     and native_point_error(fin_end, cofin_start)
                     <= reverse_end_tolerance
                     and (
-                        (fin["end_u"] - fin["start_u"])
-                        * (cofin["end_u"] - cofin["start_u"])
-                        < 0.0
+                        (
+                            collapsed_pair
+                            and native_u_equal(fin["start_u"], fin["end_u"])
+                            and native_u_equal(
+                                cofin["start_u"],
+                                cofin["end_u"],
+                            )
+                        )
+                        or (
+                            not collapsed_pair
+                            and (fin["end_u"] - fin["start_u"])
+                            * (cofin["end_u"] - cofin["start_u"])
+                            < 0.0
+                        )
                     )
                     and native_u_equal(fin["start_u"], cofin["end_u"])
                     and native_u_equal(fin["end_u"], cofin["start_u"])
@@ -1452,6 +1526,15 @@ def _parse_v3_itessellation(
                 for face_index in edge["face_indices"]
                 if face_spans_by_key[(*body_key, face_index)]["triangle_count"] > 0
             }
+            _require(
+                all(
+                    face_index in intervals_by_face
+                    and bool(intervals_by_face[face_index])
+                    for face_index in active_faces
+                ),
+                component
+                + f": native tessellation v3 edge {reference} has a collapsed-only face without positive U coverage",
+            )
             _require(
                 fin_faces == active_faces,
                 component
@@ -1599,22 +1682,28 @@ def _parse_itessellation_body(
     previous_fin = None
     facet_fin_membership = {}
     for index, fin in enumerate(body["fins"]):
+        required_fin_keys = {
+            "fin_id",
+            "facet_id",
+            "face_index",
+            "vertex_ids",
+            "edge_reference_sha256",
+            "classification",
+            "start_u",
+            "end_u",
+            "start_evidence",
+            "end_evidence",
+            "cofin_id",
+        }
+        collapsed_fin_keys = {
+            "u_resolution_rule",
+            "u_resolution_span_m",
+            "u_resolution_warning",
+        }
         _require(
             isinstance(fin, dict)
-            and set(fin)
-            == {
-                "fin_id",
-                "facet_id",
-                "face_index",
-                "vertex_ids",
-                "edge_reference_sha256",
-                "classification",
-                "start_u",
-                "end_u",
-                "start_evidence",
-                "end_evidence",
-                "cofin_id",
-            },
+            and required_fin_keys <= set(fin)
+            and set(fin) <= required_fin_keys | collapsed_fin_keys,
             component + f": native tessellation v3 fin {index} has an unknown shape",
         )
         fin_id = fin["fin_id"]
@@ -1672,7 +1761,7 @@ def _parse_itessellation_body(
             previous == facet_id,
             component + f": native tessellation v3 fin {fin_id} belongs to multiple facets",
         )
-        fins[fin_id] = {
+        parsed_fin = {
             "fin_id": fin_id,
             "facet_id": facet_id,
             "face_index": face_index,
@@ -1685,6 +1774,10 @@ def _parse_itessellation_body(
             "end_evidence": end_evidence,
             "cofin_id": cofin_id,
         }
+        for key in collapsed_fin_keys:
+            if key in fin:
+                parsed_fin[key] = fin[key]
+        fins[fin_id] = parsed_fin
     _require(
         set(facet_fin_membership)
         == {

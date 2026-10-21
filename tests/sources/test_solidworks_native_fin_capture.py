@@ -17,6 +17,7 @@ from unittest.mock import patch
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.geometry.native_tessellation import (  # noqa: E402
+    _finite_fin_intervals,
     _valid_u_evidence,
     parse_native_tessellation,
 )
@@ -878,6 +879,46 @@ class NativeFinCaptureTests(unittest.TestCase):
                     upper,
                     is_periodic=True,
                     is_closed=True,
+                )
+
+    def test_collapsed_u_fin_requires_positive_bounded_geometric_span(self):
+        point = (0.0, 0.0, 0.0)
+        moved = (9.489442548454158e-6, 0.0, 0.0)
+        intervals, span = _finite_fin_intervals(
+            fin_id=742,
+            start_u=2.667937521368035e-7,
+            end_u=2.667937521368035e-7,
+            start_point=point,
+            end_point=moved,
+            u_min=2.667937521368035e-7,
+            u_max=1.0,
+            is_periodic=False,
+            is_closed=False,
+            component="fixture",
+            reference="edge",
+        )
+        self.assertEqual(intervals, [])
+        self.assertEqual(span, 9.489442548454158e-6)
+
+        for moved_point in (
+            point,
+            (50.1e-6, 0.0, 0.0),
+        ):
+            with self.subTest(moved_point=moved_point), self.assertRaises(
+                PipelineError
+            ):
+                _finite_fin_intervals(
+                    fin_id=742,
+                    start_u=2.667937521368035e-7,
+                    end_u=2.667937521368035e-7,
+                    start_point=point,
+                    end_point=moved_point,
+                    u_min=2.667937521368035e-7,
+                    u_max=1.0,
+                    is_periodic=False,
+                    is_closed=False,
+                    component="fixture",
+                    reference="edge",
                 )
 
     def test_ninety_percent_leading_gap_counterexample_is_rejected(self):

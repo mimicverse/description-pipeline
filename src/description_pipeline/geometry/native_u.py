@@ -20,6 +20,7 @@ NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
     "tessellation-edge-projection-v1"
 )
 NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M = 50e-6
+NATIVE_COLLAPSED_U_FIN_RULE = "native-fin-u-collapse-v1"
 NATIVE_PERIODIC_FIN_INTERVAL_RULE = "native-periodic-fin-interval-v1"
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
