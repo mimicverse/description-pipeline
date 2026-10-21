@@ -324,6 +324,16 @@ def _valid_curve_endpoint_evaluation(value: object, u_parameter: object) -> bool
     )
 
 
+def _write_only_sense_error(value: object) -> bool:
+    """Return whether a secondary sense read failed with documented COM 61836."""
+
+    return (
+        isinstance(value, str)
+        and value.startswith("com_error:")
+        and "(61836," in value
+    )
+
+
 def parse_native_tessellation(
     component: str,
     tessellation: object,
@@ -892,8 +902,7 @@ def parse_native_tessellation(
                         and secondary["value"] is primary["value"]
                     )
                     or (
-                        isinstance(secondary["error"], str)
-                        and bool(secondary["error"])
+                        _write_only_sense_error(secondary["error"])
                         and secondary["value"] is None
                     )
                 ),

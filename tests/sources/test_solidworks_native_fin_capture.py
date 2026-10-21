@@ -2012,6 +2012,26 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(len(spans), 2)
 
+    def test_parser_rejects_unrelated_secondary_sense_error(self):
+        evidence, triangles = self.group_333_tessellation()
+        secondary = evidence["native_edges"][0]["face_senses"][0][
+            "IEdgeInFaceSense2"
+        ]
+        secondary["value"] = None
+        secondary["error"] = (
+            "com_error: (-2147352567, 'unexpected condition', "
+            "(61837, None, None, None, 0, None))"
+        )
+
+        with self.assertRaises(PipelineError):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
     def test_parser_accepts_face_local_cofin_vertices_with_equal_coordinates(self):
         evidence, triangles = self.group_333_tessellation()
         body = evidence["itessellation"]["bodies"][0]
