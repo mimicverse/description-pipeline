@@ -64,6 +64,65 @@ def cube_stl(path: Path, half: float = 0.02) -> int:
     )
 
 
+def cube_native_edges(half: float = 0.02) -> tuple[dict[int, list[str]], list[dict]]:
+    """Return the cube's twelve native edges and the references on each owner face."""
+
+    corners = [(x, y, z) for x in (-half, half) for y in (-half, half) for z in (-half, half)]
+    face_corners = (
+        (0, 1, 2, 3),
+        (4, 5, 6, 7),
+        (0, 1, 4, 5),
+        (2, 3, 6, 7),
+        (0, 2, 4, 6),
+        (1, 3, 5, 7),
+    )
+    face_edges: dict[int, list[str]] = {face_index: [] for face_index in range(len(face_corners))}
+    native_edges = []
+    for start, end in (
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (1, 3),
+        (1, 5),
+        (2, 3),
+        (2, 6),
+        (3, 7),
+        (4, 5),
+        (4, 6),
+        (5, 7),
+        (6, 7),
+    ):
+        face_indices = [
+            face_index
+            for face_index, owners in enumerate(face_corners)
+            if start in owners and end in owners
+        ]
+        if len(face_indices) != 2:
+            raise AssertionError(f"cube edge {start}-{end} must have two owner faces")
+        reference = hashlib.sha256(f"fixture-cube-edge-{start}-{end}".encode()).hexdigest()
+        for face_index in face_indices:
+            face_edges[face_index].append(reference)
+        native_edges.append(
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "edge_reference_sha256": reference,
+                "start_vertex_reference_sha256": hashlib.sha256(
+                    f"fixture-cube-vertex-{start}".encode()
+                ).hexdigest(),
+                "end_vertex_reference_sha256": hashlib.sha256(
+                    f"fixture-cube-vertex-{end}".encode()
+                ).hexdigest(),
+                "start_point_m": list(corners[start]),
+                "end_point_m": list(corners[end]),
+                "face_indices": face_indices,
+            }
+        )
+    for references in face_edges.values():
+        references.sort()
+    return face_edges, native_edges
+
+
 def _matrix16(values: Sequence[float]) -> Matrix:
     """Coerce a sequence to the 4x4 row-major matrix shape the protocol declares."""
 
@@ -582,6 +641,7 @@ class FixtureCadBackend(CadBackend):
             triangles = cube_stl(Path(dest_path))
             self.exported.append(str(dest_path))
             payload = Path(dest_path).read_bytes()
+            face_edges, native_edges = cube_native_edges()
             spans = []
             start = 0
             for face_index in range(6):
@@ -597,7 +657,7 @@ class FixtureCadBackend(CadBackend):
                             f"fixture-face-{face_index}".encode()
                         ).hexdigest(),
                         "face_owner_id": face_index + 1,
-                        "edge_references": [],
+                        "edge_references": face_edges[face_index],
                         "triangle_start": start,
                         "triangle_count": count,
                         "triangle_records_sha256": hashlib.sha256(
@@ -616,7 +676,7 @@ class FixtureCadBackend(CadBackend):
                     "schema_version": NATIVE_TESSELLATION_SCHEMA,
                     "faces": 6,
                     "face_spans": spans,
-                    "native_edges": [],
+                    "native_edges": native_edges,
                     "no_facets_faces": [],
                 },
             }

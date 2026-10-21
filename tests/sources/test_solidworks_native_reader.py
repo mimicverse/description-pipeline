@@ -341,6 +341,12 @@ class _Extension:
             return None
         return types.SimpleNamespace(ArrayData=list(transform))
 
+    def GetPersistReference3(self, item):
+        reference = getattr(item, "_persist_reference", None)
+        if reference is None:
+            raise RuntimeError("fixture entity has no persistent reference")
+        return list(reference)
+
 
 class _ConfigurationManager:
     """Reflects the document's *currently shown* configuration at each read."""
@@ -558,6 +564,22 @@ def _write(root: Path, name: str) -> Path:
     path = root / name
     path.write_bytes(f"portable fixture: {name}\n".encode())
     return path
+
+
+def _mesh_face(read_triangles, key: str):
+    return types.SimpleNamespace(
+        GetTessTriangles=read_triangles,
+        GetEdges=list,
+        _persist_reference=f"fixture-face-{key}".encode(),
+    )
+
+
+def _mesh_body(faces, key: str):
+    return types.SimpleNamespace(
+        Name=f"fixture-body-{key}",
+        GetFaces=lambda: list(faces),
+        _persist_reference=f"fixture-body-{key}".encode(),
+    )
 
 
 @contextmanager
@@ -1559,8 +1581,11 @@ class CaptureSceneTests(unittest.TestCase):
                     "Short": [0, 0, 0, 1, 0, 0, 0, 1, 0],
                     "Long": [0, 0, 0, 2, 0, 0, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0],
                 }[self.ReferencedConfiguration]
-                face = types.SimpleNamespace(GetTessTriangles=lambda _quality: triangles)
-                return [types.SimpleNamespace(GetFaces=lambda: [face])]
+                face = _mesh_face(
+                    lambda _quality, values=triangles: values,
+                    self.ReferencedConfiguration,
+                )
+                return [_mesh_body([face], self.ReferencedConfiguration)]
 
         class ConfiguredBackend(_CaptureBackend):
             def _mass_properties_document(self, doc, require_material=True):
@@ -2009,7 +2034,9 @@ class CaptureSceneTests(unittest.TestCase):
                 GetFeature=lambda: types.SimpleNamespace(Name="shaft"),
                 GetSurface=lambda: _Cylinder((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), 0.02),
             )
-            short.GetBodies2 = lambda body_type: [types.SimpleNamespace(GetFaces=lambda: [face])]
+            face.GetEdges = list
+            face._persist_reference = b"fixture-shaft-face"
+            short.GetBodies2 = lambda body_type: [_mesh_body([face], "shaft")]
             lifetimes = self._borrowed_occurrence_geometry(backend, root)
             result = backend.capture_axis_reference({"component": "part-short", "feature_name": "shaft"})
             self.assertEqual(result["axis_direction"], [0.0, 0.0, 1.0])
@@ -2020,10 +2047,10 @@ class CaptureSceneTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, _com_stubs():
             root = Path(tmp)
             backend, _, _, short, _ = self._configured_occurrences(root)
-            good = types.SimpleNamespace(GetTessTriangles=lambda _quality: [0, 0, 0, 1, 0, 0, 0, 1, 0])
-            failed = types.SimpleNamespace(GetTessTriangles=_raiser(RuntimeError("RPC_S_UNKNOWN_IF")))
+            good = _mesh_face(lambda _quality: [0, 0, 0, 1, 0, 0, 0, 1, 0], "good")
+            failed = _mesh_face(_raiser(RuntimeError("RPC_S_UNKNOWN_IF")), "failed")
             short.GetBodies2 = lambda body_type: (
-                [types.SimpleNamespace(GetFaces=lambda: [good, failed])] if body_type == 0 else []
+                [_mesh_body([good, failed], "failure")] if body_type == 0 else []
             )
             path = root / "failed.stl"
             with self.assertRaises(CadError) as caught:

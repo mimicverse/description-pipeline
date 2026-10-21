@@ -105,6 +105,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
             if sum(counts) != triangles:
                 raise AssertionError("the split fixture cube must carry twelve triangles")
             spans = []
+            face_edges, native_edges = support.cube_native_edges()
             start = 0
             for face_index, count in enumerate(counts):
                 spans.append(
@@ -116,7 +117,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
                         "face_index": face_index,
                         "face_reference_sha256": hashlib.sha256(f"fixture-face-{face_index}".encode()).hexdigest(),
                         "face_owner_id": face_index + 1,
-                        "edge_references": [],
+                        "edge_references": face_edges[face_index],
                         "triangle_start": start,
                         "triangle_count": count,
                         "triangle_records_sha256": hashlib.sha256(
@@ -129,7 +130,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
                 "schema_version": NATIVE_TESSELLATION_SCHEMA,
                 "faces": 6,
                 "face_spans": spans,
-                "native_edges": [],
+                "native_edges": native_edges,
                 "no_facets_faces": [],
             }
         return entries
