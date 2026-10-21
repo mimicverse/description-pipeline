@@ -23,12 +23,15 @@ from pathlib import Path
 
 from ...geometry.native_u import (
     NATIVE_CURVE_DOMAIN_RULE,
+    NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_RESOLUTION_RULE,
+    native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
     native_evaluate2_evidence,
     native_get_parameter_success,
+    native_point_error,
     native_point_roundtrip_tolerance,
     native_u_equal,
     native_u_in_closed_interval,
@@ -4735,12 +4738,14 @@ class SolidWorksBackend(CadBackend):
                 }
             edge_row["curve_domain_transform"] = curve_domain_transform
             curve_evaluations = {}
-            for name, u_parameter, expected_point in (
-                ("start", umin, parameter_endpoints[0]),
-                ("end", umax, parameter_endpoints[1]),
+            evaluated_points = {}
+            for name, u_parameter in (
+                ("start", umin),
+                ("end", umax),
             ):
                 evaluation = {
                     "u": float(u_parameter),
+                    "point_roundtrip_rule": NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
                     "payload": None,
                     "packed_status": None,
                     "error": None,
@@ -4767,26 +4772,13 @@ class SolidWorksBackend(CadBackend):
                     evaluated_point = _binary64_xyz(
                         evaluate_evidence["payload"][:3]
                     )
-                    tolerance = native_point_roundtrip_tolerance(
-                        expected_point,
-                        evaluated_point,
-                    )
-                    error_m = max(
-                        abs(expected_point[index] - evaluated_point[index])
-                        for index in range(3)
-                    )
-                    if error_m > tolerance:
-                        raise ValueError(
-                            "Evaluate2 endpoint differs from curve endpoint"
-                        )
+                    evaluated_points[name] = evaluated_point
                     evaluation.update(
                         {
                             "payload": evaluate_evidence["payload"],
                             "packed_status": evaluate_evidence[
                                 "packed_status"
                             ],
-                            "point_tolerance_m": tolerance,
-                            "point_error_m": error_m,
                         }
                     )
                 except Exception as error:  # noqa: BLE001
@@ -4794,6 +4786,36 @@ class SolidWorksBackend(CadBackend):
                         f"{type(error).__name__}: {error}"[:300]
                     )
                 curve_evaluations[name] = evaluation
+            if len(evaluated_points) == 2:
+                for index, (name, expected_point) in enumerate(
+                    zip(
+                        ("start", "end"),
+                        parameter_endpoints,
+                        strict=True,
+                    )
+                ):
+                    evaluation = curve_evaluations[name]
+                    opposite_point = parameter_endpoints[1 - index]
+                    tolerance = native_curve_endpoint_operation_tolerance(
+                        expected_point,
+                        evaluated_points[name],
+                        opposite_point,
+                    )
+                    error_m = native_point_error(
+                        expected_point,
+                        evaluated_points[name],
+                    )
+                    evaluation.update(
+                        {
+                            "point_tolerance_m": tolerance,
+                            "point_error_m": error_m,
+                        }
+                    )
+                    if error_m > tolerance:
+                        evaluation["error"] = (
+                            "ValueError: Evaluate2 endpoint differs from "
+                            "curve endpoint"
+                        )
             edge_row["curve_endpoint_evaluations"] = curve_evaluations
             endpoint_states = {
                 name: endpoints[name]["state"] for name in ("start", "end")

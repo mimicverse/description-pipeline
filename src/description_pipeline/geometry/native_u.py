@@ -11,6 +11,9 @@ NATIVE_U_COVERAGE_COVERED = "covered"
 NATIVE_U_COVERAGE_UNCOVERED = "uncovered"
 NATIVE_U_COVERAGE_UNRESOLVED = "unresolved"
 NATIVE_POINT_ROUNDTRIP_RULE = "native-point-float32-pair-v3"
+NATIVE_CURVE_ENDPOINT_OPERATION_RULE = (
+    "native-curve-endpoint-float32-operation-v4"
+)
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
 
@@ -263,6 +266,20 @@ def native_point_roundtrip_tolerance(*points) -> float:
         )
         for left_index, left in enumerate(points)
         for right in points[left_index + 1 :]
+    )
+
+
+def native_curve_endpoint_operation_tolerance(*points) -> float:
+    """Bound one evaluated endpoint against its peer-defined native curve."""
+
+    if len(points) != 3:
+        raise ValueError("curve endpoint operation requires three points")
+    if any(len(point) != 3 for point in points):
+        raise ValueError("points must contain three coordinates")
+    endpoint, evaluated, opposite = points
+    return (
+        native_point_roundtrip_tolerance(endpoint, evaluated)
+        + native_point_roundtrip_tolerance(endpoint, opposite)
     )
 
 

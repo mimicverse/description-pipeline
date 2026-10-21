@@ -13,10 +13,12 @@ from typing import Any, cast
 
 from description_pipeline.geometry.native_u import (
     NATIVE_CURVE_DOMAIN_RULE,
+    NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_RESOLUTION_RULE,
     native_curve_domain_transform,
+    native_curve_endpoint_operation_tolerance,
     native_evaluate2_evidence,
     native_point_roundtrip_tolerance,
 )
@@ -238,18 +240,22 @@ def _u_evidence(
 def _curve_endpoint_evaluation(
     u_parameter: float,
     point: Sequence[float],
+    opposite_point: Sequence[float],
 ) -> dict[str, Any]:
     expected = _binary32_point(point)
+    opposite = _binary32_point(opposite_point)
     payload, packed_status = _evaluate2_evidence(expected)
     evaluated = tuple(payload[:3])
     return {
         "u": u_parameter,
+        "point_roundtrip_rule": NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
         "payload": payload,
         "packed_status": packed_status,
         "error": None,
-        "point_tolerance_m": native_point_roundtrip_tolerance(
+        "point_tolerance_m": native_curve_endpoint_operation_tolerance(
             expected,
             evaluated,
+            opposite,
         ),
         "point_error_m": max(
             abs(expected[index] - evaluated[index])
@@ -261,10 +267,17 @@ def _curve_endpoint_evaluation(
 def replace_curve_endpoint_evaluation(
     evaluation: dict[str, Any],
     point: Sequence[float],
+    opposite_point: Sequence[float],
 ) -> None:
     """Rebind one fixture evaluation to a new expected native endpoint."""
 
-    evaluation.update(_curve_endpoint_evaluation(evaluation["u"], point))
+    evaluation.update(
+        _curve_endpoint_evaluation(
+            evaluation["u"],
+            point,
+            opposite_point,
+        )
+    )
 
 
 def replace_u_evidence(
@@ -675,10 +688,12 @@ def native_tessellation_v3(
                     "start": _curve_endpoint_evaluation(
                         u_min,
                         curve_start_point,
+                        curve_end_point,
                     ),
                     "end": _curve_endpoint_evaluation(
                         u_max,
                         curve_end_point,
+                        curve_start_point,
                     ),
                 },
                 "endpoint_points_derived_from_curve": False,

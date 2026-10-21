@@ -17,6 +17,7 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_CURVE_DOMAIN_RULE,
+    native_curve_endpoint_operation_tolerance,
     native_curve_domain_transform,
     native_u_equal,
 )
@@ -212,7 +213,8 @@ class NativeCurveDomainTests(unittest.TestCase):
         )
         for evaluation in row["curve_endpoint_evaluations"].values():
             evaluation["payload"] = [*common_point, 0.0, 0.0, 0.0]
-            evaluation["point_tolerance_m"] = support.native_point_roundtrip_tolerance(
+            evaluation["point_tolerance_m"] = native_curve_endpoint_operation_tolerance(
+                common_point,
                 common_point,
                 common_point,
             )

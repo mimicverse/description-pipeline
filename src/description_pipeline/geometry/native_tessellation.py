@@ -9,9 +9,11 @@ import struct
 from ..io import PipelineError
 from ..schemas import NATIVE_TESSELLATION_SCHEMA
 from .native_u import (
+    NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_RESOLUTION_RULE,
+    native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
     native_get_parameter_success,
     native_point_error,
@@ -160,6 +162,7 @@ def _valid_u_evidence(value: object, u_parameter: object, endpoint_point: object
 def _valid_curve_endpoint_evaluation(value: object, u_parameter: object) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "u",
+        "point_roundtrip_rule",
         "payload",
         "packed_status",
         "error",
@@ -185,6 +188,8 @@ def _valid_curve_endpoint_evaluation(value: object, u_parameter: object) -> bool
             for value in payload
         )
         and _valid_evaluate2_packed_status(value["packed_status"])
+        and value["point_roundtrip_rule"]
+        == NATIVE_CURVE_ENDPOINT_OPERATION_RULE
         and type(tolerance) in (int, float)
         and type(error_m) in (int, float)
         and math.isfinite(float(tolerance))
@@ -628,16 +633,20 @@ def parse_native_tessellation(
             edge["curve_end_point_m"],
             edge["curve_sense"],
         )
-        for name, expected_point in zip(
-            ("start", "end"),
-            parameter_endpoints,
-            strict=True,
+        for index, (name, expected_point) in enumerate(
+            zip(
+                ("start", "end"),
+                parameter_endpoints,
+                strict=True,
+            )
         ):
             evaluation = evaluations[name]
             evaluated_point = evaluation["payload"][:3]
-            computed_tolerance = native_point_roundtrip_tolerance(
+            opposite_point = parameter_endpoints[1 - index]
+            computed_tolerance = native_curve_endpoint_operation_tolerance(
                 expected_point,
                 evaluated_point,
+                opposite_point,
             )
             computed_error = native_point_error(
                 expected_point,

@@ -24,10 +24,12 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     native_binary32_spacing,
     native_curve_endpoint_roles,
     native_curve_domain_transform,
+    native_curve_endpoint_operation_tolerance,
     native_evaluate2_evidence,
     native_evaluate2_success,
     native_float32_adjacency_bound,
     native_get_parameter_success,
+    native_point_error,
     native_point_roundtrip_tolerance,
     native_u_equal,
     native_u_domain_is_resolvable,
@@ -182,6 +184,9 @@ class FakeEdge:
         self.evaluate_status_double = packed_evaluate_status(1)
         self.parameter_success = True
         self.sense = True
+        self.evaluate_points = []
+        self.evaluate_raw = []
+        self.evaluate_u_points = {}
         self.curve = FakeCurve(u_min, u_max)
 
     def GetBody(self):  # noqa: N802 - SolidWorks API name
@@ -239,6 +244,25 @@ class FakeEdge:
 
     def Evaluate2(self, u_parameter, _derivative):  # noqa: N802
         self.evaluate_calls += 1
+        if self.evaluate_raw:
+            return self.evaluate_raw.pop(0)
+        if self.evaluate_points:
+            point = self.evaluate_points.pop(0)
+            return [
+                *point,
+                0.0,
+                0.0,
+                0.0,
+                self.evaluate_status_double,
+            ]
+        if u_parameter in self.evaluate_u_points:
+            return [
+                *self.evaluate_u_points[u_parameter],
+                0.0,
+                0.0,
+                0.0,
+                self.evaluate_status_double,
+            ]
         return [
             u_parameter,
             0.0,
@@ -501,6 +525,83 @@ class NativeFinCaptureTests(unittest.TestCase):
             read_end_params=fake_read_end_params,
         )
 
+    def configure_group_333(self, edge, tessellation, *, evaluate_start=None):
+        start = (
+            -0.005322370050934642,
+            0.00013700629315608413,
+            -0.0021180644098793633,
+        )
+        end = (
+            -0.005322370560299019,
+            0.00013700674222233032,
+            0.0013000000000000002,
+        )
+        evaluated_start = (
+            -0.005322370560299019,
+            0.00013700509113409066,
+            -0.0021180644098793633,
+        )
+        evaluated_end = (
+            -0.005322370560299019,
+            0.00013700509113409066,
+            0.0013,
+        )
+        edge.u_min = 8.193559012063638e-05
+        edge.u_max = 0.0034999999999999996
+        edge.curve = FakeCurve(-10.0, 10.0, is_closed=False, is_periodic=False)
+        edge.curve_start_point = list(start)
+        edge.curve_end_point = list(end)
+        edge.vertices = [FakeVertex(start), FakeVertex(end)]
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: evaluated_start if evaluate_start is None else evaluate_start,
+            2: evaluated_end,
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+        u_by_point = {
+            (evaluated_start if evaluate_start is None else evaluate_start): edge.u_min,
+            evaluated_end: edge.u_max,
+        }
+        edge.GetClosestPointOn = lambda x, y, z: [
+            x,
+            y,
+            z,
+            u_by_point[(x, y, z)],
+            0.0,
+        ]
+        edge.GetParameter = lambda x, y, z: [u_by_point[(x, y, z)], True]
+        edge.evaluate_points = [
+            evaluated_start if evaluate_start is None else evaluate_start,
+            evaluated_end,
+        ]
+        edge.evaluate_u_points = {
+            edge.u_min: evaluated_start if evaluate_start is None else evaluate_start,
+            edge.u_max: evaluated_end,
+        }
+        return start, end, evaluated_start, evaluated_end
+
+    def group_333_tessellation(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        self.configure_group_333(edge, tessellation)
+        backend = SolidWorksBackend()
+        backend._source_components = {"part-1": (object(), "Default")}
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
+            Extension=extension
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            destination = Path(directory) / "mesh.stl"
+            entry = backend._write_component_mesh(
+                "part-1",
+                destination,
+                FakeHolder(body),
+            )
+            triangles = self.stl_triangles(destination)
+        return entry["tessellation"], triangles
+
     @staticmethod
     def next_after(value, count):
         for _ in range(count):
@@ -678,6 +779,43 @@ class NativeFinCaptureTests(unittest.TestCase):
                 native_point_roundtrip_tolerance(point, point),
                 expected,
             )
+
+    def test_curve_endpoint_operation_tolerance_covers_group_333(self):
+        start = (
+            -0.005322370050934642,
+            0.00013700629315608413,
+            -0.0021180644098793633,
+        )
+        end = (
+            -0.005322370560299019,
+            0.00013700674222233032,
+            0.0013000000000000002,
+        )
+        evaluated_start = (
+            -0.005322370560299019,
+            0.00013700509113409066,
+            -0.0021180644098793633,
+        )
+        evaluated_end = (
+            -0.005322370560299019,
+            0.00013700509113409066,
+            0.0013,
+        )
+        tolerance = native_curve_endpoint_operation_tolerance(
+            start,
+            evaluated_start,
+            end,
+        )
+
+        self.assertEqual(tolerance, 1.862645149230957e-9)
+        self.assertGreaterEqual(
+            tolerance,
+            native_point_error(start, evaluated_start),
+        )
+        self.assertGreaterEqual(
+            tolerance,
+            native_point_error(end, evaluated_end),
+        )
 
     def test_ninety_percent_leading_gap_counterexample_is_rejected(self):
         fixture = Path(__file__).with_name(
@@ -1113,6 +1251,145 @@ class NativeFinCaptureTests(unittest.TestCase):
             )
         )
 
+    def test_present_curve_endpoint_operation_accepts_group_333_residual(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        self.configure_group_333(edge, tessellation)
+
+        captured = self.capture(body, extension)
+
+        evaluations = captured["native_edge_rows"][0][
+            "curve_endpoint_evaluations"
+        ]
+        self.assertTrue(
+            all(evidence["error"] is None for evidence in evaluations.values())
+        )
+        self.assertEqual(
+            {
+                evidence["point_tolerance_m"]
+                for evidence in evaluations.values()
+            },
+            {1.862645149230957e-9},
+        )
+
+    def test_present_curve_endpoint_operation_rejects_one_micrometre_error(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        start, _end, _evaluated_start, _evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        edge.evaluate_points[0] = (start[0] + 1e-6, start[1], start[2])
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn("curve-domain evidence", caught.exception.message)
+
+    def test_one_failed_curve_endpoint_evaluation_cannot_be_bypassed(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        self.configure_group_333(edge, tessellation)
+        edge.evaluate_points = []
+        edge.evaluate_raw = [
+            [
+                *edge.curve_start_point,
+                0.0,
+                0.0,
+                0.0,
+                edge.evaluate_status_double,
+            ],
+            [0.0, 0.0, 5e-324],
+        ]
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        self.assertIn("curve-domain evidence", caught.exception.message)
+
+    def test_curve_endpoint_bound_does_not_mask_conflicting_fin_point(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        _start, _end, evaluated_start, evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        conflicting_start = (
+            evaluated_start[0] + 1e-6,
+            evaluated_start[1],
+            evaluated_start[2],
+        )
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: conflicting_start,
+            2: evaluated_end,
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+        u_by_point = {
+            conflicting_start: edge.u_min,
+            evaluated_end: edge.u_max,
+        }
+        edge.GetClosestPointOn = lambda x, y, z: [
+            x,
+            y,
+            z,
+            u_by_point[(x, y, z)],
+            0.0,
+        ]
+        edge.GetParameter = lambda x, y, z: [u_by_point[(x, y, z)], True]
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        self.assertIn("does not reproduce the fin endpoint", caught.exception.message)
+
+    def test_parser_accepts_group_333_operation_bound(self):
+        evidence, triangles = self.group_333_tessellation()
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+        )
+
+        self.assertEqual(len(spans), 2)
+
+    def test_parser_rejects_group_333_operation_bound_overshoot(self):
+        evidence, triangles = self.group_333_tessellation()
+        evaluation = evidence["native_edges"][0][
+            "curve_endpoint_evaluations"
+        ]["start"]
+        evaluation["payload"][0] += 1e-6
+
+        with self.assertRaises(PipelineError) as caught:
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+        self.assertIn("not independently reproducible", str(caught.exception))
+
+    def test_parser_rejects_one_failed_curve_endpoint_evaluation(self):
+        evidence, triangles = self.group_333_tessellation()
+        evaluation = evidence["native_edges"][0][
+            "curve_endpoint_evaluations"
+        ]["end"]
+        evaluation["packed_status"]["parsed_success"] = False
+
+        with self.assertRaises(PipelineError) as caught:
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+        self.assertIn("endpoint evaluation is malformed", str(caught.exception))
+
     def test_reverse_sense_requires_directed_topology_mapping(self):
         body, _face_10, _face_20, edge, _tessellation, extension = self.fixture()
         edge.sense = False
@@ -1256,7 +1533,8 @@ class NativeFinCaptureTests(unittest.TestCase):
                 evaluation = derived_edge["curve_endpoint_evaluations"][name]
                 evaluation["payload"] = [0.0] * 6
                 evaluation["point_tolerance_m"] = (
-                    native_point_roundtrip_tolerance(
+                    native_curve_endpoint_operation_tolerance(
+                        [0.0, 0.0, 0.0],
                         [0.0, 0.0, 0.0],
                         [0.0, 0.0, 0.0],
                     )
