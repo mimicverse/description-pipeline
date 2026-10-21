@@ -32,6 +32,12 @@ def _packed_success_status():
     return struct.unpack("<d", struct.pack("<Q", 1))[0]
 
 
+def _fake_whole_body_face_list(_faces, face_reference_sha256):
+    return "VT_ARRAY|VT_DISPATCH", support.native_tessellation_request(
+        face_reference_sha256
+    )
+
+
 class FakeCurve:
     def __init__(self, edge):
         self._edge = edge
@@ -259,6 +265,7 @@ class FakeBody:
         self.Name = name or f"Body{FakeBody._next_reference}"
         self._persist_reference = b"body-" + FakeBody._next_reference.to_bytes(8, "little")
         self._tessellation = None
+        self.tessellation_face_lists = []
         FakeBody._next_reference += 1
 
     def GetFaces(self):  # noqa: N802 - SolidWorks API name
@@ -271,7 +278,8 @@ class FakeBody:
                 edges[id(edge)] = edge
         return list(edges.values())
 
-    def GetTessellation(self):  # noqa: N802 - SolidWorks API name
+    def GetTessellation(self, face_list):  # noqa: N802 - SolidWorks API name
+        self.tessellation_face_lists.append(face_list)
         if self._tessellation is None:
             self._tessellation = FakeTessellation()
         return self._tessellation
@@ -297,7 +305,12 @@ class FakeTessellation:
         self.requested = {}
 
     def __setattr__(self, name, value):
-        if name in {"NeedFaceFacetMap", "NeedEdgeFinMap", "NeedVertexParams"}:
+        if name in {
+            "MatchType",
+            "NeedFaceFacetMap",
+            "NeedEdgeFinMap",
+            "NeedVertexParams",
+        }:
             self.__dict__.setdefault("requested", {})[name] = value
         object.__setattr__(self, name, value)
 
@@ -425,7 +438,8 @@ class FakeTessellationBody(FakeBody):
         super().__init__(faces, name=name)
         self._tessellation = tessellation
 
-    def GetTessellation(self):  # noqa: N802 - SolidWorks API name
+    def GetTessellation(self, face_list):  # noqa: N802 - SolidWorks API name
+        self.tessellation_face_lists.append(face_list)
         return self._tessellation
 
 
@@ -600,7 +614,7 @@ def _configure_fake_body(body, extension):
             }
         )
 
-    tessellation = body.GetTessellation()
+    tessellation = body.GetTessellation(None)
     if tessellation.automatic and faces:
         graph = support.native_tessellation_v3(
             spans,
@@ -667,11 +681,19 @@ class ComponentMeshExportTests(unittest.TestCase):
             )
             end_params_patch.start()
             self.addCleanup(end_params_patch.stop)
+        face_list_patch = patch.object(
+            native_module,
+            "_whole_body_face_list",
+            _fake_whole_body_face_list,
+        )
+        face_list_patch.start()
+        self.addCleanup(face_list_patch.stop)
 
     def test_sheet_only_part_exports_its_faces(self):
+        body = FakeBody([FakeFace(TRIANGLE)])
         component = FakeComponent(
             FakeDocument([]),
-            {0: [], 1: [FakeBody([FakeFace(TRIANGLE)])]},
+            {0: [], 1: [body]},
         )
         entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 1)
@@ -679,6 +701,22 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
         self.assertIn("ITessellation", entry["used_api"])
         self.assertEqual(component.body_calls, [(0,), (1,)])
+        self.assertEqual(
+            body.tessellation_face_lists[-1],
+            "VT_ARRAY|VT_DISPATCH",
+        )
+        self.assertEqual(body._tessellation.requested["MatchType"], 0)
+        self.assertEqual(
+            entry["tessellation"]["itessellation"]["bodies"][0]["request"],
+            support.native_tessellation_request(
+                span["face_reference_sha256"]
+                for span in entry["tessellation"]["face_spans"]
+            ),
+        )
+        self.assertEqual(
+            entry["tessellation"]["itessellation"]["bodies"][0]["properties"],
+            support.NATIVE_TESSELLATION_PROPERTIES,
+        )
         self.assertEqual(read_stl(self.dest).triangles, 1)
 
     def test_native_face_spans_carry_shared_edge_incidence(self):

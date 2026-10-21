@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,7 +52,27 @@ def packed_evaluate_status(value):
 class FakeVariant:
     def __init__(self, value_type, value):
         self.value_type = value_type
+        self.varianttype = value_type
         self.value = value
+
+
+def whole_body_request(face_references):
+    references = tuple(face_references)
+    return {
+        "api": "IBody2.GetTessellation",
+        "argument_count": 1,
+        "face_list": {
+            "scope": "whole_body",
+            "variant_type": "VT_ARRAY|VT_DISPATCH",
+            "face_count": len(references),
+            "first_face_reference_sha256": references[0],
+            "last_face_reference_sha256": references[-1],
+        },
+    }
+
+
+def fake_whole_body_face_list(_faces, face_reference_sha256):
+    return "VT_ARRAY|VT_DISPATCH", whole_body_request(face_reference_sha256)
 
 
 def fake_read_end_params(curve):
@@ -273,6 +294,15 @@ class FakeCurve:
 
 
 class FakeTessellation:
+    _option_names = frozenset(
+        {
+            "MatchType",
+            "NeedFaceFacetMap",
+            "NeedEdgeFinMap",
+            "NeedVertexParams",
+        }
+    )
+
     def __init__(self, face_facets, *, transient_failures=None):
         self.face_facets = face_facets
         self.transient_remaining = dict(transient_failures or {})
@@ -287,11 +317,28 @@ class FakeTessellation:
         self.cofin_calls = []
         self.native_totals = {"GetFacetCount": 2, "GetFinCount": 6, "GetVertexCount": 4}
         self.requested = {}
+        self.property_readbacks = {}
+        self.property_writes = []
+        self.property_reads = []
+        self._property_values = {}
 
     def __setattr__(self, name, value):
-        if name in {"NeedFaceFacetMap", "NeedEdgeFinMap", "NeedVertexParams"}:
+        if name in self._option_names:
             self.__dict__.setdefault("requested", {})[name] = value
+            self.__dict__.setdefault("property_writes", []).append(name)
+            self.__dict__.setdefault("_property_values", {})[name] = value
+            return
         object.__setattr__(self, name, value)
+
+    def __getattr__(self, name):
+        values = self.__dict__.get("_property_values", {})
+        if name in values:
+            self.__dict__.setdefault("property_reads", []).append(name)
+            return self.__dict__.get("property_readbacks", {}).get(
+                name,
+                values[name],
+            )
+        raise AttributeError(name)
 
     def _observe(self, api):
         self.call_counts[api] = self.call_counts.get(api, 0) + 1
@@ -373,6 +420,7 @@ class FakeBody:
         self.edge = edge
         self.tessellation = tessellation
         self.tessellation_calls = 0
+        self.tessellation_face_lists = []
         self.Name = "fixture-body"
 
     def GetFaces(self):  # noqa: N802 - SolidWorks API name
@@ -381,8 +429,9 @@ class FakeBody:
     def GetEdges(self):  # noqa: N802 - SolidWorks API name
         return [self.edge]
 
-    def GetTessellation(self):  # noqa: N802 - SolidWorks API name
+    def GetTessellation(self, face_list):  # noqa: N802 - SolidWorks API name
         self.tessellation_calls += 1
+        self.tessellation_face_lists.append(face_list)
         return self.tessellation
 
 
@@ -395,6 +444,18 @@ class FakeHolder:
 
 
 class NativeFinCaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.production_whole_body_face_list = (
+            native_module._whole_body_face_list
+        )
+        helper_patch = patch.object(
+            native_module,
+            "_whole_body_face_list",
+            fake_whole_body_face_list,
+        )
+        helper_patch.start()
+        self.addCleanup(helper_patch.stop)
+
     def fixture(self):
         body = FakeBody([], None, None)
         face_10 = FakeFace(
@@ -602,6 +663,28 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertTrue(native_u_equal(0.0, boundary))
         self.assertFalse(native_u_equal(0.0, math.nextafter(boundary, math.inf)))
 
+    def test_whole_body_face_list_is_one_explicit_all_face_dispatch_array(self):
+        pythoncom = SimpleNamespace(VT_ARRAY=0x2000, VT_DISPATCH=9)
+        client = SimpleNamespace(VARIANT=FakeVariant)
+        faces = ("face-0", "face-1")
+        references = ("a" * 64, "b" * 64)
+        with patch.dict(sys.modules, {"pythoncom": pythoncom}), patch.object(
+            native_module,
+            "_win32",
+            return_value=client,
+        ):
+            face_list, request = self.production_whole_body_face_list(
+                faces,
+                references,
+            )
+
+        self.assertEqual(
+            face_list.varianttype,
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
+        )
+        self.assertEqual(face_list.value, faces)
+        self.assertEqual(request, whole_body_request(references))
+
     def test_evaluate2_packed_status_counterexample_is_rejected(self):
         fixture = Path(__file__).with_name(
             "edge-evaluate-packed-status-counterexample.json"
@@ -782,13 +865,49 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(face_10.display_calls, 0)
         self.assertEqual(face_20.display_calls, 0)
         self.assertEqual(body.tessellation_calls, 1)
+        self.assertEqual(body.tessellation_face_lists, ["VT_ARRAY|VT_DISPATCH"])
         self.assertEqual(tessellation.tessellate_calls, 1)
         self.assertEqual(
             tessellation.requested,
             {
+                "MatchType": 0,
                 "NeedFaceFacetMap": True,
                 "NeedEdgeFinMap": True,
                 "NeedVertexParams": True,
+            },
+        )
+        self.assertEqual(
+            tessellation.property_writes,
+            [
+                "MatchType",
+                "NeedFaceFacetMap",
+                "NeedEdgeFinMap",
+                "NeedVertexParams",
+            ],
+        )
+        self.assertEqual(
+            tessellation.property_reads,
+            [
+                "MatchType",
+                "NeedFaceFacetMap",
+                "NeedEdgeFinMap",
+                "NeedVertexParams",
+            ],
+        )
+        self.assertEqual(
+            captured["itessellation_body"]["request"],
+            whole_body_request(
+                row["reference"]["typed_sha256"]
+                for row in captured["faces"]
+            ),
+        )
+        self.assertEqual(
+            captured["itessellation_body"]["properties"],
+            {
+                "match_type": 0,
+                "need_face_facet_map": True,
+                "need_edge_fin_map": True,
+                "need_vertex_params": True,
             },
         )
         self.assertEqual(len(tessellation.face_facet_calls), 2)
@@ -1204,6 +1323,16 @@ class NativeFinCaptureTests(unittest.TestCase):
             self.capture(body, extension)
         self.assertEqual(caught.exception.code, "cad_persistent_reference_alias")
         self.assertEqual(caught.exception.detail["previous"]["kind"], "face")
+
+    def test_match_type_readback_mismatch_is_rejected(self):
+        body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
+        tessellation.property_readbacks["MatchType"] = 1
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        self.assertEqual(caught.exception.code, "cad_native_tessellation_unreadable")
+        self.assertEqual(caught.exception.detail["api"], "ITessellation.MatchType")
 
     def test_native_total_mismatch_is_rejected(self):
         body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()

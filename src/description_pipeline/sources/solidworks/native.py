@@ -132,6 +132,34 @@ def _win32():
     return win32com.client
 
 
+def _whole_body_face_list(faces, face_reference_sha256):
+    """Build one explicit all-face dispatch array for a whole-body read."""
+
+    import pythoncom
+
+    typed_faces = tuple(faces)
+    references = tuple(face_reference_sha256)
+    if not typed_faces or len(typed_faces) != len(references):
+        raise RuntimeError("whole-body FaceList requires every typed native face")
+    variant_type = pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH
+    face_list = _win32().VARIANT(variant_type, typed_faces)
+    if getattr(face_list, "varianttype", None) != variant_type:
+        raise RuntimeError(
+            "whole-body FaceList did not marshal as VT_ARRAY|VT_DISPATCH"
+        )
+    return face_list, {
+        "api": "IBody2.GetTessellation",
+        "argument_count": 1,
+        "face_list": {
+            "scope": "whole_body",
+            "variant_type": "VT_ARRAY|VT_DISPATCH",
+            "face_count": len(typed_faces),
+            "first_face_reference_sha256": references[0],
+            "last_face_reference_sha256": references[-1],
+        },
+    }
+
+
 def _dynamic(value):
     # A COM interface can be callable through DISPID_VALUE. It is not a method.
     if hasattr(value, "_oleobj_"):
@@ -4892,10 +4920,23 @@ class SolidWorksBackend(CadBackend):
                 )
             edge_row["face_senses"] = face_senses
 
-        raw_tessellation = call(
-            "IBody2.GetTessellation",
-            lambda: _member(body, "GetTessellation"),
-        )
+        tessellation_request = None
+
+        def get_tessellation():
+            nonlocal tessellation_request
+            typed_faces = tuple(
+                _interface(_dynamic(face), IFACE2_IID) for face in faces
+            )
+            face_references = tuple(
+                row["reference"]["typed_sha256"] for row in face_rows
+            )
+            face_list, tessellation_request = _whole_body_face_list(
+                typed_faces,
+                face_references,
+            )
+            return _member(body, "GetTessellation", face_list)
+
+        raw_tessellation = call("IBody2.GetTessellation", get_tessellation)
         if raw_tessellation is None:
             raise CadError(
                 "cad_native_tessellation_unreadable",
@@ -4903,21 +4944,30 @@ class SolidWorksBackend(CadBackend):
                 {**base, "api": "IBody2.GetTessellation"},
             )
         tessellation = _interface(_dynamic(raw_tessellation), ITESSELLATION_IID)
-        for name in ("NeedFaceFacetMap", "NeedEdgeFinMap", "NeedVertexParams"):
+        tessellation_properties = {}
+        for name, expected, evidence_name in (
+            ("MatchType", 0, "match_type"),
+            ("NeedFaceFacetMap", True, "need_face_facet_map"),
+            ("NeedEdgeFinMap", True, "need_edge_fin_map"),
+            ("NeedVertexParams", True, "need_vertex_params"),
+        ):
             call(
                 f"ITessellation.{name}",
-                lambda name=name: setattr(tessellation, name, True),
+                lambda name=name, expected=expected: setattr(
+                    tessellation, name, expected
+                ),
             )
             observed = call(
                 f"ITessellation.{name}",
                 lambda name=name: _member(tessellation, name),
             )
-            if observed is not True:
+            if type(observed) is not type(expected) or observed != expected:
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "a required tessellation map request did not remain enabled",
+                    "a required tessellation property did not preserve its requested value",
                     {**base, "api": f"ITessellation.{name}", "returned": repr(observed)[:60]},
                 )
+            tessellation_properties[evidence_name] = observed
         tessellate_result = call(
             "ITessellation.Tessellate",
             lambda: _method(tessellation, "Tessellate"),
@@ -5517,6 +5567,8 @@ class SolidWorksBackend(CadBackend):
                 "body_index": body_index,
                 "body_reference_sha256": body_reference["typed_sha256"],
                 "tessellate_result": tessellate_result,
+                "request": tessellation_request,
+                "properties": tessellation_properties,
                 "facet_count": native_totals["facets"],
                 "fin_count": native_totals["fins"],
                 "vertex_count": native_totals["vertices"],
@@ -5904,6 +5956,7 @@ class SolidWorksBackend(CadBackend):
                 "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
                 "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
                 "properties": {
+                    "match_type": 0,
                     "need_face_facet_map": True,
                     "need_edge_fin_map": True,
                     "need_vertex_params": True,

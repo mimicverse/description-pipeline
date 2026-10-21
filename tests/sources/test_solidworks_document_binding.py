@@ -519,6 +519,7 @@ class ReturnViewRegistryTests(unittest.TestCase):
         "MateEntity": native.IMATEENTITY2_IID,
         "GetSurface": native.ISURFACE_IID,
         "GetCurve": native.ICURVE_IID,
+        "GetCurveParams3": native.ICURVEPARAMDATA_IID,
         "GetStartVertex": native.IVERTEX_IID,
         "GetEndVertex": native.IVERTEX_IID,
         "GetTotalTransform": native.IMATHTRANSFORM_IID,

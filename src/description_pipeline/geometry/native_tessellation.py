@@ -854,17 +854,19 @@ def _parse_v3_itessellation(
         component + ": native U observation statistics are inconsistent",
     )
     properties = value["properties"]
-    expected_properties = (
+    expected_boolean_properties = (
         "need_face_facet_map",
         "need_edge_fin_map",
         "need_vertex_params",
     )
     _require(
         isinstance(properties, dict)
-        and set(properties) == set(expected_properties)
+        and set(properties) == {"match_type", *expected_boolean_properties}
+        and type(properties["match_type"]) is int
+        and properties["match_type"] == 0
         and all(
-            type(properties[key]) is bool and properties[key]
-            for key in expected_properties
+            type(properties[key]) is bool and properties[key] is True
+            for key in expected_boolean_properties
         ),
         component + ": native tessellation v3 ITessellation properties are incomplete",
     )
@@ -907,6 +909,8 @@ def _parse_v3_itessellation(
                 "body_index",
                 "body_reference_sha256",
                 "tessellate_result",
+                "request",
+                "properties",
                 "facet_count",
                 "fin_count",
                 "vertex_count",
@@ -930,9 +934,29 @@ def _parse_v3_itessellation(
             component + f": native tessellation v3 body {index} is duplicated or unordered",
         )
         previous_body = body_key
+        body_face_references = tuple(
+            span["face_reference_sha256"]
+            for span in sorted(
+                spans_by_body[body_key],
+                key=lambda item: item["face_index"],
+            )
+        )
         _require(
             body["body_reference_sha256"] == body_references[body_key]
             and body["tessellate_result"] is True
+            and body["request"]
+            == {
+                "api": "IBody2.GetTessellation",
+                "argument_count": 1,
+                "face_list": {
+                    "scope": "whole_body",
+                    "variant_type": "VT_ARRAY|VT_DISPATCH",
+                    "face_count": len(body_face_references),
+                    "first_face_reference_sha256": body_face_references[0],
+                    "last_face_reference_sha256": body_face_references[-1],
+                },
+            }
+            and body["properties"] == properties
             and _integer(body["facet_count"])
             and body["facet_count"] >= 0
             and _integer(body["fin_count"])

@@ -493,6 +493,20 @@ class NativeMeshObservationTests(unittest.TestCase):
                 "properties are incomplete",
             ),
             (
+                "match-type",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "match_type", 1
+                ),
+                "properties are incomplete",
+            ),
+            (
+                "match-type-bool",
+                lambda row: row["tessellation"]["itessellation"]["properties"].__setitem__(
+                    "match_type", False
+                ),
+                "properties are incomplete",
+            ),
+            (
                 "interface",
                 lambda row: row["tessellation"]["itessellation"].__setitem__(
                     "interface_iid", "invented"
@@ -545,12 +559,20 @@ class NativeMeshObservationTests(unittest.TestCase):
                 fin["start_evidence"],
             )
 
+        def partial_face_list(row):
+            body(row)["request"]["face_list"]["face_count"] = 1
+
+        def missing_match_type_evidence(row):
+            body(row)["properties"].pop("match_type")
+
         cases = (
             ("misowned", misowned_facet, "has misowned facets"),
             ("three-fins", missing_fin, "facet 0 is malformed"),
             ("fin-vertices", duplicate_fin_vertex, "fin 0 is malformed"),
             ("fin-sides", fin_side_from_other_facet, "facet 1 is malformed"),
             ("reversed-fin", reversed_fin, "not a directed three-cycle"),
+            ("partial-face-list", partial_face_list, "is incomplete"),
+            ("missing-match-type", missing_match_type_evidence, "is incomplete"),
         )
         for label, mutate, message in cases:
             with self.subTest(label=label):

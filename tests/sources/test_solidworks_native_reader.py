@@ -718,7 +718,7 @@ def _mesh_body(faces, key: str):
         Name=f"fixture-body-{key}",
         GetFaces=lambda: list(faces),
         GetEdges=list,
-        GetTessellation=lambda: _MeshTessellation(),
+        GetTessellation=lambda _face_list: _MeshTessellation(),
         _persist_reference=body_reference,
     )
     for face in faces:
@@ -740,7 +740,10 @@ def _com_stubs():
     pythoncom.COINIT_APARTMENTTHREADED = 2
     pythoncom.CoInitializeEx = lambda *_args, **_kwargs: None
     pythoncom.CoUninitialize = lambda: None
-    pythoncom.VARIANT = lambda _vt, value: types.SimpleNamespace(value=value)
+    pythoncom.VARIANT = lambda vt, value: types.SimpleNamespace(
+        value=value,
+        varianttype=vt,
+    )
     win32com = types.ModuleType("win32com")
     client = types.ModuleType("win32com.client")
     client.VARIANT = pythoncom.VARIANT

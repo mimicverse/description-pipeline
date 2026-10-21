@@ -25,6 +25,30 @@ from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
+NATIVE_TESSELLATION_PROPERTIES = {
+    "match_type": 0,
+    "need_face_facet_map": True,
+    "need_edge_fin_map": True,
+    "need_vertex_params": True,
+}
+
+
+def native_tessellation_request(face_references: Sequence[str]) -> dict[str, Any]:
+    references = tuple(face_references)
+    if not references:
+        raise ValueError("native tessellation request requires at least one face")
+    return {
+        "api": "IBody2.GetTessellation",
+        "argument_count": 1,
+        "face_list": {
+            "scope": "whole_body",
+            "variant_type": "VT_ARRAY|VT_DISPATCH",
+            "face_count": len(references),
+            "first_face_reference_sha256": references[0],
+            "last_face_reference_sha256": references[-1],
+        },
+    }
+
 
 def write_binary_stl(
     path: Path,
@@ -683,12 +707,21 @@ def native_tessellation_v3(
     for body_type, body_index in body_keys:
         body_key = (body_type, body_index)
         body = evidence_by_body[body_key]
+        body_face_references = tuple(
+            span["face_reference_sha256"]
+            for span in sorted(
+                body["spans"],
+                key=lambda item: item["face_index"],
+            )
+        )
         body_rows.append(
             {
                 "body_type": body_type,
                 "body_index": body_index,
                 "body_reference_sha256": body["spans"][0]["body_reference_sha256"],
                 "tessellate_result": True,
+                "request": native_tessellation_request(body_face_references),
+                "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
                 "facet_count": len(body["facets"]),
                 "fin_count": len(body["fins"]),
                 "vertex_count": len(body["vertex_ids_by_point"]),
@@ -757,11 +790,7 @@ def native_tessellation_v3(
                 "get_parameter_calls": u_observations,
                 "evaluate2_calls": u_observations,
             },
-            "properties": {
-                "need_face_facet_map": True,
-                "need_edge_fin_map": True,
-                "need_vertex_params": True,
-            },
+            "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
             "bodies": body_rows,
             "vertices": vertex_rows,
         },
