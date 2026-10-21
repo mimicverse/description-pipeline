@@ -5,7 +5,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 
-function Emit([hashtable]$payload) {
+function Emit($payload) {
   $payload | ConvertTo-Json -Depth 12 -Compress
 }
 function Fail([string]$code, [string]$message) {
@@ -378,47 +378,55 @@ try {
   }
   $volumeAfter = (New-Object System.IO.DriveInfo -ArgumentList (
     [System.IO.Path]::GetPathRoot($root))).AvailableFreeSpace
-  $entryCount = if ($null -eq $entriesBefore) { 0 } else { @($entriesBefore).Count }
-  Emit @{
-    passed=$false
-    code='managed_root_transaction_failed'
-    message=$failure
-    operator_sid=$operatorIdentity.User.Value
-    service_sid=$serviceSid
-    rollback=[ordered]@{
-      passed=($rollbackErrors.Count -eq 0)
-      errors=$rollbackErrors
-      entry_count=$entryCount
-    }
-    volume=[ordered]@{
-      before=$volumeBefore
-      after=$volumeAfter
-    }
+  $entryCount = $entriesBefore.Count
+  $rollbackDocument = [ordered]@{
+    passed=($rollbackErrors.Count -eq 0)
+    errors=$rollbackErrors
+    entry_count=$entryCount
   }
+  $failureVolumeDocument = [ordered]@{
+    before=$volumeBefore
+    after=$volumeAfter
+  }
+  $failurePayload = [ordered]@{}
+  $failurePayload['passed'] = $false
+  $failurePayload['code'] = 'managed_root_transaction_failed'
+  $failurePayload['message'] = $failure
+  $failurePayload['operator_sid'] = $operatorIdentity.User.Value
+  $failurePayload['service_sid'] = $serviceSid
+  $failurePayload['rollback'] = $rollbackDocument
+  $failurePayload['volume'] = $failureVolumeDocument
+  Emit $failurePayload
   exit 1
 }
 $volumeAfter = (New-Object System.IO.DriveInfo -ArgumentList (
   [System.IO.Path]::GetPathRoot($root))).AvailableFreeSpace
 
-Emit @{
-  passed=$true
-  managed_root=$root
-  marker_path=(Normalize $markerPath)
-  marker_sha256=(Get-FileHash -LiteralPath $markerPath -Algorithm SHA256).Hash.ToLower()
-  operator_sid=$operatorIdentity.User.Value
-  service_sid=$serviceSid
-  managed_runtime=[ordered]@{
-    sid=$serviceSid
-    account=[string]$serviceUser.Name
-    administrator=$true
-    privilege_qualification='user-approved-administrator-runtime'
-    acl_ace=$true
-  }
-  root_acl=(Get-AclProjection $root)
-  marker_acl=(Get-AclProjection $markerPath)
-  managed_entry_acl_count=@($entriesBefore).Count
-  volume=[ordered]@{
-    before=$volumeBefore
-    after=$volumeAfter
-  }
+$rootAclProjection = Get-AclProjection $root
+$markerAclProjection = Get-AclProjection $markerPath
+$entriesCount = $entriesBefore.Count
+$successVolumeDocument = [ordered]@{
+  before=$volumeBefore
+  after=$volumeAfter
 }
+$managedRuntimeDocument = [ordered]@{
+  sid=$serviceSid
+  account=[string]$serviceUser.Name
+  administrator=$true
+  privilege_qualification='user-approved-administrator-runtime'
+  acl_ace=$true
+}
+$receipt = [ordered]@{}
+$receipt['passed'] = $true
+$receipt['managed_root'] = $root
+$receipt['marker_path'] = Normalize $markerPath
+$receipt['marker_sha256'] = (
+  Get-FileHash -LiteralPath $markerPath -Algorithm SHA256).Hash.ToLower()
+$receipt['operator_sid'] = $operatorIdentity.User.Value
+$receipt['service_sid'] = $serviceSid
+$receipt['managed_runtime'] = $managedRuntimeDocument
+$receipt['root_acl'] = $rootAclProjection
+$receipt['marker_acl'] = $markerAclProjection
+$receipt['managed_entry_acl_count'] = $entriesCount
+$receipt['volume'] = $successVolumeDocument
+Emit $receipt
