@@ -165,7 +165,11 @@ class NativeCurveDomainTests(unittest.TestCase):
                     evidence["closest_point_on_raw"][:3] = common_point
                     evidence["evaluate_payload"][:3] = common_point
                     evidence["point_tolerance_m"] = (
-                        support.native_point_roundtrip_tolerance(common_point)
+                        support.native_point_roundtrip_tolerance(
+                            common_point,
+                            common_point,
+                            common_point,
+                        )
                     )
                     evidence["closest_point_error_m"] = 0.0
                     evidence["evaluate_point_error_m"] = 0.0
@@ -330,7 +334,11 @@ class NativeCurveDomainTests(unittest.TestCase):
                 evidence["closest_point_on_raw"][:3] = former_end
                 evidence["evaluate_payload"][:3] = former_end
                 evidence["point_tolerance_m"] = (
-                    support.native_point_roundtrip_tolerance(former_end)
+                    support.native_point_roundtrip_tolerance(
+                        former_end,
+                        former_end,
+                        former_end,
+                    )
                 )
         for vertex in tessellation["itessellation"]["vertices"]:
             if vertex["vertex_id"] in affected_vertices:

@@ -26,6 +26,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     native_curve_domain_transform,
     native_evaluate2_evidence,
     native_evaluate2_success,
+    native_float32_adjacency_bound,
     native_get_parameter_success,
     native_point_roundtrip_tolerance,
     native_u_equal,
@@ -633,6 +634,51 @@ class NativeFinCaptureTests(unittest.TestCase):
             native_u_intervals_cover([(lower, upper)], lower, upper)
         )
 
+    def test_point_tolerance_binds_both_endpoint_roundtrips(self):
+        expected = (-0.0028346584947739543, 0.01, 0.01535)
+        evaluated = (-0.0028346575612019013, 0.009999999999999608, 0.01535)
+        tolerance = native_point_roundtrip_tolerance(expected, evaluated)
+        expected_tolerance = max(
+            native_float32_adjacency_bound(expected[index])
+            + native_float32_adjacency_bound(evaluated[index])
+            for index in range(3)
+        )
+        error = max(
+            abs(expected[index] - evaluated[index])
+            for index in range(3)
+        )
+
+        self.assertEqual(tolerance, expected_tolerance)
+        self.assertGreaterEqual(tolerance, error)
+        self.assertLess(tolerance, 2e-9)
+        self.assertGreater(
+            error,
+            max(
+                native_binary32_spacing(value)
+                for point in (expected, evaluated)
+                for value in point
+            ),
+        )
+        self.assertLess(tolerance, 100.0)
+
+    def test_point_tolerance_handles_zero_negative_and_binade_coordinates(self):
+        zero = (0.0, -0.0, 0.0)
+        negative = (-0.0028346584947739543, -0.01, -0.01535)
+        binade = (1.0, -2.0, 0.5)
+        for point in (zero, negative, binade):
+            expected = max(
+                native_float32_adjacency_bound(point[0])
+                + native_float32_adjacency_bound(point[0]),
+                native_float32_adjacency_bound(point[1])
+                + native_float32_adjacency_bound(point[1]),
+                native_float32_adjacency_bound(point[2])
+                + native_float32_adjacency_bound(point[2]),
+            )
+            self.assertEqual(
+                native_point_roundtrip_tolerance(point, point),
+                expected,
+            )
+
     def test_ninety_percent_leading_gap_counterexample_is_rejected(self):
         fixture = Path(__file__).with_name(
             "native-u-leading-gap-counterexample.json"
@@ -1238,6 +1284,8 @@ class NativeFinCaptureTests(unittest.TestCase):
                         evidence["evaluate_payload"][:3] = [0.0, 0.0, 0.0]
                         evidence["point_tolerance_m"] = (
                             native_point_roundtrip_tolerance(
+                                [0.0, 0.0, 0.0],
+                                [0.0, 0.0, 0.0],
                                 [0.0, 0.0, 0.0],
                             )
                         )

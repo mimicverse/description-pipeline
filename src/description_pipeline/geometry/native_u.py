@@ -10,7 +10,7 @@ NATIVE_U_IDENTITY_ULPS = 128
 NATIVE_U_COVERAGE_COVERED = "covered"
 NATIVE_U_COVERAGE_UNCOVERED = "uncovered"
 NATIVE_U_COVERAGE_UNRESOLVED = "unresolved"
-NATIVE_POINT_ROUNDTRIP_RULE = "native-point-float32-adjacent-v2"
+NATIVE_POINT_ROUNDTRIP_RULE = "native-point-float32-pair-v3"
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
 
@@ -243,17 +243,27 @@ def native_point_error(
 
 
 def native_point_roundtrip_tolerance(*points) -> float:
-    """Bound one finite XYZ point to its binary32 serialization and back."""
+    """Bound the largest coordinate-wise roundtrip between any two XYZ points."""
 
     if not points:
         raise ValueError("at least one point is required")
-    bound = 0.0
     for point in points:
         if len(point) != 3:
             raise ValueError("points must contain three coordinates")
-        for coordinate in point:
-            bound = max(bound, native_float32_adjacency_bound(coordinate))
-    return bound
+    if len(points) == 1:
+        return max(
+            native_float32_adjacency_bound(coordinate)
+            for coordinate in points[0]
+        )
+    return max(
+        max(
+            native_float32_adjacency_bound(left[index])
+            + native_float32_adjacency_bound(right[index])
+            for index in range(3)
+        )
+        for left_index, left in enumerate(points)
+        for right in points[left_index + 1 :]
+    )
 
 
 def native_curve_endpoint_roles(
