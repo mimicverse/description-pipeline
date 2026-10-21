@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$ManagedRoot,
-  [Parameter(Mandatory=$true)][string]$ServiceAccount
+  [Parameter(Mandatory=$true)][string]$ServiceAccount,
+  [string]$PostflightScript = ''
 )
 $ErrorActionPreference='Stop'
 
@@ -72,13 +73,73 @@ function Get-AclProjection([string]$path) {
     owner_sid=Resolve-Sid ([string]$acl.Owner)
     group_sid=Resolve-Sid ([string]$acl.Group)
     protected=[bool]$acl.AreAccessRulesProtected
+    sddl=[string]$acl.GetSecurityDescriptorSddlForm(
+      [System.Security.AccessControl.AccessControlSections]::All)
     rules=$rules
   }
 }
-function Assert-ManagedAcl([string]$path) {
-  $expected = @{}
-  $expected['S-1-5-18'] = [long][System.Security.AccessControl.FileSystemRights]::FullControl
-  $expected['S-1-5-32-544'] = [long][System.Security.AccessControl.FileSystemRights]::FullControl
+function Get-ManagedEntriesSnapshot([string]$root) {
+  $rows = New-Object System.Collections.Generic.List[object]
+  foreach ($child in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)) {
+    $path = $child.FullName
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      throw ('managed entry is a reparse point: ' + $path)
+    }
+    $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+    $security = if ($item.PSIsContainer) {
+      New-Object System.Security.AccessControl.DirectorySecurity
+    } else {
+      New-Object System.Security.AccessControl.FileSecurity
+    }
+    $security.SetSecurityDescriptorSddlForm(
+      [string]$acl.GetSecurityDescriptorSddlForm(
+        [System.Security.AccessControl.AccessControlSections]::All),
+      [System.Security.AccessControl.AccessControlSections]::All)
+    $rows.Add([pscustomobject]@{
+      path=(Normalize $path)
+      container=[bool]$item.PSIsContainer
+      security=$security
+      projection=Get-AclProjection $path
+    })
+  }
+  return @($rows)
+}
+function Set-ManagedAcl([string]$path, [string]$serviceSid) {
+  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    throw ('managed ACL target is a reparse point: ' + $path)
+  }
+  $inheritance = if ($item.PSIsContainer) {
+    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+  } else {
+    [System.Security.AccessControl.InheritanceFlags]::None
+  }
+  $acl = if ($item.PSIsContainer) {
+    New-Object System.Security.AccessControl.DirectorySecurity
+  } else {
+    New-Object System.Security.AccessControl.FileSecurity
+  }
+  $acl.SetOwner(
+    (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))
+  $acl.SetAccessRuleProtection($true, $false)
+  [void]$acl.AddAccessRule((New-Rule 'S-1-5-18' (
+    [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
+  [void]$acl.AddAccessRule((New-Rule 'S-1-5-32-544' (
+    [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
+  [void]$acl.AddAccessRule((New-Rule $serviceSid (
+    [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
+  Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+  Assert-ManagedAcl $path $serviceSid
+}
+function Assert-ManagedAcl([string]$path, [string]$serviceSid) {
+  $expected = @(
+    'S-1-5-18',
+    'S-1-5-32-544',
+    $serviceSid
+  )
+  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
   $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
   if (-not $acl.AreAccessRulesProtected) {
     throw ('managed ACL is not protected: ' + $path)
@@ -86,26 +147,66 @@ function Assert-ManagedAcl([string]$path) {
   if ((Resolve-Sid ([string]$acl.Owner)) -ne 'S-1-5-32-544') {
     throw ('managed ACL owner is not Administrators: ' + $path)
   }
+  $expectedInheritance = if ($item.PSIsContainer) {
+    [int](
+      [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+  } else {
+    [int][System.Security.AccessControl.InheritanceFlags]::None
+  }
   $rules = @($acl.GetAccessRules(
     $true,
     $true,
     [System.Security.Principal.SecurityIdentifier]))
   if ($rules.Count -ne $expected.Count) {
-    throw ('managed ACL does not contain exactly two entries: ' + $path)
+    throw ('managed ACL does not contain exactly SYSTEM, Administrators and the service account: ' + $path)
   }
+  $seen = @{}
   foreach ($rule in $rules) {
     $sid = Resolve-Sid ([string]$rule.IdentityReference)
-    if (-not $expected.ContainsKey($sid) -or
+    if ($sid -notin $expected -or
+        $seen.ContainsKey($sid) -or
         $rule.AccessControlType -ne
           [System.Security.AccessControl.AccessControlType]::Allow -or
-        [long]$rule.FileSystemRights -ne [long]$expected[$sid] -or
+        [long]$rule.FileSystemRights -ne
+          [long][System.Security.AccessControl.FileSystemRights]::FullControl -or
         $rule.IsInherited -or
-        [int]$rule.InheritanceFlags -ne
-          [int][System.Security.AccessControl.InheritanceFlags]::None -or
+        [int]$rule.InheritanceFlags -ne $expectedInheritance -or
         [int]$rule.PropagationFlags -ne
           [int][System.Security.AccessControl.PropagationFlags]::None) {
-      throw ('managed ACL entry does not match the administrator/system matrix: ' + $path)
+      throw ('managed ACL entry does not match the SYSTEM/Administrators/service matrix: ' + $path)
     }
+    $seen[$sid] = $true
+  }
+  if ($seen.Count -ne $expected.Count) {
+    throw ('managed ACL is missing a required principal: ' + $path)
+  }
+}
+function Assert-ServiceInherited([string]$path, [string]$serviceSid) {
+  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+  $expectedInheritance = if ($item.PSIsContainer) {
+    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+  } else {
+    [System.Security.AccessControl.InheritanceFlags]::None
+  }
+  $matching = @($acl.GetAccessRules(
+    $true,
+    $true,
+    [System.Security.Principal.SecurityIdentifier]) | Where-Object {
+      (Resolve-Sid ([string]$_.IdentityReference)) -eq $serviceSid -and
+      $_.AccessControlType -eq
+        [System.Security.AccessControl.AccessControlType]::Allow -and
+      [long]$_.FileSystemRights -eq
+        [long][System.Security.AccessControl.FileSystemRights]::FullControl -and
+      $_.IsInherited -and
+      [int]$_.InheritanceFlags -eq [int]$expectedInheritance -and
+      [int]$_.PropagationFlags -eq
+        [int][System.Security.AccessControl.PropagationFlags]::None
+    })
+  if ($matching.Count -ne 1) {
+    throw ('managed root did not propagate service-account access to: ' + $path)
   }
 }
 
@@ -171,10 +272,15 @@ if (Test-Path -LiteralPath $markerPath) {
 }
 Assert-NoReparseAncestor $markerPath
 $rootAclBefore = $null
+$entriesBefore = $null
 $markerAclBefore = $null
 $markerCreated = $false
+$probePath = $null
+$volumeBefore = (New-Object System.IO.DriveInfo -ArgumentList (
+  [System.IO.Path]::GetPathRoot($root))).AvailableFreeSpace
 try {
   $rootAclBefore = Get-Acl -LiteralPath $root -ErrorAction Stop
+  $entriesBefore = @(Get-ManagedEntriesSnapshot $root)
   if ($markerExisted) {
     $markerAclBefore = Get-Acl -LiteralPath $markerPath -ErrorAction Stop
   } else {
@@ -184,44 +290,60 @@ try {
       (New-Object System.Text.UTF8Encoding($false)))
     $markerCreated = $true
   }
-  $markerAcl = Get-Acl -LiteralPath $markerPath -ErrorAction Stop
-  $markerAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $adminSid))
-  $markerAcl.SetAccessRuleProtection($true, $false)
-  foreach ($rule in @($markerAcl.GetAccessRules(
-      $true,
-      $false,
-      [System.Security.Principal.SecurityIdentifier]))) {
-    [void]$markerAcl.RemoveAccessRuleSpecific($rule)
-  }
-  [void]$markerAcl.AddAccessRule((New-Rule 'S-1-5-18' (
-    [System.Security.AccessControl.FileSystemRights]::FullControl) (
-    [System.Security.AccessControl.InheritanceFlags]::None)))
-  [void]$markerAcl.AddAccessRule((New-Rule $adminSid (
-    [System.Security.AccessControl.FileSystemRights]::FullControl) (
-    [System.Security.AccessControl.InheritanceFlags]::None)))
-  Set-Acl -LiteralPath $markerPath -AclObject $markerAcl -ErrorAction Stop
 
-  $rootAcl = Get-Acl -LiteralPath $root -ErrorAction Stop
-  $rootAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $adminSid))
-  $rootAcl.SetAccessRuleProtection($true, $false)
-  foreach ($rule in @($rootAcl.GetAccessRules(
-      $true,
-      $false,
-      [System.Security.Principal.SecurityIdentifier]))) {
-    [void]$rootAcl.RemoveAccessRuleSpecific($rule)
+  $entriesBefore | ForEach-Object {
+    Set-ManagedAcl ([string]$_.path) $serviceSid
   }
-  [void]$rootAcl.AddAccessRule((New-Rule 'S-1-5-18' (
-    [System.Security.AccessControl.FileSystemRights]::FullControl) (
-    [System.Security.AccessControl.InheritanceFlags]::None)))
-  [void]$rootAcl.AddAccessRule((New-Rule $adminSid (
-    [System.Security.AccessControl.FileSystemRights]::FullControl) (
-    [System.Security.AccessControl.InheritanceFlags]::None)))
-  Set-Acl -LiteralPath $root -AclObject $rootAcl -ErrorAction Stop
-  Assert-ManagedAcl $root
-  Assert-ManagedAcl $markerPath
+  Set-ManagedAcl $root $serviceSid
+  Set-ManagedAcl $markerPath $serviceSid
+
+  $probePath = Join-Path $root (
+    '.description-managed-root-probe-' + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $probePath -ErrorAction Stop
+  $probeFile = Join-Path $probePath 'service-access.txt'
+  [System.IO.File]::WriteAllText(
+    $probeFile,
+    'managed-root-service-access',
+    (New-Object System.Text.UTF8Encoding($false)))
+  Assert-ServiceInherited $probePath $serviceSid
+  Assert-ServiceInherited $probeFile $serviceSid
+
+  if ($PostflightScript) {
+    $postflight = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+      $PostflightScript)
+    if (-not (Test-Path -LiteralPath $postflight -PathType Leaf)) {
+      throw ('managed-root postflight script is missing: ' + $postflight)
+    }
+    $powershell = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $result = & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+      -File $postflight -ManagedRoot $root -ServiceAccount $ServiceAccount 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw ('managed-root postflight failed with exit ' + [string]$LASTEXITCODE)
+    }
+  }
+  if (Test-Path -LiteralPath $probePath) {
+    Remove-Item -LiteralPath $probePath -Recurse -Force -ErrorAction Stop
+  }
+  $probePath = $null
 } catch {
   $failure = $_.Exception.Message
   $rollbackErrors = @()
+  if ($probePath -and (Test-Path -LiteralPath $probePath)) {
+    try {
+      Remove-Item -LiteralPath $probePath -Recurse -Force -ErrorAction Stop
+    } catch {
+      $rollbackErrors += ('probe: ' + $_.Exception.Message)
+    }
+  }
+  if ($null -ne $entriesBefore) {
+    foreach ($row in @($entriesBefore)) {
+      try {
+        Set-Acl -LiteralPath ([string]$row.path) -AclObject $row.security -ErrorAction Stop
+      } catch {
+        $rollbackErrors += ([string]$row.path + ': ' + $_.Exception.Message)
+      }
+    }
+  }
   if ($null -ne $rootAclBefore) {
     try {
       Set-Acl -LiteralPath $root -AclObject $rootAclBefore -ErrorAction Stop
@@ -240,19 +362,29 @@ try {
   } catch {
     $rollbackErrors += ('marker: ' + $_.Exception.Message)
   }
+  $volumeAfter = (New-Object System.IO.DriveInfo -ArgumentList (
+    [System.IO.Path]::GetPathRoot($root))).AvailableFreeSpace
+  $entryCount = if ($null -eq $entriesBefore) { 0 } else { @($entriesBefore).Count }
   Emit @{
     passed=$false
-    code='managed_root_acl_failed'
+    code='managed_root_transaction_failed'
     message=$failure
     operator_sid=$operatorIdentity.User.Value
     service_sid=$serviceSid
     rollback=[ordered]@{
       passed=($rollbackErrors.Count -eq 0)
       errors=$rollbackErrors
+      entry_count=$entryCount
+    }
+    volume=[ordered]@{
+      before=$volumeBefore
+      after=$volumeAfter
     }
   }
   exit 1
 }
+$volumeAfter = (New-Object System.IO.DriveInfo -ArgumentList (
+  [System.IO.Path]::GetPathRoot($root))).AvailableFreeSpace
 
 Emit @{
   passed=$true
@@ -266,8 +398,13 @@ Emit @{
     account=[string]$serviceUser.Name
     administrator=$true
     privilege_qualification='user-approved-administrator-runtime'
-    acl_ace=$false
+    acl_ace=$true
   }
   root_acl=Get-AclProjection $root
   marker_acl=Get-AclProjection $markerPath
+  managed_entry_acl_count=@($entriesBefore).Count
+  volume=[ordered]@{
+    before=$volumeBefore
+    after=$volumeAfter
+  }
 }

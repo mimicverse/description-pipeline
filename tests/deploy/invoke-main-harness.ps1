@@ -114,14 +114,14 @@ function Set-ManagedAcl {
   param(
     [string]$Path,
     [bool]$Protected,
+    [string]$ServiceSid,
     [switch]$NonInheriting,
-    [switch]$AllowServiceOwner,
     [switch]$Recurse)
   $script:Calls.Add(
     'managed-acl:' + $Path +
     ':protected=' + [string]$Protected +
+    ':service-sid=' + $ServiceSid +
     ':non-inheriting=' + [string][bool]$NonInheriting +
-    ':allow-service-owner=' + [string][bool]$AllowServiceOwner +
     ':recurse=' + [string][bool]$Recurse)
 }
 function Set-ManagedEndpointAcls {

@@ -845,16 +845,27 @@ function New-ManagedAccessRule(
 function Assert-ManagedAcl(
   [string]$Path,
   [bool]$Protected,
+  [string]$ServiceSid = '',
   [switch]$NonInheriting,
   [switch]$Recurse) {
   $pending = New-Object 'System.Collections.Generic.Stack[string]'
   $pending.Push([System.IO.Path]::GetFullPath($Path))
   $administratorsSid = Get-ManagedAdministratorsSid
   $systemSid = Get-ManagedSystemSid
-  $operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  if (-not $ServiceSid) {
+    $ServiceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $ServiceSid = Resolve-Sid $ServiceSid
+    $authorization = Get-ManagedServiceAuthorization $ServiceSid
+    if (-not [bool]$authorization.administrator) {
+      Die 'windows_runtime_not_administrator' 'the endpoint runtime is not an administrator'
+    }
+  } else {
+    $ServiceSid = Resolve-Sid $ServiceSid
+  }
   $expectedRights = @{
     $systemSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
     $administratorsSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
+    $ServiceSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
   }
   while ($pending.Count -gt 0) {
     $current = $pending.Pop()
@@ -872,10 +883,9 @@ function Assert-ManagedAcl(
       [int][System.Security.AccessControl.InheritanceFlags]::None
     }
     $rules = @($projection.rules)
-    $invalid = ($projection.owner_sid -ne $administratorsSid -and
-        $projection.owner_sid -ne $operatorSid) -or
+    $invalid = $projection.owner_sid -ne $administratorsSid -or
       [bool]$projection.protected -ne $Protected -or
-      $rules.Count -ne 2
+      $rules.Count -ne $expectedRights.Count
     $seenRuleSids = @{}
     foreach ($rule in $rules) {
       $ruleSid = [string]$rule.sid
@@ -919,17 +929,21 @@ function Assert-ManagedAcl(
 function Set-ManagedAcl(
   [string]$Path,
   [bool]$Protected,
+  [string]$ServiceSid = '',
   [switch]$NonInheriting,
-  [switch]$AllowServiceOwner,
   [switch]$Recurse) {
-  if ($AllowServiceOwner) {
-    Die 'windows_managed_acl_service_ace_refused' (
-      'the administrator runtime is authorized through Administrators; service-specific ACL entries are forbidden')
-  }
   $pending = New-Object 'System.Collections.Generic.Stack[string]'
   $pending.Push([System.IO.Path]::GetFullPath($Path))
   $administratorsSid = Get-ManagedAdministratorsSid
   $systemSid = Get-ManagedSystemSid
+  if (-not $ServiceSid) {
+    $ServiceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  }
+  $ServiceSid = Resolve-Sid $ServiceSid
+  $authorization = Get-ManagedServiceAuthorization $ServiceSid
+  if (-not [bool]$authorization.administrator) {
+    Die 'windows_runtime_not_administrator' 'the endpoint runtime is not an administrator'
+  }
   while ($pending.Count -gt 0) {
     $current = $pending.Pop()
     $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
@@ -958,9 +972,11 @@ function Set-ManagedAcl(
         [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
       [void]$acl.AddAccessRule((New-ManagedAccessRule $administratorsSid (
         [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
+      [void]$acl.AddAccessRule((New-ManagedAccessRule $ServiceSid (
+        [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
     }
     Set-Acl -LiteralPath $current -AclObject $acl -ErrorAction Stop
-    Assert-ManagedAcl $current $Protected -NonInheriting:$NonInheriting
+    Assert-ManagedAcl $current $Protected $ServiceSid -NonInheriting:$NonInheriting
     if ($Recurse -and $item.PSIsContainer) {
       foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
         $pending.Push($child.FullName)
@@ -1080,7 +1096,7 @@ function Get-ManagedEndpointAclRows(
   $rows = @()
   $seen = @{}
   $rules = @(
-    @{role='common_parent'; path=$common; recurse=$false; non_inheriting=$true; required=$true},
+    @{role='common_parent'; path=$common; recurse=$false; non_inheriting=$false; required=$true},
     @{role='managed_root_marker'; path=$managedRootMarker; recurse=$false; non_inheriting=$false; required=$true},
     @{role='package_root'; path=$Config.package_root; recurse=$false; non_inheriting=$false; required=$true},
     @{role='output_root'; path=$Config.output_root; recurse=$false; non_inheriting=$false; required=$true},
@@ -1113,7 +1129,7 @@ function Get-ManagedEndpointAclRows(
         path=$normalized
         recurse=[bool]$rule.recurse
         non_inheriting=[bool]$rule.non_inheriting
-        allow_service_owner=[bool]$rule.allow_service_owner
+        allow_service_owner=$true
         required=[bool]$rule.required
       }
     }
@@ -1126,6 +1142,7 @@ function Set-ManagedEndpointAcls(
   [string]$ConfigPath,
   [string]$InstallIdPath,
   [string]$TaskFile = '') {
+  $serviceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
     if (-not (Test-Path -LiteralPath $row.path)) {
       if ($row.required) {
@@ -1133,7 +1150,8 @@ function Set-ManagedEndpointAcls(
       }
       continue
     }
-    Set-ManagedAcl $row.path $true -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
+    Set-ManagedAcl $row.path $true $serviceSid `
+      -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
   }
 }
 function Assert-ManagedEndpointAcls(
@@ -1142,6 +1160,7 @@ function Assert-ManagedEndpointAcls(
   [string]$ConfigPath,
   [string]$InstallIdPath,
   [string]$TaskFile = '') {
+  $serviceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
     if (-not (Test-Path -LiteralPath $row.path)) {
       if ($row.required) {
@@ -1149,7 +1168,8 @@ function Assert-ManagedEndpointAcls(
       }
       continue
     }
-    Assert-ManagedAcl $row.path $true -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
+    Assert-ManagedAcl $row.path $true $serviceSid `
+      -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
   }
 }
 function Get-ManagedAclProjectionForRole($Acl, [string]$Role) {

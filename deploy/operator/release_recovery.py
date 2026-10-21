@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-SCHEMA = "description-pipeline.release-recovery-gate/v1"
+SCHEMA = "solidworks-to-urdf.release-recovery-gate/v1"
 RECEIPT = "release-recovery-gate.json"
 FINALIZE_RECEIPT = "release-finalize-gate.json"
 DEFAULT_TIMEOUT_SECONDS = 3600
