@@ -187,10 +187,17 @@ function Get-ScheduledTask {
 function Start-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:Starts++; $script:CallLog.Add('start') }
 function Stop-ScheduledTask { [CmdletBinding()] param([string]$TaskName) $script:CallLog.Add('stop') }
 function Register-ScheduledTask {
-  [CmdletBinding()] param([string]$TaskName, [string]$Xml, [switch]$Force)
+  [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, [string]$Xml, [switch]$Force)
+  if ($PSBoundParameters.ContainsKey('TaskPath') -and -not $TaskPath) {
+    throw 'root task registration must omit an empty TaskPath'
+  }
   $script:CallLog.Add('register')
   return $null
 }
+$rootTaskRegistration = $true
+try { Register-ManagedTask -TaskName 'root-fixture' -TaskPath '' -TaskXml '<Task />' } catch { $rootTaskRegistration = $false }
+Check 'windows.recovery.root_task_registration_omits_empty_path' $rootTaskRegistration
+$script:CallLog.Clear()
 function Get-Process {
   [CmdletBinding()] param([int]$Id)
   switch ($script:ProcScenario) {

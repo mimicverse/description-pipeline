@@ -1797,6 +1797,7 @@ def _verify_native_solid_orientation(source_bytes: bytes, row: dict) -> None:
             for vertex in face:
                 adjacency.setdefault(vertex, set()).add(triangle_index)
         pending = set(range(len(faces)))
+        components = []
         while pending:
             stack = [pending.pop()]
             component = []
@@ -1809,20 +1810,101 @@ def _verify_native_solid_orientation(source_bytes: bytes, row: dict) -> None:
                             pending.remove(neighbor)
                             stack.append(neighbor)
             signed_volume = 0.0
+            weighted_center = [0.0, 0.0, 0.0]
+            sample = None
+            sample_area = -1.0
             for triangle_index in component:
                 a, b, c = (
                     tuple(float(value) for value in points[index])
                     for index in faces[triangle_index]
                 )
-                signed_volume += (
+                volume = (
                     a[0] * (b[1] * c[2] - b[2] * c[1])
                     - a[1] * (b[0] * c[2] - b[2] * c[0])
                     + a[2] * (b[0] * c[1] - b[1] * c[0])
                 ) / 6.0
-            _require(
-                signed_volume > 0,
-                "Closed native solid component is globally inverted against its native outward winding",
+                signed_volume += volume
+                for axis in range(3):
+                    weighted_center[axis] += volume * (a[axis] + b[axis] + c[axis]) / 4.0
+                normal = np.cross(np.asarray(b) - np.asarray(a), np.asarray(c) - np.asarray(a))
+                area = float(np.linalg.norm(normal))
+                if area > sample_area and area > 0.0:
+                    triangle_center = np.asarray(
+                        tuple((a[axis] + b[axis] + c[axis]) / 3.0 for axis in range(3))
+                    )
+                    edge_scale = min(
+                        float(np.linalg.norm(np.asarray(b) - np.asarray(a))),
+                        float(np.linalg.norm(np.asarray(c) - np.asarray(b))),
+                        float(np.linalg.norm(np.asarray(a) - np.asarray(c))),
+                    )
+                    sample_area = area
+                    sample = (
+                        triangle_center,
+                        normal / area,
+                        max(edge_scale * 1.0e-6, 1.0e-12),
+                    )
+            if abs(signed_volume) <= 1e-18:
+                continue
+            center = tuple(value / signed_volume for value in weighted_center)
+            triangle_center, unit_normal, epsilon = sample
+            interior_sample = tuple(
+                float(
+                    triangle_center[axis]
+                    - (1.0 if signed_volume > 0 else -1.0) * epsilon * unit_normal[axis]
+                )
+                for axis in range(3)
             )
+            components.append(
+                {
+                    "triangles": component,
+                    "signed_volume": signed_volume,
+                    "center": center,
+                    "interior_sample": interior_sample,
+                }
+            )
+        _require(
+            components and sum(component["signed_volume"] for component in components) > 0,
+            "Closed native solid has no positive total material volume",
+        )
+        for component_index, component in enumerate(components):
+            nesting_depth = sum(
+                _point_inside_triangle_component(
+                    component["interior_sample"],
+                    points,
+                    faces,
+                    other["triangles"],
+                )
+                for other_index, other in enumerate(components)
+                if other_index != component_index
+            )
+            expected_positive = nesting_depth % 2 == 0
+            _require(
+                (component["signed_volume"] > 0) == expected_positive,
+                "Closed native solid shell orientation differs from its nesting depth",
+            )
+
+
+def _point_inside_triangle_component(point, points, faces, component) -> bool:
+    """Solid-angle membership used only to distinguish outer shells from valid cavities."""
+
+    origin = np.asarray(point, dtype=float)
+    solid_angle = 0.0
+    for triangle_index in component:
+        a, b, c = (
+            np.asarray(points[index], dtype=float) - origin
+            for index in faces[triangle_index]
+        )
+        numerator = float(np.dot(a, np.cross(b, c)))
+        denominator = (
+            float(np.linalg.norm(a) * np.linalg.norm(b) * np.linalg.norm(c))
+            + float(np.dot(a, b)) * float(np.linalg.norm(c))
+            + float(np.dot(b, c)) * float(np.linalg.norm(a))
+            + float(np.dot(c, a)) * float(np.linalg.norm(b))
+        )
+        if abs(denominator) <= 1e-18:
+            continue
+        solid_angle += 2.0 * math.atan2(numerator, denominator)
+    return abs(solid_angle) > 2.0 * math.pi
 
 
 def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:

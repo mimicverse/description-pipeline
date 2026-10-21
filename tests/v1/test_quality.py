@@ -2113,7 +2113,7 @@ class MeshChunkContractTests(unittest.TestCase):
             for index, part in enumerate(self._parts(flipped, 2)):
                 (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
             with (
-                self.assertRaisesRegex(PipelineError, "globally inverted"),
+                self.assertRaisesRegex(PipelineError, "positive total material volume"),
                 mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 2),
             ):
                 quality._geometry(
@@ -2172,6 +2172,73 @@ class MeshChunkContractTests(unittest.TestCase):
                     set(),
                 )
             self.assertEqual(len(points), 12)
+
+    def test_hollow_solid_accepts_inward_cavity_but_rejects_outward_cavity(self):
+        def tetra(scale, center, inward):
+            source = [
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            ][0]
+            transformed = [
+                tuple(
+                    float(center[axis] + scale * (point[axis] - 0.25))
+                    for axis in range(3)
+                )
+                for point in source
+            ]
+            faces = (
+                (0, 2, 1),
+                (0, 1, 3),
+                (0, 3, 2),
+                (1, 2, 3),
+            )
+            if inward:
+                faces = tuple((first, third, second) for first, second, third in faces)
+            return [tuple(transformed[index] for index in face) for face in faces]
+
+        def run_case(root, *, inward):
+            node, body, model_link, geometry, components = self._fixture(
+                root,
+                limit=2,
+                mutate=None,
+            )
+            triangles = tetra(2.0, (0.0, 0.0, 0.0), False) + tetra(
+                0.25,
+                (0.0, 0.0, 0.0),
+                inward,
+            )
+            payload = self._mesh(triangles)
+            source = root / "evidence/geometry/0001_mesh.stl"
+            source.write_bytes(payload)
+            geometry["pcb-1"]["sha256"] = hashlib.sha256(payload).hexdigest()
+            geometry["pcb-1"]["triangles"] = 8
+            spans = geometry["pcb-1"]["tessellation"]["face_spans"]
+            spans[0]["triangle_count"] = 4
+            spans[0]["triangle_records_sha256"] = hashlib.sha256(payload[84:284]).hexdigest()
+            spans[1]["triangle_start"] = 4
+            spans[1]["triangle_count"] = 4
+            spans[1]["triangle_records_sha256"] = hashlib.sha256(payload[284:484]).hexdigest()
+            for index, part in enumerate(self._parts(payload, 4)):
+                (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
+            with mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 4):
+                return quality._geometry(
+                    root,
+                    body,
+                    node,
+                    model_link,
+                    geometry,
+                    components,
+                    np.identity(4),
+                    np.identity(4),
+                    set(),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_case(Path(tmp), inward=True)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            self.assertRaisesRegex(PipelineError, "shell orientation"),
+        ):
+            run_case(Path(tmp), inward=False)
 
 
 class EntityPartitionTests(unittest.TestCase):

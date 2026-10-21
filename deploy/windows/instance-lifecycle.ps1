@@ -810,6 +810,21 @@ function Register-ManagedTask(
   if ($Force) { $parameters.Force = $true }
   Register-ScheduledTask @parameters | Out-Null
 }
+function Stop-ManagedTask([string]$TaskName, [string]$TaskPath) {
+  $parameters = @{TaskName = $TaskName; ErrorAction = 'Stop'}
+  if ($TaskPath) { $parameters.TaskPath = $TaskPath }
+  Stop-ScheduledTask @parameters
+}
+function Disable-ManagedTask([string]$TaskName, [string]$TaskPath) {
+  $parameters = @{TaskName = $TaskName; ErrorAction = 'Stop'}
+  if ($TaskPath) { $parameters.TaskPath = $TaskPath }
+  Disable-ScheduledTask @parameters | Out-Null
+}
+function Enable-ManagedTask([string]$TaskName, [string]$TaskPath) {
+  $parameters = @{TaskName = $TaskName; ErrorAction = 'Stop'}
+  if ($TaskPath) { $parameters.TaskPath = $TaskPath }
+  Enable-ScheduledTask @parameters | Out-Null
+}
 function Get-RecoveryTask([string]$TaskName, [string]$TaskPath = '') {
   $tasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
   if ($TaskPath) {
@@ -1465,8 +1480,8 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
           Die 'windows_task_projection_mismatch' 'the existing task is not the archived managed task'
         }
         $ownedTask = $true
-        if ($existing[0].State -eq 'Running') { Stop-ScheduledTask -TaskName $existing[0].TaskName -TaskPath $existing[0].TaskPath }
-        Disable-ScheduledTask -TaskName $existing[0].TaskName -TaskPath $existing[0].TaskPath -ErrorAction Stop | Out-Null
+        if ($existing[0].State -eq 'Running') { Stop-ManagedTask ([string]$existing[0].TaskName) ([string]$existing[0].TaskPath) }
+        Disable-ManagedTask ([string]$existing[0].TaskName) ([string]$existing[0].TaskPath)
       }
       $cadBefore = Get-RecoveryCadState $state.identity
       Assert-RecoveryIdle $state.identity
@@ -1492,7 +1507,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
           -TaskXml (Read-Utf8Text (Join-Path $extracted.root 'task.xml'))
         $registeringTask = $false
         $ownedTask = $true
-        Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null
+        Disable-ManagedTask ([string]$Binding.task_name) ([string]$Binding.task_path)
       }
       Set-AclProjection (Join-Path $env:SystemRoot ('System32\Tasks\' + ([string]$Binding.task_path).TrimStart('\') + [string]$Binding.task_name)) $state.acl.task_file
       Set-AclProjection ([string]$state.identity.package_root) $state.acl.roots.package_root
@@ -1528,7 +1543,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       }
     }
     if (-not $VerifyOnly -and $failedOwner) {
-      try { Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null } catch { }
+      try { Disable-ManagedTask ([string]$Binding.task_name) ([string]$Binding.task_path) } catch { }
     }
     $cleanup = Close-RecoveryTemp
     Emit @{
@@ -1558,13 +1573,13 @@ function Invoke-RecoveryResume($Binding) {
   } elseif ($projection.state -eq 'Disabled') {
     Assert-RecoveryStopped $projection $identity $cad
     Set-DomainPins ([string]$identity.state_root) ([string]$identity.endpoint_root)
-    Enable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop | Out-Null
+    Enable-ManagedTask ([string]$task.TaskName) ([string]$task.TaskPath)
     try {
       $started = Start-OrRefuse ([string]$identity.config_path) $Binding ([string]$identity.endpoint_root) `
         (Join-Path ([string]$identity.state_root) 'instance-promotions')
       $settled = $started.settled
     } catch {
-      try { Disable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop | Out-Null } catch { }
+      try { Disable-ManagedTask ([string]$task.TaskName) ([string]$task.TaskPath) } catch { }
       throw
     }
   } else {
@@ -1576,7 +1591,7 @@ function Invoke-RecoveryResume($Binding) {
       $health.release.version -ne [string]$Binding.version -or
       $health.release.source_commit -ne [string]$Binding.source_commit -or
       $health.release.source_sha256 -ne [string]$Binding.source_sha256) {
-    try { Disable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop | Out-Null } catch { }
+    try { Disable-ManagedTask ([string]$task.TaskName) ([string]$task.TaskPath) } catch { }
     Die 'windows_health_mismatch' 'the resumed endpoint did not report the bound identity'
   }
   Emit @{passed=$true; verb='resume'; task_state='Running'; settled_seconds=$settled.settled_seconds;
