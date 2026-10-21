@@ -205,8 +205,9 @@ def restore(args, *, verify_only: bool = False) -> int:
             and prior.get("inputs") == inputs
             and prior.get("windows_verified") is True
             and prior.get("health") == "PASS"
-            and prior.get("database_rollback") == (not verify_only)
-            and prior.get("runtime_restart") == (not verify_only)
+            and prior.get("database_restore_executed") == (not verify_only)
+            and prior.get("database_recovery_verified") is True
+            and prior.get("runtime_restart") is True
         ):
             print(
                 json.dumps(
@@ -269,12 +270,11 @@ def restore(args, *, verify_only: bool = False) -> int:
                 "release_recovery_windows_unverified",
                 "Windows recovery did not return a verified disabled, stopped state",
             )
-        if not verify_only:
-            run(
-                [str(operatorctl), "start", "--config", args.config],
-                timeout=timeout,
-                runner=args.runner,
-            )
+        run(
+            [str(operatorctl), "start", "--config", args.config],
+            timeout=timeout,
+            runner=args.runner,
+        )
         status_result = run(
             [str(operatorctl), "status", "--config", args.config],
             timeout=timeout,
@@ -307,8 +307,10 @@ def restore(args, *, verify_only: bool = False) -> int:
         "inputs": inputs,
         "recovery_run": str(run_dir),
         "recovery_receipt_sha256": sha256_file(run_dir / "receipt.json"),
+        "database_restore_executed": not verify_only,
+        "database_recovery_verified": True,
         "database_rollback": not verify_only,
-        "runtime_restart": not verify_only,
+        "runtime_restart": True,
         "windows_verified": True,
         "health": "PASS",
         "operator_status": "PASS",

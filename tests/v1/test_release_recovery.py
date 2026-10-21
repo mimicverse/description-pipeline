@@ -283,6 +283,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
 
             args.runner = runner
             self.assertEqual(release_recovery.restore(args, verify_only=True), 0)
+            self.assertTrue(any("start" in row for row in calls))
             calls.clear()
             self.assertEqual(release_recovery.restore(args), 0)
             self.assertTrue(any("restore" in row for row in calls))
@@ -333,6 +334,52 @@ class ReleaseRecoveryTests(unittest.TestCase):
             gate = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
             self.assertEqual(gate["operation"], "recovery-verify-only")
             self.assertEqual(gate["database_rollback"], False)
+            self.assertEqual(gate["database_restore_executed"], False)
+            self.assertEqual(gate["database_recovery_verified"], True)
+            self.assertEqual(gate["runtime_restart"], True)
+
+    def test_verify_start_and_health_failures_preserve_evidence(self):
+        for failing_command in ("start", "health"):
+            with self.subTest(failing_command=failing_command):  # noqa: SIM117
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    status = root / "status"
+                    args = self.restore_args(root, status_dir=status)
+
+                    def runner(argv, _failing=failing_command, **_kwargs):
+                        if "verify-only" in argv:
+                            run_dir = Path(argv[argv.index("--status-dir") + 1])
+                            run_dir.mkdir(parents=True, exist_ok=True)
+                            (run_dir / "receipt.json").write_text(
+                                json.dumps(
+                                    {
+                                        "status": "succeeded",
+                                        "windows": {
+                                            "task_state": "Disabled",
+                                            "endpoint": "stopped",
+                                            "state_sha256": "d" * 64,
+                                        },
+                                    }
+                                ),
+                                encoding="utf-8",
+                            )
+                            return Result()
+                        if _failing in argv:
+                            return Result(returncode=1, stderr=f"{_failing} failed\n")
+                        return Result()
+
+                    args.runner = runner
+                    with self.assertRaisesRegex(
+                        release_recovery.GateError,
+                        "operatorctl.sh exited with 1",
+                    ):
+                        release_recovery.restore(args, verify_only=True)
+                    gate = json.loads(
+                        (status / release_recovery.RECEIPT).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(gate["status"], "failed")
+                    self.assertEqual(gate["preserved"], True)
+                    self.assertIn("recovery_receipt_sha256", gate)
 
     def test_timeout_preserves_failure_gate(self):
         with tempfile.TemporaryDirectory() as directory:
