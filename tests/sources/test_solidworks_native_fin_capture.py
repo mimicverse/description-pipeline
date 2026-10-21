@@ -379,6 +379,7 @@ class FakeTessellation:
         self.vertex_point_calls = []
         self.native_count_calls = []
         self.cofin_calls = []
+        self.cofin_values = {100: 200, 200: 100}
         self.native_totals = {"GetFacetCount": 2, "GetFinCount": 6, "GetVertexCount": 4}
         self.requested = {}
         self.property_readbacks = {}
@@ -475,7 +476,7 @@ class FakeTessellation:
     def GetFinCoFin(self, fin_id):  # noqa: N802 - SolidWorks API name
         self._observe("GetFinCoFin")
         self.cofin_calls.append(fin_id)
-        return {100: 200, 200: 100}[fin_id]
+        return self.cofin_values[fin_id]
 
 
 class FakeBody:
@@ -500,11 +501,12 @@ class FakeBody:
 
 
 class FakeHolder:
-    def __init__(self, body):
+    def __init__(self, body, body_type=0):
         self.body = body
+        self.body_type = body_type
 
     def GetBodies2(self, body_type):  # noqa: N802 - SolidWorks API name
-        return [self.body] if body_type == 0 else []
+        return [self.body] if body_type == self.body_type else []
 
 
 class NativeFinCaptureTests(unittest.TestCase):
@@ -553,12 +555,12 @@ class NativeFinCaptureTests(unittest.TestCase):
         body.tessellation = tessellation
         return body, face_10, face_20, edge, tessellation, FakeExtension()
 
-    def capture(self, body, extension):
+    def capture(self, body, extension, *, body_type=0):
         return SolidWorksBackend()._capture_body_tessellation(
             body,
             extension,
             component="part-1",
-            body_type=0,
+            body_type=body_type,
             body_index=0,
             read_end_params=fake_read_end_params,
             scope_context={
@@ -571,6 +573,25 @@ class NativeFinCaptureTests(unittest.TestCase):
                 "referenced_configuration": "Default",
             },
         )
+
+    def open_boundary_fixture(self):
+        body, face_10, _face_20, edge, tessellation, extension = self.fixture()
+        body.faces = [face_10]
+        edge.faces = [face_10]
+        tessellation.face_facets = {id(face_10): 10}
+        tessellation.native_totals = {
+            "GetFacetCount": 1,
+            "GetFinCount": 3,
+            "GetVertexCount": 3,
+        }
+        tessellation.cofin_values = {100: -1}
+        tessellation.GetEdgeFins = lambda _edge: [100]
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: (0.0, 0.0, 0.0),
+            2: (1.0, 0.0, 0.0),
+            3: (0.0, 1.0, 0.0),
+        }[vertex_id]
+        return body, face_10, edge, tessellation, extension
 
     def configure_group_333(self, edge, tessellation, *, evaluate_start=None):
         start = (
@@ -1439,6 +1460,142 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         self.assertIn("inconsistent or unreadable", caught.exception.message)
 
+    def test_open_sheet_edge_accepts_single_boundary_fin(self):
+        body, _face_10, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        direct = self.capture(body, extension, body_type=1)
+        self.assertEqual(direct["itessellation_body"]["body_type"], 1)
+        self.assertEqual(direct["edges"][0]["fin_ids"], (100,))
+        self.assertEqual(tessellation.cofin_calls, [100])
+        tessellation.cofin_calls.clear()
+        backend = SolidWorksBackend()
+        backend._source_components = {"part-1": (object(), "Default")}
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
+            Extension=extension
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            destination = Path(directory) / "mesh.stl"
+            entry = backend._write_component_mesh(
+                "part-1",
+                destination,
+                FakeHolder(body, body_type=1),
+            )
+            triangles = self.stl_triangles(destination)
+        captured = entry["tessellation"]
+        self.assertEqual(entry["bodies"], {"solid": 0, "sheet": 1})
+        self.assertEqual(
+            captured["itessellation"]["bodies"][0]["body_type"],
+            1,
+        )
+        self.assertEqual(captured["native_edges"][0]["fin_ids"], [100])
+        self.assertEqual(tessellation.cofin_calls, [100])
+        fins = {
+            row["fin_id"]: row
+            for row in captured["itessellation"]["bodies"][0]["fins"]
+        }
+        self.assertEqual(fins[100]["cofin_raw_id"], -1)
+        self.assertIsNone(fins[100]["cofin_id"])
+        self.assertIsNone(fins[101]["cofin_raw_id"])
+        self.assertIsNone(fins[101]["cofin_id"])
+        spans = parse_native_tessellation(
+            "part-1",
+            captured,
+            entry["bodies"],
+            entry["triangles"],
+            triangles,
+        )
+        self.assertEqual(len(spans), 1)
+
+    def test_shared_edge_rejects_boundary_sentinel(self):
+        body, _face_10, _face_20, _edge, tessellation, extension = (
+            self.fixture()
+        )
+        tessellation.cofin_values = {100: -1, 200: 100}
+
+        with self.assertRaisesRegex(
+            CadError,
+            "shared-edge fin did not report a cofin ID",
+        ):
+            self.capture(body, extension)
+
+    def test_shared_edge_rejects_cofin_outside_its_fin_set(self):
+        body, _face_10, _face_20, _edge, tessellation, extension = (
+            self.fixture()
+        )
+        tessellation.cofin_values = {
+            100: 102,
+            102: 100,
+            200: 101,
+            101: 200,
+        }
+        tessellation.GetFinCoFin = lambda fin_id: tessellation.cofin_values[
+            fin_id
+        ]
+
+        with self.assertRaisesRegex(
+            CadError,
+            "shared-edge cofin is outside the same edge",
+        ):
+            self.capture(body, extension)
+
+    def test_solid_body_cannot_use_open_boundary_semantics(self):
+        body, _face_10, _edge, _tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+
+        with self.assertRaisesRegex(
+            CadError,
+            "open native edge is valid only on a sheet body",
+        ):
+            self.capture(body, extension, body_type=0)
+
+    def test_open_edge_rejects_nonnegative_cofin(self):
+        body, _face_10, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.cofin_values = {100: 200}
+
+        with self.assertRaisesRegex(
+            CadError,
+            "open-edge fin did not report the boundary sentinel",
+        ):
+            self.capture(body, extension, body_type=1)
+
+    def test_open_edge_rejects_invalid_boundary_reads(self):
+        for value in (-2, None, True, 1.0):
+            with self.subTest(value=value):
+                body, _face_10, _edge, tessellation, extension = (
+                    self.open_boundary_fixture()
+                )
+                tessellation.cofin_values = {100: value}
+                with self.assertRaises(CadError) as caught:
+                    self.capture(body, extension, body_type=1)
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_native_tessellation_unreadable",
+                )
+                self.assertIn(
+                    "did not return an integer boundary or cofin ID",
+                    caught.exception.message,
+                )
+
+    def test_native_edge_rejects_an_empty_fin_set(self):
+        body, _face_10, _edge, tessellation, extension = (
+            self.open_boundary_fixture()
+        )
+        tessellation.GetEdgeFins = lambda _edge: []
+
+        with self.assertRaisesRegex(
+            CadError,
+            "native edge did not return any fins",
+        ):
+            self.capture(body, extension, body_type=1)
+
     def test_one_tessellate_partitions_edge_and_internal_fins(self):
         body, face_10, face_20, edge, tessellation, extension = self.fixture()
 
@@ -2194,6 +2351,10 @@ class NativeFinCaptureTests(unittest.TestCase):
                     )
                 )
                 fin["cofin_id"] = replacement["fin_id"]
+                fin["cofin_raw_id"] = replacement["fin_id"]
+                if same_face:
+                    replacement["cofin_id"] = fin["fin_id"]
+                    replacement["cofin_raw_id"] = fin["fin_id"]
                 replacement["start_u"] = edge["u_min"]
                 replacement["end_u"] = edge["u_min"]
                 replacement_points = tuple(
@@ -2214,7 +2375,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     PipelineError,
-                    "cofin/orientation is inconsistent",
+                    "not reciprocal|same face",
                 ):
                     parse_native_tessellation(
                         "part-1",
@@ -2288,7 +2449,7 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             PipelineError,
-            "cofin/orientation is inconsistent",
+            "reciprocal cofin endpoints do not correspond",
         ):
             parse_native_tessellation(
                 "part-1",

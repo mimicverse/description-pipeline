@@ -105,6 +105,8 @@ native edge 的 U 覆盖仍按每个实际三角面分别严格验收。对 clos
 
 面方向以可读的 `IEdge::EdgeInFaceSense` 为主证据；SolidWorks 2026 中 `IEdgeInFaceSense2` 为只写属性，其带错误记录的不可用结果可保留为诊断，但仅在它成功返回布尔值时才要求与主证据一致，主证据缺失或不合法仍拒绝。fin/cofin 跨面时允许使用各自 face-local 的 tessellation vertex ID；独立验证须确认 reciprocal cofin、不同面、反向 U、端点 U 对应以及反向端点坐标落在 v3 点界内，不得仅凭 vertex ID 相同或不同作结论。
 
+原生 tessellation schema v6 将 `ITessellation.GetFinCoFin` 的严格整数 `-1` 定义为开放 sheet body（`body_type=1`）的 boundary sentinel：记录必须保留原始 `cofin_raw_id=-1`，并将归一化 `cofin_id` 写为 `null`。只有唯一 incident face 的 sheet edge 可包含 boundary fins；该 edge 不得为空，且其中每个 fin 都必须携带该 sentinel、指向该唯一 face，并由逐 face 的 U interval 证据证明完整覆盖。solid body（`body_type=0`）不得使用 boundary semantics。具有两个 incident faces 的 edge 不得包含 boundary fin；其每个 fin 都必须指向同一 edge fin set 内的非负 cofin，形成双向 reciprocal pair，并满足不同面、反向 U、端点 U 与坐标对应。允许同一 shared edge 以多段 reciprocal pairs 表示；任一端为 `null`、类型不是严格整数、cofin 不在该 edge set、非 reciprocal、在 shared edge 出现 `-1`、在 open edge 出现非负 cofin、空 fin set 或 incident face 数大于 2 均 fail closed。producer、独立 parser 与 topology summary 使用同一规则；该规则不放宽 curve endpoint、U、surface、身份或 mesh 验收。
+
 极短 fin 的两个端点经原生 128-ULP U identity 视为同一参数时，可采用版本化 `native-fin-u-collapse-v1`：保留两端原始 U、坐标、投影和求值证据，要求 reciprocal cofin、不同面、反向坐标 v3 一致、主 sense 相反、两端投影/Evaluate2/U 域证据有效，且几何端点跨度严格大于零并不超过 50 µm。collapsed fin 只保留为零测度拓扑段，贡献零 U coverage；其余非 collapsed intervals 仍须对每个实际面独立覆盖完整 edge 域。零跨度、部分坍缩、跨度超过 50 µm、cofin/sense 异常、证据不可读或依赖该 fin 补洞的情形必须 unresolved。fin 输入保持 exact schema；规则名、跨度和 warning 是从上述原始证据复算得到的归一化输出，不属于可注入的原始真值，parser 不得修改调用方输入对象。
 
 <a id="qualification"></a>
