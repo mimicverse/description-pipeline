@@ -91,6 +91,8 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 对同一次冻结 CAD、配置和实例，原生 ITessellation 的顶点、facet、fin 与边关系是交付 STL 和拓扑证据的共同来源。交付三角形必须由该 facet 的有向顶点环生成；binary32 序列化、坐标转换和必要的派生值保留原生原值、转换依据及 warning，并由 Linux 从原点、原始关系和实际 STL 字节独立复算。不得把另一种显示缓存的三角形数量当作相同网格的隐含保证，也不得拼接两套 tessellation；原件绑定、`50 µm` 表面比较、完整覆盖及朝向验收不变。
 
+原生曲线端点与 `Evaluate2` 的一致性采用版本化 curve-operation 误差界：对端点 `E`、求值点 `Q` 和曲线另一端点 `O`，允许界由 `pair(E,Q) + pair(E,O)` 组成，其中 `pair` 是两个有限 XYZ 点逐坐标 binary32 邻接界之和的最大值。producer 与独立 parser 使用同一规则；该界不放宽 U 域、持久引用、拓扑端点、fin/cofin 或同 U 证据，也不允许把任何端点跳过验证。
+
 <a id="qualification"></a>
 ## 警告与资格
 
