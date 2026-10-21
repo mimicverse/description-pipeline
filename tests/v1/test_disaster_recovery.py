@@ -2883,6 +2883,13 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "windows_operator_not_administrator",
             ),
             (
+                "operator_runtime_mismatch",
+                lambda state: state["identity"].update(
+                    operator_sid="S-1-5-21-2"
+                ),
+                "windows_recovery_state_invalid",
+            ),
+            (
                 "runtime_qualification",
                 lambda state: state["identity"].update(
                     runtime_privilege_qualification="least-privilege"

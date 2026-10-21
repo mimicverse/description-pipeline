@@ -168,21 +168,22 @@ if (Test-Path -LiteralPath $markerPath) {
   if ($existing.Trim() -ne $markerText) {
     Fail 'managed_root_marker_conflict' 'the existing managed-root marker has different contents'
   }
-} else {
-  [System.IO.File]::WriteAllText(
-    $markerPath,
-    $markerText,
-    (New-Object System.Text.UTF8Encoding($false)))
 }
 Assert-NoReparseAncestor $markerPath
-$rootAclBefore = Get-Acl -LiteralPath $root -ErrorAction Stop
-$markerAclBefore = if ($markerExisted) {
-  Get-Acl -LiteralPath $markerPath -ErrorAction Stop
-} else {
-  $null
-}
-$markerCreated = -not $markerExisted
+$rootAclBefore = $null
+$markerAclBefore = $null
+$markerCreated = $false
 try {
+  $rootAclBefore = Get-Acl -LiteralPath $root -ErrorAction Stop
+  if ($markerExisted) {
+    $markerAclBefore = Get-Acl -LiteralPath $markerPath -ErrorAction Stop
+  } else {
+    [System.IO.File]::WriteAllText(
+      $markerPath,
+      $markerText,
+      (New-Object System.Text.UTF8Encoding($false)))
+    $markerCreated = $true
+  }
   $markerAcl = Get-Acl -LiteralPath $markerPath -ErrorAction Stop
   $markerAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $adminSid))
   $markerAcl.SetAccessRuleProtection($true, $false)
@@ -221,17 +222,19 @@ try {
 } catch {
   $failure = $_.Exception.Message
   $rollbackErrors = @()
-  try {
-    Set-Acl -LiteralPath $root -AclObject $rootAclBefore -ErrorAction Stop
-  } catch {
-    $rollbackErrors += ('root: ' + $_.Exception.Message)
+  if ($null -ne $rootAclBefore) {
+    try {
+      Set-Acl -LiteralPath $root -AclObject $rootAclBefore -ErrorAction Stop
+    } catch {
+      $rollbackErrors += ('root: ' + $_.Exception.Message)
+    }
   }
   try {
     if ($markerCreated) {
       if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
         Remove-Item -LiteralPath $markerPath -Force -ErrorAction Stop
       }
-    } else {
+    } elseif ($null -ne $markerAclBefore) {
       Set-Acl -LiteralPath $markerPath -AclObject $markerAclBefore -ErrorAction Stop
     }
   } catch {

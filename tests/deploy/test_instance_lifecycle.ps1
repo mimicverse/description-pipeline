@@ -323,6 +323,27 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
       "throw 'injected post-root ACL failure'"),
     (New-Object System.Text.UTF8Encoding($false)))
   $powershellExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  $otherLocalUser = Get-LocalUser | Where-Object {
+    [string]$_.SID.Value -ne $serviceSid
+  } | Select-Object -First 1
+  if ($null -ne $otherLocalUser) {
+    $mismatchRoot = Join-Path $driveRoot (
+      'description-managed-mismatch-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $mismatchRoot -Force
+    $mismatchBefore = Get-AclProjection $mismatchRoot
+    $mismatchOutput = @(& $powershellExe -NoProfile -File $bootstrapScript `
+      -ManagedRoot $mismatchRoot -ServiceAccount ([string]$otherLocalUser.SID.Value))
+    $mismatchExit = $LASTEXITCODE
+    $mismatchReceipt = ($mismatchOutput | Select-Object -Last 1) | ConvertFrom-Json
+    Check 'windows_acl.bootstrap_operator_runtime_mismatch' (
+      $mismatchExit -ne 0 -and
+      $mismatchReceipt.code -eq 'managed_root_operator_runtime_mismatch' -and
+      -not (Test-Path -LiteralPath (
+        Join-Path $mismatchRoot '.description-managed-root.json')) -and
+      (Get-AclProjection $mismatchRoot).projection_sha256 -eq
+        $mismatchBefore.projection_sha256)
+    Remove-Item -LiteralPath $mismatchRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
   $markerBeforeFailure = Get-AclProjection $markerPath
   $rootBeforeFailure = Get-AclProjection $aclRoot
   $failureOutput = @(& $powershellExe -NoProfile -File $failureScript `
