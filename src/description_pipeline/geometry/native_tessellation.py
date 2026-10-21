@@ -12,6 +12,7 @@ from .native_u import (
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_RESOLUTION_RULE,
+    native_curve_endpoint_roles,
     native_get_parameter_success,
     native_point_error,
     native_point_roundtrip_tolerance,
@@ -622,14 +623,14 @@ def parse_native_tessellation(
             component
             + f": native edge {index} curve endpoint evaluation is malformed",
         )
-        expected_evaluation_points = (
-            (edge["curve_start_point_m"], edge["curve_end_point_m"])
-            if edge["curve_sense"]
-            else (edge["curve_end_point_m"], edge["curve_start_point_m"])
+        parameter_endpoints, _ = native_curve_endpoint_roles(
+            edge["curve_start_point_m"],
+            edge["curve_end_point_m"],
+            edge["curve_sense"],
         )
         for name, expected_point in zip(
             ("start", "end"),
-            expected_evaluation_points,
+            parameter_endpoints,
             strict=True,
         ):
             evaluation = evaluations[name]
@@ -1151,10 +1152,31 @@ def _parse_v3_itessellation(
                 edge["end_point_m"],
             )
             if all(point is not None for point in endpoint_points):
-                edge_points = {
-                    tuple(_float32(value) for value in point)
-                    for point in endpoint_points
-                }
+                _, topology_endpoints = native_curve_endpoint_roles(
+                    edge["curve_start_point_m"],
+                    edge["curve_end_point_m"],
+                    edge["curve_sense"],
+                )
+                for name, expected_point, actual_point in zip(
+                    ("start", "end"),
+                    topology_endpoints,
+                    endpoint_points,
+                    strict=True,
+                ):
+                    point_tolerance = native_point_roundtrip_tolerance(
+                        expected_point,
+                        actual_point,
+                    )
+                    point_error = native_point_error(
+                        expected_point,
+                        actual_point,
+                    )
+                    _require(
+                        point_error <= point_tolerance,
+                        component
+                        + f": native tessellation v3 edge {reference} "
+                        + f"{name} topology endpoint disagrees with curve direction",
+                    )
             else:
                 evaluations = edge["curve_endpoint_evaluations"]
                 edge_points = {
@@ -1164,11 +1186,11 @@ def _parse_v3_itessellation(
                     )
                     for name in ("start", "end")
                 }
-            _require(
-                curve_points == edge_points,
-                component
-                + f": native tessellation v3 edge {reference} curve endpoints differ",
-            )
+                _require(
+                    curve_points == edge_points,
+                    component
+                    + f": native tessellation v3 edge {reference} curve endpoints differ",
+                )
             evaluations = edge["curve_endpoint_evaluations"]
             for edge_endpoint in ("start", "end"):
                 edge_evaluation = evaluations[edge_endpoint]

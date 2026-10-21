@@ -256,6 +256,29 @@ def native_point_roundtrip_tolerance(*points) -> float:
     return bound
 
 
+def native_curve_endpoint_roles(
+    curve_start: tuple[float | int, float | int, float | int],
+    curve_end: tuple[float | int, float | int, float | int],
+    sense: bool,
+) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...]:
+    """Return U-ordered parameter endpoints and sense-directed topology endpoints."""
+
+    if type(sense) is not bool:
+        raise ValueError("edge sense must be bool")
+    points = []
+    for point in (curve_start, curve_end):
+        if len(point) != 3:
+            raise ValueError("curve endpoints must contain three coordinates")
+        points.append(tuple(_native_u(value) for value in point))
+    parameter_endpoints = (points[0], points[1])
+    topology_endpoints = (
+        parameter_endpoints
+        if sense
+        else (parameter_endpoints[1], parameter_endpoints[0])
+    )
+    return parameter_endpoints, topology_endpoints
+
+
 def native_curve_domain_transform(
     underlying_start: float | int,
     underlying_end: float | int,

@@ -627,11 +627,6 @@ def native_tessellation_v3(
             raise ValueError("native edge curve flags must be booleans")
         curve_start_point = _binary32_point(edge["start_point_m"])
         curve_end_point = _binary32_point(edge["end_point_m"])
-        evaluation_points = (
-            (curve_start_point, curve_end_point)
-            if curve_sense
-            else (curve_end_point, curve_start_point)
-        )
         curve_domain_transform = native_curve_domain_transform(
             u_min,
             u_max,
@@ -679,11 +674,11 @@ def native_tessellation_v3(
                 "curve_endpoint_evaluations": {
                     "start": _curve_endpoint_evaluation(
                         u_min,
-                        evaluation_points[0],
+                        curve_start_point,
                     ),
                     "end": _curve_endpoint_evaluation(
                         u_max,
-                        evaluation_points[1],
+                        curve_end_point,
                     ),
                 },
                 "endpoint_points_derived_from_curve": False,

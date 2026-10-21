@@ -26,6 +26,7 @@ from ...geometry.native_u import (
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_RESOLUTION_RULE,
+    native_curve_endpoint_roles,
     native_evaluate2_evidence,
     native_get_parameter_success,
     native_point_roundtrip_tolerance,
@@ -4677,6 +4678,13 @@ class SolidWorksBackend(CadBackend):
                         "curve_type": repr(curve_type)[:60],
                     },
                 )
+            parameter_endpoints, topology_endpoints = (
+                native_curve_endpoint_roles(
+                    curve_start,
+                    curve_end,
+                    curve_sense,
+                )
+            )
             edge_row["curve"] = {
                 "u_min": float(umin),
                 "u_max": float(umax),
@@ -4727,11 +4735,9 @@ class SolidWorksBackend(CadBackend):
                 }
             edge_row["curve_domain_transform"] = curve_domain_transform
             curve_evaluations = {}
-            edge_start_point = curve_start if curve_sense else curve_end
-            edge_end_point = curve_end if curve_sense else curve_start
             for name, u_parameter, expected_point in (
-                ("start", umin, edge_start_point),
-                ("end", umax, edge_end_point),
+                ("start", umin, parameter_endpoints[0]),
+                ("end", umax, parameter_endpoints[1]),
             ):
                 evaluation = {
                     "u": float(u_parameter),
@@ -4866,6 +4872,36 @@ class SolidWorksBackend(CadBackend):
                         },
                     },
                 )
+            if set(endpoint_states.values()) == {"present"}:
+                for name, expected_point in zip(
+                    ("start", "end"),
+                    topology_endpoints,
+                    strict=True,
+                ):
+                    actual_point = endpoints[name]["point_m"]
+                    tolerance = native_point_roundtrip_tolerance(
+                        expected_point,
+                        actual_point,
+                    )
+                    error_m = max(
+                        abs(expected_point[index] - actual_point[index])
+                        for index in range(3)
+                    )
+                    if error_m > tolerance:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "edge topology endpoints disagree with curve parameter direction",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "endpoint": name,
+                                "curve_sense": curve_sense,
+                                "expected_point_m": list(expected_point),
+                                "actual_point_m": list(actual_point),
+                                "point_tolerance_m": tolerance,
+                                "point_error_m": error_m,
+                            },
+                        )
             if not both_absent and (
                 not endpoint_evaluations_valid
                 or curve_domain_transform["status"]

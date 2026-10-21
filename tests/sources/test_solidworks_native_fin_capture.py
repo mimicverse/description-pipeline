@@ -22,6 +22,7 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_U_IDENTITY_RULE,
     native_binary32_spacing,
+    native_curve_endpoint_roles,
     native_curve_domain_transform,
     native_evaluate2_evidence,
     native_evaluate2_success,
@@ -179,6 +180,7 @@ class FakeEdge:
         self.closest_not_used = 0.0
         self.evaluate_status_double = packed_evaluate_status(1)
         self.parameter_success = True
+        self.sense = True
         self.curve = FakeCurve(u_min, u_max)
 
     def GetBody(self):  # noqa: N802 - SolidWorks API name
@@ -208,7 +210,7 @@ class FakeEdge:
                 if closed
                 else list(self.curve_end_point)
             ),
-            Sense=True,
+            Sense=self.sense,
             CurveType=0,
         )
 
@@ -873,6 +875,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 edge.closest_offset = 100.0
                 edge.curve_end_point = [scale, 0.0, 0.0]
                 edge.curve = FakeCurve(0.0, scale)
+                edge.vertices[1] = FakeVertex((scale, 0.0, 0.0))
                 with self.assertRaises(CadError) as caught:
                     self.capture(body, extension)
                 self.assertEqual(
@@ -1037,6 +1040,58 @@ class NativeFinCaptureTests(unittest.TestCase):
             captured["triangle_records"][0]["output_float32_points"][1][0],
             1.0,
         )
+
+    def test_nonperiodic_reverse_sense_keeps_parameter_endpoint_order(self):
+        body, _face_10, _face_20, edge, _tessellation, extension = self.fixture()
+        edge.sense = False
+        edge.vertices = [
+            FakeVertex((1.0, 0.0, 0.0)),
+            FakeVertex((0.0, 0.0, 0.0)),
+        ]
+
+        captured = self.capture(body, extension)
+
+        edge_row = captured["native_edge_rows"][0]
+        self.assertIs(edge_row["curve_sense"], False)
+        self.assertEqual(
+            [
+                edge_row["curve_endpoint_evaluations"][name]["payload"][:3]
+                for name in ("start", "end")
+            ],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        )
+        self.assertTrue(
+            all(
+                evidence["error"] is None
+                for evidence in edge_row["curve_endpoint_evaluations"].values()
+            )
+        )
+
+    def test_reverse_sense_requires_directed_topology_mapping(self):
+        body, _face_10, _face_20, edge, _tessellation, extension = self.fixture()
+        edge.sense = False
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn(
+            "topology endpoints disagree with curve parameter direction",
+            caught.exception.message,
+        )
+
+    def test_curve_endpoint_roles_separate_parameter_order_from_sense(self):
+        start = (0.0, 1.0, 2.0)
+        end = (3.0, 4.0, 5.0)
+
+        forward = native_curve_endpoint_roles(start, end, True)
+        reverse = native_curve_endpoint_roles(start, end, False)
+
+        self.assertEqual(forward, ((start, end), (start, end)))
+        self.assertEqual(reverse, ((start, end), (end, start)))
 
     def test_closed_absent_endpoints_parser_derives_curve_closure(self):
         body, face_10, face_20, _edge, _tessellation, extension = self.fixture()

@@ -12,6 +12,7 @@ from . import _paths  # noqa: F401
 from . import support
 
 from description_pipeline.geometry.native_tessellation import parse_native_tessellation
+from description_pipeline.geometry.native_u import native_curve_domain_transform
 from description_pipeline.io import PipelineError
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.snapshot import write_manifest
@@ -1041,6 +1042,25 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         _edge, fins = self.edge_fins(tessellation)
         fins[0]["cofin_id"] = None
         with self.assertRaisesRegex(PipelineError, "malformed|cofin"):
+            self.parse(tessellation, triangles)
+
+    def test_curve_sense_requires_directed_topology_mapping(self):
+        tessellation, triangles = self.fixture()
+        edge = tessellation["native_edges"][0]
+        edge["curve_sense"] = False
+        edge["curve_domain_transform"] = native_curve_domain_transform(
+            edge["curve_end_params"]["start"],
+            edge["curve_end_params"]["end"],
+            edge["u_min"],
+            edge["u_max"],
+            False,
+            edge["curve_end_params"]["is_periodic"],
+        )
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "topology endpoint disagrees with curve direction",
+        ):
             self.parse(tessellation, triangles)
 
     def test_curved_native_edge_rejects_same_u_direction(self):
