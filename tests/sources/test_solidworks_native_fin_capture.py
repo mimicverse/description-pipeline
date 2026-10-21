@@ -1075,7 +1075,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "cad_native_tessellation_unreadable",
                 )
                 self.assertIn(
-                    "does not reproduce the fin endpoint",
+                    "projection exceeds the 50 micrometre bound",
                     caught.exception.message,
                 )
 
@@ -1450,6 +1450,93 @@ class NativeFinCaptureTests(unittest.TestCase):
             1.862645149230957e-9,
         )
 
+    def test_projection_point_not_raw_tessellation_vertex_feeds_parameter(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        _start, _end, evaluated_start, evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        source_point = (
+            evaluated_start[0] + 1.9e-6,
+            evaluated_start[1],
+            evaluated_start[2],
+        )
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: source_point,
+            2: evaluated_end,
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+
+        def closest_point(x, y, z):
+            if (x, y, z) == source_point:
+                return evaluated_start
+            return (x, y, z)
+
+        def closest_u(x, y, z):
+            return edge.u_min if (x, y, z) == source_point else edge.u_max
+
+        edge.GetClosestPointOn = lambda x, y, z: [
+            *closest_point(x, y, z),
+            closest_u(x, y, z),
+            0.0,
+        ]
+
+        def parameter(x, y, z):
+            if (x, y, z) == evaluated_start:
+                return [edge.u_min, packed_evaluate_status(1)]
+            if (x, y, z) == source_point:
+                return [edge.u_min, 0.0]
+            return [edge.u_max, packed_evaluate_status(1)]
+
+        edge.GetParameter = parameter
+
+        captured = self.capture(body, extension)
+
+        evidence = next(
+            row
+            for row in captured["itessellation_body"]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(row["start_u"], edge.u_min)
+        )["start_evidence"]
+        self.assertEqual(evidence["source_point_m"], list(source_point))
+        self.assertEqual(
+            evidence["parameter_input_point_m"],
+            list(evaluated_start),
+        )
+        self.assertGreaterEqual(evidence["projection_error_m"], 1.8e-6)
+        self.assertLessEqual(evidence["projection_error_m"], 50e-6)
+
+    def test_projection_over_50_micrometres_is_rejected(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        _start, _end, evaluated_start, evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        source_point = (
+            evaluated_start[0] + 60e-6,
+            evaluated_start[1],
+            evaluated_start[2],
+        )
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: source_point,
+            2: evaluated_end,
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+        edge.GetClosestPointOn = lambda x, y, z: [
+            *(
+                evaluated_start
+                if (x, y, z) == source_point
+                else (x, y, z)
+            ),
+            edge.u_min if (x, y, z) == source_point else edge.u_max,
+            0.0,
+        ]
+
+        with self.assertRaises(CadError) as caught:
+            self.capture(body, extension)
+
+        self.assertIn("50 micrometre bound", caught.exception.message)
+
     def test_parser_accepts_group_333_operation_bound(self):
         evidence, triangles = self.group_333_tessellation()
 
@@ -1540,6 +1627,9 @@ class NativeFinCaptureTests(unittest.TestCase):
                 affected_vertices.add(vertex_id)
                 fin_evidence["closest_point_on_raw"][:3] = start
                 fin_evidence["evaluate_payload"][:3] = evaluated_start
+                fin_evidence["source_point_m"] = list(start)
+                fin_evidence["parameter_input_point_m"] = list(start)
+                fin_evidence["projection_error_m"] = 0.0
                 fin_evidence["point_tolerance_m"] = tolerance
                 fin_evidence["closest_point_error_m"] = 0.0
                 fin_evidence["evaluate_point_error_m"] = error
@@ -1561,6 +1651,83 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
 
         self.assertEqual(len(spans), 2)
+
+    def test_parser_accepts_tessellation_projection_within_50_micrometres(self):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        projected = tuple(edge["curve_start_point_m"])
+        evaluated = tuple(
+            edge["curve_endpoint_evaluations"]["start"]["payload"][:3]
+        )
+        source = (projected[0] + 1.9e-6, projected[1], projected[2])
+        projection_error = native_point_error(source, projected)
+        tolerance = native_curve_endpoint_operation_tolerance(
+            projected,
+            evaluated,
+            edge["curve_end_point_m"],
+        )
+        error = native_point_error(projected, evaluated)
+        affected_vertices = set()
+        for fin in evidence["itessellation"]["bodies"][0]["fins"]:
+            if fin["classification"] == "internal_only":
+                continue
+            for vertex_id, fin_u, fin_evidence in (
+                (fin["vertex_ids"][0], fin["start_u"], fin["start_evidence"]),
+                (fin["vertex_ids"][1], fin["end_u"], fin["end_evidence"]),
+            ):
+                if not native_u_equal(fin_u, edge["u_min"]):
+                    continue
+                affected_vertices.add(vertex_id)
+                fin_evidence["source_point_m"] = list(source)
+                fin_evidence["closest_point_on_raw"][:3] = projected
+                fin_evidence["parameter_input_point_m"] = list(projected)
+                fin_evidence["evaluate_payload"][:3] = evaluated
+                fin_evidence["projection_error_m"] = projection_error
+                fin_evidence["closest_point_error_m"] = projection_error
+                fin_evidence["point_tolerance_m"] = tolerance
+                fin_evidence["point_roundtrip_rule"] = (
+                    "native-curve-endpoint-float32-operation-v4"
+                )
+                fin_evidence["evaluate_point_error_m"] = error
+                fin_evidence["closest_evaluate_error_m"] = error
+        for vertex in evidence["itessellation"]["vertices"]:
+            if vertex["vertex_id"] in affected_vertices:
+                vertex["point_m"] = list(source)
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+        )
+
+        self.assertEqual(len(spans), 2)
+
+    def test_parser_rejects_tessellation_projection_over_50_micrometres(self):
+        evidence, triangles = self.group_333_tessellation()
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+        )
+        fin_evidence = fin["start_evidence"]
+        source = list(fin_evidence["source_point_m"])
+        source[0] += 60e-6
+        fin_evidence["source_point_m"] = source
+        fin_evidence["projection_error_m"] = 60e-6
+        fin_evidence["closest_point_error_m"] = 60e-6
+
+        with self.assertRaises(PipelineError) as caught:
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                None,
+            )
+
+        self.assertIn("U evidence is not independently reproducible", str(caught.exception))
 
     def test_parser_rejects_group_333_operation_bound_overshoot(self):
         evidence, triangles = self.group_333_tessellation()
@@ -1788,6 +1955,9 @@ class NativeFinCaptureTests(unittest.TestCase):
                         affected_vertices.add(vertex_id)
                         evidence["closest_point_on_raw"][:3] = [0.0, 0.0, 0.0]
                         evidence["evaluate_payload"][:3] = [0.0, 0.0, 0.0]
+                        evidence["source_point_m"] = [0.0, 0.0, 0.0]
+                        evidence["parameter_input_point_m"] = [0.0, 0.0, 0.0]
+                        evidence["projection_error_m"] = 0.0
                         evidence["point_tolerance_m"] = (
                             native_curve_endpoint_operation_tolerance(
                                 [0.0, 0.0, 0.0],

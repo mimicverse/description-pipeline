@@ -25,6 +25,8 @@ from ...geometry.native_u import (
     NATIVE_CURVE_DOMAIN_RULE,
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
@@ -5241,6 +5243,25 @@ class SolidWorksBackend(CadBackend):
                 )
             closest_point = _binary64_xyz(closest[0:3])
             closest_u = float(closest[3])
+
+            def point_error(left, right):
+                return max(
+                    abs(left[index] - right[index])
+                    for index in range(3)
+                )
+
+            projection_error = point_error(point, closest_point)
+            if projection_error > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "tessellation edge projection exceeds the 50 micrometre bound",
+                    {
+                        **base,
+                        "fin_id": fin_id,
+                        "endpoint": endpoint,
+                        "projection_error_m": projection_error,
+                    },
+                )
             if not native_u_in_closed_interval(
                 closest_u,
                 domain["u_min"],
@@ -5258,8 +5279,8 @@ class SolidWorksBackend(CadBackend):
                 )
             parameter = call(
                 "IEdge.GetParameter",
-                lambda edge=edge, point=point: _as_list(
-                    _method(edge, "GetParameter", *point)
+                lambda edge=edge, closest_point=closest_point: _as_list(
+                    _method(edge, "GetParameter", *closest_point)
                 ),
                 fin_id=fin_id,
                 endpoint=endpoint,
@@ -5332,37 +5353,30 @@ class SolidWorksBackend(CadBackend):
             )
             if native_u_equal(parameter_u, domain["u_min"]):
                 point_tolerance = native_curve_endpoint_operation_tolerance(
-                    point,
+                    closest_point,
                     evaluated_point,
                     domain["end_point_m"],
                 )
+                point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
             elif native_u_equal(parameter_u, domain["u_max"]):
                 point_tolerance = native_curve_endpoint_operation_tolerance(
-                    point,
+                    closest_point,
                     evaluated_point,
                     domain["start_point_m"],
                 )
+                point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
             else:
                 point_tolerance = native_point_roundtrip_tolerance(
-                    point,
                     closest_point,
                     evaluated_point,
                 )
-
-            def point_error(left, right):
-                return max(
-                    abs(left[index] - right[index])
-                    for index in range(3)
-                )
-
-            closest_error = point_error(point, closest_point)
-            evaluate_error = point_error(point, evaluated_point)
+                point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
+            evaluate_error = point_error(closest_point, evaluated_point)
             closest_evaluate_error = point_error(
                 closest_point,
                 evaluated_point,
             )
             if max(
-                closest_error,
                 evaluate_error,
                 closest_evaluate_error,
             ) > point_tolerance:
@@ -5373,7 +5387,8 @@ class SolidWorksBackend(CadBackend):
                         **base,
                         "fin_id": fin_id,
                         "endpoint": endpoint,
-                        "closest_point_error_m": closest_error,
+                        "closest_point_error_m": projection_error,
+                        "projection_error_m": projection_error,
                         "evaluate_point_error_m": evaluate_error,
                         "closest_evaluate_error_m": closest_evaluate_error,
                         "point_tolerance_m": point_tolerance,
@@ -5383,12 +5398,19 @@ class SolidWorksBackend(CadBackend):
                 "u": parameter_u,
                 "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
                 "rule_version": NATIVE_U_IDENTITY_RULE,
-                "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
+                "point_roundtrip_rule": point_roundtrip_rule,
+                "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
+                "projection_tolerance_m": (
+                    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+                ),
+                "source_point_m": list(point),
+                "projection_error_m": projection_error,
                 "point_tolerance_m": point_tolerance,
-                "closest_point_error_m": closest_error,
+                "closest_point_error_m": projection_error,
                 "evaluate_point_error_m": evaluate_error,
                 "closest_evaluate_error_m": closest_evaluate_error,
                 "closest_point_on_raw": list(closest),
+                "parameter_input_point_m": list(closest_point),
                 "parameter_raw": list(parameter),
                 "parameter_success_raw": parameter[1],
                 "parameter_success_raw_type": type(parameter[1]).__name__,

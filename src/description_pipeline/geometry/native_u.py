@@ -15,6 +15,10 @@ NATIVE_POINT_ROUNDTRIP_RULE = "native-point-float32-pair-v3"
 NATIVE_CURVE_ENDPOINT_OPERATION_RULE = (
     "native-curve-endpoint-float32-operation-v4"
 )
+NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
+    "tessellation-edge-projection-v1"
+)
+NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M = 50e-6
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
 

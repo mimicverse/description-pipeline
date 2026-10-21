@@ -15,6 +15,8 @@ from description_pipeline.geometry.native_u import (
     NATIVE_CURVE_DOMAIN_RULE,
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
@@ -234,6 +236,7 @@ def _u_evidence(
             point,
             curve_end,
         )
+        point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
     elif (
         domain_upper is not None
         and native_u_equal(u_parameter, domain_upper)
@@ -244,18 +247,27 @@ def _u_evidence(
             point,
             curve_start,
         )
+        point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
     else:
         tolerance = native_point_roundtrip_tolerance(point, point, point)
+        point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
     return {
         "u": u_parameter,
         "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
         "rule_version": NATIVE_U_IDENTITY_RULE,
-        "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
+        "point_roundtrip_rule": point_roundtrip_rule,
+        "projection_rule": NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
+        "projection_tolerance_m": (
+            NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+        ),
+        "source_point_m": list(point),
+        "projection_error_m": 0.0,
         "point_tolerance_m": tolerance,
         "closest_point_error_m": 0.0,
         "evaluate_point_error_m": 0.0,
         "closest_evaluate_error_m": 0.0,
         "closest_point_on_raw": [*point, u_parameter, 0.0],
+        "parameter_input_point_m": list(point),
         "parameter_raw": [u_parameter, True],
         "parameter_success_raw": True,
         "parameter_success_raw_type": "bool",

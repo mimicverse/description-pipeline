@@ -11,6 +11,8 @@ from ..schemas import NATIVE_TESSELLATION_SCHEMA
 from .native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_IDENTITY_RULE,
     NATIVE_U_POINT_PARAMETER_RULE,
     NATIVE_U_RESOLUTION_RULE,
@@ -76,11 +78,16 @@ def _valid_u_evidence(
         "u_parameter_rule",
         "rule_version",
         "point_roundtrip_rule",
+        "projection_rule",
+        "projection_tolerance_m",
+        "source_point_m",
+        "projection_error_m",
         "point_tolerance_m",
         "closest_point_error_m",
         "evaluate_point_error_m",
         "closest_evaluate_error_m",
         "closest_point_on_raw",
+        "parameter_input_point_m",
         "parameter_raw",
         "parameter_success_raw",
         "parameter_success_raw_type",
@@ -113,6 +120,18 @@ def _valid_u_evidence(
             type(item) in numeric and math.isfinite(float(item))
             for item in evaluated
         )
+        or not isinstance(value["source_point_m"], list)
+        or len(value["source_point_m"]) != 3
+        or not all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in value["source_point_m"]
+        )
+        or not isinstance(value["parameter_input_point_m"], list)
+        or len(value["parameter_input_point_m"]) != 3
+        or not all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in value["parameter_input_point_m"]
+        )
         or not isinstance(curve_start, (list, tuple))
         or len(curve_start) != 3
         or not all(
@@ -138,26 +157,39 @@ def _valid_u_evidence(
     closest_point = tuple(closest[:3])
     evaluated_point = tuple(evaluated[:3])
     expected_point = tuple(float(item) for item in endpoint_point)
+    source_point = tuple(value["source_point_m"])
+    projection_error = native_point_error(source_point, closest_point)
+    if (
+        source_point != expected_point
+        or tuple(value["parameter_input_point_m"]) != closest_point
+        or value["projection_rule"]
+        != NATIVE_TESSELLATION_EDGE_PROJECTION_RULE
+        or value["projection_tolerance_m"]
+        != NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+        or projection_error > NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+    ):
+        return False
     if native_u_equal(value["u"], domain_lower):
         computed_tolerance = native_curve_endpoint_operation_tolerance(
             expected_point,
             evaluated_point,
             curve_end,
         )
+        point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
     elif native_u_equal(value["u"], domain_upper):
         computed_tolerance = native_curve_endpoint_operation_tolerance(
             expected_point,
             evaluated_point,
             curve_start,
         )
+        point_roundtrip_rule = NATIVE_CURVE_ENDPOINT_OPERATION_RULE
     else:
         computed_tolerance = native_point_roundtrip_tolerance(
-            expected_point,
             closest_point,
             evaluated_point,
         )
-    closest_error = native_point_error(expected_point, closest_point)
-    evaluate_error = native_point_error(expected_point, evaluated_point)
+        point_roundtrip_rule = NATIVE_POINT_ROUNDTRIP_RULE
+    evaluate_error = native_point_error(closest_point, evaluated_point)
     closest_evaluate_error = native_point_error(
         closest_point,
         evaluated_point,
@@ -172,17 +204,18 @@ def _valid_u_evidence(
     return (
         value["rule_version"] == NATIVE_U_IDENTITY_RULE
         and value["u_parameter_rule"] == NATIVE_U_POINT_PARAMETER_RULE
-        and value["point_roundtrip_rule"] == NATIVE_POINT_ROUNDTRIP_RULE
+        and value["point_roundtrip_rule"] == point_roundtrip_rule
         and all(
             type(item) in numeric and math.isfinite(float(item))
             for item in finite_values
         )
         and value["point_tolerance_m"] >= 0.0
         and value["point_tolerance_m"] == computed_tolerance
-        and value["closest_point_error_m"] == closest_error
+        and value["projection_error_m"] == projection_error
+        and value["closest_point_error_m"] == projection_error
         and value["evaluate_point_error_m"] == evaluate_error
         and value["closest_evaluate_error_m"] == closest_evaluate_error
-        and max(closest_error, evaluate_error, closest_evaluate_error)
+        and max(evaluate_error, closest_evaluate_error)
         <= computed_tolerance
         and native_u_equal(value["u"], u_parameter)
         and isinstance(parameter, list)
