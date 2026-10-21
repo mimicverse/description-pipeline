@@ -602,6 +602,18 @@ def _scope_bijection(
     }
 
 
+def _fin_edge_row_map(edge_rows, fin_ids_by_edge_index):
+    """Bind each native fin to its exact edge row, independent of aliases."""
+
+    result = {}
+    for edge_row in edge_rows:
+        for fin_id in fin_ids_by_edge_index[edge_row["index"]]:
+            if fin_id in result:
+                raise ValueError("a fin belongs to multiple native edges")
+            result[fin_id] = edge_row
+    return result
+
+
 _SCOPE_OWNER_KEYS = {
     "occurrence",
     "source_document_path",
@@ -5839,7 +5851,7 @@ class SolidWorksBackend(CadBackend):
                 "last_face_reference_sha256"
             ] = face_rows[-1]["reference"]["typed_sha256"]
 
-        fin_to_edge = {}
+        fin_ids_by_edge_index = {}
         for edge_row in edge_rows:
             edge_index = edge_row["index"]
             edge_fins = call(
@@ -5863,15 +5875,29 @@ class SolidWorksBackend(CadBackend):
                         "an edge returned a fin outside the captured facets",
                         {**base, "edge_index": edge_index, "fin_id": fin_id},
                     )
-                if fin_id in fin_to_edge:
+                if fin_id in fin_ids_by_edge_index.get(
+                    edge_index,
+                    (),
+                ):
                     raise CadError(
                         "cad_native_tessellation_unreadable",
                         "a fin belongs to multiple native edges",
                         {**base, "edge_index": edge_index, "fin_id": fin_id},
                     )
-                fin_to_edge[fin_id] = edge_row["reference"]["typed_sha256"]
                 normalized.append(fin_id)
             edge_row["fin_ids"] = tuple(normalized)
+            fin_ids_by_edge_index[edge_index] = tuple(normalized)
+        try:
+            fin_to_edge_row = _fin_edge_row_map(
+                edge_rows,
+                fin_ids_by_edge_index,
+            )
+        except ValueError as error:
+            raise CadError(
+                "cad_native_tessellation_unreadable",
+                str(error),
+                {**base},
+            ) from error
 
         fin_vertices = {}
         vertex_points_binary64 = {}
@@ -6148,7 +6174,6 @@ class SolidWorksBackend(CadBackend):
                     endpoint["reference"]["typed_sha256"] = identity_sha256
                     endpoint["identity"] = identity
 
-        edge_identity_by_legacy = {}
         edge_topology_keys = {}
         for edge_row in edge_rows:
             legacy_identity = edge_row["reference"]["typed_sha256"]
@@ -6330,7 +6355,6 @@ class SolidWorksBackend(CadBackend):
             identity_sha256 = native_scope_identity_sha256(identity)
             edge_row["identity"] = identity
             edge_row["reference"]["typed_sha256"] = identity_sha256
-            edge_identity_by_legacy[legacy_identity] = identity_sha256
             registry.claim_scope(
                 kind="edge",
                 raw_sha256=edge_row["reference"]["raw_sha256"],
@@ -6342,12 +6366,6 @@ class SolidWorksBackend(CadBackend):
                 },
                 base=base,
             )
-        for fin_id, legacy_identity in tuple(fin_to_edge.items()):
-            fin_to_edge[fin_id] = edge_identity_by_legacy.get(
-                legacy_identity,
-                legacy_identity,
-            )
-
         vertex_identity_rows = list(precomputed_vertex_identity_rows)
         if not vertex_aliased:
             for vertex_index, (_, _, group) in enumerate(
@@ -6376,10 +6394,6 @@ class SolidWorksBackend(CadBackend):
                     },
                     base=base,
                 )
-
-        edge_by_reference = {
-            row["reference"]["typed_sha256"]: row for row in edge_rows
-        }
 
         def fin_endpoint_u(edge, point, domain, *, fin_id, endpoint):
             closest = call(
@@ -6619,8 +6633,13 @@ class SolidWorksBackend(CadBackend):
         u_cache_hits = 0
         for fin_id, row in fins_by_id.items():
             row["vertex_ids"] = fin_vertices[fin_id]
-            row["edge_reference_sha256"] = fin_to_edge.get(fin_id)
-            row["internal"] = fin_id not in fin_to_edge
+            edge_row = fin_to_edge_row.get(fin_id)
+            row["edge_reference_sha256"] = (
+                edge_row["reference"]["typed_sha256"]
+                if edge_row is not None
+                else None
+            )
+            row["internal"] = edge_row is None
             row["classification"] = (
                 "internal_only" if row["internal"] else "native_edge"
             )
@@ -6635,13 +6654,7 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
             else:
-                edge = edge_by_reference.get(row["edge_reference_sha256"])
-                if edge is None:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "an external fin has no captured native edge",
-                        {**base, "fin_id": fin_id},
-                    )
+                edge = edge_row
                 domain = edge["curve"]
                 endpoint_evidence = []
                 for endpoint, vertex_id in zip(

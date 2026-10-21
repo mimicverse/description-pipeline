@@ -27,6 +27,7 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     _NativeReferenceRegistry,
     _com_object_identity,
+    _fin_edge_row_map,
     _group_vertex_observations,
     _scope_bijection,
     _scope_edge_rows,
@@ -3486,6 +3487,32 @@ class NativeFinCaptureTests(unittest.TestCase):
             _scope_bijection(
                 [first, duplicate],
                 [copy.deepcopy(first)],
+            )
+
+    def test_fin_edges_bind_exact_rows_across_aliased_references(self):
+        shared_reference = {
+            "raw_sha256": "1" * 64,
+            "typed_sha256": "2" * 64,
+        }
+        first = {"index": 0, "reference": dict(shared_reference)}
+        second = {"index": 1, "reference": dict(shared_reference)}
+
+        mapping = _fin_edge_row_map(
+            [first, second],
+            {0: (10, 11), 1: (12, 13)},
+        )
+
+        self.assertIs(mapping[10], first)
+        self.assertIs(mapping[11], first)
+        self.assertIs(mapping[12], second)
+        self.assertIs(mapping[13], second)
+        with self.assertRaisesRegex(
+            ValueError,
+            "multiple native edges",
+        ):
+            _fin_edge_row_map(
+                [first, second],
+                {0: (10, 11), 1: (11, 12)},
             )
 
     def test_scope_vertex_identity_uses_point_and_reference_not_address(self):
