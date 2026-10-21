@@ -11,7 +11,10 @@ from pathlib import Path
 from . import _paths  # noqa: F401
 from . import support
 
-from description_pipeline.geometry.native_tessellation import parse_native_tessellation
+from description_pipeline.geometry.native_tessellation import (
+    parse_native_tessellation,
+    summarize_native_topology,
+)
 from description_pipeline.geometry.native_u import native_curve_domain_transform
 from description_pipeline.io import PipelineError
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
@@ -465,6 +468,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                 fin["end_u"] = None
                 fin["start_evidence"] = None
                 fin["end_evidence"] = None
+                fin["cofin_raw_id"] = None
                 fin["cofin_id"] = None
 
         cases = (
@@ -953,11 +957,58 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         )
         return tessellation, triangles
 
-    def parse(self, tessellation, triangles):
+    def boundary_fixture(self, body_type=1):
+        def binary32(point):
+            return struct.unpack("<3f", struct.pack("<3f", *point))
+
+        start = binary32((0.0, 0.0, 0.0))
+        end = binary32((1.0, 0.0, 0.0))
+        apex = binary32((0.5, 0.5, 0.0))
+        triangles = [(start, end, apex)]
+        edge_reference = hashlib.sha256(b"open-native-edge").hexdigest()
+        span = {
+            "body_type": body_type,
+            "body_index": 0,
+            "body_name": "open-body",
+            "body_reference_sha256": hashlib.sha256(b"open-body").hexdigest(),
+            "face_index": 0,
+            "face_reference_sha256": hashlib.sha256(b"open-face").hexdigest(),
+            "face_owner_id": 1,
+            "edge_references": [edge_reference],
+            "triangle_start": 0,
+            "triangle_count": 1,
+            "triangle_records_sha256": "0" * 64,
+        }
+        edge = {
+            "body_type": body_type,
+            "body_index": 0,
+            "edge_reference_sha256": edge_reference,
+            "start_vertex_reference_sha256": hashlib.sha256(
+                struct.pack("<3f", *start)
+            ).hexdigest(),
+            "end_vertex_reference_sha256": hashlib.sha256(
+                struct.pack("<3f", *end)
+            ).hexdigest(),
+            "start_point_m": list(start),
+            "end_point_m": list(end),
+            "face_indices": [0],
+            "u_min": 0.0,
+            "u_max": 1.0,
+            "curve_sense": True,
+            "curve_type": 1,
+        }
+        tessellation = support.native_tessellation_fixture(
+            [span],
+            [edge],
+            triangle_vertices=triangles,
+        )
+        return tessellation, triangles
+
+    def parse(self, tessellation, triangles, bodies=None):
         return parse_native_tessellation(
             "curved-body",
             tessellation,
-            {"solid": 1, "sheet": 0},
+            bodies or {"solid": 1, "sheet": 0},
             len(triangles),
             triangles,
         )
@@ -970,6 +1021,26 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         }
         return edge, [fins[fin_id] for fin_id in edge["fin_ids"]]
 
+    def clear_edge_fins(self, tessellation):
+        edge = tessellation["native_edges"][0]
+        fin_ids = set(edge["fin_ids"])
+        edge["fin_ids"] = []
+        for fin in tessellation["itessellation"]["bodies"][0]["fins"]:
+            if fin["fin_id"] not in fin_ids:
+                continue
+            fin.update(
+                {
+                    "edge_reference_sha256": None,
+                    "classification": "internal_only",
+                    "start_u": None,
+                    "end_u": None,
+                    "start_evidence": None,
+                    "end_evidence": None,
+                    "cofin_raw_id": None,
+                    "cofin_id": None,
+                }
+            )
+
     def set_u(self, fin, start_u, end_u):
         fin["start_u"] = start_u
         fin["end_u"] = end_u
@@ -980,6 +1051,100 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
             evidence["u"] = value
             evidence["closest_point_on_raw"][3] = value
             evidence["parameter_raw"][0] = value
+
+    def test_open_edge_accepts_one_boundary_fin_and_summarizes_it(self):
+        tessellation, triangles = self.boundary_fixture()
+        edge, fins = self.edge_fins(tessellation)
+        self.assertEqual(len(edge["fin_ids"]), 1)
+        self.assertEqual(len(fins), 1)
+        self.assertEqual(fins[0]["cofin_raw_id"], -1)
+        self.assertIsNone(fins[0]["cofin_id"])
+        spans = self.parse(
+            tessellation,
+            triangles,
+            {"solid": 0, "sheet": 1},
+        )
+        self.assertEqual(len(spans), 1)
+        summary = summarize_native_topology(tessellation, spans)
+        body = summary["bodies"][0]
+        self.assertEqual(body["open_edges"], 1)
+        self.assertEqual(body["shared_edges"], 0)
+        self.assertEqual(body["boundary_fins"], 1)
+        self.assertEqual(body["paired_fins"], 0)
+
+    def test_boundary_raw_and_normalized_id_must_agree(self):
+        for raw, normalized in ((0, None), (-1, 101), (True, None), (None, None)):
+            with self.subTest(raw=raw, normalized=normalized):
+                tessellation, triangles = self.boundary_fixture()
+                _edge, fins = self.edge_fins(tessellation)
+                fins[0]["cofin_raw_id"] = raw
+                fins[0]["cofin_id"] = normalized
+                with self.assertRaisesRegex(PipelineError, "malformed|boundary"):
+                    self.parse(
+                        tessellation,
+                        triangles,
+                        {"solid": 0, "sheet": 1},
+                    )
+
+    def test_shared_edge_rejects_boundary_raw_with_matching_null_id(self):
+        tessellation, triangles = self.fixture()
+        _edge, fins = self.edge_fins(tessellation)
+        fins[0]["cofin_raw_id"] = -1
+        fins[0]["cofin_id"] = None
+        with self.assertRaisesRegex(PipelineError, "boundary fin|malformed"):
+            self.parse(tessellation, triangles)
+
+    def test_nonmanifold_edge_incidence_is_rejected(self):
+        tessellation, triangles = self.fixture()
+        edge = tessellation["native_edges"][0]
+        edge["face_indices"] = [0, 1, 2]
+        edge["face_senses"].append(
+            {
+                "face_index": 2,
+                "EdgeInFaceSense": {"value": True},
+            }
+        )
+        with self.assertRaisesRegex(PipelineError, "non-manifold"):
+            self.parse(tessellation, triangles)
+
+    def test_solid_body_cannot_use_open_boundary_semantics(self):
+        tessellation, triangles = self.boundary_fixture(body_type=0)
+        with self.assertRaisesRegex(PipelineError, "only on a sheet body"):
+            self.parse(
+                tessellation,
+                triangles,
+                {"solid": 1, "sheet": 0},
+            )
+
+    def test_open_and_shared_edges_reject_empty_fin_sets(self):
+        for fixture in (self.fixture, self.boundary_fixture):
+            with self.subTest(fixture=fixture.__name__):
+                tessellation, triangles = fixture()
+                self.clear_edge_fins(tessellation)
+                bodies = (
+                    {"solid": 0, "sheet": 1}
+                    if fixture == self.boundary_fixture
+                    else {"solid": 1, "sheet": 0}
+                )
+                with self.assertRaisesRegex(
+                    PipelineError,
+                    "does not carry the boundary sentinel|contains a boundary fin",
+                ):
+                    self.parse(tessellation, triangles, bodies)
+
+    def test_topology_summary_rejects_an_empty_open_edge(self):
+        tessellation, triangles = self.boundary_fixture()
+        spans = self.parse(
+            tessellation,
+            triangles,
+            {"solid": 0, "sheet": 1},
+        )
+        self.clear_edge_fins(tessellation)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "invalid open boundary fin",
+        ):
+            summarize_native_topology(tessellation, spans)
 
     def test_curved_native_edge_allows_multiple_reciprocal_fins_per_face(self):
         tessellation, triangles = self.fixture()
@@ -1001,6 +1166,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                     "cofin_id"
                 ]
                 == row["fin_id"]
+                and row["cofin_raw_id"] == row["cofin_id"]
                 for row in fins
             )
         )
@@ -1026,11 +1192,20 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
             all(
                 row["start_u"] is None
                 and row["end_u"] is None
+                and row["cofin_raw_id"] is None
                 and row["cofin_id"] is None
                 for row in internal
             )
         )
         self.assertEqual(len(self.parse(tessellation, triangles)), 2)
+
+    def test_v5_schema_is_rejected_after_open_boundary_schema_bump(self):
+        tessellation, triangles = self.fixture()
+        tessellation["schema_version"] = (
+            "solidworks-to-urdf.native-tessellation/v5"
+        )
+        with self.assertRaisesRegex(PipelineError, "schema"):
+            self.parse(tessellation, triangles)
 
     def test_curved_native_edge_rejects_u_gap(self):
         tessellation, triangles = self.fixture()
