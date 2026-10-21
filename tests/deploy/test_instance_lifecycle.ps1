@@ -87,8 +87,16 @@ $seams = 'Get-OwnershipRefusalFacts', 'Start-OrRefuse', 'Wait-SettleRetryDelay',
   'Get-ServedStateRoot', 'Get-EndpointConfigScanPython', 'Get-EndpointConfigStrictPrelude',
   'Get-EndpointConfigEarlyScanProgram', 'Write-PythonProgram', 'Normalize-PathIdentity', 'Get-WriterResidue'
 $seams += 'Get-AclProjection', 'Set-AclProjection', 'Get-TaskProjection', 'Get-RecoveryCurrentState',
-  'Invoke-RecoverySnapshot', 'Invoke-RecoveryRestore', 'Invoke-RecoveryResume'
+  'Invoke-RecoverySnapshot', 'Invoke-RecoveryRestore', 'Invoke-RecoveryResume', 'Test-NetTcpNoMatchError'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
+Check 'windows_recovery.net_tcp_no_match' (Test-NetTcpNoMatchError ([pscustomobject]@{
+  CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
+  FullyQualifiedErrorId='CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'
+}))
+Check 'windows_recovery.net_tcp_not_found_text_is_not_enough' (-not (Test-NetTcpNoMatchError ([pscustomobject]@{
+  CategoryInfo=[pscustomobject]@{Category='InvalidOperation'}
+  FullyQualifiedErrorId='ProviderFailure'
+})))
 $releaseHash = Get-ReleaseIdentitySha256 @{
   version='1.2.3'
   source_commit='a' * 40

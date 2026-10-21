@@ -4340,6 +4340,39 @@ def _remove_remote_dir(
     )
 
 
+def _attempt_remote_dir_cleanup(
+    *,
+    ssh_host: str,
+    remote_dir: str,
+    ownership_token: str,
+    timeout: int,
+    commands: list[dict],
+) -> dict:
+    try:
+        _remove_remote_dir(
+            ssh_host=ssh_host,
+            remote_dir=remote_dir,
+            ownership_token=ownership_token,
+            timeout=timeout,
+            commands=commands,
+        )
+    except RecoveryError as error:
+        return {
+            "attempted": True,
+            "passed": False,
+            "remote_dir": remote_dir,
+            "ownership_marker": f"{remote_dir.rstrip('/')}/{WINDOWS_REMOTE_OWNERSHIP_MEMBER}",
+            "code": error.code,
+            "message": error.message,
+            "detail": error.detail,
+        }
+    return {
+        "attempted": True,
+        "passed": True,
+        "remote_dir": remote_dir,
+    }
+
+
 def _read_windows_state(bundle: Path) -> dict:
     require_real_file(bundle, "Windows recovery bundle", "windows_recovery_bundle_invalid")
     try:
@@ -4989,6 +5022,8 @@ def _transfer_windows_recovery(
             uploads.append(upload_bundle)
         ownership_token = secrets.token_hex(32)
         remote_dir_owned = False
+        document: dict | None = None
+        action_error: BaseException | None = None
         try:
             _create_remote_dir(
                 ssh_host=ssh_host,
@@ -5051,16 +5086,35 @@ def _transfer_windows_recovery(
                     "windows_recovery_bundle_invalid",
                     "downloaded Windows recovery bundle differs from the remote receipt",
                 )
-            return document
-        finally:
-            if remote_dir_owned:
-                _remove_remote_dir(
-                    ssh_host=ssh_host,
-                    remote_dir=remote_dir,
-                    ownership_token=ownership_token,
-                    timeout=timeout,
-                    commands=commands,
-                )
+        except BaseException as error:
+            action_error = error
+        cleanup = (
+            _attempt_remote_dir_cleanup(
+                ssh_host=ssh_host,
+                remote_dir=remote_dir,
+                ownership_token=ownership_token,
+                timeout=timeout,
+                commands=commands,
+            )
+            if remote_dir_owned
+            else {"attempted": False, "passed": None, "remote_dir": remote_dir}
+        )
+        if action_error is not None:
+            if isinstance(action_error, RecoveryError):
+                detail = dict(action_error.detail or {})
+                detail["remote_cleanup"] = cleanup
+                action_error.detail = detail
+            else:
+                action_error.add_note("remote_cleanup=" + canonical_json(cleanup).decode("utf-8").strip())
+            raise action_error
+        if document is None:
+            raise RecoveryError(
+                "windows_recovery_transport_unknown",
+                "the Windows recovery action returned no receipt",
+                {"remote_cleanup": cleanup},
+            )
+        document["remote_cleanup"] = cleanup
+        return document
 
 
 def capture_windows_recovery(

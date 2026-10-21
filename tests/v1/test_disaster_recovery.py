@@ -3243,6 +3243,83 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertRegex(ownership_token, r"\A[0-9a-f]{64}\Z")
         self.assertEqual(remove.call_args.kwargs["ownership_token"], ownership_token)
 
+    def test_windows_success_receipt_records_cleanup_residue_without_reclassifying(self) -> None:
+        script = write(self.root / "instance-lifecycle.ps1", "fixture\n")
+        action_receipt = {
+            "passed": True,
+            "verb": "recovery-snapshot",
+            "task_state": "Disabled",
+            "endpoint": "stopped",
+            "cad_ownership": "free",
+            "bundle_sha256": "a" * 64,
+        }
+        with (
+            mock.patch.object(recovery, "_create_remote_dir"),
+            mock.patch.object(recovery, "_windows_scp"),
+            mock.patch.object(recovery, "_run_windows_recovery_json", return_value=dict(action_receipt)),
+            mock.patch.object(
+                recovery,
+                "_remove_remote_dir",
+                side_effect=recovery.RecoveryError(
+                    "windows_recovery_transport_unknown",
+                    "fixture cleanup failed",
+                ),
+            ),
+        ):
+            result = recovery._transfer_windows_recovery(
+                ssh_host="windows-fixture",
+                remote_dir="C:/description/state/recovery/fixture",
+                script=script,
+                binding_document={},
+                operation="recovery-snapshot",
+                commands=[],
+                timeout=5,
+            )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["verb"], "recovery-snapshot")
+        self.assertFalse(result["remote_cleanup"]["passed"])
+        self.assertEqual(
+            result["remote_cleanup"]["ownership_marker"],
+            "C:/description/state/recovery/fixture/.recovery-owner",
+        )
+
+    def test_windows_action_error_survives_cleanup_error(self) -> None:
+        script = write(self.root / "instance-lifecycle.ps1", "fixture\n")
+        with (
+            mock.patch.object(recovery, "_create_remote_dir"),
+            mock.patch.object(recovery, "_windows_scp"),
+            mock.patch.object(
+                recovery,
+                "_run_windows_recovery_json",
+                side_effect=recovery.RecoveryError(
+                    "windows_task_not_disabled",
+                    "fixture action failed",
+                    {"action": "preserved"},
+                ),
+            ),
+            mock.patch.object(
+                recovery,
+                "_remove_remote_dir",
+                side_effect=recovery.RecoveryError(
+                    "windows_recovery_transport_unknown",
+                    "fixture cleanup failed",
+                ),
+            ),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._transfer_windows_recovery(
+                ssh_host="windows-fixture",
+                remote_dir="C:/description/state/recovery/fixture",
+                script=script,
+                binding_document={},
+                operation="recovery-snapshot",
+                commands=[],
+                timeout=5,
+            )
+        self.assertEqual(raised.exception.code, "windows_task_not_disabled")
+        self.assertEqual(raised.exception.detail["action"], "preserved")
+        self.assertFalse(raised.exception.detail["remote_cleanup"]["passed"])
+
     def test_backup_requires_airflow_venv_interpreter(self) -> None:
         with self.assertRaises(recovery.RecoveryError) as raised:
             recovery._require_airflow_interpreter(self.context)

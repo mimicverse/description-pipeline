@@ -1036,14 +1036,23 @@ function Get-RecoveryCadState($Identity) {
   }
   return $state
 }
+function Test-NetTcpNoMatchError($ErrorRecord) {
+  $category = [string]$ErrorRecord.CategoryInfo.Category
+  $errorId = [string]$ErrorRecord.FullyQualifiedErrorId
+  return $category -eq 'ObjectNotFound' -and
+    $errorId -match '^CmdletizationQuery_NotFound_[A-Za-z0-9_]+,Get-NetTCPConnection$'
+}
 function Assert-RecoveryIdle($Identity) {
   try {
     $listeners = @(Get-NetTCPConnection -LocalPort ([int]$Identity.port) -State Listen -ErrorAction Stop)
   } catch {
-    if ([string]$_.Exception.Message -match '(?i)(No .*NetTCPConnection|ObjectNotFound|not found)') {
+    if (Test-NetTcpNoMatchError $_) {
       $listeners = @()
     } else {
-      DieUnknown 'windows_recovery_observer_failed' 'the endpoint listener state could not be observed'
+      DieUnknown 'windows_recovery_observer_failed' 'the endpoint listener state could not be observed' @{
+        category = [string]$_.CategoryInfo.Category
+        error_id = [string]$_.FullyQualifiedErrorId
+      }
     }
   }
   if ($listeners.Count -ne 0) {
@@ -1365,6 +1374,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
   $ownedTask = $false
   $registeringTask = $false
   $state = $null
+  $cleanup = @{attempted=$false; passed=$null; path=$temp}
   try {
     Set-PrivateRecoveryAcl $temp
     $extracted = Expand-RecoveryBundle $RecoveryBundle $temp
@@ -1458,9 +1468,20 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
     if ((Get-JsonSha256 $current.state) -ne (Get-JsonSha256 $state)) {
       Die 'windows_recovery_verification_failed' 'Windows recovery did not read back the archived state'
     }
+    if (Test-Path -LiteralPath $temp) {
+      $cleanup.attempted = $true
+      try {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop
+        $cleanup.passed = $true
+      } catch {
+        $cleanup.passed = $false
+        $cleanup.error = [string]$_.Exception.Message
+      }
+    }
     Emit @{
       passed=$true; verb=$Script:Verb; task_state=[string]$current.task_projection.state;
-      endpoint='stopped'; cad_ownership='free'; state_sha256=(Get-JsonSha256 $state)
+      endpoint='stopped'; cad_ownership='free'; state_sha256=(Get-JsonSha256 $state);
+      cleanup=$cleanup
     }
   } catch {
     $failedOwner = $ownedTask
@@ -1482,7 +1503,13 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
     }
     throw
   } finally {
-    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop }
+    if (Test-Path -LiteralPath $temp) {
+      try {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop
+      } catch {
+        Write-Warning ('recovery temp cleanup failed: ' + $temp + ': ' + $_.Exception.Message)
+      }
+    }
   }
 }
 function Invoke-RecoveryResume($Binding) {
