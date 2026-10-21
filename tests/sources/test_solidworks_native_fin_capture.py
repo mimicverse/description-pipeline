@@ -27,13 +27,13 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
 from description_pipeline.sources.solidworks.native import (  # noqa: E402
     _NativeReferenceRegistry,
     _com_object_identity,
+    _group_vertex_observations,
     _scope_bijection,
     _scope_edge_rows,
     _scope_edge_mapping_key,
     _scope_face_rows,
     _scope_owner_key,
     _scope_vertex_rows,
-    _single_vertex_reference,
     _typed_reference_sha256,
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
@@ -1944,6 +1944,41 @@ class NativeFinCaptureTests(unittest.TestCase):
             )
         )
 
+    def test_production_capture_ignores_recycled_vertex_addresses(self):
+        original_pointer = native_module._com_object_pointer
+
+        def pointer(value):
+            if isinstance(value, FakeVertex):
+                return 0xDEADBEEF
+            return original_pointer(value)
+
+        with patch.object(
+            native_module,
+            "_com_object_pointer",
+            side_effect=pointer,
+        ):
+            evidence, triangles = self.group_333_tessellation()
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+        )
+        self.assertEqual(len(spans), 2)
+        identities = evidence["itessellation"]["solidworks_vertex_identities"]
+        self.assertEqual(len(identities), 2)
+        native_edge = evidence["native_edges"][0]
+        expected_points = {
+            tuple(native_edge["start_point_m"]),
+            tuple(native_edge["end_point_m"]),
+        }
+        self.assertEqual(
+            {tuple(row["point_m"]) for row in identities},
+            expected_points,
+        )
+
     def test_parser_rejects_malformed_or_ambiguous_alias_evidence(self):
         evidence, triangles = self.group_333_tessellation()
         raw_sha = hashlib.sha256(b"raw-alias-evidence").hexdigest()
@@ -3338,6 +3373,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 base={"component": "part-1"},
             )
         self.assertEqual(caught.exception.code, "cad_scope_identity_alias")
+    def test_com_object_identity_uses_underlying_dispatch(self):
         native_object = object()
         wrapper_a = SimpleNamespace(_oleobj_=native_object)
         wrapper_b = SimpleNamespace(_oleobj_=native_object)
@@ -3350,24 +3386,32 @@ class NativeFinCaptureTests(unittest.TestCase):
             _com_object_identity(SimpleNamespace(_oleobj_=object())),
         )
 
-    def test_one_vertex_object_cannot_return_multiple_references(self):
-        with self.assertRaises(CadError) as caught:
-            _single_vertex_reference(
-                {
-                    "raw_references": {
-                        hashlib.sha256(b"raw-a").hexdigest(),
-                        hashlib.sha256(b"raw-b").hexdigest(),
-                    },
-                    "typed_references": {
+    def test_vertex_group_rejects_inconsistent_typed_reference(self):
+        raw_reference = hashlib.sha256(b"raw-vertex").hexdigest()
+        with self.assertRaisesRegex(
+            ValueError,
+            "inconsistent typed references",
+        ):
+            _group_vertex_observations(
+                [
+                    (
+                        (0.0, 0.0, 0.0),
+                        raw_reference,
                         hashlib.sha256(b"typed-a").hexdigest(),
-                    },
-                },
-                {"component": "part-1"},
+                        0,
+                        0,
+                        0x1000,
+                    ),
+                    (
+                        (0.0, 0.0, 0.0),
+                        raw_reference,
+                        hashlib.sha256(b"typed-b").hexdigest(),
+                        1,
+                        0,
+                        0x1001,
+                    ),
+                ]
             )
-        self.assertEqual(
-            caught.exception.code,
-            "cad_persistent_reference_alias",
-        )
 
     def test_scope_mapping_rejects_duplicate_topology_and_keeps_coincident_vertices(self):
         def edge_row(edge_index, *, start_pointer, start_reference, end_x):
@@ -3443,6 +3487,139 @@ class NativeFinCaptureTests(unittest.TestCase):
                 [first, duplicate],
                 [copy.deepcopy(first)],
             )
+
+    def test_scope_vertex_identity_uses_point_and_reference_not_address(self):
+        def edge_row(edge_index, start, end):
+            return {
+                "edge_index": edge_index,
+                "endpoints": {
+                    "start": {
+                        "state": "present",
+                        "object_pointer": start[2],
+                        "reference_sha256": start[1],
+                        "point_m": start[0],
+                    },
+                    "end": {
+                        "state": "present",
+                        "object_pointer": end[2],
+                        "reference_sha256": end[1],
+                        "point_m": end[0],
+                    },
+                },
+            }
+
+        first_reference = hashlib.sha256(b"first-vertex").hexdigest()
+        second_reference = hashlib.sha256(b"second-vertex").hexdigest()
+        rows = _scope_vertex_rows(
+            [
+                edge_row(
+                    0,
+                    ([0.0, 0.0, 0.0], first_reference, 0x1000),
+                    ([1.0, 0.0, 0.0], second_reference, 0x1000),
+                ),
+                edge_row(
+                    1,
+                    ([0.0, 0.0, 0.0], first_reference, 0x1001),
+                    ([2.0, 0.0, 0.0], second_reference, 0x1001),
+                ),
+                edge_row(
+                    2,
+                    (
+                        [0.0, 0.0, 0.0],
+                        hashlib.sha256(b"coincident-vertex").hexdigest(),
+                        0x1000,
+                    ),
+                    (
+                        [3.0, 0.0, 0.0],
+                        hashlib.sha256(b"third-end").hexdigest(),
+                        0x1000,
+                    ),
+                ),
+            ]
+        )
+
+        coincident = [
+            row for row in rows if row["point_m"] == [0.0, 0.0, 0.0]
+        ]
+        self.assertEqual(len(coincident), 2)
+        merged = next(
+            row
+            for row in coincident
+            if row["reference_sha256"] == first_reference
+        )
+        self.assertEqual(merged["object_pointers"], [0x1000, 0x1001])
+        self.assertEqual(
+            sorted(
+                tuple(row["point_m"])
+                for row in rows
+                if row["reference_sha256"] == second_reference
+            ),
+            [(1.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
+        )
+
+    def test_scope_vertex_mapping_uses_mapped_edge_incidence(self):
+        def edge_row(edge_index, start_reference, end_x):
+            return {
+                "edge_index": edge_index,
+                "endpoints": {
+                    "start": {
+                        "state": "present",
+                        "object_pointer": 0x2000 + edge_index,
+                        "reference_sha256": start_reference,
+                        "point_m": [0.0, 0.0, 0.0],
+                    },
+                    "end": {
+                        "state": "present",
+                        "object_pointer": 0x2100 + edge_index,
+                        "reference_sha256": hashlib.sha256(
+                            f"end-{edge_index}".encode()
+                        ).hexdigest(),
+                        "point_m": [end_x, 0.0, 0.0],
+                    },
+                },
+            }
+
+        first = hashlib.sha256(b"first").hexdigest()
+        second = hashlib.sha256(b"second").hexdigest()
+        component_rows = _scope_vertex_rows(
+            [edge_row(0, first, 1.0), edge_row(1, second, 2.0)],
+            {0: 1, 1: 0},
+        )
+        part_rows = _scope_vertex_rows(
+            [edge_row(0, second, 2.0), edge_row(1, first, 1.0)]
+        )
+
+        component_by_reference = {
+            row["reference_sha256"]: row["mapping_key"]
+            for row in component_rows
+            if row["point_m"] == [0.0, 0.0, 0.0]
+        }
+        part_by_reference = {
+            row["reference_sha256"]: row["mapping_key"]
+            for row in part_rows
+            if row["point_m"] == [0.0, 0.0, 0.0]
+        }
+        self.assertEqual(component_by_reference, part_by_reference)
+        self.assertEqual(
+            component_by_reference[first][-1],
+            (1,),
+        )
+        self.assertEqual(
+            component_by_reference[second][-1],
+            (0,),
+        )
+        self.assertEqual(
+            {
+                row["reference_sha256"]: row["vertex_index"]
+                for row in component_rows
+                if row["point_m"] == [0.0, 0.0, 0.0]
+            },
+            {
+                row["reference_sha256"]: row["vertex_index"]
+                for row in part_rows
+                if row["point_m"] == [0.0, 0.0, 0.0]
+            },
+        )
 
     def test_scope_snapshot_accepts_only_both_absent_closed_endpoints(self):
         body, _face_10, _face_20, edge, _tessellation, extension = (

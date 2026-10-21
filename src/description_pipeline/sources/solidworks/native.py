@@ -449,50 +449,106 @@ def _scope_edge_mapping_key(
     )
 
 
-def _scope_vertex_rows(edge_rows) -> list[dict]:
+def _group_vertex_observations(observations) -> list[dict]:
+    """Group vertices by exact point and persistent reference, never by address."""
+
     groups = {}
+    for (
+        point_m,
+        raw_reference_sha256,
+        typed_reference_sha256,
+        edge_index,
+        endpoint_order,
+        object_pointer,
+    ) in observations:
+        point = tuple(float(value) for value in point_m)
+        point_bits = tuple(_binary64_bits(value) for value in point)
+        if (
+            not isinstance(raw_reference_sha256, str)
+            or not raw_reference_sha256
+            or not isinstance(typed_reference_sha256, str)
+            or not typed_reference_sha256
+        ):
+            raise ValueError("a present native vertex has no persistent reference")
+        key = (point_bits, raw_reference_sha256)
+        group = groups.setdefault(
+            key,
+            {
+                "point_m": point,
+                "point_bits": point_bits,
+                "raw_reference_sha256": raw_reference_sha256,
+                "typed_references": set(),
+                "object_pointers": set(),
+                "occurrences": [],
+            },
+        )
+        if group["point_m"] != point:
+            raise ValueError("one native vertex key has inconsistent points")
+        group["typed_references"].add(typed_reference_sha256)
+        if len(group["typed_references"]) != 1:
+            raise ValueError(
+                "one native vertex key has inconsistent typed references"
+            )
+        if object_pointer is not None:
+            group["object_pointers"].add(object_pointer)
+        group["occurrences"].append((edge_index, endpoint_order))
+
+    result = []
+    for group in groups.values():
+        occurrences = tuple(sorted(group["occurrences"]))
+        result.append(
+            {
+                "point_m": group["point_m"],
+                "point_bits": group["point_bits"],
+                "raw_reference_sha256": group["raw_reference_sha256"],
+                "typed_reference_sha256": next(
+                    iter(group["typed_references"])
+                ),
+                "object_pointers": tuple(sorted(group["object_pointers"])),
+                "occurrences": occurrences,
+            }
+        )
+    result.sort(
+        key=lambda group: (
+            group["point_bits"],
+            group["raw_reference_sha256"],
+            group["typed_reference_sha256"],
+            group["occurrences"],
+        )
+    )
+    return result
+
+
+def _scope_vertex_rows(edge_rows, edge_index_map=None) -> list[dict]:
+    observations = []
     for row in edge_rows:
         for order, endpoint_name in enumerate(("start", "end")):
             endpoint = row["endpoints"][endpoint_name]
             if endpoint["state"] != "present":
                 continue
-            pointer = endpoint["object_pointer"]
-            group = groups.setdefault(
-                pointer,
-                {
-                    "point_m": tuple(endpoint["point_m"]),
-                    "reference_sha256": endpoint["reference_sha256"],
-                    "occurrences": [],
-                },
-            )
-            if (
-                tuple(endpoint["point_m"]) != group["point_m"]
-                or endpoint["reference_sha256"]
-                != group["reference_sha256"]
-            ):
-                raise ValueError(
-                    "one native vertex object has inconsistent evidence"
+            observations.append(
+                (
+                    endpoint["point_m"],
+                    endpoint["reference_sha256"],
+                    endpoint["reference_sha256"],
+                    row["edge_index"],
+                    order,
+                    endpoint["object_pointer"],
                 )
-            group["occurrences"].append((row["edge_index"], order))
+            )
     rows_by_point = {}
-    for pointer, group in groups.items():
-        point_bits = tuple(
-            _binary64_bits(value) for value in group["point_m"]
-        )
-        rows_by_point.setdefault(point_bits, []).append(
-            (min(group["occurrences"]), pointer)
-        )
-    for occurrences in rows_by_point.values():
-        occurrences.sort()
+    for group in _group_vertex_observations(observations):
+        point_bits = group["point_bits"]
+        rows_by_point.setdefault(point_bits, []).append(group)
     ordered = sorted(
         (
             (
                 point_bits,
                 occurrence,
-                pointer,
+                group,
             )
-            for point_bits, occurrences in rows_by_point.items()
-            for occurrence, (_, pointer) in enumerate(occurrences)
+            for point_bits, groups in rows_by_point.items()
+            for occurrence, group in enumerate(groups)
         ),
         key=lambda row: (row[0], row[1]),
     )
@@ -500,43 +556,27 @@ def _scope_vertex_rows(edge_rows) -> list[dict]:
         {
             "vertex_index": vertex_index,
             "mapping_index": vertex_index,
-            "point_m": list(groups[pointer]["point_m"]),
+            "point_m": list(group["point_m"]),
             "coincident_occurrence_index": occurrence,
             "mapping_key": (
                 *(
                     _binary64_bits(value)
-                    for value in groups[pointer]["point_m"]
+                    for value in group["point_m"]
                 ),
-                occurrence,
+                tuple(
+                    sorted(
+                        {
+                            (edge_index_map or {}).get(edge_index, edge_index)
+                            for edge_index, _ in group["occurrences"]
+                        }
+                    )
+                ),
             ),
-            "reference_sha256": groups[pointer]["reference_sha256"],
-            "object_pointer": pointer,
+            "reference_sha256": group["raw_reference_sha256"],
+            "object_pointers": list(group["object_pointers"]),
         }
-        for vertex_index, (_, occurrence, pointer) in enumerate(ordered)
+        for vertex_index, (_, occurrence, group) in enumerate(ordered)
     ]
-
-
-def _single_vertex_reference(group: dict, base: dict) -> tuple[str, str]:
-    """One COM vertex must expose one raw and one typed persistent reference."""
-
-    raw_references = group.get("raw_references")
-    typed_references = group.get("typed_references")
-    if (
-        not isinstance(raw_references, set)
-        or len(raw_references) != 1
-        or not isinstance(typed_references, set)
-        or len(typed_references) != 1
-    ):
-        raise CadError(
-            "cad_persistent_reference_alias",
-            "one native vertex object returned multiple persistent references",
-            {
-                **base,
-                "reference_sha256": sorted(raw_references or ()),
-            },
-        )
-    return next(iter(raw_references)), next(iter(typed_references))
-
 
 def _scope_bijection(
     left: list[dict],
@@ -5914,68 +5954,49 @@ class SolidWorksBackend(CadBackend):
             _require_scope_owner(owner_scope, base)
 
         mapped_edge_witnesses = {}
-        vertex_groups = {}
+        vertex_observations = []
         for edge_row in edge_rows:
             for order, endpoint_name in enumerate(("start", "end")):
                 endpoint = edge_row["endpoints"][endpoint_name]
                 if endpoint["state"] != "present":
                     continue
-                pointer = endpoint["object_pointer"]
-                group = vertex_groups.setdefault(
-                    pointer,
-                    {
-                        "point_m": tuple(endpoint["point_m"]),
-                        "raw_references": set(),
-                        "typed_references": set(),
-                        "occurrences": [],
-                    },
-                )
-                if tuple(endpoint["point_m"]) != group["point_m"]:
-                    raise CadError(
-                        "cad_native_tessellation_unreadable",
-                        "one native vertex object returned different points",
-                        {**base, "edge_index": edge_row["index"]},
+                vertex_observations.append(
+                    (
+                        endpoint["point_m"],
+                        endpoint["reference"]["raw_sha256"],
+                        endpoint["reference"]["typed_sha256"],
+                        edge_row["index"],
+                        order,
+                        endpoint["object_pointer"],
                     )
-                group["raw_references"].add(
-                    endpoint["reference"]["raw_sha256"]
                 )
-                group["typed_references"].add(
-                    endpoint["reference"]["typed_sha256"]
-                )
-                group["occurrences"].append(
-                    (edge_row["index"], order)
-                )
+        try:
+            vertex_groups = _group_vertex_observations(vertex_observations)
+        except ValueError as error:
+            raise CadError(
+                "cad_native_tessellation_unreadable",
+                str(error),
+                {**base},
+            ) from error
         vertices_by_point = {}
-        for pointer, group in vertex_groups.items():
-            raw_reference, typed_reference = _single_vertex_reference(
-                group,
-                base,
-            )
-            group["raw_reference"] = raw_reference
-            group["typed_reference"] = typed_reference
-            point_bits = tuple(
-                _binary64_bits(value) for value in group["point_m"]
-            )
-            vertices_by_point.setdefault(point_bits, []).append(
-                (min(group["occurrences"]), pointer)
-            )
-        for rows in vertices_by_point.values():
-            rows.sort()
+        for group in vertex_groups:
+            point_bits = group["point_bits"]
+            vertices_by_point.setdefault(point_bits, []).append(group)
         ordered_vertices = sorted(
             (
                 (
                     point_bits,
                     occurrence,
-                    pointer,
+                    group,
                 )
-                for point_bits, rows in vertices_by_point.items()
-                for occurrence, (_, pointer) in enumerate(rows)
+                for point_bits, groups in vertices_by_point.items()
+                for occurrence, group in enumerate(groups)
             ),
             key=lambda row: (row[0], row[1]),
         )
         vertex_raw_references = {
-            vertex_groups[pointer]["raw_reference"]
-            for _, _, pointer in ordered_vertices
+            group["raw_reference_sha256"]
+            for _, _, group in ordered_vertices
         }
         vertex_aliased = (
             len(ordered_vertices) > 1
@@ -5996,10 +6017,9 @@ class SolidWorksBackend(CadBackend):
             for vertex_index, (
                 point_bits,
                 coincident_ordinal,
-                pointer,
+                group,
             ) in enumerate(ordered_vertices):
-                group = vertex_groups[pointer]
-                raw_sha256 = group["raw_reference"]
+                raw_sha256 = group["raw_reference_sha256"]
                 witness = vertex_witnesses.get(vertex_index)
                 if (
                     not isinstance(witness, dict)
@@ -6330,12 +6350,11 @@ class SolidWorksBackend(CadBackend):
 
         vertex_identity_rows = list(precomputed_vertex_identity_rows)
         if not vertex_aliased:
-            for vertex_index, (_, _, pointer) in enumerate(
+            for vertex_index, (_, _, group) in enumerate(
                 ordered_vertices
             ):
-                group = vertex_groups[pointer]
-                typed_sha256 = group["typed_reference"]
-                raw_sha256 = group["raw_reference"]
+                typed_sha256 = group["typed_reference_sha256"]
+                raw_sha256 = group["raw_reference_sha256"]
                 vertex_identity_rows.append(
                     {
                         "vertex_index": vertex_index,
@@ -7117,7 +7136,8 @@ class SolidWorksBackend(CadBackend):
                     for row in component_edge_rows
                 }
                 component_vertex_rows = _scope_vertex_rows(
-                    component_edge_rows
+                    component_edge_rows,
+                    edge_index_map,
                 )
                 part_vertex_rows = _scope_vertex_rows(part_edge_rows)
                 vertex_map = _scope_bijection(
