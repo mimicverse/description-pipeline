@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 
 SCHEMA = "description-pipeline.release-recovery-gate/v1"
 RECEIPT = "release-recovery-gate.json"
+DEFAULT_TIMEOUT_SECONDS = 3600
 
 
 class GateError(Exception):
@@ -58,9 +60,20 @@ def expected_identity(path: Path) -> dict:
     return identity
 
 
-def run(argv: list[str], *, runner=subprocess.run) -> subprocess.CompletedProcess:
+def run(
+    argv: list[str],
+    *,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    runner=subprocess.run,
+) -> subprocess.CompletedProcess:
     try:
-        result = runner(argv, capture_output=True, text=True, check=False)
+        result = runner(argv, capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise GateError(
+            "release_recovery_command_timeout",
+            f"{Path(argv[0]).name} exceeded its bounded timeout",
+            {"program": Path(argv[0]).name, "timeout": timeout},
+        ) from error
     except (OSError, subprocess.SubprocessError) as error:
         raise GateError(
             "release_recovery_command_failed",
@@ -133,6 +146,7 @@ def snapshot(args) -> int:
             "--operatorctl",
             str(operatorctl),
         ],
+        timeout=getattr(args, "timeout", DEFAULT_TIMEOUT_SECONDS),
         runner=args.runner,
     )
     values = key_values(result.stdout)
@@ -170,6 +184,7 @@ def restore(args, *, verify_only: bool = False) -> int:
     operatorctl = require_file(Path(args.operatorctl), "operatorctl")
     status_dir = Path(args.status_dir)
     receipt = status_dir / RECEIPT
+    action = "recovery-verify-only" if verify_only else "recovery-restore"
     identity = expected_identity(Path(args.expected_release))
     if release_from_manifest(manifest) != identity:
         raise GateError(
@@ -184,20 +199,38 @@ def restore(args, *, verify_only: bool = False) -> int:
     }
     if receipt.is_file():
         prior = load_json(receipt)
-        if prior.get("status") == "succeeded" and prior.get("inputs") == inputs:
-            print(json.dumps({"status": "succeeded", "idempotent": True}, sort_keys=True))
+        if (
+            prior.get("status") == "succeeded"
+            and prior.get("operation") == action
+            and prior.get("inputs") == inputs
+            and prior.get("windows_verified") is True
+            and prior.get("health") == "PASS"
+            and prior.get("database_rollback") == (not verify_only)
+            and prior.get("runtime_restart") == (not verify_only)
+        ):
+            print(
+                json.dumps(
+                    {"status": "succeeded", "operation": action, "idempotent": True},
+                    sort_keys=True,
+                )
+            )
             return 0
-        raise GateError("release_recovery_status_exists", "recovery status already contains different evidence")
-    if status_dir.exists() and any(status_dir.iterdir()):
-        raise GateError("release_recovery_status_not_empty", "recovery status directory is not empty")
+    if status_dir.is_symlink() or (status_dir.exists() and not status_dir.is_dir()):
+        raise GateError("release_recovery_status_invalid", "recovery status path must be a real directory")
     status_dir.mkdir(parents=True, exist_ok=True)
-    action = "verify-only" if verify_only else "restore"
+    run_number = 1
+    while True:
+        run_dir = status_dir / f"{action}-{run_number}"
+        if not run_dir.exists() and not run_dir.is_symlink():
+            break
+        run_number += 1
+    timeout = getattr(args, "timeout", DEFAULT_TIMEOUT_SECONDS)
     try:
         result = run(
             [
                 sys.executable,
                 args.recovery_py,
-                action,
+                "verify-only" if verify_only else "restore",
                 "--manifest",
                 str(manifest),
                 "--key",
@@ -205,22 +238,26 @@ def restore(args, *, verify_only: bool = False) -> int:
                 "--target-plan",
                 str(plan),
                 "--status-dir",
-                str(status_dir),
+                str(run_dir),
             ],
+            timeout=timeout,
             runner=args.runner,
         )
-        recovery_receipt = load_json(status_dir / "receipt.json")
+        recovery_receipt = load_json(run_dir / "receipt.json")
         if recovery_receipt.get("status") != "succeeded":
             raise GateError(
                 "release_recovery_database_unverified",
                 "recovery receipt did not verify the restored database and runtime",
             )
-        marker = load_json(status_dir / "recovery-marker.json")
-        if marker.get("release") != identity:
-            raise GateError(
-                "release_recovery_release_identity_mismatch",
-                "recovery marker release identity differs from the expected release",
-            )
+        marker_sha = None
+        if not verify_only:
+            marker = load_json(run_dir / "recovery-marker.json")
+            if marker.get("release") != identity:
+                raise GateError(
+                    "release_recovery_release_identity_mismatch",
+                    "recovery marker release identity differs from the expected release",
+                )
+            marker_sha = sha256_file(run_dir / "recovery-marker.json")
         windows = recovery_receipt.get("windows")
         if (
             not isinstance(windows, dict)
@@ -235,12 +272,21 @@ def restore(args, *, verify_only: bool = False) -> int:
         if not verify_only:
             run(
                 [str(operatorctl), "start", "--config", args.config],
+                timeout=timeout,
                 runner=args.runner,
             )
-        run(
-            [str(operatorctl), "health", "--config", args.config],
+        status_result = run(
+            [str(operatorctl), "status", "--config", args.config],
+            timeout=timeout,
             runner=args.runner,
         )
+        health_result = run(
+            [str(operatorctl), "health", "--config", args.config],
+            timeout=timeout,
+            runner=args.runner,
+        )
+        (run_dir / "operator-status.out").write_text(status_result.stdout, encoding="utf-8")
+        (run_dir / "operator-health.out").write_text(health_result.stdout, encoding="utf-8")
     except GateError as error:
         failure = {
             "schema": SCHEMA,
@@ -250,32 +296,49 @@ def restore(args, *, verify_only: bool = False) -> int:
             "error": {"code": error.code, "message": error.message, "detail": error.detail},
             "preserved": True,
         }
-        if (status_dir / "receipt.json").is_file():
-            failure["recovery_receipt_sha256"] = sha256_file(status_dir / "receipt.json")
-        write_once(receipt, failure)
+        if (run_dir / "receipt.json").is_file():
+            failure["recovery_receipt_sha256"] = sha256_file(run_dir / "receipt.json")
+        _replace_gate_receipt(receipt, failure)
         raise
-    write_once(
-        receipt,
-        {
-            "schema": SCHEMA,
-            "operation": action,
-            "status": "succeeded",
-            "inputs": inputs,
-            "recovery_receipt_sha256": sha256_file(status_dir / "receipt.json"),
-            "database_rollback": not verify_only,
-            "runtime_restart": not verify_only,
-            "health": "PASS",
-            "windows": recovery_receipt.get("windows"),
-            "stdout": result.stdout.strip().splitlines()[-1:] if result.stdout.strip() else [],
-        },
-    )
+    success = {
+        "schema": SCHEMA,
+        "operation": action,
+        "status": "succeeded",
+        "inputs": inputs,
+        "recovery_run": str(run_dir),
+        "recovery_receipt_sha256": sha256_file(run_dir / "receipt.json"),
+        "database_rollback": not verify_only,
+        "runtime_restart": not verify_only,
+        "windows_verified": True,
+        "health": "PASS",
+        "operator_status": "PASS",
+        "marker_sha256": marker_sha,
+        "windows": recovery_receipt.get("windows"),
+        "stdout": result.stdout.strip().splitlines()[-1:] if result.stdout.strip() else [],
+    }
+    _replace_gate_receipt(receipt, success)
     print(json.dumps({"status": "succeeded", "operation": action}, sort_keys=True))
     return 0
+
+
+def _replace_gate_receipt(receipt: Path, document: dict) -> None:
+    if receipt.exists():
+        prior_sha = sha256_file(receipt)
+        archive = receipt.with_name(f"release-recovery-gate.previous-{prior_sha[:16]}.json")
+        if archive.exists():
+            raise GateError(
+                "release_recovery_status_exists",
+                "prior recovery evidence has the same digest but a different filename",
+                {"archive": str(archive)},
+            )
+        os.replace(receipt, archive)
+    write_once(receipt, document)
 
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="release_recovery.py")
     root.add_argument("--recovery-py", default=str(Path(__file__).with_name("recovery.py")))
+    root.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     sub = root.add_subparsers(dest="action", required=True)
     snapshot_parser = sub.add_parser("snapshot")
     snapshot_parser.add_argument("--config", required=True)
@@ -332,12 +395,16 @@ def restore_from_plan(args):
         operatorctl=plan["operatorctl"],
         expected_release=plan["expected_release"],
         runner=args.runner,
+        timeout=args.timeout,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     args.runner = subprocess.run
+    if args.timeout <= 0:
+        print("release_recovery: timeout must be positive", file=sys.stderr)
+        return 2
     try:
         if args.action == "snapshot":
             return snapshot(args)

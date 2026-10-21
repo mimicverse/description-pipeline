@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -111,8 +112,9 @@ class ReleaseRecoveryTests(unittest.TestCase):
             def runner(argv, **_kwargs):
                 calls.append(argv)
                 if "restore" in argv:
-                    status.mkdir(parents=True, exist_ok=True)
-                    (status / "receipt.json").write_text(
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
                         json.dumps(
                             {
                                 "status": "succeeded",
@@ -125,7 +127,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                         ),
                         encoding="utf-8",
                     )
-                    (status / "recovery-marker.json").write_text(
+                    (run_dir / "recovery-marker.json").write_text(
                         json.dumps({"release": args_release(args)}),
                         encoding="utf-8",
                     )
@@ -161,8 +163,9 @@ class ReleaseRecoveryTests(unittest.TestCase):
 
             def runner(argv, **_kwargs):
                 if "restore" in argv:
-                    status.mkdir(parents=True, exist_ok=True)
-                    (status / "receipt.json").write_text(
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
                         json.dumps({"status": "failed", "code": "database_restore_failed"}),
                         encoding="utf-8",
                     )
@@ -186,8 +189,9 @@ class ReleaseRecoveryTests(unittest.TestCase):
             def runner(argv, **_kwargs):
                 calls.append(argv)
                 if "restore" in argv:
-                    status.mkdir(parents=True, exist_ok=True)
-                    (status / "receipt.json").write_text(
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
                         json.dumps(
                             {
                                 "status": "succeeded",
@@ -200,7 +204,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                         ),
                         encoding="utf-8",
                     )
-                    (status / "recovery-marker.json").write_text(
+                    (run_dir / "recovery-marker.json").write_text(
                         json.dumps({"release": args_release(args)}),
                         encoding="utf-8",
                     )
@@ -244,6 +248,139 @@ class ReleaseRecoveryTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(release_recovery.GateError, "must be absent"):
                 release_recovery.snapshot(args)
+
+    def test_verify_success_does_not_authorize_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "status"
+            args = self.restore_args(root, status_dir=status)
+            calls = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                if "verify-only" in argv or "restore" in argv:
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "succeeded",
+                                "windows": {
+                                    "task_state": "Disabled",
+                                    "endpoint": "stopped",
+                                    "state_sha256": "d" * 64,
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    if "restore" in argv:
+                        (run_dir / "recovery-marker.json").write_text(
+                            json.dumps({"release": args_release(args)}),
+                            encoding="utf-8",
+                        )
+                return Result()
+
+            args.runner = runner
+            self.assertEqual(release_recovery.restore(args, verify_only=True), 0)
+            calls.clear()
+            self.assertEqual(release_recovery.restore(args), 0)
+            self.assertTrue(any("restore" in row for row in calls))
+            self.assertFalse(any("verify-only" in row for row in calls))
+
+    def test_verify_accepts_prior_failed_gate_without_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "status"
+            args = self.restore_args(root, status_dir=status)
+
+            def failing(argv, **_kwargs):
+                if "restore" in argv:
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
+                        json.dumps({"status": "failed"}),
+                        encoding="utf-8",
+                    )
+                    return Result(returncode=1, stderr="failed\n")
+                return Result()
+
+            args.runner = failing
+            with self.assertRaises(release_recovery.GateError):
+                release_recovery.restore(args)
+
+            def verifying(argv, **_kwargs):
+                if "verify-only" in argv:
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "succeeded",
+                                "windows": {
+                                    "task_state": "Disabled",
+                                    "endpoint": "stopped",
+                                    "state_sha256": "d" * 64,
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return Result()
+
+            args.runner = verifying
+            self.assertEqual(release_recovery.restore(args, verify_only=True), 0)
+            gate = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
+            self.assertEqual(gate["operation"], "recovery-verify-only")
+            self.assertEqual(gate["database_rollback"], False)
+
+    def test_timeout_preserves_failure_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "status"
+            args = self.restore_args(root, status_dir=status)
+
+            def timeout(_argv, **_kwargs):
+                raise subprocess.TimeoutExpired("recovery.py", 1)
+
+            args.runner = timeout
+            with self.assertRaisesRegex(release_recovery.GateError, "bounded timeout"):
+                release_recovery.restore(args)
+            gate = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
+            self.assertEqual(gate["status"], "failed")
+            self.assertEqual(gate["preserved"], True)
+
+    def test_missing_marker_and_key_are_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "status"
+            args = self.restore_args(root, status_dir=status)
+
+            def runner(argv, **_kwargs):
+                if "restore" in argv:
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "succeeded",
+                                "windows": {
+                                    "task_state": "Disabled",
+                                    "endpoint": "stopped",
+                                    "state_sha256": "d" * 64,
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return Result()
+
+            args.runner = runner
+            with self.assertRaisesRegex(release_recovery.GateError, "JSON input"):
+                release_recovery.restore(args)
+            Path(args.key).unlink()
+            with self.assertRaisesRegex(release_recovery.GateError, "recovery key"):
+                release_recovery.restore(args)
 
 
 def args_release(args) -> dict:
