@@ -17,14 +17,132 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_CURVE_DOMAIN_RULE,
+    NATIVE_CURVE_TOPOLOGY_PAIRING_RULE,
+    NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE,
     native_curve_endpoint_operation_tolerance,
+    native_curve_endpoint_roles,
     native_curve_domain_transform,
+    native_curve_topology_endpoint_assignment,
     native_u_equal,
 )
 from description_pipeline.io import PipelineError  # noqa: E402
 
 
 class NativeCurveDomainTests(unittest.TestCase):
+    def test_topology_pairing_accepts_observed_39nm_curve_wobble(self):
+        expected_start = (
+            0.01000643903049045,
+            -0.0061647112233256295,
+            -0.055676906273813,
+        )
+        expected_end = (
+            expected_start[0] + 0.001,
+            expected_start[1],
+            expected_start[2],
+        )
+        actual_start = (
+            expected_start[0] + 3.936764624706823e-8,
+            expected_start[1] - 1.1517504897859e-8,
+            expected_start[2] - 9.72215465027256e-11,
+        )
+
+        result = native_curve_topology_endpoint_assignment(
+            expected_start,
+            expected_end,
+            actual_start,
+            expected_end,
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["rule_version"], NATIVE_CURVE_TOPOLOGY_PAIRING_RULE)
+        self.assertEqual(result["result"], "sense_directed")
+        self.assertEqual(
+            result["point_tolerance_source"],
+            NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE,
+        )
+        self.assertLess(result["direct_error_m"], result["point_tolerance_m"])
+        self.assertGreater(
+            result["swapped_error_m"],
+            result["point_tolerance_m"],
+        )
+        self.assertGreater(result["wrong_assignment_margin_m"], 0.0)
+
+    def test_topology_pairing_rejects_swapped_endpoints(self):
+        result = native_curve_topology_endpoint_assignment(
+            (0.0, 0.0, 0.0),
+            (0.010, 0.0, 0.0),
+            (0.010, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["result"], "swapped_only")
+        self.assertGreater(result["direct_error_m"], result["point_tolerance_m"])
+
+    def test_topology_pairing_rejects_ambiguous_short_edge(self):
+        result = native_curve_topology_endpoint_assignment(
+            (0.0, 0.0, 0.0),
+            (40e-6, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (40e-6, 0.0, 0.0),
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["result"], "ambiguous")
+        self.assertLessEqual(
+            result["swapped_error_m"],
+            result["point_tolerance_m"],
+        )
+
+    def test_topology_pairing_tolerance_boundary_is_inclusive(self):
+        accepted = native_curve_topology_endpoint_assignment(
+            (0.0, 0.0, 0.0),
+            (0.010, 0.0, 0.0),
+            (50e-6, 0.0, 0.0),
+            (0.010, 0.0, 0.0),
+        )
+        rejected = native_curve_topology_endpoint_assignment(
+            (0.0, 0.0, 0.0),
+            (0.010, 0.0, 0.0),
+            (50e-6 + 1e-12, 0.0, 0.0),
+            (0.010, 0.0, 0.0),
+        )
+
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["direct_error_m"], accepted["point_tolerance_m"])
+        self.assertFalse(rejected["accepted"])
+        self.assertEqual(rejected["result"], "unmatched")
+        self.assertGreater(
+            rejected["direct_error_m"],
+            rejected["point_tolerance_m"],
+        )
+
+        swapped_boundary = native_curve_topology_endpoint_assignment(
+            (0.0, 0.0, 0.0),
+            (50e-6, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (50e-6, 0.0, 0.0),
+        )
+        self.assertFalse(swapped_boundary["accepted"])
+        self.assertEqual(swapped_boundary["result"], "ambiguous")
+
+    def test_topology_pairing_rejects_malformed_inputs(self):
+        with self.assertRaisesRegex(ValueError, "three coordinates"):
+            native_curve_topology_endpoint_assignment(
+                (0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+            )
+        with self.assertRaisesRegex(ValueError, "finite"):
+            native_curve_topology_endpoint_assignment(
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                tolerance_m=float("nan"),
+            )
+
     def counterexample(self):
         path = Path(__file__).with_name("native-curve-domain-r5-counterexample.json")
         return json.loads(path.read_text(encoding="utf-8"))
@@ -126,9 +244,26 @@ class NativeCurveDomainTests(unittest.TestCase):
             row["curve_sense"],
             curve["is_periodic"],
         )
+        _, topology_endpoints = native_curve_endpoint_roles(
+            row["curve_start_point_m"],
+            row["curve_end_point_m"],
+            row["curve_sense"],
+        )
+        row["topology_endpoint_assignment"] = (
+            native_curve_topology_endpoint_assignment(
+                topology_endpoints[0],
+                topology_endpoints[1],
+                row["start_point_m"],
+                row["end_point_m"],
+            )
+        )
         return tessellation, triangles
 
     def parse(self, tessellation, triangles):
+        support.refresh_topology_endpoint_assignment(tessellation)
+        return self.parse_raw(tessellation, triangles)
+
+    def parse_raw(self, tessellation, triangles):
         return parse_native_tessellation(
             "curve-domain-fixture",
             tessellation,
@@ -200,6 +335,7 @@ class NativeCurveDomainTests(unittest.TestCase):
                 "start_point_error": "vertex_absent",
                 "end_point_error": "vertex_absent",
                 "endpoint_points_derived_from_curve": True,
+                "topology_endpoint_assignment": None,
                 "curve_closed": True,
                 "curve_start_point_m": common_point,
                 "curve_end_point_m": list(common_point),
@@ -379,6 +515,40 @@ class NativeCurveDomainTests(unittest.TestCase):
 
         with self.assertRaises(PipelineError):
             self.parse(old, triangles)
+
+    def test_present_topology_assignment_is_required(self):
+        tessellation, triangles = self.tessellation()
+        del tessellation["native_edges"][0]["topology_endpoint_assignment"]
+
+        with self.assertRaisesRegex(PipelineError, "unknown shape"):
+            self.parse_raw(tessellation, triangles)
+
+    def test_absent_topology_assignment_field_is_required(self):
+        tessellation, triangles, _former_end = self.closed_absent_case()
+        for edge in tessellation["native_edges"]:
+            if {
+                edge["start_vertex_state"],
+                edge["end_vertex_state"],
+            } == {"absent"}:
+                del edge["topology_endpoint_assignment"]
+
+        with self.assertRaisesRegex(PipelineError, "unknown shape"):
+            self.parse_raw(tessellation, triangles)
+
+    def test_absent_endpoints_reject_forged_topology_assignment(self):
+        tessellation, triangles, _former_end = self.closed_absent_case()
+        for edge in tessellation["native_edges"]:
+            if {
+                edge["start_vertex_state"],
+                edge["end_vertex_state"],
+            } == {"absent"}:
+                edge["topology_endpoint_assignment"] = {"accepted": True}
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "absent endpoints",
+        ):
+            self.parse_raw(tessellation, triangles)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from .native_u import (
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
+    native_curve_topology_endpoint_assignment,
     native_fin_interval,
     native_get_parameter_success,
     native_point_error,
@@ -809,7 +810,7 @@ def _finite_fin_intervals(
     _require(
         0.0 < span <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
         component
-        + f": native tessellation v4 edge {reference} fin {fin_id} collapsed U span is invalid",
+        + f": native tessellation v5 edge {reference} fin {fin_id} collapsed U span is invalid",
     )
     return [], span
 
@@ -1093,6 +1094,7 @@ def parse_native_tessellation(
         "curve_end_params",
         "curve_domain_transform",
         "curve_endpoint_evaluations",
+        "topology_endpoint_assignment",
         "endpoint_points_derived_from_curve",
         "face_senses",
     }
@@ -1101,7 +1103,7 @@ def parse_native_tessellation(
     vertex_points = {}
     for index, edge in enumerate(native_edges):
         _require(
-            isinstance(edge, dict) and set(edge) == edge_required,
+            isinstance(edge, dict) and frozenset(edge) == edge_required,
             component + f": native edge {index} has an unknown shape",
         )
         reference = edge["edge_reference_sha256"]
@@ -1544,6 +1546,11 @@ def parse_native_tessellation(
                 end_evaluated,
             )
             _require(
+                edge.get("topology_endpoint_assignment") is None,
+                component
+                + f": native edge {index} absent endpoints carry a topology assignment",
+            )
+            _require(
                 edge["endpoint_points_derived_from_curve"] is True
                 and end_params["is_closed"] is True
                 and start_reference is None
@@ -1559,6 +1566,7 @@ def parse_native_tessellation(
         else:
             _require(
                 edge["endpoint_points_derived_from_curve"] is False
+                and edge["topology_endpoint_assignment"] is not None
                 and isinstance(start_reference, str)
                 and isinstance(end_reference, str)
                 and isinstance(start_point, list)
@@ -1919,12 +1927,12 @@ def _parse_itessellation_evidence(
                 )
                 for triangle in triangle_vertices
             ),
-            component + ": native STL triangle vertices are unavailable for v4 binding",
+            component + ": native STL triangle vertices are unavailable for v5 binding",
         )
     raw_bodies = value["bodies"]
     _require(
         isinstance(raw_bodies, list) and bool(raw_bodies),
-        component + ": native tessellation v4 body evidence is missing",
+        component + ": native tessellation v5 body evidence is missing",
     )
 
     body_evidence = {}
@@ -1948,7 +1956,7 @@ def _parse_itessellation_evidence(
                 "facets",
                 "fins",
             },
-            component + f": native tessellation v4 body {index} has an unknown shape",
+            component + f": native tessellation v5 body {index} has an unknown shape",
         )
         body_key = (body["body_type"], body["body_index"])
         _require(
@@ -1957,11 +1965,11 @@ def _parse_itessellation_evidence(
             and _integer(body_key[1])
             and body_key[1] >= 0
             and body_key in expected_bodies,
-            component + f": native tessellation v4 body {index} is unknown",
+            component + f": native tessellation v5 body {index} is unknown",
         )
         _require(
             previous_body is None or body_key > previous_body,
-            component + f": native tessellation v4 body {index} is duplicated or unordered",
+            component + f": native tessellation v5 body {index} is duplicated or unordered",
         )
         previous_body = body_key
         body_face_references = tuple(
@@ -1996,7 +2004,7 @@ def _parse_itessellation_evidence(
             and isinstance(body["faces"], list)
             and isinstance(body["facets"], list)
             and isinstance(body["fins"], list),
-            component + f": native tessellation v4 body {body_key} is incomplete",
+            component + f": native tessellation v5 body {body_key} is incomplete",
         )
         body_evidence[body_key] = _parse_itessellation_body(
             component,
@@ -2011,13 +2019,13 @@ def _parse_itessellation_evidence(
         }
     _require(
         set(body_evidence) == expected_bodies,
-        component + ": native tessellation v4 evidence does not cover every body",
+        component + ": native tessellation v5 evidence does not cover every body",
     )
 
     raw_vertices = value["vertices"]
     _require(
         isinstance(raw_vertices, list),
-        component + ": native tessellation v4 vertex point cache is missing",
+        component + ": native tessellation v5 vertex point cache is missing",
     )
     vertices = {}
     previous_vertex = None
@@ -2025,7 +2033,7 @@ def _parse_itessellation_evidence(
         _require(
             isinstance(vertex, dict)
             and set(vertex) == {"body_type", "body_index", "vertex_id", "point_m"},
-            component + f": native tessellation v4 vertex {index} has an unknown shape",
+            component + f": native tessellation v5 vertex {index} has an unknown shape",
         )
         body_key = (vertex["body_type"], vertex["body_index"])
         vertex_id = vertex["vertex_id"]
@@ -2040,12 +2048,12 @@ def _parse_itessellation_evidence(
                 type(coordinate) in (int, float) and math.isfinite(coordinate)
                 for coordinate in point
             ),
-            component + f": native tessellation v4 vertex {index} is malformed",
+            component + f": native tessellation v5 vertex {index} is malformed",
         )
         order = (*body_key, vertex_id)
         _require(
             previous_vertex is None or order > previous_vertex,
-            component + f": native tessellation v4 vertex {index} is duplicated or unordered",
+            component + f": native tessellation v5 vertex {index} is duplicated or unordered",
         )
         previous_vertex = order
         vertices[(body_key, vertex_id)] = tuple(point)
@@ -2732,11 +2740,11 @@ def _parse_itessellation_evidence(
     for body_key, evidence in body_evidence.items():
         _require(
             len(evidence["facets"]) == body_counts[body_key]["facet_count"],
-            component + f": native tessellation v4 facet count differs for body {body_key}",
+            component + f": native tessellation v5 facet count differs for body {body_key}",
         )
         _require(
             len(evidence["fins"]) == body_counts[body_key]["fin_count"],
-            component + f": native tessellation v4 fin count differs for body {body_key}",
+            component + f": native tessellation v5 fin count differs for body {body_key}",
         )
         cached = {vertex_id for owner, vertex_id in vertices if owner == body_key}
         referenced = {
@@ -2746,11 +2754,11 @@ def _parse_itessellation_evidence(
         }
         _require(
             len(cached) == body_counts[body_key]["vertex_count"],
-            component + f": native tessellation v4 vertex count differs for body {body_key}",
+            component + f": native tessellation v5 vertex count differs for body {body_key}",
         )
         _require(
             cached == referenced,
-            component + ": native tessellation v4 vertex cache differs from fin vertices",
+            component + ": native tessellation v5 vertex cache differs from fin vertices",
         )
         edges_by_reference = {
             edge["edge_reference_sha256"]: edge
@@ -2766,7 +2774,7 @@ def _parse_itessellation_evidence(
             }
             <= set(edges_by_reference),
             component
-            + f": native tessellation v4 edge references differ for body {body_key}",
+            + f": native tessellation v5 edge references differ for body {body_key}",
         )
         for fin in evidence["fins"].values():
             if fin["classification"] == "internal_only":
@@ -2827,7 +2835,7 @@ def _parse_itessellation_evidence(
         body_edges = edges_by_body.get(body_key, {})
         _require(
             set(fins_by_edge_reference) <= set(body_edges),
-            component + f": native tessellation v4 edge references differ for body {body_key}",
+            component + f": native tessellation v5 edge references differ for body {body_key}",
         )
         for reference, edge in body_edges.items():
             declared = set(edge["fin_ids"])
@@ -2835,7 +2843,7 @@ def _parse_itessellation_evidence(
             _require(
                 declared == actual,
                 component
-                + f": native tessellation v4 edge {reference} fin_ids are not bidirectional",
+                + f": native tessellation v5 edge {reference} fin_ids are not bidirectional",
             )
             u_min = float(edge["u_min"])
             u_max = float(edge["u_max"])
@@ -2849,7 +2857,7 @@ def _parse_itessellation_evidence(
                     native_u_in_closed_interval(start_u, u_min, u_max)
                     and native_u_in_closed_interval(end_u, u_min, u_max),
                     component
-                    + f": native tessellation v4 edge {reference} fin {fin_id} U is invalid",
+                    + f": native tessellation v5 edge {reference} fin {fin_id} U is invalid",
                 )
                 fin_start = vertices[(body_key, fin["vertex_ids"][0])]
                 fin_end = vertices[(body_key, fin["vertex_ids"][1])]
@@ -2876,7 +2884,7 @@ def _parse_itessellation_evidence(
                 _require(
                     native_u_intervals_cover(intervals, u_min, u_max),
                     component
-                    + f": native tessellation v4 edge {reference} face {face_index} does not cover its U domain",
+                    + f": native tessellation v5 edge {reference} face {face_index} does not cover its U domain",
                 )
             curve_points = {
                 tuple(_float32(value) for value in edge["curve_start_point_m"]),
@@ -2892,27 +2900,40 @@ def _parse_itessellation_evidence(
                     edge["curve_end_point_m"],
                     edge["curve_sense"],
                 )
-                for name, expected_point, actual_point in zip(
-                    ("start", "end"),
-                    topology_endpoints,
-                    endpoint_points,
-                    strict=True,
-                ):
-                    point_tolerance = native_point_roundtrip_tolerance(
-                        expected_point,
-                        actual_point,
-                    )
-                    point_error = native_point_error(
-                        expected_point,
-                        actual_point,
-                    )
-                    _require(
-                        point_error <= point_tolerance,
-                        component
-                        + f": native tessellation v4 edge {reference} "
-                        + f"{name} topology endpoint disagrees with curve direction",
-                    )
+                assignment = native_curve_topology_endpoint_assignment(
+                    topology_endpoints[0],
+                    topology_endpoints[1],
+                    endpoint_points[0],
+                    endpoint_points[1],
+                )
+                _require(
+                    edge["topology_endpoint_assignment"] == assignment,
+                    component
+                    + f": native tessellation v5 edge {reference} "
+                    + "topology endpoint assignment is not independently reproducible",
+                )
+                _require(
+                    assignment["accepted"] is True
+                    or (
+                        assignment["result"] == "ambiguous"
+                        and bool(collapsed_fin_span)
+                    ),
+                    component
+                    + f": native tessellation v5 edge {reference} "
+                    + (
+                        "topology endpoint disagrees with curve direction"
+                        if assignment["result"]
+                        in {"swapped_only", "unmatched"}
+                        else "topology endpoint direction is not uniquely proven"
+                    ),
+                )
             else:
+                _require(
+                    edge.get("topology_endpoint_assignment") is None,
+                    component
+                    + f": native tessellation v5 edge {reference} "
+                    + "absent endpoints carry a topology assignment",
+                )
                 evaluations = edge["curve_endpoint_evaluations"]
                 edge_points = {
                     tuple(
@@ -2924,7 +2945,7 @@ def _parse_itessellation_evidence(
                 _require(
                     curve_points == edge_points,
                     component
-                    + f": native tessellation v4 edge {reference} curve endpoints differ",
+                    + f": native tessellation v5 edge {reference} curve endpoints differ",
                 )
             evaluations = edge["curve_endpoint_evaluations"]
             for edge_endpoint in ("start", "end"):
@@ -2948,7 +2969,7 @@ def _parse_itessellation_evidence(
                         _require(
                             point_error <= point_tolerance,
                             component
-                            + f": native tessellation v4 edge {reference} "
+                            + f": native tessellation v5 edge {reference} "
                             + f"{edge_endpoint} endpoint conflicts with fin {fin_id} "
                             + f"{fin_endpoint} at the same U",
                         )
@@ -2962,7 +2983,7 @@ def _parse_itessellation_evidence(
                 _require(
                     cofin_id in actual and cofin_id != fin_id,
                     component
-                    + f": native tessellation v4 fin {fin_id} has no distinct cofin",
+                    + f": native tessellation v5 fin {fin_id} has no distinct cofin",
                 )
                 cofin = evidence["fins"][cofin_id]
                 fin_start = vertices[
@@ -2991,7 +3012,7 @@ def _parse_itessellation_evidence(
                 _require(
                     fin_collapsed is cofin_collapsed,
                     component
-                    + f": native tessellation v4 fin {fin_id} has partial U collapse",
+                    + f": native tessellation v5 fin {fin_id} has partial U collapse",
                 )
                 _require(
                     cofin["cofin_id"] == fin_id
@@ -3021,7 +3042,7 @@ def _parse_itessellation_evidence(
                     and face_sense[fin["face_index"]]
                     is not face_sense[cofin["face_index"]],
                     component
-                    + f": native tessellation v4 fin {fin_id} cofin/orientation is inconsistent",
+                    + f": native tessellation v5 fin {fin_id} cofin/orientation is inconsistent",
                 )
                 if (
                     collapsed_pair
@@ -3066,12 +3087,12 @@ def _parse_itessellation_evidence(
                     for face_index in active_faces
                 ),
                 component
-                + f": native tessellation v4 edge {reference} has a collapsed-only face without positive U coverage",
+                + f": native tessellation v5 edge {reference} has a collapsed-only face without positive U coverage",
             )
             _require(
                 fin_faces == active_faces,
                 component
-                + f": native tessellation v4 edge {reference} does not cover its tessellated faces",
+                + f": native tessellation v5 edge {reference} does not cover its tessellated faces",
             )
             _require(
                 bool(active_faces)
@@ -3080,7 +3101,7 @@ def _parse_itessellation_evidence(
                     for face_index in edge["face_indices"]
                 ),
                 component
-                + f": native tessellation v4 edge {reference} has no fin without an untessellated face",
+                + f": native tessellation v5 edge {reference} has no fin without an untessellated face",
             )
 
 
@@ -3103,7 +3124,7 @@ def _parse_itessellation_body(
                 "facet_ids",
                 "face_identity_sha256",
             },
-            component + f": native tessellation v4 face {index} has an unknown shape",
+            component + f": native tessellation v5 face {index} has an unknown shape",
         )
         face_index = face["face_index"]
         facet_ids = face["facet_ids"]
@@ -3141,13 +3162,13 @@ def _parse_itessellation_body(
                 )
             )
             and (previous_face is None or face_index > previous_face),
-            component + f": native tessellation v4 face {index} is malformed",
+            component + f": native tessellation v5 face {index} is malformed",
         )
         previous_face = face_index
         faces[face_index] = set(facet_ids)
     _require(
         set(faces) == set(face_spans),
-        component + f": native tessellation v4 body {body_key} does not cover every face",
+        component + f": native tessellation v5 body {body_key} does not cover every face",
     )
 
     facets = {}
@@ -3164,7 +3185,7 @@ def _parse_itessellation_body(
                 "vertex_ids",
                 "triangle_record_index",
             },
-            component + f": native tessellation v4 facet {index} has an unknown shape",
+            component + f": native tessellation v5 facet {index} has an unknown shape",
         )
         facet_id = facet["facet_id"]
         face_index = facet["face_index"]
@@ -3187,7 +3208,7 @@ def _parse_itessellation_body(
             and all(_integer(vertex_id) and vertex_id >= 0 for vertex_id in vertex_ids)
             and _integer(triangle_record_index)
             and triangle_record_index >= 0,
-            component + f": native tessellation v4 facet {index} is malformed",
+            component + f": native tessellation v5 facet {index} is malformed",
         )
         previous_facet = facet_id
         span = face_spans_by_key[(*body_key, face_index)]
@@ -3199,7 +3220,7 @@ def _parse_itessellation_body(
             triangle_record_index in expected_records
             and triangle_record_index not in used_triangle_records,
             component
-            + f": native tessellation v4 facet {facet_id} has duplicate or misplaced triangle index",
+            + f": native tessellation v5 facet {facet_id} has duplicate or misplaced triangle index",
         )
         used_triangle_records.add(triangle_record_index)
         facets[facet_id] = {
@@ -3220,7 +3241,7 @@ def _parse_itessellation_body(
     }
     _require(
         used_triangle_records == expected_triangle_records,
-        component + f": native tessellation v4 body {body_key} does not cover every triangle record",
+        component + f": native tessellation v5 body {body_key} does not cover every triangle record",
     )
     _require(
         {
@@ -3229,7 +3250,7 @@ def _parse_itessellation_body(
             for facet_id in facet_ids
         }
         == set(facets),
-        component + f": native tessellation v4 body {body_key} face-to-facet map is not closed",
+        component + f": native tessellation v5 body {body_key} face-to-facet map is not closed",
     )
     for face_index, facet_ids in faces.items():
         _require(
@@ -3240,7 +3261,7 @@ def _parse_itessellation_body(
                 if facet["face_index"] == face_index
             },
             component
-            + f": native tessellation v4 body {body_key} face {face_index} has misowned facets",
+            + f": native tessellation v5 body {body_key} face {face_index} has misowned facets",
         )
 
     fins = {}
@@ -3263,7 +3284,7 @@ def _parse_itessellation_body(
                 "end_evidence",
                 "cofin_id",
             },
-            component + f": native tessellation v4 fin {index} has an unknown shape",
+            component + f": native tessellation v5 fin {index} has an unknown shape",
         )
         fin_id = fin["fin_id"]
         facet_id = fin["facet_id"]
@@ -3308,17 +3329,17 @@ def _parse_itessellation_body(
                     and cofin_id is None
                 )
             ),
-            component + f": native tessellation v4 fin {index} is malformed or unclassified",
+            component + f": native tessellation v5 fin {index} is malformed or unclassified",
         )
         previous_fin = fin_id
         _require(
             fin_id in facets[facet_id]["fin_ids"],
-            component + f": native tessellation v4 fin {fin_id} is absent from its facet",
+            component + f": native tessellation v5 fin {fin_id} is absent from its facet",
         )
         previous = facet_fin_membership.setdefault(fin_id, facet_id)
         _require(
             previous == facet_id,
-            component + f": native tessellation v4 fin {fin_id} belongs to multiple facets",
+            component + f": native tessellation v5 fin {fin_id} belongs to multiple facets",
         )
         fins[fin_id] = {
             "fin_id": fin_id,
@@ -3340,7 +3361,7 @@ def _parse_itessellation_body(
             for facet in facets.values()
             for fin_id in facet["fin_ids"]
         },
-        component + f": native tessellation v4 body {body_key} facet-to-fin map is not closed",
+        component + f": native tessellation v5 body {body_key} facet-to-fin map is not closed",
     )
     return {"faces": faces, "facets": facets, "fins": fins}
 
@@ -3365,7 +3386,7 @@ def _validate_facet_side_coverage(
             and len(set(starts)) == 3
             and len(set(ends)) == 3,
             component
-            + f": native tessellation v4 facet {facet['facet_id']} is not a directed three-cycle",
+            + f": native tessellation v5 facet {facet['facet_id']} is not a directed three-cycle",
         )
         cycle = [fins[0]["vertex_ids"][0]]
         current = fins[0]
@@ -3374,7 +3395,7 @@ def _validate_facet_side_coverage(
             _require(
                 current["fin_id"] not in used,
                 component
-                + f": native tessellation v4 facet {facet['facet_id']} repeats a directed fin",
+                + f": native tessellation v5 facet {facet['facet_id']} repeats a directed fin",
             )
             used.add(current["fin_id"])
             cycle.append(current["vertex_ids"][1])
@@ -3386,7 +3407,7 @@ def _validate_facet_side_coverage(
             _require(
                 len(matches) == 1,
                 component
-                + f": native tessellation v4 facet {facet['facet_id']} has an ambiguous directed cycle",
+                + f": native tessellation v5 facet {facet['facet_id']} has an ambiguous directed cycle",
             )
             current = matches[0]
         _require(
@@ -3394,7 +3415,7 @@ def _validate_facet_side_coverage(
             and cycle[0] == cycle[-1]
             and len(set(cycle[:-1])) == 3,
             component
-            + f": native tessellation v4 facet {facet['facet_id']} does not form one directed three-cycle",
+            + f": native tessellation v5 facet {facet['facet_id']} does not form one directed three-cycle",
         )
         cycles[facet["facet_id"]] = (cycle[0], cycle[1], cycle[2])
     return cycles
@@ -3426,7 +3447,7 @@ def _validate_facet_stl_binding(
         _require(
             any(native == stl[offset:] + stl[:offset] for offset in range(3)),
             component
-            + f": native tessellation v4 facet {facet['facet_id']} does not bind "
+            + f": native tessellation v5 facet {facet['facet_id']} does not bind "
             + f"triangle record {facet['triangle_record_index']}",
         )
 
