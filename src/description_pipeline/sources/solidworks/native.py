@@ -4499,6 +4499,7 @@ class SolidWorksBackend(CadBackend):
                         "vertex_error": vertex_error
                         or "endpoint interface unavailable",
                         "point_error": "vertex_absent",
+                        "reference_error": None,
                     }
                     continue
                 point = None

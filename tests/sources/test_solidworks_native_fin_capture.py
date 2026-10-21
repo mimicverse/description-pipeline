@@ -1166,6 +1166,43 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
         self.assertIn("both absent endpoints", caught.exception.message)
 
+    def test_closed_absent_endpoints_serialize_null_reference_errors(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        closed_point = (0.0, 0.0, 0.0)
+        projected_point = (1e-7, 0.0, 0.0)
+        edge.vertices = [None, None]
+        edge.curve = FakeCurve(-10.0, 10.0, is_closed=True)
+        edge.u_min = 0.0
+        edge.u_max = 1.0
+        edge.curve_start_point = list(closed_point)
+        edge.curve_end_point = list(closed_point)
+        edge.evaluate_u_points = {
+            0.0: closed_point,
+            1.0: closed_point,
+        }
+        edge.GetClosestPointOn = lambda x, y, z: [
+            x,
+            y,
+            z,
+            1.0 if x > 0.0 else 0.0,
+            0.0,
+        ]
+        edge.GetParameter = lambda _x, _y, _z: [0.0, 0.0]
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: closed_point,
+            2: projected_point,
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+
+        captured = self.capture(body, extension)
+
+        edge_row = captured["native_edge_rows"][0]
+        self.assertEqual(edge_row["start_vertex_state"], "absent")
+        self.assertEqual(edge_row["end_vertex_state"], "absent")
+        self.assertIsNone(edge_row["start_reference_error"])
+        self.assertIsNone(edge_row["end_reference_error"])
+
     def test_present_vertex_get_point_failure_is_not_reclassified_as_absent(self):
         body, _face_10, _face_20, edge, _tessellation, extension = self.fixture()
         edge.vertices = [
