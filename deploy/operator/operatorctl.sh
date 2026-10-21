@@ -1176,6 +1176,7 @@ PY
 windows_status_check() {
   python3 - "$CONFIG_FILE" "$OPERATOR_STATE_DIR/install-record.json" <<'PY'
 import base64
+import gzip
 import json
 import os
 import subprocess
@@ -1310,6 +1311,17 @@ try {{
 }}
 """
 ssh_bin = os.environ.get("SOLIDWORKS_SSH_BIN", "ssh")
+payload = base64.b64encode(gzip.compress(script.encode("utf-8"), mtime=0)).decode("ascii")
+launcher = (
+    "$p=[Convert]::FromBase64String('" + payload + "');"
+    "$m=New-Object System.IO.MemoryStream(,$p);"
+    "$g=New-Object System.IO.Compression.GZipStream($m,"
+    "[System.IO.Compression.CompressionMode]::Decompress);"
+    "$r=New-Object System.IO.StreamReader($g,[System.Text.Encoding]::UTF8);"
+    "$s=$r.ReadToEnd();$r.Dispose();$g.Dispose();$m.Dispose();"
+    "Invoke-Expression $s"
+)
+encoded_command = base64.b64encode(launcher.encode("utf-16le")).decode("ascii")
 try:
     completed = subprocess.run(
         [
@@ -1322,23 +1334,27 @@ try:
             "powershell.exe",
             "-NoProfile",
             "-NonInteractive",
-            "-Command",
-            "-",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            encoded_command,
         ],
-        input=script,
-        text=True,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=60,
     )
 except (OSError, subprocess.TimeoutExpired) as error:
     raise SystemExit(f"operatorctl status: Windows probe failed: {error}") from error
 if completed.returncode != 0:
+    stderr_text = completed.stderr.decode("utf-8", errors="replace").strip()
+    stdout_text = completed.stdout.decode("utf-8", errors="replace").strip()
     raise SystemExit(
         "operatorctl status: Windows probe failed: "
-        + (completed.stderr or completed.stdout or "unknown failure").strip()[:1000]
+        + (stderr_text or stdout_text or "unknown failure")[:1000]
     )
+stdout_text = completed.stdout.decode("utf-8", errors="replace")
 try:
-    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    result = json.loads(stdout_text.strip().splitlines()[-1])
 except (IndexError, ValueError) as error:
     raise SystemExit("operatorctl status: Windows probe returned no JSON") from error
 if not isinstance(result, dict) or result.get("passed") is not True:
