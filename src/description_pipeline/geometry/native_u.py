@@ -124,9 +124,20 @@ def native_boolean_success(value: object) -> bool | None:
 
 
 def native_get_parameter_success(value: object) -> bool | None:
-    """Parse GetParameter's SAFEARRAY flag without truthiness coercion."""
+    """Parse GetParameter's flag or packed double-long status strictly."""
 
-    return native_boolean_success(value)
+    boolean = native_boolean_success(value)
+    if boolean is not None:
+        return boolean
+    if type(value) is not float or not math.isfinite(value):
+        return None
+    bits = struct.unpack("<Q", struct.pack("<d", value))[0]
+    low32 = bits & 0xFFFFFFFF
+    if value == 0.0:
+        return False
+    if low32 == 1:
+        return True
+    return None
 
 
 def native_evaluate2_evidence(raw: list | tuple) -> dict | None:

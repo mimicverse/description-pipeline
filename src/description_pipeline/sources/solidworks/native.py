@@ -5277,7 +5277,8 @@ class SolidWorksBackend(CadBackend):
             if parameter_success is not True:
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "GetParameter success is not strict bool or numeric 0/1",
+                    "GetParameter success is not strict bool, numeric 0/1, "
+                    "or packed low32 exactly 1",
                     {
                         **base,
                         "fin_id": fin_id,

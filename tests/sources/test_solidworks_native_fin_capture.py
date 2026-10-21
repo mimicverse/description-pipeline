@@ -549,6 +549,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         edge.u_min = 8.193559012063638e-05
         edge.u_max = 0.0034999999999999996
         edge.curve = FakeCurve(-10.0, 10.0, is_closed=False, is_periodic=False)
+        edge.parameter_success = packed_evaluate_status(1)
         edge.curve_start_point = list(start)
         edge.curve_end_point = list(end)
         edge.vertices = [FakeVertex(start), FakeVertex(end)]
@@ -929,15 +930,22 @@ class NativeFinCaptureTests(unittest.TestCase):
                     "cad_native_tessellation_unreadable",
                 )
 
-    def test_get_parameter_numeric_success_is_strict_but_accepts_safearray(self):
+    def test_get_parameter_success_is_strict_but_accepts_packed_status(self):
+        packed_success = packed_evaluate_status(1)
+        packed_non_success = struct.unpack(
+            "<d",
+            struct.pack("<Q", 12),
+        )[0]
         self.assertIs(native_get_parameter_success(True), True)
         self.assertIs(native_get_parameter_success(False), False)
         self.assertIs(native_get_parameter_success(1), True)
         self.assertIs(native_get_parameter_success(1.0), True)
         self.assertIs(native_get_parameter_success(0.0), False)
+        self.assertIs(native_get_parameter_success(packed_success), True)
         for invalid in (
             2.0,
             -1.0,
+            packed_non_success,
             math.nan,
             math.inf,
             -math.inf,
@@ -950,7 +958,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         edge.parameter_success = 2.0
         with self.assertRaises(CadError) as caught:
             self.capture(body, extension)
-        self.assertIn("strict bool or numeric 0/1", caught.exception.message)
+        self.assertIn("packed low32 exactly 1", caught.exception.message)
 
     def test_get_end_params_uses_four_byref_outputs_and_scalar_bool(self):
         curve = FakeCurve(-10.0, 10.0, is_closed=True, is_periodic=False)
