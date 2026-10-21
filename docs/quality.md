@@ -99,6 +99,8 @@ CAD 值、规格值与实测值须明确来源和适用性。材料缺失、有�
 
 native edge 的 U 覆盖仍按每个实际三角面分别严格验收。对 closed+periodic edge 中跨越参数缝的 fin，采用版本化 `native-periodic-fin-interval-v1`：在 edge `[u_min,u_max]` 内比较直接区间与补区间，只有较短且无歧义的一侧可作为该 tessellation 段的覆盖证据，另一侧表示为沿 seam 的两段；半个 edge 域的歧义区间必须 unresolved。原始 fin start/end、面归属、cofin 反向关系及全部 fin 端点域检查均保留，不得用 edge-wide 并集放宽单面覆盖。
 
+面方向以可读的 `IEdge::EdgeInFaceSense` 为主证据；SolidWorks 2026 中 `IEdgeInFaceSense2` 为只写属性，其带错误记录的不可用结果可保留为诊断，但仅在它成功返回布尔值时才要求与主证据一致，主证据缺失或不合法仍拒绝。fin/cofin 跨面时允许使用各自 face-local 的 tessellation vertex ID；独立验证须确认 reciprocal cofin、不同面、反向 U、端点 U 对应以及反向端点坐标落在 v3 点界内，不得仅凭 vertex ID 相同或不同作结论。
+
 <a id="qualification"></a>
 ## 警告与资格
 
