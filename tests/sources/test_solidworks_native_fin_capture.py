@@ -1991,6 +1991,71 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertEqual(len(spans), 2)
 
+    def test_parser_uses_primary_sense_when_secondary_is_write_only(self):
+        evidence, triangles = self.group_333_tessellation()
+        secondary = evidence["native_edges"][0]["face_senses"][0][
+            "IEdgeInFaceSense2"
+        ]
+        secondary["value"] = None
+        secondary["error"] = (
+            "com_error: (-2147352567, 'write-only property', "
+            "(61836, None, None, None, 0, None))"
+        )
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+        )
+
+        self.assertEqual(len(spans), 2)
+
+    def test_parser_accepts_face_local_cofin_vertices_with_equal_coordinates(self):
+        evidence, triangles = self.group_333_tessellation()
+        body = evidence["itessellation"]["bodies"][0]
+        fins = {fin["fin_id"]: fin for fin in body["fins"]}
+        facets = {facet["facet_id"]: facet for facet in body["facets"]}
+        vertices = {
+            vertex["vertex_id"]: vertex
+            for vertex in evidence["itessellation"]["vertices"]
+        }
+        local_vertices = {}
+        for replacement, source_id in ((21, 1), (22, 2)):
+            row = dict(vertices[source_id])
+            row["vertex_id"] = replacement
+            local_vertices[replacement] = row
+            evidence["itessellation"]["vertices"].append(row)
+        body["vertex_count"] += 2
+        replacements = {2: 22, 1: 21}
+        for fin in body["fins"]:
+            if fin["facet_id"] != 20:
+                continue
+            fin["vertex_ids"] = [
+                replacements.get(vertex_id, vertex_id)
+                for vertex_id in fin["vertex_ids"]
+            ]
+        facets[20]["vertex_ids"] = sorted(
+            replacements.get(vertex_id, vertex_id)
+            for vertex_id in facets[20]["vertex_ids"]
+        )
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+        )
+
+        self.assertEqual(len(spans), 2)
+        self.assertNotEqual(
+            fins[100]["vertex_ids"],
+            list(reversed(fins[200]["vertex_ids"])),
+        )
+        self.assertIn(21, local_vertices)
+
     def test_parser_rejects_fallback_with_source_evaluate_error_over_50_micrometres(self):
         evidence, triangles = self.group_333_tessellation()
         edge = evidence["native_edges"][0]

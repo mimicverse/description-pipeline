@@ -872,24 +872,34 @@ def parse_native_tessellation(
                 },
                 component + f": native edge {index} face-sense row is malformed",
             )
-            values = []
-            for method in ("EdgeInFaceSense", "IEdgeInFaceSense2"):
-                observation = row[method]
-                _require(
-                    isinstance(observation, dict)
-                    and set(observation) == {"value", "error"}
-                    and observation["error"] is None
-                    and type(observation["value"]) is bool,
-                    component
-                    + f": native edge {index} orientation is unreadable",
-                )
-                values.append(observation["value"])
+            primary = row["EdgeInFaceSense"]
             _require(
-                values[0] is values[1],
+                isinstance(primary, dict)
+                and set(primary) == {"value", "error"}
+                and primary["error"] is None
+                and type(primary["value"]) is bool,
                 component
-                + f": native edge {index} orientation methods disagree",
+                + f": native edge {index} primary orientation is unreadable",
             )
-            sense_values.append(values[0])
+            secondary = row["IEdgeInFaceSense2"]
+            _require(
+                isinstance(secondary, dict)
+                and set(secondary) == {"value", "error"}
+                and (
+                    (
+                        secondary["error"] is None
+                        and type(secondary["value"]) is bool
+                        and secondary["value"] is primary["value"]
+                    )
+                    or (
+                        isinstance(secondary["error"], str)
+                        and bool(secondary["error"])
+                        and secondary["value"] is None
+                    )
+                ),
+                component + f": native edge {index} secondary orientation is invalid",
+            )
+            sense_values.append(primary["value"])
         _require(
             len(sense_values) == 1 or sense_values[0] is not sense_values[1],
             component + f": native edge {index} cofaces have the same orientation",
@@ -1386,11 +1396,33 @@ def _parse_v3_itessellation(
                     + f": native tessellation v3 fin {fin_id} has no distinct cofin",
                 )
                 cofin = evidence["fins"][cofin_id]
+                fin_start = vertices[
+                    (body_key, fin["vertex_ids"][0])
+                ]
+                fin_end = vertices[
+                    (body_key, fin["vertex_ids"][1])
+                ]
+                cofin_start = vertices[
+                    (body_key, cofin["vertex_ids"][0])
+                ]
+                cofin_end = vertices[
+                    (body_key, cofin["vertex_ids"][1])
+                ]
+                reverse_start_tolerance = native_point_roundtrip_tolerance(
+                    fin_start,
+                    cofin_end,
+                )
+                reverse_end_tolerance = native_point_roundtrip_tolerance(
+                    fin_end,
+                    cofin_start,
+                )
                 _require(
                     cofin["cofin_id"] == fin_id
                     and cofin["face_index"] != fin["face_index"]
-                    and tuple(cofin["vertex_ids"])
-                    == tuple(reversed(fin["vertex_ids"]))
+                    and native_point_error(fin_start, cofin_end)
+                    <= reverse_start_tolerance
+                    and native_point_error(fin_end, cofin_start)
+                    <= reverse_end_tolerance
                     and (
                         (fin["end_u"] - fin["start_u"])
                         * (cofin["end_u"] - cofin["start_u"])
