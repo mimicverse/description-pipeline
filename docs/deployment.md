@@ -84,13 +84,15 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 `windows.instance` 固定 Windows 执行端的任务名及工程、产物和状态目录，维护命令依据配置和安装记录定位该目标。同一主机上的任务共享 CAD 排他资源约束，新用户或新目录不形成独立资源域。
 
-配置、状态、上传、交付、临时工作区和发行安装使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`；Windows 使用仅执行用户可读写的 ACL。日志只展示标识、摘要和路径，不展示秘密值。
+配置、状态、上传、交付、临时工作区和发行安装使用专用目录，禁止使用主目录/操作系统根、目录重叠、符号链接或 junction。Linux 私有配置和秘密文件权限为 `0600`，私有目录为 `0700`。Windows 受管路径使用 protected ACL，只保留 `Administrators` 与 `SYSTEM` 的 `FullControl`，移除 `Authenticated Users`、`Users`、`Everyone` 等普通主体；日志只展示标识、摘要和路径，不展示秘密值。
 
 产品目标、仓库与 base 仅在 Linux 维护。Git 凭据属于 Linux 服务账户；模型仓库来源必须与目标一致，发布使用受管理的干净工作区。模型工程值以封存 CAD 为依据，允许版本化配置承载命名、方向及数值表达规则；配置不得抄入手工结果或覆盖原生事实。仓库规则须允许服务主体向受管理候选分支追加提交和创建 PR，禁止非 fast-forward；凭据权限限定于配置目标，工程集成 base 保持独立评审。PostgreSQL 的平台与 Airflow 角色只能迁移各自 schema，连接预算及恢复目标在部署验收中固定并验证。
 
 ## 安装 Windows 执行端
 
-本次发行支持已完成受控初始化的 Windows 端点升级：目标已有专用执行账户、受管 Scheduled Task、目录及 ACL、端点配置、令牌和安装身份。全新 Windows 主机初始化及 Session 0 broker 不在本次支持范围，不能用依赖安装成功或手工启动端点代替完整初始化资格。既有端点的任务、配置、令牌、ACL 和安装身份恢复仍须实际验证。
+本次发行支持已完成受控初始化的 Windows 端点升级：目标已有受管管理员交互式执行账户、Scheduled Task、目录及 ACL、端点配置、令牌和安装身份。按用户 2026-10-21 决定，端点继续在已受管的管理员账户下运行；部署和恢复核验必须核验账户为本地、启用、属于 `Administrators` 且任务使用最高可用令牌，不得把该运行方式表述为 least privilege。全新 Windows 主机初始化及 Session 0 broker 不在本次支持范围，不能用依赖安装成功或手工启动端点代替完整初始化资格。既有端点的任务、配置、令牌、ACL 和安装身份恢复仍须实际验证。
+
+受管共同父目录必须通过同版 `deploy/windows/bootstrap-managed-root.ps1` 完成一次性初始化。引导入口只在当前管理员执行身份与任务运行账户一致时运行，拒绝盘符根、共享系统/用户目录、重解析路径和缺失或冲突的 marker；它事务性写入唯一的 `.description-managed-root.json`，将父目录和 marker 设为 protected 的 `Administrators`/`SYSTEM` ACL，并在任一步失败时恢复原 ACL、删除本次新建 marker。`stage` 只接受已经核验的 marker，不自行选择或创建共同父目录。缺少 marker、普通组 ACE、服务身份或任务令牌资格不符时，Windows 安装保持拒绝。
 
 内嵌虚拟组件随同版原生端点与 Linux 验证器部署，不增加服务、环境变量或配置字段。Windows 读取受控会话中的组件及所属装配绑定，Linux 按封存契约独立验证；不得将 `VC~~` 临时文档复制成上传来源或配置额外搜索目录。
 
