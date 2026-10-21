@@ -179,7 +179,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             "security_descriptor_sha256": "1" * 64,
         },
         "identity": {
-            "operator_sid": "S-1-5-21-500",
+            "operator_sid": "S-1-5-21-1",
             "operator_administrator": True,
             "runtime_sid": "S-1-5-21-1",
             "runtime_administrator": True,
@@ -2888,6 +2888,22 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     runtime_privilege_qualification="least-privilege"
                 ),
                 "windows_recovery_state_invalid",
+            ),
+            (
+                "runtime_not_admin",
+                lambda state: (
+                    state["task"]["principal"].update(administrator=False),
+                    state["identity"].update(
+                        runtime_administrator=False,
+                        runtime_privilege_qualification="non-administrative-runtime",
+                    ),
+                ),
+                "windows_recovery_state_invalid",
+            ),
+            (
+                "run_level",
+                lambda state: state["task"]["principal"].update(run_level="Limited"),
+                "windows_run_level_not_elevated",
             ),
             (
                 "logon",

@@ -108,6 +108,9 @@ if (-not (Test-Path -LiteralPath $root -PathType Container)) {
 }
 
 $serviceSid = Resolve-Sid $ServiceAccount
+if ($serviceSid -ne $operatorIdentity.User.Value) {
+  Fail 'managed_root_operator_runtime_mismatch' 'ServiceAccount must be the current administrator runtime'
+}
 $adminSid = 'S-1-5-32-544'
 
 $markerPath = Join-Path $root '.description-managed-root.json'

@@ -784,7 +784,10 @@ function Assert-ManagedOperatorIsAdministrator {
 }
 function Get-ManagedServiceAuthorization([string]$ServiceSid) {
   $expectedSid = Resolve-Sid $ServiceSid
-  $null = Assert-ManagedOperatorIsAdministrator
+  $operatorSid = Assert-ManagedOperatorIsAdministrator
+  if ($operatorSid -ne $expectedSid) {
+    Die 'windows_operator_runtime_mismatch' 'the deployment operator and endpoint runtime must be the same administrator account'
+  }
   try {
     $localUser = Get-LocalUser -SID $expectedSid -ErrorAction Stop
   } catch {
@@ -822,7 +825,9 @@ function Get-ManagedServiceAuthorization([string]$ServiceSid) {
 function Get-ManagedServiceSid($Task) {
   $authorization = Get-ManagedServiceAuthorization (
     Resolve-Sid ([string]$Task.Principal.UserId))
-  $script:ManagedServiceIsAdministrator = [bool]$authorization.administrator
+  if (-not [bool]$authorization.administrator) {
+    Die 'windows_runtime_not_administrator' 'the endpoint runtime is not an administrator'
+  }
   return [string]$authorization.sid
 }
 function New-ManagedAccessRule(
@@ -836,16 +841,6 @@ function New-ManagedAccessRule(
     $Inheritance,
     [System.Security.AccessControl.PropagationFlags]::None,
     [System.Security.AccessControl.AccessControlType]::Allow)
-}
-function Get-ManagedComparableRights([long]$Rights, [switch]$RegularFile) {
-  # The filesystem persists this generic mapping bit on ACEs; the project matrix compares
-  # semantic file rights and intentionally ignores this bit. Regular files cannot persist
-  # ExecuteFile as a distinct effective bit, so ReadAndExecute compares as Read only there.
-  $comparable = [long]$Rights -band [long]0xFFEFFFFF
-  if ($RegularFile) {
-    $comparable = $comparable -band [long]0xFFFFFFDF
-  }
-  return $comparable
 }
 function Assert-ManagedAcl(
   [string]$Path,
@@ -887,8 +882,7 @@ function Assert-ManagedAcl(
       if ($rule.access_type -ne 'Allow' -or
           $seenRuleSids.ContainsKey($ruleSid) -or
           -not $expectedRights.ContainsKey($ruleSid) -or
-          (Get-ManagedComparableRights ([long]$rule.rights) -RegularFile:(-not [bool]$item.PSIsContainer)) -ne
-            (Get-ManagedComparableRights ([long]$expectedRights[$ruleSid]) -RegularFile:(-not [bool]$item.PSIsContainer)) -or
+          [long]$rule.rights -ne [long]$expectedRights[$ruleSid] -or
           [int]$rule.inheritance -ne $expectedInheritance -or
           [int]$rule.propagation -ne 0 -or
           ($Protected -and [bool]$rule.inherited) -or
@@ -1243,7 +1237,9 @@ function Get-TaskProjection($Task) {
   $authorization = Get-ManagedServiceAuthorization (
     Resolve-Sid ([string]$Task.Principal.UserId))
   $principalSid = [string]$authorization.sid
-  $script:ManagedServiceIsAdministrator = [bool]$authorization.administrator
+  if (-not [bool]$authorization.administrator) {
+    Die 'windows_runtime_not_administrator' 'the endpoint runtime is not an administrator'
+  }
   $xml = [xml](Export-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath)
   $xmlText = [string]$xml.OuterXml
   $passwordNodes = @($xml.SelectNodes('//*[local-name()="Password" and string-length(normalize-space(.)) > 0]'))
@@ -1262,6 +1258,9 @@ function Get-TaskProjection($Task) {
   }
   if ($principal.logon_type -notin @('Interactive', 'InteractiveToken')) {
     Die 'windows_logon_type_unsupported' 'the task principal is not interactive'
+  }
+  if ($principal.run_level -notin @('Highest', 'HighestAvailable')) {
+    Die 'windows_run_level_not_elevated' 'the task principal does not request the elevated administrator token'
   }
   $action = [ordered]@{
     execute = [string]$Task.Actions[0].Execute
@@ -2138,7 +2137,7 @@ if ($Verb -eq 'stage') {
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
   New-Item -ItemType Directory -Path $StageDir | Out-Null
-  Set-ManagedAcl $StageDir $serviceSid 'ReadAndExecute' $true -Recurse
+  Set-ManagedAcl $StageDir $true -Recurse
   Expand-Archive -LiteralPath $archive -DestinationPath $StageDir
   $files = Read-Json (Join-Path $StageDir 'files.json')
   foreach ($name in $files.PSObject.Properties.Name) {

@@ -108,21 +108,8 @@ $seams += 'Get-ManagedServiceSid', 'Set-ManagedAcl', 'Assert-ManagedAcl',
   'Set-ManagedEndpointAcls', 'Assert-ManagedEndpointAcls', 'Get-ManagedEndpointPaths',
   'Get-ManagedCommonParent', 'Test-ManagedPathWithin', 'Assert-ManagedOperatorIsAdministrator',
   'Get-ManagedServiceAuthorization', 'New-ManagedAccessRule',
-  'Get-ManagedAclProjectionForRole', 'Get-ManagedComparableRights'
+  'Get-ManagedAclProjectionForRole'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
-foreach ($rights in @(
-    [System.Security.AccessControl.FileSystemRights]::Modify,
-    [System.Security.AccessControl.FileSystemRights]::Read,
-    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)) {
-  Check ('windows_acl.synchronize_' + $rights) (
-    (Get-ManagedComparableRights ([long]($rights -bor [System.Security.AccessControl.FileSystemRights]::Synchronize))) -eq
-      (Get-ManagedComparableRights ([long]$rights)))
-}
-Check 'windows_acl.regular_file_read_execute_is_read' (
-  (Get-ManagedComparableRights (
-    [long][System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -RegularFile) -eq
-  (Get-ManagedComparableRights (
-    [long][System.Security.AccessControl.FileSystemRights]::Read) -RegularFile))
 Check 'windows_recovery.net_tcp_no_match' (Test-NetTcpNoMatchError ([pscustomobject]@{
   CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
   FullyQualifiedErrorId='CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'

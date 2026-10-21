@@ -4608,10 +4608,6 @@ def _validate_windows_acl_policy(
     system_sid = "S-1-5-18"
     administrators_sid = "S-1-5-32-544"
 
-    def comparable(rights: int) -> int:
-        value = int(rights) & 0xFFEFFFFF
-        return value if directory else value & 0xFFFFFFDF
-
     inheritance = 0 if non_inheriting or not directory else 3
     expected = {
         system_sid: 2032127,
@@ -4633,7 +4629,7 @@ def _validate_windows_acl_policy(
             sid in expected
             and sid not in seen
             and rule["access_type"] == "Allow"
-            and comparable(rule["rights"]) == comparable(expected[sid])
+            and rule["rights"] == expected[sid]
             and rule["inherited"] is (not protected)
             and rule["inheritance"] == inheritance
             and rule["propagation"] == 0,
@@ -4724,6 +4720,11 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "Windows task principal is not interactive",
     )
     require(
+        principal["run_level"] in {"Highest", "HighestAvailable"},
+        "windows_run_level_not_elevated",
+        "Windows task principal does not request the elevated administrator token",
+    )
+    require(
         type(principal["administrator"]) is bool,
         "windows_recovery_state_invalid",
         "Windows task principal privilege qualification is missing",
@@ -4776,6 +4777,8 @@ def _validate_windows_recovery_state(document: object) -> dict:
     )
     require(
         identity["runtime_sid"] == principal["sid"]
+        and identity["operator_sid"] == principal["sid"]
+        and identity["runtime_administrator"] is True
         and identity["runtime_administrator"] is principal["administrator"]
         and identity["runtime_privilege_qualification"]
         == (
