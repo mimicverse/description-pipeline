@@ -108,59 +108,15 @@ if (-not (Test-Path -LiteralPath $root -PathType Container)) {
 }
 
 $serviceSid = Resolve-Sid $ServiceAccount
-if ($serviceSid -eq $operatorIdentity.User.Value) {
-  Fail 'managed_root_service_not_separate' 'the service account must differ from the deployment operator'
-}
-try {
-  $serviceUser = Get-LocalUser -SID $serviceSid -ErrorAction Stop
-} catch {
-  Fail 'managed_root_service_not_local' 'the service account is not a local user'
-}
-if ($null -eq $serviceUser -or -not $serviceUser.Enabled) {
-  Fail 'managed_root_service_invalid' 'the service account is missing or disabled'
-}
 $adminSid = 'S-1-5-32-544'
-$subjects = @{}
-$subjects[$serviceSid] = $true
-do {
-  $changed = $false
-  foreach ($group in @(Get-LocalGroup)) {
-    $groupId = [string]$group.SID.Value
-    if ($subjects.ContainsKey($groupId)) { continue }
-    $members = @(Get-LocalGroupMember -Group $groupId -ErrorAction SilentlyContinue)
-    if (@($members | Where-Object { $subjects.ContainsKey([string]$_.SID.Value) }).Count -gt 0) {
-      $subjects[$groupId] = $true
-      $changed = $true
-    }
-  }
-} while ($changed)
-if ($subjects.ContainsKey($adminSid)) {
-  Fail 'managed_root_service_elevated' 'the service account is a member of Administrators'
-}
-
-$rootAcl = Get-Acl -LiteralPath $root
-$rootAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $adminSid))
-$rootAcl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($rootAcl.GetAccessRules(
-    $true,
-    $false,
-    [System.Security.Principal.SecurityIdentifier]))) {
-  [void]$rootAcl.RemoveAccessRuleSpecific($rule)
-}
-[void]$rootAcl.AddAccessRule((New-Rule 'S-1-5-18' (
-  [System.Security.AccessControl.FileSystemRights]::FullControl) (
-  [System.Security.AccessControl.InheritanceFlags]::None)))
-[void]$rootAcl.AddAccessRule((New-Rule $adminSid (
-  [System.Security.AccessControl.FileSystemRights]::FullControl) (
-  [System.Security.AccessControl.InheritanceFlags]::None)))
-[void]$rootAcl.AddAccessRule((New-Rule $serviceSid (
-  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) (
-  [System.Security.AccessControl.InheritanceFlags]::None)))
-Set-Acl -LiteralPath $root -AclObject $rootAcl
 
 $markerPath = Join-Path $root '.description-managed-root.json'
 $markerText = '{"schema_version":"solidworks-to-urdf.managed-root/v1"}'
 if (Test-Path -LiteralPath $markerPath) {
+  Assert-NoReparseAncestor $markerPath
+  if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+    Fail 'managed_root_marker_conflict' 'the managed-root marker is not a regular file'
+  }
   $existing = [System.IO.File]::ReadAllText(
     $markerPath,
     (New-Object System.Text.UTF8Encoding($false, $true)))
@@ -189,10 +145,24 @@ foreach ($rule in @($markerAcl.GetAccessRules(
 [void]$markerAcl.AddAccessRule((New-Rule $adminSid (
   [System.Security.AccessControl.FileSystemRights]::FullControl) (
   [System.Security.AccessControl.InheritanceFlags]::None)))
-[void]$markerAcl.AddAccessRule((New-Rule $serviceSid (
-  [System.Security.AccessControl.FileSystemRights]::Read) (
-  [System.Security.AccessControl.InheritanceFlags]::None)))
 Set-Acl -LiteralPath $markerPath -AclObject $markerAcl
+
+$rootAcl = Get-Acl -LiteralPath $root
+$rootAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $adminSid))
+$rootAcl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($rootAcl.GetAccessRules(
+    $true,
+    $false,
+    [System.Security.Principal.SecurityIdentifier]))) {
+  [void]$rootAcl.RemoveAccessRuleSpecific($rule)
+}
+[void]$rootAcl.AddAccessRule((New-Rule 'S-1-5-18' (
+  [System.Security.AccessControl.FileSystemRights]::FullControl) (
+  [System.Security.AccessControl.InheritanceFlags]::None)))
+[void]$rootAcl.AddAccessRule((New-Rule $adminSid (
+  [System.Security.AccessControl.FileSystemRights]::FullControl) (
+  [System.Security.AccessControl.InheritanceFlags]::None)))
+Set-Acl -LiteralPath $root -AclObject $rootAcl
 
 Emit @{
   passed=$true

@@ -66,8 +66,8 @@ Check 'wording.strict_scan_on_bound_python' ($source.Contains('Get-EndpointConfi
   $source.Contains('Get-EndpointConfigStrictPrelude') -and $source.Contains('object_pairs_hook'))
 Check 'wording.path_identity_normalization' ($source.Contains('Normalize-PathIdentity') -and
   $source.Contains("Replace('\', '/')")) 'path identity comparisons must normalize the two Windows separators'
-Check 'wording.machine_domain_pins' ($source.Contains("GetEnvironmentVariable(`$Name, 'Machine')") -and
-  $source.Contains("SetEnvironmentVariable(`$Name, `$Value, 'Machine')"))
+Check 'wording.user_domain_pins' ($source.Contains("GetEnvironmentVariable(`$Name, 'User')") -and
+  $source.Contains("SetEnvironmentVariable(`$Name, `$Value, 'User')"))
 Check 'wording.windows_recovery_schema' ($source.Contains('recovery-snapshot') -and
   $source.Contains('recovery-restore') -and $source.Contains('recovery-verify') -and
   $source.Contains('solidworks-to-urdf.windows-recovery/v1'))
@@ -77,9 +77,8 @@ Check 'wording.windows_managed_acl' ($source.Contains('Set-ManagedEndpointAcls')
   $source.Contains('Assert-ManagedEndpointAcls') -and $source.Contains('windows_managed_acl_invalid') -and
   $source.Contains('windows_managed_acl_unsafe') -and $source.Contains('Get-ManagedCommonParent') -and
   $source.Contains('windows_managed_acl_boundary_invalid') -and
-  $source.Contains('Assert-ManagedServiceIsNonAdministrator') -and
-  $source.Contains('windows_service_identity_elevated') -and
-  $source.Contains('windows_service_environment_override') -and
+  $source.Contains('Get-ManagedServiceAuthorization') -and
+  $source.Contains('user-approved-administrator-runtime') -and
   $source.Contains('windows_managed_acl_marker_missing') -and
   $source.Contains('solidworks-to-urdf.managed-root/v1'))
 Check 'wording.windows_recovery_identity' ($source.Contains('config_digest') -and
@@ -108,9 +107,8 @@ $seams += 'Get-AclProjection', 'Set-AclProjection', 'Get-TaskProjection', 'Get-R
 $seams += 'Get-ManagedServiceSid', 'Set-ManagedAcl', 'Assert-ManagedAcl',
   'Set-ManagedEndpointAcls', 'Assert-ManagedEndpointAcls', 'Get-ManagedEndpointPaths',
   'Get-ManagedCommonParent', 'Test-ManagedPathWithin', 'Assert-ManagedOperatorIsAdministrator',
-  'Assert-ManagedServiceIsNonAdministrator', 'New-ManagedAccessRule',
-  'Get-ManagedAclProjectionForRole', 'Assert-ManagedServiceEnvironmentUnpinned',
-  'Get-ManagedComparableRights'
+  'Get-ManagedServiceAuthorization', 'New-ManagedAccessRule',
+  'Get-ManagedAclProjectionForRole', 'Get-ManagedComparableRights'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
 foreach ($rights in @(
     [System.Security.AccessControl.FileSystemRights]::Modify,
@@ -230,33 +228,23 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
       $taskFile, $packageChild)) {
     [System.IO.File]::WriteAllText($path, 'fixture', (New-Object System.Text.UTF8Encoding($false)))
   }
-  $localUserName = 'descsvc' + [guid]::NewGuid().ToString('N').Substring(0, 12)
-  $localPassword = ConvertTo-SecureString -String ('Aa1!' + [guid]::NewGuid().ToString('N')) -AsPlainText -Force
-  $localUser = New-LocalUser -Name $localUserName -Password $localPassword `
-    -AccountNeverExpires -PasswordNeverExpires
-  $bootstrapOutput = & $bootstrapScript -ManagedRoot $aclRoot -ServiceAccount $localUserName
+  $operatorIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $serviceSid = [string]$operatorIdentity.User.Value
+  $bootstrapOutput = & $bootstrapScript -ManagedRoot $aclRoot -ServiceAccount $serviceSid
   $bootstrapReceipt = ($bootstrapOutput | Select-Object -Last 1) | ConvertFrom-Json
   Check 'windows_acl.bootstrap_marker' ($bootstrapReceipt.passed -eq $true -and
-    $bootstrapReceipt.service_sid -eq $localUser.SID.Value -and
+    $bootstrapReceipt.service_sid -eq $serviceSid -and
     (Test-Path -LiteralPath (Join-Path $aclRoot '.description-managed-root.json') -PathType Leaf))
   Check 'windows_acl.bootstrap_marker_acl' (@($bootstrapReceipt.marker_acl.rules | Where-Object {
-    $_.sid -eq $localUser.SID.Value -and
-    (Get-ManagedComparableRights ([long]$_.rights) -RegularFile) -eq
-      (Get-ManagedComparableRights ([long][System.Security.AccessControl.FileSystemRights]::Read) -RegularFile) -and
+    $_.sid -in @('S-1-5-18', 'S-1-5-32-544') -and
+    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl -and
     -not $_.inherited
-  }).Count -eq 1 -and @($bootstrapReceipt.marker_acl.rules | Where-Object {
+  }).Count -eq 2 -and @($bootstrapReceipt.marker_acl.rules | Where-Object {
     $_.sid -in @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-4')
   }).Count -eq 0)
-  $serviceSid = Assert-ManagedServiceIsNonAdministrator $localUser.SID.Value
-  Check 'windows_acl.service_identity_non_admin' ($serviceSid -eq $localUser.SID.Value)
-  $adminRejected = $false
-  try {
-    $null = Assert-ManagedServiceIsNonAdministrator (
-      [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
-  } catch {
-    $adminRejected = $_.Exception.Message -match 'windows_service_operator_not_separated'
-  }
-  Check 'windows_acl.admin_service_identity_refused' $adminRejected
+  $operatorAuthorization = Get-ManagedServiceAuthorization $serviceSid
+  Check 'windows_acl.administrator_runtime_allowed' (
+    $operatorAuthorization.administrator -eq $true)
   $config = [pscustomobject]@{
     package_root=$packageRoot
     output_root=$outputRoot
@@ -267,7 +255,7 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $commonParent = Get-ManagedCommonParent $managedPaths
   Check 'windows_acl.common_parent_from_config' ((Normalize-PathIdentity $commonParent) -eq
     (Normalize-PathIdentity $aclRoot))
-  $aclRows = @(Get-ManagedEndpointAclRows $config $endpointRoot $configPath $installIdPath $taskFile $serviceSid)
+  $aclRows = @(Get-ManagedEndpointAclRows $config $endpointRoot $configPath $installIdPath $taskFile)
   Check 'windows_acl.paths_deduplicated' (@($aclRows.path | Select-Object -Unique).Count -eq $aclRows.Count)
   $commonRows = @($aclRows | Where-Object {
     (Normalize-PathIdentity ([string]$_.path)) -eq (Normalize-PathIdentity $commonParent)
@@ -287,8 +275,8 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   Set-Acl -LiteralPath $aclRoot -AclObject $broadAcl
   $markerPath = Join-Path $aclRoot '.description-managed-root.json'
   $siblingBefore = Get-AclProjection $siblingRoot
-  Set-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $serviceSid $taskFile
-  Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $serviceSid $taskFile
+  Set-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $taskFile
+  Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $taskFile
   $broadFound = @()
   foreach ($row in $aclRows) {
     $broadFound += @((Get-AclProjection $row.path).rules | Where-Object {
@@ -296,36 +284,24 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     })
   }
   Check 'windows_acl.broad_principals_removed' ($broadFound.Count -eq 0)
-  $operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $operatorSid = $serviceSid
   Check 'windows_acl.administrator_owns_boundary' (
     (Get-AclProjection $aclRoot).owner_sid -in @('S-1-5-32-544', $operatorSid))
-  $packageRules = @((Get-AclProjection $packageChild).rules)
-  Check 'windows_acl.package_service_modify' (@($packageRules | Where-Object {
-    $_.sid -eq $serviceSid -and
-    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Modify
-  }).Count -eq 1)
-  $commonServiceRules = @((Get-AclProjection $aclRoot).rules | Where-Object {
-    $_.sid -eq $serviceSid
-  })
-  Check 'windows_acl.common_service_read_execute_only' ($commonServiceRules.Count -eq 1 -and
-    $commonServiceRules[0].rights -eq [long][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -and
-    ($commonServiceRules[0].rights -band [long][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -eq 0)
-  Check 'windows_acl.token_service_read' (@((Get-AclProjection $tokenPath).rules | Where-Object {
-    $_.sid -eq $serviceSid -and
-    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Read
-  }).Count -eq 1)
-  Check 'windows_acl.marker_service_read' (@((Get-AclProjection $markerPath).rules | Where-Object {
-    $_.sid -eq $serviceSid -and
-    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Read
-  }).Count -eq 1)
-  Check 'windows_acl.cad_ledger_service_modify' (@((Get-AclProjection $ownershipPath).rules | Where-Object {
-    $_.sid -eq $serviceSid -and
-    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Modify
-  }).Count -eq 1)
-  Check 'windows_acl.endpoint_service_read_execute' (@((Get-AclProjection $endpointRoot).rules | Where-Object {
-    $_.sid -eq $serviceSid -and
-    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::ReadAndExecute
-  }).Count -eq 1)
+  $managedAclChecks = @(
+    $packageChild,
+    $tokenPath,
+    $markerPath,
+    $ownershipPath,
+    $endpointRoot
+  ) | ForEach-Object {
+    $rules = @((Get-AclProjection $_).rules)
+    @($rules).Count -eq 2 -and
+      @($rules | Where-Object {
+        $_.sid -in @('S-1-5-18', 'S-1-5-32-544') -and
+        $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::FullControl
+      }).Count -eq 2
+  }
+  Check 'windows_acl.administrators_system_only' (@($managedAclChecks | Where-Object { -not $_ }).Count -eq 0)
   $badTokenAcl = Get-Acl -LiteralPath $tokenPath
   [void]$badTokenAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
     $authenticated,
@@ -337,7 +313,7 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $badBefore = Get-AclProjection $tokenPath
   $assertRejected = $false
   try {
-    Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $serviceSid $taskFile
+    Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $taskFile
   } catch {
     $assertRejected = $_.Exception.Message -match 'windows_managed_acl_invalid'
   }
@@ -346,7 +322,6 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     $badBefore.projection_sha256 -eq $badAfter.projection_sha256)
   Check 'windows_acl.sibling_untouched' (
     (Get-AclProjection $siblingRoot).projection_sha256 -eq $siblingBefore.projection_sha256)
-  Remove-LocalUser -Name $localUserName -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $siblingRoot -Recurse -Force -ErrorAction SilentlyContinue
 } else {
