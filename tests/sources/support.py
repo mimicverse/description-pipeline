@@ -16,16 +16,24 @@ from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import CadBackend, Matrix, RawComponent, RawScene
 
 
-def write_binary_stl(path: Path, triangles: Sequence[Sequence[Sequence[float]]]) -> int:
+def write_binary_stl(
+    path: Path,
+    triangles: Sequence[Sequence[Sequence[float]]],
+    *,
+    attributes: Sequence[int] | None = None,
+) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
+    attributes = list(attributes or [0] * len(triangles))
+    if len(attributes) != len(triangles):
+        raise ValueError("binary STL attributes must match the triangle count")
     header = b"fixture stl".ljust(80, b" ")
     payload = bytearray()
-    for triangle in triangles:
+    for triangle, attribute in zip(triangles, attributes, strict=True):
         first, second, third = triangle
         payload += struct.pack("<3f", 0.0, 0.0, 1.0)
         for vertex in (first, second, third):
             payload += struct.pack("<3f", float(vertex[0]), float(vertex[1]), float(vertex[2]))
-        payload += struct.pack("<H", 0)
+        payload += struct.pack("<H", attribute)
     with open(path, "wb") as handle:
         handle.write(header)
         handle.write(struct.pack("<I", len(triangles)))
@@ -49,7 +57,11 @@ def cube_stl(path: Path, half: float = 0.02) -> int:
         (1, 3, 7),
         (1, 7, 5),
     ]
-    return write_binary_stl(path, [(corners[a], corners[b], corners[c]) for a, b, c in faces])
+    return write_binary_stl(
+        path,
+        [(corners[a], corners[b], corners[c]) for a, b, c in faces],
+        attributes=(1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6),
+    )
 
 
 def _matrix16(values: Sequence[float]) -> Matrix:
@@ -584,6 +596,7 @@ class FixtureCadBackend(CadBackend):
                         "face_reference_sha256": hashlib.sha256(
                             f"fixture-face-{face_index}".encode()
                         ).hexdigest(),
+                        "face_owner_id": face_index + 1,
                         "edge_references": [],
                         "triangle_start": start,
                         "triangle_count": count,

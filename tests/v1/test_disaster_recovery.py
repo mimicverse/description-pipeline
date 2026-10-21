@@ -204,12 +204,17 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             "passed": True,
             "remote_dir": "C:/description/state/recovery/snapshot/windows-fixture",
         },
+        "windows_cleanup": None,
     }
     return block, state
 
 
-def windows_snapshot_receipt(*, remote_cleanup: dict | None = None) -> dict:
-    return {
+def windows_snapshot_receipt(
+    *,
+    remote_cleanup: dict | None = None,
+    inner_cleanup: dict | None = None,
+) -> dict:
+    receipt = {
         "passed": True,
         "verb": "recovery-snapshot",
         "task_state": "Disabled",
@@ -222,6 +227,9 @@ def windows_snapshot_receipt(*, remote_cleanup: dict | None = None) -> dict:
             "remote_dir": "C:/description/state/recovery/snapshot/windows-fixture",
         },
     }
+    if inner_cleanup is not None:
+        receipt["cleanup"] = inner_cleanup
+    return receipt
 
 
 def fake_capture_windows_recovery(context, *, backup_id, staging, commands):
@@ -2907,6 +2915,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
                         "passed": True,
                         "remote_dir": "C:/description/state/recovery/restore/windows-fixture",
                     },
+                    "cleanup": {
+                        "attempted": True,
+                        "passed": True,
+                        "path": "C:/Users/test/AppData/Local/Temp/windows-recovery-fixture",
+                    },
                 },
             ),
             self.assertRaises(recovery.RecoveryError) as raised,
@@ -3004,6 +3017,29 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 commands=[],
             )
         self.assertEqual(captured["remote_cleanup"], residual)
+
+    def test_windows_snapshot_carries_powershell_temp_cleanup_residual(self) -> None:
+        staging = self.root / "windows-snapshot-inner-cleanup-staging"
+        staging.mkdir()
+        windows_recovery_fixture(self.context, staging)
+        residual = {
+            "attempted": True,
+            "passed": False,
+            "path": "C:/Users/test/AppData/Local/Temp/windows-recovery-fixture",
+            "error": "access denied",
+        }
+        with mock.patch.object(
+            recovery,
+            "_transfer_windows_recovery",
+            return_value=windows_snapshot_receipt(inner_cleanup=residual),
+        ):
+            captured = self.real_capture_windows_recovery(
+                self.context,
+                backup_id="windows-snapshot-inner-cleanup",
+                staging=staging,
+                commands=[],
+            )
+        self.assertEqual(captured["windows_cleanup"], residual)
 
     def test_windows_snapshot_refuses_a_tampered_member_before_acceptance(self) -> None:
         staging = self.root / "windows-tampered-staging"
@@ -3195,6 +3231,12 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
 
     def test_windows_failure_receipt_with_expected_verb_is_definite(self) -> None:
+        cleanup = {
+            "attempted": True,
+            "passed": False,
+            "path": "C:/Users/test/AppData/Local/Temp/windows-recovery-fixture",
+            "error": "access denied",
+        }
         completed = subprocess.CompletedProcess(
             ["ssh", "windows-fixture"],
             1,
@@ -3203,6 +3245,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     "passed": False,
                     "code": "windows_task_not_disabled",
                     "verb": "recovery-snapshot",
+                    "cleanup": cleanup,
                 }
             )
             + "\n",
@@ -3220,6 +3263,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 expected_verb="recovery-snapshot",
             )
         self.assertEqual(raised.exception.code, "windows_task_not_disabled")
+        self.assertEqual(raised.exception.detail["windows_inner_cleanup"], cleanup)
 
     def test_windows_remote_dir_is_not_removed_before_creation_is_owned(self) -> None:
         script = write(self.root / "instance-lifecycle.ps1", "fixture\n")

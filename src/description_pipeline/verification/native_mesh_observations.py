@@ -58,10 +58,15 @@ def _span_digests(path: Path, spans: list[dict]) -> None:
         for span in spans:
             stream.seek(84 + 50 * span["triangle_start"])
             payload = stream.read(50 * span["triangle_count"])
+            owners = {
+                struct.unpack_from("<H", payload, 50 * index + 48)[0]
+                for index in range(span["triangle_count"])
+            }
             _require(
                 len(payload) == 50 * span["triangle_count"]
+                and owners <= {span["face_owner_id"]}
                 and hashlib.sha256(payload).hexdigest() == span["triangle_records_sha256"],
-                "a native face span does not bind its exact STL triangle records",
+                "a native face span does not bind its exact STL triangle owners",
             )
 
 
@@ -91,12 +96,12 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         )
         _require(sum(bodies.values()) > 0, component + ": no native bodies recorded")
         spans = parse_native_tessellation(component, tessellation, bodies, triangles)
-        topologies.append(
-            {
-                "component": component,
-                **summarize_native_topology(tessellation, spans),
-            }
+        topology = summarize_native_topology(tessellation, spans)
+        _require(
+            topology["status"] == "evidence_complete",
+            component + ": native body-local topology evidence is unresolved",
         )
+        topologies.append({"component": component, **topology})
         path = _stl_binding(bundle, entry, triangles)
         _span_digests(path, spans)
         seen = set()

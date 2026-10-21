@@ -4159,7 +4159,7 @@ class SolidWorksBackend(CadBackend):
                 body,
                 context={**context, "identity_kind": "body"},
             )
-            body_triangle_start = len(body_values) // 9
+            body_triangle_start = len(values) // 9
             face_count = len(faces)
             for face_index, raw_face in enumerate(faces):
                 face = _dynamic(raw_face)
@@ -4344,6 +4344,7 @@ class SolidWorksBackend(CadBackend):
                                 "body_reference_sha256": body_reference_sha256,
                                 "face_index": face_index,
                                 "face_reference_sha256": face_reference_sha256,
+                                "face_owner_id": None,
                                 "edge_references": face_edge_references,
                                 "triangle_start": body_triangle_start + len(body_values) // 9,
                                 "triangle_count": 0,
@@ -4377,6 +4378,7 @@ class SolidWorksBackend(CadBackend):
                         "body_reference_sha256": body_reference_sha256,
                         "face_index": face_index,
                         "face_reference_sha256": face_reference_sha256,
+                        "face_owner_id": None,
                         "edge_references": face_edge_references,
                         "triangle_start": triangle_start,
                         "triangle_count": triangle_count,
@@ -4654,6 +4656,22 @@ class SolidWorksBackend(CadBackend):
                         }
                     )
                 tessellation["no_facets_faces"].extend(body_evidence["no_facets_faces"])
+        if len(tessellation["face_spans"]) >= 0xFFFF:
+            raise CadError(
+                "cad_mesh_export_failed",
+                "the component carries more face owners than a binary STL attribute can bind",
+                {"component": component, "faces": len(tessellation["face_spans"])},
+            )
+        triangle_owners: list[int] = []
+        for owner_id, span in enumerate(tessellation["face_spans"], start=1):
+            span["face_owner_id"] = owner_id
+            triangle_owners.extend([owner_id] * span["triangle_count"])
+        if len(triangle_owners) != len(values) // 9:
+            raise CadError(
+                "cad_mesh_export_failed",
+                "native face owners do not cover the complete triangle stream",
+                {"component": component},
+            )
         if not values:
             raise CadError(
                 "cad_mesh_export_failed",
@@ -4674,7 +4692,7 @@ class SolidWorksBackend(CadBackend):
         with open(dest_path, "xb") as handle:
             handle.write(b"SolidWorks GetTessTriangles(True), metres".ljust(80, b" "))
             handle.write(struct.pack("<I", len(values) // 9))
-            for offset in range(0, len(values), 9):
+            for triangle_index, offset in enumerate(range(0, len(values), 9)):
                 xyz = values[offset : offset + 9]
                 a, b, c = xyz[:3], xyz[3:6], xyz[6:9]
                 u, v = [b[i] - a[i] for i in range(3)], [c[i] - a[i] for i in range(3)]
@@ -4682,7 +4700,14 @@ class SolidWorksBackend(CadBackend):
                 size = math.sqrt(sum(t * t for t in n))
                 if size == 0:
                     raise CadError("cad_mesh_degenerate", component)
-                handle.write(struct.pack("<12fH", *(t / size for t in n), *xyz, 0))
+                handle.write(
+                    struct.pack(
+                        "<12fH",
+                        *(t / size for t in n),
+                        *xyz,
+                        triangle_owners[triangle_index],
+                    )
+                )
         self._fill_face_span_digests(dest_path, tessellation["face_spans"])
         # The count already written into the header is the writer's own
         # tessellation count; no reader pass is needed (the Linux verifier

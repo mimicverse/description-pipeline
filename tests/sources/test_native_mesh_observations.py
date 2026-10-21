@@ -17,7 +17,9 @@ from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.native_mesh_observations import verify_native_mesh_observations
 
 
-def binary_stl(count: int) -> bytes:
+def binary_stl(count: int, *, owners: list[int] | None = None) -> bytes:
+    owners = owners or [0] * count
+    assert len(owners) == count
     payload = bytearray(b"fixture".ljust(80, b" ") + struct.pack("<I", count))
     for index in range(count):
         x = float(index)
@@ -36,7 +38,7 @@ def binary_stl(count: int) -> bytes:
                 x,
                 1.0,
                 0.0,
-                0,
+                owners[index],
             )
         )
     return bytes(payload)
@@ -47,7 +49,8 @@ class NativeMeshObservationTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        self.stl_bytes = binary_stl(12)
+        triangle_owners = [1, 2, 3, 4, 5, 6, 8, 8, 9, 10, 11, 12]
+        self.stl_bytes = binary_stl(12, owners=triangle_owners)
         stl_path = self.root / "evidence/geometry/fixture.stl"
         stl_path.parent.mkdir(parents=True, exist_ok=True)
         stl_path.write_bytes(self.stl_bytes)
@@ -93,6 +96,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                     "body_reference_sha256": hashlib.sha256(f"body-{body_index}".encode()).hexdigest(),
                     "face_index": face_index,
                     "face_reference_sha256": hashlib.sha256(f"face-{ordinal}".encode()).hexdigest(),
+                    "face_owner_id": ordinal + 1,
                     "edge_references": [],
                     "triangle_start": start,
                     "triangle_count": count,
@@ -117,6 +121,31 @@ class NativeMeshObservationTests(unittest.TestCase):
                 "face_indices": [0, 1],
             }
         ]
+        for body_index, face_index in ((1, 0), (2, 0), (3, 0)):
+            reference = hashlib.sha256(f"body-{body_index}-edge".encode()).hexdigest()
+            native_edges.append(
+                {
+                    "body_type": 1,
+                    "body_index": body_index,
+                    "edge_reference_sha256": reference,
+                    "start_vertex_reference_sha256": hashlib.sha256(
+                        f"body-{body_index}-vertex-0".encode()
+                    ).hexdigest(),
+                    "end_vertex_reference_sha256": hashlib.sha256(
+                        f"body-{body_index}-vertex-1".encode()
+                    ).hexdigest(),
+                    "start_point_m": [0.0, float(body_index), 0.0],
+                    "end_point_m": [1.0, float(body_index), 0.0],
+                    "face_indices": [face_index],
+                }
+            )
+            span = next(
+                entry
+                for entry in spans
+                if entry["body_index"] == body_index
+                and entry["face_index"] == face_index
+            )
+            span["edge_references"].append(reference)
         self.row = {
             "component": "pcb",
             "path": "geometry/fixture.stl",
@@ -298,6 +327,49 @@ class NativeMeshObservationTests(unittest.TestCase):
                     for reference in span["edge_references"]
                 ]
 
+        def vertex_role_alias(row):
+            edge = row["tessellation"]["native_edges"][0]
+            edge["start_vertex_reference_sha256"] = row["tessellation"]["face_spans"][0][
+                "body_reference_sha256"
+            ]
+
+        def vertex_coordinate_conflict(row):
+            edge = row["tessellation"]["native_edges"][0]
+            edge["end_vertex_reference_sha256"] = edge["start_vertex_reference_sha256"]
+            edge["end_point_m"] = [2.0, 0.0, 0.0]
+
+        def boundary_shift_with_recomputed_digest(row):
+            spans = row["tessellation"]["face_spans"]
+            earlier = next(
+                span
+                for span in spans
+                if span["body_index"] == 2 and span["face_index"] == 1
+            )
+            later = next(
+                span
+                for span in spans
+                if span["body_index"] == 3 and span["face_index"] == 0
+            )
+            earlier["triangle_count"] = 1
+            earlier["triangle_records_sha256"] = hashlib.sha256(
+                self.stl_bytes[84 + 50 * 6 : 84 + 50 * 7]
+            ).hexdigest()
+            later["triangle_start"] = 7
+            later["triangle_count"] = 2
+            later["triangle_records_sha256"] = hashlib.sha256(
+                self.stl_bytes[84 + 50 * 7 : 84 + 50 * 9]
+            ).hexdigest()
+
+        def missing_body_edge_evidence(row):
+            row["tessellation"]["native_edges"] = [
+                edge
+                for edge in row["tessellation"]["native_edges"]
+                if edge["body_index"] != 3
+            ]
+            for span in row["tessellation"]["face_spans"]:
+                if span["body_index"] == 3:
+                    span["edge_references"] = []
+
         cases = (
             ("legacy", legacy, "unknown or legacy"),
             ("boolean-body", boolean_body_type, "face span 0 is malformed"),
@@ -308,6 +380,10 @@ class NativeMeshObservationTests(unittest.TestCase):
             ("facetless", missing_facetless_row, "differs from zero-length"),
             ("edge-incidence", edge_incidence_mismatch, "no matching native edge incidence"),
             ("role-alias", role_identity_alias, "identities must not alias"),
+            ("vertex-role-alias", vertex_role_alias, "identities must not alias"),
+            ("vertex-coordinate-conflict", vertex_coordinate_conflict, "multiple coordinates"),
+            ("boundary-shift", boundary_shift_with_recomputed_digest, "triangle owners"),
+            ("missing-body-edges", missing_body_edge_evidence, "topology evidence is unresolved"),
         )
         for label, mutate, message in cases:
             with self.subTest(label=label):

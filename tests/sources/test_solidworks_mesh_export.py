@@ -349,6 +349,10 @@ class ComponentMeshExportTests(unittest.TestCase):
         entry = _backend(component).export_component_meshes({"pcb-1": self.dest})["pcb-1"]
         self.assertEqual(entry["triangles"], 2)
         self.assertEqual(entry["tessellation_sources"], ["solid_body_faces", "sheet_body_faces"])
+        self.assertEqual(
+            [span["triangle_start"] for span in entry["tessellation"]["face_spans"]],
+            [0, 1],
+        )
 
     def test_solid_part_exports_every_occurrence_body(self):
         component = FakeComponent(
@@ -361,6 +365,14 @@ class ComponentMeshExportTests(unittest.TestCase):
         self.assertEqual(entry["bodies"], {"solid": 2, "sheet": 0})
         self.assertIn("GetTessTriangles", entry["used_api"])
         self.assertEqual(component.body_calls, [(0,), (1,)])
+        self.assertEqual(
+            [span["triangle_start"] for span in entry["tessellation"]["face_spans"]],
+            [0, 1],
+        )
+        self.assertEqual(
+            [span["face_owner_id"] for span in entry["tessellation"]["face_spans"]],
+            [1, 2],
+        )
 
     def test_solid_geometry_does_not_need_document_tessellation(self):
         component = FakeComponent(FakeDocument([]), {0: [FakeBody([FakeFace(TRIANGLE)])], 1: []})
@@ -871,7 +883,10 @@ class NoFullScanExportTests(unittest.TestCase):
             ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
             ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)),
         ]
-        payload = b"".join(struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 0) for a, b, c in triangles)
+        payload = b"".join(
+            struct.pack("<12fH", 0.0, 0.0, 1.0, *a, *b, *c, 1)
+            for a, b, c in triangles
+        )
         return header + struct.pack("<I", len(triangles)) + payload
 
     def test_export_records_identity_and_header_count_without_reader(self):
@@ -911,6 +926,7 @@ class NoFullScanExportTests(unittest.TestCase):
                                     "body_reference_sha256": "1" * 64,
                                     "face_index": 0,
                                     "face_reference_sha256": "2" * 64,
+                                    "face_owner_id": 1,
                                     "edge_references": [],
                                     "triangle_start": 0,
                                     "triangle_count": 2,

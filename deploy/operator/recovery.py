@@ -4116,10 +4116,13 @@ def _run_windows_recovery_json(
         and isinstance(code, str)
         and code
     ):
+        detail = dict(document.get("detail") or {})
+        if "cleanup" in document:
+            detail["windows_inner_cleanup"] = document["cleanup"]
         raise RecoveryError(
             code,
             str(document.get("message") or "Windows recovery refused the operation"),
-            document.get("detail") if isinstance(document.get("detail"), dict) else {},
+            detail,
         )
     raise RecoveryError(
         "windows_recovery_transport_unknown",
@@ -4130,6 +4133,8 @@ def _run_windows_recovery_json(
             "code": code,
             "verb": document.get("verb"),
             "expected_verb": expected_verb,
+            "detail": document.get("detail"),
+            "cleanup": document.get("cleanup"),
         },
     )
 
@@ -5000,6 +5005,37 @@ def _validate_remote_cleanup(value: object) -> dict:
     return value
 
 
+def _validate_windows_inner_cleanup(value: object, *, required: bool) -> dict | None:
+    if value is None and not required:
+        return None
+    require(isinstance(value, dict), "recovery_manifest_invalid", "Windows temp cleanup must be an object")
+    allowed = {"attempted", "passed", "path", "error"}
+    require(
+        {"attempted", "passed", "path"} <= set(value) <= allowed,
+        "recovery_manifest_invalid",
+        "Windows temp cleanup carries an unknown shape",
+    )
+    attempted = value["attempted"]
+    passed = value["passed"]
+    path = value["path"]
+    require(
+        isinstance(attempted, bool)
+        and (
+            (attempted and isinstance(passed, bool) and isinstance(path, str) and bool(path))
+            or (not attempted and passed is None and path == "")
+        ),
+        "recovery_manifest_invalid",
+        "Windows temp cleanup identity is malformed",
+    )
+    if passed is False:
+        require(
+            isinstance(value.get("error"), str) and bool(value["error"]),
+            "recovery_manifest_invalid",
+            "failed Windows temp cleanup lacks its residual path error",
+        )
+    return value
+
+
 def _windows_snapshot_binding(context: BackupContext) -> dict:
     windows = context.resolved["windows"]
     instance = windows["instance"]
@@ -5202,6 +5238,10 @@ def capture_windows_recovery(
         "Windows snapshot did not prove a disabled, stopped, CAD-free endpoint",
     )
     cleanup = _validate_remote_cleanup(result.get("remote_cleanup"))
+    windows_cleanup = _validate_windows_inner_cleanup(
+        result.get("cleanup"),
+        required=False,
+    )
     return {
         "schema_version": WINDOWS_RECOVERY_SCHEMA,
         "bundle": {
@@ -5212,6 +5252,7 @@ def capture_windows_recovery(
         "state_sha256": _digest_document(state),
         "state": state,
         "remote_cleanup": cleanup,
+        "windows_cleanup": windows_cleanup,
     }
 
 
@@ -5267,6 +5308,7 @@ def restore_windows_recovery(
         upload_bundle=bundle,
     )
     _validate_remote_cleanup(result.get("remote_cleanup"))
+    _validate_windows_inner_cleanup(result.get("cleanup"), required=True)
     require(
         result.get("task_state") == "Disabled"
         and result.get("endpoint") == "stopped"
@@ -6835,7 +6877,14 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
     )
     windows = _exact_keys(
         doc["windows"],
-        {"schema_version", "bundle", "state_sha256", "state", "remote_cleanup"},
+        {
+            "schema_version",
+            "bundle",
+            "state_sha256",
+            "state",
+            "remote_cleanup",
+            "windows_cleanup",
+        },
         "windows",
     )
     bundle = _exact_keys(
@@ -6852,6 +6901,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         "Windows recovery block is malformed",
     )
     _validate_remote_cleanup(windows["remote_cleanup"])
+    _validate_windows_inner_cleanup(windows["windows_cleanup"], required=False)
     require_bound_file(
         bundle["member"],
         expected_bytes=bundle["bytes"],

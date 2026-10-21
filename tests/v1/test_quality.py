@@ -2016,6 +2016,44 @@ class MeshChunkContractTests(unittest.TestCase):
         self.assertEqual(quality._mesh_chunk_count(399_998), 2)
         self.assertEqual(quality._mesh_chunk_count(399_999), 3)
 
+    def test_globally_flipped_closed_mesh_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node, body, model_link, geometry, components = self._fixture(
+                root,
+                limit=2,
+                mutate=None,
+            )
+            source = root / "evidence/geometry/0001_mesh.stl"
+            flipped = bytearray(source.read_bytes())
+            count = struct.unpack_from("<I", flipped, 80)[0]
+            for index in range(count):
+                offset = 84 + 50 * index
+                normal = struct.unpack_from("<3f", flipped, offset)
+                first = struct.unpack_from("<3f", flipped, offset + 12)
+                second = struct.unpack_from("<3f", flipped, offset + 24)
+                third = struct.unpack_from("<3f", flipped, offset + 36)
+                struct.pack_into("<12f", flipped, offset, *[-value for value in normal], *first, *third, *second)
+            source.write_bytes(flipped)
+            geometry["pcb-1"]["sha256"] = hashlib.sha256(flipped).hexdigest()
+            for index, part in enumerate(self._parts(flipped, 2)):
+                (root / f"meshes/visual/board_0_part_{index}.stl").write_bytes(part)
+            with (
+                self.assertRaisesRegex(PipelineError, "globally inverted"),
+                mock.patch.object(quality, "CHUNK_TRIANGLES_MAX", 2),
+            ):
+                quality._geometry(
+                    root,
+                    body,
+                    node,
+                    model_link,
+                    geometry,
+                    components,
+                    np.identity(4),
+                    np.identity(4),
+                    set(),
+                )
+
 
 class EntityPartitionTests(unittest.TestCase):
     """Native, selected and unassigned entity partitions bind to the sealed scene."""

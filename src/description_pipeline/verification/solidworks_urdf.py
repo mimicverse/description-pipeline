@@ -1699,6 +1699,11 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             stats.volume > 1e-15 or occurrence in exclusions or _qualified_surface_only(root, occurrence),
             "Zero-volume geometry needs a documented exclusion",
         )
+        if stats.volume > 1e-15:
+            _require(
+                stats.signed_volume > 0,
+                "Closed mesh orientation is globally inverted against its native outward winding",
+            )
         points = stl.vertices(original)
         world = urdf_pose @ origins[0]
         native = components[occurrence]

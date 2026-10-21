@@ -41,6 +41,8 @@ function Emit([hashtable]$payload) {
   $payload | ConvertTo-Json -Depth 8 -Compress
 }
 function Close-RecoveryTemp {
+  # One cleanup attempt only: after a failure the receipt carries the residual path and the
+  # caller must not repeat a completed remote action merely to retry deletion.
   $path = [string]$Script:RecoveryTemp
   if (-not $path) {
     return @{attempted=$false; passed=$null; path=''}
@@ -1499,6 +1501,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       cleanup=$cleanup
     }
   } catch {
+    $primaryError = $_
     $failedOwner = $ownedTask
     if (-not $VerifyOnly -and $registeringTask -and $state) {
       try {
@@ -1516,7 +1519,15 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
     if (-not $VerifyOnly -and $failedOwner) {
       try { Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null } catch { }
     }
-    throw
+    $cleanup = Close-RecoveryTemp
+    Emit @{
+      passed=$false
+      code='windows_recovery_exception'
+      message=$primaryError.Exception.Message
+      detail=@{error=$primaryError.Exception.Message; cleanup=$cleanup}
+      verb=$Script:Verb
+    }
+    exit 2
   } finally {
     if ($Script:RecoveryTemp) { Close-RecoveryTemp | Out-Null }
   }

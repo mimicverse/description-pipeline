@@ -59,6 +59,7 @@ def parse_native_tessellation(
         "body_reference_sha256",
         "face_index",
         "face_reference_sha256",
+        "face_owner_id",
         "edge_references",
         "triangle_start",
         "triangle_count",
@@ -69,6 +70,7 @@ def parse_native_tessellation(
     body_names = {}
     body_references = {}
     face_references = set()
+    face_owner_ids = set()
     face_keys = set()
     bodies_by_face = {}
     face_edge_references = {}
@@ -85,6 +87,7 @@ def parse_native_tessellation(
         body_name = span["body_name"]
         body_reference = span["body_reference_sha256"]
         face_reference = span["face_reference_sha256"]
+        face_owner_id = span["face_owner_id"]
         edge_references = span["edge_references"]
         records_digest = span["triangle_records_sha256"]
         _require(
@@ -103,6 +106,8 @@ def parse_native_tessellation(
             and bool(HEX64.fullmatch(body_reference))
             and isinstance(face_reference, str)
             and bool(HEX64.fullmatch(face_reference))
+            and _integer(face_owner_id)
+            and 0 < face_owner_id < 0xFFFF
             and isinstance(edge_references, list)
             and len(edge_references) == len(set(edge_references))
             and all(
@@ -141,6 +146,11 @@ def parse_native_tessellation(
             component + f": native face reference repeats at span {index}",
         )
         face_references.add(face_reference)
+        _require(
+            face_owner_id not in face_owner_ids,
+            component + f": face owner id repeats at span {index}",
+        )
+        face_owner_ids.add(face_owner_id)
         face_key = (*body_key, face_index)
         _require(face_key not in face_keys, component + f": duplicate native face {face_key}")
         face_keys.add(face_key)
@@ -183,6 +193,7 @@ def parse_native_tessellation(
     }
     edge_owners = {}
     seen_edges = set()
+    vertex_points = {}
     for index, edge in enumerate(native_edges):
         _require(
             isinstance(edge, dict) and set(edge) == edge_required,
@@ -221,6 +232,15 @@ def parse_native_tessellation(
         _require(body_key in expected_bodies, component + f": native edge {index} names an unknown body")
         _require(reference not in seen_edges, component + f": native edge {index} is duplicated")
         seen_edges.add(reference)
+        for vertex_reference, point in (
+            (edge["start_vertex_reference_sha256"], edge["start_point_m"]),
+            (edge["end_vertex_reference_sha256"], edge["end_point_m"]),
+        ):
+            observed = vertex_points.setdefault(vertex_reference, tuple(point))
+            _require(
+                observed == tuple(point),
+                component + f": native vertex {vertex_reference} binds multiple coordinates",
+            )
         edge_owners[reference] = (body_key, set(edge["face_indices"]))
         _require(
             all((*body_key, face_index) in face_edge_references for face_index in edge_owners[reference][1]),
@@ -252,8 +272,11 @@ def parse_native_tessellation(
             & face_references
             or set(body_references.values()) & seen_edges
             or face_references & seen_edges
+            or set(body_references.values()) & set(vertex_points)
+            or face_references & set(vertex_points)
+            or seen_edges & set(vertex_points)
         ),
-        component + ": body, face and edge identities must not alias",
+        component + ": body, face, edge and vertex identities must not alias",
     )
     return spans
 

@@ -115,6 +115,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
                         "body_reference_sha256": hashlib.sha256(b"fixture-body").hexdigest(),
                         "face_index": face_index,
                         "face_reference_sha256": hashlib.sha256(f"fixture-face-{face_index}".encode()).hexdigest(),
+                        "face_owner_id": face_index + 1,
                         "edge_references": [],
                         "triangle_start": start,
                         "triangle_count": count,

@@ -752,6 +752,8 @@ class StructuralReportTests(unittest.TestCase):
             self.assertIn("cad_surface_only_effective_instance", codes)
 
     def _geometry_list(self, rows):
+        owner_ids = iter(range(1, 100))
+
         def span(body_type, body_index, face_index, start, count):
             return {
                 "body_type": body_type,
@@ -764,6 +766,7 @@ class StructuralReportTests(unittest.TestCase):
                 "face_reference_sha256": hashlib.sha256(
                     f"face-{body_type}-{body_index}-{face_index}".encode()
                 ).hexdigest(),
+                "face_owner_id": next(owner_ids),
                 "edge_references": [],
                 "triangle_start": start,
                 "triangle_count": count,
