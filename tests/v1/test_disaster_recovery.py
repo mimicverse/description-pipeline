@@ -49,11 +49,11 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
     token = b"t" * 64 + b"\n"
     install_id = b"win-" + b"1" * 32 + b"\n"
     marker = b'{"schema_version":"solidworks-to-urdf.managed-root/v1"}'
-    generation = "C:/description/lifecycle/win-11111111111111111111111111111111/generation"
+    generation = "C:/description/state/lifecycle/win-11111111111111111111111111111111/generation"
     paths = {
         "managed_root_marker": "C:/description/.description-managed-root.json",
         "endpoint_config": generation + "/endpoint.json",
-        "endpoint_token": "C:/description/state/endpoint.token",
+        "endpoint_token": "C:/description/secrets/endpoint.token",
         "install_id": "C:/description/state/install-id",
     }
     payloads = {
@@ -122,7 +122,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             }
             for sid, rights in (
                 ("S-1-5-18", 2032127),
-                ("S-1-5-21-1", service_rights),
+                ("S-1-5-21-1", service_rights | 0x00100000),
                 ("S-1-5-32-544", 2032127),
             )
         ]
@@ -137,7 +137,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         return projection
 
     acl = {
-        "common_parent": acl_projection("0", service_rights=197055, directory=True, non_inheriting=True),
+        "common_parent": acl_projection("0", service_rights=131241, directory=True, non_inheriting=True),
         "managed_root_marker": acl_projection("3", service_rights=131209),
         "lifecycle_root": acl_projection("4", service_rights=197055, directory=True),
         "endpoint_secrets_root": acl_projection("5", service_rights=131241, directory=True),
@@ -180,7 +180,8 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             "security_descriptor_sha256": "1" * 64,
         },
         "identity": {
-            "operator_sid": "S-1-5-21-1",
+            "operator_sid": "S-1-5-21-500",
+            "operator_administrator": True,
             "service_non_administrator": True,
             "endpoint_root": generation,
             "config_path": paths["endpoint_config"],
@@ -2865,6 +2866,10 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ]
             projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
 
+        def move_marker(state):
+            row = next(item for item in state["files"] if item["role"] == "managed_root_marker")
+            row["path"] = "C:/unrelated/managed-root.json"
+
         cases = (
             (
                 "started",
@@ -2875,6 +2880,16 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "service_elevated",
                 lambda state: state["identity"].update(service_non_administrator=False),
                 "windows_service_identity_elevated",
+            ),
+            (
+                "operator_is_service",
+                lambda state: state["identity"].update(operator_sid="S-1-5-21-1"),
+                "windows_service_operator_not_separated",
+            ),
+            (
+                "operator_not_admin",
+                lambda state: state["identity"].update(operator_administrator=False),
+                "windows_operator_not_administrator",
             ),
             (
                 "logon",
@@ -2914,6 +2929,23 @@ class RecoveryControlFlowTests(unittest.TestCase):
             (
                 "path",
                 lambda state: state["identity"].update(config_path="C:/../escape"),
+                "windows_recovery_state_invalid",
+            ),
+            (
+                "null_operator",
+                lambda state: state["identity"].update(operator_sid=None),
+                "windows_recovery_state_invalid",
+            ),
+            (
+                "token_in_state_root",
+                lambda state: state["identity"].update(
+                    token_path=state["identity"]["state_root"] + "/token"
+                ),
+                "windows_recovery_state_invalid",
+            ),
+            (
+                "moved_marker",
+                move_marker,
                 "windows_recovery_state_invalid",
             ),
         )

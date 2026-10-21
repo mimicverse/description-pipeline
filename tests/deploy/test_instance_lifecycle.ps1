@@ -16,13 +16,14 @@ param(
   [switch]$StaticOnly
 )
 $ErrorActionPreference = 'Stop'
+$repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $ScriptPath) {
   # Windows PowerShell 5.1 does not populate $PSScriptRoot while parameter defaults evaluate and
   # has no multi-child Join-Path (PowerShell 6+ -AdditionalChildPath): the repository-relative
   # default resolves here, after the parameter block.
-  $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
   $ScriptPath = Join-Path (Join-Path (Join-Path $repositoryRoot 'deploy') 'windows') 'instance-lifecycle.ps1'
 }
+$bootstrapScript = Join-Path (Join-Path (Join-Path $repositoryRoot 'deploy') 'windows') 'bootstrap-managed-root.ps1'
 $script:checks = 0
 $script:failures = [System.Collections.Generic.List[string]]::new()
 function Check([string]$name, [bool]$condition, [string]$detail = '') {
@@ -40,6 +41,11 @@ $tokens = $null
 $parseErrors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$parseErrors)
 Check 'parse.clean' ($parseErrors.Count -eq 0) (($parseErrors | Out-String).Trim())
+$bootstrapTokens = $null
+$bootstrapParseErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile(
+  $bootstrapScript, [ref]$bootstrapTokens, [ref]$bootstrapParseErrors)
+Check 'parse.bootstrap_clean' ($bootstrapParseErrors.Count -eq 0) (($bootstrapParseErrors | Out-String).Trim())
 $source = Get-Content -LiteralPath $ScriptPath -Raw
 # Design-lead settle rules: no blind wait/retry, positive owner proof first, three-valued
 # observers, and a recorded safe restore on the failure path.
@@ -103,8 +109,17 @@ $seams += 'Get-ManagedServiceSid', 'Set-ManagedAcl', 'Assert-ManagedAcl',
   'Set-ManagedEndpointAcls', 'Assert-ManagedEndpointAcls', 'Get-ManagedEndpointPaths',
   'Get-ManagedCommonParent', 'Test-ManagedPathWithin', 'Assert-ManagedOperatorIsAdministrator',
   'Assert-ManagedServiceIsNonAdministrator', 'New-ManagedAccessRule',
-  'Get-ManagedAclProjectionForRole', 'Assert-ManagedServiceEnvironmentUnpinned'
+  'Get-ManagedAclProjectionForRole', 'Assert-ManagedServiceEnvironmentUnpinned',
+  'Get-ManagedComparableRights'
 Check 'seams.present' (@($seams | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
+foreach ($rights in @(
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    [System.Security.AccessControl.FileSystemRights]::Read,
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)) {
+  Check ('windows_acl.synchronize_' + $rights) (
+    (Get-ManagedComparableRights ([long]($rights -bor [System.Security.AccessControl.FileSystemRights]::Synchronize))) -eq
+      (Get-ManagedComparableRights ([long]$rights)))
+}
 Check 'windows_recovery.net_tcp_no_match' (Test-NetTcpNoMatchError ([pscustomobject]@{
   CategoryInfo=[pscustomobject]@{Category='ObjectNotFound'}
   FullyQualifiedErrorId='CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'
@@ -189,10 +204,6 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $siblingRoot = Join-Path $driveRoot ('description-unmanaged-sibling-' + [guid]::NewGuid().ToString('N'))
   $null = New-Item -ItemType Directory -Path $aclRoot -Force
   $null = New-Item -ItemType Directory -Path $siblingRoot -Force
-  [System.IO.File]::WriteAllText(
-    (Join-Path $aclRoot '.description-managed-root.json'),
-    '{"schema_version":"solidworks-to-urdf.managed-root/v1"}',
-    (New-Object System.Text.UTF8Encoding($false)))
   $packageRoot = Join-Path $aclRoot 'packages'
   $outputRoot = Join-Path $aclRoot 'output'
   $stateRoot = Join-Path $aclRoot 'state'
@@ -218,6 +229,18 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $localPassword = ConvertTo-SecureString -String ('Aa1!' + [guid]::NewGuid().ToString('N')) -AsPlainText -Force
   $localUser = New-LocalUser -Name $localUserName -Password $localPassword `
     -AccountNeverExpires -PasswordNeverExpires
+  $bootstrapOutput = & $bootstrapScript -ManagedRoot $aclRoot -ServiceAccount $localUserName
+  $bootstrapReceipt = ($bootstrapOutput | Select-Object -Last 1) | ConvertFrom-Json
+  Check 'windows_acl.bootstrap_marker' ($bootstrapReceipt.passed -eq $true -and
+    $bootstrapReceipt.service_sid -eq $localUser.SID.Value -and
+    (Test-Path -LiteralPath (Join-Path $aclRoot '.description-managed-root.json') -PathType Leaf))
+  Check 'windows_acl.bootstrap_marker_acl' (@($bootstrapReceipt.marker_acl.rules | Where-Object {
+    $_.sid -eq $localUser.SID.Value -and
+    $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Read -and
+    -not $_.inherited
+  }).Count -eq 1 -and @($bootstrapReceipt.marker_acl.rules | Where-Object {
+    $_.sid -in @('S-1-5-11', 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-4')
+  }).Count -eq 0)
   $serviceSid = Assert-ManagedServiceIsNonAdministrator $localUser.SID.Value
   Check 'windows_acl.service_identity_non_admin' ($serviceSid -eq $localUser.SID.Value)
   $adminRejected = $false
@@ -238,7 +261,7 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   $commonParent = Get-ManagedCommonParent $managedPaths
   Check 'windows_acl.common_parent_from_config' ((Normalize-PathIdentity $commonParent) -eq
     (Normalize-PathIdentity $aclRoot))
-  $aclRows = @(Get-ManagedEndpointAclRows $config $endpointRoot $configPath $installIdPath $taskFile)
+  $aclRows = @(Get-ManagedEndpointAclRows $config $endpointRoot $configPath $installIdPath $taskFile $serviceSid)
   Check 'windows_acl.paths_deduplicated' (@($aclRows.path | Select-Object -Unique).Count -eq $aclRows.Count)
   $commonRows = @($aclRows | Where-Object {
     (Normalize-PathIdentity ([string]$_.path)) -eq (Normalize-PathIdentity $commonParent)
@@ -257,15 +280,6 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   [void]$broadAcl.AddAccessRule($broadRule)
   Set-Acl -LiteralPath $aclRoot -AclObject $broadAcl
   $markerPath = Join-Path $aclRoot '.description-managed-root.json'
-  $markerAcl = Get-Acl -LiteralPath $markerPath
-  $markerBroadRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
-    $authenticated,
-    [System.Security.AccessControl.FileSystemRights]::Modify,
-    [System.Security.AccessControl.InheritanceFlags]::None,
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow)
-  [void]$markerAcl.AddAccessRule($markerBroadRule)
-  Set-Acl -LiteralPath $markerPath -AclObject $markerAcl
   $siblingBefore = Get-AclProjection $siblingRoot
   Set-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $serviceSid $taskFile
   Assert-ManagedEndpointAcls $config $endpointRoot $configPath $installIdPath $serviceSid $taskFile
@@ -276,13 +290,20 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     })
   }
   Check 'windows_acl.broad_principals_removed' ($broadFound.Count -eq 0)
-  Check 'windows_acl.administrators_own_boundary' (
-    (Get-AclProjection $aclRoot).owner_sid -eq 'S-1-5-32-544')
+  $operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  Check 'windows_acl.administrator_owns_boundary' (
+    (Get-AclProjection $aclRoot).owner_sid -in @('S-1-5-32-544', $operatorSid))
   $packageRules = @((Get-AclProjection $packageChild).rules)
   Check 'windows_acl.package_service_modify' (@($packageRules | Where-Object {
     $_.sid -eq $serviceSid -and
     $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Modify
   }).Count -eq 1)
+  $commonServiceRules = @((Get-AclProjection $aclRoot).rules | Where-Object {
+    $_.sid -eq $serviceSid
+  })
+  Check 'windows_acl.common_service_read_execute_only' ($commonServiceRules.Count -eq 1 -and
+    $commonServiceRules[0].rights -eq [long][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -and
+    ($commonServiceRules[0].rights -band [long][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -eq 0)
   Check 'windows_acl.token_service_read' (@((Get-AclProjection $tokenPath).rules | Where-Object {
     $_.sid -eq $serviceSid -and
     $_.rights -eq [long][System.Security.AccessControl.FileSystemRights]::Read

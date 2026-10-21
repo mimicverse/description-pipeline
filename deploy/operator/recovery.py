@@ -41,6 +41,7 @@ import fcntl
 import hashlib
 import io
 import json
+import ntpath
 import os
 import re
 import secrets
@@ -4598,24 +4599,33 @@ def _validate_windows_acl_policy(
     *,
     label: str,
     service_sid: str,
+    operator_sid: str,
     service_rights: int,
     directory: bool,
     non_inheriting: bool = False,
     protected: bool = True,
+    allow_service_owner: bool = False,
 ) -> None:
     """Require the explicit SYSTEM/Administrators/service DACL used at install time."""
 
     system_sid = "S-1-5-18"
     administrators_sid = "S-1-5-32-544"
+
+    def comparable(rights: int) -> int:
+        return int(rights) & 0xFFEFFFFF
+
     inheritance = 0 if non_inheriting or not directory else 3
     expected = {
         system_sid: 2032127,
         administrators_sid: 2032127,
         service_sid: service_rights,
     }
+    allowed_owners = {administrators_sid, operator_sid}
+    if allow_service_owner:
+        allowed_owners.add(service_sid)
     rules = projection["rules"]
     require(
-        projection["owner_sid"] == administrators_sid
+        projection["owner_sid"] in allowed_owners
         and projection["protected"] is protected
         and len(rules) == len(expected),
         "windows_managed_acl_policy_invalid",
@@ -4628,7 +4638,7 @@ def _validate_windows_acl_policy(
             sid in expected
             and sid not in seen
             and rule["access_type"] == "Allow"
-            and rule["rights"] == expected[sid]
+            and comparable(rule["rights"]) == comparable(expected[sid])
             and rule["inherited"] is (not protected)
             and rule["inheritance"] == inheritance
             and rule["propagation"] == 0,
@@ -4738,6 +4748,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
         state["identity"],
         {
             "operator_sid",
+            "operator_administrator",
             "service_non_administrator",
             "endpoint_root",
             "config_path",
@@ -4757,9 +4768,19 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows state identity",
     )
     require(
+        identity["operator_administrator"] is True,
+        "windows_operator_not_administrator",
+        "the Windows deployment operator is not proven administrative",
+    )
+    require(
         identity["service_non_administrator"] is True,
         "windows_service_identity_elevated",
         "the Windows task service identity is not proven non-administrative",
+    )
+    require(
+        identity["operator_sid"] != principal["sid"],
+        "windows_service_operator_not_separated",
+        "the Windows deployment operator and task service identity are not distinct",
     )
     for key in ("config_sha256", "config_digest", "token_sha256", "release_identity_sha256"):
         require(
@@ -4790,7 +4811,6 @@ def _validate_windows_recovery_state(document: object) -> dict:
         and normalized_action["arguments"] == f'serve --config "{normalized["config_path"]}"'
         and normalized_action["working_directory"] == normalized["state_root"]
         and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
-        and normalized["token_path"].startswith(normalized["state_root"] + "/")
         and normalized["install_id_path"].startswith(normalized["state_root"] + "/")
         and normalized["package_root"] != normalized["state_root"]
         and normalized["output_root"] != normalized["state_root"]
@@ -4818,6 +4838,61 @@ def _validate_windows_recovery_state(document: object) -> dict:
             "windows_recovery_state_invalid",
             f"Windows identity {key} is not a safe absolute forward-slash path",
         )
+    require(
+        isinstance(identity["operator_sid"], str)
+        and bool(re.fullmatch(r"S-1-[0-9-]+", identity["operator_sid"])),
+        "windows_recovery_state_invalid",
+        "Windows operator SID is malformed",
+    )
+    nt_paths = {
+        key: value.replace("/", "\\")
+        for key, value in normalized.items()
+    }
+    common_parent = ntpath.commonpath(
+        [
+            nt_paths[key]
+            for key in (
+                "package_root",
+                "output_root",
+                "state_root",
+                "endpoint_root",
+                "config_path",
+                "token_path",
+                "install_id_path",
+            )
+        ]
+    ).replace("\\", "/")
+    common_parts = [part.casefold() for part in common_parent.split("/")[1:] if part]
+    require(
+        bool(common_parts)
+        and common_parts[0]
+        not in {
+            "windows",
+            "program files",
+            "program files (x86)",
+            "programdata",
+            "users",
+        },
+        "windows_recovery_state_invalid",
+        "Windows managed common parent is a shared or system root",
+    )
+    lifecycle_root = normalized["state_root"] + "/lifecycle"
+    secret_root = ntpath.dirname(nt_paths["token_path"]).replace("\\", "/")
+    require(
+        normalized["endpoint_root"].startswith(lifecycle_root + "/")
+        and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
+        and normalized["install_id_path"] == normalized["state_root"] + "/install-id"
+        and secret_root not in {
+            normalized["package_root"],
+            normalized["output_root"],
+            normalized["state_root"],
+            lifecycle_root,
+            normalized["endpoint_root"],
+            common_parent,
+        },
+        "windows_recovery_state_invalid",
+        "Windows lifecycle, generation, install identity, or secret root is unsafe",
+    )
     require(
         type(identity["port"]) is int and 0 < identity["port"] < 65536,
         "windows_recovery_state_invalid",
@@ -4875,7 +4950,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
         )
     service_sid = principal["sid"]
     policies = (
-        ("common_parent", acl["common_parent"], 197055, True, True),
+        ("common_parent", acl["common_parent"], 131241, True, True),
         ("managed_root_marker", acl["managed_root_marker"], 131209, False, False),
         ("lifecycle_root", acl["lifecycle_root"], 197055, True, False),
         ("endpoint_secrets_root", acl["endpoint_secrets_root"], 131241, True, False),
@@ -4893,6 +4968,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
             projection,
             label=f"windows state acl.{name}",
             service_sid=service_sid,
+            operator_sid=identity["operator_sid"],
             service_rights=rights,
             directory=directory,
             non_inheriting=non_inheriting,
@@ -4903,9 +4979,11 @@ def _validate_windows_recovery_state(document: object) -> dict:
                 acl[name],
                 label=f"windows state acl.{name}",
                 service_sid=service_sid,
+                operator_sid=identity["operator_sid"],
                 service_rights=197055,
                 directory=False,
                 protected=False,
+                allow_service_owner=True,
             )
     cad = _exact_keys(
         state["cad"],
@@ -5016,6 +5094,12 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "Windows task XML file and task projection differ",
     )
     files_by_role = {row["role"]: row for row in files}
+    require(
+        files_by_role["managed_root_marker"]["path"]
+        == common_parent + "/.description-managed-root.json",
+        "windows_recovery_state_invalid",
+        "Windows managed-root marker is outside the computed common parent",
+    )
     require(
         files_by_role["endpoint_config"]["path"] == identity["config_path"]
         and files_by_role["endpoint_config"]["sha256"] == identity["config_sha256"]

@@ -797,27 +797,28 @@ function Assert-ManagedServiceIsNonAdministrator([string]$ServiceSid) {
   if ($null -eq $localUser -or -not [bool]$localUser.Enabled) {
     Die 'windows_service_identity_invalid' 'the endpoint service local user is missing or disabled'
   }
-  $members = @{}
-  foreach ($group in @(Get-LocalGroup -ErrorAction Stop)) {
-    $groupSid = [string]$group.SID.Value
-    $members[$groupSid] = @(
-      Get-LocalGroupMember -Group $groupSid -ErrorAction SilentlyContinue |
-        ForEach-Object { [string]$_.SID.Value }
-    )
-  }
-  $subjects = @{}
-  $subjects[$expectedSid] = $true
-  do {
-    $changed = $false
-    foreach ($groupSid in @($members.Keys)) {
-      if ($subjects.ContainsKey($groupSid)) { continue }
-      if (@($members[$groupSid] | Where-Object { $subjects.ContainsKey($_) }).Count -gt 0) {
-        $subjects[$groupSid] = $true
-        $changed = $true
-      }
+  Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+  $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext -ArgumentList (
+    [System.DirectoryServices.AccountManagement.ContextType]::Machine)
+  $principal = $null
+  try {
+    $principal = [System.DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity(
+      $context,
+      [System.DirectoryServices.AccountManagement.IdentityType]::Sid,
+      $expectedSid)
+    if ($null -eq $principal) {
+      Die 'windows_service_identity_invalid' 'the endpoint service account cannot be resolved on this host'
     }
-  } while ($changed)
-  if ($subjects.ContainsKey((Get-ManagedAdministratorsSid))) {
+    $groupSids = @($principal.GetAuthorizationGroups() | ForEach-Object {
+      [string]$_.SID.Value
+    })
+  } catch {
+    Die 'windows_service_identity_unknown' 'the endpoint service authorization groups are unreadable'
+  } finally {
+    if ($principal) { $principal.Dispose() }
+    $context.Dispose()
+  }
+  if ($groupSids -contains (Get-ManagedAdministratorsSid)) {
     Die 'windows_service_identity_elevated' 'the endpoint service identity is a member of Administrators'
   }
   return $expectedSid
@@ -854,6 +855,11 @@ function New-ManagedAccessRule(
     [System.Security.AccessControl.PropagationFlags]::None,
     [System.Security.AccessControl.AccessControlType]::Allow)
 }
+function Get-ManagedComparableRights([long]$Rights) {
+  # The filesystem persists this generic mapping bit on ACEs; the project matrix compares
+  # semantic file rights and intentionally ignores only this bit.
+  return [long]$Rights -band [long]0xFFEFFFFF
+}
 function Assert-ManagedAcl(
   [string]$Path,
   [string]$ServiceSid,
@@ -867,6 +873,7 @@ function Assert-ManagedAcl(
   $expectedSid = Resolve-Sid $ServiceSid
   $administratorsSid = Get-ManagedAdministratorsSid
   $systemSid = Get-ManagedSystemSid
+  $operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   $expectedRights = @{
     $systemSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
     $administratorsSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
@@ -889,22 +896,43 @@ function Assert-ManagedAcl(
     }
     $rules = @($projection.rules)
     $invalid = ($projection.owner_sid -ne $administratorsSid -and
+        $projection.owner_sid -ne $operatorSid -and
         -not ($AllowServiceOwner -and $projection.owner_sid -eq $expectedSid)) -or
       [bool]$projection.protected -ne $Protected -or
       $rules.Count -ne 3
+    $seenRuleSids = @{}
     foreach ($rule in $rules) {
+      $ruleSid = [string]$rule.sid
       if ($rule.access_type -ne 'Allow' -or
-          -not $expectedRights.ContainsKey([string]$rule.sid) -or
-          [long]$rule.rights -ne [long]$expectedRights[[string]$rule.sid] -or
+          $seenRuleSids.ContainsKey($ruleSid) -or
+          -not $expectedRights.ContainsKey($ruleSid) -or
+          (Get-ManagedComparableRights ([long]$rule.rights)) -ne
+            (Get-ManagedComparableRights ([long]$expectedRights[$ruleSid])) -or
           [int]$rule.inheritance -ne $expectedInheritance -or
           [int]$rule.propagation -ne 0 -or
           ($Protected -and [bool]$rule.inherited) -or
           ((-not $Protected) -and -not [bool]$rule.inherited)) {
         $invalid = $true
       }
+      $seenRuleSids[$ruleSid] = $true
+    }
+    if ($seenRuleSids.Count -ne $expectedRights.Count) {
+      $invalid = $true
     }
     if ($invalid) {
-      Die 'windows_managed_acl_invalid' ('the managed path does not match its minimum permission matrix: ' + $current)
+      $observed = @($rules | ForEach-Object {
+        [string]$_.sid + '/' + [string]$_.rights + '/' +
+          [string]$_.inheritance + '/' + [string]$_.inherited
+      }) -join ';'
+      $expected = @($expectedRights.GetEnumerator() | ForEach-Object {
+        [string]$_.Key + '/' + [string]$_.Value
+      }) -join ';'
+      Die 'windows_managed_acl_invalid' (
+        'the managed path does not match its minimum permission matrix: ' + $current +
+        ' owner=' + [string]$projection.owner_sid +
+        ' protected=' + [string]$projection.protected +
+        ' expected=' + $expected +
+        ' rules=' + $observed)
     }
     if ($Recurse -and $item.PSIsContainer) {
       foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
@@ -1049,7 +1077,8 @@ function Get-ManagedEndpointAclRows(
   [string]$EndpointRoot,
   [string]$ConfigPath,
   [string]$InstallIdPath,
-  [string]$TaskFile = '') {
+  [string]$TaskFile = '',
+  [string]$ServiceSid = '') {
   $paths = @(Get-ManagedEndpointPaths $Config $EndpointRoot $ConfigPath $InstallIdPath)
   $common = Get-ManagedCommonParent $paths
   $managedRootMarker = Join-Path $common '.description-managed-root.json'
@@ -1059,6 +1088,10 @@ function Get-ManagedEndpointAclRows(
     Die 'windows_managed_acl_marker_missing' (
       'the common parent is not marked for exclusive description-pipeline management: ' + $common)
   }
+  if (-not $ServiceSid) {
+    Die 'windows_managed_acl_marker_unverified' 'the managed-root marker cannot be verified without the service SID'
+  }
+  Assert-ManagedAcl $managedRootMarker $ServiceSid 'Read' $true
   $stateRoot = Normalize-PathIdentity ([string]$Config.state_root)
   $lifecycleRoot = Normalize-PathIdentity (
     [System.IO.Path]::Combine([string]$Config.state_root, 'lifecycle'))
@@ -1078,7 +1111,7 @@ function Get-ManagedEndpointAclRows(
   $rows = @()
   $seen = @{}
   $rules = @(
-    @{role='common_parent'; path=$common; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$true; required=$true},
+    @{role='common_parent'; path=$common; service_rights='ReadAndExecute'; protected=$true; recurse=$false; non_inheriting=$true; required=$true},
     @{role='managed_root_marker'; path=$managedRootMarker; service_rights='Read'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
     @{role='package_root'; path=$Config.package_root; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
     @{role='output_root'; path=$Config.output_root; service_rights='Modify'; protected=$true; recurse=$false; non_inheriting=$false; required=$true},
@@ -1133,7 +1166,7 @@ function Set-ManagedEndpointAcls(
   [string]$InstallIdPath,
   [string]$ServiceSid,
   [string]$TaskFile = '') {
-  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
+  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile $ServiceSid)) {
     if (-not (Test-Path -LiteralPath $row.path)) {
       if ($row.required) {
         Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
@@ -1152,7 +1185,7 @@ function Assert-ManagedEndpointAcls(
   [string]$InstallIdPath,
   [string]$ServiceSid,
   [string]$TaskFile = '') {
-  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
+  foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile $ServiceSid)) {
     if (-not (Test-Path -LiteralPath $row.path)) {
       if ($row.required) {
         Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
@@ -1422,6 +1455,7 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
   }
   return [ordered]@{
     operator_sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    operator_administrator = $true
     service_non_administrator = $true
     endpoint_root = Normalize-PathIdentity $generation
     config_path = Normalize-PathIdentity $configPath
@@ -1602,7 +1636,7 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
   }
   $aclByRole = @{}
   foreach ($row in @(Get-ManagedEndpointAclRows $configDocument $identity.endpoint_root `
-      $identity.config_path $identity.install_id_path $taskFile)) {
+      $identity.config_path $identity.install_id_path $taskFile $taskProjection.principal.sid)) {
     if (Test-Path -LiteralPath $row.path) {
       $aclByRole[[string]$row.role] = Get-AclProjection $row.path
     }
@@ -1642,6 +1676,7 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
     }
     identity = [ordered]@{
       operator_sid = $identity.operator_sid
+      operator_administrator = $identity.operator_administrator
       service_non_administrator = $identity.service_non_administrator
       endpoint_root = $identity.endpoint_root
       config_path = $identity.config_path
@@ -1947,7 +1982,7 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       $configDocument = Read-Json ([string]$state.identity.config_path)
       $taskFile = Join-Path $env:SystemRoot ('System32\Tasks\' + ([string]$Binding.task_path).TrimStart('\') + [string]$Binding.task_name)
       foreach ($row in @(Get-ManagedEndpointAclRows $configDocument $state.identity.endpoint_root `
-          $state.identity.config_path $state.identity.install_id_path $taskFile)) {
+          $state.identity.config_path $state.identity.install_id_path $taskFile $state.task.principal.sid)) {
         $projection = Get-ManagedAclProjectionForRole $state.acl $row.role
         if (-not (Test-Path -LiteralPath $row.path)) {
           if ($null -eq $projection) { continue }
