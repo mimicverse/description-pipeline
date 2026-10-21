@@ -560,7 +560,8 @@ function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$
     $restore.stopped = $true
   } catch { if (-not $restore.error) { $restore.error = 'stop: ' + $_.Exception.Message } }
   try {
-    Register-ScheduledTask -TaskName $binding.task_name -Xml (Read-Utf8Text (Join-Path $previous 'task.xml')) -Force | Out-Null
+    Register-ManagedTask -TaskName $binding.task_name -TaskPath ([string]$binding.task_path) `
+      -TaskXml (Read-Utf8Text (Join-Path $previous 'task.xml')) -Force
     $restore.restored = $true
   } catch { if (-not $restore.error) { $restore.error = 'restore: ' + $_.Exception.Message } }
   $previousGeneration = ''
@@ -794,6 +795,21 @@ function Assert-NoReparseAncestor([string]$Path) {
     $current = $parent
   }
 }
+function Register-ManagedTask(
+  [string]$TaskName,
+  [string]$TaskPath,
+  [string]$TaskXml,
+  [switch]$Force
+) {
+  $parameters = @{
+    TaskName = $TaskName
+    Xml = $TaskXml
+    ErrorAction = 'Stop'
+  }
+  if ($TaskPath) { $parameters.TaskPath = $TaskPath }
+  if ($Force) { $parameters.Force = $true }
+  Register-ScheduledTask @parameters | Out-Null
+}
 function Get-RecoveryTask([string]$TaskName, [string]$TaskPath = '') {
   $tasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
   if ($TaskPath) {
@@ -819,13 +835,8 @@ function Get-TaskProjection($Task) {
   if ($passwordNodes.Count -ne 0) {
     Die 'windows_secret_exposure_refused' 'the scheduled task XML carries a password'
   }
-  $securityDescriptor = [string]$Task.SecurityDescriptor
-  if (-not $securityDescriptor -and $xml.Task.RegistrationInfo) {
-    $securityDescriptor = [string]$xml.Task.RegistrationInfo.SecurityDescriptor
-  }
-  if (-not $securityDescriptor) {
-    DieUnknown 'windows_acl_unreadable' 'the scheduled task has no readable security descriptor'
-  }
+  $taskFile = Get-TaskFilePath $Task
+  $taskFileAcl = Get-AclProjection $taskFile
   $principal = [ordered]@{
     user = [string]$Task.Principal.UserId
     sid = $principalSid
@@ -873,7 +884,7 @@ function Get-TaskProjection($Task) {
     action = $action
     settings = $settings
     triggers_sha256 = Get-JsonSha256 @($Task.Triggers)
-    security_descriptor_sha256 = Get-TextSha256 $securityDescriptor
+    security_descriptor_sha256 = [string]$taskFileAcl.projection_sha256
   }
   return [ordered]@{
     task_path = [string]$Task.TaskPath
@@ -1477,8 +1488,8 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
         }
         Assert-NoReparseAncestor (Join-Path $taskFolder ([string]$Binding.task_name))
         $registeringTask = $true
-        Register-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) `
-          -Xml (Read-Utf8Text (Join-Path $extracted.root 'task.xml')) -ErrorAction Stop | Out-Null
+        Register-ManagedTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) `
+          -TaskXml (Read-Utf8Text (Join-Path $extracted.root 'task.xml'))
         $registeringTask = $false
         $ownedTask = $true
         Disable-ScheduledTask -TaskName ([string]$Binding.task_name) -TaskPath ([string]$Binding.task_path) -ErrorAction Stop | Out-Null
@@ -1798,7 +1809,8 @@ if ($Verb -eq 'rollback') {
   $servingConfig = Action-Config $task
   $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $servingConfig)
   Stop-Endpoint $binding
-  Register-ScheduledTask -TaskName $binding.task_name -Xml (Read-Utf8Text (Join-Path $Previous 'task.xml')) -Force | Out-Null
+  Register-ManagedTask -TaskName $binding.task_name -TaskPath ([string]$binding.task_path) `
+    -TaskXml (Read-Utf8Text (Join-Path $Previous 'task.xml')) -Force
   # The restored task names the previous generation's own configuration; that file is the one
   # the recorded endpoint-before.json replaces - the candidate generation stays untouched.
   $restored = Get-ScheduledTask -TaskName $binding.task_name

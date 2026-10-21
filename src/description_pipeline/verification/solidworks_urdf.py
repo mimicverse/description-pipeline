@@ -1699,11 +1699,7 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             stats.volume > 1e-15 or occurrence in exclusions or _qualified_surface_only(root, occurrence),
             "Zero-volume geometry needs a documented exclusion",
         )
-        if stats.volume > 1e-15:
-            _require(
-                stats.signed_volume > 0,
-                "Closed mesh orientation is globally inverted against its native outward winding",
-            )
+        _verify_native_solid_orientation(source_bytes, row)
         points = stl.vertices(original)
         world = urdf_pose @ origins[0]
         native = components[occurrence]
@@ -1730,6 +1726,103 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
     )
     world_points = points @ body_pose[:3, :3].T + body_pose[:3, 3]
     return used, world_points
+
+
+def _verify_native_solid_orientation(source_bytes: bytes, row: dict) -> None:
+    """Check orientation only on native bodies whose edge incidence proves closure."""
+
+    tessellation = row.get("tessellation")
+    if not isinstance(tessellation, dict):
+        return
+    spans = tessellation.get("face_spans")
+    native_edges = tessellation.get("native_edges")
+    if not isinstance(spans, list) or not isinstance(native_edges, list):
+        return
+    solid_bodies = sorted(
+        {
+            span["body_index"]
+            for span in spans
+            if span.get("body_type") == 0
+        }
+    )
+    for body_index in solid_bodies:
+        body_edges = [
+            edge
+            for edge in native_edges
+            if edge.get("body_type") == 0 and edge.get("body_index") == body_index
+        ]
+        triangles = []
+        for span in spans:
+            if span.get("body_type") != 0 or span.get("body_index") != body_index:
+                continue
+            for triangle_index in range(
+                span["triangle_start"],
+                span["triangle_start"] + span["triangle_count"],
+            ):
+                offset = 84 + 50 * triangle_index + 12
+                values = struct.unpack_from("<9f", source_bytes, offset)
+                triangles.append(tuple(tuple(values[index : index + 3]) for index in range(0, 9, 3)))
+        directed: dict[tuple, list[int]] = {}
+        points = []
+        point_index = {}
+        faces = []
+        for triangle in triangles:
+            keys = []
+            for point in triangle:
+                index = point_index.get(point)
+                if index is None:
+                    index = len(points)
+                    point_index[point] = index
+                    points.append(point)
+                keys.append(index)
+            faces.append(tuple(keys))
+            for left, right in ((keys[0], keys[1]), (keys[1], keys[2]), (keys[2], keys[0])):
+                key = tuple(sorted((left, right)))
+                directed.setdefault(key, []).append(1 if left < right else -1)
+        _require(
+            all(
+                len(directions) != 2
+                or directions[0] != directions[1]
+                for directions in directed.values()
+            ),
+            "Native solid faces contain same-oriented shared triangle edges",
+        )
+        if not body_edges or any(
+            len(edge.get("face_indices") or []) != 2
+            for edge in body_edges
+        ):
+            continue
+        adjacency = {}
+        for triangle_index, face in enumerate(faces):
+            for vertex in face:
+                adjacency.setdefault(vertex, set()).add(triangle_index)
+        pending = set(range(len(faces)))
+        while pending:
+            stack = [pending.pop()]
+            component = []
+            while stack:
+                triangle_index = stack.pop()
+                component.append(triangle_index)
+                for vertex in faces[triangle_index]:
+                    for neighbor in adjacency[vertex]:
+                        if neighbor in pending:
+                            pending.remove(neighbor)
+                            stack.append(neighbor)
+            signed_volume = 0.0
+            for triangle_index in component:
+                a, b, c = (
+                    tuple(float(value) for value in points[index])
+                    for index in faces[triangle_index]
+                )
+                signed_volume += (
+                    a[0] * (b[1] * c[2] - b[2] * c[1])
+                    - a[1] * (b[0] * c[2] - b[2] * c[0])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0])
+                ) / 6.0
+            _require(
+                signed_volume > 0,
+                "Closed native solid component is globally inverted against its native outward winding",
+            )
 
 
 def evaluate_bundle(root: Path, *, native_receipts=None) -> dict:

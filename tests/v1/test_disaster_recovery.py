@@ -3230,6 +3230,26 @@ class RecoveryControlFlowTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
 
+    def test_windows_localized_stderr_bytes_do_not_break_transport_decoding(self) -> None:
+        process = subprocess.CompletedProcess(
+            ["ssh", "windows-fixture"],
+            2,
+            b'{"passed":false,"code":"fixture","message":"refused"}\n',
+            " localized PowerShell error".encode("gb18030"),
+        )
+        with mock.patch.object(recovery, "subprocess") as subprocess_module:
+            subprocess_module.run.return_value = process
+            subprocess_module.CompletedProcess = subprocess.CompletedProcess
+            subprocess_module.SubprocessError = subprocess.SubprocessError
+            completed = recovery._run_windows_powershell(
+                ssh_host="windows-fixture",
+                script="fixture",
+                timeout=5,
+                commands=[],
+            )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("localized PowerShell error", completed.stderr)
+
     def test_windows_failure_receipt_with_expected_verb_is_definite(self) -> None:
         cleanup = {
             "attempted": True,
@@ -3264,6 +3284,48 @@ class RecoveryControlFlowTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "windows_task_not_disabled")
         self.assertEqual(raised.exception.detail["windows_inner_cleanup"], cleanup)
+
+    def test_windows_failure_receipt_preserves_malformed_detail_and_cleanup(self) -> None:
+        cleanup = {
+            "attempted": True,
+            "passed": False,
+            "path": "C:/Users/test/AppData/Local/Temp/windows-recovery-fixture",
+            "error": "access denied",
+        }
+        for malformed in (42, "invalid", ["invalid"]):
+            with self.subTest(detail=malformed):
+                completed = subprocess.CompletedProcess(
+                    ["ssh", "windows-fixture"],
+                    1,
+                    json.dumps(
+                        {
+                            "passed": False,
+                            "code": "windows_task_not_disabled",
+                            "verb": "recovery-snapshot",
+                            "detail": malformed,
+                            "cleanup": cleanup,
+                        }
+                    )
+                    + "\n",
+                    "",
+                )
+                with (
+                    mock.patch.object(recovery, "_run_windows_powershell", return_value=completed),
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery._run_windows_recovery_json(
+                        ssh_host="windows-fixture",
+                        script="fixture",
+                        timeout=5,
+                        commands=[],
+                        expected_verb="recovery-snapshot",
+                    )
+                self.assertEqual(raised.exception.code, "windows_task_not_disabled")
+                self.assertEqual(
+                    raised.exception.detail["malformed_original_detail"],
+                    malformed,
+                )
+                self.assertEqual(raised.exception.detail["windows_inner_cleanup"], cleanup)
 
     def test_windows_remote_dir_is_not_removed_before_creation_is_owned(self) -> None:
         script = write(self.root / "instance-lifecycle.ps1", "fixture\n")

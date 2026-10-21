@@ -224,6 +224,7 @@ def parse_native_tessellation(
                 for value in edge["end_point_m"]
             )
             and isinstance(edge["face_indices"], list)
+            and bool(edge["face_indices"])
             and edge["face_indices"] == sorted(set(edge["face_indices"]))
             and all(_integer(value) and value >= 0 for value in edge["face_indices"]),
             component + f": native edge {index} is malformed",

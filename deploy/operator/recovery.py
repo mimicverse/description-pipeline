@@ -3991,7 +3991,13 @@ def _linux_unit_states(*, timeout: int) -> list[dict]:
 
 
 def _powershell_script(script: str) -> str:
-    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    prelude = (
+        "$ProgressPreference='SilentlyContinue';"
+        "$utf8=New-Object System.Text.UTF8Encoding($false);"
+        "$OutputEncoding=$utf8;"
+        "[Console]::OutputEncoding=$utf8;"
+    )
+    return base64.b64encode((prelude + script).encode("utf-16le")).decode("ascii")
 
 
 def _windows_script_path() -> Path:
@@ -4007,6 +4013,17 @@ def _windows_remote_dir(state_root: str, operation: str, identity: str) -> str:
 
 def _powershell_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _decode_windows_output(payload: bytes) -> str:
+    if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return payload.decode("utf-16")
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return payload.decode("utf-8", errors="replace")
 
 
 def _run_windows_powershell(
@@ -4032,10 +4049,9 @@ def _run_windows_powershell(
         _powershell_script(script),
     ]
     try:
-        completed = subprocess.run(
+        process = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
             timeout=timeout,
             check=False,
         )
@@ -4045,6 +4061,12 @@ def _run_windows_powershell(
             "the Windows recovery command could not be executed",
             {"error": str(error)},
         ) from error
+    completed = subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        _decode_windows_output(process.stdout),
+        _decode_windows_output(process.stderr),
+    )
     commands.append(_command_evidence(argv, completed))
     return completed
 
@@ -4116,7 +4138,13 @@ def _run_windows_recovery_json(
         and isinstance(code, str)
         and code
     ):
-        detail = dict(document.get("detail") or {})
+        raw_detail = document.get("detail")
+        if raw_detail is None:
+            detail = {}
+        elif isinstance(raw_detail, dict):
+            detail = dict(raw_detail)
+        else:
+            detail = {"malformed_original_detail": raw_detail}
         if "cleanup" in document:
             detail["windows_inner_cleanup"] = document["cleanup"]
         raise RecoveryError(
