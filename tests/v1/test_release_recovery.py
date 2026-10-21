@@ -42,13 +42,18 @@ class ReleaseRecoveryTests(unittest.TestCase):
         config.write_text("{}\n", encoding="utf-8")
         key = root / "recovery.key"
         key.write_bytes(b"key")
+        recovery = root / "recovery.py"
+        recovery.write_text("# test recovery entry\n", encoding="utf-8")
         operatorctl = root / "operatorctl.sh"
         operatorctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         operatorctl.chmod(0o700)
         target_plan = root / "target-plan.json"
         target_plan.write_text("{}\n", encoding="utf-8")
         manifest = root / "recovery-manifest.json"
-        manifest.write_text(json.dumps({"release": release}), encoding="utf-8")
+        manifest.write_text(
+            json.dumps({"release": release, "windows": {"state_sha256": "d" * 64}}),
+            encoding="utf-8",
+        )
         return expected, config, key, operatorctl, target_plan, release
 
     def restore_args(self, root: Path, *, status_dir: Path | None = None):
@@ -63,6 +68,87 @@ class ReleaseRecoveryTests(unittest.TestCase):
             config=str(config),
             operatorctl=str(operatorctl),
             expected_release=str(expected),
+            runner=None,
+        )
+
+    def completed_finalize_inputs(self, root: Path) -> SimpleNamespace:
+        status = root / "status"
+        restore = self.restore_args(root, status_dir=status)
+        state_root = root / "state"
+        Path(restore.config).write_text(
+            json.dumps({"storage": {"state_root": str(state_root)}}),
+            encoding="utf-8",
+        )
+
+        def restoring(argv, **_kwargs):
+            if "restore" in argv:
+                run_dir = Path(argv[argv.index("--status-dir") + 1])
+                run_dir.mkdir(parents=True, exist_ok=True)
+                windows = {
+                    "task_state": "Disabled",
+                    "endpoint": "stopped",
+                    "cad_ownership": "free",
+                    "state_sha256": "d" * 64,
+                }
+                (run_dir / "receipt.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "solidworks-to-urdf.recovery-receipt/v1",
+                            "operation": "restore",
+                            "status": "succeeded",
+                            "manifest_sha256": digest(Path(restore.manifest).read_bytes()),
+                            "target_plan_sha256": digest(Path(restore.target_plan).read_bytes()),
+                            "windows": windows,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (run_dir / "recovery-marker.json").write_text(
+                    json.dumps({"release": args_release(restore)}),
+                    encoding="utf-8",
+                )
+            return Result()
+
+        restore.runner = restoring
+        self.assertEqual(release_recovery.restore(restore), 0)
+
+        install_id = "gen-release-rollback"
+        source = root / "install-record.json"
+        source.write_text(
+            json.dumps({"release": args_release(restore)}),
+            encoding="utf-8",
+        )
+        code_rollback = state_root / "promotions" / install_id / "receipt.json"
+        code_rollback.parent.mkdir(parents=True, exist_ok=True)
+        code_rollback.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.promotion/v1",
+                    "install_id": install_id,
+                    "from": str(source),
+                    "from_sha256": digest(source.read_bytes()),
+                    "plan": list(release_recovery.ROLLBACK_STEPS),
+                    "steps": [
+                        {
+                            "seq": index,
+                            "verb": "rollback",
+                            "step": step,
+                            "status": "completed",
+                        }
+                        for index, step in enumerate(release_recovery.ROLLBACK_STEPS, 1)
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            config=restore.config,
+            operatorctl=restore.operatorctl,
+            recovery_py=restore.recovery_py,
+            expected_release=restore.expected_release,
+            restore_status_dir=str(status),
+            code_rollback_receipt=str(code_rollback),
+            install_id=install_id,
             runner=None,
         )
 
@@ -121,6 +207,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                                 "windows": {
                                     "task_state": "Disabled",
                                     "endpoint": "stopped",
+                                    "cad_ownership": "free",
                                     "state_sha256": "d" * 64,
                                 },
                             }
@@ -140,7 +227,13 @@ class ReleaseRecoveryTests(unittest.TestCase):
             self.assertEqual(len(calls), before)
             receipt = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
             self.assertEqual(receipt["database_rollback"], True)
-            self.assertEqual(receipt["health"], "PASS")
+            self.assertEqual(receipt["database_restore_executed"], True)
+            self.assertEqual(receipt["database_recovery_verified"], True)
+            self.assertEqual(receipt["runtime_restart"], False)
+            self.assertEqual(receipt["services_stopped"], True)
+            self.assertEqual(receipt["admission"], "closed")
+            self.assertEqual(receipt["health"], "NOT_RUN")
+            self.assertFalse(any("start" in row for row in calls))
 
     def test_restore_release_mismatch_refuses_before_runner(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -268,6 +361,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                                 "windows": {
                                     "task_state": "Disabled",
                                     "endpoint": "stopped",
+                                    "cad_ownership": "free",
                                     "state_sha256": "d" * 64,
                                 },
                             }
@@ -283,7 +377,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
 
             args.runner = runner
             self.assertEqual(release_recovery.restore(args, verify_only=True), 0)
-            self.assertTrue(any("start" in row for row in calls))
+            self.assertFalse(any("start" in row for row in calls))
             calls.clear()
             self.assertEqual(release_recovery.restore(args), 0)
             self.assertTrue(any("restore" in row for row in calls))
@@ -321,6 +415,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                                 "windows": {
                                     "task_state": "Disabled",
                                     "endpoint": "stopped",
+                                    "cad_ownership": "free",
                                     "state_sha256": "d" * 64,
                                 },
                             }
@@ -336,50 +431,9 @@ class ReleaseRecoveryTests(unittest.TestCase):
             self.assertEqual(gate["database_rollback"], False)
             self.assertEqual(gate["database_restore_executed"], False)
             self.assertEqual(gate["database_recovery_verified"], True)
-            self.assertEqual(gate["runtime_restart"], True)
-
-    def test_verify_start_and_health_failures_preserve_evidence(self):
-        for failing_command in ("start", "health"):
-            with self.subTest(failing_command=failing_command):  # noqa: SIM117
-                with tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    status = root / "status"
-                    args = self.restore_args(root, status_dir=status)
-
-                    def runner(argv, _failing=failing_command, **_kwargs):
-                        if "verify-only" in argv:
-                            run_dir = Path(argv[argv.index("--status-dir") + 1])
-                            run_dir.mkdir(parents=True, exist_ok=True)
-                            (run_dir / "receipt.json").write_text(
-                                json.dumps(
-                                    {
-                                        "status": "succeeded",
-                                        "windows": {
-                                            "task_state": "Disabled",
-                                            "endpoint": "stopped",
-                                            "state_sha256": "d" * 64,
-                                        },
-                                    }
-                                ),
-                                encoding="utf-8",
-                            )
-                            return Result()
-                        if _failing in argv:
-                            return Result(returncode=1, stderr=f"{_failing} failed\n")
-                        return Result()
-
-                    args.runner = runner
-                    with self.assertRaisesRegex(
-                        release_recovery.GateError,
-                        "operatorctl.sh exited with 1",
-                    ):
-                        release_recovery.restore(args, verify_only=True)
-                    gate = json.loads(
-                        (status / release_recovery.RECEIPT).read_text(encoding="utf-8")
-                    )
-                    self.assertEqual(gate["status"], "failed")
-                    self.assertEqual(gate["preserved"], True)
-                    self.assertIn("recovery_receipt_sha256", gate)
+            self.assertEqual(gate["runtime_restart"], False)
+            self.assertEqual(gate["services_stopped"], True)
+            self.assertEqual(gate["admission"], "closed")
 
     def test_timeout_preserves_failure_gate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -414,6 +468,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                                 "windows": {
                                     "task_state": "Disabled",
                                     "endpoint": "stopped",
+                                    "cad_ownership": "free",
                                     "state_sha256": "d" * 64,
                                 },
                             }
@@ -428,6 +483,275 @@ class ReleaseRecoveryTests(unittest.TestCase):
             Path(args.key).unlink()
             with self.assertRaisesRegex(release_recovery.GateError, "recovery key"):
                 release_recovery.restore(args)
+
+    def test_windows_state_hash_must_match_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "status"
+            args = self.restore_args(root, status_dir=status)
+
+            def runner(argv, **_kwargs):
+                if "restore" in argv:
+                    run_dir = Path(argv[argv.index("--status-dir") + 1])
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "receipt.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "succeeded",
+                                "windows": {
+                                    "task_state": "Disabled",
+                                    "endpoint": "stopped",
+                                    "cad_ownership": "free",
+                                    "state_sha256": "not-a-hash",
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    (run_dir / "recovery-marker.json").write_text(
+                        json.dumps({"release": args_release(args)}),
+                        encoding="utf-8",
+                    )
+                return Result()
+
+            args.runner = runner
+            with self.assertRaisesRegex(release_recovery.GateError, "state-identical"):
+                release_recovery.restore(args)
+            gate = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
+            self.assertEqual(gate["status"], "failed")
+            self.assertNotIn("windows_verified", gate)
+
+    def test_release_plan_cannot_replace_fixed_authorities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = root / "plan.json"
+            plan.write_text(
+                json.dumps(
+                    {
+                        "config": str(root / "config.json"),
+                        "manifest": str(root / "manifest.json"),
+                        "key_file": str(root / "key"),
+                        "target_plan": str(root / "target.json"),
+                        "operatorctl": str(root / "fake-operatorctl"),
+                        "recovery_py": str(root / "fake-recovery.py"),
+                        "expected_release": str(root / "fake-release.json"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(plan=str(plan), runner=lambda *_a, **_k: Result(), timeout=1)
+            with self.assertRaisesRegex(release_recovery.GateError, "fixed release authorities"):
+                release_recovery.restore_from_plan(args)
+            with self.assertRaisesRegex(release_recovery.GateError, "fixed release authorities"):
+                release_recovery.finalize_from_plan(args)
+
+    def test_release_plan_uses_fixed_release_root_authorities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release_root = root / "release"
+            operator_root = release_root / "deploy" / "operator"
+            operator_root.mkdir(parents=True)
+            release = {
+                "version": "1.5.0",
+                "source_commit": "a" * 40,
+                "source_sha256": "b" * 64,
+            }
+            (release_root / "release.json").write_text(
+                json.dumps({"release": release}),
+                encoding="utf-8",
+            )
+            (operator_root / "recovery.py").write_text("# fixed recovery\n", encoding="utf-8")
+            (operator_root / "operatorctl.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            config = root / "platform.json"
+            config.write_text("{}\n", encoding="utf-8")
+            plan = root / "plan.json"
+            status = root / "status"
+            plan.write_text(
+                json.dumps(
+                    {
+                        "config": str(config),
+                        "manifest": str(root / "manifest.json"),
+                        "key_file": str(root / "key"),
+                        "target_plan": str(root / "target.json"),
+                        "restore_status_dir": str(status),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(plan=str(plan), runner=lambda *_a, **_k: Result(), timeout=1)
+            original = release_recovery.RELEASE_ROOT
+            release_recovery.RELEASE_ROOT = release_root
+            try:
+                parsed = release_recovery.restore_from_plan(args)
+            finally:
+                release_recovery.RELEASE_ROOT = original
+            self.assertEqual(Path(parsed.recovery_py), operator_root / "recovery.py")
+            self.assertEqual(Path(parsed.operatorctl), operator_root / "operatorctl.sh")
+            self.assertEqual(Path(parsed.expected_release), release_root / "release.json")
+            self.assertEqual(parsed.status_dir, str(status))
+
+    def test_finalize_requires_restore_then_starts_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.completed_finalize_inputs(root)
+            calls = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                action = argv[1]
+                if action == "start":
+                    return Result(stdout="start complete: admission open\n")
+                if action == "status":
+                    return Result(
+                        stdout=(
+                            "description-portal.service active\n"
+                            + json.dumps(
+                                {
+                                    "task_name": "Description",
+                                    "task_state": "Running",
+                                    "listener_pid": 42,
+                                    "process_start_utc": "2026-10-21T00:00:00Z",
+                                    "install_id": args.install_id,
+                                    "config_digest": "a" * 64,
+                                }
+                            )
+                            + "\n"
+                        )
+                    )
+                if action == "health":
+                    return Result(stdout="PASS endpoint identity\n")
+                self.fail(f"unexpected command: {argv}")
+
+            args.runner = runner
+            self.assertEqual(release_recovery.finalize(args), 0)
+            self.assertEqual([argv[1] for argv in calls], ["start", "status", "health"])
+            status = Path(args.restore_status_dir)
+            gate = json.loads(
+                (status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8")
+            )
+            restore_gate = json.loads(
+                (status / release_recovery.RECEIPT).read_text(encoding="utf-8")
+            )
+            self.assertEqual(gate["operation"], "release-finalize")
+            self.assertEqual(gate["database_restore_executed"], True)
+            self.assertEqual(gate["database_recovery_verified"], True)
+            self.assertEqual(gate["runtime_restart"], True)
+            self.assertEqual(gate["services_running"], True)
+            self.assertEqual(gate["admission"], "open")
+            self.assertEqual(gate["windows_verified"], True)
+            self.assertEqual(gate["health"], "PASS")
+            self.assertEqual(gate["operator_status"], "PASS")
+            self.assertEqual(gate["restore"]["operation"], "recovery-restore")
+            self.assertEqual(
+                gate["inputs"]["restore_gate_sha256"],
+                digest((status / release_recovery.RECEIPT).read_bytes()),
+            )
+            self.assertFalse(restore_gate["runtime_restart"])
+            before = len(calls)
+            self.assertEqual(release_recovery.finalize(args), 0)
+            self.assertEqual(len(calls), before)
+
+    def test_finalize_refuses_verify_only_gate_before_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.completed_finalize_inputs(root)
+            gate_path = Path(args.restore_status_dir) / release_recovery.RECEIPT
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            gate["operation"] = "recovery-verify-only"
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            calls = []
+            args.runner = lambda argv, **_kwargs: calls.append(argv) or Result()
+            with self.assertRaisesRegex(release_recovery.GateError, "restore operation"):
+                release_recovery.finalize(args)
+            self.assertEqual(calls, [])
+
+    def test_finalize_refuses_incomplete_code_rollback_before_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.completed_finalize_inputs(root)
+            rollback_path = Path(args.code_rollback_receipt)
+            receipt = json.loads(rollback_path.read_text(encoding="utf-8"))
+            receipt["steps"][-1]["status"] = "failed"
+            rollback_path.write_text(json.dumps(receipt), encoding="utf-8")
+            calls = []
+            args.runner = lambda argv, **_kwargs: calls.append(argv) or Result()
+            with self.assertRaisesRegex(release_recovery.GateError, "has not completed"):
+                release_recovery.finalize(args)
+            self.assertEqual(calls, [])
+
+    def test_finalize_rejects_noncanonical_code_rollback_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.completed_finalize_inputs(root)
+            fake = root / "fake-rollback.json"
+            fake.write_bytes(Path(args.code_rollback_receipt).read_bytes())
+            args.code_rollback_receipt = str(fake)
+            calls = []
+            args.runner = lambda argv, **_kwargs: calls.append(argv) or Result()
+            with self.assertRaisesRegex(release_recovery.GateError, "canonical receipt"):
+                release_recovery.finalize(args)
+            self.assertEqual(calls, [])
+
+    def test_finalize_start_failure_preserves_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.completed_finalize_inputs(root)
+            calls = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                return Result(returncode=1, stderr="start failed\n")
+
+            args.runner = runner
+            with self.assertRaisesRegex(release_recovery.GateError, "exited with 1"):
+                release_recovery.finalize(args)
+            self.assertEqual([argv[1] for argv in calls], ["start"])
+            status = Path(args.restore_status_dir)
+            gate = json.loads(
+                (status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8")
+            )
+            self.assertEqual(gate["status"], "failed")
+            self.assertEqual(gate["preserved"], True)
+            self.assertIsNone(gate["failure_drain"])
+
+    def test_finalize_post_start_failure_drains_and_preserves_identity_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.completed_finalize_inputs(root)
+            calls = []
+
+            def runner(argv, **_kwargs):
+                calls.append(argv)
+                if argv[1] == "start":
+                    return Result(stdout="start complete: admission open\n")
+                if argv[1] == "status":
+                    return Result(
+                        stdout=json.dumps(
+                            {
+                                "task_state": "Running",
+                                "install_id": "another-generation",
+                                "config_digest": "b" * 64,
+                                "listener_pid": 9,
+                                "process_start_utc": "2026-10-21T00:00:00Z",
+                            }
+                        )
+                        + "\n"
+                    )
+                if argv[1] == "drain":
+                    return Result(stdout="admission=closed revision=2\n")
+                self.fail(f"unexpected command: {argv}")
+
+            args.runner = runner
+            with self.assertRaisesRegex(release_recovery.GateError, "Windows identity"):
+                release_recovery.finalize(args)
+            self.assertEqual([argv[1] for argv in calls], ["start", "status", "drain"])
+            status = Path(args.restore_status_dir)
+            gate = json.loads(
+                (status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8")
+            )
+            self.assertEqual(gate["status"], "failed")
+            self.assertEqual(gate["failure_drain"]["returncode"], 0)
+            self.assertTrue(gate["failure_drain"]["stdout_sha256"])
 
 
 def args_release(args) -> dict:
