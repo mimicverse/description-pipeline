@@ -1598,6 +1598,26 @@ class NativeFinCaptureTests(unittest.TestCase):
 
         self.assertIn("endpoint evaluation is malformed", str(caught.exception))
 
+    def test_parser_rejects_malformed_fin_u_payload_without_type_error(self):
+        evidence, triangles = self.group_333_tessellation()
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "native_edge"
+        )
+        fin["start_evidence"]["evaluate_payload"] = None
+
+        with self.assertRaises(PipelineError) as caught:
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+        self.assertIn("U evidence is not independently reproducible", str(caught.exception))
+
     def test_reverse_sense_requires_directed_topology_mapping(self):
         body, _face_10, _face_20, edge, _tessellation, extension = self.fixture()
         edge.sense = False

@@ -93,25 +93,6 @@ def _valid_u_evidence(
     closest = value["closest_point_on_raw"]
     parameter = value["parameter_raw"]
     evaluated = value["evaluate_payload"]
-    evaluated_point = evaluated[:3]
-    if native_u_equal(value["u"], domain_lower):
-        computed_tolerance = native_curve_endpoint_operation_tolerance(
-            endpoint_point,
-            evaluated_point,
-            curve_end,
-        )
-    elif native_u_equal(value["u"], domain_upper):
-        computed_tolerance = native_curve_endpoint_operation_tolerance(
-            endpoint_point,
-            evaluated_point,
-            curve_start,
-        )
-    else:
-        computed_tolerance = native_point_roundtrip_tolerance(
-            endpoint_point,
-            closest[:3],
-            evaluated_point,
-        )
     numeric = (int, float)
     if (
         not isinstance(endpoint_point, (list, tuple))
@@ -132,11 +113,49 @@ def _valid_u_evidence(
             type(item) in numeric and math.isfinite(float(item))
             for item in evaluated
         )
+        or not isinstance(curve_start, (list, tuple))
+        or len(curve_start) != 3
+        or not all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in curve_start
+        )
+        or not isinstance(curve_end, (list, tuple))
+        or len(curve_end) != 3
+        or not all(
+            type(item) in numeric and math.isfinite(float(item))
+            for item in curve_end
+        )
+        or type(domain_lower) not in numeric
+        or type(domain_upper) not in numeric
+        or not math.isfinite(float(domain_lower))
+        or not math.isfinite(float(domain_upper))
+        or type(u_parameter) not in numeric
+        or not math.isfinite(float(u_parameter))
+        or type(value["u"]) not in numeric
+        or not math.isfinite(float(value["u"]))
     ):
         return False
     closest_point = tuple(closest[:3])
     evaluated_point = tuple(evaluated[:3])
     expected_point = tuple(float(item) for item in endpoint_point)
+    if native_u_equal(value["u"], domain_lower):
+        computed_tolerance = native_curve_endpoint_operation_tolerance(
+            expected_point,
+            evaluated_point,
+            curve_end,
+        )
+    elif native_u_equal(value["u"], domain_upper):
+        computed_tolerance = native_curve_endpoint_operation_tolerance(
+            expected_point,
+            evaluated_point,
+            curve_start,
+        )
+    else:
+        computed_tolerance = native_point_roundtrip_tolerance(
+            expected_point,
+            closest_point,
+            evaluated_point,
+        )
     closest_error = native_point_error(expected_point, closest_point)
     evaluate_error = native_point_error(expected_point, evaluated_point)
     closest_evaluate_error = native_point_error(
@@ -165,7 +184,6 @@ def _valid_u_evidence(
         and value["closest_evaluate_error_m"] == closest_evaluate_error
         and max(closest_error, evaluate_error, closest_evaluate_error)
         <= computed_tolerance
-        and type(u_parameter) in numeric
         and native_u_equal(value["u"], u_parameter)
         and isinstance(parameter, list)
         and len(parameter) == 2
