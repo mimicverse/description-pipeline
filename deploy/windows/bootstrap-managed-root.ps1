@@ -91,10 +91,10 @@ function Get-ManagedTreeSnapshot(
       throw ('managed tree contains a reparse point: ' + $path)
     }
     $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
-    $security = if ($item.PSIsContainer) {
-      New-Object System.Security.AccessControl.DirectorySecurity
+    if ($item.PSIsContainer) {
+      $security = New-Object System.Security.AccessControl.DirectorySecurity
     } else {
-      New-Object System.Security.AccessControl.FileSecurity
+      $security = New-Object System.Security.AccessControl.FileSecurity
     }
     $security.SetSecurityDescriptorSddlForm(
       [string]$acl.GetSecurityDescriptorSddlForm(
@@ -134,10 +134,10 @@ function Set-ManagedAcl([string]$path, [string]$serviceSid) {
   } else {
     [System.Security.AccessControl.InheritanceFlags]::None
   }
-  $acl = if ($item.PSIsContainer) {
-    New-Object System.Security.AccessControl.DirectorySecurity
+  if ($item.PSIsContainer) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
   } else {
-    New-Object System.Security.AccessControl.FileSecurity
+    $acl = New-Object System.Security.AccessControl.FileSecurity
   }
   $acl.SetOwner(
     (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))
