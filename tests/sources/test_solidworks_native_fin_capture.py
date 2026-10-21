@@ -628,9 +628,11 @@ class NativeFinCaptureTests(unittest.TestCase):
         }
         return start, end, evaluated_start, evaluated_end
 
-    def group_333_tessellation(self):
+    def group_333_tessellation(self, *, topology_start=None):
         body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
         self.configure_group_333(edge, tessellation)
+        if topology_start is not None:
+            edge.vertices[0] = FakeVertex(topology_start)
         backend = SolidWorksBackend()
         backend._source_components = {"part-1": (object(), "Default")}
         backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
@@ -779,6 +781,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                 fin["end_u"],
                 fallback=end_point == near,
             )
+        support.refresh_topology_endpoint_assignment(evidence)
         return evidence, triangles, edge_row, start, near, end, bind
 
     @staticmethod
@@ -2896,6 +2899,119 @@ class NativeFinCaptureTests(unittest.TestCase):
             caught.exception.message,
         )
 
+    def test_topology_pairing_accepts_39nm_native_point_wobble(self):
+        start = (
+            -0.005322370050934642,
+            0.00013700629315608413,
+            -0.0021180644098793633,
+        )
+        tessellation, _triangles = self.group_333_tessellation(
+            topology_start=(
+                start[0] + 3.936764624706823e-8,
+                start[1] - 1.1517504897859e-8,
+                start[2] - 9.72215465027256e-11,
+            )
+        )
+
+        assignment = tessellation["native_edges"][0][
+            "topology_endpoint_assignment"
+        ]
+        self.assertTrue(assignment["accepted"])
+        self.assertEqual(assignment["result"], "sense_directed")
+        self.assertLess(assignment["direct_error_m"], 50e-6)
+        self.assertGreater(assignment["swapped_error_m"], 50e-6)
+        self.assertGreater(assignment["wrong_assignment_margin_m"], 0.0)
+
+    def test_topology_pairing_rejects_swapped_edge_vertices(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        start, end, _evaluated_start, _evaluated_end = self.configure_group_333(
+            edge,
+            tessellation,
+        )
+        edge.vertices = [FakeVertex(end), FakeVertex(start)]
+        backend = SolidWorksBackend()
+        backend._source_components = {"part-1": (object(), "Default")}
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
+            Extension=extension
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ), self.assertRaises(CadError) as caught:
+            backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                FakeHolder(body),
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "cad_native_tessellation_unreadable",
+        )
+        self.assertIn(
+            "edge topology endpoints disagree with curve parameter direction",
+            caught.exception.message,
+        )
+        assignment = caught.exception.detail["topology_endpoint_assignment"]
+        self.assertFalse(assignment["accepted"])
+        self.assertEqual(assignment["result"], "swapped_only")
+
+    def test_producer_defers_ambiguous_topology_to_collapsed_parser_gate(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        start = (0.0, 0.0, 0.0)
+        end = (20e-6, 0.0, 0.0)
+        edge.u_min = 2.667937521368035e-7
+        edge.u_max = 0.0005305172218399963
+        edge.curve = FakeCurve(
+            -10.0,
+            10.0,
+            is_closed=False,
+            is_periodic=False,
+        )
+        edge.parameter_success = True
+        edge.curve_start_point = list(start)
+        edge.curve_end_point = list(end)
+        edge.vertices = [FakeVertex(start), FakeVertex(end)]
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: start,
+            2: end,
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+        u_by_point = {start: edge.u_min, end: edge.u_max}
+        edge.GetClosestPointOn = lambda x, y, z: [
+            x,
+            y,
+            z,
+            u_by_point[(x, y, z)],
+            0.0,
+        ]
+        edge.GetParameter = lambda x, y, z: [u_by_point[(x, y, z)], True]
+        edge.evaluate_points = [start, end]
+        edge.evaluate_u_points = {edge.u_min: start, edge.u_max: end}
+        backend = SolidWorksBackend()
+        backend._source_components = {"part-1": (object(), "Default")}
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
+            Extension=extension
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            entry = backend._write_component_mesh(
+                "part-1",
+                Path(directory) / "mesh.stl",
+                FakeHolder(body),
+            )
+
+        assignment = entry["tessellation"]["native_edges"][0][
+            "topology_endpoint_assignment"
+        ]
+        self.assertEqual(assignment["result"], "ambiguous")
+        self.assertFalse(assignment["accepted"])
+
     def test_curve_endpoint_roles_separate_parameter_order_from_sense(self):
         start = (0.0, 1.0, 2.0)
         end = (3.0, 4.0, 5.0)
@@ -3073,6 +3189,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                     (0.0, 0.0, 0.0) if tuple(point) in old_edge_points else point
                     for point in triangle
                 )
+            support.refresh_topology_endpoint_assignment(derived)
             derived_spans = parse_native_tessellation(
                 "part-1",
                 derived,

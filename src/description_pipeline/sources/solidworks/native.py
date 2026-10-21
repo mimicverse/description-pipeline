@@ -45,6 +45,7 @@ from ...geometry.native_u import (
     NATIVE_U_RESOLUTION_RULE,
     native_curve_endpoint_operation_tolerance,
     native_curve_endpoint_roles,
+    native_curve_topology_endpoint_assignment,
     native_evaluate2_evidence,
     native_fin_interval,
     native_get_parameter_success,
@@ -5401,6 +5402,7 @@ class SolidWorksBackend(CadBackend):
                             "curve endpoint"
                         )
             edge_row["curve_endpoint_evaluations"] = curve_evaluations
+            edge_row["topology_endpoint_assignment"] = None
             endpoint_states = {
                 name: endpoints[name]["state"] for name in ("start", "end")
             }
@@ -5479,35 +5481,33 @@ class SolidWorksBackend(CadBackend):
                     },
                 )
             if set(endpoint_states.values()) == {"present"}:
-                for name, expected_point in zip(
-                    ("start", "end"),
-                    topology_endpoints,
-                    strict=True,
-                ):
-                    actual_point = endpoints[name]["point_m"]
-                    tolerance = native_point_roundtrip_tolerance(
-                        expected_point,
-                        actual_point,
+                topology_assignment = native_curve_topology_endpoint_assignment(
+                    topology_endpoints[0],
+                    topology_endpoints[1],
+                    endpoints["start"]["point_m"],
+                    endpoints["end"]["point_m"],
+                )
+                edge_row["topology_endpoint_assignment"] = topology_assignment
+                if topology_assignment["result"] not in {
+                    "sense_directed",
+                    "ambiguous",
+                }:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        (
+                            "edge topology endpoints disagree with curve "
+                            "parameter direction"
+                            if topology_assignment["direct_error_m"]
+                            > topology_assignment["point_tolerance_m"]
+                            else "edge topology endpoint direction is ambiguous"
+                        ),
+                        {
+                            **base,
+                            "edge_index": edge_row["index"],
+                            "curve_sense": curve_sense,
+                            "topology_endpoint_assignment": topology_assignment,
+                        },
                     )
-                    error_m = max(
-                        abs(expected_point[index] - actual_point[index])
-                        for index in range(3)
-                    )
-                    if error_m > tolerance:
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "edge topology endpoints disagree with curve parameter direction",
-                            {
-                                **base,
-                                "edge_index": edge_row["index"],
-                                "endpoint": name,
-                                "curve_sense": curve_sense,
-                                "expected_point_m": list(expected_point),
-                                "actual_point_m": list(actual_point),
-                                "point_tolerance_m": tolerance,
-                                "point_error_m": error_m,
-                            },
-                        )
             if not both_absent and (
                 not endpoint_evaluations_valid
                 or curve_domain_transform["status"]
@@ -7011,6 +7011,9 @@ class SolidWorksBackend(CadBackend):
                     ],
                     "curve_endpoint_evaluations": row[
                         "curve_endpoint_evaluations"
+                    ],
+                    "topology_endpoint_assignment": row[
+                        "topology_endpoint_assignment"
                     ],
                     "endpoint_points_derived_from_curve": row[
                         "endpoint_points_derived_from_curve"

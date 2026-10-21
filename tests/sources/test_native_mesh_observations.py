@@ -1065,6 +1065,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
             False,
             edge["curve_end_params"]["is_periodic"],
         )
+        support.refresh_topology_endpoint_assignment(tessellation)
 
         with self.assertRaisesRegex(
             PipelineError,
