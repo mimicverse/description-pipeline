@@ -24,6 +24,8 @@ from description_pipeline.geometry.native_u import (
     NATIVE_U_RESOLUTION_RULE,
     native_curve_domain_transform,
     native_curve_endpoint_operation_tolerance,
+    native_curve_endpoint_roles,
+    native_curve_topology_endpoint_assignment,
     native_evaluate2_evidence,
     native_point_roundtrip_tolerance,
     native_u_equal,
@@ -744,6 +746,17 @@ def native_tessellation_fixture(
         )
         if curve_domain_transform["rule_version"] != NATIVE_CURVE_DOMAIN_RULE:
             raise ValueError("native curve domain rule differs")
+        _, topology_endpoints = native_curve_endpoint_roles(
+            curve_start_point,
+            curve_end_point,
+            curve_sense,
+        )
+        topology_assignment = native_curve_topology_endpoint_assignment(
+            topology_endpoints[0],
+            topology_endpoints[1],
+            edge["start_point_m"],
+            edge["end_point_m"],
+        )
         edge_rows.append(
             {
                 "body_type": body_key[0],
@@ -802,6 +815,7 @@ def native_tessellation_fixture(
                         curve_start_point,
                     ),
                 },
+                "topology_endpoint_assignment": topology_assignment,
                 "endpoint_points_derived_from_curve": False,
                 "face_senses": [
                     {
@@ -968,6 +982,28 @@ def native_tessellation_fixture(
         stl_bytes=stl_bytes,
         triangle_vertices=fixture_triangles,
     )
+
+
+def refresh_topology_endpoint_assignment(tessellation: dict[str, Any]) -> None:
+    """Recompute the topology audit after a test mutates curve or endpoint evidence."""
+
+    for edge in tessellation["native_edges"]:
+        if edge["start_point_m"] is None or edge["end_point_m"] is None:
+            edge["topology_endpoint_assignment"] = None
+            continue
+        _, topology_endpoints = native_curve_endpoint_roles(
+            edge["curve_start_point_m"],
+            edge["curve_end_point_m"],
+            edge["curve_sense"],
+        )
+        edge["topology_endpoint_assignment"] = (
+            native_curve_topology_endpoint_assignment(
+                topology_endpoints[0],
+                topology_endpoints[1],
+                edge["start_point_m"],
+                edge["end_point_m"],
+            )
+        )
 
 
 def _matrix16(values: Sequence[float]) -> Matrix:

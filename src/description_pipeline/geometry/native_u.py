@@ -23,6 +23,10 @@ NATIVE_TESSELLATION_EDGE_PROJECTION_RULE = (
     "tessellation-edge-projection-v1"
 )
 NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M = 50e-6
+NATIVE_CURVE_TOPOLOGY_PAIRING_RULE = "native-curve-topology-paired-endpoints-v1"
+NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE = (
+    "NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M"
+)
 NATIVE_COLLAPSED_U_FIN_RULE = "native-fin-u-collapse-v1"
 NATIVE_PERIODIC_FIN_INTERVAL_RULE = "native-periodic-fin-interval-v1"
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
@@ -653,6 +657,59 @@ def native_curve_endpoint_operation_tolerance(*points) -> float:
         native_point_roundtrip_tolerance(endpoint, evaluated)
         + native_point_roundtrip_tolerance(endpoint, opposite)
     )
+
+
+def native_curve_topology_endpoint_assignment(
+    expected_start,
+    expected_end,
+    actual_start,
+    actual_end,
+    *,
+    tolerance_m: float = NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
+) -> dict:
+    """Prove the sense-directed curve endpoints uniquely match the edge topology."""
+
+    points = (expected_start, expected_end, actual_start, actual_end)
+    if any(len(point) != 3 for point in points):
+        raise ValueError("topology endpoint points must contain three coordinates")
+    tolerance = _native_u(tolerance_m)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("topology endpoint tolerance must be finite and non-negative")
+    if tolerance != NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M:
+        raise ValueError("topology endpoint tolerance must use the fixed native bound")
+    direct_error = max(
+        native_point_error(expected_start, actual_start),
+        native_point_error(expected_end, actual_end),
+    )
+    swapped_error = max(
+        native_point_error(expected_start, actual_end),
+        native_point_error(expected_end, actual_start),
+    )
+    accepted = direct_error <= tolerance < swapped_error
+    if accepted:
+        result = "sense_directed"
+    elif direct_error <= tolerance:
+        result = "ambiguous"
+    elif swapped_error <= tolerance:
+        result = "swapped_only"
+    else:
+        result = "unmatched"
+    return {
+        "rule_version": NATIVE_CURVE_TOPOLOGY_PAIRING_RULE,
+        "metric": "max_abs_coordinate",
+        "expected_start_point_m": list(expected_start),
+        "expected_end_point_m": list(expected_end),
+        "actual_start_point_m": list(actual_start),
+        "actual_end_point_m": list(actual_end),
+        "direct_error_m": direct_error,
+        "swapped_error_m": swapped_error,
+        "direct_margin_to_tolerance_m": tolerance - direct_error,
+        "wrong_assignment_margin_m": swapped_error - tolerance,
+        "point_tolerance_m": tolerance,
+        "point_tolerance_source": NATIVE_CURVE_TOPOLOGY_PAIRING_TOLERANCE_SOURCE,
+        "result": result,
+        "accepted": accepted,
+    }
 
 
 def native_curve_endpoint_roles(
