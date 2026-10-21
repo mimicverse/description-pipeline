@@ -942,7 +942,10 @@ function Get-ManagedEndpointAclRows($Config, [string]$EndpointRoot, [string]$Con
   $common = Get-ManagedCommonParent $paths
   $rows = @()
   $seen = @{}
-  foreach ($path in @($common + $paths)) {
+  $managedPaths = @()
+  $managedPaths += $common
+  $managedPaths += $paths
+  foreach ($path in $managedPaths) {
     $normalized = (Normalize-PathIdentity $path).TrimEnd('/')
     $key = $normalized.ToLowerInvariant()
     if (-not $seen.ContainsKey($key)) {
