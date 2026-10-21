@@ -22,6 +22,7 @@ from description_pipeline.geometry.native_u import (
     native_curve_endpoint_operation_tolerance,
     native_evaluate2_evidence,
     native_point_roundtrip_tolerance,
+    native_u_equal,
 )
 from description_pipeline.io import file_digest
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
@@ -216,9 +217,35 @@ def _evaluate2_evidence(
 def _u_evidence(
     u_parameter: float,
     point: tuple[float, float, float],
+    *,
+    domain_lower: float | None = None,
+    domain_upper: float | None = None,
+    curve_start: Sequence[float] | None = None,
+    curve_end: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     payload, packed_status = _evaluate2_evidence(point)
-    tolerance = native_point_roundtrip_tolerance(point, point, point)
+    if (
+        domain_lower is not None
+        and native_u_equal(u_parameter, domain_lower)
+        and curve_end is not None
+    ):
+        tolerance = native_curve_endpoint_operation_tolerance(
+            point,
+            point,
+            curve_end,
+        )
+    elif (
+        domain_upper is not None
+        and native_u_equal(u_parameter, domain_upper)
+        and curve_start is not None
+    ):
+        tolerance = native_curve_endpoint_operation_tolerance(
+            point,
+            point,
+            curve_start,
+        )
+    else:
+        tolerance = native_point_roundtrip_tolerance(point, point, point)
     return {
         "u": u_parameter,
         "u_parameter_rule": NATIVE_U_POINT_PARAMETER_RULE,
@@ -599,10 +626,18 @@ def native_tessellation_v3(
                         "start_evidence": _u_evidence(
                             first_start_u,
                             body["points_by_vertex_id"][first_fin["vertex_ids"][0]],
+                            domain_lower=u_min,
+                            domain_upper=u_max,
+                            curve_start=_binary32_point(edge["start_point_m"]),
+                            curve_end=_binary32_point(edge["end_point_m"]),
                         ),
                         "end_evidence": _u_evidence(
                             first_end_u,
                             body["points_by_vertex_id"][first_fin["vertex_ids"][1]],
+                            domain_lower=u_min,
+                            domain_upper=u_max,
+                            curve_start=_binary32_point(edge["start_point_m"]),
+                            curve_end=_binary32_point(edge["end_point_m"]),
                         ),
                         "cofin_id": second_fin["fin_id"],
                     }
@@ -616,10 +651,18 @@ def native_tessellation_v3(
                         "start_evidence": _u_evidence(
                             second_start_u,
                             body["points_by_vertex_id"][second_fin["vertex_ids"][0]],
+                            domain_lower=u_min,
+                            domain_upper=u_max,
+                            curve_start=_binary32_point(edge["start_point_m"]),
+                            curve_end=_binary32_point(edge["end_point_m"]),
                         ),
                         "end_evidence": _u_evidence(
                             second_end_u,
                             body["points_by_vertex_id"][second_fin["vertex_ids"][1]],
+                            domain_lower=u_min,
+                            domain_upper=u_max,
+                            curve_start=_binary32_point(edge["start_point_m"]),
+                            curve_end=_binary32_point(edge["end_point_m"]),
                         ),
                         "cofin_id": first_fin["fin_id"],
                     }

@@ -5330,11 +5330,24 @@ class SolidWorksBackend(CadBackend):
             evaluated_point = _binary64_xyz(
                 evaluate_evidence["payload"][:3]
             )
-            point_tolerance = native_point_roundtrip_tolerance(
-                point,
-                closest_point,
-                evaluated_point,
-            )
+            if native_u_equal(parameter_u, domain["u_min"]):
+                point_tolerance = native_curve_endpoint_operation_tolerance(
+                    point,
+                    evaluated_point,
+                    domain["end_point_m"],
+                )
+            elif native_u_equal(parameter_u, domain["u_max"]):
+                point_tolerance = native_curve_endpoint_operation_tolerance(
+                    point,
+                    evaluated_point,
+                    domain["start_point_m"],
+                )
+            else:
+                point_tolerance = native_point_roundtrip_tolerance(
+                    point,
+                    closest_point,
+                    evaluated_point,
+                )
 
             def point_error(left, right):
                 return max(

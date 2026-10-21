@@ -6,7 +6,7 @@ import math
 import struct
 
 NATIVE_U_IDENTITY_RULE = "native-u-identity-128ulp-v1"
-NATIVE_U_POINT_PARAMETER_RULE = "native-u-point-parameter-authoritative-v1"
+NATIVE_U_POINT_PARAMETER_RULE = "native-u-point-parameter-authoritative-v2"
 NATIVE_U_IDENTITY_ULPS = 128
 NATIVE_U_COVERAGE_COVERED = "covered"
 NATIVE_U_COVERAGE_UNCOVERED = "uncovered"

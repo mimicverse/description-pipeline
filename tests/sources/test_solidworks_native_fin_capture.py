@@ -1383,7 +1383,7 @@ class NativeFinCaptureTests(unittest.TestCase):
         self.assertEqual(start_evidence["u"], edge.u_min)
         self.assertEqual(
             start_evidence["u_parameter_rule"],
-            "native-u-point-parameter-authoritative-v1",
+            "native-u-point-parameter-authoritative-v2",
         )
         self.assertNotEqual(
             start_evidence["u"],
@@ -1406,6 +1406,49 @@ class NativeFinCaptureTests(unittest.TestCase):
             self.capture(body, extension)
 
         self.assertIn("outside the edge domain", caught.exception.message)
+
+    def test_fin_at_edge_boundary_uses_curve_operation_tolerance(self):
+        body, _face_10, _face_20, edge, tessellation, extension = self.fixture()
+        start, end, evaluated_start, evaluated_end = (
+            self.configure_group_333(edge, tessellation)
+        )
+        tessellation.GetVertexPoint = lambda vertex_id: {
+            1: start,
+            2: end,
+            3: (0.0, 1.0, 0.0),
+            4: (1.0, 1.0, 0.0),
+        }[vertex_id]
+        u_by_point = {start: edge.u_min, end: edge.u_max}
+        edge.GetClosestPointOn = lambda x, y, z: [
+            x,
+            y,
+            z,
+            u_by_point[(x, y, z)],
+            0.0,
+        ]
+        edge.GetParameter = lambda x, y, z: [u_by_point[(x, y, z)], True]
+        edge.evaluate_u_points = {
+            edge.u_min: evaluated_start,
+            edge.u_max: evaluated_end,
+        }
+
+        captured = self.capture(body, extension)
+
+        fin = next(
+            row
+            for row in captured["itessellation_body"]["fins"]
+            if row["classification"] == "native_edge"
+            and native_u_equal(row["start_u"], edge.u_min)
+        )
+        self.assertEqual(fin["start_u"], edge.u_min)
+        self.assertGreater(
+            fin["start_evidence"]["evaluate_point_error_m"],
+            1e-9,
+        )
+        self.assertEqual(
+            fin["start_evidence"]["point_tolerance_m"],
+            1.862645149230957e-9,
+        )
 
     def test_parser_accepts_group_333_operation_bound(self):
         evidence, triangles = self.group_333_tessellation()
@@ -1469,6 +1512,55 @@ class NativeFinCaptureTests(unittest.TestCase):
             )
 
         self.assertIn("U evidence is not independently reproducible", str(caught.exception))
+
+    def test_parser_accepts_curve_operation_bound_at_fin_edge_boundary(self):
+        evidence, triangles = self.group_333_tessellation()
+        edge = evidence["native_edges"][0]
+        start = tuple(edge["curve_start_point_m"])
+        end = tuple(edge["curve_end_point_m"])
+        evaluated_start = tuple(
+            edge["curve_endpoint_evaluations"]["start"]["payload"][:3]
+        )
+        tolerance = native_curve_endpoint_operation_tolerance(
+            start,
+            evaluated_start,
+            end,
+        )
+        error = native_point_error(start, evaluated_start)
+        affected_vertices = set()
+        for fin in evidence["itessellation"]["bodies"][0]["fins"]:
+            if fin["classification"] == "internal_only":
+                continue
+            for vertex_id, fin_u, fin_evidence in (
+                (fin["vertex_ids"][0], fin["start_u"], fin["start_evidence"]),
+                (fin["vertex_ids"][1], fin["end_u"], fin["end_evidence"]),
+            ):
+                if not native_u_equal(fin_u, edge["u_min"]):
+                    continue
+                affected_vertices.add(vertex_id)
+                fin_evidence["closest_point_on_raw"][:3] = start
+                fin_evidence["evaluate_payload"][:3] = evaluated_start
+                fin_evidence["point_tolerance_m"] = tolerance
+                fin_evidence["closest_point_error_m"] = 0.0
+                fin_evidence["evaluate_point_error_m"] = error
+                fin_evidence["closest_evaluate_error_m"] = error
+        for vertex in evidence["itessellation"]["vertices"]:
+            if vertex["vertex_id"] in affected_vertices:
+                vertex["point_m"] = list(start)
+        triangles = [
+            tuple(start if point == evaluated_start else point for point in triangle)
+            for triangle in triangles
+        ]
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            None,
+        )
+
+        self.assertEqual(len(spans), 2)
 
     def test_parser_rejects_group_333_operation_bound_overshoot(self):
         evidence, triangles = self.group_333_tessellation()
@@ -1677,7 +1769,7 @@ class NativeFinCaptureTests(unittest.TestCase):
                         evidence["closest_point_on_raw"][:3] = [0.0, 0.0, 0.0]
                         evidence["evaluate_payload"][:3] = [0.0, 0.0, 0.0]
                         evidence["point_tolerance_m"] = (
-                            native_point_roundtrip_tolerance(
+                            native_curve_endpoint_operation_tolerance(
                                 [0.0, 0.0, 0.0],
                                 [0.0, 0.0, 0.0],
                                 [0.0, 0.0, 0.0],

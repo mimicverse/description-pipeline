@@ -66,6 +66,8 @@ def _valid_u_evidence(
     endpoint_point: object,
     domain_lower: object,
     domain_upper: object,
+    curve_start: object,
+    curve_end: object,
 ) -> bool:
     """Validate one retained GetClosestPointOn/GetParameter/Evaluate2 proof."""
 
@@ -91,6 +93,25 @@ def _valid_u_evidence(
     closest = value["closest_point_on_raw"]
     parameter = value["parameter_raw"]
     evaluated = value["evaluate_payload"]
+    evaluated_point = evaluated[:3]
+    if native_u_equal(value["u"], domain_lower):
+        computed_tolerance = native_curve_endpoint_operation_tolerance(
+            endpoint_point,
+            evaluated_point,
+            curve_end,
+        )
+    elif native_u_equal(value["u"], domain_upper):
+        computed_tolerance = native_curve_endpoint_operation_tolerance(
+            endpoint_point,
+            evaluated_point,
+            curve_start,
+        )
+    else:
+        computed_tolerance = native_point_roundtrip_tolerance(
+            endpoint_point,
+            closest[:3],
+            evaluated_point,
+        )
     numeric = (int, float)
     if (
         not isinstance(endpoint_point, (list, tuple))
@@ -116,11 +137,6 @@ def _valid_u_evidence(
     closest_point = tuple(closest[:3])
     evaluated_point = tuple(evaluated[:3])
     expected_point = tuple(float(item) for item in endpoint_point)
-    computed_tolerance = native_point_roundtrip_tolerance(
-        expected_point,
-        closest_point,
-        evaluated_point,
-    )
     closest_error = native_point_error(expected_point, closest_point)
     evaluate_error = native_point_error(expected_point, evaluated_point)
     closest_evaluate_error = native_point_error(
@@ -1087,8 +1103,8 @@ def _parse_v3_itessellation(
             cached == referenced,
             component + ": native tessellation v3 vertex cache differs from fin vertices",
         )
-        edge_domains = {
-            edge["edge_reference_sha256"]: (edge["u_min"], edge["u_max"])
+        edges_by_reference = {
+            edge["edge_reference_sha256"]: edge
             for edge in native_edges
             if edge["body_type"] == body_key[0]
             and edge["body_index"] == body_key[1]
@@ -1096,9 +1112,9 @@ def _parse_v3_itessellation(
         for fin in evidence["fins"].values():
             if fin["classification"] == "internal_only":
                 continue
-            domain = edge_domains.get(fin["edge_reference_sha256"])
+            edge = edges_by_reference.get(fin["edge_reference_sha256"])
             _require(
-                domain is not None,
+                edge is not None,
                 component
                 + f": native fin {fin['fin_id']} has no captured edge domain",
             )
@@ -1119,8 +1135,10 @@ def _parse_v3_itessellation(
                         evidence_value,
                         u_value,
                         vertices[(body_key, vertex_id)],
-                        domain[0],
-                        domain[1],
+                        edge["u_min"],
+                        edge["u_max"],
+                        edge["curve_start_point_m"],
+                        edge["curve_end_point_m"],
                     ),
                     component
                     + f": native fin {fin['fin_id']} U evidence is not independently reproducible",
