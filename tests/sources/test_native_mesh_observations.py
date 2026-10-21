@@ -666,26 +666,102 @@ class NativeMeshObservationTests(unittest.TestCase):
                     self.verify()
 
     def test_vertex_cache_never_selects_edges_by_coordinate(self):
+        start = (0.0, 0.0, 0.0)
+        end = (1.0, 0.0, 0.0)
+        triangles = [
+            (start, end, (0.5, -0.5, 0.0)),
+            (end, start, (0.5, 0.5, 0.0)),
+            (start, end, (0.5, 0.0, 0.5)),
+        ]
+        edge_reference = hashlib.sha256(b"persistent-native-edge").hexdigest()
+        body_reference = hashlib.sha256(b"coordinate-collision-body").hexdigest()
+        spans = [
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "body_name": "coordinate-collision",
+                "body_reference_sha256": body_reference,
+                "face_index": face_index,
+                "face_reference_sha256": hashlib.sha256(
+                    f"coordinate-collision-face-{face_index}".encode()
+                ).hexdigest(),
+                "face_owner_id": face_index + 1,
+                "edge_references": [edge_reference] if face_index < 2 else [],
+                "triangle_start": face_index,
+                "triangle_count": 1,
+                "triangle_records_sha256": "0" * 64,
+            }
+            for face_index in range(3)
+        ]
+        native_edges = [
+            {
+                "body_type": 0,
+                "body_index": 0,
+                "edge_reference_sha256": edge_reference,
+                "start_vertex_reference_sha256": hashlib.sha256(
+                    b"persistent-start-reference"
+                ).hexdigest(),
+                "end_vertex_reference_sha256": hashlib.sha256(
+                    b"persistent-end-reference"
+                ).hexdigest(),
+                "start_point_m": list(start),
+                "end_point_m": list(end),
+                "face_indices": [0, 1],
+                "u_min": 0.0,
+                "u_max": 1.0,
+                "curve_sense": True,
+                "curve_type": 0,
+            }
+        ]
+        tessellation = support.native_tessellation_v3(
+            spans,
+            native_edges,
+            triangle_vertices=triangles,
+        )
+        vertices = {
+            row["vertex_id"]: row["point_m"]
+            for row in tessellation["itessellation"]["vertices"]
+        }
+        internal_fin = next(
+            fin
+            for fin in tessellation["itessellation"]["bodies"][0]["fins"]
+            if fin["classification"] == "internal_only"
+            and fin["face_index"] == 2
+        )
+        self.assertEqual(
+            [vertices[vertex_id] for vertex_id in internal_fin["vertex_ids"]],
+            [list(start), list(end)],
+        )
+        self.assertEqual(
+            len(
+                parse_native_tessellation(
+                    "coordinate-collision",
+                    tessellation,
+                    {"solid": 1, "sheet": 0},
+                    len(triangles),
+                    triangles,
+                )
+            ),
+            3,
+        )
+
+    def test_vertex_cache_rejects_duplicate_or_missing_vertex_rows(self):
         original = copy.deepcopy(self.row)
-        edge = original["tessellation"]["native_edges"][0]
-        edge["start_vertex_reference_sha256"] = hashlib.sha256(
-            b"persistent-edge-start"
-        ).hexdigest()
-        edge["end_vertex_reference_sha256"] = hashlib.sha256(
-            b"persistent-edge-end"
-        ).hexdigest()
-        self.row = original
-        self.assertEqual(self.verify()["components"], 1)
 
         self.row = copy.deepcopy(original)
-        duplicate = copy.deepcopy(self.row["tessellation"]["itessellation"]["vertices"][0])
+        duplicate = copy.deepcopy(
+            self.row["tessellation"]["itessellation"]["vertices"][0]
+        )
         self.row["tessellation"]["itessellation"]["vertices"].append(duplicate)
         with self.assertRaisesRegex(PipelineError, "vertex.*duplicated or unordered"):
             self.verify()
 
         self.row = copy.deepcopy(original)
         self.row["tessellation"]["itessellation"]["vertices"].pop()
-        with self.assertRaisesRegex(PipelineError, "vertex count differs|vertex cache differs"):
+        with self.assertRaisesRegex(
+            PipelineError,
+            "vertex count differs|vertex cache differs",
+        ):
             self.verify()
 
     def test_shared_native_cycle_binds_float32_stl_vertices(self):

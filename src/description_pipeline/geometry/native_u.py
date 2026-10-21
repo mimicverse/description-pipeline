@@ -264,7 +264,7 @@ def native_curve_domain_transform(
     sense: bool,
     is_periodic: bool | None,
 ) -> dict:
-    """Map a trimmed edge U domain into its underlying native curve domain."""
+    """Classify an edge U domain against underlying-curve and periodicity evidence."""
 
     curve_start = _native_u(underlying_start)
     curve_end = _native_u(underlying_end)
