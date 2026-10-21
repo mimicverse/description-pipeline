@@ -305,11 +305,22 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     ([regex]::Matches($bootstrapSource, [regex]::Escape($rootSetAcl))).Count -eq 1)
   $failureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
     'bootstrap-injected-failure-' + [guid]::NewGuid().ToString('N') + '.ps1')
+  $rootAssert = 'Assert-ManagedAcl $root'
+  Check 'windows_acl.bootstrap_post_root_failure_injection_anchor' (
+    ([regex]::Matches($bootstrapSource, [regex]::Escape($rootAssert))).Count -eq 1)
+  $postRootFailureScript = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'bootstrap-post-root-failure-' + [guid]::NewGuid().ToString('N') + '.ps1')
   [System.IO.File]::WriteAllText(
     $failureScript,
     $bootstrapSource.Replace(
       $rootSetAcl,
       "throw 'injected root ACL failure'"),
+    (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText(
+    $postRootFailureScript,
+    $bootstrapSource.Replace(
+      $rootAssert,
+      "throw 'injected post-root ACL failure'"),
     (New-Object System.Text.UTF8Encoding($false)))
   $powershellExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
   $markerBeforeFailure = Get-AclProjection $markerPath
@@ -328,7 +339,7 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
     'description-managed-rollback-' + [guid]::NewGuid().ToString('N'))
   $null = New-Item -ItemType Directory -Path $rollbackRoot -Force
   $rollbackBefore = Get-AclProjection $rollbackRoot
-  $rollbackOutput = @(& $powershellExe -NoProfile -File $failureScript `
+  $rollbackOutput = @(& $powershellExe -NoProfile -File $postRootFailureScript `
     -ManagedRoot $rollbackRoot -ServiceAccount $serviceSid)
   $rollbackExit = $LASTEXITCODE
   $rollbackReceipt = ($rollbackOutput | Select-Object -Last 1) | ConvertFrom-Json
@@ -347,6 +358,7 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
       ' acl_stable=' + [string]$rollbackAclStable +
       ' receipt=' + ($rollbackReceipt | ConvertTo-Json -Depth 8 -Compress))
   Remove-Item -LiteralPath $failureScript -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $postRootFailureScript -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $rollbackRoot -Recurse -Force -ErrorAction SilentlyContinue
   $badTokenAcl = Get-Acl -LiteralPath $tokenPath
   [void]$badTokenAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
