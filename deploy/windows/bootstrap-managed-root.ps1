@@ -156,6 +156,7 @@ $adminSid = 'S-1-5-32-544'
 
 $markerPath = Join-Path $root '.description-managed-root.json'
 $markerText = '{"schema_version":"solidworks-to-urdf.managed-root/v1"}'
+$markerExisted = Test-Path -LiteralPath $markerPath -PathType Leaf
 if (Test-Path -LiteralPath $markerPath) {
   Assert-NoReparseAncestor $markerPath
   if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
@@ -174,7 +175,6 @@ if (Test-Path -LiteralPath $markerPath) {
     (New-Object System.Text.UTF8Encoding($false)))
 }
 Assert-NoReparseAncestor $markerPath
-$markerExisted = Test-Path -LiteralPath $markerPath -PathType Leaf
 $rootAclBefore = Get-Acl -LiteralPath $root -ErrorAction Stop
 $markerAclBefore = if ($markerExisted) {
   Get-Acl -LiteralPath $markerPath -ErrorAction Stop
