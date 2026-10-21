@@ -113,13 +113,16 @@ def verify_native_mesh_observations(bundle: Path) -> dict:
         )
         _require(sum(bodies.values()) > 0, component + ": no native bodies recorded")
         path = _stl_binding(bundle, entry, triangles)
+        native_fin_resolutions = []
         spans = parse_native_tessellation(
             component,
             tessellation,
             bodies,
             triangles,
             _stl_triangle_vertices(path, triangles),
+            native_fin_resolutions=native_fin_resolutions,
         )
+        warnings.extend(native_fin_resolutions)
         topology = summarize_native_topology(tessellation, spans)
         _require(
             topology["status"] == "evidence_complete",

@@ -290,6 +290,7 @@ def _canonical_untessellated_faces(value) -> list | None:
                 tessellation,
                 bodies,
                 entry.get("triangles"),
+                native_fin_resolutions=[],
             )
         except PipelineError:
             return None

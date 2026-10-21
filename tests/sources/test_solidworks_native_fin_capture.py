@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from . import _paths  # noqa: F401  (import side effect: sys.path)
+from . import _paths, support  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.geometry.native_tessellation import (  # noqa: E402
     _finite_fin_intervals,
@@ -22,6 +22,8 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
     parse_native_tessellation,
 )
 from description_pipeline.geometry.native_u import (  # noqa: E402
+    NATIVE_COLLAPSED_U_FIN_RULE,
+    NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_IDENTITY_RULE,
     native_binary32_spacing,
     native_curve_endpoint_roles,
@@ -605,6 +607,136 @@ class NativeFinCaptureTests(unittest.TestCase):
             )
             triangles = self.stl_triangles(destination)
         return entry["tessellation"], triangles
+
+    def collapsed_u_tessellation(self):
+        def binary32(point):
+            return struct.unpack("<3f", struct.pack("<3f", *point))
+
+        u_min = 2.667937521368035e-7
+        u_max = 0.0005305172218399963
+        start = binary32((0.0, 0.0, 0.0))
+        near = binary32((9.489442548454158e-6, 0.0, 0.0))
+        end = binary32((20e-6, 0.0, 0.0))
+        apex_a = binary32((10e-6, -1.0, 0.0))
+        apex_b = binary32((10e-6, 1.0, 0.0))
+        triangles = [
+            (start, near, apex_a),
+            (near, end, apex_a),
+            (near, start, apex_b),
+            (end, near, apex_b),
+        ]
+        reference = hashlib.sha256(b"collapsed-native-edge").hexdigest()
+        spans = []
+        for face_index in range(2):
+            spans.append(
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "body_name": "collapsed-body",
+                    "body_reference_sha256": hashlib.sha256(
+                        b"collapsed-body"
+                    ).hexdigest(),
+                    "face_index": face_index,
+                    "face_reference_sha256": hashlib.sha256(
+                        f"collapsed-face-{face_index}".encode()
+                    ).hexdigest(),
+                    "face_owner_id": face_index + 1,
+                    "edge_references": [reference],
+                    "triangle_start": face_index * 2,
+                    "triangle_count": 2,
+                    "triangle_records_sha256": "0" * 64,
+                }
+            )
+        edge = {
+            "body_type": 0,
+            "body_index": 0,
+            "edge_reference_sha256": reference,
+            "start_vertex_reference_sha256": hashlib.sha256(
+                struct.pack("<3f", *start)
+            ).hexdigest(),
+            "end_vertex_reference_sha256": hashlib.sha256(
+                struct.pack("<3f", *end)
+            ).hexdigest(),
+            "start_point_m": list(start),
+            "end_point_m": list(end),
+            "face_indices": [0, 1],
+            "u_min": u_min,
+            "u_max": u_max,
+            "curve_sense": True,
+            "curve_type": 0,
+        }
+        evidence = support.native_tessellation_v3(
+            spans,
+            [edge],
+            triangle_vertices=triangles,
+        )
+        body = evidence["itessellation"]["bodies"][0]
+        edge_row = evidence["native_edges"][0]
+        vertex_points = {
+            row["vertex_id"]: tuple(row["point_m"])
+            for row in evidence["itessellation"]["vertices"]
+        }
+        fins = {row["fin_id"]: row for row in body["fins"]}
+
+        def bind(evidence_row, point, u_parameter, *, fallback):
+            evidence_row.clear()
+            evidence_row.update(
+                support._u_evidence(
+                    u_parameter,
+                    point,
+                    domain_lower=u_min,
+                    domain_upper=u_max,
+                    curve_start=start,
+                    curve_end=end,
+                )
+            )
+            if not fallback:
+                return
+            evaluated = start
+            error = native_point_error(point, evaluated)
+            evidence_row.update(
+                {
+                    "u_parameter_rule": "native-u-closest-point-fallback-v1",
+                    "parameter_u_source": "closest_point_fallback",
+                    "fallback_reason": "get_parameter_false",
+                    "point_roundtrip_rule": (
+                        "tessellation-edge-projection-v1"
+                    ),
+                    "point_tolerance_m": (
+                        NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+                    ),
+                    "parameter_raw": [u_parameter, 0.0],
+                    "parameter_success_raw": 0.0,
+                    "parameter_success_raw_type": "float",
+                    "parameter_success_bit": 0,
+                    "parameter_success_parsed": False,
+                    "evaluate_point_error_m": error,
+                    "source_evaluate_error_m": error,
+                    "closest_evaluate_error_m": error,
+                }
+            )
+            evidence_row["evaluate_payload"][:3] = list(evaluated)
+
+        u_by_point = {start: u_min, near: u_min, end: u_max}
+        for fin_id in edge_row["fin_ids"]:
+            fin = fins[fin_id]
+            start_point = vertex_points[fin["vertex_ids"][0]]
+            end_point = vertex_points[fin["vertex_ids"][1]]
+            fin["start_u"] = u_by_point[start_point]
+            fin["end_u"] = u_by_point[end_point]
+            bind(
+                fin["start_evidence"],
+                start_point,
+                fin["start_u"],
+                fallback=start_point == near,
+            )
+            bind(
+                fin["end_evidence"],
+                end_point,
+                fin["end_u"],
+                fallback=end_point == near,
+            )
+        return evidence, triangles, edge_row, start, near, end, bind
 
     @staticmethod
     def next_after(value, count):
@@ -1748,6 +1880,334 @@ class NativeFinCaptureTests(unittest.TestCase):
         )
 
         self.assertEqual(len(spans), 2)
+
+    def test_parser_accepts_collapsed_pair_as_zero_coverage_with_warning(self):
+        evidence, triangles, _edge, _start, _near, _end, _bind = (
+            self.collapsed_u_tessellation()
+        )
+        original = copy.deepcopy(evidence)
+        resolutions = []
+
+        spans = parse_native_tessellation(
+            "part-1",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+            native_fin_resolutions=resolutions,
+        )
+
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(evidence, original)
+        warning, = resolutions
+        self.assertEqual(warning["code"], "native_fin_u_collapsed")
+        self.assertEqual(warning["rule"], NATIVE_COLLAPSED_U_FIN_RULE)
+        self.assertEqual(warning["component"], "part-1")
+        self.assertEqual(
+            warning["qualification"],
+            "zero_u_coverage; native_geometry_bounded_50um",
+        )
+        self.assertEqual(len(warning["fin_ids"]), 2)
+        self.assertEqual(sorted(warning["spans_m"]), sorted(map(str, warning["fin_ids"])))
+        self.assertTrue(
+            all(
+                0.0 < span <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M
+                for span in warning["spans_m"].values()
+            )
+        )
+
+    def test_parser_rejects_injected_collapse_resolution_fields(self):
+        evidence, triangles, _edge, _start, _near, _end, _bind = (
+            self.collapsed_u_tessellation()
+        )
+        fin = next(
+            row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+            if row["classification"] == "internal_only"
+        )
+        fin.update(
+            {
+                "u_resolution_rule": NATIVE_COLLAPSED_U_FIN_RULE,
+                "u_resolution_span_m": -1.0,
+                "u_resolution_warning": 123,
+            }
+        )
+
+        with self.assertRaisesRegex(PipelineError, "unknown shape"):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+    def test_parser_requires_an_empty_native_fin_resolution_sink(self):
+        evidence, triangles, _edge, _start, _near, _end, _bind = (
+            self.collapsed_u_tessellation()
+        )
+        for sink in ((), [{"code": "spoof"}]):
+            with self.subTest(sink=sink), self.assertRaisesRegex(
+                PipelineError,
+                "resolution output must be an empty list",
+            ):
+                parse_native_tessellation(
+                    "part-1",
+                    evidence,
+                    {"solid": 1, "sheet": 0},
+                    len(triangles),
+                    triangles,
+                    native_fin_resolutions=sink,
+                )
+
+    def test_parser_rejects_partial_collapsed_fin_pair(self):
+        evidence, triangles, edge, _start, near, _end, bind = (
+            self.collapsed_u_tessellation()
+        )
+        body = evidence["itessellation"]["bodies"][0]
+        fins = {row["fin_id"]: row for row in body["fins"]}
+        vertices = {
+            row["vertex_id"]: tuple(row["point_m"])
+            for row in evidence["itessellation"]["vertices"]
+        }
+        cofin = next(
+            fins[fin_id]
+            for fin_id in edge["fin_ids"]
+            if vertices[fins[fin_id]["vertex_ids"][0]] == near
+            and vertices[fins[fin_id]["vertex_ids"][1]] == _start
+        )
+        new_u = edge["u_min"] + 1e-12
+        cofin["end_u"] = new_u
+        bind(
+            cofin["end_evidence"],
+            _start,
+            new_u,
+            fallback=False,
+        )
+
+        with self.assertRaisesRegex(PipelineError, "partial U collapse"):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+    def test_parser_rejects_nonreciprocal_or_same_face_collapsed_cofin(self):
+        base, triangles, edge, _start, _near, _end, bind = (
+            self.collapsed_u_tessellation()
+        )
+        base_body = base["itessellation"]["bodies"][0]
+        base_fins = {row["fin_id"]: row for row in base_body["fins"]}
+        base_vertices = {
+            row["vertex_id"]: tuple(row["point_m"])
+            for row in base["itessellation"]["vertices"]
+        }
+        collapsed = next(
+            fin
+            for fin_id in edge["fin_ids"]
+            if (fin := base_fins[fin_id])["start_u"] == fin["end_u"]
+            and len(
+                {
+                    base_vertices[fin["vertex_ids"][0]],
+                    base_vertices[fin["vertex_ids"][1]],
+                }
+            )
+            == 2
+        )
+
+        for label, same_face in (("same-face", True), ("nonreciprocal", False)):
+            with self.subTest(label=label):
+                evidence = copy.deepcopy(base)
+                body = evidence["itessellation"]["bodies"][0]
+                fins = {row["fin_id"]: row for row in body["fins"]}
+                fin = fins[collapsed["fin_id"]]
+                replacement = next(
+                    row
+                    for row in body["fins"]
+                    if row["classification"] == "native_edge"
+                    and row["fin_id"] not in {
+                        fin["fin_id"],
+                        fin["cofin_id"],
+                    }
+                    and (
+                        row["face_index"] == fin["face_index"]
+                        if same_face
+                        else row["face_index"] != fin["face_index"]
+                    )
+                )
+                fin["cofin_id"] = replacement["fin_id"]
+                replacement["start_u"] = edge["u_min"]
+                replacement["end_u"] = edge["u_min"]
+                replacement_points = tuple(
+                    base_vertices[vertex_id]
+                    for vertex_id in replacement["vertex_ids"]
+                )
+                bind(
+                    replacement["start_evidence"],
+                    replacement_points[0],
+                    edge["u_min"],
+                    fallback=replacement_points[0] != _start,
+                )
+                bind(
+                    replacement["end_evidence"],
+                    replacement_points[1],
+                    edge["u_min"],
+                    fallback=replacement_points[1] != _start,
+                )
+                with self.assertRaisesRegex(
+                    PipelineError,
+                    "cofin/orientation is inconsistent",
+                ):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        triangles,
+                    )
+
+    def test_parser_rejects_collapsed_cofin_reverse_coordinate_mismatch(self):
+        evidence, triangles, edge, start, near, _end, bind = (
+            self.collapsed_u_tessellation()
+        )
+        body = evidence["itessellation"]["bodies"][0]
+        vertices = evidence["itessellation"]["vertices"]
+        vertex_by_id = {row["vertex_id"]: row for row in vertices}
+        fins = {row["fin_id"]: row for row in body["fins"]}
+        vertex_points = {
+            row["vertex_id"]: tuple(row["point_m"])
+            for row in vertices
+        }
+        cofin = next(
+            fins[fin_id]
+            for fin_id in edge["fin_ids"]
+            if vertex_points[fins[fin_id]["vertex_ids"][0]] == near
+            and vertex_points[fins[fin_id]["vertex_ids"][1]] == start
+        )
+        face_index = cofin["face_index"]
+        near_id = cofin["vertex_ids"][0]
+        new_id = max(vertex_points) + 1
+        shifted = copy.deepcopy(vertex_by_id[near_id])
+        shifted["vertex_id"] = new_id
+        shifted["point_m"][0] += 1e-8
+        shifted["point_m"] = list(
+            struct.unpack("<3f", struct.pack("<3f", *shifted["point_m"]))
+        )
+        shifted_point = tuple(shifted["point_m"])
+        vertices.append(shifted)
+        body["vertex_count"] += 1
+        for fin in body["fins"]:
+            if fin["face_index"] != face_index or near_id not in fin["vertex_ids"]:
+                continue
+            fin["vertex_ids"] = [
+                new_id if vertex_id == near_id else vertex_id
+                for vertex_id in fin["vertex_ids"]
+            ]
+            for endpoint in ("start", "end"):
+                if fin[f"{endpoint}_evidence"] is None:
+                    continue
+                if fin["vertex_ids"][0 if endpoint == "start" else 1] != new_id:
+                    continue
+                bind(
+                    fin[f"{endpoint}_evidence"],
+                    shifted_point,
+                    fin[f"{endpoint}_u"],
+                    fallback=True,
+                )
+        for facet in body["facets"]:
+            if facet["face_index"] != face_index:
+                continue
+            facet["vertex_ids"] = [
+                new_id if vertex_id == near_id else vertex_id
+                for vertex_id in facet["vertex_ids"]
+            ]
+            facet["vertex_ids"].sort()
+        for index in (2, 3):
+            triangles[index] = tuple(
+                shifted_point if point == near else point
+                for point in triangles[index]
+            )
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "cofin/orientation is inconsistent",
+        ):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
+
+    def test_parser_rejects_collapsed_pair_with_equal_or_unreadable_sense(self):
+        base, triangles, _edge, _start, _near, _end, _bind = (
+            self.collapsed_u_tessellation()
+        )
+        for label in ("equal", "unreadable"):
+            with self.subTest(label=label):
+                evidence = copy.deepcopy(base)
+                senses = evidence["native_edges"][0]["face_senses"]
+                if label == "equal":
+                    for row in senses:
+                        row["EdgeInFaceSense"]["value"] = True
+                        row["IEdgeInFaceSense2"]["value"] = True
+                    expected = "cofaces have the same orientation"
+                else:
+                    senses[0]["EdgeInFaceSense"]["value"] = None
+                    expected = "primary orientation is unreadable"
+                with self.assertRaisesRegex(PipelineError, expected):
+                    parse_native_tessellation(
+                        "part-1",
+                        evidence,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        triangles,
+                    )
+
+    def test_parser_rejects_collapsed_only_active_face_coverage(self):
+        evidence, triangles, edge, start, near, end, bind = (
+            self.collapsed_u_tessellation()
+        )
+        body = evidence["itessellation"]["bodies"][0]
+        fins = {row["fin_id"]: row for row in body["fins"]}
+        vertices = {
+            row["vertex_id"]: tuple(row["point_m"])
+            for row in evidence["itessellation"]["vertices"]
+        }
+        for fin_id in edge["fin_ids"]:
+            fin = fins[fin_id]
+            points = tuple(vertices[vertex_id] for vertex_id in fin["vertex_ids"])
+            if set(points) != {near, end}:
+                continue
+            fin["start_u"] = edge["u_min"]
+            fin["end_u"] = edge["u_min"]
+            bind(
+                fin["start_evidence"],
+                points[0],
+                edge["u_min"],
+                fallback=points[0] != start,
+            )
+            bind(
+                fin["end_evidence"],
+                points[1],
+                edge["u_min"],
+                fallback=points[1] != start,
+            )
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "collapsed-only face without positive U coverage",
+        ):
+            parse_native_tessellation(
+                "part-1",
+                evidence,
+                {"solid": 1, "sheet": 0},
+                len(triangles),
+                triangles,
+            )
 
     def test_parser_uses_point_parameter_when_closest_u_is_auxiliary(self):
         evidence, triangles = self.group_333_tessellation()

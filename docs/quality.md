@@ -101,7 +101,7 @@ native edge 的 U 覆盖仍按每个实际三角面分别严格验收。对 clos
 
 面方向以可读的 `IEdge::EdgeInFaceSense` 为主证据；SolidWorks 2026 中 `IEdgeInFaceSense2` 为只写属性，其带错误记录的不可用结果可保留为诊断，但仅在它成功返回布尔值时才要求与主证据一致，主证据缺失或不合法仍拒绝。fin/cofin 跨面时允许使用各自 face-local 的 tessellation vertex ID；独立验证须确认 reciprocal cofin、不同面、反向 U、端点 U 对应以及反向端点坐标落在 v3 点界内，不得仅凭 vertex ID 相同或不同作结论。
 
-极短 fin 的两个端点经原生 128-ULP U identity 视为同一参数时，可采用版本化 `native-fin-u-collapse-v1`：保留两端原始 U、坐标、投影和求值证据，要求 reciprocal cofin、不同面、反向坐标 v3 一致、主 sense 相反、两端投影/Evaluate2/U 域证据有效，且几何端点跨度严格大于零并不超过 50 µm。collapsed fin 只保留为零测度拓扑段，贡献零 U coverage；其余非 collapsed intervals 仍须对每个实际面独立覆盖完整 edge 域。零跨度、部分坍缩、跨度超过 50 µm、cofin/sense 异常、证据不可读或依赖该 fin 补洞的情形必须 unresolved。
+极短 fin 的两个端点经原生 128-ULP U identity 视为同一参数时，可采用版本化 `native-fin-u-collapse-v1`：保留两端原始 U、坐标、投影和求值证据，要求 reciprocal cofin、不同面、反向坐标 v3 一致、主 sense 相反、两端投影/Evaluate2/U 域证据有效，且几何端点跨度严格大于零并不超过 50 µm。collapsed fin 只保留为零测度拓扑段，贡献零 U coverage；其余非 collapsed intervals 仍须对每个实际面独立覆盖完整 edge 域。零跨度、部分坍缩、跨度超过 50 µm、cofin/sense 异常、证据不可读或依赖该 fin 补洞的情形必须 unresolved。fin 输入保持 exact schema；规则名、跨度和 warning 是从上述原始证据复算得到的归一化输出，不属于可注入的原始真值，parser 不得修改调用方输入对象。
 
 <a id="qualification"></a>
 ## 警告与资格

@@ -378,9 +378,20 @@ def parse_native_tessellation(
     bodies: dict,
     triangles: int,
     triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None = None,
+    *,
+    native_fin_resolutions: list[dict] | None = None,
 ) -> list[dict]:
     """Validate the one current tessellation schema and return its face spans."""
 
+    _require(
+        native_fin_resolutions is None
+        or (
+            isinstance(native_fin_resolutions, list)
+            and not native_fin_resolutions
+        ),
+        component
+        + ": native fin resolution output must be an empty list",
+    )
     _require(
         isinstance(tessellation, dict)
         and set(tessellation) == {
@@ -995,6 +1006,7 @@ def parse_native_tessellation(
         expected_bodies,
         triangles,
         triangle_vertices,
+        native_fin_resolutions,
     )
     return spans
 
@@ -1009,6 +1021,7 @@ def _parse_v3_itessellation(
     expected_bodies: set,
     triangles: int,
     triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None,
+    native_fin_resolutions: list[dict] | None,
 ) -> None:
     """Validate body-local ITessellation facet/fin evidence fail closed."""
 
@@ -1257,6 +1270,16 @@ def _parse_v3_itessellation(
             if edge["body_type"] == body_key[0]
             and edge["body_index"] == body_key[1]
         }
+        _require(
+            {
+                fin["edge_reference_sha256"]
+                for fin in evidence["fins"].values()
+                if fin["classification"] == "native_edge"
+            }
+            <= set(edges_by_reference),
+            component
+            + f": native tessellation v3 edge references differ for body {body_key}",
+        )
         for fin in evidence["fins"].values():
             if fin["classification"] == "internal_only":
                 continue
@@ -1357,13 +1380,7 @@ def _parse_v3_itessellation(
                 )
                 if span is not None:
                     collapsed_fin_span[fin_id] = span
-                    fin["u_resolution_rule"] = NATIVE_COLLAPSED_U_FIN_RULE
-                    fin["u_resolution_span_m"] = span
-                    fin["u_resolution_warning"] = "native_fin_u_collapsed"
                     continue
-                fin.pop("u_resolution_rule", None)
-                fin.pop("u_resolution_span_m", None)
-                fin.pop("u_resolution_warning", None)
                 intervals_by_face.setdefault(fin["face_index"], []).extend(
                     intervals
                 )
@@ -1518,6 +1535,34 @@ def _parse_v3_itessellation(
                     component
                     + f": native tessellation v3 fin {fin_id} cofin/orientation is inconsistent",
                 )
+                if (
+                    collapsed_pair
+                    and fin_id < cofin_id
+                    and native_fin_resolutions is not None
+                ):
+                    native_fin_resolutions.append(
+                        {
+                            "code": "native_fin_u_collapsed",
+                            "component": component,
+                            "body_type": body_key[0],
+                            "body_index": body_key[1],
+                            "edge_reference_sha256": reference,
+                            "fin_ids": [fin_id, cofin_id],
+                            "face_indices": [
+                                fin["face_index"],
+                                cofin["face_index"],
+                            ],
+                            "u": fin["start_u"],
+                            "spans_m": {
+                                str(fin_id): collapsed_fin_span[fin_id],
+                                str(cofin_id): collapsed_fin_span[cofin_id],
+                            },
+                            "rule": NATIVE_COLLAPSED_U_FIN_RULE,
+                            "qualification": (
+                                "zero_u_coverage; native_geometry_bounded_50um"
+                            ),
+                        }
+                    )
             fin_faces = {
                 evidence["fins"][fin_id]["face_index"] for fin_id in actual
             }
@@ -1682,28 +1727,22 @@ def _parse_itessellation_body(
     previous_fin = None
     facet_fin_membership = {}
     for index, fin in enumerate(body["fins"]):
-        required_fin_keys = {
-            "fin_id",
-            "facet_id",
-            "face_index",
-            "vertex_ids",
-            "edge_reference_sha256",
-            "classification",
-            "start_u",
-            "end_u",
-            "start_evidence",
-            "end_evidence",
-            "cofin_id",
-        }
-        collapsed_fin_keys = {
-            "u_resolution_rule",
-            "u_resolution_span_m",
-            "u_resolution_warning",
-        }
         _require(
             isinstance(fin, dict)
-            and required_fin_keys <= set(fin)
-            and set(fin) <= required_fin_keys | collapsed_fin_keys,
+            and set(fin)
+            == {
+                "fin_id",
+                "facet_id",
+                "face_index",
+                "vertex_ids",
+                "edge_reference_sha256",
+                "classification",
+                "start_u",
+                "end_u",
+                "start_evidence",
+                "end_evidence",
+                "cofin_id",
+            },
             component + f": native tessellation v3 fin {index} has an unknown shape",
         )
         fin_id = fin["fin_id"]
@@ -1761,7 +1800,7 @@ def _parse_itessellation_body(
             previous == facet_id,
             component + f": native tessellation v3 fin {fin_id} belongs to multiple facets",
         )
-        parsed_fin = {
+        fins[fin_id] = {
             "fin_id": fin_id,
             "facet_id": facet_id,
             "face_index": face_index,
@@ -1774,10 +1813,6 @@ def _parse_itessellation_body(
             "end_evidence": end_evidence,
             "cofin_id": cofin_id,
         }
-        for key in collapsed_fin_keys:
-            if key in fin:
-                parsed_fin[key] = fin[key]
-        fins[fin_id] = parsed_fin
     _require(
         set(facet_fin_membership)
         == {

@@ -766,86 +766,56 @@ class NativeMeshObservationTests(unittest.TestCase):
             self.verify()
 
     def test_shared_native_cycle_binds_float32_stl_vertices(self):
-        original = copy.deepcopy(self.row)
-        itessellation = original["tessellation"]["itessellation"]
-        body = itessellation["bodies"][0]
+        original_row = copy.deepcopy(self.row)
+        original_stl = self.stl_bytes
+        tessellation = original_row["tessellation"]
+        body = tessellation["itessellation"]["bodies"][0]
         facet = body["facets"][0]
-        fins = {
-            fin["fin_id"]: fin
-            for fin in body["fins"]
-        }
-        first = fins[facet["fin_ids"][0]]
-        cycle = [first["vertex_ids"][0]]
-        current = first
-        for _ in range(3):
-            cycle.append(current["vertex_ids"][1])
-            current = next(
-                fin
-                for fin_id in facet["fin_ids"]
-                if (fin := fins[fin_id])["vertex_ids"][0] == current["vertex_ids"][1]
+        record_index = facet["triangle_record_index"]
+        record_start = 84 + 50 * record_index
+        points_offset = record_start + 12
+        points = [
+            struct.unpack_from("<3f", original_stl, points_offset + 12 * index)
+            for index in range(3)
+        ]
+        face_span = next(
+            span
+            for span in tessellation["face_spans"]
+            if (span["body_type"], span["body_index"], span["face_index"])
+            == (body["body_type"], body["body_index"], facet["face_index"])
+        )
+
+        def assert_rejected(replacement):
+            payload = bytearray(original_stl)
+            for index, point in enumerate(replacement):
+                struct.pack_into("<3f", payload, points_offset + 12 * index, *point)
+            self.row = copy.deepcopy(original_row)
+            row_span = next(
+                span
+                for span in self.row["tessellation"]["face_spans"]
+                if span["face_index"] == face_span["face_index"]
+                and span["body_type"] == face_span["body_type"]
+                and span["body_index"] == face_span["body_index"]
             )
-        cycle = cycle[:3]
-        rows = {
-            row["vertex_id"]: row
-            for row in itessellation["vertices"]
-            if (row["body_type"], row["body_index"]) == (1, 0)
-        }
-        points = [list(rows[vertex_id]["point_m"]) for vertex_id in cycle]
+            start = 84 + 50 * row_span["triangle_start"]
+            end = start + 50 * row_span["triangle_count"]
+            row_span["triangle_records_sha256"] = hashlib.sha256(
+                payload[start:end]
+            ).hexdigest()
+            self.row["sha256"] = hashlib.sha256(payload).hexdigest()
+            self.stl_bytes = bytes(payload)
+            (self.root / "evidence" / self.row["path"]).write_bytes(self.stl_bytes)
+            with self.assertRaisesRegex(
+                PipelineError,
+                "does not bind triangle record",
+            ):
+                self.verify()
 
-        def replace_vertex_points(tessellation, replacements):
-            vertex_rows = {
-                row["vertex_id"]: row
-                for row in tessellation["itessellation"]["vertices"]
-            }
-            for vertex_id, point in replacements.items():
-                vertex_rows[vertex_id]["point_m"] = list(point)
-            for body_row in tessellation["itessellation"]["bodies"]:
-                for fin in body_row["fins"]:
-                    for evidence_key, vertex_id in (
-                        ("start_evidence", fin["vertex_ids"][0]),
-                        ("end_evidence", fin["vertex_ids"][1]),
-                    ):
-                        evidence = fin[evidence_key]
-                        if evidence is not None and vertex_id in replacements:
-                            support.replace_u_evidence(
-                                evidence,
-                                replacements[vertex_id],
-                            )
+        shifted = [list(point) for point in points]
+        shifted[0][0] += 1.0
+        assert_rejected(shifted)
 
-        shifted = copy.deepcopy(original)
-        shifted_point = list(points[0])
-        shifted_point[0] += 100.0
-        replace_vertex_points(
-            shifted["tessellation"],
-            {cycle[0]: shifted_point},
-        )
-        self.row = shifted
-        with self.assertRaisesRegex(PipelineError, "does not bind triangle record"):
-            self.verify()
-
-        rotated = copy.deepcopy(original)
-        replace_vertex_points(
-            rotated["tessellation"],
-            {
-                vertex_id: points[(index - 1) % 3]
-                for index, vertex_id in enumerate(cycle)
-            },
-        )
-        self.row = rotated
-        with self.assertRaisesRegex(PipelineError, "does not bind triangle record"):
-            self.verify()
-
-        reversed_points = copy.deepcopy(original)
-        replace_vertex_points(
-            reversed_points["tessellation"],
-            {
-                vertex_id: points[-index]
-                for index, vertex_id in enumerate(cycle)
-            },
-        )
-        self.row = reversed_points
-        with self.assertRaisesRegex(PipelineError, "does not bind triangle record"):
-            self.verify()
+        assert_rejected(tuple(reversed(points)))
 
     def test_facet_triangle_record_indexes_cover_each_face_once(self):
         original = copy.deepcopy(self.row)
@@ -1065,7 +1035,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
 
     def test_curved_native_edge_rejects_same_u_direction(self):
         tessellation, triangles = self.fixture()
-        _edge, external_fins = self.edge_fins(tessellation)
+        edge, external_fins = self.edge_fins(tessellation)
         by_id = {
             fin["fin_id"]: fin
             for fin in tessellation["itessellation"]["bodies"][0]["fins"]
@@ -1082,14 +1052,18 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                 continue
             cofin = by_id[fin["cofin_id"]]
             self.set_u(fin, cofin["start_u"], cofin["end_u"])
-            support.replace_u_evidence(
-                fin["start_evidence"],
-                vertices[fin["vertex_ids"][0]],
-            )
-            support.replace_u_evidence(
-                fin["end_evidence"],
-                vertices[fin["vertex_ids"][1]],
-            )
+            for endpoint in ("start", "end"):
+                point = vertices[fin["vertex_ids"][0 if endpoint == "start" else 1]]
+                fin[f"{endpoint}_evidence"].update(
+                    support._u_evidence(
+                        fin[f"{endpoint}_u"],
+                        point,
+                        domain_lower=edge["u_min"],
+                        domain_upper=edge["u_max"],
+                        curve_start=edge["curve_start_point_m"],
+                        curve_end=edge["curve_end_point_m"],
+                    )
+                )
         for index in (3, 4, 5):
             triangles[index] = tuple(reversed(triangles[index]))
         with self.assertRaisesRegex(PipelineError, "cofin/orientation is inconsistent"):
