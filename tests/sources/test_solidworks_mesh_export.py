@@ -616,7 +616,7 @@ def _configure_fake_body(body, extension):
 
     tessellation = body.GetTessellation(None)
     if tessellation.automatic and faces:
-        graph = support.native_tessellation_v3(
+        graph = support.native_tessellation_fixture(
             spans,
             edge_rows,
             triangle_vertices=triangles,
@@ -1382,7 +1382,7 @@ class NoFullScanExportTests(unittest.TestCase):
             "triangle_count": 2,
             "triangle_records_sha256": "0" * 64,
         }
-        tessellation = support.native_tessellation_v3(
+        tessellation = support.native_tessellation_fixture(
             [span],
             [],
             triangle_vertices=self._planar_triangles(),
@@ -1439,7 +1439,7 @@ class NoFullScanExportTests(unittest.TestCase):
             "triangle_count": 2,
             "triangle_records_sha256": "0" * 64,
         }
-        valid = support.native_tessellation_v3(
+        valid = support.native_tessellation_fixture(
             [span],
             [],
             triangle_vertices=triangles,

@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,8 +22,19 @@ from description_pipeline.geometry.native_tessellation import (  # noqa: E402
     _valid_u_evidence,
     parse_native_tessellation,
 )
+from description_pipeline.sources.solidworks.native import (  # noqa: E402
+    _NativeReferenceRegistry,
+    _com_object_identity,
+    _scope_bijection,
+    _scope_edge_mapping_key,
+    _scope_owner_key,
+    _scope_vertex_rows,
+    _typed_reference_sha256,
+)
 from description_pipeline.geometry.native_u import (  # noqa: E402
     NATIVE_COLLAPSED_U_FIN_RULE,
+    NATIVE_SCOPE_MAPPING_METHOD,
+    NATIVE_SCOPE_SOURCE_AUTHORITY,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_IDENTITY_RULE,
     native_binary32_spacing,
@@ -36,6 +48,7 @@ from description_pipeline.geometry.native_u import (  # noqa: E402
     native_get_parameter_success,
     native_point_error,
     native_point_roundtrip_tolerance,
+    native_scope_identity_sha256,
     native_u_equal,
     native_u_domain_is_resolvable,
     native_u_intervals_cover,
@@ -155,6 +168,19 @@ class FakeFace:
     def GetTessTriangles(self, _flag):  # noqa: N802 - SolidWorks API name
         self.display_calls += 1
         return list(self.display_triangles)
+
+    def GetArea(self):  # noqa: N802 - SolidWorks API name
+        points = [
+            self.display_triangles[offset : offset + 3]
+            for offset in range(0, len(self.display_triangles), 3)
+        ]
+        area = 0.0
+        for start, end in pairwise([*points, points[0]]):
+            area += (
+                start[0] * end[1]
+                - end[0] * start[1]
+            ) / 2.0
+        return abs(area)
 
     def GetBody(self):  # noqa: N802 - SolidWorks API name
         self.body_calls += 1
@@ -528,6 +554,15 @@ class NativeFinCaptureTests(unittest.TestCase):
             body_type=0,
             body_index=0,
             read_end_params=fake_read_end_params,
+            scope_context={
+                "occurrence": "part-1",
+                "source_document_path": "C:/fixture.SLDPRT",
+                "source_document_sha256": "a" * 64,
+                "source_document_identity_sha256": "a" * 64,
+                "source_document_identity_kind": "file_sha256",
+                "active_configuration": "Default",
+                "referenced_configuration": "Default",
+            },
         )
 
     def configure_group_333(self, edge, tessellation, *, evaluate_start=None):
@@ -666,7 +701,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             "curve_sense": True,
             "curve_type": 0,
         }
-        evidence = support.native_tessellation_v3(
+        evidence = support.native_tessellation_fixture(
             spans,
             [edge],
             triangle_vertices=triangles,
@@ -1484,7 +1519,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             captured["native_totals"],
             {"facets": 2, "fins": 6, "vertices": 4},
         )
-        self.assertEqual(len(extension.calls), 11)
+        self.assertEqual(len(extension.calls), 9)
         self.assertNotEqual(
             captured["body_reference"]["raw_sha256"],
             captured["body_reference"]["typed_sha256"],
@@ -1871,16 +1906,91 @@ class NativeFinCaptureTests(unittest.TestCase):
 
     def test_parser_accepts_group_333_operation_bound(self):
         evidence, triangles = self.group_333_tessellation()
+        alias_audit = evidence["itessellation"]["reference_alias_audit"]
+        self.assertEqual(
+            set(alias_audit),
+            {"body", "face", "edge", "vertex"},
+        )
+        self.assertTrue(all(not alias_audit[kind] for kind in alias_audit))
+        self.assertEqual(
+            evidence["itessellation"]["cross_kind_raw_aliases"],
+            [],
+        )
 
+        identity_warnings = []
         spans = parse_native_tessellation(
             "part-1",
             evidence,
             {"solid": 1, "sheet": 0},
             len(triangles),
             triangles,
+            native_identity_warnings=identity_warnings,
         )
 
         self.assertEqual(len(spans), 2)
+        self.assertEqual(identity_warnings, [])
+        self.assertTrue(
+            all(
+                span["face_identity_mode"]
+                == "native-persistent-reference-v1"
+                and span["face_identity"] is None
+                for span in evidence["face_spans"]
+            )
+        )
+
+    def test_parser_rejects_malformed_or_ambiguous_alias_evidence(self):
+        evidence, triangles = self.group_333_tessellation()
+        raw_sha = hashlib.sha256(b"raw-alias-evidence").hexdigest()
+        component = "part-1"
+        body_owner = {
+            "kind": "body",
+            "component": component,
+            "body_type": 0,
+            "body_index": 0,
+            "typed_sha256": _typed_reference_sha256("body", b"raw-alias-evidence"),
+        }
+        face_owner = {
+            "kind": "face",
+            "component": component,
+            "body_type": 0,
+            "body_index": 0,
+            "face_index": 0,
+            "typed_sha256": _typed_reference_sha256("face", b"raw-alias-evidence"),
+        }
+        valid = {
+            "raw_sha256": raw_sha,
+            "owners": [body_owner, face_owner],
+        }
+        mutations = (
+            (
+                "extra-owner-key",
+                lambda row: row["owners"][1].update({"injected": True}),
+            ),
+            (
+                "duplicate-typed",
+                lambda row: row["owners"][1].update(
+                    {"typed_sha256": row["owners"][0]["typed_sha256"]}
+                ),
+            ),
+            (
+                "cross-body",
+                lambda row: row["owners"][1].update({"body_index": 1}),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                changed = copy.deepcopy(evidence)
+                alias = copy.deepcopy(valid)
+                mutate(alias)
+                changed["itessellation"]["cross_kind_raw_aliases"] = [alias]
+                with self.assertRaises(PipelineError):
+                    parse_native_tessellation(
+                        component,
+                        changed,
+                        {"solid": 1, "sheet": 0},
+                        len(triangles),
+                        triangles,
+                    )
 
     def test_parser_accepts_collapsed_pair_as_zero_coverage_with_warning(self):
         evidence, triangles, _edge, _start, _near, _end, _bind = (
@@ -2857,6 +2967,7 @@ class NativeFinCaptureTests(unittest.TestCase):
             )
             derived_edge["curve_end_params"]["is_closed"] = True
             derived_edge["curve_end_params"]["raw_outputs"][2]["value"] = True
+            derived["itessellation"]["solidworks_vertex_identities"] = []
             derived_edge["curve_domain_transform"] = (
                 native_curve_domain_transform(
                     -10.0,
@@ -3136,25 +3247,567 @@ class NativeFinCaptureTests(unittest.TestCase):
             (POINTS[2], POINTS[1], POINTS[4]),
         )
 
-    def test_cross_kind_persistent_reference_alias_is_rejected(self):
+    def test_cross_kind_raw_reference_alias_keeps_typed_identity_separate(self):
         body, face_10, _face_20, _edge, _tessellation, extension = self.fixture()
         shared = hashlib.sha256(b"same").digest()
         extension.references[id(body)] = shared
         extension.references[id(face_10)] = shared
 
+        captured = self.capture(body, extension)
+
+        self.assertEqual(
+            captured["body_reference"]["raw_sha256"],
+            captured["faces"][0]["reference"]["raw_sha256"],
+        )
+        self.assertNotEqual(
+            captured["body_reference"]["typed_sha256"],
+            captured["faces"][0]["reference"]["typed_sha256"],
+        )
+        alias, = captured["cross_kind_raw_aliases"]
+        self.assertEqual(alias["raw_sha256"], hashlib.sha256(shared).hexdigest())
+        self.assertEqual(
+            [row["kind"] for row in alias["owners"]],
+            ["body", "face"],
+        )
+
+    def test_capture_wide_registry_enforces_typed_identity(self):
+        registry = _NativeReferenceRegistry()
+        raw = hashlib.sha256(b"shared-across-kinds").digest()
+        raw_sha = hashlib.sha256(raw).hexdigest()
+        registry.claim(
+            kind="body",
+            raw_sha256=raw_sha,
+            typed_sha256=_typed_reference_sha256("body", raw),
+            owner={"kind": "body", "body_index": 0},
+            base={"component": "part-1"},
+        )
+        registry.claim(
+            kind="face",
+            raw_sha256=raw_sha,
+            typed_sha256=_typed_reference_sha256("face", raw),
+            owner={"kind": "face", "face_index": 0},
+            base={"component": "part-1"},
+        )
+        alias, = registry.cross_kind_aliases()
+        self.assertEqual(alias["raw_sha256"], raw_sha)
+        with self.assertRaises(CadError) as caught:
+            registry.claim(
+                kind="face",
+                raw_sha256=raw_sha,
+                typed_sha256=_typed_reference_sha256("face", raw),
+                owner={"kind": "face", "body_index": 1, "face_index": 0},
+                base={"component": "part-1"},
+            )
+        self.assertEqual(caught.exception.code, "cad_persistent_reference_alias")
+
+    def test_vertex_reference_reuse_requires_same_com_object(self):
+        registry = _NativeReferenceRegistry()
+        raw = hashlib.sha256(b"shared-vertex").digest()
+        raw_sha = hashlib.sha256(raw).hexdigest()
+        typed_sha = _typed_reference_sha256("vertex", raw)
+        registry.claim(
+            kind="vertex",
+            raw_sha256=raw_sha,
+            typed_sha256=typed_sha,
+            owner={"kind": "vertex", "vertex_index": 0},
+            base={"component": "part-1"},
+        )
+        registry.claim_scope(
+            kind="vertex",
+            raw_sha256=raw_sha,
+            identity_sha256=hashlib.sha256(b"scope-a").hexdigest(),
+            owner={"kind": "vertex", "vertex_index": 1},
+            base={"component": "part-1"},
+        )
+        self.assertEqual(
+            registry.alias_audit()["vertex"],
+            (raw_sha,),
+        )
+        with self.assertRaises(CadError) as caught:
+            registry.claim_scope(
+                kind="vertex",
+                raw_sha256=raw_sha,
+                identity_sha256=hashlib.sha256(b"scope-a").hexdigest(),
+                owner={"kind": "vertex", "vertex_index": 2},
+                base={"component": "part-1"},
+            )
+        self.assertEqual(caught.exception.code, "cad_scope_identity_alias")
+        native_object = object()
+        wrapper_a = SimpleNamespace(_oleobj_=native_object)
+        wrapper_b = SimpleNamespace(_oleobj_=native_object)
+        self.assertEqual(
+            _com_object_identity(wrapper_a),
+            _com_object_identity(wrapper_b),
+        )
+        self.assertNotEqual(
+            _com_object_identity(wrapper_a),
+            _com_object_identity(SimpleNamespace(_oleobj_=object())),
+        )
+
+    def test_scope_mapping_rejects_duplicate_topology_and_keeps_coincident_vertices(self):
+        def edge_row(edge_index, *, start_pointer, start_reference, end_x):
+            return {
+                "edge_index": edge_index,
+                "reference_sha256": hashlib.sha256(
+                    f"edge-{edge_index}".encode()
+                ).hexdigest(),
+                "endpoints": {
+                    "start": {
+                        "object_pointer": start_pointer,
+                        "reference_sha256": start_reference,
+                        "point_m": [0.0, 0.0, 0.0],
+                    },
+                    "end": {
+                        "object_pointer": start_pointer + 100,
+                        "reference_sha256": hashlib.sha256(
+                            f"end-{edge_index}".encode()
+                        ).hexdigest(),
+                        "point_m": [end_x, 0.0, 0.0],
+                    },
+                },
+                "face_indices": [0, 1],
+                "u_min": 0.0,
+                "u_max": 1.0,
+                "curve_start_point_m": [0.0, 0.0, 0.0],
+                "curve_end_point_m": [1.0, 0.0, 0.0],
+                "curve_sense": True,
+                "curve_type": 0,
+                "curve_closed": False,
+                "curve_periodic": False,
+            }
+
+        first = edge_row(
+            0,
+            start_pointer=1,
+            start_reference="1" * 64,
+            end_x=1.0,
+        )
+        second = edge_row(
+            1,
+            start_pointer=2,
+            start_reference="2" * 64,
+            end_x=2.0,
+        )
+        vertices = _scope_vertex_rows([first, second])
+        coincident = [
+            row
+            for row in vertices
+            if row["point_m"] == [0.0, 0.0, 0.0]
+        ]
+        self.assertEqual(
+            [
+                row["coincident_occurrence_index"]
+                for row in coincident
+            ],
+            [0, 1],
+        )
+
+        duplicate = copy.deepcopy(first)
+        duplicate["edge_index"] = 2
+        duplicate["mapping_index"] = 2
+        first["mapping_index"] = 0
+        first["mapping_key"] = _scope_edge_mapping_key(first, [0, 1])
+        duplicate["mapping_key"] = _scope_edge_mapping_key(
+            duplicate,
+            [0, 1],
+        )
+        with self.assertRaises(ValueError):
+            _scope_bijection(
+                [first, duplicate],
+                [copy.deepcopy(first)],
+            )
+
+    def test_same_kind_edge_alias_uses_mapped_scope_identity(self):
+        triangles = []
+        spans = []
+        body_reference = hashlib.sha256(b"edge-alias-body").hexdigest()
+        for block in range(2):
+            origin = float(block * 10)
+            vertices = (
+                (origin, 0.0, 0.0),
+                (origin + 1.0, 0.0, 0.0),
+                (origin, 1.0, 0.0),
+                (origin + 1.0, 1.0, 0.0),
+            )
+            for triangle in (
+                (vertices[0], vertices[1], vertices[2]),
+                (vertices[1], vertices[0], vertices[3]),
+            ):
+                face_index = len(spans)
+                triangles.append(triangle)
+                spans.append(
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "body_name": "edge-alias-body",
+                        "body_reference_sha256": body_reference,
+                        "face_index": face_index,
+                        "face_reference_sha256": hashlib.sha256(
+                            f"edge-alias-face-{face_index}".encode()
+                        ).hexdigest(),
+                        "face_owner_id": face_index + 1,
+                        "edge_references": [],
+                        "triangle_start": face_index,
+                        "triangle_count": 1,
+                        "triangle_records_sha256": "0" * 64,
+                    }
+                )
+        shared_edge_reference = hashlib.sha256(
+            b"body-scope-edge-alias"
+        ).hexdigest()
+        native_edges = []
+        for edge_index, first_face in enumerate((0, 2)):
+            origin = float((edge_index) * 10)
+            native_edges.append(
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "edge_reference_sha256": shared_edge_reference,
+                    "start_vertex_reference_sha256": hashlib.sha256(
+                        f"edge-alias-start-{edge_index}".encode()
+                    ).hexdigest(),
+                    "end_vertex_reference_sha256": hashlib.sha256(
+                        f"edge-alias-end-{edge_index}".encode()
+                    ).hexdigest(),
+                    "start_point_m": [origin, 0.0, 0.0],
+                    "end_point_m": [origin + 1.0, 0.0, 0.0],
+                    "face_indices": [first_face, first_face + 1],
+                    "u_min": 0.0,
+                    "u_max": 1.0,
+                    "curve_sense": True,
+                    "curve_type": 0,
+                }
+            )
+        evidence = support.native_tessellation_fixture(
+            spans,
+            native_edges,
+            triangle_vertices=triangles,
+        )
+        source_sha256 = "a" * 64
+        owner_scope = {
+            "occurrence": "edge-alias",
+            "source_document_path": "C:/edge-alias.SLDPRT",
+            "source_document_sha256": source_sha256,
+            "source_document_identity_sha256": source_sha256,
+            "source_document_identity_kind": "file_sha256",
+            "active_configuration": "Default",
+            "referenced_configuration": "Default",
+        }
+        owner_scope_key = _scope_owner_key(
+            owner_scope,
+            body_type=0,
+            body_index=0,
+            body_name="edge-alias-body",
+        )
+        fins = {
+            row["fin_id"]: row
+            for row in evidence["itessellation"]["bodies"][0]["fins"]
+        }
+        for edge_index, edge in enumerate(evidence["native_edges"]):
+            edge_identity = {
+                "rule_version": "native-scope-entity-id-v1",
+                "entity_kind": "edge",
+                "identity_kind": "mapped_scope_local",
+                "persistent": False,
+                "owner_scope_key": owner_scope_key,
+                "source_document_sha256": source_sha256,
+                "native_edge_index": edge_index,
+                "start_point_binary64_hex": [
+                    struct.pack("<d", float(value)).hex()
+                    for value in edge["start_point_m"]
+                ],
+                "end_point_binary64_hex": [
+                    struct.pack("<d", float(value)).hex()
+                    for value in edge["end_point_m"]
+                ],
+                "start_vertex_reference_sha256": edge[
+                    "start_vertex_reference_sha256"
+                ],
+                "end_vertex_reference_sha256": edge[
+                    "end_vertex_reference_sha256"
+                ],
+                "curve_type": edge["curve_type"],
+                "curve_sense": edge["curve_sense"],
+                "curve_domain_binary64_hex": [
+                    struct.pack("<d", float(edge["u_min"])).hex(),
+                    struct.pack("<d", float(edge["u_max"])).hex(),
+                ],
+                "curve_closed": edge["curve_closed"],
+                "curve_periodic": edge["curve_periodic"],
+                "adjacent_mapped_face_ids": edge["face_indices"],
+                "mapping_source_part_document_sha256": source_sha256,
+                "mapping_source_edge_index": edge_index,
+                "mapping_source_edge_persistent_reference_sha256": hashlib.sha256(
+                    f"part-edge-{edge_index}".encode()
+                ).hexdigest(),
+                "mapping_method": NATIVE_SCOPE_MAPPING_METHOD,
+                "source_authority": NATIVE_SCOPE_SOURCE_AUTHORITY,
+                "warnings": [
+                    "cad_component_persistent_reference_aliased",
+                    "cad_scope_local_identity_derived",
+                ],
+            }
+            mapping_row = {
+                "endpoints": {
+                    "start": {
+                        "point_m": edge["start_point_m"],
+                    },
+                    "end": {
+                        "point_m": edge["end_point_m"],
+                    },
+                },
+                "u_min": edge["u_min"],
+                "u_max": edge["u_max"],
+                "curve_start_point_m": edge["curve_start_point_m"],
+                "curve_end_point_m": edge["curve_end_point_m"],
+                "curve_sense": edge["curve_sense"],
+                "curve_type": edge["curve_type"],
+                "curve_closed": edge["curve_closed"],
+                "curve_periodic": edge["curve_periodic"],
+            }
+            edge_identity["topology_signature_sha256"] = (
+                _scope_edge_mapping_key(
+                    mapping_row,
+                    edge["face_indices"],
+                )
+            )
+            identity_sha256 = native_scope_identity_sha256(edge_identity)
+            edge["edge_identity_mode"] = "native-scope-entity-id-v1"
+            edge["edge_identity"] = edge_identity
+            edge["edge_reference_sha256"] = identity_sha256
+            for fin_id in edge["fin_ids"]:
+                fins[fin_id]["edge_reference_sha256"] = identity_sha256
+            for face_index in edge["face_indices"]:
+                evidence["face_spans"][face_index][
+                    "edge_references"
+                ].append(identity_sha256)
+        evidence["itessellation"]["reference_alias_audit"] = {
+            "body": [],
+            "face": [],
+            "edge": [shared_edge_reference],
+            "vertex": [],
+        }
+        identity_warnings = []
+        parse_native_tessellation(
+            "edge-alias",
+            evidence,
+            {"solid": 1, "sheet": 0},
+            len(triangles),
+            triangles,
+            native_identity_warnings=identity_warnings,
+        )
+        self.assertEqual(
+            {row["entity_kind"] for row in identity_warnings},
+            {"edge"},
+        )
+
+    def test_same_kind_alias_uses_scope_local_identity(self):
+        body, face_10, _face_20, edge, tessellation, extension = self.fixture()
+        face_alias = FakeFace(
+            [2.0, 0.0, 0.0, 3.0, 0.0, 0.0, 2.0, 1.0, 0.0],
+            20,
+            body,
+        )
+        body.faces = [face_10, face_alias]
+        edge.faces = [face_10, face_alias]
+        tessellation.face_facets[id(face_alias)] = 20
+        shared = hashlib.sha256(b"body-scope-face-alias").digest()
+
+        def reference(value):
+            if value is face_10 or value is face_alias:
+                return list(shared)
+            return list(
+                hashlib.sha256(
+                    f"native-{id(value)}".encode()
+                ).digest()
+            )
+
+        extension.GetPersistReference3 = reference
         with self.assertRaises(CadError) as caught:
             self.capture(body, extension)
-        self.assertEqual(caught.exception.code, "cad_persistent_reference_alias")
-        self.assertEqual(caught.exception.detail["kind"], "face")
+        self.assertEqual(
+            caught.exception.code,
+            "cad_scope_witness_unavailable",
+        )
+        backend = SolidWorksBackend()
+        document_key = object()
+        source_path = Path(__file__).resolve()
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        backend._source_components = {"part-1": (document_key, "Default")}
+        backend._source_documents = {
+            document_key: (
+                str(source_path),
+                "source",
+                "Default",
+                object(),
+            )
+        }
+        backend._scope_witnesses_override = lambda *_args: {
+            "face": {
+                index: {
+                    "part_document_sha256": source_sha256,
+                    "face_index": index,
+                    "persistent_reference_sha256": hashlib.sha256(
+                        f"part-face-{index}".encode()
+                    ).hexdigest(),
+                }
+                for index in range(2)
+            },
+            "edge": {},
+            "vertex": {},
+        }
+        backend._captured_document = lambda *_args, **_kwargs: SimpleNamespace(
+            Extension=extension
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            native_module,
+            "_read_curve_end_params",
+            fake_read_end_params,
+        ):
+            destination = Path(directory) / "alias.stl"
+            entry = backend._write_component_mesh(
+                "part-1",
+                destination,
+                FakeHolder(body),
+            )
+            mesh_triangles = self.stl_triangles(destination)
+            identity_warnings = []
+            parse_native_tessellation(
+                "part-1",
+                entry["tessellation"],
+                entry["bodies"],
+                entry["triangles"],
+                mesh_triangles,
+                native_identity_warnings=identity_warnings,
+            )
+        identities = [
+            row["face_identity"]
+            for row in entry["tessellation"]["face_spans"]
+        ]
+        self.assertTrue(all(identity is not None for identity in identities))
+        self.assertTrue(
+            all(
+                identity["persistent"] is False
+                and "cad_component_persistent_reference_aliased"
+                in identity["warnings"]
+                for identity in identities
+            )
+        )
+        self.assertEqual(
+            entry["tessellation"]["itessellation"]["reference_alias_audit"][
+                "face"
+            ],
+            [hashlib.sha256(shared).hexdigest()],
+        )
+        self.assertEqual(
+            {
+                row["code"]
+                for row in identity_warnings
+            },
+            {
+                "cad_component_persistent_reference_aliased",
+                "cad_scope_local_identity_derived",
+            },
+        )
+        self.assertTrue(
+            all(
+                row["object_indices"] == [0, 1]
+                for row in identity_warnings
+            )
+        )
 
-    def test_same_kind_persistent_reference_alias_is_rejected(self):
-        body, face_10, _face_20, _edge, _tessellation, extension = self.fixture()
-        body.faces = [face_10, face_10]
+        def mutate_identity(value, mutate):
+            span = value["face_spans"][0]
+            mutate(span["face_identity"])
+            span["face_reference_sha256"] = native_scope_identity_sha256(
+                span["face_identity"]
+            )
 
-        with self.assertRaises(CadError) as caught:
-            self.capture(body, extension)
-        self.assertEqual(caught.exception.code, "cad_persistent_reference_alias")
-        self.assertEqual(caught.exception.detail["previous"]["kind"], "face")
+        def change_referenced_configuration(identity):
+            identity["referenced_configuration"] = "Different"
+            identity["owner_scope_key"] = native_scope_identity_sha256(
+                {
+                    "occurrence_scope": identity["occurrence_scope"],
+                    "source_document_sha256": identity[
+                        "source_document_sha256"
+                    ],
+                    "referenced_configuration": identity[
+                        "referenced_configuration"
+                    ],
+                    "body_type": identity["body_type"],
+                    "body_index": identity["body_index"],
+                    "body_name": identity["body_name"],
+                }
+            )
+
+        mutations = (
+            lambda value: value["face_spans"][0]["face_identity"].pop(
+                "area_binary64_hex"
+            ),
+            lambda value: mutate_identity(
+                value,
+                lambda identity: identity.__setitem__(
+                    "area_binary64_hex", "Z" * 16
+                ),
+            ),
+            lambda value: mutate_identity(
+                value,
+                lambda identity: identity.__setitem__(
+                    "topology_signature_sha256", "0" * 64
+                ),
+            ),
+            lambda value: mutate_identity(
+                value,
+                lambda identity: identity.__setitem__(
+                    "body_name", "different-body"
+                ),
+            ),
+            lambda value: mutate_identity(
+                value,
+                lambda identity: identity.__setitem__(
+                    "mapping_source_face_index", 99
+                ),
+            ),
+            lambda value: mutate_identity(
+                value,
+                change_referenced_configuration,
+            ),
+            lambda value: mutate_identity(
+                value,
+                lambda identity: identity["warnings"].remove(
+                    "cad_component_persistent_reference_aliased"
+                ),
+            ),
+            lambda value: value["itessellation"][
+                "reference_alias_audit"
+            ].__setitem__("face", []),
+            lambda value: value["face_spans"][1].update(
+                {
+                    "face_identity_mode": (
+                        "native-persistent-reference-v1"
+                    ),
+                    "face_identity": None,
+                }
+            ),
+            lambda value: mutate_identity(
+                value,
+                lambda identity: identity.__setitem__(
+                    "mapped_source_face_persistent_reference_sha256",
+                    "0" * 64,
+                ),
+            ),
+        )
+        for mutate in mutations:
+            broken = copy.deepcopy(entry["tessellation"])
+            mutate(broken)
+            with self.assertRaises(PipelineError):
+                parse_native_tessellation(
+                    "part-1",
+                    broken,
+                    entry["bodies"],
+                    entry["triangles"],
+                    mesh_triangles,
+                )
 
     def test_match_type_readback_mismatch_is_rejected(self):
         body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()

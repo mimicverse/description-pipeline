@@ -14,6 +14,8 @@ from typing import Any, cast
 from description_pipeline.geometry.native_u import (
     NATIVE_CURVE_DOMAIN_RULE,
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
+    NATIVE_IDENTITY_POLICY_RULE,
+    NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
@@ -357,7 +359,7 @@ def _curve_end_params(
     }
 
 
-def native_tessellation_v3(
+def native_tessellation_fixture(
     face_spans: Sequence[dict[str, Any]],
     native_edges: Sequence[dict[str, Any]],
     no_facets_faces: Sequence[dict[str, Any]] = (),
@@ -368,6 +370,26 @@ def native_tessellation_v3(
 
     spans = copy.deepcopy(list(face_spans))
     input_edges = copy.deepcopy(list(native_edges))
+    for span in spans:
+        span.setdefault(
+            "native_face_reference_sha256",
+            span["face_reference_sha256"],
+        )
+        span.setdefault(
+            "face_identity_mode",
+            NATIVE_PERSISTENT_IDENTITY_RULE,
+        )
+        span.setdefault("face_identity", None)
+    for edge in input_edges:
+        edge.setdefault(
+            "native_edge_reference_sha256",
+            edge["edge_reference_sha256"],
+        )
+        edge.setdefault(
+            "edge_identity_mode",
+            NATIVE_PERSISTENT_IDENTITY_RULE,
+        )
+        edge.setdefault("edge_identity", None)
     fixture_triangles = []
     body_keys = sorted({(span["body_type"], span["body_index"]) for span in spans})
     evidence_by_body: dict[tuple[int, int], dict[str, Any]] = {}
@@ -476,6 +498,9 @@ def native_tessellation_v3(
                 {
                     "face_index": span["face_index"],
                     "facet_ids": facet_ids,
+                    "face_identity_sha256": span[
+                        "face_reference_sha256"
+                    ],
                 }
             )
         evidence_by_body[body_key] = {
@@ -715,6 +740,11 @@ def native_tessellation_v3(
                 "body_type": body_key[0],
                 "body_index": body_key[1],
                 "edge_reference_sha256": edge["edge_reference_sha256"],
+                "native_edge_reference_sha256": edge[
+                    "native_edge_reference_sha256"
+                ],
+                "edge_identity_mode": edge["edge_identity_mode"],
+                "edge_identity": edge["edge_identity"],
                 "start_vertex_reference_sha256": edge["start_vertex_reference_sha256"],
                 "end_vertex_reference_sha256": edge["end_vertex_reference_sha256"],
                 "start_point_m": [float(value) for value in edge["start_point_m"]],
@@ -810,6 +840,46 @@ def native_tessellation_v3(
         for fin in body["fins"]
     )
     u_observations = native_fin_count * 2
+    solidworks_vertex_identities = []
+    vertex_identity_by_key = {}
+    for edge in input_edges:
+        body_key = (edge["body_type"], edge["body_index"])
+        for endpoint in ("start", "end"):
+            reference = edge[f"{endpoint}_vertex_reference_sha256"]
+            point = edge[f"{endpoint}_point_m"]
+            if reference is None or point is None:
+                continue
+            key = (*body_key, reference)
+            previous = vertex_identity_by_key.get(key)
+            if previous is not None:
+                if previous != point:
+                    raise ValueError(
+                        "fixture vertex reference has inconsistent points"
+                    )
+                continue
+            vertex_identity_by_key[key] = point
+    next_vertex_index = {}
+    for body_key, reference, point in sorted(
+        (
+            (key[:2], key[2], value)
+            for key, value in vertex_identity_by_key.items()
+        ),
+        key=lambda item: (item[0], item[1]),
+    ):
+        vertex_index = next_vertex_index.get(body_key, 0)
+        next_vertex_index[body_key] = vertex_index + 1
+        solidworks_vertex_identities.append(
+            {
+                "body_type": body_key[0],
+                "body_index": body_key[1],
+                "vertex_index": vertex_index,
+                "point_m": list(point),
+                "identity_mode": NATIVE_PERSISTENT_IDENTITY_RULE,
+                "native_reference_sha256": reference,
+                "identity": None,
+                "identity_sha256": reference,
+            }
+        )
     expected_triangles = sum(span["triangle_count"] for span in spans)
     if len(fixture_triangles) != expected_triangles:
         raise ValueError("native tessellation triangle projection is incomplete")
@@ -852,6 +922,7 @@ def native_tessellation_v3(
             "interface_iid": ITESSELLATION_IID,
             "u_rule_version": NATIVE_U_IDENTITY_RULE,
             "u_resolution_rule": NATIVE_U_RESOLUTION_RULE,
+            "identity_rule": NATIVE_IDENTITY_POLICY_RULE,
             "point_roundtrip_rule": NATIVE_POINT_ROUNDTRIP_RULE,
             "u_observation_stats": {
                 "unique_observations": u_observations,
@@ -863,6 +934,7 @@ def native_tessellation_v3(
             "properties": copy.deepcopy(NATIVE_TESSELLATION_PROPERTIES),
             "bodies": body_rows,
             "vertices": vertex_rows,
+            "solidworks_vertex_identities": solidworks_vertex_identities,
         },
     }
     return NativeTessellationV3Fixture(
@@ -1411,7 +1483,7 @@ class FixtureCadBackend(CadBackend):
                     }
                 )
                 start += count
-            tessellation = native_tessellation_v3(
+            tessellation = native_tessellation_fixture(
                 spans,
                 native_edges,
                 triangle_vertices=mesh_triangles,

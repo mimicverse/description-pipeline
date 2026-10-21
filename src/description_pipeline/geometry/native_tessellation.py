@@ -11,7 +11,16 @@ from ..schemas import NATIVE_TESSELLATION_SCHEMA
 from .native_u import (
     NATIVE_CURVE_ENDPOINT_OPERATION_RULE,
     NATIVE_COLLAPSED_U_FIN_RULE,
+    NATIVE_COMPONENT_REFERENCE_ALIASED,
+    NATIVE_FACE_IDENTITY_KEY_RULE,
+    NATIVE_SCOPE_MAPPING_METHOD,
+    NATIVE_SCOPE_SOURCE_AUTHORITY,
+    NATIVE_SCOPE_VERTEX_MAPPING_METHOD,
+    NATIVE_PERSISTENT_IDENTITY_RULE,
     NATIVE_POINT_ROUNDTRIP_RULE,
+    NATIVE_IDENTITY_POLICY_RULE,
+    NATIVE_SCOPE_IDENTITY_RULE,
+    NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
     NATIVE_TESSELLATION_EDGE_PROJECTION_RULE,
     NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
     NATIVE_U_CLOSEST_FALLBACK_RULE,
@@ -28,10 +37,10 @@ from .native_u import (
     native_u_in_closed_interval,
     native_u_intervals_cover,
     native_curve_domain_transform,
+    native_scope_identity_sha256,
 )
 
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
-NATIVE_TESSELLATION_V3_SCHEMA = NATIVE_TESSELLATION_SCHEMA
 ITESSELLATION_IID = "{699C7492-DB56-4CC2-B7A2-9FFD56698434}"
 
 
@@ -42,6 +51,348 @@ def _require(condition: bool, message: str) -> None:
 
 def _integer(value) -> bool:
     return type(value) is int
+
+
+def _binary64_hex(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-f]{16}", value) is not None
+    )
+
+
+def _valid_scope_identity(
+    value: object,
+    *,
+    kind: str,
+    component: str,
+) -> bool:
+    common = {
+        "rule_version",
+        "entity_kind",
+        "identity_kind",
+        "persistent",
+        "owner_scope_key",
+        "warnings",
+    }
+    keys = {
+        "face": common
+        | {
+            "source_document_sha256",
+            "referenced_configuration",
+            "occurrence_scope",
+            "body_type",
+            "body_index",
+            "body_name",
+            "native_face_index",
+            "area_binary64_hex",
+            "tessellation_bbox_min_binary64_hex",
+            "tessellation_bbox_max_binary64_hex",
+            "tessellation_coordinate_sha256_float64_le",
+            "topology_signature_sha256",
+            "raw_component_reference_sha256",
+            "raw_component_reference_kind",
+            "mapping_source_part_document_sha256",
+            "mapping_source_face_index",
+            "mapped_source_face_persistent_reference_sha256",
+            "mapping_method",
+            "source_authority",
+        },
+        "edge": common
+        | {
+            "source_document_sha256",
+            "native_edge_index",
+            "start_point_binary64_hex",
+            "end_point_binary64_hex",
+            "start_vertex_reference_sha256",
+            "end_vertex_reference_sha256",
+            "curve_type",
+            "curve_sense",
+            "curve_domain_binary64_hex",
+            "curve_closed",
+            "curve_periodic",
+            "adjacent_mapped_face_ids",
+            "topology_signature_sha256",
+            "mapping_source_part_document_sha256",
+            "mapping_source_edge_index",
+            "mapping_source_edge_persistent_reference_sha256",
+            "mapping_method",
+            "source_authority",
+        },
+        "vertex": common
+        | {
+            "source_document_sha256",
+            "native_vertex_index",
+            "point_binary64_hex",
+            "coincident_occurrence_index",
+            "incident_edge_identity_sha256",
+            "topology_signature_sha256",
+            "mapping_source_part_document_sha256",
+            "mapping_source_vertex_index",
+            "mapped_source_vertex_persistent_reference_sha256",
+            "mapping_method",
+            "source_authority",
+        },
+    }
+    if not isinstance(value, dict) or set(value) != keys[kind]:
+        return False
+    warnings = value["warnings"]
+    expected_warnings = {NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED}
+    return (
+        value["rule_version"] == NATIVE_SCOPE_IDENTITY_RULE
+        and value["entity_kind"] == kind
+        and value["identity_kind"] == "mapped_scope_local"
+        and value["persistent"] is False
+        and isinstance(value["owner_scope_key"], str)
+        and bool(HEX64.fullmatch(value["owner_scope_key"]))
+        and isinstance(warnings, list)
+        and warnings == sorted(set(warnings))
+        and set(warnings)
+        == expected_warnings | {NATIVE_COMPONENT_REFERENCE_ALIASED}
+        and (
+            kind != "face"
+            or (
+                isinstance(value["source_document_sha256"], str)
+                and bool(
+                    HEX64.fullmatch(value["source_document_sha256"])
+                )
+                and isinstance(value["referenced_configuration"], str)
+                and bool(value["referenced_configuration"])
+                and value["occurrence_scope"] == component
+                and _integer(value["body_type"])
+                and value["body_type"] in (0, 1)
+                and _integer(value["body_index"])
+                and value["body_index"] >= 0
+                and isinstance(value["body_name"], str)
+                and bool(value["body_name"])
+                and _integer(value["native_face_index"])
+                and value["native_face_index"] >= 0
+                and _binary64_hex(value["area_binary64_hex"])
+                and isinstance(
+                    value["tessellation_bbox_min_binary64_hex"], list
+                )
+                and len(value["tessellation_bbox_min_binary64_hex"]) == 3
+                and all(
+                    _binary64_hex(item)
+                    for item in value[
+                        "tessellation_bbox_min_binary64_hex"
+                    ]
+                )
+                and isinstance(
+                    value["tessellation_bbox_max_binary64_hex"], list
+                )
+                and len(value["tessellation_bbox_max_binary64_hex"]) == 3
+                and all(
+                    _binary64_hex(item)
+                    for item in value[
+                        "tessellation_bbox_max_binary64_hex"
+                    ]
+                )
+                and isinstance(
+                    value[
+                        "tessellation_coordinate_sha256_float64_le"
+                    ],
+                    str,
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value[
+                            "tessellation_coordinate_sha256_float64_le"
+                        ]
+                    )
+                )
+                and isinstance(value["topology_signature_sha256"], str)
+                and bool(
+                    HEX64.fullmatch(value["topology_signature_sha256"])
+                )
+                and isinstance(
+                    value["mapping_source_part_document_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["mapping_source_part_document_sha256"]
+                    )
+                )
+                and isinstance(
+                    value["raw_component_reference_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["raw_component_reference_sha256"]
+                    )
+                )
+                and value["raw_component_reference_kind"]
+                == "body_scope_alias"
+                and isinstance(
+                    value["mapping_source_part_document_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["mapping_source_part_document_sha256"]
+                    )
+                )
+                and _integer(value["mapping_source_face_index"])
+                and value["mapping_source_face_index"] >= 0
+                and isinstance(
+                    value[
+                        "mapped_source_face_persistent_reference_sha256"
+                    ],
+                    str,
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value[
+                            "mapped_source_face_persistent_reference_sha256"
+                        ]
+                    )
+                )
+                and value["mapping_method"]
+                == NATIVE_SCOPE_MAPPING_METHOD
+                and value["source_authority"]
+                == NATIVE_SCOPE_SOURCE_AUTHORITY
+            )
+        )
+        and (
+            kind != "edge"
+            or (
+                isinstance(value["source_document_sha256"], str)
+                and bool(
+                    HEX64.fullmatch(value["source_document_sha256"])
+                )
+                and _integer(value["native_edge_index"])
+                and value["native_edge_index"] >= 0
+                and isinstance(value["start_point_binary64_hex"], list)
+                and len(value["start_point_binary64_hex"]) == 3
+                and all(
+                    _binary64_hex(item)
+                    for item in value["start_point_binary64_hex"]
+                )
+                and isinstance(value["end_point_binary64_hex"], list)
+                and len(value["end_point_binary64_hex"]) == 3
+                and all(
+                    _binary64_hex(item)
+                    for item in value["end_point_binary64_hex"]
+                )
+                and isinstance(
+                    value["start_vertex_reference_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["start_vertex_reference_sha256"]
+                    )
+                )
+                and isinstance(
+                    value["end_vertex_reference_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["end_vertex_reference_sha256"]
+                    )
+                )
+                and _integer(value["curve_type"])
+                and value["curve_type"] >= 0
+                and type(value["curve_sense"]) is bool
+                and isinstance(value["curve_domain_binary64_hex"], list)
+                and len(value["curve_domain_binary64_hex"]) == 2
+                and all(
+                    _binary64_hex(item)
+                    for item in value["curve_domain_binary64_hex"]
+                )
+                and type(value["curve_closed"]) is bool
+                and type(value["curve_periodic"]) is bool
+                and isinstance(value["adjacent_mapped_face_ids"], list)
+                and value["adjacent_mapped_face_ids"]
+                == sorted(set(value["adjacent_mapped_face_ids"]))
+                and all(
+                    _integer(item) and item >= 0
+                    for item in value["adjacent_mapped_face_ids"]
+                )
+                and isinstance(value["topology_signature_sha256"], str)
+                and bool(
+                    HEX64.fullmatch(value["topology_signature_sha256"])
+                )
+                and isinstance(
+                    value[
+                        "mapping_source_edge_persistent_reference_sha256"
+                    ],
+                    str,
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value[
+                            "mapping_source_edge_persistent_reference_sha256"
+                        ]
+                    )
+                )
+                and _integer(value["mapping_source_edge_index"])
+                and value["mapping_source_edge_index"] >= 0
+                and value["mapping_source_part_document_sha256"]
+                == value["source_document_sha256"]
+                and value["mapping_method"]
+                == NATIVE_SCOPE_MAPPING_METHOD
+                and value["source_authority"]
+                == NATIVE_SCOPE_SOURCE_AUTHORITY
+            )
+        )
+        and (
+            kind != "vertex"
+            or (
+                isinstance(value["source_document_sha256"], str)
+                and bool(
+                    HEX64.fullmatch(value["source_document_sha256"])
+                )
+                and _integer(value["native_vertex_index"])
+                and value["native_vertex_index"] >= 0
+                and isinstance(value["point_binary64_hex"], list)
+                and len(value["point_binary64_hex"]) == 3
+                and all(
+                    _binary64_hex(item)
+                    for item in value["point_binary64_hex"]
+                )
+                and _integer(value["coincident_occurrence_index"])
+                and value["coincident_occurrence_index"] >= 0
+                and isinstance(value["incident_edge_identity_sha256"], list)
+                and value["incident_edge_identity_sha256"]
+                == sorted(set(value["incident_edge_identity_sha256"]))
+                and all(
+                    isinstance(item, str) and bool(HEX64.fullmatch(item))
+                    for item in value["incident_edge_identity_sha256"]
+                )
+                and isinstance(value["topology_signature_sha256"], str)
+                and bool(
+                    HEX64.fullmatch(value["topology_signature_sha256"])
+                )
+                and isinstance(
+                    value["mapping_source_part_document_sha256"], str
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value["mapping_source_part_document_sha256"]
+                    )
+                )
+                and _integer(value["mapping_source_vertex_index"])
+                and value["mapping_source_vertex_index"] >= 0
+                and isinstance(
+                    value[
+                        "mapped_source_vertex_persistent_reference_sha256"
+                    ],
+                    str,
+                )
+                and bool(
+                    HEX64.fullmatch(
+                        value[
+                            "mapped_source_vertex_persistent_reference_sha256"
+                        ]
+                    )
+                )
+                and value["mapping_source_part_document_sha256"]
+                == value["source_document_sha256"]
+                and value["mapping_method"]
+                == NATIVE_SCOPE_VERTEX_MAPPING_METHOD
+                and value["source_authority"]
+                == NATIVE_SCOPE_SOURCE_AUTHORITY
+            )
+        )
+    )
 
 
 def _valid_evaluate2_packed_status(value: object) -> bool:
@@ -367,7 +718,7 @@ def _finite_fin_intervals(
     _require(
         0.0 < span <= NATIVE_TESSELLATION_EDGE_PROJECTION_TOLERANCE_M,
         component
-        + f": native tessellation v3 edge {reference} fin {fin_id} collapsed U span is invalid",
+        + f": native tessellation v4 edge {reference} fin {fin_id} collapsed U span is invalid",
     )
     return [], span
 
@@ -380,6 +731,7 @@ def parse_native_tessellation(
     triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None = None,
     *,
     native_fin_resolutions: list[dict] | None = None,
+    native_identity_warnings: list[dict] | None = None,
 ) -> list[dict]:
     """Validate the one current tessellation schema and return its face spans."""
 
@@ -391,6 +743,15 @@ def parse_native_tessellation(
         ),
         component
         + ": native fin resolution output must be an empty list",
+    )
+    _require(
+        native_identity_warnings is None
+        or (
+            isinstance(native_identity_warnings, list)
+            and not native_identity_warnings
+        ),
+        component
+        + ": native identity warning output must be an empty list",
     )
     _require(
         isinstance(tessellation, dict)
@@ -405,7 +766,7 @@ def parse_native_tessellation(
         component + ": unknown or legacy tessellation accounting",
     )
     _require(
-        tessellation["schema_version"] == NATIVE_TESSELLATION_V3_SCHEMA,
+        tessellation["schema_version"] == NATIVE_TESSELLATION_SCHEMA,
         component + ": unsupported native tessellation schema",
     )
     spans = tessellation["face_spans"]
@@ -424,6 +785,9 @@ def parse_native_tessellation(
         "body_reference_sha256",
         "face_index",
         "face_reference_sha256",
+        "native_face_reference_sha256",
+        "face_identity_mode",
+        "face_identity",
         "face_owner_id",
         "edge_references",
         "triangle_start",
@@ -454,9 +818,56 @@ def parse_native_tessellation(
         body_name = span["body_name"]
         body_reference = span["body_reference_sha256"]
         face_reference = span["face_reference_sha256"]
+        native_face_reference = span["native_face_reference_sha256"]
+        face_identity_mode = span["face_identity_mode"]
+        face_identity = span["face_identity"]
         face_owner_id = span["face_owner_id"]
         edge_references = span["edge_references"]
         records_digest = span["triangle_records_sha256"]
+        expected_owner_scope_key = (
+            native_scope_identity_sha256(
+                {
+                    "occurrence_scope": face_identity["occurrence_scope"],
+                    "source_document_sha256": face_identity[
+                        "source_document_sha256"
+                    ],
+                    "referenced_configuration": face_identity[
+                        "referenced_configuration"
+                    ],
+                    "body_type": face_identity["body_type"],
+                    "body_index": face_identity["body_index"],
+                    "body_name": face_identity["body_name"],
+                }
+            )
+            if isinstance(face_identity, dict)
+            else None
+        )
+        scope_identity_valid = (
+            (
+                face_identity_mode == NATIVE_PERSISTENT_IDENTITY_RULE
+                and face_identity is None
+            )
+            or (
+                face_identity_mode == NATIVE_SCOPE_IDENTITY_RULE
+                and _valid_scope_identity(
+                    face_identity,
+                    kind="face",
+                    component=component,
+                )
+                and face_identity["body_type"] == body_type
+                and face_identity["body_index"] == body_index
+                and face_identity["body_name"] == body_name
+                and face_identity["native_face_index"] == face_index
+                and face_identity["raw_component_reference_sha256"]
+                == native_face_reference
+                and face_identity["mapping_source_part_document_sha256"]
+                == face_identity["source_document_sha256"]
+                and face_reference
+                == native_scope_identity_sha256(face_identity)
+                and face_identity["owner_scope_key"]
+                == expected_owner_scope_key
+            )
+        )
         _require(
             _integer(body_type)
             and body_type in (0, 1)
@@ -473,6 +884,9 @@ def parse_native_tessellation(
             and bool(HEX64.fullmatch(body_reference))
             and isinstance(face_reference, str)
             and bool(HEX64.fullmatch(face_reference))
+            and isinstance(native_face_reference, str)
+            and bool(HEX64.fullmatch(native_face_reference))
+            and scope_identity_valid
             and _integer(face_owner_id)
             and 0 < face_owner_id <= 0xFFFF
             and isinstance(edge_references, list)
@@ -554,6 +968,9 @@ def parse_native_tessellation(
         "body_type",
         "body_index",
         "edge_reference_sha256",
+        "native_edge_reference_sha256",
+        "edge_identity_mode",
+        "edge_identity",
         "start_vertex_reference_sha256",
         "end_vertex_reference_sha256",
         "start_point_m",
@@ -591,6 +1008,9 @@ def parse_native_tessellation(
             component + f": native edge {index} has an unknown shape",
         )
         reference = edge["edge_reference_sha256"]
+        native_reference = edge["native_edge_reference_sha256"]
+        identity_mode = edge["edge_identity_mode"]
+        identity = edge["edge_identity"]
         start_reference = edge["start_vertex_reference_sha256"]
         end_reference = edge["end_vertex_reference_sha256"]
         start_point = edge["start_point_m"]
@@ -610,6 +1030,13 @@ def parse_native_tessellation(
             and edge["body_index"] >= 0
             and isinstance(reference, str)
             and bool(HEX64.fullmatch(reference))
+            and isinstance(native_reference, str)
+            and bool(HEX64.fullmatch(native_reference))
+            and identity_mode
+            in {
+                NATIVE_PERSISTENT_IDENTITY_RULE,
+                NATIVE_SCOPE_IDENTITY_RULE,
+            }
             and (
                 start_reference is None
                 or (
@@ -691,6 +1118,110 @@ def parse_native_tessellation(
             and isinstance(edge["face_senses"], list),
             component + f": native edge {index} is malformed",
         )
+        body_key = (edge["body_type"], edge["body_index"])
+        if identity_mode == NATIVE_PERSISTENT_IDENTITY_RULE:
+            _require(
+                identity is None,
+                component
+                + f": native edge {index} carries a derived identity "
+                + "without an alias",
+            )
+        else:
+            adjacent_face_identities = [
+                face_spans_by_key[(*body_key, face_index)][
+                    "face_identity"
+                ]
+                for face_index in edge["face_indices"]
+            ]
+            expected_face_ids = (
+                sorted(
+                    face_identity["mapping_source_face_index"]
+                    for face_identity in adjacent_face_identities
+                )
+                if all(
+                    face_identity is not None
+                    for face_identity in adjacent_face_identities
+                )
+                else identity["adjacent_mapped_face_ids"]
+            )
+            expected_topology = native_scope_identity_sha256(
+                {
+                    "start_point_binary64": [
+                        struct.pack("<d", float(value)).hex()
+                        for value in start_point
+                    ],
+                    "end_point_binary64": [
+                        struct.pack("<d", float(value)).hex()
+                        for value in end_point
+                    ],
+                    "curve_u_min_binary64": struct.pack(
+                        "<d", float(edge["u_min"])
+                    ).hex(),
+                    "curve_u_max_binary64": struct.pack(
+                        "<d", float(edge["u_max"])
+                    ).hex(),
+                    "curve_start_point_binary64": [
+                        struct.pack("<d", float(value)).hex()
+                        for value in edge["curve_start_point_m"]
+                    ],
+                    "curve_end_point_binary64": [
+                        struct.pack("<d", float(value)).hex()
+                        for value in edge["curve_end_point_m"]
+                    ],
+                    "curve_sense": edge["curve_sense"],
+                    "curve_type": edge["curve_type"],
+                    "curve_closed": edge["curve_closed"],
+                    "curve_periodic": edge["curve_periodic"],
+                    "adjacent_mapped_face_ids": expected_face_ids,
+                }
+            )
+            _require(
+                _valid_scope_identity(
+                    identity,
+                    kind="edge",
+                    component=component,
+                )
+                and identity["native_edge_index"] == index
+                and identity["start_point_binary64_hex"]
+                == [
+                    struct.pack("<d", float(value)).hex()
+                    for value in start_point
+                ]
+                and identity["end_point_binary64_hex"]
+                == [
+                    struct.pack("<d", float(value)).hex()
+                    for value in end_point
+                ]
+                and identity["start_vertex_reference_sha256"]
+                == edge["start_vertex_reference_sha256"]
+                and identity["end_vertex_reference_sha256"]
+                == edge["end_vertex_reference_sha256"]
+                and identity["curve_type"] == edge["curve_type"]
+                and identity["curve_sense"] is edge["curve_sense"]
+                and identity["curve_domain_binary64_hex"]
+                == [
+                    struct.pack("<d", float(edge["u_min"])).hex(),
+                    struct.pack("<d", float(edge["u_max"])).hex(),
+                ]
+                and identity["curve_closed"] is edge["curve_closed"]
+                and identity["curve_periodic"] is edge["curve_periodic"]
+                and identity["adjacent_mapped_face_ids"]
+                == expected_face_ids
+                and (
+                    face_spans_by_key[
+                        (*body_key, edge["face_indices"][0])
+                    ]["face_identity"]
+                    is None
+                    or identity["owner_scope_key"]
+                    == face_spans_by_key[
+                        (*body_key, edge["face_indices"][0])
+                    ]["face_identity"]["owner_scope_key"]
+                )
+                and reference == native_scope_identity_sha256(identity)
+                and identity["topology_signature_sha256"]
+                == expected_topology,
+                component + f": native edge {index} scope identity is invalid",
+            )
         end_params = edge["curve_end_params"]
         _require(
             set(end_params)
@@ -996,7 +1527,7 @@ def parse_native_tessellation(
         ),
         component + ": body, face, edge and vertex identities must not alias",
     )
-    _parse_v3_itessellation(
+    _parse_itessellation_evidence(
         component,
         tessellation["itessellation"],
         spans_by_body,
@@ -1007,11 +1538,12 @@ def parse_native_tessellation(
         triangles,
         triangle_vertices,
         native_fin_resolutions,
+        native_identity_warnings,
     )
     return spans
 
 
-def _parse_v3_itessellation(
+def _parse_itessellation_evidence(
     component: str,
     value: object,
     spans_by_body: dict,
@@ -1022,27 +1554,156 @@ def _parse_v3_itessellation(
     triangles: int,
     triangle_vertices: list[tuple[tuple[float, float, float], ...]] | None,
     native_fin_resolutions: list[dict] | None,
+    native_identity_warnings: list[dict] | None,
 ) -> None:
     """Validate body-local ITessellation facet/fin evidence fail closed."""
 
+    required = {
+        "interface_iid",
+        "u_rule_version",
+        "u_resolution_rule",
+        "point_roundtrip_rule",
+        "properties",
+        "identity_rule",
+        "bodies",
+        "vertices",
+        "solidworks_vertex_identities",
+        "u_observation_stats",
+    }
+    optional_alias_keys = {
+        "reference_alias_audit",
+        "cross_kind_raw_aliases",
+    }
     _require(
         isinstance(value, dict)
-        and set(value)
-        == {
-            "interface_iid",
-            "u_rule_version",
-            "u_resolution_rule",
-            "point_roundtrip_rule",
-            "properties",
-            "bodies",
-            "vertices",
-            "u_observation_stats",
-        },
-        component + ": native tessellation v3 ITessellation evidence is missing",
+        and required <= set(value)
+        and set(value) <= required | optional_alias_keys,
+        component + ": native ITessellation evidence is missing",
     )
+    if "reference_alias_audit" in value:
+        audit = value["reference_alias_audit"]
+        _require(
+            isinstance(audit, dict)
+            and set(audit) == {"body", "face", "edge", "vertex"}
+            and all(
+                isinstance(references, list)
+                and references == sorted(set(references))
+                and all(
+                    isinstance(reference, str)
+                    and bool(HEX64.fullmatch(reference))
+                    for reference in references
+                )
+                for references in audit.values()
+            ),
+            component + ": native persistent-reference alias audit is malformed",
+        )
+    if "cross_kind_raw_aliases" in value:
+        aliases = value["cross_kind_raw_aliases"]
+        base_owner_keys = {
+            "kind",
+            "component",
+            "body_type",
+            "body_index",
+            "typed_sha256",
+        }
+        kind_owner_keys = {
+            "body": base_owner_keys,
+            "face": base_owner_keys | {"face_index"},
+            "edge": base_owner_keys | {"edge_index"},
+            "vertex": base_owner_keys | {"vertex_index"},
+        }
+        _require(
+            isinstance(aliases, list)
+            and all(
+                isinstance(row, dict)
+                and set(row) == {"raw_sha256", "owners"}
+                and isinstance(row["raw_sha256"], str)
+                and bool(HEX64.fullmatch(row["raw_sha256"]))
+                and isinstance(row["owners"], list)
+                and bool(row["owners"])
+                and all(
+                    isinstance(owner, dict)
+                    and owner.get("kind") in {"body", "face", "edge", "vertex"}
+                    and set(owner) == kind_owner_keys[owner["kind"]]
+                    and isinstance(owner["component"], str)
+                    and bool(owner["component"])
+                    and _integer(owner["body_type"])
+                    and owner["body_type"] >= 0
+                    and _integer(owner["body_index"])
+                    and owner["body_index"] >= 0
+                    and isinstance(owner["typed_sha256"], str)
+                    and bool(HEX64.fullmatch(owner["typed_sha256"]))
+                    and (
+                        owner["kind"] != "face"
+                        or (_integer(owner["face_index"]) and owner["face_index"] >= 0)
+                    )
+                    and (
+                        owner["kind"] != "edge"
+                        or (_integer(owner["edge_index"]) and owner["edge_index"] >= 0)
+                    )
+                    and (
+                        owner["kind"] != "vertex"
+                        or (
+                            _integer(owner["vertex_index"])
+                            and owner["vertex_index"] >= 0
+                        )
+                    )
+                    for owner in row["owners"]
+                )
+                and len({owner["typed_sha256"] for owner in row["owners"]})
+                == len(row["owners"])
+                for row in aliases
+            ),
+            component + ": native persistent-reference raw-alias evidence is malformed",
+        )
+        for row in aliases:
+            _require(
+                len({owner["kind"] for owner in row["owners"]}) > 1,
+                component + ": native persistent-reference alias does not cross kinds",
+            )
+            body_owners = {
+                (owner["component"], owner["body_type"], owner["body_index"])
+                for owner in row["owners"]
+                if owner["kind"] == "body"
+            }
+            _require(
+                len(body_owners) <= 1
+                and all(
+                    (owner["component"], owner["body_type"], owner["body_index"])
+                    in body_owners
+                    for owner in row["owners"]
+                    if owner["kind"] != "body"
+                )
+                if body_owners
+                else True,
+                component
+                + ": native persistent-reference raw alias crosses native body identities",
+            )
+        owner_order = [
+            (
+                row["raw_sha256"],
+                tuple(
+                    (
+                        owner["kind"],
+                        owner["component"],
+                        owner["body_type"],
+                        owner["body_index"],
+                        owner.get("face_index", -1),
+                        owner.get("edge_index", -1),
+                        owner.get("vertex_index", -1),
+                    )
+                    for owner in row["owners"]
+                ),
+            )
+            for row in aliases
+        ]
+        _require(
+            owner_order == sorted(owner_order),
+            component + ": native persistent-reference raw-alias evidence is not canonical",
+        )
     _require(
         value["interface_iid"] == ITESSELLATION_IID,
-        component + ": native tessellation v3 ITessellation interface is unsupported",
+        component + ": native ITessellation interface is unsupported",
     )
     _require(
         value["u_rule_version"] == NATIVE_U_IDENTITY_RULE,
@@ -1055,6 +1716,10 @@ def _parse_v3_itessellation(
     _require(
         value["point_roundtrip_rule"] == NATIVE_POINT_ROUNDTRIP_RULE,
         component + ": native point round-trip rule is unsupported",
+    )
+    _require(
+        value["identity_rule"] == NATIVE_IDENTITY_POLICY_RULE,
+        component + ": native identity policy is unsupported",
     )
     stats = value["u_observation_stats"]
     _require(
@@ -1089,7 +1754,7 @@ def _parse_v3_itessellation(
             type(properties[key]) is bool and properties[key] is True
             for key in expected_boolean_properties
         ),
-        component + ": native tessellation v3 ITessellation properties are incomplete",
+        component + ": native ITessellation properties are incomplete",
     )
     if triangle_vertices is not None:
         _require(
@@ -1110,12 +1775,12 @@ def _parse_v3_itessellation(
                 )
                 for triangle in triangle_vertices
             ),
-            component + ": native STL triangle vertices are unavailable for v3 binding",
+            component + ": native STL triangle vertices are unavailable for v4 binding",
         )
     raw_bodies = value["bodies"]
     _require(
         isinstance(raw_bodies, list) and bool(raw_bodies),
-        component + ": native tessellation v3 body evidence is missing",
+        component + ": native tessellation v4 body evidence is missing",
     )
 
     body_evidence = {}
@@ -1139,7 +1804,7 @@ def _parse_v3_itessellation(
                 "facets",
                 "fins",
             },
-            component + f": native tessellation v3 body {index} has an unknown shape",
+            component + f": native tessellation v4 body {index} has an unknown shape",
         )
         body_key = (body["body_type"], body["body_index"])
         _require(
@@ -1148,11 +1813,11 @@ def _parse_v3_itessellation(
             and _integer(body_key[1])
             and body_key[1] >= 0
             and body_key in expected_bodies,
-            component + f": native tessellation v3 body {index} is unknown",
+            component + f": native tessellation v4 body {index} is unknown",
         )
         _require(
             previous_body is None or body_key > previous_body,
-            component + f": native tessellation v3 body {index} is duplicated or unordered",
+            component + f": native tessellation v4 body {index} is duplicated or unordered",
         )
         previous_body = body_key
         body_face_references = tuple(
@@ -1187,7 +1852,7 @@ def _parse_v3_itessellation(
             and isinstance(body["faces"], list)
             and isinstance(body["facets"], list)
             and isinstance(body["fins"], list),
-            component + f": native tessellation v3 body {body_key} is incomplete",
+            component + f": native tessellation v4 body {body_key} is incomplete",
         )
         body_evidence[body_key] = _parse_itessellation_body(
             component,
@@ -1202,13 +1867,13 @@ def _parse_v3_itessellation(
         }
     _require(
         set(body_evidence) == expected_bodies,
-        component + ": native tessellation v3 evidence does not cover every body",
+        component + ": native tessellation v4 evidence does not cover every body",
     )
 
     raw_vertices = value["vertices"]
     _require(
         isinstance(raw_vertices, list),
-        component + ": native tessellation v3 vertex point cache is missing",
+        component + ": native tessellation v4 vertex point cache is missing",
     )
     vertices = {}
     previous_vertex = None
@@ -1216,7 +1881,7 @@ def _parse_v3_itessellation(
         _require(
             isinstance(vertex, dict)
             and set(vertex) == {"body_type", "body_index", "vertex_id", "point_m"},
-            component + f": native tessellation v3 vertex {index} has an unknown shape",
+            component + f": native tessellation v4 vertex {index} has an unknown shape",
         )
         body_key = (vertex["body_type"], vertex["body_index"])
         vertex_id = vertex["vertex_id"]
@@ -1231,24 +1896,447 @@ def _parse_v3_itessellation(
                 type(coordinate) in (int, float) and math.isfinite(coordinate)
                 for coordinate in point
             ),
-            component + f": native tessellation v3 vertex {index} is malformed",
+            component + f": native tessellation v4 vertex {index} is malformed",
         )
         order = (*body_key, vertex_id)
         _require(
             previous_vertex is None or order > previous_vertex,
-            component + f": native tessellation v3 vertex {index} is duplicated or unordered",
+            component + f": native tessellation v4 vertex {index} is duplicated or unordered",
         )
         previous_vertex = order
         vertices[(body_key, vertex_id)] = tuple(point)
 
+    raw_scope_vertices = value["solidworks_vertex_identities"]
+    _require(
+        isinstance(raw_scope_vertices, list),
+        component + ": native scope-local vertex identities are missing",
+    )
+    scope_vertex_keys = set()
+    previous_scope_vertex = None
+    edges_by_owner_reference = {
+        (
+            edge["body_type"],
+            edge["body_index"],
+            edge["edge_reference_sha256"],
+        ): edge
+        for edge in native_edges
+    }
+    for index, row in enumerate(raw_scope_vertices):
+        _require(
+            isinstance(row, dict)
+            and set(row)
+            == {
+                "body_type",
+                "body_index",
+                "vertex_index",
+                "point_m",
+                "identity_mode",
+                "native_reference_sha256",
+                "identity",
+                "identity_sha256",
+            },
+            component
+            + f": native scope-local vertex {index} has an unknown shape",
+        )
+        body_key = (row["body_type"], row["body_index"])
+        identity_mode = row["identity_mode"]
+        identity = row["identity"]
+        point = row["point_m"]
+        identity_valid = (
+            identity_mode == NATIVE_PERSISTENT_IDENTITY_RULE
+            and identity is None
+        ) or (
+            identity_mode == NATIVE_SCOPE_IDENTITY_RULE
+            and _valid_scope_identity(
+                identity,
+                kind="vertex",
+                component=component,
+            )
+            and identity["native_vertex_index"] == row["vertex_index"]
+            and identity["point_binary64_hex"]
+            == [
+                struct.pack("<d", float(value)).hex()
+                for value in point
+            ]
+            and identity["owner_scope_key"]
+            == spans_by_body[body_key][0]["face_identity"][
+                "owner_scope_key"
+            ]
+            and row["identity_sha256"]
+            == native_scope_identity_sha256(identity)
+        )
+        _require(
+            body_key in body_evidence
+            and _integer(row["vertex_index"])
+            and row["vertex_index"] >= 0
+            and isinstance(point, list)
+            and len(point) == 3
+            and all(
+                type(value) in (int, float) and math.isfinite(value)
+                for value in point
+            )
+            and identity_mode
+            in {
+                NATIVE_PERSISTENT_IDENTITY_RULE,
+                NATIVE_SCOPE_IDENTITY_RULE,
+            }
+            and identity_valid
+            and isinstance(row["identity_sha256"], str)
+            and bool(HEX64.fullmatch(row["identity_sha256"]))
+            and isinstance(row["native_reference_sha256"], str)
+            and bool(HEX64.fullmatch(row["native_reference_sha256"]))
+            and identity_valid,
+            component
+            + f": native scope-local vertex {index} is malformed",
+        )
+        order = (*body_key, row["vertex_index"])
+        _require(
+            previous_scope_vertex is None or order > previous_scope_vertex,
+            component
+            + f": native scope-local vertex {index} is duplicated or unordered",
+        )
+        previous_scope_vertex = order
+        _require(
+            (*body_key, row["identity_sha256"]) not in scope_vertex_keys,
+            component
+            + f": native scope-local vertex identity repeats at {index}",
+        )
+        scope_vertex_keys.add(
+            (*body_key, row["identity_sha256"])
+        )
+        incident_edges = (
+            [
+                edges_by_owner_reference.get(
+                    (*body_key, reference)
+                )
+                for reference in identity[
+                    "incident_edge_identity_sha256"
+                ]
+            ]
+            if identity is not None
+            else [
+                edge
+                for (edge_body_type, edge_body_index, _), edge
+                in edges_by_owner_reference.items()
+                if (edge_body_type, edge_body_index) == body_key
+                and row["identity_sha256"]
+                in {
+                    edge["start_vertex_reference_sha256"],
+                    edge["end_vertex_reference_sha256"],
+                }
+            ]
+        )
+        _require(
+            incident_edges
+            and all(edge is not None for edge in incident_edges)
+            and (
+                identity is not None
+                or all(
+                    (
+                        edge["start_vertex_reference_sha256"]
+                        == row["identity_sha256"]
+                    )
+                    or (
+                        edge["end_vertex_reference_sha256"]
+                        == row["identity_sha256"]
+                    )
+                    for edge in incident_edges
+                )
+            ),
+            component
+            + f": native scope-local vertex {index} is not bound to its edges",
+        )
+
+    def expected_body_aliases(
+        kind: str,
+        rows: list[dict],
+    ) -> set[str]:
+        by_body = {}
+        for row in rows:
+            by_body.setdefault(
+                (row["body_type"], row["body_index"]),
+                [],
+            ).append(row)
+        aliases = set()
+        for body_key, body_rows in by_body.items():
+            scope_rows = [
+                row
+                for row in body_rows
+                if row["identity"] is not None
+            ]
+            _require(
+                not scope_rows or len(scope_rows) == len(body_rows),
+                component
+                + f": {kind} identity modes are mixed for body {body_key}",
+            )
+            identities_by_raw = {}
+            for row in body_rows:
+                identities_by_raw.setdefault(
+                    row["native_reference_sha256"],
+                    set(),
+                ).add(
+                    row.get("identity_sha256")
+                    or row.get("face_reference_sha256")
+                    or row.get("edge_reference_sha256")
+                )
+            reused = {
+                raw_sha256
+                for raw_sha256, identities in identities_by_raw.items()
+                if len(identities) > 1
+            }
+            _require(
+                (
+                    not reused
+                    and not scope_rows
+                )
+                or (
+                    reused
+                    and scope_rows
+                    and len(scope_rows) == len(body_rows)
+                    and len(identities_by_raw) == 1
+                ),
+                component
+                + f": {kind} identity mode does not match reference reuse "
+                + f"for body {body_key}",
+            )
+            aliases.update(reused)
+            for row in scope_rows:
+                identity = row["identity"]
+                warning_expected = (
+                    NATIVE_COMPONENT_REFERENCE_ALIASED
+                    in identity["warnings"]
+                )
+                _require(
+                    warning_expected
+                    is (
+                        row["native_reference_sha256"] in reused
+                    ),
+                    component
+                    + f": {kind} alias warning does not match raw reference reuse",
+                )
+        return aliases
+
+    face_alias_rows = [
+        {
+            "body_type": span["body_type"],
+            "body_index": span["body_index"],
+            "face_reference_sha256": span["face_reference_sha256"],
+            "native_reference_sha256": span[
+                "native_face_reference_sha256"
+            ],
+            "identity_mode": span["face_identity_mode"],
+            "identity": span["face_identity"],
+        }
+        for spans in spans_by_body.values()
+        for span in spans
+    ]
+    edge_alias_rows = [
+        {
+            "body_type": edge["body_type"],
+            "body_index": edge["body_index"],
+            "edge_reference_sha256": edge["edge_reference_sha256"],
+            "native_reference_sha256": edge[
+                "native_edge_reference_sha256"
+            ],
+            "identity_mode": edge["edge_identity_mode"],
+            "identity": edge["edge_identity"],
+        }
+        for edge in native_edges
+    ]
+    vertex_alias_rows = [
+        {
+            "body_type": row["body_type"],
+            "body_index": row["body_index"],
+            "identity_sha256": row["identity_sha256"],
+            "native_reference_sha256": row[
+                "native_reference_sha256"
+            ],
+            "identity_mode": row["identity_mode"],
+            "identity": row["identity"],
+        }
+        for row in raw_scope_vertices
+    ]
+    scope_owner_keys = [
+        row["identity"]["owner_scope_key"]
+        for row in [*face_alias_rows, *edge_alias_rows, *vertex_alias_rows]
+        if row["identity"] is not None
+    ]
+    _require(
+        not scope_owner_keys
+        or all(
+            owner == scope_owner_keys[0]
+            for owner in scope_owner_keys[1:]
+        ),
+        component
+        + ": native scope-local identities disagree on their owner scope",
+    )
+    scope_part_documents = {
+        row["identity"]["mapping_source_part_document_sha256"]
+        for row in [*face_alias_rows, *edge_alias_rows, *vertex_alias_rows]
+        if row["identity"] is not None
+    }
+    _require(
+        len(scope_part_documents) <= 1,
+        component
+        + ": native scope-local identities disagree on the part witness",
+    )
+    face_scope_source_documents = {
+        row["identity"]["source_document_sha256"]
+        for row in face_alias_rows
+        if row["identity"] is not None
+    }
+    _require(
+        not scope_part_documents
+        or not face_scope_source_documents
+        or scope_part_documents == face_scope_source_documents,
+        component
+        + ": the part witness does not match the frozen source document",
+    )
+    for entity_kind, rows, index_field, reference_field in (
+        (
+            "face",
+            face_alias_rows,
+            "mapping_source_face_index",
+            "mapped_source_face_persistent_reference_sha256",
+        ),
+        (
+            "edge",
+            edge_alias_rows,
+            "mapping_source_edge_index",
+            "mapping_source_edge_persistent_reference_sha256",
+        ),
+        (
+            "vertex",
+            vertex_alias_rows,
+            "mapping_source_vertex_index",
+            "mapped_source_vertex_persistent_reference_sha256",
+        ),
+    ):
+        by_body = {}
+        for row in rows:
+            if row["identity"] is None:
+                continue
+            by_body.setdefault(
+                (row["body_type"], row["body_index"]),
+                [],
+            ).append(row["identity"])
+        for body_key, identities in by_body.items():
+            mapped_indices = [
+                identity[index_field]
+                for identity in identities
+            ]
+            mapped_references = [
+                identity[reference_field]
+                for identity in identities
+            ]
+            _require(
+                len(mapped_indices) == len(set(mapped_indices))
+                and len(mapped_references)
+                == len(set(mapped_references))
+                and set(mapped_indices)
+                == set(range(len(mapped_indices))),
+                component
+                + f": {entity_kind} part witness mapping is not one-to-one "
+                + f"for body {body_key}",
+            )
+    if native_identity_warnings is not None:
+        grouped_warnings = {}
+        for entity_kind, rows, index_field in (
+            ("face", face_alias_rows, "native_face_index"),
+            ("edge", edge_alias_rows, "native_edge_index"),
+            ("vertex", vertex_alias_rows, "native_vertex_index"),
+        ):
+            for row in rows:
+                identity = row["identity"]
+                if identity is None:
+                    continue
+                for code in identity["warnings"]:
+                    key = (
+                        code,
+                        entity_kind,
+                        row["body_type"],
+                        row["body_index"],
+                        identity["owner_scope_key"],
+                    )
+                    group = grouped_warnings.setdefault(
+                        key,
+                        {
+                            "code": code,
+                            "component": component,
+                            "entity_kind": entity_kind,
+                            "body_type": row["body_type"],
+                            "body_index": row["body_index"],
+                            "owner_scope_key": identity[
+                                "owner_scope_key"
+                            ],
+                            "persistent": False,
+                            "rule_version": NATIVE_SCOPE_IDENTITY_RULE,
+                            "object_indices": [],
+                            "field": "identity.warnings",
+                        },
+                    )
+                    group["object_indices"].append(identity[index_field])
+        for key in sorted(grouped_warnings):
+            group = grouped_warnings[key]
+            group["object_indices"] = sorted(
+                set(group["object_indices"])
+            )
+            native_identity_warnings.append(group)
+    expected_aliases = {
+        "face": expected_body_aliases("face", face_alias_rows),
+        "edge": expected_body_aliases("edge", edge_alias_rows),
+        "vertex": expected_body_aliases("vertex", vertex_alias_rows),
+    }
+    expected_audit = {
+        kind: sorted(references)
+        for kind, references in expected_aliases.items()
+    }
+    _require(
+        value.get("reference_alias_audit", {
+            "body": [],
+            "face": [],
+            "edge": [],
+            "vertex": [],
+        })
+        == {
+            **expected_audit,
+            "body": [],
+        },
+        component + ": native scope-local alias audit differs from objects",
+    )
+    _require(
+        all(
+            (
+                edge["start_vertex_reference_sha256"] is None
+                or (
+                    edge["body_type"],
+                    edge["body_index"],
+                    edge["start_vertex_reference_sha256"],
+                )
+                in scope_vertex_keys
+            )
+            and (
+                edge["end_vertex_reference_sha256"] is None
+                or (
+                    edge["body_type"],
+                    edge["body_index"],
+                    edge["end_vertex_reference_sha256"],
+                )
+                in scope_vertex_keys
+            )
+            for edge in native_edges
+        ),
+        component + ": an edge endpoint is not a captured scope-local vertex",
+    )
+
     for body_key, evidence in body_evidence.items():
         _require(
             len(evidence["facets"]) == body_counts[body_key]["facet_count"],
-            component + f": native tessellation v3 facet count differs for body {body_key}",
+            component + f": native tessellation v4 facet count differs for body {body_key}",
         )
         _require(
             len(evidence["fins"]) == body_counts[body_key]["fin_count"],
-            component + f": native tessellation v3 fin count differs for body {body_key}",
+            component + f": native tessellation v4 fin count differs for body {body_key}",
         )
         cached = {vertex_id for owner, vertex_id in vertices if owner == body_key}
         referenced = {
@@ -1258,11 +2346,11 @@ def _parse_v3_itessellation(
         }
         _require(
             len(cached) == body_counts[body_key]["vertex_count"],
-            component + f": native tessellation v3 vertex count differs for body {body_key}",
+            component + f": native tessellation v4 vertex count differs for body {body_key}",
         )
         _require(
             cached == referenced,
-            component + ": native tessellation v3 vertex cache differs from fin vertices",
+            component + ": native tessellation v4 vertex cache differs from fin vertices",
         )
         edges_by_reference = {
             edge["edge_reference_sha256"]: edge
@@ -1278,7 +2366,7 @@ def _parse_v3_itessellation(
             }
             <= set(edges_by_reference),
             component
-            + f": native tessellation v3 edge references differ for body {body_key}",
+            + f": native tessellation v4 edge references differ for body {body_key}",
         )
         for fin in evidence["fins"].values():
             if fin["classification"] == "internal_only":
@@ -1339,7 +2427,7 @@ def _parse_v3_itessellation(
         body_edges = edges_by_body.get(body_key, {})
         _require(
             set(fins_by_edge_reference) <= set(body_edges),
-            component + f": native tessellation v3 edge references differ for body {body_key}",
+            component + f": native tessellation v4 edge references differ for body {body_key}",
         )
         for reference, edge in body_edges.items():
             declared = set(edge["fin_ids"])
@@ -1347,7 +2435,7 @@ def _parse_v3_itessellation(
             _require(
                 declared == actual,
                 component
-                + f": native tessellation v3 edge {reference} fin_ids are not bidirectional",
+                + f": native tessellation v4 edge {reference} fin_ids are not bidirectional",
             )
             u_min = float(edge["u_min"])
             u_max = float(edge["u_max"])
@@ -1361,7 +2449,7 @@ def _parse_v3_itessellation(
                     native_u_in_closed_interval(start_u, u_min, u_max)
                     and native_u_in_closed_interval(end_u, u_min, u_max),
                     component
-                    + f": native tessellation v3 edge {reference} fin {fin_id} U is invalid",
+                    + f": native tessellation v4 edge {reference} fin {fin_id} U is invalid",
                 )
                 fin_start = vertices[(body_key, fin["vertex_ids"][0])]
                 fin_end = vertices[(body_key, fin["vertex_ids"][1])]
@@ -1388,7 +2476,7 @@ def _parse_v3_itessellation(
                 _require(
                     native_u_intervals_cover(intervals, u_min, u_max),
                     component
-                    + f": native tessellation v3 edge {reference} face {face_index} does not cover its U domain",
+                    + f": native tessellation v4 edge {reference} face {face_index} does not cover its U domain",
                 )
             curve_points = {
                 tuple(_float32(value) for value in edge["curve_start_point_m"]),
@@ -1421,7 +2509,7 @@ def _parse_v3_itessellation(
                     _require(
                         point_error <= point_tolerance,
                         component
-                        + f": native tessellation v3 edge {reference} "
+                        + f": native tessellation v4 edge {reference} "
                         + f"{name} topology endpoint disagrees with curve direction",
                     )
             else:
@@ -1436,7 +2524,7 @@ def _parse_v3_itessellation(
                 _require(
                     curve_points == edge_points,
                     component
-                    + f": native tessellation v3 edge {reference} curve endpoints differ",
+                    + f": native tessellation v4 edge {reference} curve endpoints differ",
                 )
             evaluations = edge["curve_endpoint_evaluations"]
             for edge_endpoint in ("start", "end"):
@@ -1460,7 +2548,7 @@ def _parse_v3_itessellation(
                         _require(
                             point_error <= point_tolerance,
                             component
-                            + f": native tessellation v3 edge {reference} "
+                            + f": native tessellation v4 edge {reference} "
                             + f"{edge_endpoint} endpoint conflicts with fin {fin_id} "
                             + f"{fin_endpoint} at the same U",
                         )
@@ -1474,7 +2562,7 @@ def _parse_v3_itessellation(
                 _require(
                     cofin_id in actual and cofin_id != fin_id,
                     component
-                    + f": native tessellation v3 fin {fin_id} has no distinct cofin",
+                    + f": native tessellation v4 fin {fin_id} has no distinct cofin",
                 )
                 cofin = evidence["fins"][cofin_id]
                 fin_start = vertices[
@@ -1503,7 +2591,7 @@ def _parse_v3_itessellation(
                 _require(
                     fin_collapsed is cofin_collapsed,
                     component
-                    + f": native tessellation v3 fin {fin_id} has partial U collapse",
+                    + f": native tessellation v4 fin {fin_id} has partial U collapse",
                 )
                 _require(
                     cofin["cofin_id"] == fin_id
@@ -1533,7 +2621,7 @@ def _parse_v3_itessellation(
                     and face_sense[fin["face_index"]]
                     is not face_sense[cofin["face_index"]],
                     component
-                    + f": native tessellation v3 fin {fin_id} cofin/orientation is inconsistent",
+                    + f": native tessellation v4 fin {fin_id} cofin/orientation is inconsistent",
                 )
                 if (
                     collapsed_pair
@@ -1578,12 +2666,12 @@ def _parse_v3_itessellation(
                     for face_index in active_faces
                 ),
                 component
-                + f": native tessellation v3 edge {reference} has a collapsed-only face without positive U coverage",
+                + f": native tessellation v4 edge {reference} has a collapsed-only face without positive U coverage",
             )
             _require(
                 fin_faces == active_faces,
                 component
-                + f": native tessellation v3 edge {reference} does not cover its tessellated faces",
+                + f": native tessellation v4 edge {reference} does not cover its tessellated faces",
             )
             _require(
                 bool(active_faces)
@@ -1592,7 +2680,7 @@ def _parse_v3_itessellation(
                     for face_index in edge["face_indices"]
                 ),
                 component
-                + f": native tessellation v3 edge {reference} has no fin without an untessellated face",
+                + f": native tessellation v4 edge {reference} has no fin without an untessellated face",
             )
 
 
@@ -1609,8 +2697,13 @@ def _parse_itessellation_body(
     for index, face in enumerate(body["faces"]):
         _require(
             isinstance(face, dict)
-            and set(face) == {"face_index", "facet_ids"},
-            component + f": native tessellation v3 face {index} has an unknown shape",
+            and set(face)
+            == {
+                "face_index",
+                "facet_ids",
+                "face_identity_sha256",
+            },
+            component + f": native tessellation v4 face {index} has an unknown shape",
         )
         face_index = face["face_index"]
         facet_ids = face["facet_ids"]
@@ -1620,14 +2713,41 @@ def _parse_itessellation_body(
             and isinstance(facet_ids, list)
             and facet_ids == sorted(set(facet_ids))
             and all(_integer(facet_id) and facet_id >= 0 for facet_id in facet_ids)
+            and face["face_identity_sha256"]
+            == face_spans[face_index]["face_reference_sha256"]
+            and (
+                face_spans[face_index]["face_identity"] is None
+                or (
+                    face_spans[face_index]["face_identity"][
+                        "topology_signature_sha256"
+                    ]
+                    == native_scope_identity_sha256(
+                        {
+                            "rule": NATIVE_FACE_IDENTITY_KEY_RULE,
+                            "area_binary64": face_spans[face_index][
+                                "face_identity"
+                            ]["area_binary64_hex"],
+                            "bbox_binary64": [
+                                *face_spans[face_index]["face_identity"][
+                                    "tessellation_bbox_min_binary64_hex"
+                                ],
+                                *face_spans[face_index]["face_identity"][
+                                    "tessellation_bbox_max_binary64_hex"
+                                ],
+                            ],
+                            "facet_ids": facet_ids,
+                        }
+                    )
+                )
+            )
             and (previous_face is None or face_index > previous_face),
-            component + f": native tessellation v3 face {index} is malformed",
+            component + f": native tessellation v4 face {index} is malformed",
         )
         previous_face = face_index
         faces[face_index] = set(facet_ids)
     _require(
         set(faces) == set(face_spans),
-        component + f": native tessellation v3 body {body_key} does not cover every face",
+        component + f": native tessellation v4 body {body_key} does not cover every face",
     )
 
     facets = {}
@@ -1644,7 +2764,7 @@ def _parse_itessellation_body(
                 "vertex_ids",
                 "triangle_record_index",
             },
-            component + f": native tessellation v3 facet {index} has an unknown shape",
+            component + f": native tessellation v4 facet {index} has an unknown shape",
         )
         facet_id = facet["facet_id"]
         face_index = facet["face_index"]
@@ -1667,7 +2787,7 @@ def _parse_itessellation_body(
             and all(_integer(vertex_id) and vertex_id >= 0 for vertex_id in vertex_ids)
             and _integer(triangle_record_index)
             and triangle_record_index >= 0,
-            component + f": native tessellation v3 facet {index} is malformed",
+            component + f": native tessellation v4 facet {index} is malformed",
         )
         previous_facet = facet_id
         span = face_spans_by_key[(*body_key, face_index)]
@@ -1679,7 +2799,7 @@ def _parse_itessellation_body(
             triangle_record_index in expected_records
             and triangle_record_index not in used_triangle_records,
             component
-            + f": native tessellation v3 facet {facet_id} has duplicate or misplaced triangle index",
+            + f": native tessellation v4 facet {facet_id} has duplicate or misplaced triangle index",
         )
         used_triangle_records.add(triangle_record_index)
         facets[facet_id] = {
@@ -1700,7 +2820,7 @@ def _parse_itessellation_body(
     }
     _require(
         used_triangle_records == expected_triangle_records,
-        component + f": native tessellation v3 body {body_key} does not cover every triangle record",
+        component + f": native tessellation v4 body {body_key} does not cover every triangle record",
     )
     _require(
         {
@@ -1709,7 +2829,7 @@ def _parse_itessellation_body(
             for facet_id in facet_ids
         }
         == set(facets),
-        component + f": native tessellation v3 body {body_key} face-to-facet map is not closed",
+        component + f": native tessellation v4 body {body_key} face-to-facet map is not closed",
     )
     for face_index, facet_ids in faces.items():
         _require(
@@ -1720,7 +2840,7 @@ def _parse_itessellation_body(
                 if facet["face_index"] == face_index
             },
             component
-            + f": native tessellation v3 body {body_key} face {face_index} has misowned facets",
+            + f": native tessellation v4 body {body_key} face {face_index} has misowned facets",
         )
 
     fins = {}
@@ -1743,7 +2863,7 @@ def _parse_itessellation_body(
                 "end_evidence",
                 "cofin_id",
             },
-            component + f": native tessellation v3 fin {index} has an unknown shape",
+            component + f": native tessellation v4 fin {index} has an unknown shape",
         )
         fin_id = fin["fin_id"]
         facet_id = fin["facet_id"]
@@ -1788,17 +2908,17 @@ def _parse_itessellation_body(
                     and cofin_id is None
                 )
             ),
-            component + f": native tessellation v3 fin {index} is malformed or unclassified",
+            component + f": native tessellation v4 fin {index} is malformed or unclassified",
         )
         previous_fin = fin_id
         _require(
             fin_id in facets[facet_id]["fin_ids"],
-            component + f": native tessellation v3 fin {fin_id} is absent from its facet",
+            component + f": native tessellation v4 fin {fin_id} is absent from its facet",
         )
         previous = facet_fin_membership.setdefault(fin_id, facet_id)
         _require(
             previous == facet_id,
-            component + f": native tessellation v3 fin {fin_id} belongs to multiple facets",
+            component + f": native tessellation v4 fin {fin_id} belongs to multiple facets",
         )
         fins[fin_id] = {
             "fin_id": fin_id,
@@ -1820,7 +2940,7 @@ def _parse_itessellation_body(
             for facet in facets.values()
             for fin_id in facet["fin_ids"]
         },
-        component + f": native tessellation v3 body {body_key} facet-to-fin map is not closed",
+        component + f": native tessellation v4 body {body_key} facet-to-fin map is not closed",
     )
     return {"faces": faces, "facets": facets, "fins": fins}
 
@@ -1845,7 +2965,7 @@ def _validate_facet_side_coverage(
             and len(set(starts)) == 3
             and len(set(ends)) == 3,
             component
-            + f": native tessellation v3 facet {facet['facet_id']} is not a directed three-cycle",
+            + f": native tessellation v4 facet {facet['facet_id']} is not a directed three-cycle",
         )
         cycle = [fins[0]["vertex_ids"][0]]
         current = fins[0]
@@ -1854,7 +2974,7 @@ def _validate_facet_side_coverage(
             _require(
                 current["fin_id"] not in used,
                 component
-                + f": native tessellation v3 facet {facet['facet_id']} repeats a directed fin",
+                + f": native tessellation v4 facet {facet['facet_id']} repeats a directed fin",
             )
             used.add(current["fin_id"])
             cycle.append(current["vertex_ids"][1])
@@ -1866,7 +2986,7 @@ def _validate_facet_side_coverage(
             _require(
                 len(matches) == 1,
                 component
-                + f": native tessellation v3 facet {facet['facet_id']} has an ambiguous directed cycle",
+                + f": native tessellation v4 facet {facet['facet_id']} has an ambiguous directed cycle",
             )
             current = matches[0]
         _require(
@@ -1874,7 +2994,7 @@ def _validate_facet_side_coverage(
             and cycle[0] == cycle[-1]
             and len(set(cycle[:-1])) == 3,
             component
-            + f": native tessellation v3 facet {facet['facet_id']} does not form one directed three-cycle",
+            + f": native tessellation v4 facet {facet['facet_id']} does not form one directed three-cycle",
         )
         cycles[facet["facet_id"]] = (cycle[0], cycle[1], cycle[2])
     return cycles
@@ -1906,7 +3026,7 @@ def _validate_facet_stl_binding(
         _require(
             any(native == stl[offset:] + stl[:offset] for offset in range(3)),
             component
-            + f": native tessellation v3 facet {facet['facet_id']} does not bind "
+            + f": native tessellation v4 facet {facet['facet_id']} does not bind "
             + f"triangle record {facet['triangle_record_index']}",
         )
 

@@ -85,7 +85,7 @@ class NativeCurveDomainTests(unittest.TestCase):
                 "curve_type": case["curve_type"],
             }
         ]
-        tessellation = support.native_tessellation_v3(
+        tessellation = support.native_tessellation_fixture(
             spans,
             native_edges,
             triangle_vertices=triangles,
@@ -205,6 +205,7 @@ class NativeCurveDomainTests(unittest.TestCase):
                 "curve_end_point_m": list(common_point),
             }
         )
+        tessellation["itessellation"]["solidworks_vertex_identities"] = []
         row["curve_end_params"]["is_closed"] = True
         row["curve_end_params"]["raw_outputs"][2]["value"] = True
         row["curve_domain_transform"] = native_curve_domain_transform(

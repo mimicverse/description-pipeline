@@ -791,7 +791,7 @@ class StructuralReportTests(unittest.TestCase):
                 "component": "arm-1",
                 "triangles": 12,
                 "bodies": {"solid": 3, "sheet": 0},
-                "tessellation": support.native_tessellation_v3(
+                "tessellation": support.native_tessellation_fixture(
                     solid_spans,
                     [],
                 ),
@@ -800,7 +800,7 @@ class StructuralReportTests(unittest.TestCase):
                 "component": "board-1",
                 "triangles": 5,
                 "bodies": {"solid": 0, "sheet": 6},
-                "tessellation": support.native_tessellation_v3(
+                "tessellation": support.native_tessellation_fixture(
                     sheet_spans,
                     [],
                     rows,

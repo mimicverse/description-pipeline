@@ -2026,7 +2026,7 @@ class MeshChunkContractTests(unittest.TestCase):
                 "triangle_records_sha256": "0" * 64,
             },
         ]
-        tessellation = support.native_tessellation_v3(
+        tessellation = support.native_tessellation_fixture(
             face_spans,
             native_edges,
             triangle_vertices=triangles,

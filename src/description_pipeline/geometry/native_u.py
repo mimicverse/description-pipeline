@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import struct
 
@@ -24,6 +26,36 @@ NATIVE_COLLAPSED_U_FIN_RULE = "native-fin-u-collapse-v1"
 NATIVE_PERIODIC_FIN_INTERVAL_RULE = "native-periodic-fin-interval-v1"
 NATIVE_CURVE_DOMAIN_RULE = "native-curve-domain-edge-local-v2"
 NATIVE_U_RESOLUTION_RULE = "native-u-binary32-resolution-gate-v1"
+NATIVE_SCOPE_IDENTITY_RULE = "native-scope-entity-id-v1"
+NATIVE_PERSISTENT_IDENTITY_RULE = "native-persistent-reference-v1"
+NATIVE_IDENTITY_POLICY_RULE = "native-reference-or-scope-identity-v1"
+NATIVE_SCOPE_MAPPING_METHOD = (
+    "direct_part_reference_witness+exact_native_area+"
+    "exact_tessellation_bbox+bidirectional_one_to_one+topology_replay"
+)
+NATIVE_SCOPE_VERTEX_MAPPING_METHOD = (
+    "direct_part_reference_witness+exact_native_point+"
+    "coincident_ordinal+topology_incidence_replay"
+)
+NATIVE_SCOPE_SOURCE_AUTHORITY = (
+    "frozen_part_persistent_reference_witness"
+)
+NATIVE_FACE_IDENTITY_KEY_RULE = "native-face-area-bbox-exact-v1"
+NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED = "cad_scope_local_identity_derived"
+NATIVE_COMPONENT_REFERENCE_ALIASED = "cad_component_persistent_reference_aliased"
+
+
+def native_scope_identity_sha256(value: dict) -> str:
+    """Hash a canonical, JSON-safe scope-local identity record."""
+
+    payload = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _native_u(value: float | int) -> float:

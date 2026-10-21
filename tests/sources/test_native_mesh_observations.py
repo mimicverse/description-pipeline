@@ -166,7 +166,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                 span_by_face[(body_index, face_index)]["edge_references"].append(
                     reference
                 )
-        tessellation = support.native_tessellation_v3(
+        tessellation = support.native_tessellation_fixture(
             spans,
             native_edges,
             [
@@ -490,7 +490,11 @@ class NativeMeshObservationTests(unittest.TestCase):
                 boundary_shift_with_recomputed_digest,
                 "gap or overlaps",
             ),
-            ("missing-body-edges", missing_body_edge_evidence, "topology evidence is unresolved"),
+            (
+                "missing-body-edges",
+                missing_body_edge_evidence,
+                "topology evidence is unresolved|not bound to its edges",
+            ),
         )
         for label, mutate, message in cases:
             with self.subTest(label=label):
@@ -749,7 +753,7 @@ class NativeMeshObservationTests(unittest.TestCase):
                 "curve_type": 0,
             }
         ]
-        tessellation = support.native_tessellation_v3(
+        tessellation = support.native_tessellation_fixture(
             spans,
             native_edges,
             triangle_vertices=triangles,
@@ -942,7 +946,7 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
             "curve_sense": True,
             "curve_type": 1,
         }
-        tessellation = support.native_tessellation_v3(
+        tessellation = support.native_tessellation_fixture(
             spans,
             [edge],
             triangle_vertices=triangles,

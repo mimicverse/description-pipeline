@@ -638,7 +638,7 @@ def _mesh_body(faces, key: str):
             }
         )
         triangle_start += triangle_count
-    tessellation = support.native_tessellation_v3(
+    tessellation = support.native_tessellation_fixture(
         spans,
         [],
         triangle_vertices=triangles,
