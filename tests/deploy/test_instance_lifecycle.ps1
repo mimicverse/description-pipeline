@@ -1328,14 +1328,25 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
 }
 foreach ($scenario in $exceptionCases) {
   $errorFile = Join-Path ([System.IO.Path]::GetTempPath()) ('il-error-' + [guid]::NewGuid().ToString('N'))
-  $lines = @(& $pwshExe -NoProfile -File $exceptionHarness -ScriptPath $ScriptPath `
-    -Scenario $scenario -Root $PSScriptRoot 2> $errorFile)
-  $rc = $LASTEXITCODE
+  $outputFile = $errorFile + '.stdout'
+  # Desktop PowerShell deserializes native stderr beginning with CLIXML. Capture
+  # at the OS process boundary instead so the deliberately malformed noise stays raw.
+  $arguments = @('-NoProfile', '-File', ('"{0}"' -f $exceptionHarness),
+    '-ScriptPath', ('"{0}"' -f $ScriptPath), '-Scenario', $scenario,
+    '-Root', ('"{0}"' -f $PSScriptRoot))
+  $child = Start-Process -FilePath $pwshExe -ArgumentList $arguments `
+    -RedirectStandardOutput $outputFile -RedirectStandardError $errorFile -Wait -PassThru
+  $rc = $child.ExitCode
+  $lines = @(Get-Content -LiteralPath $outputFile -Encoding UTF8)
   $result = ($lines | Select-Object -Last 1) | ConvertFrom-Json
   $expectedRc = if ($scenario -in @('promote', 'rollback', 'recovery-snapshot', 'die-unknown')) { 2 } else { 1 }
   Check ('exception.' + $scenario + '.exit') ($rc -eq $expectedRc)
   Check ('exception.' + $scenario + '.refused') ($result.passed -eq $false)
   Check ('exception.' + $scenario + '.single_json') (@($lines | Where-Object { $_ -match '^\{' }).Count -eq 1)
+  if ($scenario -eq 'noisy') {
+    Check 'exception.noisy.raw_stderr' (([System.IO.File]::ReadAllText($errorFile)).Contains('#< CLIXML'))
+    Check 'exception.noisy.stdout_preserved' ($lines[0] -eq 'pip succeeded')
+  }
   if ($scenario -eq 'die') {
     Check 'exception.die_preserved' ($result.code -eq 'original_refusal')
   } elseif ($scenario -eq 'die-unknown') {
@@ -1357,6 +1368,7 @@ foreach ($scenario in $exceptionCases) {
       [System.Text.Encoding]::UTF8.GetByteCount($result.message) -le 512 -and $result.message_redacted)
   }
   Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $outputFile -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
