@@ -5785,7 +5785,9 @@ def _canonical_windows_pin(value: object) -> str | None:
         for part in parts
     ):
         return None
-    return path.casefold()
+    # Windows path comparison uses its one-to-one ordinal case folding, not
+    # Unicode casefold expansion (for example, ``ß`` must not equal ``ss``).
+    return ntpath.normcase(path)
 
 
 def _validate_windows_recovery_state(document: object) -> dict:

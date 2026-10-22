@@ -1627,6 +1627,16 @@ class WindowsEnvironmentPinTests(unittest.TestCase):
                 with self.subTest(name=name, suffix=suffix):
                     self.assertIsNone(recovery._canonical_windows_pin("C:/data/" + name + suffix))
 
+    def test_unicode_case_expansion_is_not_a_windows_path_identity(self) -> None:
+        self.assertEqual(
+            recovery._canonical_windows_pin("C:/data/STRASSE"),
+            recovery._canonical_windows_pin("C:/data/strasse"),
+        )
+        self.assertNotEqual(
+            recovery._canonical_windows_pin("C:/data/Straße"),
+            recovery._canonical_windows_pin("C:/data/STRASSE"),
+        )
+
 
 class WindowsAclPolicyTests(unittest.TestCase):
     def test_service_principal_must_be_distinct_and_present(self) -> None:
