@@ -1376,6 +1376,16 @@ promotion_step() {
     --freeze-root "$OPERATOR_STATE/promotions/$generation/evidence-immutable" >/dev/null
 }
 
+require_rollback_archive() {
+  local receipt_dir="$1" reference_status=0
+  config_reference_recorded "$receipt_dir/receipt.json" || reference_status=$?
+  [ "$reference_status" != 2 ] || die "recovery_history_unavailable: rollback receipt is unreadable"
+  if [ "$reference_status" = 0 ] || [ -e "$receipt_dir/evidence/private/connection-before-promotion.json" ]; then
+    [ -f "$receipt_dir/backup.tar.enc" ] && [ ! -L "$receipt_dir/backup.tar.enc" ] \
+      || die "recovery_history_unavailable: rollback requires an excluded historical archive; no action was taken"
+  fi
+}
+
 config_reference_recorded() {
   "$CONTROL_PYTHON" - "$1" <<'PY'
 import json
@@ -2921,6 +2931,7 @@ PY
     ROLLBACK_ID="$MAINT_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$ROLLBACK_ID"
     [ -f "$RECEIPT_DIR/receipt.json" ] || die "no promotion receipt for maintenance $ROLLBACK_ID; nothing is guessed"
+    require_rollback_archive "$RECEIPT_DIR"
     resolve_release_file
     "$CONTROL_PYTHON" "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
       --install-id "$ROLLBACK_ID" --release-file "$RELEASE_FILE" >/dev/null \

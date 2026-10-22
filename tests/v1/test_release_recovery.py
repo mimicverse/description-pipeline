@@ -17,6 +17,8 @@ REPOSITORY = HERE.parents[1]
 sys.path.insert(0, str(REPOSITORY / "deploy" / "operator"))
 
 import release_recovery  # noqa: E402
+import promotion  # noqa: E402
+from tests.v1 import test_disaster_recovery as recovery_tests  # noqa: E402
 
 
 def digest(payload: bytes) -> str:
@@ -31,18 +33,42 @@ class Result:
 
 
 class ReleaseRecoveryTests(unittest.TestCase):
+    def freeze_steps(self, receipt):
+        root = self.current_receipt_path.parent
+        for index, row in enumerate(receipt["steps"], 1):
+            row["seq"] = index
+            row["at"] = "2026-10-22T00:00:00Z"
+            if "evidence" not in row:
+                source = root / f"{row['verb']}-{row['step']}.json"
+                source.write_text(json.dumps({"step": row["step"]}))
+                files = promotion.freeze_evidence([source], root / "evidence-immutable", row["verb"], row["step"])
+                row["evidence"] = [str(path) for path in files]
+                row["evidence_digests"] = [{"path": str(path), "sha256": digest(path.read_bytes())} for path in files]
+        return receipt
+
     def add_promotion_history(self, receipt):
         names = [
-            "linux-generation", "windows-generation", "close-admission", "drain", "backup", "stop-services",
-            "schema-migration", "windows-switch", "endpoint-identity", "switch-pointer", "config-reference",
-            "start-services", "verify", "open-admission",
+            "linux-generation",
+            "windows-generation",
+            "close-admission",
+            "drain",
+            "backup",
+            "stop-services",
+            "schema-migration",
+            "windows-switch",
+            "endpoint-identity",
+            "switch-pointer",
+            "config-reference",
+            "start-services",
+            "verify",
+            "open-admission",
         ]
         receipt["plan"] = names + receipt["plan"]
         prefix = [{"verb": "promote", "step": name, "status": "completed"} for name in names]
         receipt["steps"] = prefix + receipt["steps"]
         for index, row in enumerate(receipt["steps"], 1):
             row["seq"] = index
-        return receipt
+        return self.freeze_steps(receipt)
 
     def make_inputs(self, root: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
         release = {
@@ -88,7 +114,25 @@ class ReleaseRecoveryTests(unittest.TestCase):
     def completed_finalize_inputs(self, root: Path) -> SimpleNamespace:
         status = root / "status"
         restore = self.restore_args(root, status_dir=status)
-        state_root = root / "state"
+        harness = recovery_tests.RecoveryControlFlowTests("test_backup_and_restore_control_flow")
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        self.addCleanup(harness.tearDown)
+        out, manifest_document = harness.backup()
+        Path(restore.manifest).write_bytes((out / "recovery-manifest.json").read_bytes())
+        Path(restore.expected_release).write_text(
+            json.dumps(
+                {
+                    "release": {
+                        key: manifest_document["release"][key] for key in ("version", "source_commit", "source_sha256")
+                    }
+                }
+            )
+        )
+        roots = {row["name"]: row["path"] for row in manifest_document["roots"] if "reconstructible_runtime" not in row}
+        target = harness.target_plan(digest(Path(restore.manifest).read_bytes()), roots)
+        Path(restore.target_plan).write_bytes(target.read_bytes())
+        state_root = Path(roots["state_root"])
         Path(restore.config).write_text(
             json.dumps({"storage": {"state_root": str(state_root)}}),
             encoding="utf-8",
@@ -102,7 +146,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                     "task_state": "Disabled",
                     "endpoint": "stopped",
                     "cad_ownership": "free",
-                    "state_sha256": "d" * 64,
+                    "state_sha256": manifest_document["windows"]["state_sha256"],
                 }
                 (run_dir / "receipt.json").write_text(
                     json.dumps(
@@ -112,13 +156,14 @@ class ReleaseRecoveryTests(unittest.TestCase):
                             "status": "succeeded",
                             "manifest_sha256": digest(Path(restore.manifest).read_bytes()),
                             "target_plan_sha256": digest(Path(restore.target_plan).read_bytes()),
+                            "closure": manifest_document["closure"],
                             "windows": windows,
                         }
                     ),
                     encoding="utf-8",
                 )
                 (run_dir / "recovery-marker.json").write_text(
-                    json.dumps({"release": args_release(restore)}),
+                    json.dumps({"release": args_release(restore), "closure": manifest_document["closure"]}),
                     encoding="utf-8",
                 )
             return Result()
@@ -127,38 +172,43 @@ class ReleaseRecoveryTests(unittest.TestCase):
         self.assertEqual(release_recovery.restore(restore), 0)
 
         install_id = "gen-release-rollback"
-        source = root / "install-record.json"
+        source = state_root / "install-records/rollback-source.json"
+        source_snapshot = state_root / "snapshots/rollback-source.json"
+        source_snapshot.write_text(json.dumps({"install_id": "rollback-source"}))
         source.write_text(
-            json.dumps({
-                "release": args_release(restore),
-                "ends": {"windows": {
-                    "install_id": "win-" + "a" * 32,
-                    "config_digest": "a" * 64,
-                    "release": {**args_release(restore), "role": "native"},
-                }},
-            }),
-            encoding="utf-8",
+            json.dumps(recovery_tests.install_record_fixture(state_root, "rollback-source", source_snapshot))
         )
+        target_snapshot = state_root / "snapshots" / (install_id + ".json")
+        target_snapshot.write_text(json.dumps({"install_id": install_id}))
         code_rollback = state_root / "promotions" / install_id / "receipt.json"
+        self.current_receipt_path = code_rollback
         code_rollback.parent.mkdir(parents=True, exist_ok=True)
         code_rollback.write_text(
             json.dumps(
-                {
-                    "schema_version": "solidworks-to-urdf.promotion/v1",
-                    "install_id": install_id,
-                    "from": str(source),
-                    "from_sha256": digest(source.read_bytes()),
-                    "plan": list(release_recovery.ROLLBACK_STEPS),
-                    "steps": [
-                        {
-                            "seq": index,
-                            "verb": "rollback",
-                            "step": step,
-                            "status": "completed",
-                        }
-                        for index, step in enumerate(release_recovery.ROLLBACK_STEPS, 1)
-                    ],
-                }
+                self.freeze_steps(
+                    {
+                        "schema_version": "solidworks-to-urdf.promotion/v1",
+                        "install_id": install_id,
+                        "from": str(source),
+                        "from_sha256": digest(source.read_bytes()),
+                        "to": str(target_snapshot),
+                        "to_sha256": digest(target_snapshot.read_bytes()),
+                        "release_manifest": {
+                            "path": restore.expected_release,
+                            "sha256": digest(Path(restore.expected_release).read_bytes()),
+                        },
+                        "plan": list(release_recovery.ROLLBACK_STEPS),
+                        "steps": [
+                            {
+                                "seq": index,
+                                "verb": "rollback",
+                                "step": step,
+                                "status": "completed",
+                            }
+                            for index, step in enumerate(release_recovery.ROLLBACK_STEPS, 1)
+                        ],
+                    }
+                )
             ),
             encoding="utf-8",
         )
@@ -650,12 +700,8 @@ class ReleaseRecoveryTests(unittest.TestCase):
             self.assertEqual(release_recovery.finalize(args), 0)
             self.assertEqual([argv[1] for argv in calls], ["start", "status", "health"])
             status = Path(args.restore_status_dir)
-            gate = json.loads(
-                (status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8")
-            )
-            restore_gate = json.loads(
-                (status / release_recovery.RECEIPT).read_text(encoding="utf-8")
-            )
+            gate = json.loads((status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8"))
+            restore_gate = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
             self.assertEqual(gate["operation"], "release-finalize")
             self.assertEqual(gate["database_restore_executed"], True)
             self.assertEqual(gate["database_recovery_verified"], True)
@@ -752,12 +798,17 @@ class ReleaseRecoveryTests(unittest.TestCase):
                     action = argv[1]
                     calls.append(action)
                     if action == "status":
-                        return Result(stdout=json.dumps({
-                            "task_state": "Running", "listener_pid": 42,
-                            "process_start_utc": "2026-10-22T00:00:00Z",
-                            "install_id": args.install_id if use_generation_id else "win-" + "a" * 32,
-                            "config_digest": "a" * 64 if use_generation_id else "b" * 64,
-                        }))
+                        return Result(
+                            stdout=json.dumps(
+                                {
+                                    "task_state": "Running",
+                                    "listener_pid": 42,
+                                    "process_start_utc": "2026-10-22T00:00:00Z",
+                                    "install_id": args.install_id if use_generation_id else "win-" + "a" * 32,
+                                    "config_digest": "a" * 64 if use_generation_id else "b" * 64,
+                                }
+                            )
+                        )
                     return Result(stdout="admission open\n")
 
                 args.runner = runner
@@ -854,9 +905,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                 release_recovery.finalize(args)
             self.assertEqual([argv[1] for argv in calls], ["start"])
             status = Path(args.restore_status_dir)
-            gate = json.loads(
-                (status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8")
-            )
+            gate = json.loads((status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8"))
             self.assertEqual(gate["status"], "failed")
             self.assertEqual(gate["preserved"], True)
             self.assertIsNone(gate["failure_drain"])
@@ -893,9 +942,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                 release_recovery.finalize(args)
             self.assertEqual([argv[1] for argv in calls], ["start", "status", "drain"])
             status = Path(args.restore_status_dir)
-            gate = json.loads(
-                (status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8")
-            )
+            gate = json.loads((status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8"))
             self.assertEqual(gate["status"], "failed")
             self.assertEqual(gate["failure_drain"]["returncode"], 0)
             self.assertTrue(gate["failure_drain"]["stdout_sha256"])

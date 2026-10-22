@@ -53,7 +53,9 @@ def require_file(path: Path, label: str) -> Path:
 def load_json(path: Path) -> dict:
     require_file(path, "JSON input")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        import recovery
+
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=recovery._pairs_no_duplicates)
     except (OSError, ValueError) as error:
         raise GateError("release_recovery_input_invalid", f"cannot read {path}", {"error": str(error)}) from error
     if not isinstance(value, dict):
@@ -64,10 +66,7 @@ def load_json(path: Path) -> dict:
 def expected_identity(path: Path) -> dict:
     document = load_json(path)
     release = document.get("release", document)
-    identity = {
-        key: release.get(key)
-        for key in ("version", "source_commit", "source_sha256")
-    }
+    identity = {key: release.get(key) for key in ("version", "source_commit", "source_sha256")}
     if not all(isinstance(value, str) and value for value in identity.values()):
         raise GateError("release_recovery_release_identity_invalid", str(path))
     return identity
@@ -126,10 +125,7 @@ def release_from_manifest(path: Path) -> dict:
     release = manifest.get("release")
     if not isinstance(release, dict):
         raise GateError("release_recovery_manifest_invalid", "recovery manifest has no release identity")
-    identity = {
-        key: release.get(key)
-        for key in ("version", "source_commit", "source_sha256")
-    }
+    identity = {key: release.get(key) for key in ("version", "source_commit", "source_sha256")}
     if not all(isinstance(value, str) and value for value in identity.values()):
         raise GateError("release_recovery_manifest_invalid", "recovery manifest release identity is malformed")
     return identity
@@ -214,6 +210,14 @@ def validate_restore_gate(status_dir: Path, identity: dict) -> tuple[Path, dict]
     )
     require_success(recovery_receipt.get("windows"), "recovery receipt Windows state", gate.get("windows"))
     manifest_document = load_json(manifest)
+    import recovery
+
+    try:
+        recovery.validate_manifest(manifest_document, expected_manifest_sha=sha256_file(manifest))
+        recovery.validate_target_plan(load_json(target_plan), manifest_document, sha256_file(manifest))
+    except recovery.RecoveryError as error:
+        raise GateError("release_recovery_gate_invalid", str(error)) from error
+    require_success(recovery_receipt.get("closure"), "recovery receipt closure", manifest_document["closure"])
     validate_windows_result(gate.get("windows"), manifest_document)
 
     marker = require_file(recovery_run / "recovery-marker.json", "recovery marker")
@@ -222,7 +226,9 @@ def validate_restore_gate(status_dir: Path, identity: dict) -> tuple[Path, dict]
             "release_recovery_gate_invalid",
             "recovery marker hash differs from the restore gate",
         )
-    require_success(load_json(marker).get("release"), "recovery marker release identity", identity)
+    marker_document = load_json(marker)
+    require_success(marker_document.get("release"), "recovery marker release identity", identity)
+    require_success(marker_document.get("closure"), "recovery marker closure", manifest_document["closure"])
     return gate_path, gate
 
 
@@ -375,10 +381,7 @@ def validate_windows_result(windows: object, manifest_document: dict) -> dict:
             "recovery manifest has no Windows recovery identity",
         )
     expected_state_sha256 = manifest_windows.get("state_sha256")
-    if (
-        not isinstance(expected_state_sha256, str)
-        or HEX64.fullmatch(expected_state_sha256) is None
-    ):
+    if not isinstance(expected_state_sha256, str) or HEX64.fullmatch(expected_state_sha256) is None:
         raise GateError(
             "release_recovery_manifest_invalid",
             "recovery manifest Windows state hash is malformed",
@@ -628,6 +631,10 @@ def finalize(args) -> int:
             sha256_file(path),
         )
     rollback = validate_code_rollback(code_rollback_path, args.install_id, identity)
+    import recovery
+
+    manifest_document = load_json(Path(restore_inputs["manifest"]))
+    state_root = Path(next(row["path"] for row in manifest_document["roots"] if row["name"] == "state_root"))
     source_path = require_file(Path(rollback["from"]), "rollback source install record")
     source_record = load_json(source_path)
     if sha256_file(source_path) != rollback["from_sha256"]:
@@ -643,6 +650,11 @@ def finalize(args) -> int:
         or windows_identity.get("release") != {**identity, "role": "native"}
     ):
         raise GateError("release_recovery_identity_unverified", "rollback source Windows identity is invalid")
+    try:
+        recovery.journal_selection(state_root, expected=manifest_document["selection"]["journal_entries"])
+        recovery.journal_selection(state_root, additional_receipts=(canonical_rollback,))
+    except recovery.RecoveryError as error:
+        raise GateError("release_recovery_gate_invalid", str(error)) from error
     receipt = status_dir / FINALIZE_RECEIPT
     inputs = {
         "restore_gate_sha256": sha256_file(restore_gate_path),

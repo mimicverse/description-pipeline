@@ -78,21 +78,19 @@ except ImportError as error:  # pragma: no cover - exercised by deployment layou
     ) from error
 
 
-MANIFEST_SCHEMA = "solidworks-to-urdf.recovery-manifest/v5"
-TARGET_SCHEMA = "solidworks-to-urdf.recovery-target/v2"
+MANIFEST_SCHEMA = "solidworks-to-urdf.recovery-manifest/v6"
+TARGET_SCHEMA = "solidworks-to-urdf.recovery-target/v3"
 MARKER_SCHEMA = "solidworks-to-urdf.recovery-marker/v1"
 RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-receipt/v1"
 MAINTENANCE_RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-maintenance/v1"
-SNAPSHOT_WORKER_SCHEMA = "solidworks-to-urdf.recovery-snapshot-worker/v4"
+SNAPSHOT_WORKER_SCHEMA = "solidworks-to-urdf.recovery-snapshot-worker/v5"
+SELECTION_SCHEMA = "solidworks-to-urdf.recovery-selection/v1"
+SNAPSHOT_READY_SCHEMA = "solidworks-to-urdf.recovery-snapshot-ready/v1"
 WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v1"
 WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
 WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
-WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256 = (
-    "62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200"
-)
-WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256 = (
-    "15d94bef1ad0475bc30ba4b3cc9fd19a707d9893e6318d9529b787cca0dfcf3a"
-)
+WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256 = "62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200"
+WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256 = "15d94bef1ad0475bc30ba4b3cc9fd19a707d9893e6318d9529b787cca0dfcf3a"
 WINDOWS_BUNDLE_MEMBER = "windows/recovery.zip"
 WINDOWS_STATE_MEMBER = "windows-state.json"
 WINDOWS_BUNDLE = "recovery.zip"
@@ -125,6 +123,7 @@ ARCHIVE_TOP_LEVEL = {
     "release",
     "secrets",
     "reconstruct",
+    "journal-files",
     "inventory",
     "windows",
 }
@@ -730,7 +729,8 @@ def archive_source_identity(root: Path, document: dict) -> dict:
     members = document.get("deployment_files")
     require(
         isinstance(members, dict) and bool(members),
-        "recovery_release_missing", "release deployment inventory is missing",
+        "recovery_release_missing",
+        "release deployment inventory is missing",
     )
     for name, expected in members.items():
         path = root / confined_member(name, "deployment member")
@@ -738,7 +738,8 @@ def archive_source_identity(root: Path, document: dict) -> dict:
         require(sha256_file(path) == expected, "recovery_release_missing", f"release deployment member differs: {name}")
     require(
         members.get("deploy/operator/recovery.py") == sha256_file(Path(__file__)),
-        "recovery_release_missing", "running recovery script differs from the release",
+        "recovery_release_missing",
+        "running recovery script differs from the release",
     )
     wheels = [row for row in identity["artifacts"] if row["name"].endswith(".whl")]
     require(len(wheels) == 1, "recovery_release_missing", "release must bind exactly one product wheel")
@@ -753,7 +754,8 @@ def archive_source_identity(root: Path, document: dict) -> dict:
             embedded.get(key) == document.get(key)
             for key in ("version", "source_commit", "source_tree", "source_sha256")
         ),
-        "recovery_release_missing", "release wheel source identity differs",
+        "recovery_release_missing",
+        "release wheel source identity differs",
     )
     return {"commit": identity["source_commit"], "tree": tree, "worktree": "release-archive"}
 
@@ -913,11 +915,7 @@ def _git_optional_output(repo: Path, *args: str) -> str | None:
 
 
 def _git_environment() -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_")
-    }
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment.update(
         {
             "GIT_ATTR_NOSYSTEM": "1",
@@ -958,9 +956,7 @@ def _workspace_refs(
             continue
         fields = line.split()
         require(
-            len(fields) in {2, 3}
-            and bool(GIT_OBJECT.fullmatch(fields[1]))
-            and fields[0] not in refs,
+            len(fields) in {2, 3} and bool(GIT_OBJECT.fullmatch(fields[1])) and fields[0] not in refs,
             "recovery_release_missing",
             f"workspace ref identity is malformed for {repo}",
         )
@@ -1152,18 +1148,10 @@ def capture_workspace_bundles(
                 check=False,
                 env=_git_environment(),
             )
-            listed_heads = {
-                line.split(maxsplit=1)[1]
-                for line in heads.stdout.splitlines()
-                if line.strip()
-            }
+            listed_heads = {line.split(maxsplit=1)[1] for line in heads.stdout.splitlines() if line.strip()}
             if (
                 heads.returncode != 0
-                or row["head"] not in {
-                    line.split(maxsplit=1)[0]
-                    for line in heads.stdout.splitlines()
-                    if line.strip()
-                }
+                or row["head"] not in {line.split(maxsplit=1)[0] for line in heads.stdout.splitlines() if line.strip()}
                 or not set(row.get("refs", {})).issubset(listed_heads)
             ):
                 raise RuntimeError(heads.stderr.strip()[-2000:] or "recorded HEAD is absent from bundle")
@@ -1768,18 +1756,21 @@ def verify_sequence_dump_positions(
     )
 
 
+CHECKPOINT_REFERENCES_QUERY = (
+    "SELECT COALESCE(json_agg(json_build_object("
+    "'run_id', s.run_id, 'stage', s.stage, 'stage_state', s.state, "
+    "'request_id', r.request_id, 'run_parent_run_id', r.parent_run_id, "
+    "'reused_from_run', s.reused_from_run, "
+    "'original_executed_at', s.original_executed_at, "
+    "'checkpoint_uri', s.checkpoint_uri, 'receipt', s.receipt "
+    ") ORDER BY s.run_id, s.stage), '[]'::json) "
+    "FROM platform.stage s JOIN platform.run r ON r.run_id = s.run_id "
+    "WHERE s.state = 'completed' OR (s.checkpoint_uri IS NOT NULL AND s.checkpoint_uri <> '')"
+)
+
+
 def _checkpoint_references(connection) -> list[dict]:
-    rows = _connection_json(
-        connection,
-        (
-            "SELECT COALESCE(json_agg(json_build_object("
-            "'run_id', run_id, 'stage', stage, "
-            "'checkpoint_uri', checkpoint_uri, 'receipt', receipt "
-            ") ORDER BY run_id, stage), '[]'::json) "
-            "FROM platform.stage "
-            "WHERE checkpoint_uri IS NOT NULL AND checkpoint_uri <> ''"
-        ),
-    )
+    rows = _connection_json(connection, CHECKPOINT_REFERENCES_QUERY)
     require(
         isinstance(rows, list),
         "recovery_database_readback_failed",
@@ -2496,20 +2487,29 @@ def verify_checkpoint_tree(
     files: list[dict],
     *,
     receipt: object,
+    check_inventory: bool = True,
 ) -> None:
-    current = inventory_tree(tree)
+    current = inventory_tree(tree) if check_inventory else files
     require(
         current == files,
         "recovery_member_hash_mismatch",
         f"checkpoint tree differs from its reference index: {tree}",
     )
     if isinstance(receipt, dict):
+        from description_pipeline.delivery import STAMPED_EXTRA, SUBJECT_DIRECTORIES, read_delivery_manifest
+        from description_pipeline.io import PipelineError
+
+        try:
+            delivery = read_delivery_manifest(tree)
+        except (PipelineError, OSError, ValueError) as error:
+            raise RecoveryError("recovery_member_hash_mismatch", "checkpoint delivery manifest is invalid") from error
         artifacts = receipt.get("artifacts") or []
         require(
             isinstance(artifacts, list),
             "recovery_member_hash_mismatch",
             f"checkpoint receipt artifacts are malformed: {tree}",
         )
+        artifact_paths = set()
         for artifact in artifacts:
             require(
                 isinstance(artifact, dict) and set(artifact) >= {"path", "bytes", "sha256"},
@@ -2517,6 +2517,8 @@ def verify_checkpoint_tree(
                 f"checkpoint receipt artifact is malformed: {tree}",
             )
             relative = confined_member(artifact["path"], "checkpoint artifact")
+            require(relative not in artifact_paths, "recovery_member_hash_mismatch", "duplicate checkpoint artifact")
+            artifact_paths.add(relative)
             target = tree / relative
             require(
                 target.is_file()
@@ -2526,28 +2528,162 @@ def verify_checkpoint_tree(
                 "recovery_member_hash_mismatch",
                 f"checkpoint artifact differs from its receipt: {relative}",
             )
+        sidecars = {name for name in STAMPED_EXTRA if name != "reports" and (tree / name).is_file()}
+        expected_files = artifact_paths | {"manifest.json"} | sidecars
+        require(
+            {row["path"] for row in files if row["type"] == "file"} == expected_files,
+            "recovery_member_hash_mismatch",
+            "checkpoint tree contains missing or unregistered files",
+        )
+        subject_paths = {row["path"] for row in delivery["subject"]["files"]}
+        require(
+            subject_paths == {path for path in artifact_paths if not path.startswith("reports/")},
+            "recovery_member_hash_mismatch",
+            "receipt differs from delivery subject",
+        )
+        allowed_dirs = set(SUBJECT_DIRECTORIES) | {"reports"}
+        for path in expected_files:
+            allowed_dirs.update(parent.as_posix() for parent in Path(path).parents if parent != Path("."))
+        require(
+            all(row["path"] in allowed_dirs for row in files if row["type"] == "directory"),
+            "recovery_member_hash_mismatch",
+            "checkpoint contains an unregistered directory",
+        )
+
+
+def checkpoint_origins(references: list[dict]) -> dict[tuple[str, str], str]:
+    """Resolve explicit stage reuse using only rows from one DB snapshot."""
+    from description_pipeline.delivery import BUNDLE_SCHEMA
+    from description_pipeline.io import PipelineError
+    from description_pipeline.platform.storage import parse_sealed_uri
+    from description_pipeline.stages import CONFIRMED_STAGE_PASSED, CONFIRMED_STAGE_STATES
+
+    require(isinstance(references, list), "recovery_reference_invalid", "checkpoint references must be a list")
+    by_key = {}
+    for row in references:
+        require(
+            isinstance(row, dict)
+            and set(row)
+            == {
+                "run_id",
+                "stage",
+                "stage_state",
+                "request_id",
+                "run_parent_run_id",
+                "reused_from_run",
+                "original_executed_at",
+                "checkpoint_uri",
+                "receipt",
+            },
+            "recovery_reference_invalid",
+            "checkpoint reference fields are malformed",
+        )
+        for key in ("run_id", "stage", "request_id"):
+            value = row[key]
+            require(
+                isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}", value)),
+                "recovery_reference_invalid",
+                f"invalid checkpoint {key}",
+            )
+        key = (row["run_id"], row["stage"])
+        require(key not in by_key, "recovery_reference_invalid", "duplicate logical checkpoint")
+        require(
+            row["stage_state"] in {"completed", "failed", "cancelled", "unknown", "unresolved"}
+            and isinstance(row["receipt"], dict),
+            "recovery_reference_invalid",
+            "checkpoint must carry an auditable terminal stage receipt",
+        )
+        try:
+            producer, uri_stage = parse_sealed_uri(row["checkpoint_uri"])
+        except PipelineError as error:
+            raise RecoveryError("recovery_reference_invalid", "invalid sealed checkpoint URI") from error
+        receipt = row["receipt"]
+        require(
+            uri_stage == row["stage"]
+            and receipt.get("schema_version") == BUNDLE_SCHEMA
+            and receipt.get("run_id") == producer
+            and receipt.get("stage") == row["stage"],
+            "recovery_reference_invalid",
+            "checkpoint receipt identity differs from its producer",
+        )
+        expected_states = (
+            CONFIRMED_STAGE_STATES[row["stage"]] if row["stage_state"] == "completed" else {row["stage_state"]}
+        )
+        expected_passed = CONFIRMED_STAGE_PASSED[row["stage"]] if row["stage_state"] == "completed" else False
+        require(
+            receipt.get("state") in expected_states
+            and receipt.get("passed") is expected_passed
+            and isinstance(receipt.get("artifacts"), list),
+            "recovery_reference_invalid",
+            "checkpoint receipt outcome differs from stage state",
+        )
+        require(
+            row["stage_state"] == "completed" or row["reused_from_run"] is None,
+            "recovery_reference_invalid",
+            "non-completed checkpoint cannot reuse a parent",
+        )
+        by_key[key] = row
+    origins = {}
+    for key, row in by_key.items():
+        current = row
+        seen = set()
+        while True:
+            run_id = current["run_id"]
+            require(
+                run_id not in seen and len(seen) < 256,
+                "recovery_reference_invalid",
+                "checkpoint reuse cycle or depth limit",
+            )
+            seen.add(run_id)
+            parent = current["reused_from_run"]
+            if parent is None:
+                break
+            require(
+                parent == current["run_parent_run_id"] and (parent, row["stage"]) in by_key,
+                "recovery_reference_invalid",
+                "checkpoint reuse is not bound to its registered parent",
+            )
+            source = by_key[(parent, row["stage"])]
+            require(
+                source["stage_state"] == "completed"
+                and source["checkpoint_uri"] == row["checkpoint_uri"]
+                and source["receipt"] == row["receipt"]
+                and source["original_executed_at"] == row["original_executed_at"],
+                "recovery_reference_invalid",
+                "checkpoint reuse source identity differs",
+            )
+            current = source
+        require(
+            row["checkpoint_uri"] == f"store://sealed/{current['run_id']}/{row['stage']}",
+            "recovery_reference_invalid",
+            "checkpoint URI differs from its proven producer",
+        )
+        origins[key] = current["run_id"]
+    return origins
 
 
 def checkpoint_index(references: list[dict], store_root: Path) -> list[dict]:
+    origins = checkpoint_origins(references)
     indexed = []
+    physical = {}
     for reference in references:
         uri = reference.get("checkpoint_uri")
         run_id = reference.get("run_id")
         stage = reference.get("stage")
-        require(
-            isinstance(uri, str) and uri == f"store://sealed/{run_id}/{stage}",
-            "recovery_member_hash_mismatch",
-            "checkpoint URI does not bind the registered run/stage",
-        )
-        tree = store_root / "sealed" / str(run_id) / str(stage)
-        files = inventory_tree(tree)
-        verify_checkpoint_tree(tree, files, receipt=reference.get("receipt"))
+        producer = origins[(run_id, stage)]
+        tree = store_root / "sealed" / producer / stage
+        tree_relative = Path("sealed", producer, stage).as_posix()
+        if tree_relative not in physical:
+            files = inventory_tree(tree)
+            verify_checkpoint_tree(tree, files, receipt=reference.get("receipt"), check_inventory=False)
+            physical[tree_relative] = files
+        files = physical[tree_relative]
         indexed.append(
             {
                 "run_id": run_id,
                 "stage": stage,
                 "checkpoint_uri": uri,
-                "tree_relative": Path("sealed", str(run_id), str(stage)).as_posix(),
+                "tree_relative": tree_relative,
                 "files": files,
             }
         )
@@ -2555,9 +2691,18 @@ def checkpoint_index(references: list[dict], store_root: Path) -> list[dict]:
 
 
 def verify_checkpoint_index(index: list[dict], store_root: Path) -> None:
+    checked = {}
     for row in index:
         tree = store_root / row["tree_relative"]
-        verify_checkpoint_tree(tree, row["files"], receipt={})
+        if row["tree_relative"] in checked:
+            require(
+                checked[row["tree_relative"]] == row["files"],
+                "recovery_member_hash_mismatch",
+                "shared checkpoint inventories differ",
+            )
+            continue
+        require(inventory_tree(tree) == row["files"], "recovery_member_hash_mismatch", "checkpoint inventory differs")
+        checked[row["tree_relative"]] = row["files"]
 
 
 def copy_tree_strict(source: Path, destination: Path) -> None:
@@ -2611,12 +2756,324 @@ def copy_required_file(
     )
 
 
+def selected_inventory(path: Path, selected: list[str]) -> list[dict]:
+    """Inventory only explicitly selected subtrees/files and their ancestors."""
+    require_real_dir(path, "selected source root", "recovery_release_missing")
+    rows = {}
+    for relative in selected:
+        relative = confined_member(relative, "selected source member")
+        target = path / relative
+        require_no_links(target, "selected source member")
+        if target.is_dir():
+            entries = [
+                {
+                    "path": relative,
+                    "type": "directory",
+                    "bytes": 0,
+                    "sha256": None,
+                    "mode": stat.S_IMODE(target.stat().st_mode),
+                }
+            ]
+            entries += [{**row, "path": f"{relative}/{row['path']}"} for row in inventory_tree(target)]
+        else:
+            require_real_file(target, "selected source member", "recovery_release_missing")
+            entries = [
+                {
+                    "path": relative,
+                    "type": "file",
+                    "bytes": target.stat().st_size,
+                    "sha256": sha256_file(target),
+                    "mode": stat.S_IMODE(target.stat().st_mode),
+                }
+            ]
+        for entry in entries:
+            rows[entry["path"]] = entry
+        for parent in Path(relative).parents:
+            if parent == Path("."):
+                continue
+            directory = path / parent
+            rows[parent.as_posix()] = {
+                "path": parent.as_posix(),
+                "type": "directory",
+                "bytes": 0,
+                "sha256": None,
+                "mode": stat.S_IMODE(directory.stat().st_mode),
+            }
+    return [rows[key] for key in sorted(rows)]
+
+
+def copy_selected_root(source: Path, destination: Path, selected: list[str]) -> None:
+    rows = selected_inventory(source, selected)
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for row in rows:
+        target = destination / row["path"]
+        if row["type"] == "directory":
+            target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        else:
+            copy_required_file(source / row["path"], target)
+    for row in reversed(rows):
+        if row["type"] == "directory":
+            os.chmod(destination / row["path"], row["mode"])
+    os.chmod(destination, stat.S_IMODE(source.stat().st_mode))
+
+
+def journal_selection(
+    state_root: Path,
+    *,
+    extracted: Path | None = None,
+    expected: list[dict] | None = None,
+    additional_receipts: tuple[Path, ...] = (),
+) -> list[dict]:
+    """Follow typed current/previous journal edges; never enumerate promotions."""
+    entries = {}
+    parsed = set()
+    pending = []
+
+    def physical(path):
+        if extracted is None:
+            return path
+        member = (
+            "config/state/" + path.relative_to(state_root).as_posix()
+            if path.is_relative_to(state_root)
+            else "journal-files/" + hashlib.sha256(str(path).encode()).hexdigest() + "/" + path.name
+        )
+        return extracted / member
+
+    def document(path, label):
+        return strict_json_file(physical(path), label)[1]
+
+    def add(raw, owner, reference, kind, digest=None):
+        path = Path(absolute_text(raw, "journal source"))
+        if not path.is_relative_to(state_root):
+            require(
+                kind in {"release-manifest", "map-source"} and Path(owner).is_relative_to(state_root / "promotions"),
+                "recovery_journal_invalid",
+                "external file has no controlled journal authority",
+            )
+        local = physical(path)
+        require_no_links(local, "journal source")
+        require_real_file(local, "journal source", "recovery_journal_invalid")
+        require(not path.name.endswith(".enc"), "recovery_journal_invalid", "encrypted history is excluded")
+        actual = sha256_file(local)
+        require(digest is None or digest == actual, "recovery_journal_invalid", "journal digest differs")
+        # External evidence stays an explicit exact-file target, never a recursive root.
+        member = (
+            "config/state/" + path.relative_to(state_root).as_posix()
+            if path.is_relative_to(state_root)
+            else "journal-files/" + hashlib.sha256(str(path).encode()).hexdigest() + "/" + path.name
+        )
+        edge = {
+            "owner": str(owner),
+            "reference": reference,
+            "kind": kind,
+            "source_path": str(path),
+            "member": member,
+            "sha256": actual,
+            "bytes": local.stat().st_size,
+            "mode": stat.S_IMODE(local.stat().st_mode),
+        }
+        key = (str(owner), reference, str(path))
+        require(key not in entries or entries[key] == edge, "recovery_journal_invalid", "conflicting journal edge")
+        entries[key] = edge
+        if path not in parsed:
+            pending.append((path, kind))
+        return path
+
+    current_path = state_root / "install-record.json"
+    current = document(current_path, "active install record")
+    for receipt in additional_receipts:
+        add(str(receipt), current_path, "/finalize/receipt", "evidence")
+    records = [(current_path, current)]
+    previous = current.get("previous")
+    if previous is not None:
+        require(isinstance(previous, dict), "recovery_journal_invalid", "previous record is malformed")
+        previous_path = add(previous["record"], current_path, "/previous/record", "record")
+        require(
+            previous_path.parent == state_root / "install-records",
+            "recovery_journal_invalid",
+            "previous record is outside install-records",
+        )
+        previous_document = document(previous_path, "previous install record")
+        records.append((previous_path, previous_document))
+    for path, record in records:
+        try:
+            install_record._canonical_records().validate_install_record(record)
+        except (SystemExit, ValueError, TypeError, KeyError) as error:
+            raise RecoveryError("recovery_journal_invalid", "install record is malformed") from error
+        require(
+            record["paths"].get("state_root") == str(state_root),
+            "recovery_journal_invalid",
+            "install record belongs to another state root",
+        )
+        if path != current_path:
+            require(
+                path.name == record["install_id"] + ".json",
+                "recovery_journal_invalid",
+                "previous record filename differs from its identity",
+            )
+        require(
+            isinstance(record, dict) and isinstance(record.get("journal"), list),
+            "recovery_journal_invalid",
+            "install record has no journal",
+        )
+        snapshot = record.get("snapshot")
+        require(isinstance(snapshot, dict), "recovery_journal_invalid", "install record has no snapshot")
+        require(
+            Path(snapshot["path"]) == state_root / "snapshots" / (record["install_id"] + ".json"),
+            "recovery_journal_invalid",
+            "snapshot filename differs from install identity",
+        )
+        add(snapshot["path"], path, "/snapshot/path", "snapshot", snapshot["digest"])
+        require(
+            document(Path(snapshot["path"]), "journal snapshot").get("install_id") == record["install_id"],
+            "recovery_journal_invalid",
+            "snapshot content belongs to another install",
+        )
+        require(
+            snapshot.get("install_id") == record.get("install_id"),
+            "recovery_journal_invalid",
+            "snapshot install identity differs",
+        )
+        require_real_file(
+            physical(state_root / "derived" / record["install_id"] / "operator.env"),
+            "journal derived environment",
+            "recovery_journal_invalid",
+        )
+        prior = record.get("previous")
+        if prior is not None:
+            prior_record = document(Path(prior["record"]), "previous metadata record")
+            require(
+                prior["config"]
+                == {"path": prior_record["snapshot"]["path"], "digest": prior_record["snapshot"]["digest"]}
+                and Path(prior["record"]) == state_root / "install-records" / (prior_record["install_id"] + ".json")
+                and Path(prior["config"]["path"]) == state_root / "snapshots" / (prior_record["install_id"] + ".json"),
+                "recovery_journal_invalid",
+                "previous configuration differs from its record",
+            )
+            add(prior["config"]["path"], path, "/previous/config/path", "snapshot", prior["config"]["digest"])
+        for index, row in enumerate(record["journal"]):
+            require(
+                isinstance(row, dict) and isinstance(row.get("evidence"), list),
+                "recovery_journal_invalid",
+                "journal evidence is malformed",
+            )
+            receipts = [value for value in row["evidence"] if Path(value).name == "receipt.json"]
+            require(len(receipts) == 1, "recovery_journal_invalid", "journal row must bind one promotion receipt")
+            receipt_doc = document(Path(receipts[0]), "journal receipt")
+            require(
+                receipt_doc.get("schema_version") == "solidworks-to-urdf.promotion/v1"
+                and receipt_doc.get("install_id") == record["install_id"]
+                and receipt_doc.get("to") == snapshot["path"]
+                and receipt_doc.get("to_sha256") == snapshot["digest"],
+                "recovery_journal_invalid",
+                "journal receipt identity differs",
+            )
+            for offset, value in enumerate(row["evidence"]):
+                add(value, path, f"/journal/{index}/evidence/{offset}", "evidence")
+    while pending:
+        path, kind = pending.pop()
+        if path in parsed:
+            continue
+        parsed.add(path)
+        if path.name == "evidence-map.json":
+            groups = document(path, "journal evidence map")
+            require(isinstance(groups, list) and bool(groups), "recovery_journal_invalid", "empty evidence map")
+            sources, snapshots = set(), set()
+            for group_index, group in enumerate(groups):
+                require(isinstance(group, list) and bool(group), "recovery_journal_invalid", "empty evidence group")
+                for index, row in enumerate(group):
+                    require(
+                        isinstance(row, dict) and set(row) == {"source", "snapshot"},
+                        "recovery_journal_invalid",
+                        "invalid evidence map entry",
+                    )
+                    name = row["snapshot"]
+                    require(
+                        isinstance(name, str)
+                        and Path(name).name == name
+                        and name not in {".", "..", path.name}
+                        and name not in snapshots
+                        and row["source"] not in sources,
+                        "recovery_journal_invalid",
+                        "duplicate or unsafe evidence map entry",
+                    )
+                    sources.add(row["source"])
+                    snapshots.add(name)
+                    add(row["source"], path, f"/{group_index}/{index}/source", "map-source")
+                    add(str(path.parent / name), path, f"/{group_index}/{index}/snapshot", "map-snapshot")
+        elif path.name == "receipt.json":
+            receipt = document(path, "journal receipt")
+            if receipt.get("schema_version") != "solidworks-to-urdf.promotion/v1":
+                require(
+                    kind in {"map-source", "map-snapshot"},
+                    "recovery_journal_invalid",
+                    "journal receipt has an unsupported schema",
+                )
+                continue
+            import promotion
+
+            checked_receipt = copy.deepcopy(receipt)
+            if extracted is not None:
+                for step in checked_receipt.get("steps", []):
+                    step["evidence"] = [str(physical(Path(value))) for value in step.get("evidence", [])]
+                    for entry in step.get("evidence_digests", []):
+                        entry["path"] = str(physical(Path(entry["path"])))
+            require(
+                promotion.recorded_steps_valid(checked_receipt, physical(path)),
+                "recovery_journal_invalid",
+                "promotion receipt evidence is incomplete",
+            )
+            for field in ("from", "to"):
+                add(
+                    receipt[field],
+                    path,
+                    "/" + field,
+                    "record" if field == "from" else "snapshot",
+                    receipt[field + "_sha256"],
+                )
+            source_record = document(Path(receipt["from"]), "promotion source record")
+            try:
+                install_record._canonical_records().validate_install_record(source_record)
+            except (SystemExit, ValueError, TypeError, KeyError) as error:
+                raise RecoveryError("recovery_journal_invalid", "promotion source record is malformed") from error
+            require(
+                Path(receipt["from"]).parent == state_root / "install-records"
+                and Path(receipt["from"]).name == source_record["install_id"] + ".json",
+                "recovery_journal_invalid",
+                "promotion source record path differs",
+            )
+            target_snapshot = document(Path(receipt["to"]), "promotion target snapshot")
+            require(
+                Path(receipt["to"]) == state_root / "snapshots" / (receipt["install_id"] + ".json")
+                and target_snapshot.get("install_id") == receipt["install_id"],
+                "recovery_journal_invalid",
+                "promotion target snapshot identity differs",
+            )
+            release = receipt["release_manifest"]
+            add(release["path"], path, "/release_manifest/path", "release-manifest", release["sha256"])
+            for index, step in enumerate(receipt["steps"]):
+                require(
+                    step.get("seq") == index + 1
+                    and isinstance(step.get("evidence"), list)
+                    and isinstance(step.get("evidence_digests"), list)
+                    and step["evidence"] == [entry["path"] for entry in step["evidence_digests"]]
+                    and len(step["evidence"]) == len(set(step["evidence"])),
+                    "recovery_journal_invalid",
+                    "promotion evidence identities differ",
+                )
+                for offset, evidence in enumerate(step["evidence_digests"]):
+                    add(evidence["path"], path, f"/steps/{index}/evidence/{offset}", "evidence", evidence["sha256"])
+    result = sorted(entries.values(), key=lambda row: (row["source_path"], row["owner"], row["reference"]))
+    require(expected is None or result == expected, "recovery_journal_invalid", "journal graph differs from selection")
+    return result
+
+
 def source_inventory(roots: list[dict]) -> list[dict]:
     records = []
     for root in roots:
         path = Path(root["path"])
         if path.is_dir():
-            inventory = inventory_tree(path)
+            inventory = selected_inventory(path, root["selection"]) if "selection" in root else inventory_tree(path)
             kind = "directory"
         else:
             require_real_file(
@@ -2641,16 +3098,16 @@ def source_inventory(roots: list[dict]) -> list[dict]:
                 "type": kind,
                 "mode": stat.S_IMODE(path.stat().st_mode),
                 "inventory": inventory,
+                **({"archive": root["archive"]} if "archive" in root else {}),
             }
         )
     return records
 
 
-def verify_staged_source_members(
-    context: BackupContext,
+def source_member_map(
+    release_document: dict,
     inventory_before: list[dict],
-    staging: Path,
-) -> tuple[str, dict]:
+) -> tuple[dict, set[str]]:
     fixed_prefix = {
         "install_records": "config/state/install-records",
         "snapshots": "config/state/snapshots",
@@ -2685,7 +3142,7 @@ def verify_staged_source_members(
             return secret_members[index]
         if name.startswith("release_artifact_"):
             index = int(name.removeprefix("release_artifact_"))
-            artifact = context.release_document["artifacts"][index]["name"]
+            artifact = release_document["artifacts"][index]["name"]
             return f"release/artifacts/{artifact}"
         if name.startswith("specification_root_"):
             index = int(name.removeprefix("specification_root_"))
@@ -2698,7 +3155,7 @@ def verify_staged_source_members(
     expected = {}
     directory_prefixes = []
     for root in inventory_before:
-        prefix = prefix_for(root["name"])
+        prefix = root.get("archive") or prefix_for(root["name"])
         if root["type"] == "file":
             entry = root["inventory"][0]
             expected_mode = 0o600 if root["name"].startswith("secret_") else entry["mode"]
@@ -2752,6 +3209,16 @@ def verify_staged_source_members(
         **release_copy,
         "member": "config/release.json",
     }
+    return expected, canonical_parents
+
+
+def verify_staged_source_members(
+    context: BackupContext,
+    inventory_before: list[dict],
+    staging: Path,
+) -> tuple[str, dict]:
+    expected, canonical_parents = source_member_map(context.release_document, inventory_before)
+    directory_prefixes = [member for member, row in expected.items() if row["type"] == "directory"]
     for member in canonical_parents:
         path = Path(staging) / member
         if path.is_dir() and not path.is_symlink():
@@ -2826,6 +3293,10 @@ def verify_manifest_source_binding(
                 if path.is_dir() and not path.is_symlink():
                     os.chmod(path, row["mode"])
 
+    verify_source_row_binding(manifest_members(Path(staging)), manifest_members_rows, expected)
+
+
+def verify_source_row_binding(actual_rows: list[dict], manifest_members_rows: list[dict], expected: dict) -> None:
     def comparable(row: dict) -> dict:
         return {
             "member": row["member"],
@@ -2836,7 +3307,7 @@ def verify_manifest_source_binding(
         }
 
     manifest_map = {row["member"]: comparable(row) for row in manifest_members_rows}
-    actual_map = {row["member"]: comparable(row) for row in manifest_members(Path(staging))}
+    actual_map = {row["member"]: comparable(row) for row in actual_rows}
     differences = [
         {
             "member": member,
@@ -2961,6 +3432,8 @@ def read_sealed_tar_member_rows(archive: Path, key: Path) -> list[dict]:
         if process.poll() is None:
             process.kill()
             process.wait()
+        process.stdout.close()
+        process.stderr.close()
     require(
         returncode == 0 and stream_error is None,
         "recovery_archive_member_mismatch",
@@ -2987,6 +3460,12 @@ def verify_tar_rows_against_manifest(
         }
         for row in manifest_members
     ]
+    require(
+        len({row["member"] for row in expected_rows}) == len(expected_rows)
+        and len({row["member"] for row in tar_rows}) == len(tar_rows),
+        "recovery_archive_member_mismatch",
+        "archive or manifest contains duplicate member names",
+    )
     expected_by_name = {row["member"]: row for row in expected_rows}
     actual_by_name = {row["member"]: row for row in tar_rows}
     differences = [
@@ -3014,67 +3493,10 @@ def verify_archive_member_binding(
     staged_source_members: dict,
     work_dir: Path,
 ) -> dict:
-    temporary = tempfile.TemporaryDirectory(
-        prefix="archive-members-",
-        dir=work_dir,
-    )
-    extracted = Path(temporary.name) / "archive"
-    legacy_path = Path(temporary.name) / "legacy-manifest.json"
-    try:
-        tar_rows = read_sealed_tar_member_rows(archive, key)
-        verify_tar_rows_against_manifest(tar_rows, manifest_members)
-        legacy = {
-            "schema": backup.MANIFEST_SCHEMA,
-            "files": {row["member"]: row["sha256"] for row in manifest_members if row["type"] == "file"},
-            "encrypted": {
-                "path": str(archive),
-                "sha256": sha256_file(archive),
-                "cipher": "aes-256-cbc",
-                "key": str(key),
-            },
-        }
-        atomic_write(legacy_path, canonical_json(legacy))
-        try:
-            backup.open_archive(archive, key, legacy_path, extracted)
-        except SystemExit as error:
-            raise RecoveryError(
-                "recovery_archive_member_mismatch",
-                f"cannot reopen sealed archive members: {error}",
-            ) from error
-        try:
-            verify_member_set(extracted, manifest_members)
-            verify_manifest_source_binding(
-                extracted,
-                manifest_members,
-                staged_source_members,
-                normalize_directory_modes=True,
-            )
-        except RecoveryError as error:
-            raise RecoveryError(
-                "recovery_archive_member_mismatch",
-                "sealed archive members differ from the expected member map",
-                {
-                    "cause_code": error.code,
-                    "cause_message": error.message,
-                    "cause_detail": error.detail,
-                },
-            ) from error
-        rows = [
-            {
-                "member": row["member"],
-                "type": row["type"],
-                "bytes": row["bytes"],
-                "sha256": row["sha256"],
-                "mode": row["mode"],
-            }
-            for row in manifest_members
-        ]
-        return {
-            "members": len(rows),
-            "sha256": _digest_document(rows),
-        }
-    finally:
-        temporary.cleanup()
+    tar_rows = read_sealed_tar_member_rows(archive, key)
+    verify_tar_rows_against_manifest(tar_rows, manifest_members)
+    verify_source_row_binding(tar_rows, manifest_members, staged_source_members)
+    return {"members": len(tar_rows), "sha256": _digest_document(tar_rows)}
 
 
 def manifest_members(staging: Path) -> list[dict]:
@@ -3206,7 +3628,7 @@ def copy_release_tree(context: BackupContext, staging: Path) -> dict:
     }
 
 
-def copy_state_configuration(state_root: Path, install_id: str, staging: Path) -> None:
+def copy_state_configuration(state_root: Path, install_id: str, staging: Path, *, selection: dict) -> None:
     destination = staging / "config" / "state"
     destination.mkdir(parents=True, mode=0o700)
     file_map = (
@@ -3241,12 +3663,16 @@ def copy_state_configuration(state_root: Path, install_id: str, staging: Path) -
         ("install-records", Path("install-records")),
         ("snapshots", Path("snapshots")),
         ("derived", Path("derived")),
-        ("promotions", Path("promotions")),
     ):
         copy_required_tree(
             state_root / source_relative,
             destination / target_relative,
         )
+    promotion_scope = next(row for row in selection["root_scopes"] if row["name"] == "promotions")
+    copy_selected_root(state_root / "promotions", destination / "promotions", promotion_scope["selection"])
+    for scope in selection["root_scopes"]:
+        if scope["name"].startswith("journal_file_"):
+            copy_required_file(Path(scope["path"]), staging / scope["archive"])
     derived = destination / "derived" / install_id / "operator.env"
     require_real_file(
         derived,
@@ -3382,8 +3808,9 @@ def root_contract(context: BackupContext, release_root_record: dict) -> list[dic
     return roots
 
 
-def capture_checkpoint_store(source: Path, staging: Path) -> None:
-    copy_required_tree(source, staging / "state" / "runs")
+def capture_checkpoint_store(source: Path, staging: Path, *, selection: dict) -> None:
+    scope = next(row for row in selection["root_scopes"] if row["name"] == "store_root")
+    copy_selected_root(source, staging / "state" / "runs", scope["selection"])
 
 
 def derived_dump_member(staging: Path, name: str) -> dict:
@@ -3396,14 +3823,24 @@ def derived_dump_member(staging: Path, name: str) -> dict:
     }
 
 
-def backup_source_checks(context: BackupContext) -> list[dict]:
+def backup_source_checks(context: BackupContext, *, references: list[dict], journal: list[dict]) -> list[dict]:
     state_root = Path(context.resolved["storage"]["state_root"])
     archive_root = context.archive_root
     checks = [
         {"name": "install_records", "path": str(state_root / "install-records")},
         {"name": "snapshots", "path": str(state_root / "snapshots")},
         {"name": "derived", "path": str(state_root / "derived")},
-        {"name": "promotions", "path": str(state_root / "promotions")},
+        {
+            "name": "promotions",
+            "path": str(state_root / "promotions"),
+            "selection": sorted(
+                {
+                    str(Path(row["source_path"]).relative_to(state_root / "promotions"))
+                    for row in journal
+                    if Path(row["source_path"]).is_relative_to(state_root / "promotions")
+                }
+            ),
+        },
         {"name": "install_record", "path": str(state_root / "install-record.json")},
         {"name": "resolved_env", "path": str(state_root / "resolved.env")},
         {"name": "portal", "path": str(state_root / "portal.json")},
@@ -3420,6 +3857,9 @@ def backup_source_checks(context: BackupContext) -> list[dict]:
         {
             "name": "store_root",
             "path": context.resolved["derived"]["store_root"],
+            "selection": sorted(
+                {f"sealed/{producer}/{stage}" for (_run, stage), producer in checkpoint_origins(references).items()}
+            ),
         },
         {
             "name": "handoff_root",
@@ -3454,7 +3894,353 @@ def backup_source_checks(context: BackupContext) -> list[dict]:
         context.snapshot["resolved"]["windows"]["token_file"],
     )
     checks.extend({"name": f"secret_{index}", "path": path} for index, path in enumerate(secret_paths))
+    covered = (
+        state_root / "install-records",
+        state_root / "snapshots",
+        state_root / "derived",
+        state_root / "promotions",
+    )
+    existing = {row["path"] for row in checks}
+    extra = {
+        entry["source_path"]: entry
+        for entry in journal
+        if (
+            not Path(entry["source_path"]).is_relative_to(state_root)
+            or (
+                entry["source_path"] not in existing
+                and not any(Path(entry["source_path"]).is_relative_to(root) for root in covered)
+            )
+        )
+    }
+    for index, row in enumerate(extra.values()):
+        checks.append({"name": f"journal_file_{index}", "path": row["source_path"], "archive": row["member"]})
     return checks
+
+
+def closure_binding(selection: dict) -> dict:
+    return {
+        "schema_version": SELECTION_SCHEMA,
+        "selection_sha256": _digest_document(selection),
+        "checkpoint_refs_sha256": selection["checkpoint_refs_sha256"],
+        "root_scopes_sha256": _digest_document(selection["root_scopes"]),
+    }
+
+
+def require_capacity(requirements: list[tuple[Path, int]]) -> list[dict]:
+    """Budget additional bytes per actual target filesystem before writing."""
+    filesystems = {}
+    for target, size in requirements:
+        require(type(size) is int and size >= 0, "recovery_capacity_invalid", "negative capacity requirement")
+        path = target
+        while not path.exists():
+            path = path.parent
+        device = path.stat().st_dev
+        row = filesystems.setdefault(device, {"path": str(path), "payload_bytes": 0})
+        row["payload_bytes"] += size
+    result = []
+    for row in filesystems.values():
+        required = row["payload_bytes"] + max(64 * 1024 * 1024, row["payload_bytes"] // 10)
+        free = shutil.disk_usage(row["path"]).free
+        require(
+            free >= required,
+            "recovery_capacity_insufficient",
+            "insufficient space for selected recovery closure",
+            {**row, "required_bytes": required, "free_bytes": free},
+        )
+        result.append({**row, "required_bytes": required, "free_bytes": free})
+    return result
+
+
+def validate_selected_members(manifest: dict) -> None:
+    selection = manifest["selection"]
+    verify_source_row_binding(manifest["members"], manifest["members"], selection["source_members"])
+    scopes = {row["name"]: row for row in selection["root_scopes"]}
+    roots = {row["name"]: row for row in manifest["roots"]}
+    for name, root in roots.items():
+        if name in scopes:
+            require(root["path"] == scopes[name]["path"], "recovery_manifest_invalid", "root scope identity differs")
+    state_root = Path(roots["state_root"]["path"])
+    for name, relative in {
+        "install_records": "install-records",
+        "snapshots": "snapshots",
+        "derived": "derived",
+        "install_record": "install-record.json",
+        "resolved_env": "resolved.env",
+        "portal": "portal.json",
+        "feishu_env": "feishu.env",
+        "nginx": "nginx/nginx.conf",
+        "airflow_cfg": "airflow-home/airflow.cfg",
+        "maintenance_lock": f"{MAINTENANCE_LOCK_DIRNAME}/{MAINTENANCE_LOCK_FILENAME}",
+    }.items():
+        require(
+            name in scopes and scopes[name]["path"] == str(state_root / relative) and "selection" not in scopes[name],
+            "recovery_manifest_invalid",
+            "state scope is incomplete",
+        )
+    require(
+        {"store_root", "handoff_root", "artifact_root"} <= scopes.keys(),
+        "recovery_manifest_invalid",
+        "required source scope is missing",
+    )
+    require(
+        scopes["promotions"]["path"] == str(state_root / "promotions"),
+        "recovery_manifest_invalid",
+        "promotions root identity differs",
+    )
+    allowed_promotion = {
+        row["member"] for row in selection["journal_entries"] if row["member"].startswith("config/state/promotions/")
+    }
+    require(
+        scopes["promotions"].get("selection")
+        == sorted(member.removeprefix("config/state/promotions/") for member in allowed_promotion),
+        "recovery_manifest_invalid",
+        "promotion scope differs from typed journal",
+    )
+    members = {row["member"]: row for row in manifest["members"]}
+    base_names = {
+        "install_records",
+        "snapshots",
+        "derived",
+        "promotions",
+        "install_record",
+        "resolved_env",
+        "portal",
+        "feishu_env",
+        "nginx",
+        "airflow_cfg",
+        "maintenance_lock",
+        "store_root",
+        "handoff_root",
+        "artifact_root",
+        "release_json",
+        "platform_config",
+    }
+    base_names.update(f"release_artifact_{index}" for index, _ in enumerate(manifest["release"]["artifacts"]))
+    base_names.update(f"secret_{index}" for index, _ in enumerate(manifest["secrets"]))
+    base_names.update(name for name in roots if name.startswith("specification_root_"))
+    extras = {name for name in scopes if name.startswith("journal_file_")}
+    require(set(scopes) == base_names | extras, "recovery_manifest_invalid", "source scope set differs")
+    for name in extras:
+        scope = scopes[name]
+        require(
+            any(
+                scope["path"] == edge["source_path"] and scope.get("archive") == edge["member"]
+                for edge in selection["journal_entries"]
+            ),
+            "recovery_manifest_invalid",
+            "extra source scope has no typed journal edge",
+        )
+    platform_files = [row for row in manifest["files"] if row["name"] == "platform_config"]
+    require(
+        len(platform_files) == 1 and scopes["platform_config"]["path"] == platform_files[0]["path"],
+        "recovery_manifest_invalid",
+        "platform source scope differs",
+    )
+    release_parent = Path(scopes["release_json"]["path"]).parent
+    require(
+        Path(scopes["release_json"]["path"]).name == "release.json",
+        "recovery_manifest_invalid",
+        "release source scope is malformed",
+    )
+    for index, artifact in enumerate(manifest["release"]["artifacts"]):
+        require(
+            scopes[f"release_artifact_{index}"]["path"] == str(release_parent / artifact["name"]),
+            "recovery_manifest_invalid",
+            "release artifact source scope differs",
+        )
+    for index, secret in enumerate(manifest["secrets"]):
+        require(
+            scopes[f"secret_{index}"]["path"] == secret["path"],
+            "recovery_manifest_invalid",
+            "secret source scope differs",
+        )
+    expected_exact = {
+        (row["source_path"], row["member"], row["mode"])
+        for row in selection["journal_entries"]
+        if not Path(row["source_path"]).is_relative_to(state_root)
+    }
+    expected_exact.add((platform_files[0]["path"], "config/platform.json", 0o600))
+    require(
+        len(manifest["files"]) == len(expected_exact)
+        and {(row["path"], row["member"], row["mode"]) for row in manifest["files"]} == expected_exact,
+        "recovery_manifest_invalid",
+        "exact file target set differs from typed selection",
+    )
+    for edge in selection["journal_entries"]:
+        row = members.get(edge["member"], {})
+        require(
+            row.get("type") == "file"
+            and row.get("bytes") == edge["bytes"]
+            and row.get("sha256") == edge["sha256"]
+            and row.get("mode") == edge["mode"],
+            "recovery_manifest_invalid",
+            "journal member differs from typed edge",
+        )
+        source = Path(edge["source_path"])
+        expected_member = (
+            "config/state/" + source.relative_to(state_root).as_posix()
+            if source.is_relative_to(state_root)
+            else "journal-files/" + hashlib.sha256(str(source).encode()).hexdigest() + "/" + source.name
+        )
+        require(edge["member"] == expected_member, "recovery_manifest_invalid", "journal path mapping differs")
+        if not source.is_relative_to(state_root):
+            require(
+                any(row["path"] == str(source) and row["member"] == expected_member for row in manifest["files"]),
+                "recovery_manifest_invalid",
+                "external journal target is missing",
+            )
+    selected_trees = scopes["store_root"]["selection"]
+    allowed_run_members = {"state/runs"}
+    for reference in manifest["references"]:
+        prefix = "state/runs/" + reference["tree_relative"]
+        allowed_run_members.add(prefix)
+        allowed_run_members.update(prefix + "/" + row["path"] for row in reference["files"])
+        allowed_run_members.update(
+            parent.as_posix() for parent in Path(prefix).parents if parent.as_posix().startswith("state/runs")
+        )
+    actual_run_members = {member for member in members if member == "state/runs" or member.startswith("state/runs/")}
+    require(actual_run_members == allowed_run_members, "recovery_manifest_invalid", "checkpoint member closure differs")
+    allowed_promotion_members = {"config/state/promotions", *allowed_promotion}
+    for member in allowed_promotion:
+        allowed_promotion_members.update(
+            parent.as_posix()
+            for parent in Path(member).parents
+            if parent.as_posix().startswith("config/state/promotions")
+        )
+    require(
+        {
+            member
+            for member in members
+            if member == "config/state/promotions" or member.startswith("config/state/promotions/")
+        }
+        == allowed_promotion_members,
+        "recovery_manifest_invalid",
+        "promotion member closure differs",
+    )
+    for member, row in members.items():
+        if row["type"] != "file":
+            continue
+        if member.startswith("config/state/promotions/"):
+            require(member in allowed_promotion, "recovery_manifest_invalid", "unselected promotion file")
+        if member.startswith("state/runs/"):
+            relative = member.removeprefix("state/runs/")
+            require(
+                any(relative.startswith(tree + "/") for tree in selected_trees),
+                "recovery_manifest_invalid",
+                "unselected checkpoint file",
+            )
+
+
+def verify_selection_archive(manifest: dict, extracted: Path) -> None:
+    selection = validate_selection(_load_extracted_json(extracted, "inventory/selection.json", "source selection"))
+    require(
+        selection == manifest["selection"] and closure_binding(selection) == manifest["closure"],
+        "recovery_manifest_invalid",
+        "archived selection differs",
+    )
+    state_root = Path(next(row["path"] for row in manifest["roots"] if row["name"] == "state_root"))
+    journal_selection(state_root, extracted=extracted, expected=selection["journal_entries"])
+    indexed = checkpoint_index(selection["checkpoint_refs"], extracted / "state" / "runs")
+    require(
+        indexed
+        == manifest["references"]
+        == _load_extracted_json(extracted, "database/reference-index.json", "checkpoint index"),
+        "recovery_manifest_invalid",
+        "checkpoint reference index differs",
+    )
+
+
+def validate_selection(selection: object) -> dict:
+    selected = _exact_keys(
+        selection,
+        {
+            "schema_version",
+            "snapshot_id",
+            "checkpoint_refs",
+            "checkpoint_refs_sha256",
+            "root_scopes",
+            "journal_entries",
+            "source_members",
+        },
+        "selection",
+    )
+    require(
+        selected["schema_version"] == SELECTION_SCHEMA
+        and isinstance(selected["snapshot_id"], str)
+        and bool(selected["snapshot_id"]),
+        "recovery_manifest_invalid",
+        "invalid selection identity",
+    )
+    checkpoint_origins(selected["checkpoint_refs"])
+    require(
+        selected["checkpoint_refs_sha256"] == _digest_document(selected["checkpoint_refs"]),
+        "recovery_manifest_invalid",
+        "selection reference digest differs",
+    )
+    require(
+        isinstance(selected["root_scopes"], list) and isinstance(selected["journal_entries"], list),
+        "recovery_manifest_invalid",
+        "selection scopes are malformed",
+    )
+    require(
+        isinstance(selected["source_members"], dict) and bool(selected["source_members"]),
+        "recovery_manifest_invalid",
+        "selection source members are missing",
+    )
+    for name, row in selected["source_members"].items():
+        _exact_keys(row, {"member", "type", "bytes", "sha256", "mode"}, "selected source member")
+        confined_member(name, "selected source member")
+        require(name == row["member"], "recovery_manifest_invalid", "selected source member key differs")
+    names = set()
+    for scope in selected["root_scopes"]:
+        require(
+            isinstance(scope, dict)
+            and set(scope) <= {"name", "path", "archive", "selection"}
+            and {"name", "path"} <= set(scope)
+            and scope["name"] not in names,
+            "recovery_manifest_invalid",
+            "invalid or duplicate source scope",
+        )
+        names.add(scope["name"])
+        absolute_text(scope["path"], "selection root path")
+        if "archive" in scope:
+            confined_member(scope["archive"], "selection archive member")
+        if "selection" in scope:
+            require(
+                isinstance(scope["selection"], list) and scope["selection"] == sorted(set(scope["selection"])),
+                "recovery_manifest_invalid",
+                "selection paths must be sorted and unique",
+            )
+            for path in scope["selection"]:
+                confined_member(path, "selected path")
+    require({"promotions", "store_root"} <= names, "recovery_manifest_invalid", "missing filtered scopes")
+    store = next(scope for scope in selected["root_scopes"] if scope["name"] == "store_root")
+    require(
+        store.get("selection")
+        == sorted(
+            {
+                f"sealed/{producer}/{stage}"
+                for (_run, stage), producer in checkpoint_origins(selected["checkpoint_refs"]).items()
+            }
+        ),
+        "recovery_manifest_invalid",
+        "store scope differs from checkpoint references",
+    )
+    for row in selected["journal_entries"]:
+        _exact_keys(
+            row, {"owner", "reference", "kind", "source_path", "member", "sha256", "bytes", "mode"}, "journal edge"
+        )
+        absolute_text(row["source_path"], "journal source")
+        confined_member(row["member"], "journal member")
+        require(
+            not row["source_path"].endswith(".enc")
+            and bool(HEX64.fullmatch(row["sha256"]))
+            and type(row["bytes"]) is int
+            and row["bytes"] >= 0,
+            "recovery_manifest_invalid",
+            "invalid journal edge value",
+        )
+    return selected
 
 
 def wait_for_marker(
@@ -3579,11 +4365,6 @@ def _snapshot_worker(request_path: Path) -> int:
                 }
             ),
         )
-        wait_for_marker(
-            control / "inventory.complete.json",
-            timeout=timeout,
-        )
-
         snapshot = _db_connect(database)
         snapshot_id = _begin_exported_snapshot(snapshot)
         roles_snapshot_before = _roles_settings_snapshot(snapshot)
@@ -3616,16 +4397,32 @@ def _snapshot_worker(request_path: Path) -> int:
             control / "snapshot.ready.json",
             canonical_json(
                 {
+                    "schema_version": SNAPSHOT_READY_SCHEMA,
                     "status": "ready",
                     "snapshot_id": snapshot_id,
+                    "checkpoint_refs": checkpoint_rows,
+                    "checkpoint_refs_sha256": _digest_document(checkpoint_rows),
+                    "database_bytes": int(_connection_scalar(snapshot, "SELECT pg_database_size(current_database())")),
                     "roles_sha256": _digest_document(roles_snapshot_before),
                     "created_at": utc_now(),
                 }
             ),
         )
-        wait_for_marker(
+        checkpoint_origins(checkpoint_rows)
+        inventory_marker = wait_for_marker(control / "inventory.complete.json", timeout=timeout)
+        files_marker = wait_for_marker(
             control / "files.complete.json",
             timeout=timeout,
+        )
+        selection = validate_selection(_load_extracted_json(staging, "inventory/selection.json", "source selection"))
+        binding = closure_binding(selection)
+        require(
+            selection["snapshot_id"] == snapshot_id
+            and selection["checkpoint_refs"] == checkpoint_rows
+            and inventory_marker.get("closure") == binding
+            and files_marker.get("closure") == binding,
+            "recovery_snapshot_worker_failed",
+            "snapshot selection markers differ",
         )
         indexed_checkpoints = checkpoint_index(
             checkpoint_rows,
@@ -3826,6 +4623,7 @@ def _snapshot_worker(request_path: Path) -> int:
         )
         consistency = {
             "isolation": "REPEATABLE READ READ ONLY",
+            "closure": binding,
             "snapshot_id": snapshot_id,
             "snapshot_held_until_pg_dump_complete": True,
             "roles_snapshot_before_sha256": _digest_document(roles_snapshot_before),
@@ -4119,7 +4917,7 @@ def _run_windows_recovery_json(
     )
     lines = [line for line in completed.stdout.strip().splitlines() if line.strip()]
     try:
-        document = json.loads(lines[-1])
+        document = json.loads(lines[-1], object_pairs_hook=_pairs_no_duplicates)
     except (IndexError, ValueError) as error:
         raise RecoveryError(
             "windows_recovery_transport_unknown",
@@ -4129,11 +4927,7 @@ def _run_windows_recovery_json(
                 "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
             },
         ) from error
-    if (
-        completed.returncode == 0
-        and document.get("passed") is True
-        and document.get("verb") == expected_verb
-    ):
+    if completed.returncode == 0 and document.get("passed") is True and document.get("verb") == expected_verb:
         return document
     code = document.get("code")
     if (
@@ -4429,7 +5223,7 @@ def _read_windows_state(bundle: Path) -> dict:
             {"error": str(error)},
         ) from error
     try:
-        document = json.loads(payload)
+        document = json.loads(payload, object_pairs_hook=_pairs_no_duplicates)
     except ValueError as error:
         raise RecoveryError(
             "windows_recovery_bundle_invalid",
@@ -4454,9 +5248,7 @@ def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
     for row in state["files"]:
         member = expected_members.get(row["member"])
         require(
-            member is not None
-            and row["bytes"] == member["bytes"]
-            and row["sha256"] == member["sha256"],
+            member is not None and row["bytes"] == member["bytes"] and row["sha256"] == member["sha256"],
             "windows_recovery_bundle_invalid",
             "Windows recovery file bytes and digest differ from members",
             {"member": row["member"]},
@@ -4465,8 +5257,7 @@ def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
         with zipfile.ZipFile(bundle) as archive:
             names = archive.namelist()
             require(
-                len(names) == len(set(names))
-                and set(names) == set(expected_members) | {WINDOWS_STATE_MEMBER},
+                len(names) == len(set(names)) and set(names) == set(expected_members) | {WINDOWS_STATE_MEMBER},
                 "windows_recovery_bundle_invalid",
                 "Windows recovery bundle has missing, extra or duplicate members",
             )
@@ -4485,8 +5276,7 @@ def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
             for name, row in expected_members.items():
                 payload = archive.read(name)
                 require(
-                    len(payload) == row["bytes"]
-                    and hashlib.sha256(payload).hexdigest() == row["sha256"],
+                    len(payload) == row["bytes"] and hashlib.sha256(payload).hexdigest() == row["sha256"],
                     "windows_recovery_bundle_invalid",
                     "Windows recovery member differs from its state",
                     {"member": name},
@@ -4653,14 +5443,10 @@ def _validate_windows_acl_policy(
     )
 
 
-def _validate_windows_runtime_leaf_acl_policy(
-    projection: dict, parent: dict, *, label: str, operator_sid: str
-) -> None:
+def _validate_windows_runtime_leaf_acl_policy(projection: dict, parent: dict, *, label: str, operator_sid: str) -> None:
     """Accept only protected or inherited leaves under the protected state root."""
 
-    _validate_windows_acl_policy(
-        parent, label=f"{label}.parent", operator_sid=operator_sid, directory=True
-    )
+    _validate_windows_acl_policy(parent, label=f"{label}.parent", operator_sid=operator_sid, directory=True)
     _validate_windows_acl_policy(
         projection,
         label=label,
@@ -4809,8 +5595,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
     if launch_contract is missing_launch_contract:
         launch_contract = (
             WINDOWS_LEGACY_LAUNCH_CONTRACT
-            if identity["release_identity_sha256"]
-            == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256
+            if identity["release_identity_sha256"] == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256
             else None
         )
     require(
@@ -4825,15 +5610,13 @@ def _validate_windows_recovery_state(document: object) -> dict:
     )
     require(
         launch_contract != WINDOWS_LEGACY_LAUNCH_CONTRACT
-        or identity["release_identity_sha256"]
-        == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
+        or identity["release_identity_sha256"] == WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
         "windows_recovery_state_invalid",
         "the legacy launch contract is not bound to the approved release",
     )
     require(
         launch_contract != WINDOWS_PYTHON_LAUNCH_CONTRACT
-        or identity["release_identity_sha256"]
-        != WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
+        or identity["release_identity_sha256"] != WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256,
         "windows_recovery_state_invalid",
         "the approved legacy release cannot use the Python module launch contract",
     )
@@ -4849,11 +5632,7 @@ def _validate_windows_recovery_state(document: object) -> dict:
         and identity["runtime_administrator"] is True
         and identity["runtime_administrator"] is principal["administrator"]
         and identity["runtime_privilege_qualification"]
-        == (
-            "user-approved-administrator-runtime"
-            if principal["administrator"]
-            else "non-administrative-runtime"
-        ),
+        == ("user-approved-administrator-runtime" if principal["administrator"] else "non-administrative-runtime"),
         "windows_recovery_state_invalid",
         "Windows runtime identity privilege qualification differs from the task principal",
     )
@@ -4882,35 +5661,23 @@ def _validate_windows_recovery_state(document: object) -> dict:
     }
     normalized_action = {key: str(value).replace("\\", "/") for key, value in action.items()}
     transition_python_action = (
-        identity["release_identity_sha256"]
-        == WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
-        and normalized_action["execute"]
-        == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
-        and normalized_action["arguments"]
-        == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
+        identity["release_identity_sha256"] == WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
+        and normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
+        and normalized_action["arguments"] == f'-I -m description_pipeline serve --config "{normalized["config_path"]}"'
     )
     python_module_action = (
-        normalized_action["execute"]
-        == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
+        normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
         and normalized_action["arguments"]
         == f'-I -B -m description_pipeline serve --config "{normalized["config_path"]}"'
     ) or transition_python_action
     legacy_launcher_action = (
-        normalized_action["execute"]
-        == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"
-        and normalized_action["arguments"]
-        == f'serve --config "{normalized["config_path"]}"'
+        normalized_action["execute"] == normalized["endpoint_root"] + "/runtime/Scripts/description.exe"
+        and normalized_action["arguments"] == f'serve --config "{normalized["config_path"]}"'
     )
     require(
         (
-            (
-                launch_contract == WINDOWS_PYTHON_LAUNCH_CONTRACT
-                and python_module_action
-            )
-            or (
-                launch_contract == WINDOWS_LEGACY_LAUNCH_CONTRACT
-                and legacy_launcher_action
-            )
+            (launch_contract == WINDOWS_PYTHON_LAUNCH_CONTRACT and python_module_action)
+            or (launch_contract == WINDOWS_LEGACY_LAUNCH_CONTRACT and legacy_launcher_action)
         )
         and normalized_action["working_directory"] == normalized["state_root"]
         and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
@@ -4942,15 +5709,11 @@ def _validate_windows_recovery_state(document: object) -> dict:
             f"Windows identity {key} is not a safe absolute forward-slash path",
         )
     require(
-        isinstance(identity["operator_sid"], str)
-        and bool(re.fullmatch(r"S-1-[0-9-]+", identity["operator_sid"])),
+        isinstance(identity["operator_sid"], str) and bool(re.fullmatch(r"S-1-[0-9-]+", identity["operator_sid"])),
         "windows_recovery_state_invalid",
         "Windows operator SID is malformed",
     )
-    nt_paths = {
-        key: value.replace("/", "\\")
-        for key, value in normalized.items()
-    }
+    nt_paths = {key: value.replace("/", "\\") for key, value in normalized.items()}
     common_parent = ntpath.commonpath(
         [
             nt_paths[key]
@@ -4985,7 +5748,8 @@ def _validate_windows_recovery_state(document: object) -> dict:
         normalized["endpoint_root"].startswith(lifecycle_root + "/")
         and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
         and normalized["install_id_path"] == normalized["state_root"] + "/install-id"
-        and secret_root not in {
+        and secret_root
+        not in {
             normalized["package_root"],
             normalized["output_root"],
             normalized["state_root"],
@@ -5175,24 +5939,19 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "cad_ownership": "cad-ownership.json",
     }
     require(
-        all(
-            expected_role_members.get(row["role"]) == row["member"]
-            for row in files
-        ),
+        all(expected_role_members.get(row["role"]) == row["member"] for row in files),
         "windows_recovery_state_invalid",
         "Windows recovery file roles and members differ",
     )
     task_xml_file = next(row for row in files if row["role"] == "task_xml")
     require(
-        task_xml_file["sha256"] == task["xml_sha256"]
-        and task_xml_file["member"] == "task.xml",
+        task_xml_file["sha256"] == task["xml_sha256"] and task_xml_file["member"] == "task.xml",
         "windows_recovery_state_invalid",
         "Windows task XML file and task projection differ",
     )
     files_by_role = {row["role"]: row for row in files}
     require(
-        files_by_role["managed_root_marker"]["path"]
-        == common_parent + "/.description-managed-root.json",
+        files_by_role["managed_root_marker"]["path"] == common_parent + "/.description-managed-root.json",
         "windows_recovery_state_invalid",
         "Windows managed-root marker is outside the computed common parent",
     )
@@ -5281,10 +6040,7 @@ def _validate_remote_cleanup(value: object) -> dict:
     remote_dir = value["remote_dir"]
     require(
         isinstance(attempted, bool)
-        and (
-            (attempted and isinstance(passed, bool))
-            or (not attempted and passed is None)
-        )
+        and ((attempted and isinstance(passed, bool)) or (not attempted and passed is None))
         and isinstance(remote_dir, str)
         and bool(re.fullmatch(r"[A-Za-z]:/[^/].*", remote_dir))
         and ".." not in remote_dir.split("/"),
@@ -5610,14 +6366,18 @@ def restore_windows_recovery(
     )
     _validate_remote_cleanup(result.get("remote_cleanup"))
     _validate_windows_inner_cleanup(result.get("cleanup"), required=True)
+    observed_state = _validate_windows_recovery_state(result.get("state"))
+    observed_sha256 = _digest_document(observed_state)
     require(
         result.get("task_state") == "Disabled"
         and result.get("endpoint") == "stopped"
         and result.get("cad_ownership") == "free"
-        and result.get("state_sha256") == windows["state_sha256"],
+        and observed_state == state
+        and observed_sha256 == windows["state_sha256"],
         "windows_recovery_verification_failed",
         "Windows recovery did not end disabled, stopped, CAD-free and state-identical",
     )
+    result["state_sha256"] = observed_sha256
     write_json_once(status_dir / "windows-recovery.json", result)
     return result
 
@@ -6040,7 +6800,6 @@ def _backup_command_claimed(
         staging=staging,
         commands=commands,
     )
-    source_checks = backup_source_checks(context)
     airflow_venv = Path(context.derived_env["AIRFLOW_VENV"])
     airflow_python = airflow_venv / "bin" / "python"
     require(
@@ -6093,10 +6852,43 @@ def _backup_command_claimed(
             timeout=120,
             process=worker,
         )
-        inventory_before = source_inventory(source_checks)
+        snapshot_ready = wait_for_marker(control / "snapshot.ready.json", timeout=120, process=worker)
+        require(
+            snapshot_ready.get("schema_version") == SNAPSHOT_READY_SCHEMA
+            and isinstance(snapshot_ready.get("checkpoint_refs"), list)
+            and snapshot_ready.get("checkpoint_refs_sha256") == _digest_document(snapshot_ready["checkpoint_refs"]),
+            "recovery_snapshot_worker_failed",
+            "snapshot references are malformed",
+        )
+        checkpoint_origins(snapshot_ready["checkpoint_refs"])
+        journal = journal_selection(Path(context.resolved["storage"]["state_root"]))
+        source_checks = backup_source_checks(context, references=snapshot_ready["checkpoint_refs"], journal=journal)
+        selection = {
+            "schema_version": SELECTION_SCHEMA,
+            "snapshot_id": snapshot_ready["snapshot_id"],
+            "checkpoint_refs": snapshot_ready["checkpoint_refs"],
+            "checkpoint_refs_sha256": snapshot_ready["checkpoint_refs_sha256"],
+            "root_scopes": source_checks,
+            "journal_entries": journal,
+        }
+        inventory_before = source_inventory(selection["root_scopes"])
+        selection["source_members"] = source_member_map(context.release_document, inventory_before)[0]
+        validate_selection(selection)
+        binding = closure_binding(selection)
+        payload_bytes = sum(
+            ((entry["bytes"] + 511) // 512 + 2) * 512 for row in inventory_before for entry in row["inventory"]
+        )
+        database_bytes = snapshot_ready.get("database_bytes")
+        require(
+            type(database_bytes) is int and database_bytes >= 0,
+            "recovery_snapshot_worker_failed",
+            "snapshot database capacity estimate is missing",
+        )
+        require_capacity([(out, 2 * (payload_bytes + database_bytes))])
         before_bytes = canonical_json(inventory_before)
         inventory_root = staging / "inventory"
         inventory_root.mkdir(mode=0o700)
+        write_json_once(inventory_root / "selection.json", selection)
         write_json_once(inventory_root / "source-before.json", inventory_before)
         write_json_once(control / "inventory-before.json", inventory_before)
         atomic_write(
@@ -6104,18 +6896,13 @@ def _backup_command_claimed(
             canonical_json(
                 {
                     "status": "complete",
+                    "closure": binding,
                     "sha256": hashlib.sha256(before_bytes).hexdigest(),
                     "roots": len(inventory_before),
                     "created_at": utc_now(),
                 }
             ),
         )
-        snapshot_ready = wait_for_marker(
-            control / "snapshot.ready.json",
-            timeout=120,
-            process=worker,
-        )
-
         # File copying remains strictly inside the exported DB snapshot window.
         copy_release_capture = copy_release_tree(context, staging)
         roots = root_contract(context, copy_release_capture)
@@ -6123,6 +6910,7 @@ def _backup_command_claimed(
             Path(context.resolved["storage"]["state_root"]),
             context.install_record["install_id"],
             staging,
+            selection=selection,
         )
         require(
             stat.S_IMODE(context.config_path.stat().st_mode) & 0o077 == 0,
@@ -6137,6 +6925,7 @@ def _backup_command_claimed(
         capture_checkpoint_store(
             Path(context.resolved["derived"]["store_root"]),
             staging,
+            selection=selection,
         )
         copy_required_tree(
             Path(context.resolved["storage"]["handoff_root"]),
@@ -6167,6 +6956,7 @@ def _backup_command_claimed(
             canonical_json(
                 {
                     "status": "complete",
+                    "closure": binding,
                     "created_at": utc_now(),
                 }
             ),
@@ -6176,7 +6966,7 @@ def _backup_command_claimed(
             timeout=worker_timeout,
             process=worker,
         )
-        inventory_after = source_inventory(source_checks)
+        inventory_after = source_inventory(selection["root_scopes"])
         after_bytes = canonical_json(inventory_after)
         write_json_once(inventory_root / "source-after.json", inventory_after)
         write_json_once(control / "inventory-after.json", inventory_after)
@@ -6217,6 +7007,11 @@ def _backup_command_claimed(
             and snapshot_ready.get("snapshot_id") == capture_result["consistency"]["snapshot_id"],
             "recovery_snapshot_worker_failed",
             "snapshot worker handoff identity is inconsistent",
+        )
+        require(
+            capture_result["consistency"].get("closure") == binding,
+            "recovery_snapshot_worker_failed",
+            "snapshot completion closure differs",
         )
     finally:
         if worker.poll() is None:
@@ -6273,7 +7068,7 @@ def _backup_command_claimed(
     initial_inventory = [row for row in manifest_members(staging) if row["member"] != "inventory/files.json"]
     write_json_once(inventory_root / "files.json", initial_inventory)
 
-    inventory_after = source_inventory(source_checks)
+    inventory_after = source_inventory(selection["root_scopes"])
     after_bytes = canonical_json(inventory_after)
     require(
         inventory_after == inventory_before,
@@ -6418,6 +7213,8 @@ def _backup_command_claimed(
             "operatorctl": maintenance_operatorctl,
         },
         "windows": windows_recovery,
+        "selection": selection,
+        "closure": binding,
         "files": [
             {
                 "name": "platform_config",
@@ -6426,6 +7223,18 @@ def _backup_command_claimed(
                 "mode": 0o600,
                 "required": True,
             }
+        ]
+        + [
+            {
+                "name": scope["name"],
+                "path": scope["path"],
+                "member": scope["archive"],
+                "mode": next(row["mode"] for row in journal if row["source_path"] == scope["path"]),
+                "required": True,
+            }
+            for scope in selection["root_scopes"]
+            if scope["name"].startswith("journal_file_")
+            and not Path(scope["path"]).is_relative_to(Path(context.resolved["storage"]["state_root"]))
         ],
         "roots": roots,
         "members": inventory_rows,
@@ -6461,6 +7270,7 @@ def _backup_command_claimed(
         "consistency": consistency,
     }
     validate_manifest(manifest, expected_manifest_sha=None)
+    verify_selection_archive(manifest, staging)
     require_current_claim(claim)
     manifest_path = out / "recovery-manifest.json"
     manifest_bytes = canonical_json(manifest)
@@ -6524,6 +7334,8 @@ def _backup_command_claimed(
 
 
 MANIFEST_BLOCKS = {
+    "selection",
+    "closure",
     "schema_version",
     "backup_id",
     "created_at",
@@ -6556,7 +7368,14 @@ def _exact_keys(document: object, keys: set[str], where: str) -> dict:
 
 
 def validate_manifest(document: object, *, expected_manifest_sha: str | None) -> dict:
+    require(
+        isinstance(document, dict) and document.get("schema_version") == MANIFEST_SCHEMA,
+        "recovery_schema_unsupported",
+        "recovery manifest schema is not supported",
+    )
     doc = _exact_keys(document, MANIFEST_BLOCKS, "recovery manifest")
+    selection = validate_selection(doc["selection"])
+    require(doc["closure"] == closure_binding(selection), "recovery_manifest_invalid", "closure binding differs")
     require(
         doc["schema_version"] == MANIFEST_SCHEMA,
         "recovery_schema_unsupported",
@@ -6784,7 +7603,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         absolute_text(row["path"], f"files[{index}].path")
         confined_member(row["member"], f"files[{index}].member")
         require(
-            row["mode"] == 0o600 and row["required"] is True,
+            type(row["mode"]) is int and 0 <= row["mode"] <= 0o777 and row["required"] is True,
             "recovery_manifest_invalid",
             f"files[{index}] is not required 0600",
         )
@@ -7273,20 +8092,14 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         and reconstructibles["workspace_root"]["recipe"] == "git-origin-head-clean"
         and reconstructibles["workspace_root"]["plan_member"] == "reconstruct/workspace-plan.json"
         and isinstance(reconstructibles["external"], list)
-        and all(
-            isinstance(value, str) and bool(value)
-            for value in reconstructibles["external"]
-        ),
+        and all(isinstance(value, str) and bool(value) for value in reconstructibles["external"]),
         "recovery_manifest_invalid",
         "reconstructible plan is malformed",
     )
     for name in ("release_root", "workspace_root"):
         path = reconstructibles[name]["path"]
         require(
-            isinstance(path, str)
-            and bool(path)
-            and Path(path).is_absolute()
-            and ".." not in Path(path).parts,
+            isinstance(path, str) and bool(path) and Path(path).is_absolute() and ".." not in Path(path).parts,
             "recovery_manifest_invalid",
             f"reconstructibles.{name}.path is unsafe",
         )
@@ -7318,6 +8131,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         doc["consistency"],
         {
             "isolation",
+            "closure",
             "snapshot_id",
             "snapshot_held_until_pg_dump_complete",
             "roles_snapshot_before_sha256",
@@ -7467,12 +8281,28 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
             }
             and isinstance(row["run_id"], str)
             and isinstance(row["stage"], str)
-            and row["checkpoint_uri"] == f"store://sealed/{row['run_id']}/{row['stage']}"
+            and row["checkpoint_uri"] == f"store://{row['tree_relative']}"
             and isinstance(row["tree_relative"], str)
             and isinstance(row["files"], list),
             "recovery_manifest_invalid",
             f"reference[{index}] is malformed",
         )
+    expected_origins = checkpoint_origins(selection["checkpoint_refs"])
+    require(len(references) == len(expected_origins), "recovery_manifest_invalid", "checkpoint index count differs")
+    for row in references:
+        producer = expected_origins.get((row["run_id"], row["stage"]))
+        require(
+            producer is not None and row["tree_relative"] == f"sealed/{producer}/{row['stage']}",
+            "recovery_manifest_invalid",
+            "checkpoint index producer differs",
+        )
+    require(
+        selection["snapshot_id"] == doc["database"]["snapshot"]["id"]
+        and doc["consistency"].get("closure") == doc["closure"],
+        "recovery_manifest_invalid",
+        "snapshot closure identity differs",
+    )
+    validate_selected_members(doc)
     if expected_manifest_sha is not None:
         require(
             isinstance(expected_manifest_sha, str) and bool(HEX64.fullmatch(expected_manifest_sha)),
@@ -7537,6 +8367,7 @@ def prepare_extraction(
         "recovery key does not match the manifest key_id",
     )
     archive = manifest_path.parent / manifest["archive"]["path"]
+    require_capacity([(status_dir, sum(((row["bytes"] + 511) // 512 + 2) * 512 for row in manifest["members"]))])
     require_real_file(
         archive,
         "encrypted recovery archive",
@@ -7547,6 +8378,7 @@ def prepare_extraction(
         "recovery_archive_hash_mismatch",
         "encrypted recovery archive digest differs from the manifest",
     )
+    verify_tar_rows_against_manifest(read_sealed_tar_member_rows(archive, key), manifest["members"])
     temporary = tempfile.TemporaryDirectory(
         prefix="extract-",
         dir=status_dir,
@@ -7572,6 +8404,10 @@ def prepare_extraction(
             "recovery_member_hash_mismatch",
             f"encrypted archive validation failed: {error}",
         ) from error
+    for row in manifest["members"]:
+        target = destination / row["member"]
+        require_no_links(target, "extracted member")
+        os.chmod(target, row["mode"])
     verify_member_set(destination, manifest["members"])
     return destination, temporary
 
@@ -7581,6 +8417,11 @@ def validate_target_plan(
     manifest: dict,
     manifest_sha: str,
 ) -> tuple[dict, bytes]:
+    require(
+        isinstance(document, dict) and document.get("schema_version") == TARGET_SCHEMA,
+        "recovery_schema_unsupported",
+        "target plan schema is not supported",
+    )
     plan = _exact_keys(
         document,
         {
@@ -7591,9 +8432,11 @@ def validate_target_plan(
             "postgres",
             "roots",
             "windows",
+            "closure",
         },
         "target plan",
     )
+    require(plan["closure"] == manifest["closure"], "recovery_target_plan_invalid", "target closure differs")
     require(
         plan["schema_version"] == TARGET_SCHEMA,
         "recovery_schema_unsupported",
@@ -7699,6 +8542,23 @@ def validate_target_plan(
     return plan, payload
 
 
+def build_target_plan(manifest: dict, manifest_sha: str, *, host_id: str, postgres: dict) -> dict:
+    """Derive only from a validated manifest; callers supply target execution authority."""
+    validate_manifest(manifest, expected_manifest_sha=manifest_sha)
+    plan = {
+        "schema_version": TARGET_SCHEMA,
+        "backup_manifest_sha256": manifest_sha,
+        "closure": copy.deepcopy(manifest["closure"]),
+        "mode": "exact_path",
+        "host_id": host_id,
+        "postgres": copy.deepcopy(postgres),
+        "roots": {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row},
+        "windows": _windows_target_from_state(manifest["windows"]["state"]),
+    }
+    validate_target_plan(plan, manifest, manifest_sha)
+    return plan
+
+
 def path_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
@@ -7719,6 +8579,25 @@ def require_empty_target_directory(path: Path, where: str) -> None:
 
 
 def validate_target_filesystem(manifest: dict, plan: dict) -> None:
+    requirements = []
+    for root in manifest["roots"]:
+        if "reconstructible_runtime" not in root:
+            requirements.append(
+                (
+                    Path(root["path"]),
+                    sum(
+                        ((row["bytes"] + 511) // 512 + 2) * 512
+                        for row in manifest["members"]
+                        if row["member"].startswith(root["archive"] + "/")
+                    ),
+                )
+            )
+    requirements.extend(
+        (Path(row["path"]), next(item["bytes"] for item in manifest["members"] if item["member"] == row["member"]))
+        for row in [*manifest["files"], *manifest["secrets"]]
+    )
+    requirements.append((Path(plan["postgres"]["data_dir"]), 2 * manifest["database"]["dump"]["bytes"]))
+    require_capacity(requirements)
     file_targets = [Path(row["path"]) for row in [*manifest["files"], *manifest["secrets"]]]
     for target in file_targets:
         require_no_links(target.parent, "secret target parent")
@@ -8176,6 +9055,7 @@ def verify_windows_recovery_archive(manifest: dict, extracted: Path) -> None:
 
 def verify_archive_consistency(manifest: dict, extracted: Path) -> None:
     consistency = manifest["consistency"]
+    verify_selection_archive(manifest, extracted)
     verify_maintenance_archive_consistency(manifest, extracted)
     verify_windows_recovery_archive(manifest, extracted)
     inventory_before = _load_extracted_json(
@@ -8192,6 +9072,23 @@ def verify_archive_consistency(manifest: dict, extracted: Path) -> None:
         extracted,
         "inventory/staged-source.json",
         "staged source inventory",
+    )
+    selected = manifest["selection"]
+    scopes = {row["name"]: row for row in selected["root_scopes"]}
+    require(
+        len(inventory_before) == len(scopes)
+        and {row["name"] for row in inventory_before} == set(scopes)
+        and all(
+            row["path"] == scopes[row["name"]]["path"] and row.get("archive") == scopes[row["name"]].get("archive")
+            for row in inventory_before
+        ),
+        "recovery_staged_source_mismatch",
+        "source inventory scopes differ from selection",
+    )
+    require(
+        source_member_map(manifest["release"], inventory_before)[0] == staged_source == selected["source_members"],
+        "recovery_staged_source_mismatch",
+        "selected source members differ from original inventory",
     )
     verify_manifest_source_binding(
         extracted,
@@ -8583,6 +9480,21 @@ def readback_database(
         "sequences": actual_sequences,
         "airflow_alembic_heads": actual_alembic,
     }
+    selection = _load_extracted_json(extracted, "inventory/selection.json", "source selection")
+    actual_refs = psql_json(
+        context,
+        socket_dir=socket_dir,
+        port=postgres["port"],
+        user=postgres["bootstrap_role"],
+        database=DATABASE_NAME,
+        query=CHECKPOINT_REFERENCES_QUERY,
+    )
+    checkpoint_origins(actual_refs)
+    require(
+        actual_refs == selection["checkpoint_refs"],
+        "recovery_database_readback_failed",
+        "restored checkpoint reference graph differs from the snapshot",
+    )
     require(
         actual_data == expected_data,
         "recovery_database_readback_failed",
@@ -8804,19 +9716,19 @@ def _workspace_plan(manifest: dict, extracted: Path) -> tuple[Path, dict]:
 
 def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
     required_keys = {
-            "repository_slug",
-            "path",
-            "origin",
-            "head",
-            "tree",
-            "head_symref",
-            "refs",
-            "symrefs",
-            "bases",
-            "status",
-            "bundle_member",
-            "bundle_sha256",
-        }
+        "repository_slug",
+        "path",
+        "origin",
+        "head",
+        "tree",
+        "head_symref",
+        "refs",
+        "symrefs",
+        "bases",
+        "status",
+        "bundle_member",
+        "bundle_sha256",
+    }
     require(
         isinstance(row, dict)
         and set(row) == required_keys
@@ -8839,10 +9751,7 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
     )
     require(
         isinstance(row["head_symref"], (str, type(None)))
-        and (
-            row["head_symref"] is None
-            or row["head_symref"].startswith("refs/heads/")
-        )
+        and (row["head_symref"] is None or row["head_symref"].startswith("refs/heads/"))
         and isinstance(row["refs"], dict)
         and isinstance(row["symrefs"], dict)
         and all(
@@ -8853,10 +9762,7 @@ def _workspace_row(root: Path, row: object) -> tuple[Path, dict]:
             for name, object_id in row["refs"].items()
         )
         and all(
-            isinstance(name, str)
-            and name in row["refs"]
-            and isinstance(target, str)
-            and bool(target)
+            isinstance(name, str) and name in row["refs"] and isinstance(target, str) and bool(target)
             for name, target in row["symrefs"].items()
         ),
         "recovery_manifest_invalid",
@@ -8942,8 +9848,7 @@ def _workspace_verify(path: Path, row: dict) -> None:
         )
         mode_text, _, object_id = fields
         require(
-            bool(re.fullmatch(r"[0-7]{6}", mode_text))
-            and bool(GIT_OBJECT.fullmatch(object_id)),
+            bool(re.fullmatch(r"[0-7]{6}", mode_text)) and bool(GIT_OBJECT.fullmatch(object_id)),
             "recovery_workspace_mismatch",
             f"workspace HEAD carries an invalid tree entry: {raw_relative!r}",
         )
@@ -9036,9 +9941,7 @@ def _workspace_verify(path: Path, row: dict) -> None:
             )
 
     # The index already matches HEAD exactly, so cached attributes use that same tree.
-    attribute_input = b"\0".join(
-        os.fsencode(relative) for relative in sorted(expected)
-    ) + b"\0"
+    attribute_input = b"\0".join(os.fsencode(relative) for relative in sorted(expected)) + b"\0"
     try:
         attribute_output = subprocess.check_output(
             [
@@ -9144,10 +10047,7 @@ def _workspace_verify(path: Path, row: dict) -> None:
             f"workspace tracked bytes differ: {relative}",
         )
     require(
-        origin == row["origin"]
-        and head == row["head"]
-        and tree == row["tree"]
-        and object_format == "sha1",
+        origin == row["origin"] and head == row["head"] and tree == row["tree"] and object_format == "sha1",
         "recovery_workspace_mismatch",
         f"workspace checkout differs from the reconstruction plan: {path}",
         {
@@ -9159,9 +10059,7 @@ def _workspace_verify(path: Path, row: dict) -> None:
     )
     actual_head_symref, actual_refs, actual_symrefs = _workspace_refs(path)
     require(
-        actual_head_symref == row["head_symref"]
-        and actual_refs == row["refs"]
-        and actual_symrefs == row["symrefs"],
+        actual_head_symref == row["head_symref"] and actual_refs == row["refs"] and actual_symrefs == row["symrefs"],
         "recovery_workspace_mismatch",
         f"workspace refs differ from the reconstruction plan: {path}",
         {
@@ -9272,7 +10170,8 @@ def _workspace_attributes_safe(path: Path, head: str, tree: str) -> None:
         ) from error
     require(
         indexed_tree == tree,
-        "recovery_workspace_mismatch", "workspace attribute index differs from the bound tree",
+        "recovery_workspace_mismatch",
+        "workspace attribute index differs from the bound tree",
     )
     tree_output = subprocess.check_output(
         ["git", "-C", str(path), "ls-tree", "-r", "-z", head],
@@ -9589,8 +10488,7 @@ def validate_release_runtime_target(
     )
     values = _read_rehydrate_env(operator_env)
     require(
-        isinstance(values.get("AIRFLOW_VENV"), str)
-        and isinstance(values.get("AIRFLOW_HOME"), str),
+        isinstance(values.get("AIRFLOW_VENV"), str) and isinstance(values.get("AIRFLOW_HOME"), str),
         "recovery_release_missing",
         "recovered operator environment lacks the Airflow runtime paths",
     )
@@ -9866,10 +10764,7 @@ def _release_contract(extracted: Path) -> dict:
         require(
             isinstance(rows, dict)
             and all(
-                isinstance(name, str)
-                and bool(name)
-                and isinstance(digest, str)
-                and bool(HEX64.fullmatch(digest))
+                isinstance(name, str) and bool(name) and isinstance(digest, str) and bool(HEX64.fullmatch(digest))
                 for name, digest in rows.items()
             ),
             "recovery_release_missing",
@@ -9904,6 +10799,7 @@ def _verify_installed_wheel_members(
 ) -> None:
     require_real_dir(site_packages, "installed site-packages", "recovery_release_missing")
     venv = site_packages.parents[2]
+
     def installed_path(name: str) -> Path:
         parts = name.split("/")
         if len(parts) >= 3 and parts[0].endswith(".data"):
@@ -9920,14 +10816,7 @@ def _verify_installed_wheel_members(
                 return venv / "bin" / relative
             if scheme == "headers":
                 distribution = parts[0].split("-", 1)[0]
-                return (
-                    venv
-                    / "include"
-                    / "site"
-                    / "python3.12"
-                    / distribution
-                    / relative
-                )
+                return venv / "include" / "site" / "python3.12" / distribution / relative
             return venv / relative
         return site_packages / name
 
@@ -9941,17 +10830,14 @@ def _verify_installed_wheel_members(
     package_members = {
         name: hashlib.sha256(payload).hexdigest()
         for name, payload in members.items()
-        if name.startswith("description_pipeline/")
-        and name != "description_pipeline/tool-release.json"
+        if name.startswith("description_pipeline/") and name != "description_pipeline/tool-release.json"
     }
     if expected_package is not None:
         expected_package = {
-            name.removeprefix("description_pipeline/"): digest
-            for name, digest in expected_package.items()
+            name.removeprefix("description_pipeline/"): digest for name, digest in expected_package.items()
         }
         package_members = {
-            name.removeprefix("description_pipeline/"): digest
-            for name, digest in package_members.items()
+            name.removeprefix("description_pipeline/"): digest for name, digest in package_members.items()
         }
         require(
             package_members == expected_package,
@@ -9960,9 +10846,7 @@ def _verify_installed_wheel_members(
         )
     if expected_version is not None or expected_source_sha256 is not None:
         try:
-            tool_release = json.loads(
-                members["description_pipeline/tool-release.json"].decode("utf-8")
-            )
+            tool_release = json.loads(members["description_pipeline/tool-release.json"].decode("utf-8"))
         except (KeyError, UnicodeDecodeError, ValueError) as error:
             raise RecoveryError(
                 "recovery_release_missing",
@@ -9991,15 +10875,13 @@ def _verify_installed_wheel_members(
         )
         if ".data/scripts/" in name:
             require(
-                os.access(target, os.X_OK)
-                and target.read_bytes().startswith(b"#!"),
+                os.access(target, os.X_OK) and target.read_bytes().startswith(b"#!"),
                 "recovery_release_missing",
                 f"installed script member is not executable: {name}",
             )
             interpreter = target.read_bytes().splitlines()[0][2:].strip()
             require(
-                Path(os.fsdecode(interpreter)).resolve()
-                == (venv / "bin" / "python").resolve(),
+                Path(os.fsdecode(interpreter)).resolve() == (venv / "bin" / "python").resolve(),
                 "recovery_release_missing",
                 f"installed script member has an unexpected interpreter: {name}",
             )
@@ -10009,9 +10891,7 @@ def _verify_installed_wheel_members(
                 "recovery_release_missing",
                 f"installed {label} member differs: {name}",
             )
-    record_name = next(
-        name for name in members if name.endswith(".dist-info/RECORD")
-    )
+    record_name = next(name for name in members if name.endswith(".dist-info/RECORD"))
     record_target = site_packages / record_name
     require_real_file(
         record_target,
@@ -10019,9 +10899,7 @@ def _verify_installed_wheel_members(
         "recovery_release_missing",
     )
     try:
-        record_rows = list(
-            csv.reader(record_target.read_text(encoding="utf-8").splitlines())
-        )
+        record_rows = list(csv.reader(record_target.read_text(encoding="utf-8").splitlines()))
     except (OSError, csv.Error, UnicodeDecodeError) as error:
         raise RecoveryError(
             "recovery_release_missing",
@@ -10045,12 +10923,11 @@ def _verify_installed_wheel_members(
             f"installed {label} RECORD names a missing file: {name}",
         )
         if value[0]:
-            encoded = base64.urlsafe_b64encode(
-                hashlib.sha256(target.read_bytes()).digest()
-            ).rstrip(b"=").decode("ascii")
+            encoded = (
+                base64.urlsafe_b64encode(hashlib.sha256(target.read_bytes()).digest()).rstrip(b"=").decode("ascii")
+            )
             require(
-                value[0] == f"sha256={encoded}"
-                and value[1] == str(target.stat().st_size),
+                value[0] == f"sha256={encoded}" and value[1] == str(target.stat().st_size),
                 "recovery_release_missing",
                 f"installed {label} generated file differs: {name}",
             )
@@ -10071,20 +10948,16 @@ def _verify_installed_wheel_members(
             "recovery_release_missing",
             f"installed {label} RECORD misses {name}",
         )
-        encoded = base64.urlsafe_b64encode(
-            hashlib.sha256(payload).digest()
-        ).rstrip(b"=").decode("ascii")
+        encoded = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode("ascii")
         if record[0] and ".data/scripts/" not in name:
             require(
-                record[0] == f"sha256={encoded}"
-                and record[1] == str(len(payload)),
+                record[0] == f"sha256={encoded}" and record[1] == str(len(payload)),
                 "recovery_release_missing",
                 f"installed {label} RECORD digest differs: {name}",
             )
     require(
         all(
-            name.endswith(".dist-info/RECORD")
-            or recorded_by_target.get(installed_path(name).resolve()) is not None
+            name.endswith(".dist-info/RECORD") or recorded_by_target.get(installed_path(name).resolve()) is not None
             for name in members
         ),
         "recovery_release_missing",
@@ -10143,11 +11016,7 @@ def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
     )
     try:
         with zipfile.ZipFile(linux_zip) as role:
-            wheels = [
-                name
-                for name in role.namelist()
-                if re.fullmatch(r"wheels/[^/]+\.whl", name)
-            ]
+            wheels = [name for name in role.namelist() if re.fullmatch(r"wheels/[^/]+\.whl", name)]
             require(
                 bool(wheels) and "requirements.lock" in role.namelist(),
                 "recovery_release_missing",
@@ -10160,10 +11029,7 @@ def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
             ]
             require(
                 len(lock_lines) == len(wheels)
-                and all(
-                    "==" in line and "--hash=sha256:" in line
-                    for line in lock_lines
-                ),
+                and all("==" in line and "--hash=sha256:" in line for line in lock_lines),
                 "recovery_release_missing",
                 "recovered Linux wheelhouse lock is incomplete",
             )
@@ -10174,15 +11040,9 @@ def _verify_installed_role_wheels(linux_zip: Path, site_packages: Path) -> None:
                 require(
                     any(
                         wheel_name.startswith(
-                            line.split("--hash=", 1)[0].split("==", 1)[0]
-                            .lower()
-                            .replace("-", "_")
-                            + "-"
+                            line.split("--hash=", 1)[0].split("==", 1)[0].lower().replace("-", "_") + "-"
                         )
-                        and line.split("--hash=", 1)[0]
-                        .split("==", 1)[1]
-                        .split()[0]
-                        in wheel_name
+                        and line.split("--hash=", 1)[0].split("==", 1)[1].split()[0] in wheel_name
                         and line.rsplit("sha256:", 1)[-1].split()[0] == payload_hash
                         for line in lock_lines
                     ),
@@ -10285,8 +11145,7 @@ def verify_release_runtime(
     require(
         python_header == b"\x7fELF"
         and any(
-            line.strip().startswith("home = ")
-            and Path(line.split("=", 1)[1].strip()).is_absolute()
+            line.strip().startswith("home = ") and Path(line.split("=", 1)[1].strip()).is_absolute()
             for line in pyvenv_text.splitlines()
         ),
         "recovery_release_missing",
@@ -10359,12 +11218,9 @@ def verify_release_runtime(
         ) from error
     require(
         probe.returncode == 0
-        and Path(runtime_identity.get("executable", "")).resolve()
-        == python.resolve()
-        and Path(runtime_identity.get("prefix", "")).resolve()
-        == venv.resolve()
-        and Path(runtime_identity.get("base_prefix", "")).resolve()
-        != venv.resolve()
+        and Path(runtime_identity.get("executable", "")).resolve() == python.resolve()
+        and Path(runtime_identity.get("prefix", "")).resolve() == venv.resolve()
+        and Path(runtime_identity.get("base_prefix", "")).resolve() != venv.resolve()
         and runtime_identity.get("version") == [3, 12],
         "recovery_release_missing",
         "recovered interpreter is not the expected CPython 3.12 environment",
@@ -10411,14 +11267,12 @@ def verify_release_runtime(
     _verify_release_archive(linux_zip, artifacts[linux_name]["sha256"])
     _verify_installed_role_wheels(linux_zip, package.parent)
     require(
-        (venv / "bin" / "airflow").is_file()
-        and os.access(venv / "bin" / "airflow", os.X_OK),
+        (venv / "bin" / "airflow").is_file() and os.access(venv / "bin" / "airflow", os.X_OK),
         "recovery_release_missing",
         "recovered Airflow entry point is missing or not executable",
     )
     require(
-        (venv / "bin" / "description").is_file()
-        and os.access(venv / "bin" / "description", os.X_OK),
+        (venv / "bin" / "description").is_file() and os.access(venv / "bin" / "description", os.X_OK),
         "recovery_release_missing",
         "recovered description entry point is missing or not executable",
     )
@@ -10711,6 +11565,9 @@ def restore_command(
     key = Path(key)
     target_plan_path = Path(target_plan_path)
     status_dir = Path(status_dir)
+    manifest, manifest_bytes, manifest_sha = load_recovery_manifest(manifest_path)
+    _, target_document = strict_json_file(target_plan_path, "target plan")
+    plan, canonical_plan = validate_target_plan(target_document, manifest, manifest_sha)
     require(
         status_dir.is_absolute(),
         "recovery_target_path_unsafe",
@@ -10740,7 +11597,6 @@ def restore_command(
     commands: list[dict] = []
     temporary: tempfile.TemporaryDirectory | None = None
     try:
-        manifest, manifest_bytes, manifest_sha = load_recovery_manifest(manifest_path)
         del manifest_bytes
         archive_path = manifest_path.parent / manifest["archive"]["path"]
         require_real_file(
@@ -10762,10 +11618,6 @@ def restore_command(
             hashlib.sha256(key.read_bytes()).hexdigest() == manifest["archive"]["key_id"],
             "recovery_key_unavailable",
             "recovery key does not match the manifest key_id",
-        )
-        verify_tar_rows_against_manifest(
-            read_sealed_tar_member_rows(archive_path, key),
-            manifest["members"],
         )
         _, target_document = strict_json_file(target_plan_path, "target plan")
         plan, canonical_plan = validate_target_plan(
@@ -10815,6 +11667,7 @@ def restore_command(
                 "phase": "preflight-complete",
                 "manifest_sha256": manifest_sha,
                 "target_plan_sha256": plan_sha,
+                "closure": manifest["closure"],
             }
         )
         write_status(status_dir, receipt)
@@ -10896,6 +11749,7 @@ def restore_command(
         if not verify_only:
             marker = {
                 "schema_version": MARKER_SCHEMA,
+                "closure": manifest["closure"],
                 "manifest_sha256": manifest_sha,
                 "target_plan_sha256": plan_sha,
                 "release": {
@@ -10974,6 +11828,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--status-dir", type=Path, required=True)
     worker_parser = subparsers.add_parser("snapshot-worker")
     worker_parser.add_argument("--request", type=Path, required=True)
+    plan_parser = subparsers.add_parser("target-plan")
+    plan_parser.add_argument("--manifest", type=Path, required=True)
+    plan_parser.add_argument("--host-id", required=True)
+    plan_parser.add_argument("--postgres-config", type=Path, required=True)
+    plan_parser.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -11096,6 +11955,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "snapshot-worker":
             return _snapshot_worker(args.request)
+        if args.action == "target-plan":
+            manifest, _, digest = load_recovery_manifest(args.manifest)
+            _, postgres = strict_json_file(args.postgres_config, "target PostgreSQL settings")
+            plan = build_target_plan(manifest, digest, host_id=args.host_id, postgres=postgres)
+            require_no_links(args.out, "target plan output")
+            args.out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                descriptor = os.open(args.out, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            except FileExistsError as error:
+                raise RecoveryError("recovery_write_conflict", "target plan output already exists") from error
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(canonical_json(plan))
+                stream.flush()
+                os.fsync(stream.fileno())
+            print(f"target_plan={args.out}")
+            print(f"target_plan_sha256={sha256_file(args.out)}")
+            return 0
         if args.action == "backup":
             result = backup_command(
                 config_path=args.config,

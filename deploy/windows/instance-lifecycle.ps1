@@ -2345,11 +2345,11 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
       Die 'windows_recovery_verification_failed' 'Windows recovery did not read back the archived state'
     }
     $cleanup = Close-RecoveryTemp
-    Emit @{
+    @{
       passed=$true; verb=$Script:Verb; task_state=[string]$current.task_projection.state;
-      endpoint='stopped'; cad_ownership='free'; state_sha256=(Get-JsonSha256 $state);
+      endpoint='stopped'; cad_ownership='free'; state=$current.state;
       cleanup=$cleanup
-    }
+    } | ConvertTo-Json -Depth 32 -Compress
   } catch {
     $primaryError = $_
     $failedOwner = $ownedTask

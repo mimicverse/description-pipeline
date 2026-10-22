@@ -10,10 +10,12 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import textwrap
@@ -24,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from cryptography.fernet import Fernet
+from description_pipeline.schemas import INSTALL_RECORD_SCHEMA
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
@@ -42,6 +45,46 @@ def write(path: Path, payload: str | bytes, mode: int = 0o600) -> Path:
     path.write_bytes(payload.encode() if isinstance(payload, str) else payload)
     path.chmod(mode)
     return path
+
+
+def install_record_fixture(state: Path, install_id: str, snapshot: Path) -> dict:
+    triple = {"version": "1.0.0", "source_commit": "a" * 40, "source_sha256": "b" * 64}
+    snapshot_sha = recovery.sha256_file(snapshot)
+    return {
+        "schema_version": INSTALL_RECORD_SCHEMA,
+        "install_id": install_id,
+        "timestamp": "2026-10-22T00:00:00Z",
+        "snapshot": {"path": str(snapshot), "digest": snapshot_sha, "install_id": install_id},
+        "release": {**triple, "artifacts": [{"name": "runtime.whl", "sha256": "c" * 64}]},
+        "services": ["description.service"],
+        "paths": {"state_root": str(state)},
+        "dag": {"id": "solidworks_to_urdf", "path": str(state / "dag.py"), "digest": "d" * 64, "tasks": 6},
+        "ends": {
+            "linux": {
+                "install_id": install_id,
+                "config_digest": snapshot_sha,
+                "release": {**triple, "role": "portable"},
+            },
+            "windows": {
+                "install_id": "win-" + "a" * 32,
+                "config_digest": "a" * 64,
+                "release": {**triple, "role": "native"},
+            },
+        },
+        "previous": None,
+        "journal": [],
+    }
+
+
+def journal_row_fixture(evidence: list[str]) -> dict:
+    return {
+        "seq": 1,
+        "verb": "promote",
+        "step": "promotion-receipt",
+        "status": "completed",
+        "at": "2026-10-22T00:00:00Z",
+        "evidence": evidence,
+    }
 
 
 def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
@@ -173,9 +216,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
             },
             "action": {
                 "execute": generation + "/runtime/Scripts/python.exe",
-                "arguments": '-I -B -m description_pipeline serve --config "'
-                + generation
-                + '/endpoint.json"',
+                "arguments": '-I -B -m description_pipeline serve --config "' + generation + '/endpoint.json"',
                 "working_directory": "C:/description/state",
             },
             "settings": {"multiple_instances": "IgnoreNew"},
@@ -470,7 +511,9 @@ if query:
             "extra": None,
         }
     elif "FROM platform.stage" in query:
-        payload = []
+        fixture = next((parent / "checkpoint-fixture.json" for parent in pathlib.Path(socket_dir).parents
+                        if (parent / "checkpoint-fixture.json").is_file()), None)
+        payload = json.loads(fixture.read_text()) if fixture is not None else []
     elif "'catalog'" not in query and "'database', current_database()" in query:
         payload = {
             "database": "airflow_meta",
@@ -542,6 +585,8 @@ args = sys.argv[1:]
 sys.path.insert(0, str(pathlib.Path(args[0]).resolve().parent))
 import recovery
 request = json.loads(pathlib.Path(args[args.index("--request") + 1]).read_text())
+reference_fixture = pathlib.Path(args[args.index("--request") + 1]).parents[2] / "checkpoint-fixture.json"
+references = json.loads(reference_fixture.read_text()) if reference_fixture.is_file() else []
 control = pathlib.Path(request["control_dir"])
 staging = pathlib.Path(request["staging"])
 
@@ -691,7 +736,6 @@ try:
             "roles_sha256": role_hash,
         },
     )
-    wait("inventory.complete.json")
     database = staging / "database"
     database.mkdir(parents=True)
     role_plan = {
@@ -728,14 +772,19 @@ try:
         },
     )
     write_json(database / "data-baseline.json", data)
-    write_json(database / "reference-index.json", [])
     write_json(control / "role-settings-before.json", role_plan)
     write_json(control / "sequence-before.json", [])
     write_json(
         control / "snapshot.ready.json",
-        {"status": "ready", "snapshot_id": "00000001-00000001-1"},
+        {"schema_version": recovery.SNAPSHOT_READY_SCHEMA,
+         "status": "ready", "snapshot_id": "00000001-00000001-1",
+         "checkpoint_refs": references, "checkpoint_refs_sha256": recovery._digest_document(references),
+         "database_bytes": 0},
     )
+    wait("inventory.complete.json")
     wait("files.complete.json")
+    write_json(database / "reference-index.json", recovery.checkpoint_index(references, staging / "state/runs"))
+    selection = json.loads((staging / "inventory/selection.json").read_text())
     (database / "airflow_meta.dump").write_bytes(b"fake custom dump")
     (database / "dump.toc").write_text("; fake toc\n", encoding="utf-8")
     write_json(database / "sequence-setval.json", [])
@@ -746,6 +795,7 @@ try:
     wait("inventory.after.complete.json")
     consistency = {
         "isolation": "REPEATABLE READ READ ONLY",
+        "closure": recovery.closure_binding(selection),
         "snapshot_id": "00000001-00000001-1",
         "snapshot_held_until_pg_dump_complete": True,
         "roles_snapshot_before_sha256": role_hash,
@@ -931,15 +981,11 @@ def runtime_wheel_payloads(source_sha: str = "b" * 64) -> dict[str, bytes]:
         "mimicverse_description-1.0.0.dist-info/METADATA": (
             b"Metadata-Version: 2.1\nName: mimicverse-description\nVersion: 1.0.0\n"
         ),
-        "apache_airflow-3.3.2.dist-info/METADATA": (
-            b"Metadata-Version: 2.1\nName: apache-airflow\nVersion: 3.3.2\n"
-        ),
+        "apache_airflow-3.3.2.dist-info/METADATA": (b"Metadata-Version: 2.1\nName: apache-airflow\nVersion: 3.3.2\n"),
     }
     record_lines = []
     for name, payload in payloads.items():
-        encoded = base64.urlsafe_b64encode(
-            hashlib.sha256(payload).digest()
-        ).rstrip(b"=").decode("ascii")
+        encoded = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode("ascii")
         record_lines.append(f"{name},sha256={encoded},{len(payload)}")
     record_name = "mimicverse_description-1.0.0.dist-info/RECORD"
     record_lines.append(f"{record_name},,")
@@ -973,9 +1019,7 @@ def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
     for name, payload in runtime_wheel_payloads(source_sha).items():
         target = site / name
         encoded = base64.b64encode(payload).decode("ascii")
-        lines.append(
-            f"printf '%s' '{encoded}' | base64 -d > {str(target)!r}"
-        )
+        lines.append(f"printf '%s' '{encoded}' | base64 -d > {str(target)!r}")
     lines.extend(
         [
             f"printf '%s' '# airflow' > {str(site / 'airflow' / '__init__.py')!r}",
@@ -1032,9 +1076,10 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
         )
         + "\n",
     )
-    write(state_root / "install-record.json", '{"install_id":"install-a"}\n')
-    write(state_root / "install-records" / "install-a.json", '{"install":"a"}\n')
-    write(state_root / "snapshots" / "install-a.json", '{"snapshot":"a"}\n')
+    snapshot = write(state_root / "snapshots" / "install-a.json", '{"snapshot":"a","install_id":"install-a"}\n')
+    record = install_record_fixture(state_root, "install-a", snapshot)
+    write(state_root / "install-record.json", json.dumps(record) + "\n")
+    write(state_root / "install-records" / "install-a.json", json.dumps(record) + "\n")
     write(state_root / "promotions" / "README", "empty history marker\n")
     write(state_root / "resolved.env", "OPERATOR_STATE=/fixture/state\n")
     write(state_root / "portal.json", '{"fixture":"portal"}\n')
@@ -1144,8 +1189,7 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
         "package_files": {
             name: hashlib.sha256(payload).hexdigest()
             for name, payload in runtime_wheel_payloads().items()
-            if name.startswith("description_pipeline/")
-            and name != "description_pipeline/tool-release.json"
+            if name.startswith("description_pipeline/") and name != "description_pipeline/tool-release.json"
         },
         "deployment_files": {
             "deploy/operator/recovery.py": hashlib.sha256(recovery_script).hexdigest(),
@@ -1254,11 +1298,280 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     return context
 
 
+class ArchiveMemberBindingTests(unittest.TestCase):
+    def test_duplicate_members_are_rejected_even_when_identical(self) -> None:
+        row = {
+            "member": "config/state.json",
+            "type": "file",
+            "bytes": 2,
+            "sha256": hashlib.sha256(b"{}").hexdigest(),
+            "mode": 0o600,
+        }
+        recovery.verify_tar_rows_against_manifest([row], [row])
+        for actual, expected in (([row, row], [row]), ([row], [row, row])):
+            with self.subTest(actual_count=len(actual), expected_count=len(expected)):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    recovery.verify_tar_rows_against_manifest(actual, expected)
+                self.assertEqual(raised.exception.code, "recovery_archive_member_mismatch")
+
+    def test_streaming_payload_verification_rejects_malformed_archives_without_extraction(self):
+        expected = {
+            "member": "payload",
+            "type": "file",
+            "bytes": 2,
+            "sha256": hashlib.sha256(b"{}").hexdigest(),
+            "mode": 0o600,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = write(root / "key", "test-stream-key")
+            for case in (
+                "valid",
+                "duplicate",
+                "traversal",
+                "symlink",
+                "fifo",
+                "wrong-mode",
+                "wrong-payload",
+                "truncated",
+            ):
+                with self.subTest(case=case):
+                    stream = io.BytesIO()
+                    with tarfile.open(fileobj=stream, mode="w") as tar:
+                        info = tarfile.TarInfo("../payload" if case == "traversal" else "payload")
+                        info.mode = 0o644 if case == "wrong-mode" else 0o600
+                        info.size = 2
+                        if case in {"symlink", "fifo"}:
+                            info.type = tarfile.SYMTYPE if case == "symlink" else tarfile.FIFOTYPE
+                            info.linkname = "outside"
+                            info.size = 0
+                        tar.addfile(info, io.BytesIO(b"[]" if case == "wrong-payload" else b"{}"))
+                        if case == "duplicate":
+                            tar.addfile(info, io.BytesIO(b"{}"))
+                    encrypted = subprocess.run(
+                        ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-pass", f"file:{key}"],
+                        input=stream.getvalue(),
+                        capture_output=True,
+                        check=True,
+                    ).stdout
+                    archive = write(root / "archive.enc", encrypted[:-32] if case == "truncated" else encrypted)
+                    with mock.patch.object(
+                        recovery.tempfile, "TemporaryDirectory", side_effect=AssertionError("no extraction")
+                    ):
+                        if case == "valid":
+                            result = recovery.verify_archive_member_binding(
+                                archive=archive,
+                                key=key,
+                                manifest_members=[expected],
+                                staged_source_members={"payload": expected},
+                                work_dir=root,
+                            )
+                            self.assertEqual(result["members"], 1)
+                        else:
+                            with self.assertRaises(recovery.RecoveryError):
+                                recovery.verify_archive_member_binding(
+                                    archive=archive,
+                                    key=key,
+                                    manifest_members=[expected],
+                                    staged_source_members={"payload": expected},
+                                    work_dir=root,
+                                )
+
+
+class RecoverySelectionTests(unittest.TestCase):
+    def reference(self, run="producer", parent=None, state="completed"):
+        return {
+            "run_id": run,
+            "stage": "capture",
+            "stage_state": state,
+            "request_id": "request-1",
+            "run_parent_run_id": parent,
+            "reused_from_run": parent,
+            "original_executed_at": "2026-10-22T00:00:00Z",
+            "checkpoint_uri": "store://sealed/producer/capture",
+            "receipt": {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "run_id": "producer",
+                "stage": "capture",
+                "state": "native_complete" if state == "completed" else state,
+                "passed": False,
+                "artifacts": [],
+            },
+        }
+
+    def test_multihop_reuse_resolves_one_physical_producer(self):
+        refs = [self.reference(), self.reference("child", "producer"), self.reference("grandchild", "child")]
+        self.assertEqual(set(recovery.checkpoint_origins(refs).values()), {"producer"})
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "runs"
+            tree = source / "sealed/producer/capture"
+            from description_pipeline.delivery import SUBJECT_DIRECTORIES, write_delivery_manifest
+            from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+            from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+            for name in SUBJECT_DIRECTORIES:
+                (tree / name).mkdir(parents=True, exist_ok=True)
+            write(tree / "tool.json", "{}")
+            manifest = write_delivery_manifest(
+                tree,
+                contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+                policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+            )
+            for ref in refs:
+                ref["receipt"]["artifacts"] = manifest["subject"]["files"]
+            write(source / "sealed/orphan/capture/large.bin", b"x" * 10000)
+            indexed = recovery.checkpoint_index(refs, source)
+            destination = Path(directory) / "copy"
+            recovery.copy_selected_root(source, destination, sorted({row["tree_relative"] for row in indexed}))
+            self.assertEqual(len(list(destination.rglob("tool.json"))), 1)
+            self.assertFalse((destination / "sealed/orphan").exists())
+            write(tree / "unregistered.bin", "unexpected")
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.checkpoint_index(refs, source)
+
+    def test_failed_checkpoint_is_preserved_but_cannot_be_reused(self):
+        failed = self.reference(state="failed")
+        self.assertEqual(recovery.checkpoint_origins([failed]), {("producer", "capture"): "producer"})
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.checkpoint_origins([failed, self.reference("child", "producer")])
+        changed = self.reference("child", "producer", "failed")
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.checkpoint_origins([self.reference(), changed])
+
+    def test_reuse_wrong_parent_receipt_uri_and_cycle_are_rejected(self):
+        cases = []
+        child = self.reference("child", "producer")
+        for field, value in (
+            ("run_parent_run_id", "other"),
+            ("receipt", {"changed": True}),
+            ("checkpoint_uri", "store://sealed/other/capture"),
+            ("original_executed_at", "changed"),
+        ):
+            cases.append([self.reference(), {**child, field: value}])
+        cases.append([self.reference("a", "b"), self.reference("b", "a")])
+        cases.append([child])
+        for refs in cases:
+            with self.subTest(refs=refs), self.assertRaises(recovery.RecoveryError):
+                recovery.checkpoint_origins(refs)
+
+    def test_journal_selection_keeps_only_typed_edges_and_replays_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "state"
+            snapshot = write(root / "snapshots/current.json", '{"install_id":"current"}')
+            write(root / "promotions/current/evidence.json", "{}")
+            write(root / "promotions/orphan/backup.tar.enc", b"x" * 10000)
+            record = install_record_fixture(root, "current", snapshot)
+            write(root / "install-record.json", json.dumps(record))
+            write(root / "derived/current/operator.env", "")
+            edges = recovery.journal_selection(root)
+            self.assertEqual({row["source_path"] for row in edges}, {str(snapshot)})
+            destination = Path(directory) / "archive/config/state"
+            recovery.copy_selected_root(
+                root, destination, ["install-record.json", "snapshots", "derived", "promotions/current/evidence.json"]
+            )
+            self.assertFalse((destination / "promotions/orphan").exists())
+            self.assertEqual(
+                recovery.journal_selection(root, extracted=Path(directory) / "archive", expected=edges), edges
+            )
+            snapshot.unlink()
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.journal_selection(root)
+
+    def test_old_schema_refused_before_status_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = write(
+                root / "recovery-manifest.json", '{"schema_version":"solidworks-to-urdf.recovery-manifest/v5"}'
+            )
+            write(root / "recovery-manifest.sha256", recovery.sha256_file(manifest))
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.restore_command(
+                    manifest_path=manifest, key=root / "key", target_plan_path=root / "plan", status_dir=root / "status"
+                )
+            self.assertEqual(raised.exception.code, "recovery_schema_unsupported")
+            self.assertFalse((root / "status").exists())
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.validate_target_plan({"schema_version": "solidworks-to-urdf.recovery-target/v2"}, {}, "a" * 64)
+        self.assertEqual(raised.exception.code, "recovery_schema_unsupported")
+
+    def test_journal_requires_canonical_record_and_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = write(root / "snapshots/current.json", '{"install_id":"current"}')
+            write(root / "derived/current/operator.env", "")
+            health = write(root / "promotions/current/health.json", "{}")
+            record = install_record_fixture(root, "current", snapshot)
+            record["journal"] = [journal_row_fixture([str(health)])]
+            write(root / "install-record.json", json.dumps(record))
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.journal_selection(root)
+            receipt = write(root / "promotions/current/receipt.json", '{"schema_version":"wrong"}')
+            record["journal"] = [journal_row_fixture([str(receipt)])]
+            write(root / "install-record.json", json.dumps(record))
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.journal_selection(root)
+            record["journal"] = []
+            del record["schema_version"]
+            write(root / "install-record.json", json.dumps(record))
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.journal_selection(root)
+
+    def test_snapshot_filename_must_match_install_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = write(root / "snapshots/wrong.json", '{"install_id":"current"}')
+            write(root / "derived/current/operator.env", "")
+            record = install_record_fixture(root, "current", snapshot)
+            write(root / "install-record.json", json.dumps(record))
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.journal_selection(root)
+            self.assertEqual(raised.exception.code, "recovery_journal_invalid")
+
+    def test_capacity_refuses_before_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(recovery.shutil, "disk_usage", return_value=type("Usage", (), {"free": 0})()):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    recovery.require_capacity([(Path(directory) / "new", 10)])
+                self.assertEqual(raised.exception.code, "recovery_capacity_insufficient")
+            self.assertFalse((Path(directory) / "new").exists())
+
+    def test_shell_rollback_missing_archive_has_no_following_side_effect(self):
+        source = (DEPLOY / "operatorctl.sh").read_text()
+        functions = "\n".join(
+            re.search(r"(?ms)^" + name + r"\(\) \{.*?^\}", source).group()
+            for name in ("require_rollback_archive", "config_reference_recorded")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / "receipt.json"
+            receipt.write_text(json.dumps({"steps": [{"verb": "promote", "step": "config-reference"}]}))
+            script = (
+                functions
+                + '\ndie() { echo "$*" >&2; exit 17; }\n'
+                + 'CONTROL_PYTHON="$1"\nrequire_rollback_archive "$2"\nprintf "side-effect" > "$2/mutated"\n'
+            )
+            result = subprocess.run(
+                ["bash", "-s", "--", sys.executable, str(root)], input=script, text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 17)
+            self.assertIn("recovery_history_unavailable", result.stderr)
+            self.assertFalse((root / "mutated").exists())
+
+    def test_windows_json_duplicate_keys_are_rejected(self):
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.strict_json_bytes(b'{"state":{"a":1,"a":2}}', "Windows reply")
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "recovery.zip"
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr(recovery.WINDOWS_STATE_MEMBER, '{"schema_version":1,"schema_version":2}')
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery._read_windows_state(bundle)
+            self.assertEqual(raised.exception.code, "windows_recovery_bundle_invalid")
+
+
 class WindowsAclPolicyTests(unittest.TestCase):
     def test_service_principal_must_be_distinct_and_present(self) -> None:
-        fixture = json.loads(
-            (REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text()
-        )
+        fixture = json.loads((REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text())
         leaf = copy.deepcopy(fixture["cases"][0]["leaf"])
         leaf["rules"] = [rule for rule in leaf["rules"] if rule["sid"] != fixture["service_sid"]]
         for service_sid in (fixture["service_sid"], "S-1-5-18", "S-1-5-32-544"):
@@ -1268,9 +1581,7 @@ class WindowsAclPolicyTests(unittest.TestCase):
                 )
 
     def test_shared_windows_acl_policy_projections(self) -> None:
-        fixture = json.loads(
-            (REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text()
-        )
+        fixture = json.loads((REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text())
         for case in fixture["cases"]:
             with self.subTest(case=case["name"]):
                 parent = copy.deepcopy(case["parent"])
@@ -1573,6 +1884,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 {
                     "schema_version": recovery.TARGET_SCHEMA,
                     "backup_manifest_sha256": manifest_sha,
+                    "closure": json.loads((self.root / "recovery/recovery-manifest.json").read_text())["closure"],
                     "mode": "exact_path",
                     "host_id": "target-host-fixture",
                     "postgres": {
@@ -1704,6 +2016,9 @@ class RecoveryControlFlowTests(unittest.TestCase):
     def test_backup_and_restore_control_flow(self) -> None:
         out, manifest = self.backup()
         self.assertEqual(manifest["schema_version"], recovery.MANIFEST_SCHEMA)
+        self.assertEqual(manifest["closure"], recovery.closure_binding(manifest["selection"]))
+        self.assertFalse(any(row["member"].startswith("state/runs/sealed/") for row in manifest["members"]))
+        self.assertFalse(any(row["member"].endswith("promotions/README") for row in manifest["members"]))
         self.assertEqual(manifest["database"]["bootstrap_role"], "solidworks")
         self.assertEqual(
             manifest["archive"]["sha256"],
@@ -1729,6 +2044,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             status_dir=status_dir,
         )
         self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["closure"], manifest["closure"])
         self.assertTrue((status_dir / "recovery-marker.json").is_file())
         self.assertEqual(
             (Path(roots["handoff_root"]) / "request.json").read_text(),
@@ -1781,6 +2097,166 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 verify_only=True,
             )
         self.assertEqual(restored_file.read_text(), "tampered\n")
+
+    def test_snapshot_reference_digest_mismatch_stops_before_copy(self):
+        interpreter = Path(self.context.derived_env["AIRFLOW_VENV"]) / "bin/python"
+        interpreter.write_text(
+            FAKE_SNAPSHOT_WORKER.replace(
+                '"checkpoint_refs_sha256": recovery._digest_document(references)', '"checkpoint_refs_sha256": "0" * 64'
+            )
+        )
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            self.backup()
+        self.assertEqual(raised.exception.code, "recovery_snapshot_worker_failed")
+        self.assertFalse((self.root / "recovery/backup/state/runs").exists())
+
+    def test_target_generator_derives_v3_from_v6_without_external_closure_override(self):
+        out, manifest = self.backup()
+        manifest_path = out / "recovery-manifest.json"
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
+        fixture_plan = json.loads(self.target_plan(recovery.sha256_file(manifest_path), roots).read_text())
+        generated = recovery.build_target_plan(
+            manifest,
+            recovery.sha256_file(manifest_path),
+            host_id="target-generation-fixture",
+            postgres=fixture_plan["postgres"],
+        )
+        self.assertEqual(generated["schema_version"], recovery.TARGET_SCHEMA)
+        self.assertEqual(generated["closure"], manifest["closure"])
+        self.assertEqual(generated["roots"], roots)
+        self.assertEqual(generated["windows"], recovery._windows_target_from_state(manifest["windows"]["state"]))
+        postgres = write(self.root / "target-postgres.json", json.dumps(fixture_plan["postgres"]))
+        target = self.root / "generated-target.json"
+        arguments = [
+            "target-plan",
+            "--manifest",
+            str(manifest_path),
+            "--host-id",
+            "generated-fixture",
+            "--postgres-config",
+            str(postgres),
+            "--out",
+            str(target),
+        ]
+        self.assertEqual(recovery.main(arguments), 0)
+        self.assertEqual(json.loads(target.read_text())["closure"], manifest["closure"])
+        original = target.read_bytes()
+        self.assertEqual(recovery.main(arguments), 1)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_manifest_rejects_extra_source_member_and_moved_state_scope(self):
+        _out, manifest = self.backup()
+        changed = copy.deepcopy(manifest)
+        changed["members"].append(
+            {
+                "member": "config/state/injected",
+                "type": "file",
+                "bytes": 0,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+                "mode": 0o600,
+                "required": True,
+                "class": "config",
+            }
+        )
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.validate_manifest(changed, expected_manifest_sha=None)
+        changed = copy.deepcopy(manifest)
+        scope = next(row for row in changed["selection"]["root_scopes"] if row["name"] == "install_records")
+        scope["path"] = str(self.root / "unrelated")
+        changed["closure"] = recovery.closure_binding(changed["selection"])
+        changed["consistency"]["closure"] = changed["closure"]
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.validate_manifest(changed, expected_manifest_sha=None)
+
+    def test_real_promotion_receipt_preserves_release_and_frozen_evidence(self):
+        import promotion
+
+        state = Path(self.context.resolved["storage"]["state_root"])
+        receipt_path = state / "promotions/install-a/receipt.json"
+        evidence = write(receipt_path.parent / "health.json", '{"passed":true}')
+        frozen = promotion.freeze_evidence([evidence], receipt_path.parent / "evidence-immutable", "promote", "verify")
+        source = state / "install-records/install-a.json"
+        target = state / "snapshots/install-a.json"
+        release = self.context.archive_root / "release.json"
+        document = {
+            "schema_version": "solidworks-to-urdf.promotion/v1",
+            "install_id": "install-a",
+            "plan": ["verify"],
+            "from": str(source),
+            "from_sha256": recovery.sha256_file(source),
+            "to": str(target),
+            "to_sha256": recovery.sha256_file(target),
+            "release_manifest": {"path": str(release), "sha256": recovery.sha256_file(release)},
+            "steps": [
+                {
+                    "seq": 1,
+                    "verb": "promote",
+                    "step": "verify",
+                    "status": "completed",
+                    "at": "2026-10-22T00:00:00Z",
+                    "evidence": [str(path) for path in frozen],
+                    "evidence_digests": [{"path": str(path), "sha256": recovery.sha256_file(path)} for path in frozen],
+                }
+            ],
+        }
+        write(receipt_path, json.dumps(document))
+        current = json.loads((state / "install-record.json").read_text())
+        current["journal"] = [journal_row_fixture([str(receipt_path)])]
+        write(state / "install-record.json", json.dumps(current))
+        out, manifest = self.backup()
+        sources = {row["source_path"] for row in manifest["selection"]["journal_entries"]}
+        self.assertTrue({str(release), str(evidence), str(receipt_path)} <= sources)
+        status = self.root / "journal-archive-check"
+        status.mkdir()
+        extracted, temporary = recovery.prepare_extraction(manifest, out / "recovery-manifest.json", self.key, status)
+        self.addCleanup(temporary.cleanup)
+        recovery.verify_selection_archive(manifest, extracted)
+
+    def test_failed_checkpoint_roundtrip_and_unreferenced_store_exclusion(self):
+        from description_pipeline.delivery import SUBJECT_DIRECTORIES, write_delivery_manifest
+        from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        tree = Path(self.context.resolved["derived"]["store_root"]) / "sealed/failed-run/discover"
+        for name in SUBJECT_DIRECTORIES:
+            (tree / name).mkdir(parents=True, exist_ok=True)
+        write(tree / "tool.json", "{}")
+        delivery = write_delivery_manifest(
+            tree,
+            contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
+            policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
+        )
+        reference = {
+            "run_id": "failed-run",
+            "stage": "discover",
+            "stage_state": "failed",
+            "request_id": "request-1",
+            "run_parent_run_id": None,
+            "reused_from_run": None,
+            "original_executed_at": None,
+            "checkpoint_uri": "store://sealed/failed-run/discover",
+            "receipt": {
+                "schema_version": "solidworks-to-urdf.bundle/v1",
+                "run_id": "failed-run",
+                "stage": "discover",
+                "state": "failed",
+                "passed": False,
+                "artifacts": delivery["subject"]["files"],
+            },
+        }
+        write(self.root / "checkpoint-fixture.json", json.dumps([reference]))
+        out, manifest = self.backup()
+        self.assertEqual(manifest["selection"]["checkpoint_refs"], [reference])
+        self.isolate_source()
+        manifest_path = out / "recovery-manifest.json"
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
+        plan = self.target_plan(recovery.sha256_file(manifest_path), roots)
+        result = recovery.restore_command(
+            manifest_path=manifest_path, key=self.key, target_plan_path=plan, status_dir=self.root / "failed-roundtrip"
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue((tree / "tool.json").is_file())
+        self.assertFalse((Path(roots["store_root"]) / "sealed/run-1").exists())
 
     def test_workspace_bundle_roundtrip_is_offline_and_verified(self) -> None:
         extracted, origin, manifest = self.workspace_bundle()
@@ -1863,13 +2339,18 @@ class RecoveryControlFlowTests(unittest.TestCase):
     def attribute_row(self, repository: Path) -> dict:
         head_symref, refs, symrefs = recovery._workspace_refs(repository)
         return {
-            "repository_slug": "owner/model", "path": str(repository),
+            "repository_slug": "owner/model",
+            "path": str(repository),
             "origin": recovery._git_output(repository, "remote", "get-url", "origin"),
             "head": recovery._git_output(repository, "rev-parse", "HEAD"),
             "tree": recovery._git_output(repository, "rev-parse", "HEAD^{tree}"),
-            "head_symref": head_symref, "refs": refs, "symrefs": symrefs,
-            "bases": ["main"], "status": "clean",
-            "bundle_member": "reconstruct/workspaces/fixture.bundle", "bundle_sha256": "0" * 64,
+            "head_symref": head_symref,
+            "refs": refs,
+            "symrefs": symrefs,
+            "bases": ["main"],
+            "status": "clean",
+            "bundle_member": "reconstruct/workspaces/fixture.bundle",
+            "bundle_sha256": "0" * 64,
         }
 
     def commit_attributes(self, repository: Path, attributes: str) -> dict:
@@ -2010,9 +2491,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 observed.append(arguments)
                 if len(observed) == 1:
                     self.assertFalse((target / "tracked.txt").exists())
-                    self.assertEqual(
-                        original(["git", "-C", str(target), "write-tree"], text=True).strip(), row["tree"]
-                    )
+                    self.assertEqual(original(["git", "-C", str(target), "write-tree"], text=True).strip(), row["tree"])
             return original(arguments, *args, **kwargs)
 
         with mock.patch.object(recovery.subprocess, "check_output", side_effect=git_234):
@@ -2127,11 +2606,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             with self.assertRaises(recovery.RecoveryError) as raised:
                 recovery._workspace_verify(repository, row)
             self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
-            clear = (
-                "--no-assume-unchanged"
-                if flag == "--assume-unchanged"
-                else "--no-skip-worktree"
-            )
+            clear = "--no-assume-unchanged" if flag == "--assume-unchanged" else "--no-skip-worktree"
             subprocess.run(
                 ["git", "-C", str(repository), "update-index", clear, "tracked.txt"],
                 check=True,
@@ -2170,18 +2645,10 @@ class RecoveryControlFlowTests(unittest.TestCase):
     def test_release_runtime_preflight_rejects_external_venv(self) -> None:
         release_root = self.root / "release-preflight"
         extracted = self.root / "release-preflight-extracted"
-        operator_env = (
-            extracted
-            / "config"
-            / "state"
-            / "derived"
-            / "install-a"
-            / "operator.env"
-        )
+        operator_env = extracted / "config" / "state" / "derived" / "install-a" / "operator.env"
         write(
             operator_env,
-            f"AIRFLOW_VENV={self.root / 'outside-venv'}\n"
-            f"AIRFLOW_HOME={self.root / 'airflow-home'}\n",
+            f"AIRFLOW_VENV={self.root / 'outside-venv'}\nAIRFLOW_HOME={self.root / 'airflow-home'}\n",
         )
         manifest = {
             "reconstructibles": {
@@ -2262,8 +2729,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     "package_files": {
                         name: hashlib.sha256(payload).hexdigest()
                         for name, payload in runtime_wheel_payloads().items()
-                        if name.startswith("description_pipeline/")
-                        and name != "description_pipeline/tool-release.json"
+                        if name.startswith("description_pipeline/") and name != "description_pipeline/tool-release.json"
                     },
                     "deployment_files": {
                         "deploy/operator/recovery.py": hashlib.sha256(recovery_script).hexdigest(),
@@ -2295,7 +2761,9 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 ],
             },
             "source_code": {
-                "commit": "a" * 40, "tree": "d" * 40, "worktree": "release-archive",
+                "commit": "a" * 40,
+                "tree": "d" * 40,
+                "worktree": "release-archive",
                 "script_sha256": hashlib.sha256(recovery_script).hexdigest(),
             },
             "maintenance": {"receipt": {"identity": {"install_id": "install-a"}}},
@@ -2321,8 +2789,9 @@ class RecoveryControlFlowTests(unittest.TestCase):
         for field in ("tree", "script_sha256"):
             saved = manifest["source_code"][field]
             manifest["source_code"][field] = "0" * len(saved)
-            with self.subTest(field=field), self.assertRaisesRegex(
-                recovery.RecoveryError, "archived source tree differs"
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(recovery.RecoveryError, "archived source tree differs"),
             ):
                 recovery.rehydrate_release_runtime(
                     manifest=manifest,
@@ -2333,12 +2802,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 )
             manifest["source_code"][field] = saved
         installed_package = (
-            release_root
-            / "airflow-venv"
-            / "lib"
-            / "python3.12"
-            / "site-packages"
-            / "description_pipeline"
+            release_root / "airflow-venv" / "lib" / "python3.12" / "site-packages" / "description_pipeline"
         )
         write(installed_package / "__init__.py", "fake\n", mode=0o644)
         with self.assertRaises(recovery.RecoveryError) as raised:
@@ -2376,9 +2840,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 status_dir=status_dir,
             )
         self.assertEqual(raised.exception.code, "recovery_manifest_hash_mismatch")
-        receipt = json.loads((status_dir / "receipt.json").read_text())
-        self.assertEqual(receipt["status"], "failed")
-        self.assertEqual(receipt["phase"], "preflight")
+        self.assertFalse(status_dir.exists())
         self.assertFalse(Path(roots["handoff_root"]).exists())
 
     def test_nonempty_target_is_refused_before_database_restore(self) -> None:
@@ -3177,9 +3639,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
     def test_windows_state_accepts_inherited_runtime_leaf_acls(self) -> None:
         _out, manifest = self.backup()
-        fixture = json.loads(
-            (REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text()
-        )
+        fixture = json.loads((REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text())
         leaf = copy.deepcopy(next(case for case in fixture["cases"] if case["name"] == "runtime_inherited")["leaf"])
         leaf["projection_sha256"] = recovery._windows_acl_projection_sha256(leaf)
         for role in ("cad_ownership", "cad_lease"):
@@ -3190,13 +3650,22 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     ledger = b'{"schema_version":"solidworks-to-urdf.cad-ownership/v1","records":[]}'
                     ledger_sha = hashlib.sha256(ledger).hexdigest()
                     state["cad"].update(ledger_present=True, ownership_sha256=ledger_sha)
-                    state["files"].append({
-                        "role": role, "path": state["cad"]["ownership_path"],
-                        "member": "cad-ownership.json", "bytes": len(ledger), "sha256": ledger_sha,
-                    })
-                    state["members"].append({
-                        "member": "cad-ownership.json", "bytes": len(ledger), "sha256": ledger_sha,
-                    })
+                    state["files"].append(
+                        {
+                            "role": role,
+                            "path": state["cad"]["ownership_path"],
+                            "member": "cad-ownership.json",
+                            "bytes": len(ledger),
+                            "sha256": ledger_sha,
+                        }
+                    )
+                    state["members"].append(
+                        {
+                            "member": "cad-ownership.json",
+                            "bytes": len(ledger),
+                            "sha256": ledger_sha,
+                        }
+                    )
                 validated = recovery._validate_windows_recovery_state(state)
                 self.assertFalse(validated["acl"][role]["protected"])
 
@@ -3204,12 +3673,8 @@ class RecoveryControlFlowTests(unittest.TestCase):
         _out, manifest = self.backup()
         state = copy.deepcopy(manifest["windows"]["state"])
         endpoint_root = state["identity"]["endpoint_root"]
-        state["identity"][
-            "runtime_launch_contract"
-        ] = recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT
-        state["identity"][
-            "release_identity_sha256"
-        ] = recovery.WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256
+        state["identity"]["runtime_launch_contract"] = recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT
+        state["identity"]["release_identity_sha256"] = recovery.WINDOWS_LEGACY_RELEASE_IDENTITY_SHA256
         state["task"]["action"] = {
             "execute": endpoint_root + "/runtime/Scripts/description.exe",
             "arguments": 'serve --config "' + endpoint_root + '/endpoint.json"',
@@ -3223,26 +3688,18 @@ class RecoveryControlFlowTests(unittest.TestCase):
         previous_contract_format = copy.deepcopy(state)
         previous_contract_format["identity"].pop("runtime_launch_contract")
         before_digest = recovery._digest_document(previous_contract_format)
-        validated = recovery._validate_windows_recovery_state(
-            previous_contract_format
-        )
+        validated = recovery._validate_windows_recovery_state(previous_contract_format)
         self.assertEqual(recovery._digest_document(validated), before_digest)
 
     def test_windows_state_accepts_only_the_exact_bytecode_transition_action(self) -> None:
         _out, manifest = self.backup()
         state = copy.deepcopy(manifest["windows"]["state"])
         endpoint_root = state["identity"]["endpoint_root"]
-        state["identity"][
-            "release_identity_sha256"
-        ] = recovery.WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
-        state["identity"][
-            "runtime_launch_contract"
-        ] = recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT
+        state["identity"]["release_identity_sha256"] = recovery.WINDOWS_BYTECODE_TRANSITION_RELEASE_IDENTITY_SHA256
+        state["identity"]["runtime_launch_contract"] = recovery.WINDOWS_PYTHON_LAUNCH_CONTRACT
         state["task"]["action"] = {
             "execute": endpoint_root + "/runtime/Scripts/python.exe",
-            "arguments": '-I -m description_pipeline serve --config "'
-            + endpoint_root
-            + '/endpoint.json"',
+            "arguments": '-I -m description_pipeline serve --config "' + endpoint_root + '/endpoint.json"',
             "working_directory": state["identity"]["state_root"],
         }
         validated = recovery._validate_windows_recovery_state(state)
@@ -3270,9 +3727,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
         def remove_required_acl_rule(state):
             projection = state["acl"]["endpoint_token"]
-            projection["rules"] = [
-                rule for rule in projection["rules"] if rule["sid"] != "S-1-5-32-544"
-            ]
+            projection["rules"] = [rule for rule in projection["rules"] if rule["sid"] != "S-1-5-32-544"]
             projection["projection_sha256"] = recovery._windows_acl_projection_sha256(projection)
 
         def move_marker(state):
@@ -3292,16 +3747,12 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ),
             (
                 "operator_runtime_mismatch",
-                lambda state: state["identity"].update(
-                    operator_sid="S-1-5-21-2"
-                ),
+                lambda state: state["identity"].update(operator_sid="S-1-5-21-2"),
                 "windows_recovery_state_invalid",
             ),
             (
                 "runtime_qualification",
-                lambda state: state["identity"].update(
-                    runtime_privilege_qualification="least-privilege"
-                ),
+                lambda state: state["identity"].update(runtime_privilege_qualification="least-privilege"),
                 "windows_recovery_state_invalid",
             ),
             (
@@ -3322,23 +3773,16 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ),
             (
                 "legacy_contract_with_python_action",
-                lambda state: state["identity"].update(
-                    runtime_launch_contract=recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT
-                ),
+                lambda state: state["identity"].update(runtime_launch_contract=recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT),
                 "windows_recovery_state_invalid",
             ),
             (
                 "legacy_contract_wrong_release",
                 lambda state: (
-                    state["identity"].update(
-                        runtime_launch_contract=recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT
-                    ),
+                    state["identity"].update(runtime_launch_contract=recovery.WINDOWS_LEGACY_LAUNCH_CONTRACT),
                     state["task"]["action"].update(
-                        execute=state["identity"]["endpoint_root"]
-                        + "/runtime/Scripts/description.exe",
-                        arguments='serve --config "'
-                        + state["identity"]["endpoint_root"]
-                        + '/endpoint.json"',
+                        execute=state["identity"]["endpoint_root"] + "/runtime/Scripts/description.exe",
+                        arguments='serve --config "' + state["identity"]["endpoint_root"] + '/endpoint.json"',
                     ),
                 ),
                 "windows_recovery_state_invalid",
@@ -3358,32 +3802,25 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ),
             (
                 "explicit_null_contract",
-                lambda state: state["identity"].update(
-                    runtime_launch_contract=None
-                ),
+                lambda state: state["identity"].update(runtime_launch_contract=None),
                 "windows_recovery_state_invalid",
             ),
             (
                 "unsupported_contract",
-                lambda state: state["identity"].update(
-                    runtime_launch_contract="foreign_launcher_v1"
-                ),
+                lambda state: state["identity"].update(runtime_launch_contract="foreign_launcher_v1"),
                 "windows_recovery_state_invalid",
             ),
             (
                 "legacy_description_launcher",
                 lambda state: state["task"]["action"].update(
-                    execute=state["identity"]["endpoint_root"]
-                    + "/runtime/Scripts/description.exe"
+                    execute=state["identity"]["endpoint_root"] + "/runtime/Scripts/description.exe"
                 ),
                 "windows_recovery_state_invalid",
             ),
             (
                 "legacy_serve_arguments",
                 lambda state: state["task"]["action"].update(
-                    arguments='serve --config "'
-                    + state["identity"]["endpoint_root"]
-                    + '/endpoint.json"'
+                    arguments='serve --config "' + state["identity"]["endpoint_root"] + '/endpoint.json"'
                 ),
                 "windows_recovery_state_invalid",
             ),
@@ -3441,9 +3878,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ),
             (
                 "token_in_state_root",
-                lambda state: state["identity"].update(
-                    token_path=state["identity"]["state_root"] + "/token"
-                ),
+                lambda state: state["identity"].update(token_path=state["identity"]["state_root"] + "/token"),
                 "windows_recovery_state_invalid",
             ),
             (
@@ -3486,7 +3921,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     "task_state": "Running",
                     "endpoint": "stopped",
                     "cad_ownership": "free",
-                    "state_sha256": manifest["windows"]["state_sha256"],
+                    "state": manifest["windows"]["state"],
                     "remote_cleanup": {
                         "attempted": True,
                         "passed": True,
@@ -3510,6 +3945,53 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 commands=[],
             )
         self.assertEqual(raised.exception.code, "windows_recovery_verification_failed")
+
+    def test_windows_restore_hashes_actual_state_and_rejects_missing_or_changed_state(self) -> None:
+        out, manifest = self.backup()
+        manifest_path = out / "recovery-manifest.json"
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
+        plan = json.loads(self.target_plan(recovery.sha256_file(manifest_path), roots).read_text())
+        status_dir = self.root / "windows-canonical"
+        status_dir.mkdir()
+        extracted, temporary = recovery.prepare_extraction(manifest, manifest_path, self.key, status_dir)
+        self.addCleanup(temporary.cleanup)
+        actual = json.loads(
+            json.dumps(manifest["windows"]["state"]), object_pairs_hook=lambda pairs: dict(reversed(pairs))
+        )
+        response = {
+            "passed": True,
+            "task_state": "Disabled",
+            "endpoint": "stopped",
+            "cad_ownership": "free",
+            "state": actual,
+            "remote_cleanup": {"attempted": True, "passed": True, "remote_dir": "C:/recovery/test"},
+            "cleanup": {"attempted": True, "passed": True, "path": "C:/Temp/test"},
+        }
+        with mock.patch.object(recovery, "_transfer_windows_recovery", return_value=response):
+            result = self.real_restore_windows_recovery(
+                manifest=manifest, plan=plan, extracted=extracted, status_dir=status_dir, verify_only=True, commands=[]
+            )
+        self.assertEqual(result["state_sha256"], recovery._digest_document(actual))
+        changed = copy.deepcopy(actual)
+        changed["ssh_host"] = "changed-authority"
+        for state in (None, changed):
+            with (
+                self.subTest(state=state is None),
+                mock.patch.object(
+                    recovery,
+                    "_transfer_windows_recovery",
+                    return_value={**response, "state": state, "state_sha256": manifest["windows"]["state_sha256"]},
+                ),
+                self.assertRaises(recovery.RecoveryError),
+            ):
+                self.real_restore_windows_recovery(
+                    manifest=manifest,
+                    plan=plan,
+                    extracted=extracted,
+                    status_dir=status_dir,
+                    verify_only=True,
+                    commands=[],
+                )
 
     def test_windows_bundle_refuses_an_extra_member(self) -> None:
         _out, manifest = self.backup()
@@ -3575,9 +4057,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             "attempted": True,
             "passed": False,
             "remote_dir": "C:/description/state/recovery/snapshot/windows-fixture",
-            "ownership_marker": (
-                "C:/description/state/recovery/snapshot/windows-fixture/.recovery-owner"
-            ),
+            "ownership_marker": ("C:/description/state/recovery/snapshot/windows-fixture/.recovery-owner"),
             "code": "windows_recovery_transport_unknown",
             "message": "fixture cleanup failed",
             "detail": {"stderr_sha256": "0" * 64},
@@ -3658,10 +4138,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             for row in state["files"]:
                 if row["role"] == "endpoint_token":
                     row["sha256"] = "0" * 64
-            payloads = {
-                name: source.read(name)
-                for name in source.namelist()
-            }
+            payloads = {name: source.read(name) for name in source.namelist()}
         payloads[recovery.WINDOWS_STATE_MEMBER] = json.dumps(
             state,
             sort_keys=True,
@@ -4258,7 +4735,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 target_plan_path=plan,
                 status_dir=self.root / "status-member",
             )
-        self.assertEqual(raised.exception.code, "recovery_archive_member_mismatch")
+        self.assertEqual(raised.exception.code, "recovery_staged_source_mismatch")
 
     def test_relocated_mode_is_refused(self) -> None:
         out, manifest = self.backup()
