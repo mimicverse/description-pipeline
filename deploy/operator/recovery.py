@@ -2545,8 +2545,20 @@ def verify_checkpoint_tree(
         allowed_dirs = set(SUBJECT_DIRECTORIES) | {"reports"}
         for path in expected_files:
             allowed_dirs.update(parent.as_posix() for parent in Path(path).parents if parent != Path("."))
+        directories_with_files = {
+            parent.as_posix()
+            for row in files
+            if row["type"] == "file"
+            for parent in Path(row["path"]).parents
+            if parent != Path(".")
+        }
+        empty_dirs = {
+            row["path"] for row in files if row["type"] == "directory" and row["path"] not in directories_with_files
+        }
         require(
-            all(row["path"] in allowed_dirs for row in files if row["type"] == "directory"),
+            all(
+                row["path"] in allowed_dirs or row["path"] in empty_dirs for row in files if row["type"] == "directory"
+            ),
             "recovery_member_hash_mismatch",
             "checkpoint contains an unregistered directory",
         )
