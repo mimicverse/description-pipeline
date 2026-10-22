@@ -33,6 +33,7 @@ from . import support
 
 from description_pipeline.geometry.stl import read as read_stl
 from description_pipeline.sources.solidworks.errors import CadError
+from description_pipeline.sources.solidworks.freeze import _raw_scene_payload
 from description_pipeline.sources.solidworks.isolation import CadSession
 from description_pipeline.sources.solidworks.jsonio import read_json, write_json
 from description_pipeline.sources.solidworks.native import (
@@ -2581,6 +2582,165 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertEqual(backend.lookups[:2], [str(assembly), str(assembly)])
             self.assertTrue(backend.save_flag_docs)
             self.assertIs(backend.save_flag_docs[0], refreshed)
+
+    def test_collect_scene_success_persists_production_rebuild_preparation(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            left_path = _write(root, "left.SLDPRT")
+            right_path = _write(root, "right.SLDPRT")
+            subassembly_path = _write(root, "arm-stack.SLDASM")
+            assembly_path = _write(root, "robot.SLDASM")
+
+            class SaveTrackingDocument(_Doc):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.save_calls = 0
+
+                def GetSaveFlag(self):
+                    return False
+
+                def Save(self):
+                    self.save_calls += 1
+                    return True
+
+            class RebuildTrackingExtension:
+                def __init__(self, extension, calls):
+                    self._extension = extension
+                    self._calls = calls
+
+                @property
+                def NeedsRebuild2(self):
+                    return self._extension.NeedsRebuild2
+
+                def Rebuild(self, options):
+                    self._calls.append(options)
+                    return self._extension.Rebuild(options)
+
+            left_document = SaveTrackingDocument(left_path, doc_type=1)
+            right_document = SaveTrackingDocument(right_path, doc_type=1)
+            left = _Component("left-1", left_path, doc=left_document)
+            right = _Component("right-1", right_path, doc=right_document)
+            subassembly_document = SaveTrackingDocument(
+                subassembly_path,
+                doc_type=2,
+                children=[left, right],
+            )
+            subassembly = _Component(
+                "arm-stack-1",
+                subassembly_path,
+                children=[left, right],
+                doc=subassembly_document,
+            )
+            first = SaveTrackingDocument(
+                assembly_path,
+                doc_type=2,
+                children=[subassembly],
+                needs_rebuild2=1,
+            )
+            refreshed = SaveTrackingDocument(
+                assembly_path,
+                doc_type=2,
+                children=[subassembly],
+            )
+            rebuild_calls = []
+            first.Extension = RebuildTrackingExtension(first.Extension, rebuild_calls)
+            documents = {
+                str(left_path): left_document,
+                str(right_path): right_document,
+                str(subassembly_path): subassembly_document,
+                str(assembly_path): first,
+            }
+
+            class ProductionRebuildBackend(_CaptureBackend):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.lookups = []
+                    self._capture_roots = [normalize_document_path(os.path.abspath(str(root)))]
+
+                def _rebuild_capture_copy(self, doc, path):
+                    return SolidWorksBackend._rebuild_capture_copy(self, doc, path)
+
+                def _document_by_path(self, path):
+                    self._app_for_path(path)
+                    self.lookups.append(str(path))
+                    if str(path) == str(assembly_path):
+                        return (
+                            first
+                            if self.lookups.count(str(assembly_path)) == 1
+                            else refreshed
+                        )
+                    return documents[str(path)]
+
+            backend = ProductionRebuildBackend(
+                session_factory=lambda: _Session(
+                    _App(
+                        {
+                            assembly_path: first,
+                            subassembly_path: subassembly_document,
+                            left_path: left_document,
+                            right_path: right_document,
+                        }
+                    )
+                )
+            )
+            source_documents = (
+                assembly_path,
+                subassembly_path,
+                left_path,
+                right_path,
+            )
+            hashes_before = {
+                path: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in source_documents
+            }
+
+            scene = backend.collect_scene(str(assembly_path), [])
+
+            hashes_after = {
+                path: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in source_documents
+            }
+            preparation = scene.notes["capture_preparation"]
+            raw = _raw_scene_payload(
+                scene,
+                {"assembly": str(assembly_path)},
+                root,
+            )
+            raw_path = root / "raw" / "scene_raw.json"
+            raw_path.parent.mkdir()
+            write_json(raw_path, raw)
+            persisted = read_json(raw_path)
+
+            self.assertEqual({component.name for component in scene.components}, {"left-1", "right-1"})
+            self.assertEqual(rebuild_calls, [2])
+            self.assertEqual(backend.lookups[:2], [str(assembly_path), str(assembly_path)])
+            self.assertTrue(preparation["rebuild_performed"])
+            self.assertIs(preparation["saved_to_disk"], False)
+            self.assertEqual(
+                preparation["source_sha256_before"],
+                hashes_before[assembly_path],
+            )
+            self.assertEqual(
+                preparation["source_sha256_after"],
+                hashes_before[assembly_path],
+            )
+            self.assertEqual(hashes_after, hashes_before)
+            self.assertEqual(
+                persisted["notes"]["capture_preparation"],
+                preparation,
+            )
+            self.assertTrue(
+                all(
+                    document.save_calls == 0
+                    for document in (
+                        first,
+                        refreshed,
+                        subassembly_document,
+                        left_document,
+                        right_document,
+                    )
+                )
+            )
 
     def test_collect_scene_enforces_read_only_on_the_refreshed_handle(self):
         with TemporaryDirectory() as tmp, _com_stubs():
