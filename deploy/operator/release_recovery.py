@@ -637,7 +637,7 @@ def finalize(args) -> int:
     if (
         not isinstance(windows_identity, dict)
         or not isinstance(windows_identity.get("install_id"), str)
-        or not windows_identity["install_id"]
+        or re.fullmatch(r"win-[0-9a-f]{32}", windows_identity["install_id"]) is None
         or not isinstance(windows_identity.get("config_digest"), str)
         or not HEX64.fullmatch(windows_identity["config_digest"])
         or windows_identity.get("release") != {**identity, "role": "native"}
