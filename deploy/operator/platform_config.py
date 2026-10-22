@@ -91,6 +91,10 @@ def require(condition: bool, message: str) -> None:
         die(message)
 
 
+def valid_install_id(value: object) -> bool:
+    return isinstance(value, str) and _INSTALL_ID.fullmatch(value) is not None
+
+
 def require_keys(mapping, *, allowed: set[str], required: set[str], where: str) -> None:
     require(isinstance(mapping, dict), f"{where} must be an object")
     unknown = sorted(set(mapping) - allowed)
@@ -406,7 +410,7 @@ def snapshot_digest(snapshot: dict, owner) -> str:
 
 
 def build_snapshot(resolved: dict, *, platform_json_sha256: str, install_id: str, generated_at: str) -> dict:
-    require(bool(_INSTALL_ID.match(install_id)), f"install_id is malformed: {install_id!r}")
+    require(valid_install_id(install_id), "install_id is malformed")
     require(bool(_RFC3339_UTC.match(generated_at)), f"generated_at must be RFC3339 UTC: {generated_at!r}")
     require(bool(_HEX64.match(platform_json_sha256)), "platform_json_sha256 must be lowercase sha256 hex")
     return {
@@ -481,6 +485,8 @@ def load_document(path: Path) -> tuple[bytes, object]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="platform_config.py", description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="action", required=True)
+    validate_install = subparsers.add_parser("validate-install-id")
+    validate_install.add_argument("--install-id", required=True)
     for action in ("validate", "render", "resolve"):
         subparser = subparsers.add_parser(action)
         subparser.add_argument("--config", type=Path, required=True, help="path to the private platform.json")
@@ -490,6 +496,11 @@ def main(argv: list[str] | None = None) -> int:
             subparser.add_argument("--wheel", type=Path, default=None, help="release wheel carrying the contract owner")
             subparser.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
     args = parser.parse_args(argv)
+
+    if args.action == "validate-install-id":
+        require(valid_install_id(args.install_id), "install_id is malformed")
+        print(args.install_id)
+        return 0
 
     raw, document = load_document(args.config)
     resolved = validate_platform(document)

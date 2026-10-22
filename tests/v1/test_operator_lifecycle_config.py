@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 CONTROL = OPERATOR / "operatorctl.sh"
 HEREDOC_REDIRECT = re.compile(
-    r"(?<!<)<<(?!<)-?\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|\"([A-Za-z_][A-Za-z0-9_]*)\"|([A-Za-z_][A-Za-z0-9_]*))"
+    r"(?<!<)<<(?!<)-?\s*(?:'[^'\n]+'|\"[^\"\n]+\"|[A-Za-z0-9_][A-Za-z0-9_.:+/-]*)"
 )
 
 ALL_VERBS = (
@@ -184,6 +184,261 @@ class OperatorctlSurfaceTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("not installed", result.stderr)
 
+    def test_mutating_verbs_reject_source_config_replacement_during_lock(self):
+        state = self.root / "state"
+        state.mkdir()
+        marker = self.root / "identity-loaded"
+        (state / "resolved.env").write_text(
+            f"touch {marker}\n",
+            encoding="utf-8",
+        )
+        original = self.config.read_bytes()
+        replacement_document = platform_document(self.root)
+        replacement_document["database"]["dsn_file"] = str(
+            self.root / "secrets" / "replacement.dsn"
+        )
+        replacement_document["windows"]["ssh_host"] = "replacement-windows"
+        replacement = self.root / "replacement-platform.json"
+        replacement.write_text(
+            json.dumps(replacement_document),
+            encoding="utf-8",
+        )
+
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        flock = bindir / "flock"
+        flock.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'cp -- "$FIXTURE_REPLACEMENT" "$FIXTURE_REPLACEMENT_NEXT"\n'
+            'mv -f -- "$FIXTURE_REPLACEMENT_NEXT" "$FIXTURE_SOURCE"\n'
+            'exec /usr/bin/flock "$@"\n',
+            encoding="utf-8",
+        )
+        flock.chmod(0o755)
+        temporary_root = self.root / "tmp"
+        temporary_root.mkdir()
+        environment = {
+            "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "TMPDIR": str(temporary_root),
+            "FIXTURE_REPLACEMENT": str(replacement),
+            "FIXTURE_REPLACEMENT_NEXT": str(self.root / "replacement.next"),
+            "FIXTURE_SOURCE": str(self.config),
+        }
+        for verb in ("drain", "stop", "reconcile", "stage", "promote", "rollback"):
+            with self.subTest(verb=verb):
+                self.config.write_bytes(original)
+                marker.unlink(missing_ok=True)
+                result = run(
+                    [verb, "--config", str(self.config)],
+                    env=environment,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    1,
+                    result.stdout + result.stderr,
+                )
+                self.assertIn(
+                    "configuration changed while acquiring the maintenance lock",
+                    result.stderr,
+                )
+                self.assertFalse(
+                    marker.exists(),
+                    "identity was read before the changed configuration was refused",
+                )
+                self.assertEqual(list(temporary_root.iterdir()), [])
+
+    def test_mutating_verbs_fail_before_identity_when_the_lock_is_held(self):
+        state = self.root / "state"
+        lock_dir = state / "locks"
+        lock_dir.mkdir(parents=True)
+        marker = self.root / "identity-loaded"
+        (state / "resolved.env").write_text(
+            f"touch {marker}\n",
+            encoding="utf-8",
+        )
+        lock_path = lock_dir / "maintenance.lock"
+        lock_path.write_text("held by fixture\n", encoding="utf-8")
+        temporary_root = self.root / "tmp"
+        temporary_root.mkdir()
+        with lock_path.open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for verb in ("drain", "stop", "reconcile", "stage", "promote", "rollback"):
+                with self.subTest(verb=verb):
+                    marker.unlink(missing_ok=True)
+                    result = run(
+                        [verb, "--config", str(self.config)],
+                        env={"TMPDIR": str(temporary_root)},
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        1,
+                        result.stdout + result.stderr,
+                    )
+                    self.assertIn(
+                        "another supported lifecycle operation owns the maintenance lock",
+                        result.stderr,
+                    )
+                    self.assertFalse(
+                        marker.exists(),
+                        "identity or side effects ran after the lock refusal",
+                    )
+                    for path in (
+                        state / "promotions",
+                        state / "backups",
+                        state / "health-gate",
+                    ):
+                        self.assertFalse(path.exists())
+                    self.assertEqual(list(temporary_root.iterdir()), [])
+
+    def test_source_change_after_lock_check_never_switches_the_snapshot(self):
+        state = self.root / "state"
+        state.mkdir()
+        venv = self.root / "venv"
+        (venv / "bin").mkdir(parents=True)
+        fake_python = venv / "bin" / "python"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'install_id=gen-1\\n'\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        (state / "resolved.env").write_text(
+            f"AIRFLOW_HOME={self.root / 'airflow'}\n"
+            f"AIRFLOW_VENV={venv}\n"
+            f"OPERATOR_STATE={state}\n",
+            encoding="utf-8",
+        )
+        (state / "derived" / "gen-1").mkdir(parents=True)
+        (state / "derived" / "gen-1" / "operator.env").write_text(
+            "",
+            encoding="utf-8",
+        )
+
+        switched_state = self.root / "switched-state"
+        switched_state.mkdir()
+        switched_marker = self.root / "switched-state-loaded"
+        (switched_state / "resolved.env").write_text(
+            f"touch {switched_marker}\n",
+            encoding="utf-8",
+        )
+        replacement_document = platform_document(self.root)
+        replacement_document["storage"]["state_root"] = str(switched_state)
+        replacement = self.root / "replacement-platform.json"
+        replacement.write_text(
+            json.dumps(replacement_document),
+            encoding="utf-8",
+        )
+
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        counter = self.root / "cmp-count"
+        cmp_stub = bindir / "cmp"
+        cmp_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "/usr/bin/cmp \"$@\"\n"
+            "count=\"$(cat \"$FIXTURE_COUNTER\" 2>/dev/null || printf '0')\"\n"
+            "count=$((count + 1))\n"
+            "printf '%s\\n' \"$count\" > \"$FIXTURE_COUNTER\"\n"
+            "if [ \"$count\" -eq 2 ]; then\n"
+            '  cp -- "$FIXTURE_REPLACEMENT" "$FIXTURE_REPLACEMENT_NEXT"\n'
+            '  mv -f -- "$FIXTURE_REPLACEMENT_NEXT" "$FIXTURE_SOURCE"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        cmp_stub.chmod(0o755)
+        temporary_root = self.root / "tmp"
+        temporary_root.mkdir()
+        result = run(
+            [
+                "stage",
+                "--config",
+                str(self.config),
+                "--install-id",
+                "gen-2",
+            ],
+            env={
+                "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "TMPDIR": str(temporary_root),
+                "FIXTURE_COUNTER": str(counter),
+                "FIXTURE_REPLACEMENT": str(replacement),
+                "FIXTURE_REPLACEMENT_NEXT": str(self.root / "replacement.next"),
+                "FIXTURE_SOURCE": str(self.config),
+            },
+        )
+        self.assertNotIn(
+            "configuration changed while acquiring the maintenance lock",
+            result.stderr,
+        )
+        self.assertFalse(
+            switched_marker.exists(),
+            "the operator switched to the configuration's replacement state root",
+        )
+        self.assertEqual(list(temporary_root.iterdir()), [])
+
+    def test_escape_install_id_is_refused_before_promotion_paths(self):
+        escape_name = f"escape-{self.root.name}"
+        state_root = self.root / "state"
+        actual_escape = state_root / escape_name
+        actual_escape.mkdir(parents=True)
+        sentinel = actual_escape / "sentinel"
+        sentinel.write_text("preserve\n", encoding="utf-8")
+        outside_state = self.root / "outside-state-sentinel"
+        outside_state.write_text("outside\n", encoding="utf-8")
+        malicious_values = (f"../{escape_name}", "bad\nid", "bad\tid", "bad/id")
+        for malicious in malicious_values:
+            for verb in ("stage", "promote", "rollback", "reconcile"):
+                with self.subTest(verb=verb, malicious=repr(malicious)):
+                    result = run(
+                        [
+                            verb,
+                            "--config",
+                            str(self.config),
+                            "--install-id",
+                            malicious,
+                        ]
+                    )
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("install-id is malformed", result.stderr)
+                    self.assertNotIn("bad", result.stderr)
+                    self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+                    self.assertEqual(
+                        outside_state.read_text(encoding="utf-8"),
+                        "outside\n",
+                    )
+        promotion = subprocess.run(
+            [
+                sys.executable,
+                str(OPERATOR / "promotion.py"),
+                "show",
+                "--state-root",
+                str(self.root / "state"),
+                "--install-id",
+                f"../{escape_name}",
+            ],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        )
+        self.assertEqual(promotion.returncode, 1, promotion.stdout + promotion.stderr)
+        self.assertIn("install_id is malformed", promotion.stderr)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+        self.assertEqual(
+            outside_state.read_text(encoding="utf-8"),
+            "outside\n",
+        )
+
+    def test_install_id_rule_has_one_canonical_owner(self):
+        owners = []
+        for path in OPERATOR.glob("*.py"):
+            if "_INSTALL_ID = re.compile" in path.read_text(encoding="utf-8"):
+                owners.append(path.name)
+        self.assertEqual(owners, ["platform_config.py"])
+        for name in ("install_record.py", "platform_env.py", "promotion.py"):
+            source = (OPERATOR / name).read_text(encoding="utf-8")
+            self.assertIn("valid_install_id", source)
+
     def test_keep_database_is_a_stop_only_maintenance_switch(self):
         accepted = run(
             [
@@ -251,6 +506,10 @@ class OperatorctlSurfaceTests(unittest.TestCase):
         self.assertNotIn("input=script", transport)
         self.assertNotIn("endpoint.token", resume)
         self.assertNotIn("password", resume.lower())
+        self.assertIn(
+            'stamp="$(date -u +%Y%m%dT%H%M%S%NZ)-$$-$RANDOM"',
+            resume,
+        )
 
     def test_rollback_status_is_a_read_only_existing_generation_probe(self):
         source = CONTROL.read_text(encoding="utf-8")
@@ -279,7 +538,7 @@ class OperatorctlSurfaceTests(unittest.TestCase):
             for candidate in lines[index:]:
                 if "<<" in candidate:
                     has_here_document = True
-                if ')"' in candidate:
+                if ")" in candidate:
                     self.assertFalse(
                         has_here_document,
                         f"here-document command substitution starts at line {index + 1}",
@@ -312,6 +571,8 @@ result="$(
             "cat <<EOF\nvalue\nEOF\n",
             "cat <<'EOF'\nvalue\nEOF\n",
             'cat <<"EOF"\nvalue\nEOF\n',
+            "cat <<'END MARK'\nvalue\nEND MARK\n",
+            "cat <<123\nvalue\n123\n",
             "cat <<-EOF\n\tvalue\n\tEOF\n",
         ):
             with self.subTest(body=body):
@@ -329,7 +590,10 @@ result="$(
         )
         self.assertNotIn('"$@"', executable_helper)
         self.assertEqual(source.count("> \"$archive_probe\" <<'PY'"), 2)
-        self.assertEqual(source.count('windows_transport 60 < "$archive_probe"'), 2)
+        self.assertEqual(
+            source.count('windows_transport 60 "$output.transport.json" < "$archive_probe"'),
+            2,
+        )
         for name in (
             "generation_env_declared_value",
             "airflow_record_dag",
@@ -355,9 +619,23 @@ result="$(
             '      > "$RECEIPT_DIR/windows-promote.path"',
             source,
         )
-        self.assertEqual(
-            source.count('2> "$EVIDENCE_DIR/windows-health.path.stderr" || WINDOWS_HEALTH_STATUS=$?'),
-            2,
+        self.assertIn(
+            '2> "$EVIDENCE_DIR/windows-health-promote-verify.path.stderr"',
+            source,
+        )
+        self.assertIn(
+            '2> "$EVIDENCE_DIR/windows-health-rollback-verify.path.stderr"',
+            source,
+        )
+        self.assertIn(
+            'read_output_path "$EVIDENCE_DIR/windows-health-promote-verify.path" WINDOWS_HEALTH \\\n'
+            '            || WINDOWS_HEALTH_STATUS=2',
+            source,
+        )
+        self.assertIn(
+            'read_output_path "$EVIDENCE_DIR/windows-health-rollback-verify.path" WINDOWS_HEALTH \\\n'
+            '            || WINDOWS_HEALTH_STATUS=2',
+            source,
         )
         self.assertIn(
             'WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \\\n'
@@ -380,15 +658,18 @@ result="$(
             'promotion_step "$CANDIDATE_ID" promote windows-switch failed '
             '"$RECEIPT_DIR/windows-promote.out" "$RECEIPT_DIR/windows-promote.path"',
             'promotion_step "$CANDIDATE_ID" promote endpoint-identity failed '
-            '"$RECEIPT_DIR/windows-health.out" "$RECEIPT_DIR/windows-health.path"',
+            '"$RECEIPT_DIR/windows-health-endpoint-identity.out" '
+            '"$RECEIPT_DIR/windows-health-endpoint-identity.path"',
             'promotion_step "$CANDIDATE_ID" promote endpoint-identity unknown '
-            '"$RECEIPT_DIR/windows-health.out" "$RECEIPT_DIR/windows-health.path"',
+            '"$RECEIPT_DIR/windows-health-endpoint-identity.out" '
+            '"$RECEIPT_DIR/windows-health-endpoint-identity.path"',
             'promotion_step "$CANDIDATE_ID" promote verify failed '
-            '"$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health.path" '
-            '"$RECEIPT_DIR/windows-health.out"',
+            '"$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health-promote-verify.path" '
+            '"$RECEIPT_DIR/windows-health-promote-verify.out"',
             'promotion_step "$CANDIDATE_ID" promote verify completed '
-            '"$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health.path" '
-            '"$EVIDENCE_DIR/final-health.json" "$RECEIPT_DIR/windows-health.out"',
+            '"$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health-promote-verify.path" '
+            '"$EVIDENCE_DIR/final-health.json" '
+            '"$RECEIPT_DIR/windows-health-promote-verify.out"',
             'promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown '
             '"$RECEIPT_DIR/windows-status.out" "$RECEIPT_DIR/windows-status.path"',
             'promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown '
@@ -396,13 +677,20 @@ result="$(
             'promotion_step "$ROLLBACK_ID" rollback rollback-windows failed '
             '"$RECEIPT_DIR/windows-rollback.out" "$RECEIPT_DIR/windows-rollback.path"',
             'promotion_step "$ROLLBACK_ID" rollback rollback-verify failed '
-            '"$EVIDENCE_DIR/rollback-verify.out" "$EVIDENCE_DIR/windows-health.path" '
+            '"$EVIDENCE_DIR/rollback-verify.out" '
+            '"$EVIDENCE_DIR/windows-health-rollback-verify.path" '
             '"$EVIDENCE_DIR/rollback-health.json" '
-            '"$OPERATOR_STATE/promotions/$ACTIVE_ID/windows-health.out"',
+            '"$EVIDENCE_DIR/windows-health-rollback-verify-$ROLLBACK_ID.out"',
+            'promotion_step "$ROLLBACK_ID" rollback rollback-verify unknown '
+            '"$EVIDENCE_DIR/rollback-verify.out" '
+            '"$EVIDENCE_DIR/windows-health-rollback-verify.path" '
+            '"$EVIDENCE_DIR/rollback-health.json" '
+            '"$EVIDENCE_DIR/windows-health-rollback-verify-$ROLLBACK_ID.out"',
             'promotion_step "$ROLLBACK_ID" rollback rollback-verify completed '
-            '"$EVIDENCE_DIR/rollback-verify.out" "$EVIDENCE_DIR/windows-health.path" '
+            '"$EVIDENCE_DIR/rollback-verify.out" '
+            '"$EVIDENCE_DIR/windows-health-rollback-verify.path" '
             '"$EVIDENCE_DIR/rollback-health.json" '
-            '"$OPERATOR_STATE/promotions/$ACTIVE_ID/windows-health.out"',
+            '"$EVIDENCE_DIR/windows-health-rollback-verify-$ROLLBACK_ID.out"',
         ):
             with self.subTest(call=call):
                 self.assertIn(call, normalized)
@@ -411,8 +699,11 @@ result="$(
             "$RECEIPT_DIR/windows-stage.path",
             "$RECEIPT_DIR/windows-promote.out",
             "$RECEIPT_DIR/windows-promote.path",
-            "$RECEIPT_DIR/windows-health.out",
-            "$RECEIPT_DIR/windows-health.path",
+            "$RECEIPT_DIR/windows-health-endpoint-identity.out",
+            "$RECEIPT_DIR/windows-health-endpoint-identity.path",
+            "$RECEIPT_DIR/windows-health-promote-verify.out",
+            "$EVIDENCE_DIR/windows-health-promote-verify.path",
+            "$EVIDENCE_DIR/windows-health-rollback-verify.path",
             "$RECEIPT_DIR/windows-status.out",
             "$RECEIPT_DIR/windows-status.path",
             "$RECEIPT_DIR/windows-rollback.out",
@@ -429,7 +720,7 @@ result="$(
             1,
         )
         self.assertEqual(
-            source.count('2> "$RECEIPT_DIR/windows-health.path.stderr"'),
+            source.count('2> "$RECEIPT_DIR/windows-health-endpoint-identity.path.stderr"'),
             1,
         )
         self.assertEqual(
@@ -444,7 +735,11 @@ result="$(
     def test_start_refuses_while_the_shared_maintenance_lock_is_held(self):
         state_root = self.root / "state"
         state_root.mkdir()
-        (state_root / "resolved.env").write_text("", encoding="utf-8")
+        marker = self.root / "start-env-loaded"
+        (state_root / "resolved.env").write_text(
+            f"touch {marker}\n",
+            encoding="utf-8",
+        )
         lock_dir = state_root / "locks"
         lock_dir.mkdir()
         lock_path = lock_dir / "maintenance.lock"
@@ -469,6 +764,7 @@ result="$(
             "another supported lifecycle operation owns the maintenance lock",
             result.stderr,
         )
+        self.assertFalse(marker.exists())
 
     def test_inherited_lock_requires_the_actual_held_file_descriptor(self):
         state_root = self.root / "state"

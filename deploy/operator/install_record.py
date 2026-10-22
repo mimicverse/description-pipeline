@@ -38,6 +38,7 @@ from platform_config import (  # noqa: E402  (single owners)
     atomic_write_once,
     extract_contract_closure,
     load_contract_owner,
+    valid_install_id,
 )
 
 INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
@@ -50,7 +51,6 @@ DAG_TASK_COUNT = 6
 _COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_INSTALL_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _RFC3339_UTC = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z")
 
 
@@ -236,6 +236,7 @@ def _verify_generation(config_path: Path | None, state_root: Path) -> dict:
         record = interface_records.validate_install_record(json.loads(record_path.read_text(encoding="utf-8")))
     except Exception as error:
         die(f"install record invalid: {error}")
+    require(valid_install_id(record.get("install_id")), "install record install_id is malformed")
     snapshot_path = Path(record["snapshot"]["path"])
     require(snapshot_path.is_file(), f"snapshot missing: {snapshot_path}")
     snapshot_bytes = snapshot_path.read_bytes()
@@ -330,7 +331,7 @@ def build_install_record(
     carries the switch steps already taken; both are written once, at the pointer switch.
     """
 
-    require(bool(_INSTALL_ID.match(install_id)), f"install_id is malformed: {install_id!r}")
+    require(valid_install_id(install_id), "install_id is malformed")
     require(bool(_RFC3339_UTC.match(timestamp)), f"timestamp must be RFC3339 UTC: {timestamp!r}")
     require(
         isinstance(services, list)

@@ -151,6 +151,8 @@ bash deploy/operator/operatorctl.sh health --config /srv/description/platform.js
 
 示例中的路径和安装标识须替换为本次发行的实际值。端点健康原件来自已认证的真实 Windows `/health`，须与本次 `release.json` 校验一致；不能手写身份、沿用旧端点收据或使用开发分支资产。安装使用同一发行目录中的 wheel 和清单；状态根、数据库端口和其他运行路径从当前平台配置及其受管安装记录解析，不从历史运行或个人目录猜测。
 
+`promotion receipt` 是 `stage` 的接受边界。receipt 创建前的 snapshot、derived 和运行准备写入属于未引用隔离产物，不自动清理且不得复用；一旦产生任一类预接受隔离产物，失败后必须使用新的 generation ID。只有 receipt 及其不可变证据完整落盘后，候选才对后续 `promote` 生效。
+
 `validate` 只检查静态配置，不验证发行文件、实际端点身份或运行健康。发行资产须单独核验；`install_record.py endpoint-identity` 将真实端点健康原件与发行清单交叉验证，`install` 再核验绑定输入，并在关闭准入的状态下安装锁定运行环境、渲染服务、初始化数据库及校验 DAG；不能改变正在运行的安装。`start` 先验证两端身份、服务及配置，再开启任务准入。数据库、内部服务和隧道不对用户暴露端口。
 
 需要在服务启动后完成对账或维护验收时，使用 `start --keep-admission-closed --config /srv/description/platform.json`。它执行相同启动检查，但全程保持准入关闭，成功结果明确区分“服务已启动”和“准入已开放”。完成规范对账并通过结算门后，再执行普通 `start` 重验并开闸；不得手工改状态或先开闸再关闭。该选项不能用于其他生命周期命令。
