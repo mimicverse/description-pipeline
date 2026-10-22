@@ -4689,7 +4689,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 target_plan_path=plan,
                 status_dir=self.root / "status-member",
             )
-        self.assertEqual(raised.exception.code, "recovery_archive_member_mismatch")
+        self.assertEqual(raised.exception.code, "recovery_staged_source_mismatch")
 
     def test_relocated_mode_is_refused(self) -> None:
         out, manifest = self.backup()
