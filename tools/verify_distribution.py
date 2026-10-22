@@ -9,6 +9,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -124,6 +125,11 @@ def verify_release(directory, identity):
         raise PipelineError("Release assets differ from release.json")
     if {key: value for key, value in release.items() if key != "artifacts"} != identity:
         raise PipelineError("Release manifest does not bind the wheel source identity")
+    if (
+        not isinstance(identity.get("source_tree"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", identity["source_tree"]) is None
+    ):
+        raise PipelineError("Release manifest source_tree is malformed")
     domain = release_domain_identity()
     if identity.get("contract") != domain["contract"]:
         raise PipelineError("Release manifest does not bind the live schema/stage/policy digests")

@@ -52,6 +52,7 @@ def write_release(root: Path, *wheels: Path) -> dict:
         "pipeline_id": "solidworks-to-urdf",
         "version": "1.4.0",
         "source_commit": "c" * 40,
+        "source_tree": "d" * 40,
         "source_sha256": "a" * 64,
         "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in wheels},
     }

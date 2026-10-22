@@ -91,6 +91,8 @@ def release_identity(document) -> dict:
     version = _text(document["version"], "release.json version")
     commit = _text(document["source_commit"], "release.json source_commit")
     require(bool(_COMMIT.match(commit)), f"release.json source_commit is malformed: {commit!r}")
+    tree = _text(document.get("source_tree"), "release.json source_tree")
+    require(bool(_COMMIT.fullmatch(tree)), "release.json source_tree is malformed")
     source_sha = _hex64(document["source_sha256"], "release.json source_sha256")
     artifacts = document["artifacts"]
     require(isinstance(artifacts, dict) and bool(artifacts), "release.json artifacts must be a non-empty object")

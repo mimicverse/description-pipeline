@@ -925,7 +925,7 @@ def runtime_wheel_payloads(source_sha: str = "b" * 64) -> dict[str, bytes]:
     payloads = {
         "description_pipeline/__init__.py": b'VERSION = "1.0.0-test"',
         "description_pipeline/tool-release.json": json.dumps(
-            {"source_sha256": source_sha, "version": "1.0.0"},
+            {"source_sha256": source_sha, "version": "1.0.0", "source_commit": "a" * 40, "source_tree": "d" * 40},
             separators=(",", ":"),
         ).encode(),
         "mimicverse_description-1.0.0.dist-info/METADATA": (
@@ -1110,18 +1110,25 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     linux_path.chmod(0o600)
     deployment_name = "description-1.0.0-test-deployment.zip"
     deployment_path = release_root / deployment_name
+    recovery_script = Path(recovery.__file__).read_bytes()
     installer = runtime_installer(release_root / ("airflow-venv-" + install_id))
     linux_lock = b"linux-lock\n"
     windows_lock = b"windows-lock\n"
     with zipfile.ZipFile(deployment_path, "w") as archive:
+        archive.writestr("deploy/operator/recovery.py", recovery_script)
         archive.writestr("deploy/airflow/install.sh", installer)
         archive.writestr("requirements/linux-py312.lock", linux_lock)
         archive.writestr("requirements/windows-py312.lock", windows_lock)
+    write(release_root / "deploy/airflow/install.sh", installer, mode=0o755)
+    write(release_root / "deploy/operator/recovery.py", recovery_script, mode=0o755)
+    write(release_root / "requirements/linux-py312.lock", linux_lock)
+    write(release_root / "requirements/windows-py312.lock", windows_lock)
     deployment_path.chmod(0o600)
     release_document = {
         "schema_version": "solidworks-to-urdf.release/v1",
         "version": "1.0.0",
         "source_commit": "a" * 40,
+        "source_tree": "d" * 40,
         "source_sha256": "b" * 64,
         "artifacts": [
             {
@@ -1141,6 +1148,7 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
             and name != "description_pipeline/tool-release.json"
         },
         "deployment_files": {
+            "deploy/operator/recovery.py": hashlib.sha256(recovery_script).hexdigest(),
             "deploy/airflow/install.sh": hashlib.sha256(installer.encode()).hexdigest(),
             "requirements/linux-py312.lock": hashlib.sha256(linux_lock).hexdigest(),
             "requirements/windows-py312.lock": hashlib.sha256(windows_lock).hexdigest(),
@@ -1208,6 +1216,8 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
             "source_sha256": release_document["source_sha256"],
             "artifacts": release_document["artifacts"],
         },
+        archive_root=release_root,
+        archive_document=release_document,
         derived_env={
             "POSTGRES_ROOT": str(postgres_root),
             "POSTGRES_MAJOR": "14",
@@ -1222,9 +1232,9 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
             "repositories": [],
         },
         source_code={
-            "commit": "c" * 40,
+            "commit": "a" * 40,
             "tree": "d" * 40,
-            "worktree": "clean",
+            "worktree": "release-archive",
         },
         host_id="source-host-fixture",
         postgres_root=postgres_root,
@@ -1356,6 +1366,23 @@ class RecoveryControlFlowTests(unittest.TestCase):
         manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
         self.windows_target = recovery._windows_target_from_state(manifest["windows"]["state"])
         return out, manifest
+
+    def test_snapshot_reads_non_git_archive_not_runtime_root(self) -> None:
+        runtime = Path(self.context.resolved["storage"]["release_root"])
+        archive = self.root / "release-archive"
+        archive.mkdir()
+        names = ["release.json", *(row["name"] for row in self.context.release_document["artifacts"])]
+        names.extend(self.context.archive_document["deployment_files"])
+        for name in names:
+            (archive / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(runtime / name), archive / name)
+        self.context.archive_root = archive
+        self.assertFalse((archive / ".git").exists())
+        self.assertFalse((runtime / "release.json").exists())
+        _, manifest = self.backup()
+        self.assertEqual(manifest["source_code"]["worktree"], "release-archive")
+        self.assertEqual(manifest["reconstructibles"]["release_root"]["path"], str(runtime))
+        self.assertFalse((runtime / "release.json").exists())
 
     def test_bounded_stdout_kills_writer_at_limit(self) -> None:
         script = write(
@@ -2004,10 +2031,12 @@ class RecoveryControlFlowTests(unittest.TestCase):
             archive.writestr(f"wheels/{wheel_path.name}", wheel_bytes)
             archive.writestr("requirements.lock", lock_bytes)
         deployment_zip = release_files / "artifacts" / "description-1.0.0-test-deployment.zip"
+        recovery_script = Path(recovery.__file__).read_bytes()
         installer = runtime_installer(release_root / "airflow-venv")
         linux_lock = b"linux-lock\n"
         windows_lock = b"windows-lock\n"
         with zipfile.ZipFile(deployment_zip, "w") as archive:
+            archive.writestr("deploy/operator/recovery.py", recovery_script)
             archive.writestr("deploy/airflow/install.sh", installer)
             archive.writestr("requirements/linux-py312.lock", linux_lock)
             archive.writestr("requirements/windows-py312.lock", windows_lock)
@@ -2018,6 +2047,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     "schema_version": "solidworks-to-urdf.release/v1",
                     "version": "1.0.0",
                     "source_commit": "a" * 40,
+                    "source_tree": "d" * 40,
                     "source_sha256": "b" * 64,
                     "package_files": {
                         name: hashlib.sha256(payload).hexdigest()
@@ -2026,6 +2056,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                         and name != "description_pipeline/tool-release.json"
                     },
                     "deployment_files": {
+                        "deploy/operator/recovery.py": hashlib.sha256(recovery_script).hexdigest(),
                         "deploy/airflow/install.sh": hashlib.sha256(installer.encode()).hexdigest(),
                         "requirements/linux-py312.lock": hashlib.sha256(linux_lock).hexdigest(),
                         "requirements/windows-py312.lock": hashlib.sha256(windows_lock).hexdigest(),
@@ -2053,6 +2084,10 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     )
                 ],
             },
+            "source_code": {
+                "commit": "a" * 40, "tree": "d" * 40, "worktree": "release-archive",
+                "script_sha256": hashlib.sha256(recovery_script).hexdigest(),
+            },
             "maintenance": {"receipt": {"identity": {"install_id": "install-a"}}},
             "members": [],
         }
@@ -2073,6 +2108,20 @@ class RecoveryControlFlowTests(unittest.TestCase):
             verify_only=True,
         )
         self.assertEqual(verified["identity"]["version"], "1.0.0")
+        for field in ("tree", "script_sha256"):
+            saved = manifest["source_code"][field]
+            manifest["source_code"][field] = "0" * len(saved)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                recovery.RecoveryError, "archived source tree differs"
+            ):
+                recovery.rehydrate_release_runtime(
+                    manifest=manifest,
+                    plan={"roots": {"release_root": str(release_root)}},
+                    extracted=extracted,
+                    status_dir=status_dir,
+                    verify_only=True,
+                )
+            manifest["source_code"][field] = saved
         installed_package = (
             release_root
             / "airflow-venv"
