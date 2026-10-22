@@ -68,7 +68,14 @@ function Get-AclProjection([string]$path) {
         inheritance=[int]$_.InheritanceFlags
         propagation=[int]$_.PropagationFlags
       }
-    } | Sort-Object sid, rights, access_type, inheritance, propagation, inherited)
+    } | Sort-Object -Property @(
+        { $_.sid },
+        { $_.rights },
+        { $_.access_type },
+        { $_.inheritance },
+        { $_.propagation },
+        { $_.inherited }
+      ))
   return [ordered]@{
     owner_sid=Resolve-Sid ([string]$acl.Owner)
     group_sid=Resolve-Sid ([string]$acl.Group)
