@@ -1319,5 +1319,45 @@ $outer = Invoke-Outer 'promote_source_mismatch'
 Check 'outer.promote_source_mismatch' (($outer.message -match 'candidate_source_mismatch') -and
   (@($outer.calls).Count -eq 0))
 
+# The actual exception boundary runs in a child process so exit semantics are not mocked.
+$exceptionHarness = Join-Path $PSScriptRoot 'lifecycle-exception-harness.ps1'
+$exceptionCases = @('stage', 'promote', 'rollback', 'recovery-snapshot', 'noisy', 'paths',
+  'fallback', 'sensitive', 'die', 'die-unknown')
+if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+  $exceptionCases += @('set', 'assert')
+}
+foreach ($scenario in $exceptionCases) {
+  $errorFile = Join-Path ([System.IO.Path]::GetTempPath()) ('il-error-' + [guid]::NewGuid().ToString('N'))
+  $lines = @(& $pwshExe -NoProfile -File $exceptionHarness -ScriptPath $ScriptPath `
+    -Scenario $scenario -Root $PSScriptRoot 2> $errorFile)
+  $rc = $LASTEXITCODE
+  $result = ($lines | Select-Object -Last 1) | ConvertFrom-Json
+  $expectedRc = if ($scenario -in @('promote', 'rollback', 'recovery-snapshot', 'die-unknown')) { 2 } else { 1 }
+  Check ('exception.' + $scenario + '.exit') ($rc -eq $expectedRc)
+  Check ('exception.' + $scenario + '.refused') ($result.passed -eq $false)
+  Check ('exception.' + $scenario + '.single_json') (@($lines | Where-Object { $_ -match '^\{' }).Count -eq 1)
+  if ($scenario -eq 'die') {
+    Check 'exception.die_preserved' ($result.code -eq 'original_refusal')
+  } elseif ($scenario -eq 'die-unknown') {
+    Check 'exception.unknown_preserved' ($result.code -eq 'original_unknown')
+  } else {
+    Check ('exception.' + $scenario + '.code') ($result.code -eq 'instance_lifecycle_exception')
+  }
+  if ($scenario -in @('set', 'assert')) {
+    Check ('exception.' + $scenario + '.context') ($result.role -eq 'endpoint_config' -and
+      $result.operation -eq $scenario -and $result.path -eq '[path]' -and
+      $result.path_sha256 -match '^[0-9a-f]{64}$' -and $null -ne $result.base_hresult)
+  }
+  if ($scenario -eq 'stage') {
+    Check 'exception.base_preserved' ($result.base_exception_type -eq 'System.IO.IOException' -and
+      $result.base_hresult -eq -2146232800 -and $result.error_id -and $result.line -gt 0)
+  }
+  if ($scenario -in @('sensitive', 'paths')) {
+    Check 'exception.secret_redacted' (($lines -join '') -notmatch 'SECRET_' -and
+      [System.Text.Encoding]::UTF8.GetByteCount($result.message) -le 512 -and $result.message_redacted)
+  }
+  Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host ("checks={0} failures={1}" -f $script:checks, $script:failures.Count)
 exit ([int]($script:failures.Count -gt 0))

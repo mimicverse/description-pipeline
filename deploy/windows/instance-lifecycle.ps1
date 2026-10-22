@@ -36,6 +36,89 @@ param(
 )
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
+$script:LifecyclePhase = 'dispatch'
+
+function Protect-LifecycleDiagnostic([string]$Text, [int]$Limit = 512, [bool]$HidePaths = $true) {
+  # Redact before bounding so truncation cannot expose a credential prefix.
+  $safe = $Text -replace '(?i)(bearer\s+)[^\s,;]+', '$1[redacted]'
+  $safe = $safe -replace '(?i)(["'']?(?:token|password|pwd|secret|authorization)["'']?\s*[=:]\s*)(?:"[^"]*"|''[^'']*''|[^,;\r\n]+)', '$1[redacted]'
+  $safe = $safe -replace '(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+:[^\s/@]+@', '$1[redacted]@'
+  if ($HidePaths) {
+    $safe = $safe -replace '(?i)(?:FileSystem::|file://|\\\\)[^\r\n"''<>]*', '[path]'
+    $safe = $safe -replace '(?i)(?:[A-Z]:[\\/]|/)[^\s"''<>]*', '[path]'
+  }
+  $safe = $safe -replace '[\x00-\x1f\x7f]', ' '
+  if ($safe.Length -gt $Limit) { $safe = $safe.Substring(0, $Limit) }
+  while ([System.Text.Encoding]::UTF8.GetByteCount($safe) -gt $Limit) {
+    $safe = $safe.Substring(0, $safe.Length - 1)
+  }
+  return $safe
+}
+function Get-LifecycleTextSha256([string]$Text) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString($sha.ComputeHash(
+      [System.Text.Encoding]::UTF8.GetBytes($Text))) -replace '-', '').ToLowerInvariant()
+  } finally { $sha.Dispose() }
+}
+function Add-LifecycleErrorContext($Record, [string]$Role, [string]$Operation, [string]$Path) {
+  # Annotate, then bare-rethrow at the caller: retain the original ErrorRecord/HResult.
+  try {
+    foreach ($pair in @(@('role', $Role), @('operation', $Operation), @('path', $Path))) {
+      if (-not $Record.Exception.Data.Contains('lifecycle_' + $pair[0])) {
+        $Record.Exception.Data['lifecycle_' + $pair[0]] = $pair[1]
+      }
+    }
+  } catch { } # Diagnostic annotation must never replace the primary exception.
+}
+function Write-LifecycleException($Record) {
+  try {
+    $base = $Record.Exception.GetBaseException()
+    $rawMessage = [string]$Record.Exception.Message
+    $redactedMessage = Protect-LifecycleDiagnostic $rawMessage ([int]::MaxValue)
+    $message = Protect-LifecycleDiagnostic $rawMessage
+    $path = [string]$Record.Exception.Data['lifecycle_path']
+    $payload = [ordered]@{
+      passed=$false; code='instance_lifecycle_exception'; verb=[string]$Script:Verb
+      phase=(Protect-LifecycleDiagnostic $script:LifecyclePhase 64)
+      exception_type=(Protect-LifecycleDiagnostic $Record.Exception.GetType().FullName 160 $false)
+      message=$message; message_redacted=($redactedMessage -cne $rawMessage)
+      message_truncated=($message -cne $redactedMessage)
+      message_bytes=[System.Text.Encoding]::UTF8.GetByteCount($message)
+      message_sha256=(Get-LifecycleTextSha256 $redactedMessage)
+      hresult=[int]$Record.Exception.HResult
+      base_exception_type=(Protect-LifecycleDiagnostic $base.GetType().FullName 160 $false)
+      base_hresult=[int]$base.HResult
+      error_id=(Protect-LifecycleDiagnostic ([string]$Record.FullyQualifiedErrorId) 160)
+      error_id_sha256=(Get-LifecycleTextSha256 (
+        Protect-LifecycleDiagnostic ([string]$Record.FullyQualifiedErrorId) ([int]::MaxValue)))
+      category=[string]$Record.CategoryInfo.Category
+      line=[int]$Record.InvocationInfo.ScriptLineNumber
+      script_stack_sha256=(Get-LifecycleTextSha256 ([string]$Record.ScriptStackTrace))
+      exception_stack_sha256=(Get-LifecycleTextSha256 ([string]$Record.Exception.StackTrace))
+      path=$(if ($path) { '[path]' } else { '' })
+      path_sha256=$(if ($path) { Get-LifecycleTextSha256 $path } else { '' })
+    }
+    foreach ($name in @('role', 'operation')) {
+      $payload[$name] = Protect-LifecycleDiagnostic ([string]$Record.Exception.Data['lifecycle_' + $name])
+    }
+    [Console]::Out.WriteLine(($payload | ConvertTo-Json -Depth 4 -Compress))
+  } catch {
+    # No dependency on the serializer or a failed evidence sink in the final fallback.
+    $verb = if ($Script:Verb -in @('stage','promote','rollback','health','status',
+        'recovery-snapshot','recovery-restore','recovery-verify','resume')) { $Script:Verb } else { 'unknown' }
+    [Console]::Out.WriteLine('{"passed":false,"code":"instance_lifecycle_exception","verb":"' +
+      $verb + '","message":"Exception diagnostics unavailable"}')
+  }
+}
+function Invoke-LifecycleMain {
+  try { Invoke-Main } catch {
+    Write-LifecycleException $_
+    # Stage cannot switch the active task. Other verbs may already have side effects.
+    if ($Script:Verb -eq 'stage') { exit 1 }
+    exit 2
+  }
+}
 
 function Emit([hashtable]$payload) {
   $payload | ConvertTo-Json -Depth 8 -Compress
@@ -1472,6 +1555,7 @@ function Set-ManagedEndpointAcls(
   [string]$TaskFile = '') {
   $serviceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
+    try {
     if (-not (Test-Path -LiteralPath $row.path)) {
       if ($row.required) {
         Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
@@ -1480,6 +1564,10 @@ function Set-ManagedEndpointAcls(
     }
     Set-ManagedAcl $row.path $true $serviceSid `
       -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
+    } catch {
+      Add-LifecycleErrorContext $_ ([string]$row.role) 'set' ([string]$row.path)
+      throw
+    }
   }
 }
 function Assert-ManagedEndpointAcls(
@@ -1490,6 +1578,7 @@ function Assert-ManagedEndpointAcls(
   [string]$TaskFile = '') {
   $serviceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   foreach ($row in @(Get-ManagedEndpointAclRows $Config $EndpointRoot $ConfigPath $InstallIdPath $TaskFile)) {
+    try {
     if (-not (Test-Path -LiteralPath $row.path)) {
       if ($row.required) {
         Die 'windows_managed_acl_missing' ('a managed endpoint path is missing: ' + $row.path)
@@ -1501,6 +1590,10 @@ function Assert-ManagedEndpointAcls(
     } else {
       Assert-ManagedAcl $row.path $true $serviceSid `
         -NonInheriting:$row.non_inheriting -Recurse:$row.recurse
+    }
+    } catch {
+      Add-LifecycleErrorContext $_ ([string]$row.role) 'assert' ([string]$row.path)
+      throw
     }
   }
 }
@@ -2432,6 +2525,7 @@ function Invoke-RecoveryResume($Binding) {
 
 function Invoke-Main {
 # (Body intentionally kept unindented so this refactor's diff stays reviewable.)
+$script:LifecyclePhase = [string]$Script:Verb
 $binding = Read-Json $Binding
 if ($Verb -in @('recovery-snapshot','recovery-restore','recovery-verify','resume')) {
   if ([string]::IsNullOrWhiteSpace([string]$binding.script_sha256) -or
@@ -2575,6 +2669,7 @@ if ($Verb -eq 'stage') {
   $runtime = Runtime-Python $StageDir
   & $runtime -I -B -m pip install --no-index --require-hashes --find-links (Join-Path $StageDir 'wheels') -r (Join-Path $StageDir 'requirements.lock')
   if ($LASTEXITCODE -ne 0) { Die 'pip_failed' 'the hash-locked install failed' }
+  $script:LifecyclePhase = 'stage-doctor'
   $doctor = & $runtime -I -B -c "import json;from description_pipeline.runtime import tool_record;from description_pipeline.solidworks import doctor;print(json.dumps({'tool':tool_record(),'doctor':doctor()}))"
   if ($LASTEXITCODE -ne 0) { Die 'doctor_failed' 'the installed runtime refused doctor' }
   $identity = $doctor | ConvertFrom-Json
@@ -2586,6 +2681,7 @@ if ($Verb -eq 'stage') {
   # and the release's own read_config test-loads the candidate before stage accepts it; the
   # running file stays byte-sealed for controlled recovery.  A configuration carrying
   # `targets` - or any key outside the strict schema - is refused at stage.
+  $script:LifecyclePhase = 'stage-candidate'
   $candidateProgram = Get-EndpointConfigCandidateProgram
   $candidatePath = Write-PythonProgram 'endpoint-candidate' $candidateProgram
   $candidateRc = 1
@@ -2609,10 +2705,13 @@ if ($Verb -eq 'stage') {
   $candidateInfo = ($candidateOutput | Select-Object -Last 1) | ConvertFrom-Json
   $expected = [string]$candidateInfo.config_digest
   $candidateDocument = Read-Json (Config-Path $StageDir)
+  $script:LifecyclePhase = 'stage-acl-set'
   Set-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
     $runningInstallIdPath $runningTaskFile
+  $script:LifecyclePhase = 'stage-acl-assert'
   Assert-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
     $runningInstallIdPath $runningTaskFile
+  $script:LifecyclePhase = 'stage-receipt'
   Write-Receipt (Join-Path $StageDir 'candidate-identity.json') @{
     expected=$true; at=(Get-Date).ToUniversalTime().ToString('o'); source_config=$runningConfig;
     source_config_sha256=[string]$candidateInfo.source_sha256;
@@ -2793,4 +2892,4 @@ if ($Verb -eq 'rollback') {
 }
 
 }
-if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }
+if ($MyInvocation.InvocationName -ne '.') { Invoke-LifecycleMain }
