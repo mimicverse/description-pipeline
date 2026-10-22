@@ -100,7 +100,7 @@ def _compose_scene_inputs(destination: Path, cad_root: Path, *, with_arm: bool, 
     record_keys = None
     if with_joint:
         controlled["joints/hinge.json"] = support.native_joint_record()
-        record_keys = {"joints/hinge.json": "limits"}
+        record_keys = {"joints/hinge.json": ("limits", "drive")}
     support.seal_scene_inputs(
         destination,
         cad_root=cad_root,

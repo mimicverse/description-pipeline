@@ -2169,6 +2169,32 @@ def capture_requests(config: dict) -> dict:
     return cfg
 
 
+def _record_keys_for(
+    record: dict,
+    record_keys: dict[str, str | Sequence[str]] | None,
+    relative: str,
+) -> list[str]:
+    """Every controlled key referenced by the raw claims for one fixture record."""
+
+    keys: list[str] = []
+    properties = record.get("properties") if isinstance(record.get("properties"), dict) else {}
+    for group in properties.values():
+        if not isinstance(group, dict):
+            continue
+        for value in group.values():
+            if not isinstance(value, str) or "#" not in value:
+                continue
+            referenced, _, key = value.partition("#")
+            if referenced.replace("\\", "/") == relative and key:
+                keys.append(key)
+    configured = (record_keys or {}).get(relative)
+    if isinstance(configured, str):
+        keys.append(configured)
+    elif configured:
+        keys.extend(str(key) for key in configured)
+    return list(dict.fromkeys(keys))
+
+
 def compose_delivery_inputs(
     delivery: Path,
     *,
@@ -2177,7 +2203,7 @@ def compose_delivery_inputs(
     record: dict,
     cad_files: dict[str, Path],
     records: dict[str, str] | None = None,
-    record_keys: dict[str, str] | None = None,
+    record_keys: dict[str, str | Sequence[str]] | None = None,
 ) -> None:
     """Compose the sealed inputs Linux consumers rebuild from (fixture plumbing).
 
@@ -2208,6 +2234,7 @@ def compose_delivery_inputs(
         shutil.copyfile(source, target)
         native_files[str(relative)] = file_digest(target)
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
+    import json
     import hashlib as _hashlib
 
     payload_records: list[dict] = []
@@ -2215,15 +2242,24 @@ def compose_delivery_inputs(
         target = delivery / "input" / "records" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
-        entry = {
+        common = {
             "file": str(name),
             "package_file": str(name),
             "sha256": _hashlib.sha256(text.encode("utf-8")).hexdigest(),
         }
-        key = (record_keys or {}).get(name)
-        if key is not None:
-            entry["key"] = str(key)
-        payload_records.append(entry)
+        keys = _record_keys_for(record, record_keys, str(name))
+        if keys:
+            payload_records.extend(
+                {
+                    **common,
+                    "key": str(key),
+                    "reference": f"{name}#{key}",
+                    "anchor": json.dumps(str(key)),
+                }
+                for key in keys
+            )
+        else:
+            payload_records.append(common)
     write_json(
         evidence / "discovery.json",
         {
@@ -2562,7 +2598,7 @@ def seal_scene_inputs(
     cad_names: Sequence[str],
     record: dict,
     controlled: dict[str, str] | None = None,
-    record_keys: dict[str, str] | None = None,
+    record_keys: dict[str, str | Sequence[str]] | None = None,
 ) -> None:
     """Fixture plumbing: seal the consumer inputs a Linux scene rebuild reads.
 
@@ -2600,7 +2636,7 @@ def stage_discovery_inputs(
     *,
     record: dict,
     controlled: dict[str, str] | None = None,
-    record_keys: dict[str, str] | None = None,
+    record_keys: dict[str, str | Sequence[str]] | None = None,
 ) -> None:
     """Fixture plumbing: stage the discovery payload for hand-built producer roots.
 
@@ -2612,6 +2648,7 @@ def stage_discovery_inputs(
     """
 
     import hashlib
+    import json
 
     from description_pipeline.io import write_json
 
@@ -2621,15 +2658,24 @@ def stage_discovery_inputs(
         path = root / "input" / "records" / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-        entry = {
+        common = {
             "file": relative,
             "package_file": relative,
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         }
-        key = (record_keys or {}).get(relative)
-        if key is not None:
-            entry["key"] = str(key)
-        payload_records.append(entry)
+        keys = _record_keys_for(record, record_keys, str(relative))
+        if keys:
+            payload_records.extend(
+                {
+                    **common,
+                    "key": str(key),
+                    "reference": f"{relative}#{key}",
+                    "anchor": json.dumps(str(key)),
+                }
+                for key in keys
+            )
+        else:
+            payload_records.append(common)
     write_json(
         root / "evidence" / "discovery.json",
         {
