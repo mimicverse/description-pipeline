@@ -5767,6 +5767,36 @@ def _validate_windows_runtime_leaf_acl_policy(projection: dict, parent: dict, *,
     )
 
 
+def _canonical_windows_pin(value: object, *, directory: bool) -> str | None:
+    """Compare local absolute Windows pins without changing their recorded bytes.
+
+    Path case is preserved because a Windows directory can be case-sensitive.
+    The observed recovery defect was only separator spelling, so accepting
+    additional case or Unicode equivalences would weaken object identity.
+    """
+    if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
+        return None
+    path = value.replace("\\", "/")
+    trimmed = path.rstrip("/")
+    if not directory and trimmed != path:
+        return None
+    path = trimmed
+    if not re.match(r"^[A-Za-z]:/", path):
+        return None
+    parts = path[3:].split("/")
+    if any(
+        not part or part in {".", ".."} or part.endswith((" ", "."))
+        or any(char in '<>:"|?*' for char in part)
+        or re.fullmatch(
+            r"con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$|conout\$",
+            part.split(".", 1)[0].rstrip(" ").casefold(),
+        )
+        for part in parts
+    ):
+        return None
+    return path
+
+
 def _validate_windows_recovery_state(document: object) -> dict:
     state = _exact_keys(
         document,
@@ -6076,12 +6106,34 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows_recovery_state_invalid",
         "Windows endpoint port is malformed",
     )
+    environment = identity["domain_environment"]
     require(
-        isinstance(identity["domain_environment"], dict)
-        and identity["domain_environment"].get("scope") == "user"
-        and identity["domain_environment"].get("DESCRIPTION_ENDPOINT_ROOT") == identity["endpoint_root"]
-        and identity["domain_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE")
-        == Path(identity["state_root"]).as_posix() + "/cad-ownership.json",
+        isinstance(environment, dict),
+        "windows_recovery_state_invalid",
+        "Windows account environment pins are not canonical",
+    )
+    environment_endpoint = _canonical_windows_pin(
+        environment.get("DESCRIPTION_ENDPOINT_ROOT"),
+        directory=True,
+    )
+    expected_endpoint = _canonical_windows_pin(
+        identity["endpoint_root"],
+        directory=True,
+    )
+    environment_ownership = _canonical_windows_pin(
+        environment.get("DESCRIPTION_CAD_OWNERSHIP_FILE"),
+        directory=False,
+    )
+    expected_ownership = _canonical_windows_pin(
+        normalized["state_root"] + "/cad-ownership.json",
+        directory=False,
+    )
+    require(
+        environment.get("scope") == "user"
+        and environment_endpoint is not None
+        and environment_endpoint == expected_endpoint
+        and environment_ownership is not None
+        and environment_ownership == expected_ownership,
         "windows_recovery_state_invalid",
         "Windows account environment pins are not canonical",
     )
