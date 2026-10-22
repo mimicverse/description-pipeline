@@ -28,7 +28,7 @@ function Invoke-Main {
         'postgresql://user:SECRET_URI@host/db Password=SECRET_DSN; ' + ('long' * 400))
     }
     'paths' {
-      throw 'Drive "C:\Program Files\SECRET_DIR\file" UNC "\\SECRET_HOST\SECRET SHARE\name" FileSystem::SECRET_PROVIDER\path file://SECRET_FILE/path'
+      throw 'Drive "C:\Program Files\SECRET_DIR\file" Apostrophe "C:\Users\O''Brien\SECRET_APOSTROPHE" UNC "\\SECRET_HOST\SECRET SHARE\name" FileSystem::SECRET_PROVIDER\path file://SECRET_FILE/path'
     }
   }
   # A wrapped native-style exception retains both the wrapper and base HResult.
