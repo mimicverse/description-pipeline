@@ -379,6 +379,22 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(joints[0]["limit_source"], "declared_author")
         self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
 
+    def test_native_limits_replace_missing_author_position_bounds(self) -> None:
+        for missing in (("lower",), ("upper",), ("lower", "upper")):
+            with self.subTest(missing=missing):
+                raw = raw_record()
+                raw["mates"] = [native_limit_mate(-1.0, 1.0)]
+                declaration = decode_exporter_v14(raw["exporter"]["raw_xml"], 1.4)
+                bodies, _ = _exporter_memberships(raw, declaration, [])
+                for key in missing:
+                    declaration["links"][1]["joint"]["limits"][key] = None
+                findings = []
+                joints = _exporter_joint_facts(raw, declaration, bodies, findings)
+                self.assertEqual(joints[0]["limit_source"], "native")
+                self.assertEqual(joints[0]["limits"]["lower"], -1.0)
+                self.assertEqual(joints[0]["limits"]["upper"], 1.0)
+                self.assertFalse(any(item.get("blocking") for item in findings), findings)
+
     def test_engineering_unreadable_native_limit_uses_default_and_retains_errors(self) -> None:
         record = raw_record()
         record["exporter"]["raw_xml"] = wire_xml({"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0})
@@ -390,7 +406,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 "suppressed": False,
                 "error_code": 0,
                 "is_advanced_mate": None,
-                "is_advanced_mate_error": None,
+                "is_advanced_mate_error": "COM read failed",
                 "is_advanced_mate_api": None,
                 "native_limit": None,
                 "limits": None,
@@ -406,13 +422,61 @@ class ExporterDiscoveryTests(unittest.TestCase):
             [
                 {
                     "mate": "hinge__limit",
-                    "reason": "native limit entities do not span the declared parent/child subtrees",
+                    "reason": "native limit entities are not readable",
                 }
             ],
         )
         warning = next(item for item in findings if item["code"] == "discovery.joint_default_policy")
         self.assertFalse(warning["blocking"])
         self.assertEqual(warning["detail"]["native_observation_errors"], policy["native_observation_errors"])
+
+    def test_engineering_invalid_native_limit_evidence_blocks_instead_of_defaulting(self) -> None:
+        def zero_record() -> dict:
+            record = raw_record()
+            record["exporter"]["raw_xml"] = wire_xml(
+                {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
+            )
+            record["exporter"]["raw_xml_sha256"] = hashlib.sha256(
+                record["exporter"]["raw_xml"].encode()
+            ).hexdigest()
+            return record
+
+        variation = native_limit_mate(-1.0, 1.0)
+        variation["native_limit"]["minimum_variation"]["value"] = -2.0
+        wrong_unit = native_limit_mate(-1.0, 1.0)
+        wrong_unit["native_limit"]["minimum_limit"]["unit"] = "m"
+        wrong_binding = native_limit_mate(-1.0, 1.0)
+        wrong_binding["entities"][1]["reference_configuration"] = "Other"
+        unknown_binding = native_limit_mate(-1.0, 1.0)
+        unknown_binding["entities"][1]["component"] = "missing-1"
+        degenerate = native_limit_mate(1.0, -1.0)
+
+        for label, mate in (
+            ("variation", variation),
+            ("wrong_unit", wrong_unit),
+            ("wrong_binding", wrong_binding),
+            ("unknown_binding", unknown_binding),
+            ("degenerate", degenerate),
+        ):
+            with self.subTest(case=label):
+                record = zero_record()
+                record["mates"] = [mate]
+                _bodies, joints, findings = self.derive(record)
+                self.assertEqual(joints, [])
+                invalid = next(item for item in findings if item["code"] == "discovery.joint_limits_invalid")
+                self.assertTrue(invalid["blocking"])
+                self.assertTrue(invalid["detail"]["errors"])
+                self.assertFalse(any(item["code"] == "discovery.joint_default_policy" for item in findings))
+
+        conflict = zero_record()
+        second = native_limit_mate(-2.0, 2.0)
+        second["name"] = "hinge__limit2"
+        conflict["mates"] = [native_limit_mate(-1.0, 1.0), second]
+        _bodies, joints, findings = self.derive(conflict)
+        self.assertEqual(joints, [])
+        item = next(item for item in findings if item["code"] == "discovery.joint_limits_conflict")
+        self.assertTrue(item["blocking"])
+        self.assertFalse(any(row["code"] == "discovery.joint_default_policy" for row in findings))
 
     def test_equal_bounds_and_zero_drives_are_preserved_as_stage_warnings(self):
         for values, expected in (

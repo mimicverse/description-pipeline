@@ -1026,12 +1026,16 @@ def _xml(root, definition, model):
     robot_name = (definition.get("source") or {}).get("robot_name")
     _require(isinstance(robot_name, str) and bool(robot_name), "The input definition carries no robot label")
     _require(document.tag == "robot" and document.get("name") == robot_name, "Wrong URDF robot identity")
-    expected_comments = [
-        f"WARNING {item['code']}: {item.get('message', '')} "
-        "See reports/quality.json for object and field details."
-        for item in (model.get("provenance") or {}).get("value_warnings") or []
-        if isinstance(item, dict) and item.get("code")
-    ]
+    expected_comments = []
+    for item in (model.get("provenance") or {}).get("value_warnings") or []:
+        if not isinstance(item, dict) or not item.get("code"):
+            continue
+        objects = item.get("objects")
+        for subject in objects if isinstance(objects, list) and objects else [{}]:
+            detail = {"message": item.get("message", ""), "provenance": subject}
+            payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
+            code = str(item["code"]).replace("--", "- -")
+            expected_comments.append(f"WARNING {code}: {payload} See reports/quality.json.")
     comments = [child for child in document if child.tag is ET.Comment]
     _require(
         [child.text for child in comments] == expected_comments,

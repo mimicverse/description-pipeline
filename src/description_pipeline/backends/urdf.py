@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import struct
 from pathlib import Path
@@ -81,12 +82,15 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
     document = ET.Element("robot", name=name)
     for warning in data.get("provenance", {}).get("value_warnings", []):
         if isinstance(warning, dict) and warning.get("code"):
-            document.append(
-                ET.Comment(
-                    f"WARNING {warning['code']}: {warning.get('message', '')} "
-                    "See reports/quality.json for object and field details."
-                )
-            )
+            objects = warning.get("objects")
+            subjects = objects if isinstance(objects, list) and objects else [{}]
+            for subject in subjects:
+                detail = {"message": warning.get("message", ""), "provenance": subject}
+                # JSON escapes retain exact source names without admitting an
+                # XML comment terminator from an authored name or message.
+                payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
+                code = str(warning["code"]).replace("--", "- -")
+                document.append(ET.Comment(f"WARNING {code}: {payload} See reports/quality.json."))
     for link in data["links"]:
         node = ET.SubElement(document, "link", name=link["name"])
         inertia = link["inertial"]

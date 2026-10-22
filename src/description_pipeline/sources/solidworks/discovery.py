@@ -76,6 +76,8 @@ from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .native_limits import (
     ENGINEERING_DEFAULT_POLICY_ID,
+    NativeLimitInvalidError,
+    NativeLimitReadError,
     PREVIEW_POLICY_ID,
     PREVIEW_WINDOW_RAD,
     ROTATION_WINDOW_RAD,
@@ -3239,12 +3241,21 @@ def _exporter_joint_facts(
                     )
                 )
             native_values = set()
-            native_errors = []
+            native_read_errors = []
+            native_invalid_errors = []
             for mate in record.get("mates") or []:
                 if not isinstance(mate, dict):
                     continue
                 mate_kind = str(mate.get("type") or "").strip().lower()
-                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                carries_limit_evidence = (
+                    mate.get("native_limit") is not None
+                    or mate.get("limits") is not None
+                    or mate.get("is_advanced_mate") is True
+                )
+                if (
+                    mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}
+                    and not carries_limit_evidence
+                ):
                     continue
                 if mate.get("suppressed") is True:
                     continue
@@ -3258,8 +3269,40 @@ def _exporter_joint_facts(
                 )
                 if scope == "unrelated":
                     continue
-                if scope in {"claimed_unreadable", "claimed_same_side"}:
-                    native_errors.append(
+                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                    native_invalid_errors.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": "native limit evidence is attached to an unsupported mate type",
+                        }
+                    )
+                    continue
+                if scope == "claimed_unreadable":
+                    entities = mate.get("entities")
+                    wrong_owner = (
+                        isinstance(entities, list)
+                        and any(
+                            isinstance(entity, dict)
+                            and isinstance(entity.get("component"), str)
+                            and entity["component"]
+                            and owner_for(entity["component"]) is None
+                            for entity in entities
+                        )
+                    )
+                    target = native_invalid_errors if wrong_owner else native_read_errors
+                    target.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": (
+                                "native limit entities bind unknown or ambiguous components"
+                                if wrong_owner
+                                else "native limit entities are not readable"
+                            ),
+                        }
+                    )
+                    continue
+                if scope == "claimed_same_side":
+                    native_invalid_errors.append(
                         {
                             "mate": mate.get("name"),
                             "reason": "native limit entities do not span the declared parent/child subtrees",
@@ -3267,35 +3310,41 @@ def _exporter_joint_facts(
                     )
                     continue
                 if mate.get("suppressed") is not False or mate.get("error_code") != 0:
-                    native_errors.append(
+                    native_read_errors.append(
                         {"mate": mate.get("name"), "reason": "suppression or solve state is not clean"}
                     )
                     continue
                 flag = mate.get("is_advanced_mate")
                 if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
-                    native_errors.append(
+                    native_read_errors.append(
                         {"mate": mate.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
                     )
                     continue
                 if flag is not True:
-                    if mate.get("limits") is not None:
-                        native_errors.append(
+                    if mate.get("limits") is not None or mate.get("native_limit") is not None:
+                        native_invalid_errors.append(
                             {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
                         )
                     continue
                 if mate_kind not in {"limitdistance", "limitangle"}:
-                    native_errors.append(
+                    native_invalid_errors.append(
                         {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
                     )
                     continue
                 try:
                     lower, upper, unit = validate_native_limit(mate, component_records)
+                except NativeLimitReadError as error:
+                    native_read_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
+                except NativeLimitInvalidError as error:
+                    native_invalid_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
                 except ValueError as error:
-                    native_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    native_invalid_errors.append({"mate": mate.get("name"), "reason": str(error)})
                     continue
                 expected_unit = "m" if kind == "prismatic" else "rad"
                 if unit != expected_unit:
-                    native_errors.append(
+                    native_invalid_errors.append(
                         {
                             "mate": mate.get("name"),
                             "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
@@ -3313,21 +3362,31 @@ def _exporter_joint_facts(
                     )
                 )
                 continue
+            if native_invalid_errors:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "native position-limit evidence is readable but invalid",
+                        {"errors": native_invalid_errors},
+                    )
+                )
+                continue
             if native_values:
-                if native_errors:
+                if native_read_errors:
                     findings.append(
                         _finding(
                             "discovery.joint_limits_unreadable",
                             obj,
                             "native position-limit evidence is incomplete or unreadable",
-                            {"errors": native_errors},
+                            {"errors": native_read_errors},
                         )
                     )
                     continue
                 native_lower, native_upper = next(iter(native_values))
                 declared_values = (
                     (float(limits.get("lower")), float(limits.get("upper")))
-                    if isinstance(limits, dict)
+                    if bounds_usable
                     else None
                 )
                 if declared_values not in {None, (0.0, 0.0), (native_lower, native_upper)}:
@@ -3360,10 +3419,10 @@ def _exporter_joint_facts(
                         author_limits=author_limits,
                         native_absence=(
                             "complete_mate_inventory_no_enabled_limit"
-                            if native_inventory_complete and not native_errors
+                            if native_inventory_complete and not native_read_errors
                             else "native_limit_observation_unreadable"
                         ),
-                        native_errors=native_errors,
+                        native_errors=native_read_errors,
                     )
                     limits = {
                         "lower": -ROTATION_WINDOW_RAD,
@@ -3387,7 +3446,7 @@ def _exporter_joint_facts(
                             blocking=False,
                         )
                     )
-                elif kind == "revolute" and preview_allowed and author_zero and not native_errors:
+                elif kind == "revolute" and preview_allowed and author_zero and not native_read_errors:
                     preview_policy = rotation_window_policy(
                         PREVIEW_POLICY_ID,
                         author_limits=author_limits,
@@ -3415,13 +3474,13 @@ def _exporter_joint_facts(
                             blocking=False,
                         )
                     )
-                elif native_errors:
+                elif native_read_errors:
                     findings.append(
                         _finding(
                             "discovery.joint_limits_unreadable",
                             obj,
                             "native position-limit evidence is incomplete or unreadable",
-                            {"errors": native_errors},
+                            {"errors": native_read_errors},
                         )
                     )
                     continue

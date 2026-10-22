@@ -1542,7 +1542,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   const data = {
     robot: await loadPreviewArtifactJson(artifactUrl, preview.files, "model/robot.json", signal),
     tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal),
-    quality: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/quality.json", signal),
+    quality: await loadPreviewArtifactJson(artifactUrl, preview.report_files, "reports/quality.json", signal),
   };
   state.previewData = data;
   const identity = summaryIdentity({ runId: state.dagRunId, subjectSha256: preview.subject_sha256 });
@@ -2390,23 +2390,39 @@ function renderRun(run) {
 
 function renderPreviewDiagnostic(preview) {
   const node = $("preview-diagnostic");
-  if (preview.verified !== false) {
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+  if (preview.verified !== false && !warnings.length) {
     node.hidden = true;
     node.textContent = "";
     return;
   }
-  const lines = ["Engineering verification failed: this delivery is diagnostic only and must not be published."];
+  const lines = [preview.verified === false
+    ? "Engineering verification failed: this delivery is diagnostic only and must not be published."
+    : "Verification passed with source warnings. Default ranges are not native mechanical limits or hardware qualifications."];
   const checks = Array.isArray(preview.failing_checks) ? preview.failing_checks : [];
   const checksTotal = Number.isInteger(preview.failing_checks_total) ? preview.failing_checks_total : checks.length;
   if (checks.length) {
     const shown = checks.slice(0, 8).map((check) => `${check.id} (${check.message || "check failed"})`);
     lines.push(`Failed checks: ${shown.join(", ")}${checksTotal > shown.length ? ` and ${checksTotal} total` : ""}`);
   }
-  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
   const warningsTotal = Number.isInteger(preview.warnings_total) ? preview.warnings_total : warnings.length;
   if (warnings.length) {
-    const shown = warnings.slice(0, 6).map((item) => `${item.code || "warning"}${item.object ? ` (${item.object})` : ""}`);
-    lines.push(`Warnings: ${shown.join(", ")}${warningsTotal > shown.length ? ` and ${warningsTotal} total` : ""}`);
+    for (const item of warnings) {
+      const objects = Array.isArray(item.objects) ? item.objects
+        : (Array.isArray(item.detail?.objects) ? item.detail.objects : []);
+      const scope = objects.length
+        ? objects.map((row) => `${row.object || "unknown object"}.${row.field || "unspecified field"}`).join(", ")
+        : (item.object || "");
+      lines.push(`${item.code || "warning"}${scope ? ` (${scope})` : ""}: ${item.message || "Source warning"}`);
+      for (const row of objects) {
+        const detail = Object.fromEntries(Object.entries(row).filter(([key]) => [
+          "object", "object_type", "field", "actual", "source", "rule_id", "rule_version",
+          "native_cad_ranges", "hardware_qualified", "engineering_position_range_qualified",
+        ].includes(key)));
+        lines.push(JSON.stringify(detail));
+      }
+    }
+    if (warningsTotal > warnings.length) lines.push(`${warningsTotal} warnings total; see the quality report for the complete list.`);
   }
   node.textContent = lines.join("\n");
   node.hidden = false;

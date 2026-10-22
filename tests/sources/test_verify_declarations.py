@@ -798,7 +798,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw["mates"][0]["entities"][1]["component"] = "base_part"
         report = verify_declarations(raw, source_claims())
         self.assertFalse(report["passed"])
-        self.assertIn("v14.native_limits_unreadable", {item["code"] for item in report["errors"]})
+        self.assertIn("v14.native_limits_invalid", {item["code"] for item in report["errors"]})
 
     def test_unrelated_same_side_native_limit_does_not_poison_a_joint(self):
         raw = fixture()
@@ -1150,6 +1150,50 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertEqual(declared_joint["limit_source"], "declared_author")
         self.assertEqual(declared_joint["limits"], {"lower": -1.5, "upper": 1.5, "effort": 5.0, "velocity": 2.0})
 
+    def test_native_range_replaces_missing_author_position_bounds(self) -> None:
+        for missing in (("lower",), ("upper",), ("lower", "upper")):
+            with self.subTest(missing=missing):
+                raw = fixture()
+
+                def clear_bounds(root, missing=missing):
+                    for item in root.iter():
+                        kind = item.find(NS_TAG + "AttributeType")
+                        if (
+                            (item.get(Z_TAG + "Id") or "").startswith("joint_limit_")
+                            and kind is not None and kind.text in missing
+                        ):
+                            value = item.find(NS_TAG + "Value")
+                            value.attrib.clear()
+                            value.set("{http://www.w3.org/2001/XMLSchema-instance}nil", "true")
+                            value.text = None
+
+                rewrite(raw, clear_bounds)
+                report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+                self.assertTrue(report["passed"], report["errors"])
+                joint = report["carrier"]["joints"][0]
+                self.assertEqual(joint["limit_source"], "native")
+                self.assertEqual((joint["limits"]["lower"], joint["limits"]["upper"]), (-1.5, 1.5))
+
+    def test_preview_zero_position_preserves_nonzero_drive_values(self) -> None:
+        raw = fixture()
+
+        def zero_position(root):
+            for item in root.iter():
+                kind = item.find(NS_TAG + "AttributeType")
+                if (
+                    (item.get(Z_TAG + "Id") or "").startswith("joint_limit_")
+                    and kind is not None and kind.text in {"lower", "upper"}
+                ):
+                    item.find(NS_TAG + "Value").text = "0"
+
+        rewrite(raw, zero_position)
+        raw["mates"] = []
+        report = verify_declarations(raw, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(report["passed"], report["errors"])
+        joint = report["carrier"]["joints"][0]
+        self.assertEqual(joint["limit_source"], "preview_policy")
+        self.assertEqual((joint["limits"]["effort"], joint["limits"]["velocity"]), (5.0, 2.0))
+
     def test_engineering_native_limit_conflict_stays_blocking(self) -> None:
         raw = fixture()
         raw["mates"][0]["limits"] = {"lower": -2.0, "upper": 2.0, "unit": "rad"}
@@ -1184,6 +1228,52 @@ class NativeDeclarationsTests(unittest.TestCase):
             policy["native_observation_errors"],
             [{"mate": "native_lock", "reason": "IsAdvancedMate is missing or unreadable"}],
         )
+
+    def test_engineering_invalid_native_limit_evidence_blocks_instead_of_defaulting(self) -> None:
+        raw = zero_limit_values(fixture())
+        base_mate = copy.deepcopy(raw["mates"][0])
+
+        variation = copy.deepcopy(base_mate)
+        variation["native_limit"]["minimum_variation"]["value"] = -2.0
+        wrong_unit = copy.deepcopy(base_mate)
+        wrong_unit["native_limit"]["minimum_limit"]["unit"] = "m"
+        wrong_binding = copy.deepcopy(base_mate)
+        wrong_binding["entities"][1]["reference_configuration"] = "Other"
+        unknown_binding = copy.deepcopy(base_mate)
+        unknown_binding["entities"][1]["component"] = "missing-1"
+        degenerate = copy.deepcopy(base_mate)
+        degenerate["limits"] = {"lower": 2.0, "upper": 1.0, "unit": "rad"}
+        degenerate["native_limit"] = support.native_limit_observation(
+            6, nominal=0.0, lower=2.0, upper=1.0
+        )
+
+        for label, mate in (
+            ("variation", variation),
+            ("wrong_unit", wrong_unit),
+            ("wrong_binding", wrong_binding),
+            ("unknown_binding", unknown_binding),
+            ("degenerate", degenerate),
+        ):
+            with self.subTest(case=label):
+                candidate = copy.deepcopy(raw)
+                candidate["mates"] = [mate]
+                report = verify_declarations(candidate, purpose=PURPOSE_ENGINEERING)
+                self.assertFalse(report["passed"])
+                self.assertIn("v14.native_limits_invalid", {item["code"] for item in report["errors"]})
+                self.assertNotIn("v14.default_policy", {item["code"] for item in report["diagnostics"]})
+
+        conflict = copy.deepcopy(raw)
+        second = copy.deepcopy(base_mate)
+        second["name"] = "hinge__limit2"
+        second["limits"] = {"lower": -2.0, "upper": 2.0, "unit": "rad"}
+        second["native_limit"] = support.native_limit_observation(
+            6, nominal=0.0, lower=-2.0, upper=2.0
+        )
+        conflict["mates"] = [base_mate, second]
+        report = verify_declarations(conflict, purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_conflict", {item["code"] for item in report["errors"]})
+        self.assertNotIn("v14.default_policy", {item["code"] for item in report["diagnostics"]})
 
     def test_engineering_missing_author_bounds_use_the_default_policy(self) -> None:
         raw = zero_limit_values(fixture())

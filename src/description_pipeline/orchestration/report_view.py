@@ -217,7 +217,7 @@ def _first_text(*values: object) -> str | None:
     return None
 
 
-def _failure_object(raw_type: str, message: str, raw_detail: dict | None) -> str | None:
+def _failure_object(raw_type: str, message: str, raw_detail: dict | str | None) -> str | None:
     """Basename of the failing document, only when safely parsed; never invented."""
     if isinstance(raw_detail, dict):
         candidate = raw_detail.get("document") or raw_detail.get("object")
@@ -568,7 +568,7 @@ def _failure(job: dict, stage: dict) -> dict:
     raw_type, _, message = raw_error.partition(": ")
     error_code = _first_text(stage.get("error_code"))
     diagnostic = stage.get("diagnostic")
-    raw_detail = diagnostic if isinstance(diagnostic, dict) and diagnostic else None
+    raw_detail = diagnostic if isinstance(diagnostic, (dict, str)) and diagnostic else None
     codes = None
     kind = "unknown"
     structured_groups = None
@@ -616,7 +616,7 @@ def _failure(job: dict, stage: dict) -> dict:
             "object, cause, and evidence; an unsupported pattern does not mean the design is wrong."
         )
         kind = "definition"
-    elif raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
+    elif raw_type == "CadError" and isinstance(raw_detail, dict) and {"errors", "warnings"} <= set(raw_detail):
         kind = "runtime"
         codes = {"errors": raw_detail.get("errors"), "warnings": raw_detail.get("warnings")}
         if raw_detail.get("errors") == 2:
@@ -684,6 +684,8 @@ def _failure(job: dict, stage: dict) -> dict:
         failure["finding_samples"] = structured_samples
     failed_object = _failure_object(raw_type, message, raw_detail)
     activity = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else {}
+    if (activity.get("stage") or activity.get("phase")) != stage.get("id"):
+        activity = {}
     if error_code is not None and failed_object is None:
         candidate = _first_text(
             raw_detail.get("path") if isinstance(raw_detail, dict) else None,
@@ -718,8 +720,8 @@ def _failure(job: dict, stage: dict) -> dict:
         if phase:
             failure["phase"] = phase
 
-        detail_cause = raw_detail.get("cause") if isinstance(raw_detail, dict) else None
-        cause = _first_text(detail_cause, raw_error)
+        detail_cause = raw_detail.get("cause") if isinstance(raw_detail, dict) else raw_detail
+        cause = detail_cause if isinstance(detail_cause, str) and detail_cause.strip() else _first_text(raw_error)
         if cause:
             failure["cause"] = cause
 

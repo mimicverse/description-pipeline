@@ -369,6 +369,19 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(failure["evidence_path"], job["diagnostic_path"])
         self.assertNotEqual(failure["title"], "Stage failed (cause undetermined)")
 
+    def test_publish_failure_does_not_use_stale_capture_activity(self) -> None:
+        job = passed_job()
+        job.update(status="failed", error="Publish rejected", error_code="git_push_failed",
+                   detail="  remote: permission denied\nadditional stderr\n")
+        job["events"] = protocol_events(subject=SHA, failed_stage="publish")
+        job["activity_final"] = {"phase": "capture", "action": "mesh", "current_object": "stale.SLDASM"}
+        failure = build_report(job)["failure"]
+        self.assertEqual(failure["stage"], "publish")
+        self.assertEqual(failure["phase"], "publish")
+        self.assertNotIn("object", failure)
+        self.assertEqual(failure["raw_detail"], job["detail"])
+        self.assertEqual(failure["cause"], job["detail"])
+
     def test_failed_summary_points_to_findings_and_never_blanks(self) -> None:
         from description_pipeline.orchestration.report_view import _failed_summary
 

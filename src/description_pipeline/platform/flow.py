@@ -48,8 +48,10 @@ def _registered_failure(rows: dict[str, dict]) -> dict:
             "error": receipt.get("error"),
             "error_code": receipt.get("error_code"),
             "detail": receipt.get("detail"),
+            "diagnostic_path": receipt.get("diagnostic_path"),
+            "failure_diagnostics": receipt.get("failure_diagnostics"),
         }
-    return {"stage": None, "error": None, "error_code": None, "detail": None}
+    return dict.fromkeys(("stage", "error", "error_code", "detail", "diagnostic_path", "failure_diagnostics"))
 
 
 class RunPaths:
@@ -452,6 +454,8 @@ def registered_delivery_snapshot(platform: PlatformStore, run_id: str) -> dict:
         "error": failure["error"],
         "error_code": failure["error_code"],
         "detail": failure["detail"],
+        "diagnostic_path": failure["diagnostic_path"],
+        "failure_diagnostics": failure["failure_diagnostics"],
         # The canonical attribution of the error: the earliest failed stage of the
         # registration - consumers never guess it from event order.
         "failed_stage": failure["stage"],

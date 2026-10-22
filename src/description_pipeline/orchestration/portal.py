@@ -2035,6 +2035,8 @@ class PortalApp:
                 # failure stays null instead of fabricating fields.
                 "error_code": job.get("error_code"),
                 "detail": job.get("detail"),
+                "diagnostic_path": job.get("diagnostic_path"),
+                "failure_diagnostics": job.get("failure_diagnostics"),
             },
             "discovery": None
             if not isinstance(job, dict) or not isinstance(job.get("discovery"), dict)

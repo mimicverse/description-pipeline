@@ -22,6 +22,8 @@ from ..sources.solidworks.session_artifacts import (
 )
 from ..sources.solidworks.native_limits import (
     ENGINEERING_DEFAULT_POLICY_ID,
+    NativeLimitInvalidError,
+    NativeLimitReadError,
     PREVIEW_POLICY_ID,
     PREVIEW_WINDOW_RAD,
     ROTATION_WINDOW_RAD,
@@ -728,7 +730,8 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
         )
         native_limits = []
         native_complete = True
-        native_errors = []
+        native_read_errors = []
+        native_invalid_errors = []
         if joint["type"] in {"revolute", "prismatic", "continuous"}:
             child = joint["child_link"]
             child_tree = {child}
@@ -768,27 +771,32 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             raw_mates = raw.get("mates")
             if not isinstance(raw_mates, list):
                 native_complete = False
-                native_errors.append({"reason": "mate inventory is not a list"})
+                native_read_errors.append({"reason": "mate inventory is not a list"})
                 raw_mates = []
             limit_types = {"distance", "angle", "limitdistance", "limitangle"}
             for mate in raw_mates:
                 if not isinstance(mate, dict):
                     native_complete = False
-                    native_errors.append({"reason": "mate inventory row is not an object"})
+                    native_read_errors.append({"reason": "mate inventory row is not an object"})
                     continue
                 suppressed = mate.get("suppressed")
                 if type(suppressed) is not bool:
                     native_complete = False
-                    native_errors.append({"mate": mate.get("name"), "reason": "suppression state is unreadable"})
+                    native_read_errors.append({"mate": mate.get("name"), "reason": "suppression state is unreadable"})
                     continue
                 if suppressed:
                     continue
                 mate_type = str(mate.get("type") or "").strip().lower()
-                if mate_type not in limit_types:
+                carries_limit_evidence = (
+                    mate.get("native_limit") is not None
+                    or mate.get("limits") is not None
+                    or mate.get("is_advanced_mate") is True
+                )
+                if mate_type not in limit_types and not carries_limit_evidence:
                     continue
                 if mate.get("error_code") != 0:
                     native_complete = False
-                    native_errors.append(
+                    native_read_errors.append(
                         {"mate": mate.get("name"), "reason": "suppression or solve state is not clean"}
                     )
                     continue
@@ -802,9 +810,44 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 )
                 if scope == "unrelated":
                     continue
-                if scope in {"claimed_unreadable", "claimed_same_side"}:
-                    native_complete = False
-                    native_errors.append(
+                if mate_type not in limit_types:
+                    native_invalid_errors.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": "native limit evidence is attached to an unsupported mate type",
+                        }
+                    )
+                    continue
+                if scope == "claimed_unreadable":
+                    entities = mate.get("entities")
+                    wrong_owner = (
+                        isinstance(entities, list)
+                        and any(
+                            isinstance(entity, dict)
+                            and isinstance(entity.get("component"), str)
+                            and entity["component"]
+                            and owner_for(entity["component"]) is None
+                            for entity in entities
+                        )
+                    )
+                    if wrong_owner:
+                        native_invalid_errors.append(
+                            {
+                                "mate": mate.get("name"),
+                                "reason": "native limit entities bind unknown or ambiguous components",
+                            }
+                        )
+                    else:
+                        native_complete = False
+                        native_read_errors.append(
+                            {
+                                "mate": mate.get("name"),
+                                "reason": "native limit entities are not readable",
+                            }
+                        )
+                    continue
+                if scope == "claimed_same_side":
+                    native_invalid_errors.append(
                         {
                             "mate": mate.get("name"),
                             "reason": "native limit entities do not span the declared parent/child subtrees",
@@ -814,18 +857,20 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 flag = mate.get("is_advanced_mate")
                 if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
                     native_complete = False
-                    native_errors.append(
+                    native_read_errors.append(
                         {"mate": mate.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
                     )
                     continue
                 if flag is not True:
-                    if mate.get("limits") is not None:
-                        native_complete = False
-                        native_errors.append({"mate": mate.get("name"), "reason": "advanced flag on a standard mate"})
+                    if mate.get("limits") is not None or mate.get("native_limit") is not None:
+                        native_invalid_errors.append(
+                            {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
+                        )
                     continue
                 if mate_type not in {"limitangle", "limitdistance"}:
-                    native_complete = False
-                    native_errors.append({"mate": mate.get("name"), "reason": "advanced flag on a standard mate"})
+                    native_invalid_errors.append(
+                        {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
+                    )
                     continue
                 if joint["type"] == "continuous":
                     raise DeclarationError(
@@ -835,14 +880,21 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     )
                 try:
                     lower, upper, unit = validate_native_limit(mate, state.get("components"))
-                except ValueError:
+                except NativeLimitReadError as error:
                     native_complete = False
-                    native_errors.append({"mate": mate.get("name"), "reason": "native limit evidence is unreadable"})
+                    native_read_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
+                except NativeLimitInvalidError as error:
+                    native_invalid_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
+                except ValueError:
+                    native_invalid_errors.append(
+                        {"mate": mate.get("name"), "reason": "native limit evidence is invalid"}
+                    )
                     continue
                 expected_unit = "m" if joint["type"] == "prismatic" else "rad"
                 if unit != expected_unit:
-                    native_complete = False
-                    native_errors.append(
+                    native_invalid_errors.append(
                         {
                             "mate": mate.get("name"),
                             "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
@@ -851,7 +903,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     continue
                 if mate.get("error_code") != 0 or not isinstance(mate.get("limits"), dict):
                     native_complete = False
-                    native_errors.append(
+                    native_read_errors.append(
                         {"mate": mate.get("name"), "reason": "suppression or solve state is not clean"}
                     )
                     continue
@@ -875,6 +927,12 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     "native range observations disagree for one joint",
                     {"joint": name, "ranges": sorted(ranges)},
                 )
+            if native_invalid_errors:
+                raise DeclarationError(
+                    "v14.native_limits_invalid",
+                    "native position-limit evidence is readable but invalid",
+                    {"joint": name, "errors": native_invalid_errors},
+                )
             if ranges:
                 _require(
                     native_complete,
@@ -882,7 +940,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     "the native range observation is incomplete or unreadable",
                     joint=name,
                     native=native_limits,
-                    errors=native_errors,
+                    errors=native_read_errors,
                 )
                 lower, upper = next(iter(ranges))
                 author_bounds_usable = all(_number(limits.get(key)) for key in ("lower", "upper"))
@@ -914,7 +972,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 joint["type"] == "revolute"
                 and purpose == PURPOSE_INSPECTION_PREVIEW
                 and native_limit_inventory_complete(raw.get("mates"))
-                and _all_zero_limits(raw_limits)
+                and _zero_position_bounds(raw_limits)
             ):
                 preview_limits = {"lower": -PREVIEW_WINDOW_RAD, "upper": PREVIEW_WINDOW_RAD}
                 for key in ("effort", "velocity"):
@@ -955,7 +1013,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         if native_complete and native_limit_inventory_complete(raw.get("mates"))
                         else "native_limit_observation_unreadable"
                     ),
-                    native_errors=native_errors,
+                    native_errors=native_read_errors,
                 )
                 diagnostics.append(
                     {
@@ -972,7 +1030,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 raise DeclarationError(
                     "v14.native_limits_unreadable",
                     "the native range observation is incomplete or unreadable",
-                    {"joint": name, "native": native_limits, "errors": native_errors},
+                    {"joint": name, "native": native_limits, "errors": native_read_errors},
                 )
             elif _all_zero_limits(raw_limits):
                 raise DeclarationError(

@@ -280,7 +280,10 @@ def _platform_receipt(run_id: str, stage: str, receipt: dict, tree: str | Path, 
             if not isinstance(transfer_handoff, str) or not transfer_handoff:
                 raise AirflowFailException(f"The {stage!r} stage tree carries an unreadable native transfer identity")
             payload["handoff_sha256"] = transfer_handoff
-    for key in ("error", "error_code", "detail", "tool", "native_tool", "quality", "submission"):
+    for key in (
+        "error", "error_code", "detail", "diagnostic_path", "failure_diagnostics",
+        "tool", "native_tool", "quality", "submission",
+    ):
         if receipt.get(key) is not None:
             payload[key] = receipt[key]
     return payload
@@ -343,6 +346,9 @@ def _register_failed_stage(
         "error_code": getattr(error, "code", None),
         "detail": getattr(error, "detail", None) or getattr(error, "details", None),
     }
+    for key in ("diagnostic_path", "failure_diagnostics"):
+        if getattr(error, key, None) is not None:
+            receipt[key] = getattr(error, key)
     if tree is not None and (Path(tree) / "manifest.json").is_file():
         try:
             _seal_and_confirm(platform, store_root, run_id, stage, tree, receipt, state="failed")
@@ -990,6 +996,9 @@ def _boundary_failure(message: str, source: dict) -> AirflowFailException:
         failure.code = code
     if detail is not None:
         failure.detail = detail
+    for key in ("diagnostic_path", "failure_diagnostics"):
+        if source.get(key) is not None:
+            setattr(failure, key, source[key])
     return failure
 
 

@@ -2393,6 +2393,19 @@ class PlatformRegistrationTests(unittest.TestCase):
         self.assertIn("stage exploded", call["receipt"]["error"])
         self.assertEqual(call["checkpoint_uri"], "store://sealed/run-1/generate")
 
+    def test_failure_boundary_preserves_recorded_diagnostic_identity(self) -> None:
+        source = {
+            "error_code": "publish_failed", "detail": "remote: denied",
+            "diagnostic_path": "retained/failure",
+            "failure_diagnostics": {"path": "diagnostic.json", "sha256": "d" * 64},
+        }
+        error = self.module._boundary_failure("Publish failed", source)
+        platform, _ = self.module._platform_binding()
+        self.module._register_failed_stage(platform, self.root, "run-1", "publish", error)
+        receipt = self.calls[0]["receipt"]
+        for key, value in source.items():
+            self.assertEqual(receipt[key], value)
+
     def test_an_early_failure_without_a_tree_registers_its_shape_only(self) -> None:
         run_id = "0f5b8f2c-6a3d-4e7b-9c1d-2e3f4a5b6c7d"
         absent = Path(self.temporary.name) / "absent"

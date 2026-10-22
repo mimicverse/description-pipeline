@@ -85,6 +85,17 @@ class FailureBoundaryFieldTests(unittest.TestCase):
             self.assertIsNone(observed[view].get("error_code"), view)
             self.assertIsNone(observed[view].get("detail"), view)
 
+    def test_native_diagnostics_survive_the_registered_failure_boundary(self) -> None:
+        fields = {
+            "error_code": CODE, "detail": "  native failure\n",
+            "diagnostic_path": "retained/native-failure",
+            "failure_diagnostics": {"path": "diagnostic.json", "sha256": "d" * 64},
+        }
+        observed = self._native_seam(fields)
+        for view in ("receipt", "snapshot"):
+            for key, value in fields.items():
+                self.assertEqual(observed[view][key], value, (view, key))
+
     def test_portable_summary_preserves_code_and_detail(self) -> None:
         module = _module()
         receipt = {"state": "failed", "passed": False, "error": "boom", "error_code": CODE, "detail": DETAIL}
