@@ -963,6 +963,211 @@ class ValueWarningTests(unittest.TestCase):
         self.assertFalse(row["engineering_position_range_qualified"])
         self.assertEqual(row["native_observation_errors"], [])
 
+    def test_declared_author_limits_and_drive_have_field_level_record_provenance(self):
+        limits = {"lower": -1.5, "upper": 1.5, "effort": 0.0, "velocity": 0.0}
+        native_errors = [{"mate": "native_limit", "reason": "IsAdvancedMate is missing or unreadable"}]
+        limit_evidence = {
+            "kind": "controlled_record",
+            "file": "records/record_arm.txt",
+            "sha256": "a" * 64,
+            "anchor": '"limits"',
+            "key": "limits",
+            "reference": "joints/arm.json#limits",
+            "declared_values": {"lower": -1.5, "upper": 1.5},
+            "native_observation_errors": native_errors,
+        }
+        drive_evidence = {
+            "kind": "controlled_record",
+            "file": "records/record_arm.txt",
+            "sha256": "b" * 64,
+            "anchor": '"drive"',
+            "key": "drive",
+            "reference": "joints/arm.json#drive",
+            "declared_values": {"effort": 0.0, "velocity": 0.0},
+        }
+        cfg = {
+            "joints": [
+                {
+                    "name": "right_elbow_pitch_joint",
+                    "source_name": "right_elbow_pitch_joint",
+                    "type": "revolute",
+                    "limit_source": "declared_author",
+                    "limits": limits,
+                    "limit_evidence": limit_evidence,
+                    "drive_evidence": drive_evidence,
+                    "drive_source": "controlled",
+                }
+            ],
+            "frames": [],
+        }
+        joints = [{"name": "right_elbow_pitch_joint", "limits": limits}]
+        warnings = _value_warnings(cfg, [], [], joints, [])
+
+        declared = next(item for item in warnings if item["code"] == "limits.declared_author")
+        self.assertEqual(
+            [row["field"] for row in declared["objects"]],
+            ["lower", "upper"],
+        )
+        for row in declared["objects"]:
+            self.assertEqual(row["actual"], limits[row["field"]])
+            self.assertEqual(row["original"], limits[row["field"]])
+            self.assertIn(
+                row["source"],
+                {"controlled author dp.joint.limits_record", "controlled author dp.joint.drive_record"},
+            )
+        for row in declared["objects"][:2]:
+            self.assertEqual(row["file"], limit_evidence["file"])
+            self.assertEqual(row["sha256"], limit_evidence["sha256"])
+            self.assertEqual(row["anchor"], limit_evidence["anchor"])
+            self.assertEqual(row["key"], limit_evidence["key"])
+            self.assertEqual(row["native_observation_errors"], native_errors)
+        drive = next(item for item in warnings if item["code"] == "drive.declared_author")
+        self.assertEqual([row["field"] for row in drive["objects"]], ["effort", "velocity"])
+        for row in drive["objects"]:
+            self.assertEqual(row["file"], drive_evidence["file"])
+            self.assertEqual(row["sha256"], drive_evidence["sha256"])
+            self.assertEqual(row["key"], drive_evidence["key"])
+
+        unqualified = next(item for item in warnings if item["code"] == "drive.unqualified")
+        self.assertEqual([row["field"] for row in unqualified["objects"]], ["effort", "velocity"])
+
+    def test_declared_author_warning_gate_rejects_missing_foreign_duplicate_and_cross_joint_evidence(self):
+        limits = {"lower": -1.5, "upper": 1.5, "effort": 0.0, "velocity": 0.0}
+        limit_evidence = {
+            "kind": "controlled_record",
+            "file": "records/record_arm.txt",
+            "sha256": "a" * 64,
+            "anchor": '"limits"',
+            "key": "limits",
+            "reference": "joints/arm.json#limits",
+            "declared_values": {"lower": -1.5, "upper": 1.5},
+            "native_observation_errors": [{"mate": "native_limit", "reason": "unreadable"}],
+        }
+        drive_evidence = {
+            "kind": "controlled_record",
+            "file": "records/record_arm.txt",
+            "sha256": "b" * 64,
+            "anchor": '"drive"',
+            "key": "drive",
+            "reference": "joints/arm.json#drive",
+            "declared_values": {"effort": 0.0, "velocity": 0.0},
+        }
+        source = copy.deepcopy(self.source)
+        source["joints"] = [
+            {
+                "name": "right_elbow_pitch_joint",
+                "source_name": "right_elbow_pitch_joint",
+                "type": "revolute",
+                "limit_source": "declared_author",
+                "limits": limits,
+                "limit_evidence": limit_evidence,
+                "drive_evidence": drive_evidence,
+                "drive_source": "controlled",
+            }
+        ]
+        model = copy.deepcopy(self.model)
+        model["joints"] = [
+            {
+                "name": "right_elbow_pitch_joint",
+                "limits": limits,
+                "provenance": {
+                    "limits_evidence": copy.deepcopy(limit_evidence),
+                    "drive_evidence": copy.deepcopy(drive_evidence),
+                },
+            }
+        ]
+        generated = [
+            warning
+            for warning in _value_warnings(source, source["bodies"], model["links"], model["joints"], [])
+            if warning["code"] in {"limits.declared_author", "drive.declared_author", "drive.unqualified"}
+        ]
+        model["provenance"]["value_warnings"].extend(copy.deepcopy(generated))
+        next(
+            item for item in model["provenance"]["value_warnings"] if item["code"] == "geometry.derived_from_native"
+        )["objects"].append(
+            {
+                "object_type": "joint",
+                "object": "right_elbow_pitch_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        self.assertGreaterEqual(_value_warning_gate(self.root, source, model)["objects"], 1)
+
+        missing = copy.deepcopy(model)
+        missing["provenance"]["value_warnings"] = [
+            item for item in missing["provenance"]["value_warnings"] if item["code"] != "limits.declared_author"
+        ]
+        with self.assertRaises(PipelineError):
+            _value_warning_gate(self.root, source, missing)
+
+        foreign = copy.deepcopy(model)
+        foreign["joints"][0]["provenance"]["limits_evidence"]["sha256"] = "c" * 64
+        with self.assertRaises(PipelineError):
+            _value_warning_gate(self.root, source, foreign)
+
+        duplicate = copy.deepcopy(model)
+        duplicate["provenance"]["value_warnings"].append(
+            copy.deepcopy(
+                next(
+                    item
+                    for item in duplicate["provenance"]["value_warnings"]
+                    if item["code"] == "limits.declared_author"
+                )
+            )
+        )
+        with self.assertRaises(PipelineError):
+            _value_warning_gate(self.root, source, duplicate)
+
+        reused_source = copy.deepcopy(source)
+        reused_model = copy.deepcopy(model)
+        second = copy.deepcopy(reused_source["joints"][0])
+        second["name"] = "left_elbow_pitch_joint"
+        second["source_name"] = "left_elbow_pitch_joint"
+        reused_source["joints"].append(second)
+        reused_model["joints"].append(
+            {
+                "name": "left_elbow_pitch_joint",
+                "limits": limits,
+                "provenance": {
+                    "limits_evidence": copy.deepcopy(limit_evidence),
+                    "drive_evidence": copy.deepcopy(drive_evidence),
+                },
+            }
+        )
+        extra = [
+            warning
+            for warning in _value_warnings(
+                reused_source,
+                reused_source["bodies"],
+                reused_model["links"],
+                reused_model["joints"],
+                [],
+            )
+            if warning["code"] in {"limits.declared_author", "drive.declared_author", "drive.unqualified"}
+        ]
+        reused_model["provenance"]["value_warnings"] = [
+            item
+            for item in reused_model["provenance"]["value_warnings"]
+            if item["code"] not in {"limits.declared_author", "drive.declared_author", "drive.unqualified"}
+        ] + extra
+        next(
+            item
+            for item in reused_model["provenance"]["value_warnings"]
+            if item["code"] == "geometry.derived_from_native"
+        )["objects"].append(
+            {
+                "object_type": "joint",
+                "object": "left_elbow_pitch_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        with self.assertRaisesRegex(PipelineError, "reused across joint identities"):
+            _value_warning_gate(self.root, reused_source, reused_model)
+
     def test_preview_policy_warning_gate_accepts_the_policy(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)

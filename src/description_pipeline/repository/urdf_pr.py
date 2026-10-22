@@ -595,6 +595,11 @@ _WARNING_ROW_EXTRA_KEYS = (
     "window_rad",
     "native_absence",
     "native_observation_errors",
+    "file",
+    "sha256",
+    "anchor",
+    "key",
+    "reference",
 )
 
 

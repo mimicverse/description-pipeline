@@ -282,6 +282,38 @@ def _input(root, diagnostics=None):
         )
         carrier = declarations["carrier"]
         bodies, joints = carrier["bodies"], carrier["joints"]
+        declaration_evidence = {
+            "kind": "native_declaration",
+            "file": "evidence/discovery.json",
+            "sha256": file_digest(root / "evidence/discovery.json"),
+            "anchor": raw["exporter"]["raw_xml_sha256"],
+            "key": "raw.exporter.raw_xml",
+            "reference": "evidence/discovery.json#raw.exporter.raw_xml",
+        }
+        for joint in joints:
+            raw_limits = joint.get("declared_limits")
+            raw_limits = raw_limits if isinstance(raw_limits, dict) else {}
+            if joint.get("limit_source") == "declared_author" and joint.get("type") != "continuous":
+                joint["limit_evidence"] = {
+                    **declaration_evidence,
+                    "declared_values": {
+                        field: float(raw_limits[field])
+                        for field in ("lower", "upper")
+                    },
+                    "native_observation_errors": [],
+                }
+            if all(
+                type(raw_limits.get(field)) in (int, float) and math.isfinite(raw_limits[field])
+                for field in ("effort", "velocity")
+            ):
+                joint["drive_evidence"] = {
+                    **declaration_evidence,
+                    "declared_values": {
+                        field: float(raw_limits[field])
+                        for field in ("effort", "velocity")
+                    },
+                }
+                joint["drive_source"] = "controlled"
         from ..sources.solidworks.naming import carrier_names_and_rules
 
         carrier_snapshot = _carrier_snapshot(carrier["root"], bodies, joints, raw)
@@ -1133,6 +1165,45 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
             limits.get("lower") == -PREVIEW_WINDOW_RAD and limits.get("upper") == PREVIEW_WINDOW_RAD,
             "The engineering default window does not equal the frozen full-turn radius",
         )
+    provenance = canonical.get("provenance") if isinstance(canonical.get("provenance"), dict) else {}
+
+    def require_record_binding(source_key, model_key, fields):
+        source_evidence = authored.get(source_key)
+        model_evidence = provenance.get(model_key)
+        _require(
+            isinstance(source_evidence, dict)
+            and source_evidence == model_evidence
+            and source_evidence.get("kind") in {"controlled_record", "native_declaration"}
+            and re.fullmatch(r"[0-9a-f]{64}", str(source_evidence.get("sha256") or "")) is not None
+            and all(
+                isinstance(source_evidence.get(key), str) and bool(source_evidence[key])
+                for key in ("file", "anchor", "key", "reference")
+            ),
+            f"Joint {model_key} does not bind the exact embedded controlled record",
+        )
+        declared = source_evidence.get("declared_values")
+        _require(
+            isinstance(declared, dict)
+            and set(declared) == set(fields)
+            and all(declared[field] == limits[field] for field in fields),
+            f"Joint {model_key} disagrees with its affected fields",
+        )
+        if source_key == "limit_evidence":
+            _require(
+                isinstance(source_evidence.get("native_observation_errors"), list),
+                "Controlled author limits hid native observation errors",
+            )
+
+    if (
+        limit_source == "declared_author" and authored["type"] != "continuous"
+    ) or authored.get("limit_evidence") is not None:
+        require_record_binding("limit_evidence", "limits_evidence", ("lower", "upper"))
+    _require(
+        authored.get("drive_source") != "controlled" or authored.get("drive_evidence") is not None,
+        "Controlled drive is missing its embedded-record evidence",
+    )
+    if authored.get("drive_evidence") is not None:
+        require_record_binding("drive_evidence", "drive_evidence", ("effort", "velocity"))
     unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
         unqualified.append("degenerate_position_range")
@@ -2147,7 +2218,17 @@ def _engineering_status(fact_id: str, object_id: str, joints: dict, preview: boo
     if fact_id == "engineering_position_range":
         return "established" if joint.get("limit_source") in ("native", "declared_author") else "unqualified"
     limits = joint.get("limits") or {}
-    return "established" if "effort" in limits and "velocity" in limits else "unqualified"
+    return (
+        "established"
+        if all(
+            key in limits
+            and type(limits[key]) in (int, float)
+            and math.isfinite(limits[key])
+            and limits[key] > 0
+            for key in ("effort", "velocity")
+        )
+        else "unqualified"
+    )
 
 
 def _mass_closure_equality(root, definition=None):
@@ -2504,6 +2585,10 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
         )
 
     expected: dict[str, list[dict]] = {}
+    declared_author_limits = []
+    controlled_drive = []
+    unqualified_drive = []
+    evidence_owners: dict[tuple[str, str, str, str, str], str] = {}
 
     def add(code, value):
         expected.setdefault(code, []).append(value)
@@ -2686,6 +2771,117 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
                     "native_observation_errors": policy.get("native_observation_errors"),
                 },
             )
+        limit_evidence = joint.get("limit_evidence")
+        drive_evidence = joint.get("drive_evidence")
+        limit_evidence = limit_evidence if isinstance(limit_evidence, dict) else {}
+        drive_evidence = drive_evidence if isinstance(drive_evidence, dict) else {}
+        model_limits = (model_joint or {}).get("limits")
+        model_limits = model_limits if isinstance(model_limits, dict) else {}
+        model_provenance = (
+            model_joint.get("provenance") if isinstance((model_joint or {}).get("provenance"), dict) else {}
+        )
+
+        def observe_evidence(evidence, fields, limits=model_limits, joint_name=joint["name"]):
+            declared = evidence.get("declared_values")
+            _require(
+                isinstance(declared, dict)
+                and set(declared) == set(fields)
+                and all(field in limits for field in fields)
+                and all(declared[field] == limits[field] for field in fields),
+                "A controlled record no longer binds its delivered joint fields",
+            )
+            _require(
+                evidence.get("kind") in {"controlled_record", "native_declaration"},
+                "Controlled evidence has no recognized source kind",
+            )
+            identity = tuple(
+                str(evidence.get(key) or "")
+                for key in ("file", "sha256", "anchor", "key", "reference")
+            )
+            _require(all(identity), "Controlled record provenance lacks file, sha, anchor, or key")
+            if evidence.get("kind") == "controlled_record":
+                previous = evidence_owners.setdefault(identity, joint_name)
+                _require(
+                    previous == joint_name,
+                    "One controlled record entry is reused across joint identities",
+                )
+
+        if joint.get("limit_source") == "declared_author":
+            if joint.get("type") != "continuous":
+                _require(
+                    model_provenance.get("limits_evidence") == limit_evidence,
+                    "Model limits evidence is missing, foreign, or differs from the controlled record",
+                )
+                observe_evidence(limit_evidence, ("lower", "upper"))
+            declared = limit_evidence.get("declared_values") or {}
+            for field in (() if joint.get("type") == "continuous" else ("lower", "upper")):
+                declared_author_limits.append(
+                    {
+                        "object_type": "joint",
+                        "object": joint["name"],
+                        "field": field,
+                        "actual": model_limits[field],
+                        "source": "controlled author dp.joint.limits_record",
+                        "original": declared[field],
+                        "file": limit_evidence.get("file"),
+                        "sha256": limit_evidence.get("sha256"),
+                        "anchor": limit_evidence.get("anchor"),
+                        "key": limit_evidence.get("key"),
+                        "reference": limit_evidence.get("reference"),
+                        "native_observation_errors": limit_evidence.get("native_observation_errors") or [],
+                        "rule_id": "limits.declared_author",
+                        "rule_version": "v1",
+                        "reason": "controlled author position range is not a native CAD reading",
+                    }
+                )
+        _require(
+            joint.get("drive_source") != "controlled" or bool(drive_evidence),
+            "Controlled drive evidence is missing from the independent source",
+        )
+        if drive_evidence:
+            _require(
+                model_provenance.get("drive_evidence") == drive_evidence,
+                "Model drive evidence is missing, foreign, or differs from the controlled record",
+            )
+            observe_evidence(drive_evidence, ("effort", "velocity"))
+            declared = drive_evidence.get("declared_values") or {}
+            for field in ("effort", "velocity"):
+                row = {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": field,
+                    "actual": model_limits[field],
+                    "source": "controlled author dp.joint.drive_record",
+                    "original": declared[field],
+                    "file": drive_evidence.get("file"),
+                    "sha256": drive_evidence.get("sha256"),
+                    "anchor": drive_evidence.get("anchor"),
+                    "key": drive_evidence.get("key"),
+                    "reference": drive_evidence.get("reference"),
+                    "rule_id": "drive.declared_author",
+                    "rule_version": "v1",
+                    "reason": "controlled author drive value is not a native CAD reading",
+                }
+                controlled_drive.append(row)
+                if model_limits[field] == 0:
+                    unqualified_drive.append(
+                        {
+                            **row,
+                            "rule_id": "drive.nonzero_required",
+                            "reason": (
+                                "zero effort or velocity is retained but does not qualify drive sizing"
+                            ),
+                        }
+                    )
+    if declared_author_limits:
+        for row in declared_author_limits:
+            add("limits.declared_author", row)
+    if controlled_drive:
+        for row in controlled_drive:
+            add("drive.declared_author", row)
+    if unqualified_drive:
+        for row in unqualified_drive:
+            add("drive.unqualified", row)
     for frame in source.get("frames", []):
         source_name = str(frame.get("source_name") or "")
         native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
@@ -2925,6 +3121,17 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
             "Engineering uses a versioned default rotation window because no usable native "
             "or authored position range was read; the engineering position range is unqualified."
         ),
+        "limits.declared_author": (
+            "Joint position values come from a controlled author record; they are not native CAD readings."
+        ),
+        "drive.declared_author": (
+            "Joint drive values come from a controlled author record; "
+            "they are preserved but are not native CAD readings."
+        ),
+        "drive.unqualified": (
+            "Controlled drive values of zero are retained for delivery but do not "
+            "qualify effort or velocity sizing."
+        ),
         "naming.formatted_robot_name": "The robot name is formatted from the native top-assembly filename.",
         "physics.derived_from_native": (
             "Link mass properties are transformed, translated or recombined from native readings."
@@ -2942,9 +3149,12 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
         "Non-native value provenance warning messages differ from the delivery",
     )
     for code in sorted(expected):
+        actual_rows = canonical(actual[code])
+        expected_rows = canonical(expected[code])
         _require(
-            canonical(actual[code]) == canonical(expected[code]),
-            f"Non-native value provenance warning objects differ for {code}",
+            actual_rows == expected_rows,
+            f"Non-native value provenance warning objects differ for {code}: "
+            f"actual={actual_rows} expected={expected_rows}",
         )
     return {
         "codes": sorted(actual),

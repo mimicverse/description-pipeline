@@ -70,6 +70,10 @@ class EngineeringFactTests(unittest.TestCase):
         self.assertEqual(statuses[("drive_sizing", "hinge")], "unqualified")
         statuses = self._statuses(self._definition(limit_source="declared_author"))
         self.assertEqual(statuses[("engineering_position_range", "hinge")], "established")
+        zero_drive = self._definition(limit_source="declared_author")
+        zero_drive["source"]["joints"][0]["limits"]["effort"] = 0.0
+        statuses = self._statuses(zero_drive)
+        self.assertEqual(statuses[("drive_sizing", "hinge")], "unqualified")
         statuses = self._statuses(self._definition(limit_source="default_policy"))
         self.assertEqual(statuses[("engineering_position_range", "hinge")], "unqualified")
 

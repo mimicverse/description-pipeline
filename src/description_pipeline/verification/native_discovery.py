@@ -2392,6 +2392,12 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         for mate_item in mates:
             mate_kind = str(mate_item.get("type") or "").strip().lower()
             if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                if mate_item.get("suppressed") is True:
+                    continue
+                if mate_item.get("is_advanced_mate_error") is not None:
+                    native_read_errors.append(
+                        {"mate": mate_item.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                    )
                 continue
             if mate_item.get("suppressed") is True:
                 continue
@@ -2459,15 +2465,21 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             entry = _find_record_entry(payload, author_reference)
             value = _record_value(package, entry["entry"], entry["key"])
             _require(
+                isinstance(entry["entry"].get("anchor"), str)
+                and bool(entry["entry"]["anchor"]),
+                "discovery.joint_limits_invalid",
+                "controlled limits record lacks an embedded anchor",
+                {"pair": [left, right], "reference": author_reference},
+            )
+            _require(
                 isinstance(value, dict),
                 "discovery.joint_limits_invalid",
                 "controlled limits record must contain an object",
                 {"pair": [left, right], "reference": author_reference},
             )
-            try:
-                author_lower = float(value["lower"])
-                author_upper = float(value["upper"])
-            except (KeyError, TypeError, ValueError):
+            author_lower = _number(value.get("lower"))
+            author_upper = _number(value.get("upper"))
+            if author_lower is None or author_upper is None:
                 raise _Failure(
                     "discovery.joint_limits_invalid",
                     "controlled limits record lacks finite lower/upper values",
@@ -2483,10 +2495,18 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             )
             author_limits = (author_lower, author_upper)
             author_evidence = {
+                "kind": "controlled_record",
                 "file": entry["entry"].get("package_file"),
                 "sha256": entry["entry"].get("sha256"),
                 "anchor": entry["entry"].get("anchor"),
-                "value": value,
+                "key": str(entry["entry"].get("key") or entry["key"]),
+                "reference": str(entry["entry"].get("reference") or author_reference),
+                "declared_values": {
+                    key: value[key]
+                    for key in ("lower", "upper", "effort", "velocity")
+                    if key in value
+                },
+                "native_observation_errors": list(native_read_errors),
             }
         if native_read_errors and (validated_native or isinstance(native_limits, dict)):
             raise _Failure(
@@ -2558,19 +2578,26 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             )
         drive_reference = properties.get(f"{namespace}.joint.drive_record")
         drive = None
+        drive_evidence = None
         if isinstance(drive_reference, str) and drive_reference.strip():
             entry = _find_record_entry(payload, drive_reference)
             value = _record_value(package, entry["entry"], entry["key"])
+            _require(
+                isinstance(entry["entry"].get("anchor"), str)
+                and bool(entry["entry"]["anchor"]),
+                "discovery.joint_rebuild",
+                "controlled drive record lacks an embedded anchor",
+                {"pair": [left, right], "reference": drive_reference},
+            )
             _require(
                 isinstance(value, dict),
                 "discovery.joint_rebuild",
                 "drive record must contain an object",
                 {"pair": [left, right]},
             )
-            try:
-                effort = float(value["effort"])
-                velocity_limit = float(value["velocity"])
-            except (KeyError, TypeError, ValueError):
+            effort = _number(value.get("effort"))
+            velocity_limit = _number(value.get("velocity"))
+            if effort is None or velocity_limit is None:
                 raise _Failure(
                     "discovery.joint_rebuild",
                     "drive record lacks finite effort/velocity",
@@ -2591,6 +2618,19 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "anchor": entry["entry"].get("anchor"),
                 "value": value,
             }
+            drive_evidence = {
+                "kind": "controlled_record",
+                "file": entry["entry"].get("package_file"),
+                "sha256": entry["entry"].get("sha256"),
+                "anchor": entry["entry"].get("anchor"),
+                "key": str(entry["entry"].get("key") or entry["key"]),
+                "reference": str(entry["entry"].get("reference") or drive_reference),
+                "declared_values": {
+                    key: value[key]
+                    for key in ("effort", "velocity")
+                    if key in value
+                },
+            }
         facts.append(
             {
                 "nodes": (left_body, right_body),
@@ -2605,6 +2645,7 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                     "axis_reference": axis_reference,
                     "limits": limits,
                     "drive": drive,
+                "drive_evidence": drive_evidence,
                     "limit_evidence": limit_evidence,
                     "limit_source": limit_source,
                     **({"default_policy": default_policy} if default_policy is not None else {}),
@@ -4613,18 +4654,22 @@ def verify_discovery(package: Path) -> dict:
 
 def _find_record_entry(payload: dict, reference: str) -> dict:
     relative, _, key = str(reference).partition("#")
-    for entry in payload.get("records") or []:
+    matches = [
+        entry
+        for entry in payload.get("records") or []
         if (
             isinstance(entry, dict)
             and str(entry.get("file")) == relative.replace("\\", "/")
             and str(entry.get("key") or "") == key
-        ):
-            return {"entry": entry, "key": key}
-    raise _Failure(
+        )
+    ]
+    _require(
+        len(matches) == 1,
         "discovery.record",
-        "the referenced controlled record was not embedded in the package",
-        {"reference": reference},
+        "the referenced controlled record must identify exactly one embedded entry",
+        {"reference": reference, "matches": len(matches)},
     )
+    return {"entry": matches[0], "key": key}
 
 
 def _source_record_identity(records) -> list[dict]:

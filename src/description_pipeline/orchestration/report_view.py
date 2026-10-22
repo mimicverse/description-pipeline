@@ -85,6 +85,9 @@ _DISCOVERY_CODE_LABELS = {
     "limits.default_policy": (
         "Engineering default rotation window; no native mechanical range or engineering qualification is claimed"
     ),
+    "limits.declared_author": "Controlled author limits are preserved but are not native CAD readings",
+    "drive.declared_author": "Controlled author drive values are preserved but are not native CAD readings",
+    "drive.unqualified": "Zero effort or velocity is retained but drive sizing remains unqualified",
     "discovery.joint_default_policy": (
         "Engineering default rotation window; no usable native or authored range was read"
     ),
@@ -833,6 +836,11 @@ _WARNING_DETAIL_KEYS = (
     "original",
     "actual",
     "source",
+    "file",
+    "sha256",
+    "anchor",
+    "key",
+    "reference",
     "rule_id",
     "rule_version",
     "reason",

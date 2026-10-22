@@ -516,6 +516,14 @@ def _finite_vector(value: Any, length: int) -> list[float] | None:
     return numbers
 
 
+def _controlled_number(value: Any) -> float | None:
+    """A finite JSON number from a controlled record; booleans and strings fail."""
+    if type(value) not in (int, float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def _unit_vector(value: Any) -> list[float] | None:
     numbers = _finite_vector(value, 3)
     if numbers is None:
@@ -1992,6 +2000,16 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         for mate_item in mates:
             mate_kind = str(mate_item.get("type") or "").strip().lower()
             if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                if mate_item.get("suppressed") is True:
+                    continue
+                if mate_item.get("is_advanced_mate_error") is not None:
+                    native_limit_errors.append(
+                        {"mate": mate_item.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                    )
+                elif mate_item.get("native_limit") is not None:
+                    native_limit_invalid.append(
+                        {"mate": mate_item.get("name"), "reason": "native evidence is attached to another mate type"}
+                    )
                 continue
             if mate_item.get("suppressed") is True:
                 continue
@@ -2048,10 +2066,10 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             declared_limit = _resolve_record(settings, str(declared_ref), findings, obj)
             if declared_limit is None:
                 continue
-            try:
-                declared_lower = float(declared_limit["value"]["lower"])
-                declared_upper = float(declared_limit["value"]["upper"])
-            except (KeyError, TypeError, ValueError):
+            value = declared_limit.get("value")
+            declared_lower = _controlled_number(value.get("lower")) if isinstance(value, dict) else None
+            declared_upper = _controlled_number(value.get("upper")) if isinstance(value, dict) else None
+            if declared_lower is None or declared_upper is None:
                 findings.append(
                     _finding(
                         "discovery.joint_limits_invalid",
@@ -2216,10 +2234,9 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             drive_source = "controlled"
         if drive is not None:
             spec = drive["value"]
-            try:
-                effort = float(spec["effort"])
-                velocity_value = float(spec["velocity"])
-            except (KeyError, TypeError, ValueError):
+            effort = _controlled_number(spec.get("effort")) if isinstance(spec, dict) else None
+            velocity_value = _controlled_number(spec.get("velocity")) if isinstance(spec, dict) else None
+            if effort is None or velocity_value is None:
                 findings.append(
                     _finding(
                         "discovery.joint_drive_invalid",
@@ -2229,18 +2246,20 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     )
                 )
                 continue
-            if not (math.isfinite(effort) and math.isfinite(velocity_value)) or effort <= 0.0 or velocity_value <= 0.0:
+            if effort < 0.0 or velocity_value < 0.0:
                 findings.append(
                     _finding(
                         "discovery.joint_drive_invalid",
                         obj,
-                        "drive record effort/velocity must be finite and positive",
+                        "drive record effort/velocity must be finite and nonnegative",
                         {"file": drive["file"]},
                     )
                 )
                 continue
-            if default_policy is not None:
+            if isinstance(limits, dict):
                 limits.update(effort=effort, velocity=velocity_value)
+            elif joint_type == "continuous":
+                limits = {"effort": effort, "velocity": velocity_value}
         if joint_type != "continuous" and limits is not None and limits["lower"] == limits["upper"]:
             findings.append(
                 _finding(
@@ -2277,6 +2296,9 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "limits": limits,
                 "limit_evidence": limit_evidence,
                 "limit_source": limit_source,
+                "native_observation_errors": (
+                    list(native_limit_errors) if limit_source == "declared_author" else []
+                ),
                 **({"default_policy": default_policy} if default_policy is not None else {}),
                 "drive": drive,
                 "drive_source": drive_source,
@@ -3314,7 +3336,7 @@ def _exporter_joint_facts(
         if kind != "fixed":
 
             def valid(value):
-                return type(value) in (int, float) and math.isfinite(value)
+                return _controlled_number(value) is not None
 
             bounds_usable = (
                 kind != "continuous"
@@ -3671,6 +3693,7 @@ def _exporter_joint_facts(
                 "axis": axis,
                 "declared_axis": declared_axis,
                 "delivered_axis": delivered_axis,
+                "declared_limits": dict(limits) if isinstance(limits, dict) else None,
                 "axis_reference": selector,
                 "limits": limits,
                 "limit_source": limit_source,
@@ -4798,6 +4821,25 @@ def _embed_record(output: Path, resolved: dict, records: list[dict]) -> dict:
     return entry
 
 
+def _evidence_summary(resolved: dict, embedded: dict) -> dict[str, Any]:
+    """Stable controlled-record provenance for delivery warnings and verification."""
+
+    value = resolved.get("value") if isinstance(resolved.get("value"), dict) else {}
+    return {
+        "kind": "controlled_record",
+        "file": str(embedded.get("package_file") or ""),
+        "sha256": str(embedded.get("sha256") or ""),
+        "anchor": embedded.get("anchor"),
+        "key": str(embedded.get("key") or ""),
+        "reference": str(embedded.get("reference") or ""),
+        "declared_values": {
+            key: value[key]
+            for key in ("lower", "upper", "effort", "velocity")
+            if key in value
+        },
+    }
+
+
 def _copy_tree(source: Path, output: Path, files: Mapping[str, str]) -> None:
     for name in sorted(files):
         original = confined(source, name)
@@ -5786,15 +5828,42 @@ def source_definition(
                     else ("lower", "upper", "effort", "velocity")
                 )
             }
-            entry["limit_evidence"] = {
+            raw_limits = joint.get("declared_limits")
+            declared_values = {}
+            if isinstance(raw_limits, dict):
+                for field in ("lower", "upper", "effort", "velocity"):
+                    if field not in raw_limits:
+                        continue
+                    value = _controlled_number(raw_limits[field])
+                    if value is None:
+                        raise PipelineError(
+                            f"joint {joint['name']!r} exporter declaration has an invalid {field}"
+                        )
+                    declared_values[field] = value
+            common_evidence = {
+                "kind": "native_declaration",
                 "file": discovery_name,
                 "sha256": discovery_sha256,
                 "anchor": raw["exporter"]["raw_xml_sha256"],
+                "key": "raw.exporter.raw_xml",
+                "reference": f"{discovery_name}#raw.exporter.raw_xml",
             }
-            if isinstance(joint.get("declared_limits"), dict):
-                entry["limit_evidence"].update(
-                    {f"declared_{key}": str(value) for key, value in joint["declared_limits"].items()}
-                )
+            if joint.get("limit_source") == "declared_author" and joint["type"] != "continuous":
+                entry["limit_evidence"] = {
+                    **common_evidence,
+                    "declared_values": {
+                        field: declared_values[field] for field in ("lower", "upper")
+                    },
+                    "native_observation_errors": [],
+                }
+            if all(field in declared_values for field in ("effort", "velocity")):
+                entry["drive_evidence"] = {
+                    **common_evidence,
+                    "declared_values": {
+                        field: declared_values[field] for field in ("effort", "velocity")
+                    },
+                }
+                entry["drive_source"] = "controlled"
         elif joint["type"] == "continuous":
             if joint.get("drive") is not None:
                 entry["limits"] = {
@@ -5809,22 +5878,42 @@ def source_definition(
             if joint.get("drive") is not None:
                 entry["limits"]["effort"] = float(joint["drive"]["value"]["effort"])
                 entry["limits"]["velocity"] = float(joint["drive"]["value"]["velocity"])
-        if joint.get("limit_evidence") is not None:
+        limit_evidence = joint.get("limit_evidence")
+        if isinstance(limit_evidence, dict):
             embedded = next(
                 (
                     item
                     for item in records
-                    if item["file"] == str(joint["limit_evidence"]["file"]).replace("\\", "/")
-                    and item["key"] == str(joint["limit_evidence"].get("key") or "")
+                    if item["file"] == str(limit_evidence["file"]).replace("\\", "/")
+                    and item["key"] == str(limit_evidence.get("key") or "")
                 ),
                 None,
             )
-            if embedded is not None and embedded.get("anchor"):
-                entry["limit_evidence"] = {
-                    "file": embedded["package_file"],
-                    "sha256": embedded["sha256"],
-                    "anchor": embedded["anchor"],
-                }
+            if embedded is None:
+                raise PipelineError(
+                    f"joint {joint['name']!r} limit evidence is not in the embedded record index"
+                )
+            entry["limit_evidence"] = _evidence_summary(limit_evidence, embedded)
+            entry["limit_evidence"]["native_observation_errors"] = list(
+                joint.get("native_observation_errors") or []
+            )
+        drive_evidence = joint.get("drive")
+        if isinstance(drive_evidence, dict):
+            embedded = next(
+                (
+                    item
+                    for item in records
+                    if item["file"] == str(drive_evidence["file"]).replace("\\", "/")
+                    and item["key"] == str(drive_evidence.get("key") or "")
+                ),
+                None,
+            )
+            if embedded is None:
+                raise PipelineError(
+                    f"joint {joint['name']!r} drive evidence is not in the embedded record index"
+                )
+            entry["drive_evidence"] = _evidence_summary(drive_evidence, embedded)
+            entry["drive_source"] = "controlled"
         if joint.get("limit_source") is not None:
             entry["limit_source"] = str(joint["limit_source"])
         joints_out.append(entry)

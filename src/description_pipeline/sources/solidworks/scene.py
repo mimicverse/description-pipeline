@@ -812,7 +812,16 @@ def _build_joints(
             )
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
-            entry["provenance"]["limits_evidence"] = {str(key): str(value) for key, value in limit_evidence.items()}
+            entry["provenance"]["limits_evidence"] = {
+                str(key): dict(value) if isinstance(value, dict) else value
+                for key, value in limit_evidence.items()
+            }
+        drive_evidence = joint.get("drive_evidence")
+        if isinstance(drive_evidence, dict):
+            entry["provenance"]["drive_evidence"] = {
+                str(key): dict(value) if isinstance(value, dict) else value
+                for key, value in drive_evidence.items()
+            }
         limit_source = joint.get("limit_source")
         if isinstance(limit_source, str) and limit_source:
             entry["limit_source"] = limit_source
@@ -871,6 +880,9 @@ def _value_warnings(
     sign_reversals = []
     preview_limits = []
     default_limits = []
+    declared_author_limits = []
+    controlled_drive = []
+    unqualified_drive = []
     visuals = []
     mesh_paths = []
     for body in bodies:
@@ -1031,6 +1043,79 @@ def _value_warnings(
                     "native_observation_errors": policy.get("native_observation_errors"),
                 }
             )
+        limit_evidence = source_joint.get("limit_evidence")
+        drive_evidence = source_joint.get("drive_evidence")
+        limit_evidence = limit_evidence if isinstance(limit_evidence, dict) else {}
+        drive_evidence = drive_evidence if isinstance(drive_evidence, dict) else {}
+        if source_joint.get("limit_source") == "declared_author" and source_joint.get("type") != "continuous":
+            declared_values = limit_evidence.get("declared_values")
+            if not isinstance(declared_values, dict) or not {"lower", "upper"} <= set(declared_values):
+                raise ConfigError(
+                    "declared author limits are missing their embedded-record evidence",
+                    {"joint": joint["name"]},
+                )
+        if source_joint.get("drive_source") == "controlled" and not drive_evidence:
+            raise ConfigError(
+                "controlled drive is missing its embedded-record evidence",
+                {"joint": joint["name"]},
+            )
+        if source_joint.get("limit_source") == "declared_author":
+            declared_values = limit_evidence.get("declared_values")
+            declared_values = declared_values if isinstance(declared_values, dict) else {}
+            for field in ("lower", "upper"):
+                if field not in declared_values or field not in joint["limits"]:
+                    continue
+                declared_author_limits.append(
+                    {
+                        "object_type": "joint",
+                        "object": joint["name"],
+                        "field": field,
+                        "actual": joint["limits"][field],
+                        "source": "controlled author dp.joint.limits_record",
+                        "original": declared_values[field],
+                        "file": limit_evidence.get("file"),
+                        "sha256": limit_evidence.get("sha256"),
+                        "anchor": limit_evidence.get("anchor"),
+                        "key": limit_evidence.get("key"),
+                        "reference": limit_evidence.get("reference"),
+                        "native_observation_errors": limit_evidence.get("native_observation_errors") or [],
+                        "rule_id": "limits.declared_author",
+                        "rule_version": "v1",
+                        "reason": "controlled author position range is not a native CAD reading",
+                    }
+                )
+        declared_drive = drive_evidence.get("declared_values")
+        declared_drive = declared_drive if isinstance(declared_drive, dict) else {}
+        for field in ("effort", "velocity"):
+            if field not in joint["limits"]:
+                continue
+            if field not in declared_drive:
+                continue
+            row = {
+                "object_type": "joint",
+                "object": joint["name"],
+                "field": field,
+                "actual": joint["limits"][field],
+                "source": "controlled author dp.joint.drive_record",
+                "original": declared_drive[field],
+                "file": drive_evidence.get("file"),
+                "sha256": drive_evidence.get("sha256"),
+                "anchor": drive_evidence.get("anchor"),
+                "key": drive_evidence.get("key"),
+                "reference": drive_evidence.get("reference"),
+                "rule_id": "drive.declared_author",
+                "rule_version": "v1",
+                "reason": "controlled author drive value is not a native CAD reading",
+            }
+            controlled_drive.append(row)
+            if joint["limits"][field] == 0:
+                unqualified_drive.append(
+                    {
+                        **row,
+                        "rule_id": "drive.nonzero_required",
+                        "reason": "zero effort or velocity is retained but does not qualify drive sizing",
+                    }
+                )
     for frame in cfg.get("frames") or []:
         source_name = str(frame.get("source_name") or "")
         native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
@@ -1153,6 +1238,39 @@ def _value_warnings(
                     "or authored position range was read; the engineering position range is unqualified."
                 ),
                 "objects": default_limits,
+            }
+        )
+    if declared_author_limits:
+        warnings.append(
+            {
+                "code": "limits.declared_author",
+                "message": (
+                    "Joint position values come from a controlled author record; "
+                    "they are not native CAD readings."
+                ),
+                "objects": declared_author_limits,
+            }
+        )
+    if controlled_drive:
+        warnings.append(
+            {
+                "code": "drive.declared_author",
+                "message": (
+                    "Joint drive values come from a controlled author record; "
+                    "they are preserved but are not native CAD readings."
+                ),
+                "objects": controlled_drive,
+            }
+        )
+    if unqualified_drive:
+        warnings.append(
+            {
+                "code": "drive.unqualified",
+                "message": (
+                    "Controlled drive values of zero are retained for delivery but do not "
+                    "qualify effort or velocity sizing."
+                ),
+                "objects": unqualified_drive,
             }
         )
     if visuals:

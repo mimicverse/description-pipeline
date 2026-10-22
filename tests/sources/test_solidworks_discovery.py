@@ -37,9 +37,11 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     SubmissionIdentity,
     derive_native_package,
     prepare_native_package,
+    source_definition,
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
+from description_pipeline.sources.solidworks.scene import _value_warnings  # noqa: E402
 from description_pipeline.verification.solidworks_urdf import _carrier_snapshot  # noqa: E402
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA  # noqa: E402
 from description_pipeline.verification.native_discovery import (  # noqa: E402
@@ -370,6 +372,36 @@ class DiscoveryTests(unittest.TestCase):
             record=payload,
         )
         return verify_discovery(delivery)
+
+    def _rewrite_delivery_controlled_record(self, delivery: Path, mutate) -> None:
+        discovery_path = delivery / "evidence/discovery.json"
+        discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+        entries = [
+            item
+            for item in discovery["records"]
+            if item.get("file") == "joints/arm.json"
+        ]
+        self.assertTrue(entries)
+        package_file = str(entries[0]["package_file"])
+        record_path = delivery / "input/records" / package_file
+        value = json.loads(record_path.read_text(encoding="utf-8"))
+        mutate(value)
+        content = json.dumps(value, indent=2).encode("utf-8")
+        record_path.write_bytes(content)
+        checksum = hashlib.sha256(content).hexdigest()
+        for entry in entries:
+            entry["sha256"] = checksum
+            entry["source_sha256"] = checksum
+        discovery_path.write_text(json.dumps(discovery, indent=2) + "\n", encoding="utf-8")
+
+        source_path = delivery / "input/source.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        for row in source["identity"]["records"]:
+            if str(row.get("reference") or "").startswith("joints/arm.json#"):
+                row["file_sha256"] = checksum
+        source["source_revision_id"] = digest(source["identity"])
+        source_path.write_text(json.dumps(source, indent=2) + "\n", encoding="utf-8")
+        support.seal_delivery(delivery)
 
     def test_native_preparation_forwards_the_guarded_activity_sink(self):
         class ActivityBackend:
@@ -1327,6 +1359,169 @@ class DiscoveryTests(unittest.TestCase):
         limits_entry["sha256"] = hashlib.sha256(invalid_bytes).hexdigest()
         with self.assertRaisesRegex(Exception, "finite and ordered"):
             rebuild_joint_facts(payload, baseline_output, purpose="engineering")
+
+    def test_controlled_numbers_reject_boolean_string_and_nonfinite_fields(self):
+        def author_limits(payload):
+            payload["mates"][0]["limits"] = None
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
+                "dp.joint.limits_record"
+            ] = "joints/arm.json#limits"
+
+        cases = (
+            ("boolean position", {"lower": False, "upper": True}, author_limits),
+            ("string position", {"lower": "0", "upper": "1"}, author_limits),
+            ("nan position", {"lower": float("nan"), "upper": 1.0}, author_limits),
+            ("infinite position", {"lower": 0.0, "upper": float("inf")}, author_limits),
+            ("boolean effort", {"effort": True, "velocity": 1.0}, None),
+            ("boolean velocity", {"effort": 1.0, "velocity": False}, None),
+            ("string effort", {"effort": "1", "velocity": 1.0}, None),
+            ("string velocity", {"effort": 1.0, "velocity": "1"}, None),
+            ("nan effort", {"effort": float("nan"), "velocity": 1.0}, None),
+            ("infinite velocity", {"effort": 1.0, "velocity": float("inf")}, None),
+            ("negative effort", {"effort": -1.0, "velocity": 1.0}, None),
+            ("negative velocity", {"effort": 1.0, "velocity": -1.0}, None),
+        )
+        for label, limits_value, mutate in cases:
+            with self.subTest(label=label):
+                record_value = {
+                    "limits": (
+                        limits_value
+                        if mutate is author_limits
+                        else {"lower": -1.5, "upper": 1.5}
+                    ),
+                    "drive": (
+                        limits_value
+                        if mutate is None
+                        else {"effort": 6.0, "velocity": 2.0}
+                    ),
+                }
+                result, _source, _output = self._prepare(
+                    mutate=mutate,
+                    joint_record=record_value,
+                )
+                self.assertFalse(result.passed)
+                self.assertNotIn(
+                    "discovery.joint_default_policy",
+                    {item["code"] for item in result.findings},
+                )
+
+                baseline, _source, output = self._prepare(
+                    mutate=mutate,
+                    joint_record={
+                        "limits": {"lower": -1.5, "upper": 1.5},
+                        "drive": {"effort": 6.0, "velocity": 2.0},
+                    },
+                )
+                self.assertTrue(baseline.passed, baseline.findings)
+                delivery = self._deliver(output)
+                self._rewrite_delivery_controlled_record(
+                    delivery,
+                    lambda record, limits_value=limits_value, mutate=mutate: record.update(
+                        {
+                            "limits": (
+                                limits_value
+                                if mutate is author_limits
+                                else {"lower": -1.5, "upper": 1.5}
+                            ),
+                            "drive": (
+                                limits_value
+                                if mutate is None
+                                else {"effort": 6.0, "velocity": 2.0}
+                            ),
+                        }
+                    ),
+                )
+                report = verify_discovery(delivery)
+                self.assertFalse(report["passed"])
+
+    def test_controlled_drive_zero_is_preserved_for_revolute_and_continuous(self):
+        record_value = {
+            "limits": {"lower": -1.5, "upper": 1.5},
+            "drive": {"effort": 0.0, "velocity": 0.0},
+        }
+        result, _source, output = self._prepare(joint_record=record_value)
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertEqual((joint["limits"]["effort"], joint["limits"]["velocity"]), (0.0, 0.0))
+        self.assertTrue(self._verify(output)["passed"])
+
+        continuous_record = {
+            "limits": {"lower": -1.5, "upper": 1.5},
+            "drive": {"effort": 0.0, "velocity": 0.0},
+        }
+
+        def continuous(payload):
+            payload["mates"][0]["limits"] = None
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"]["dp.joint.type"] = "continuous"
+
+        result, _source, output = self._prepare(
+            mutate=continuous,
+            joint_record=continuous_record,
+        )
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
+        self.assertEqual(joint["limits"], {"effort": 0.0, "velocity": 0.0})
+        self.assertTrue(self._verify(output)["passed"])
+
+    def test_controlled_evidence_reaches_source_warnings_with_native_read_errors(self):
+        record_value = {
+            "limits": {"lower": -1.5, "upper": 1.5},
+            "drive": {"effort": 0.0, "velocity": 0.0},
+        }
+
+        def unreadable_native_with_author(payload):
+            payload["mates"][0].update(
+                {
+                    "limits": None,
+                    "is_advanced_mate": False,
+                    "is_advanced_mate_error": "native failure",
+                    "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+                    "native_limit": None,
+                }
+            )
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
+                "dp.joint.limits_record"
+            ] = "joints/arm.json#limits"
+
+        result, _source, output = self._prepare(
+            mutate=unreadable_native_with_author,
+            joint_record=record_value,
+        )
+        self.assertTrue(result.passed, result.findings)
+        definition = source_definition(
+            self._deliver(output),
+            discovery_name="evidence/discovery.json",
+            cad_prefix="input/cad/",
+            records_prefix="input/records/",
+        )
+        joint = definition["joints"][0]
+        self.assertEqual(joint["limit_source"], "declared_author")
+        self.assertEqual(joint["limits"], record_value["limits"] | record_value["drive"])
+        self.assertRegex(joint["limit_evidence"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(joint["limit_evidence"]["key"], "limits")
+        self.assertEqual(
+            joint["limit_evidence"]["declared_values"],
+            record_value["limits"],
+        )
+        self.assertTrue(joint["limit_evidence"]["native_observation_errors"])
+        self.assertEqual(joint["drive_evidence"]["key"], "drive")
+        self.assertEqual(joint["drive_evidence"]["declared_values"], record_value["drive"])
+
+        warnings = _value_warnings(
+            definition,
+            definition["bodies"],
+            [],
+            [{"name": joint["name"], "axis": [0.0, 0.0, 1.0], "limits": joint["limits"]}],
+            [],
+        )
+        declared = next(item for item in warnings if item["code"] == "limits.declared_author")
+        self.assertEqual([row["field"] for row in declared["objects"]], ["lower", "upper"])
+        self.assertTrue(declared["objects"][0]["native_observation_errors"])
+        drive = next(item for item in warnings if item["code"] == "drive.declared_author")
+        self.assertEqual([row["field"] for row in drive["objects"]], ["effort", "velocity"])
+        self.assertIn("drive.unqualified", {item["code"] for item in warnings})
 
     def test_native_valid_range_conflicts_with_nonzero_author_record(self):
         record_value = {
