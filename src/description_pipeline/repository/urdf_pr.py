@@ -25,7 +25,15 @@ import tempfile
 import time
 from pathlib import Path
 
-from ..delivery import check_layout, read_delivery_manifest, read_source_record, subject_digest
+from ..delivery import (
+    SUBJECT_DIRECTORIES,
+    SUBJECT_FILES,
+    TRANSFER_FILES,
+    check_layout,
+    read_delivery_manifest,
+    read_source_record,
+    subject_digest,
+)
 from ..geometry.native_u import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_scope_warning_details_match,
@@ -53,6 +61,17 @@ GIT_ATTRIBUTES = (
 #: report stays outside the subject; every other receipt lives in platform run
 #: storage (contracts delivery format and digest).
 REPORTS_FILES = ("quality.json",)
+_SUBMISSION_SIDECARS = frozenset(
+    {
+        "manifest.json",
+        *SUBJECT_FILES,
+        "reports/quality.json",
+        *TRANSFER_FILES,
+        "reports/stages.json",
+        "reports/structural-team.json",
+        "reports/structural-team.md",
+    }
+)
 REQUIRED_FILES = (
     "manifest.json",
     "input/handoff.json",
@@ -208,7 +227,21 @@ def _bundle_purpose(bundle: Path) -> str:
     return purpose
 
 
-def _validate(bundle: Path) -> tuple[str, str, dict, dict]:
+def _check_submission_input_layout(bundle: Path) -> None:
+    """Allow only stage-owned sidecars outside the eventual strict delivery view."""
+
+    unknown = sorted(
+        path.relative_to(bundle).as_posix()
+        for path in bundle.rglob("*")
+        if path.is_file()
+        and path.relative_to(bundle).as_posix() not in _SUBMISSION_SIDECARS
+        and path.relative_to(bundle).parts[0] not in SUBJECT_DIRECTORIES
+    )
+    if unknown:
+        raise PrError("bundle_layout", f"Unregistered delivery entries: {unknown}")
+
+
+def _validate(bundle: Path, *, submission_input: bool = False) -> tuple[str, str, dict, dict]:
     for name in REQUIRED_FILES:
         if not (bundle / name).is_file():
             raise PrError("bundle_incomplete", name)
@@ -226,7 +259,10 @@ def _validate(bundle: Path) -> tuple[str, str, dict, dict]:
                 raise PrError("duplicate_path", {"first": seen[key], "second": rel})
             seen[key] = rel
     try:
-        check_layout(bundle)
+        if submission_input:
+            _check_submission_input_layout(bundle)
+        else:
+            check_layout(bundle)
     except PipelineError as error:
         raise PrError("bundle_layout", str(error)) from error
     try:
@@ -493,34 +529,22 @@ def _native_scope_warning_rows(report: dict) -> list[dict]:
     rows = [
         item
         for item in diagnostics
-        if isinstance(item, dict)
-        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        if isinstance(item, dict) and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
     native_gate_warnings = None
     native_gate_passed = False
     for check in report.get("checks") or []:
-        if (
-            isinstance(check, dict)
-            and check.get("id") == "geometry.native_tessellation"
-        ):
-            native_gate_passed = (
-                check.get("state") == "passed"
-                or check.get("passed") is True
-            )
+        if isinstance(check, dict) and check.get("id") == "geometry.native_tessellation":
+            native_gate_passed = check.get("state") == "passed" or check.get("passed") is True
             details = check.get("details")
-            warnings = (
-                details.get("warnings")
-                if isinstance(details, dict)
-                else None
-            )
+            warnings = details.get("warnings") if isinstance(details, dict) else None
             if isinstance(warnings, list):
                 native_gate_warnings = warnings
             break
     raw_scope = [
         item
         for item in native_gate_warnings or []
-        if isinstance(item, dict)
-        and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
+        if isinstance(item, dict) and item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
     ]
     if (native_gate_passed and native_gate_warnings is None) or (
         (rows or raw_scope)
@@ -639,12 +663,7 @@ def _open_pr_matches(
         for item in listing
     ):
         raise PrError("pr_listing_invalid", None)
-    return [
-        item
-        for item in listing
-        if item.get("baseRefName") == base
-        and item.get("headRefName") == branch
-    ]
+    return [item for item in listing if item.get("baseRefName") == base and item.get("headRefName") == branch]
 
 
 def _pr(
@@ -749,9 +768,10 @@ def submit_bundle(
     on_event=None,
 ) -> dict:
     """Validate, verify and publish one bundle through a fast-forward review branch and PR."""
-    bundle = Path(bundle).resolve()
+    source_bundle = Path(bundle).resolve()
     repository = Path(repository).resolve()
     lock_info = None
+    submission_root = None
     staging = None
     pushed = ""
     subject = ""
@@ -764,6 +784,14 @@ def submit_bundle(
         )
 
     try:
+        _validate(source_bundle, submission_input=True)
+        source_subject = subject_digest(source_bundle)
+        submission_root = Path(tempfile.mkdtemp(prefix="urdf-submission-"))
+        bundle = submission_root / "delivery"
+        bundle.mkdir()
+        _copy_governed(source_bundle, bundle)
+        if subject_digest(bundle) != source_subject:
+            raise PrError("submission_subject_mismatch", "staged delivery differs from the verified source subject")
         hardware, purpose, _manifest, current_revision = _validate(bundle)
         expected = review_branch(hardware, purpose)
         if branch != expected:
@@ -1010,6 +1038,8 @@ def submit_bundle(
             "subject": subject,
         }
     finally:
+        if submission_root is not None:
+            shutil.rmtree(submission_root, ignore_errors=True)
         if lock_info is not None:
             _, handle = lock_info
             os.close(handle)
