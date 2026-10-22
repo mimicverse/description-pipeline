@@ -537,6 +537,13 @@ def publish(
 
             submitted = publish_model(output, repository, base=base, message=message, on_event=event)
             receipt.update(submission=submitted, state=submitted.get("state", "failed"), passed=submitted["passed"])
+            if submitted["passed"] is not True:
+                error = submitted.get("error")
+                if error is not None:
+                    receipt["error"] = error
+                    receipt["error_code"] = error
+                if "detail" in submitted:
+                    receipt["detail"] = submitted["detail"]
             _stamp(output, receipt)
             return {**receipt, "output": str(output)}
         except Exception as error:
