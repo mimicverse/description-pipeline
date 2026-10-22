@@ -676,6 +676,8 @@ class ReleaseRecoveryTests(unittest.TestCase):
             mixed = self.add_promotion_history(copy.deepcopy(rollback_only))
             retried = copy.deepcopy(mixed)
             retried["steps"].insert(14, {"verb": "rollback", "step": "rollback-close", "status": "failed"})
+            for index, row in enumerate(retried["steps"], 1):
+                row["seq"] = index
             for history in (rollback_only, mixed, retried):
                 with self.subTest(rows=len(history["steps"])):
                     path.write_text(json.dumps(history), encoding="utf-8")
@@ -697,8 +699,15 @@ class ReleaseRecoveryTests(unittest.TestCase):
                 "unknown_rollback": lambda d: d["steps"][-1].update(status="unknown"),
                 "missing_step": lambda d: d["steps"].pop(),
                 "later_failure": lambda d: d["steps"].append(
-                    {"verb": "rollback", "step": "rollback-close", "status": "failed"}
+                    {"seq": 22, "verb": "rollback", "step": "rollback-close", "status": "failed"}
                 ),
+                "bad_seq_type": lambda d: d["steps"][0].update(seq="1"),
+                "boolean_seq": lambda d: d["steps"][0].update(seq=True),
+                "zero_seq": lambda d: d["steps"][0].update(seq=0),
+                "duplicate_seq": lambda d: d["steps"][1].update(seq=1),
+                "reordered": lambda d: d["steps"].reverse(),
+                "bad_verb_type": lambda d: d["steps"][0].update(verb=[]),
+                "bad_status_type": lambda d: d["steps"][0].update(status=[]),
                 "promote_cannot_complete_rollback": lambda d: d["steps"][-1].update(verb="promote"),
                 "wrong_install": lambda d: d.update(install_id="foreign"),
                 "wrong_from": lambda d: d.update({"from": str(Path(directory) / "missing")}),

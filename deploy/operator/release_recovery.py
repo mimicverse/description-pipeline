@@ -249,16 +249,22 @@ def validate_code_rollback(receipt_path: Path, install_id: str, identity: dict) 
     if not isinstance(steps, list):
         raise GateError("release_recovery_gate_invalid", "code rollback steps are malformed")
     latest = {}
+    last_seq = 0
     for item in steps:
         if (
             not isinstance(item, dict)
+            or type(item.get("seq")) is not int
+            or item["seq"] <= last_seq
+            or not isinstance(item.get("verb"), str)
             or item.get("verb") not in {"promote", "rollback"}
             or not isinstance(item.get("step"), str)
             or not item["step"]
             or item["step"] not in plan
+            or not isinstance(item.get("status"), str)
             or item.get("status") not in {"completed", "failed", "unknown"}
         ):
             raise GateError("release_recovery_gate_invalid", "code rollback receipt has a malformed step")
+        last_seq = item["seq"]
         latest[item["step"]] = (item["verb"], item["status"])
     incomplete = [step for step in ROLLBACK_STEPS if latest.get(step) != ("rollback", "completed")]
     if incomplete:
