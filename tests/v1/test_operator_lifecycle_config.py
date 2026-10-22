@@ -13,6 +13,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,9 @@ from description_pipeline import schemas
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
 CONTROL = OPERATOR / "operatorctl.sh"
+HEREDOC_REDIRECT = re.compile(
+    r"(?<!<)<<(?!<)-?\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|\"([A-Za-z_][A-Za-z0-9_]*)\"|([A-Za-z_][A-Za-z0-9_]*))"
+)
 
 ALL_VERBS = (
     "validate",
@@ -39,6 +43,26 @@ ALL_VERBS = (
     "rollback",
 )
 OPERATIONAL_VERBS = tuple(verb for verb in ALL_VERBS if verb not in {"validate", "install"})
+
+
+def has_here_document(source: str) -> bool:
+    return HEREDOC_REDIRECT.search(source) is not None
+
+
+def here_document_command_substitution_violations(source: str) -> list[str]:
+    violations = set()
+    for name in re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", source, re.M):
+        marker = f"{name}() {{"
+        body = source.split(marker, 1)[1].split("\n}\n", 1)[0]
+        if not has_here_document(body):
+            continue
+        invocation = (
+            rf"\$\(\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\n]*)\s+)*"
+            rf"{re.escape(name)}\b"
+        )
+        if re.search(invocation, source):
+            violations.add(name)
+    return sorted(violations)
 
 
 def run(
@@ -238,7 +262,184 @@ class OperatorctlSurfaceTests(unittest.TestCase):
         self.assertIn('"$output.transport.json"', source)
         self.assertNotIn("scp ", status)
         self.assertNotIn("New-Item", status)
-        self.assertIn('WINDOWS_STATUS="$(instance_lifecycle_status "$ROLLBACK_ID")"', source)
+        self.assertIn(
+            'instance_lifecycle_status "$ROLLBACK_ID" \\\n'
+            '        > "$RECEIPT_DIR/windows-status.path"',
+            source,
+        )
+        self.assertNotIn('WINDOWS_STATUS="$(instance_lifecycle_status', source)
+
+    def test_no_here_document_is_wrapped_by_command_substitution(self):
+        source = CONTROL.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("#") or "$(" not in line:
+                continue
+            has_here_document = False
+            for candidate in lines[index:]:
+                if "<<" in candidate:
+                    has_here_document = True
+                if ')"' in candidate:
+                    self.assertFalse(
+                        has_here_document,
+                        f"here-document command substitution starts at line {index + 1}",
+                    )
+                    break
+        self.assertEqual(here_document_command_substitution_violations(source), [])
+        negative = """
+reader() {
+  cat <<EOF >/dev/null
+value
+EOF
+}
+result="$(reader)"
+"""
+        self.assertEqual(here_document_command_substitution_violations(negative), ["reader"])
+        multiline = """
+multiline() {
+  cat <<EOF >/dev/null
+value
+EOF
+}
+result="$(
+  multiline
+)"
+"""
+        self.assertEqual(here_document_command_substitution_violations(multiline), ["multiline"])
+
+    def test_here_document_scanner_covers_all_delimiter_forms(self):
+        for body in (
+            "cat <<EOF\nvalue\nEOF\n",
+            "cat <<'EOF'\nvalue\nEOF\n",
+            'cat <<"EOF"\nvalue\nEOF\n',
+            "cat <<-EOF\n\tvalue\n\tEOF\n",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(has_here_document(body))
+        self.assertFalse(has_here_document("cat <<< value\n"))
+
+    def test_lifecycle_functions_with_here_documents_are_not_command_substituted(self):
+        source = CONTROL.read_text(encoding="utf-8")
+        self.assertIn("read_output_path() {", source)
+        self.assertIn('mapfile -t lines < "$source"', source)
+        self.assertIn('printf -v "$variable"', source)
+        helper = source.split("read_output_path() {", 1)[1].split("\n}\n", 1)[0]
+        executable_helper = "\n".join(
+            line for line in helper.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn('"$@"', executable_helper)
+        self.assertEqual(source.count("> \"$archive_probe\" <<'PY'"), 2)
+        self.assertEqual(source.count('windows_transport 60 < "$archive_probe"'), 2)
+        for name in (
+            "generation_env_declared_value",
+            "airflow_record_dag",
+            "airflow_here_for_record",
+        ):
+            body = source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
+            self.assertFalse(has_here_document(body), name)
+        for expression in (
+            'WINDOWS_STAGE="$(instance_lifecycle',
+            'WINDOWS_PROMOTE="$(instance_lifecycle',
+            'WINDOWS_HEALTH="$(instance_lifecycle_health',
+            'WINDOWS_STATUS="$(instance_lifecycle_status',
+            'WINDOWS_ROLLBACK="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \\\n',
+        ):
+            self.assertNotIn(expression, source)
+        self.assertIn(
+            'instance_lifecycle stage "$CANDIDATE_ID" \\\n'
+            '      > "$RECEIPT_DIR/windows-stage.path"',
+            source,
+        )
+        self.assertIn(
+            'instance_lifecycle promote "$CANDIDATE_ID" \\\n'
+            '      > "$RECEIPT_DIR/windows-promote.path"',
+            source,
+        )
+        self.assertEqual(
+            source.count('2> "$EVIDENCE_DIR/windows-health.path.stderr" || WINDOWS_HEALTH_STATUS=$?'),
+            2,
+        )
+        self.assertIn(
+            'WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \\\n'
+            '        instance_lifecycle rollback "$ROLLBACK_ID" "$PREVIOUS_GENERATION_DIR" \\\n'
+            '        > "$RECEIPT_DIR/windows-rollback.path" 2> "$RECEIPT_DIR/windows-rollback.path.stderr"',
+            source,
+        )
+
+    def test_lifecycle_failures_record_out_path_and_stderr_evidence(self):
+        source = CONTROL.read_text(encoding="utf-8")
+        normalized = re.sub(r"\\\n\s*", " ", source)
+        normalized = re.sub(r"\s+", " ", normalized)
+        for call in (
+            'promotion_step "$CANDIDATE_ID" promote windows-generation failed '
+            '"$RECEIPT_DIR/windows-stage.out" "$RECEIPT_DIR/windows-stage.path"',
+            'promotion_step "$CANDIDATE_ID" promote windows-generation unknown '
+            '"$RECEIPT_DIR/windows-stage.out" "$RECEIPT_DIR/windows-stage.path"',
+            'promotion_step "$CANDIDATE_ID" promote windows-switch unknown '
+            '"$RECEIPT_DIR/windows-promote.out" "$RECEIPT_DIR/windows-promote.path"',
+            'promotion_step "$CANDIDATE_ID" promote windows-switch failed '
+            '"$RECEIPT_DIR/windows-promote.out" "$RECEIPT_DIR/windows-promote.path"',
+            'promotion_step "$CANDIDATE_ID" promote endpoint-identity failed '
+            '"$RECEIPT_DIR/windows-health.out" "$RECEIPT_DIR/windows-health.path"',
+            'promotion_step "$CANDIDATE_ID" promote endpoint-identity unknown '
+            '"$RECEIPT_DIR/windows-health.out" "$RECEIPT_DIR/windows-health.path"',
+            'promotion_step "$CANDIDATE_ID" promote verify failed '
+            '"$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health.path" '
+            '"$RECEIPT_DIR/windows-health.out"',
+            'promotion_step "$CANDIDATE_ID" promote verify completed '
+            '"$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health.path" '
+            '"$EVIDENCE_DIR/final-health.json" "$RECEIPT_DIR/windows-health.out"',
+            'promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown '
+            '"$RECEIPT_DIR/windows-status.out" "$RECEIPT_DIR/windows-status.path"',
+            'promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown '
+            '"$RECEIPT_DIR/windows-rollback.out" "$RECEIPT_DIR/windows-rollback.path"',
+            'promotion_step "$ROLLBACK_ID" rollback rollback-windows failed '
+            '"$RECEIPT_DIR/windows-rollback.out" "$RECEIPT_DIR/windows-rollback.path"',
+            'promotion_step "$ROLLBACK_ID" rollback rollback-verify failed '
+            '"$EVIDENCE_DIR/rollback-verify.out" "$EVIDENCE_DIR/windows-health.path" '
+            '"$EVIDENCE_DIR/rollback-health.json" '
+            '"$OPERATOR_STATE/promotions/$ACTIVE_ID/windows-health.out"',
+            'promotion_step "$ROLLBACK_ID" rollback rollback-verify completed '
+            '"$EVIDENCE_DIR/rollback-verify.out" "$EVIDENCE_DIR/windows-health.path" '
+            '"$EVIDENCE_DIR/rollback-health.json" '
+            '"$OPERATOR_STATE/promotions/$ACTIVE_ID/windows-health.out"',
+        ):
+            with self.subTest(call=call):
+                self.assertIn(call, normalized)
+        for path in (
+            "$RECEIPT_DIR/windows-stage.out",
+            "$RECEIPT_DIR/windows-stage.path",
+            "$RECEIPT_DIR/windows-promote.out",
+            "$RECEIPT_DIR/windows-promote.path",
+            "$RECEIPT_DIR/windows-health.out",
+            "$RECEIPT_DIR/windows-health.path",
+            "$RECEIPT_DIR/windows-status.out",
+            "$RECEIPT_DIR/windows-status.path",
+            "$RECEIPT_DIR/windows-rollback.out",
+            "$RECEIPT_DIR/windows-rollback.path",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, source)
+        self.assertEqual(
+            source.count('2> "$RECEIPT_DIR/windows-stage.path.stderr"'),
+            1,
+        )
+        self.assertEqual(
+            source.count('2> "$RECEIPT_DIR/windows-promote.path.stderr"'),
+            1,
+        )
+        self.assertEqual(
+            source.count('2> "$RECEIPT_DIR/windows-health.path.stderr"'),
+            1,
+        )
+        self.assertEqual(
+            source.count('2> "$RECEIPT_DIR/windows-status.path.stderr"'),
+            1,
+        )
+        self.assertEqual(
+            source.count('2> "$RECEIPT_DIR/windows-rollback.path.stderr"'),
+            1,
+        )
 
     def test_start_refuses_while_the_shared_maintenance_lock_is_held(self):
         state_root = self.root / "state"

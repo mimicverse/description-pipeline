@@ -85,6 +85,20 @@ if previous:
 print("& " + powershell_quote(script_path) + " " + " ".join(arguments))
 PY
 }
+
+read_output_path() {
+  # Bash 5.1 cannot invoke a function containing here-documents through $()
+  # or an indirect "$@" call. Lifecycle functions must be called by name with
+  # stdout redirected to a file; this helper only validates and assigns it.
+  local source="$1" variable="$2"
+  local -a lines=()
+  mapfile -t lines < "$source"
+  if [ "${#lines[@]}" -ne 1 ] || [ -z "${lines[0]}" ]; then
+    return 2
+  fi
+  printf -v "$variable" '%s' "${lines[0]}"
+}
+
 usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
@@ -357,8 +371,9 @@ generation_env_value() {
 # The release manifest is a member of the controller release tree, never an external override.
 # Canonicalize it before any stage/promote/rollback side effect and refuse a cross-tree path.
 resolve_release_file() {
-  local candidate="${RELEASE_FILE:-$RELEASE_ROOT/release.json}" resolved
-  resolved="$("$CONTROL_PYTHON" - "$RELEASE_ROOT" "$candidate" <<'PY'
+  local candidate="${RELEASE_FILE:-$RELEASE_ROOT/release.json}" resolved output
+  output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$RELEASE_ROOT" "$candidate" > "$output" <<'PY'
 import os
 import sys
 
@@ -371,7 +386,15 @@ if not os.path.isfile(path):
     raise SystemExit(f"release manifest not found: {path}")
 print(path)
 PY
-)" || die "the release manifest is outside the controller release tree"
+  then
+    rm -f "$output"
+    die "the release manifest is outside the controller release tree"
+  fi
+  read_output_path "$output" resolved || {
+    rm -f "$output"
+    die "the release manifest did not resolve to one path"
+  }
+  rm -f "$output"
   RELEASE_FILE="$resolved"
 }
 
@@ -385,7 +408,7 @@ PY
 # duplicates decode to the same bytes the canonical readers see and are accepted.
 generation_env_declared_value() {
   local file="$1" key="$2" value
-  value="$("$CONTROL_PYTHON" - "$HERE/render_operator.py" "$file" "$key" <<'PY'
+  value="$("$CONTROL_PYTHON" -c '
 import importlib.util
 import sys
 from pathlib import Path
@@ -413,8 +436,7 @@ for number, line in enumerate(Path(sys.argv[2]).read_text(encoding="utf-8").spli
 if not seen or value == "":
     raise SystemExit(3)
 sys.stdout.write(value)
-PY
-  )" || {
+' "$HERE/render_operator.py" "$file" "$key")" || {
     code=$?
     if [ "$code" = 3 ]; then
       die "the generation environment $file does not declare $key"
@@ -503,7 +525,7 @@ airflow_require_no_readers() {
 }
 
 airflow_record_dag() {
-  "$CONTROL_PYTHON" - "$1" <<'PY'
+  "$CONTROL_PYTHON" -c '
 import json
 import re
 import sys
@@ -517,7 +539,7 @@ path = Path(str(dag.get("path") or ""))
 if not path.is_absolute():
     raise SystemExit("install record DAG path is not absolute")
 print(path)
-PY
+' "$1"
 }
 
 airflow_here_for_record() {
@@ -527,7 +549,8 @@ airflow_here_for_record() {
 }
 
 airflow_render_generation_config() {
-  local record_path="$1" venv="$2" env_file="$3" dag_path airflow_here renderer runtime_dsn api_port
+  local record_path="$1" venv="$2" env_file="$3"
+  local dag_path airflow_here renderer runtime_dsn api_port api_port_output
   dag_path="$(airflow_record_dag "$record_path")" \
     || die "the active generation has no usable DAG path"
   airflow_here="$(dirname "$(dirname "$dag_path")")"
@@ -541,7 +564,8 @@ airflow_render_generation_config() {
   runtime_dsn="$(generation_env_value "$env_file" AIRFLOW_RUNTIME_DB_URL)" || return 1
   # Resolve the port through the target controller's own env parser and default, so the
   # generated execution URL cannot fall back to the resident generation's ambient value.
-  api_port="$("$CONTROL_PYTHON" - "$renderer" "$env_file" <<'PY'
+  api_port_output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$renderer" "$env_file" > "$api_port_output" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
@@ -552,7 +576,15 @@ spec.loader.exec_module(module)
 values = module.load_env(Path(sys.argv[2]))
 print(module.integer(values, "AIRFLOW_API_PORT", module.PORT_DEFAULTS["AIRFLOW_API_PORT"]))
 PY
-)" || return 1
+  then
+    rm -f "$api_port_output"
+    return 1
+  fi
+  read_output_path "$api_port_output" api_port || {
+    rm -f "$api_port_output"
+    return 1
+  }
+  rm -f "$api_port_output"
   [ -n "$api_port" ] || die "the target generation has no Airflow API port"
   AIRFLOW_DB_URL="$runtime_dsn" AIRFLOW_API_PORT="$api_port" \
     "$venv/bin/python" "$airflow_here/render_config.py" \
@@ -671,8 +703,9 @@ PY
 }
 
 airflow_restore_dag_state() {
-  local state_file="$1" paused
-  paused="$("$CONTROL_PYTHON" - "$state_file" <<'PY'
+  local state_file="$1" paused output
+  output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$state_file" > "$output" <<'PY'
 import json
 import sys
 
@@ -681,7 +714,15 @@ if document.get("dag_id") != "solidworks_to_urdf" or type(document.get("paused")
     raise SystemExit("the captured DAG state is invalid")
 print("true" if document["paused"] else "false")
 PY
-)" || die "the captured DAG state is unreadable: $state_file"
+  then
+    rm -f "$output"
+    die "the captured DAG state is unreadable: $state_file"
+  fi
+  read_output_path "$output" paused || {
+    rm -f "$output"
+    die "the captured DAG state is not one boolean"
+  }
+  rm -f "$output"
   if [ "$paused" = "true" ]; then
     airflow_pause_dag
     echo "dag_paused_restored=true"
@@ -845,12 +886,11 @@ out.write_text(
 )
 PY
   local remote archive_name expected_hash remote_archive_state
+  local archive_probe="$dir/windows-health-archive-state.ps1"
   remote="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
   archive_name="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
   expected_hash="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
-  remote_archive_state="$(
-    "$CONTROL_PYTHON" - "$remote/$archive_name" <<'PY' | windows_transport 60 \
-      2>/dev/null | tr -d '\r' | tail -1
+  "$CONTROL_PYTHON" - "$remote/$archive_name" > "$archive_probe" <<'PY' || return 2
 import sys
 
 path = sys.argv[1].replace("/", "\\").replace("'", "''")
@@ -862,6 +902,8 @@ print(
     "} else { Write-Output 'absent' }"
 )
 PY
+  remote_archive_state="$(
+    windows_transport 60 < "$archive_probe" 2>/dev/null | tr -d '\r' | tail -1
   )" || { echo "instance_lifecycle: could not inspect the health archive on $SOLIDWORKS_SSH_HOST" >&2; return 2; }
   case "$remote_archive_state" in
     *"|$expected_hash") ;;
@@ -1030,7 +1072,8 @@ instance_lifecycle_status() {
   local output="$dir/windows-status.out"
   mkdir -p "$dir"
   local remote
-  remote="$("$CONTROL_PYTHON" - "$CONFIG_FILE" "$generation" <<'PY'
+  local remote_output="$dir/windows-status.remote.txt"
+  if ! "$CONTROL_PYTHON" - "$CONFIG_FILE" "$generation" > "$remote_output" <<'PY'
 import json
 import sys
 
@@ -1038,7 +1081,10 @@ document = json.load(open(sys.argv[1], encoding="utf-8"))
 instance = document["windows"]["instance"]
 print(instance["state_root"].rstrip("/") + "/lifecycle/" + sys.argv[2])
 PY
-)" || return 1
+  then
+    return 1
+  fi
+  read_output_path "$remote_output" remote || return 1
   local remote_script="$remote/instance-lifecycle.ps1"
   local remote_binding="$remote/windows-binding.json"
   if ! {
@@ -1151,6 +1197,7 @@ out.write_text(
 )
 PY
   local remote archive_local archive_name expected_archive_size expected_archive_hash remote_archive_state
+  local archive_probe="$dir/windows-$verb-archive-state.ps1"
   remote="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["dir"])' "$binding")"
   archive_local="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive_local"])' "$binding")"
   archive_name="$("$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
@@ -1169,9 +1216,7 @@ PY
   # Stage creates the archive once. Promote, rollback and reconcile reuse that
   # immutable staged copy when its remote size and digest still match the
   # binding. A present-but-different archive is a refusal, never an overwrite.
-  remote_archive_state="$(
-    "$CONTROL_PYTHON" - "$remote/$archive_name" <<'PY' | windows_transport 60 \
-      2>/dev/null | tr -d '\r' | tail -1
+  "$CONTROL_PYTHON" - "$remote/$archive_name" > "$archive_probe" <<'PY' || return 1
 import sys
 
 path = sys.argv[1].replace("/", "\\").replace("'", "''")
@@ -1183,6 +1228,8 @@ print(
     "} else { Write-Output 'absent' }"
 )
 PY
+  remote_archive_state="$(
+    windows_transport 60 < "$archive_probe" 2>/dev/null | tr -d '\r' | tail -1
   )" || { echo "instance_lifecycle: could not inspect the staged archive on $SOLIDWORKS_SSH_HOST" >&2; return 1; }
   local -a transfer_inputs=("$binding" "$HERE/../windows/instance-lifecycle.ps1")
   case "$remote_archive_state" in
@@ -2268,10 +2315,12 @@ case "$ACTION" in
     [ -n "$INSTALL_ID" ] || die "stage requires --install-id naming the candidate generation"
     CANDIDATE_ID="$INSTALL_ID"
     RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
+    mkdir -p "$RECEIPT_DIR"
     # The Linux generation is built from the candidate release's own wheel - a cross-release
     # upgrade consumes the release archive, never the running generation's asset - into a new
     # snapshot, derived environment and runtime, with no pointer, unit or admission change.
-    CANDIDATE_WHEEL="$("$CONTROL_PYTHON" - "$RELEASE_FILE" <<'PY'
+    CANDIDATE_WHEEL_OUTPUT="$RECEIPT_DIR/candidate-wheel.selection"
+    if ! "$CONTROL_PYTHON" - "$RELEASE_FILE" > "$CANDIDATE_WHEEL_OUTPUT" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
 
@@ -2289,7 +2338,11 @@ if hashlib.sha256(wheel.read_bytes()).hexdigest() != release["artifacts"][wheels
     raise SystemExit("the package wheel does not match the release manifest")
 print(wheel)
 PY
-)" || die "the candidate release wheel was refused"
+    then
+      die "the candidate release wheel was refused"
+    fi
+    read_output_path "$CANDIDATE_WHEEL_OUTPUT" CANDIDATE_WHEEL \
+      || die "the candidate release wheel selection is not one path"
     SNAPSHOT_PATH="$("$CONTROL_PYTHON" "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
       --install-id "$CANDIDATE_ID" --wheel "$CANDIDATE_WHEEL" | sed -n 's/^snapshot=//p')" || exit $?
     [ -f "$SNAPSHOT_PATH" ] || die "candidate snapshot was not written"
@@ -2313,12 +2366,23 @@ PY
         "$RECEIPT_DIR/linux-generation.out"
       die "the candidate runtime failed to stage; the active generation is unchanged"
     fi
-    if ! WINDOWS_STAGE="$(instance_lifecycle stage "$CANDIDATE_ID")"; then
+    WINDOWS_STAGE_STATUS=0
+    instance_lifecycle stage "$CANDIDATE_ID" \
+      > "$RECEIPT_DIR/windows-stage.path" 2> "$RECEIPT_DIR/windows-stage.path.stderr" \
+      || WINDOWS_STAGE_STATUS=$?
+    if [ "$WINDOWS_STAGE_STATUS" -ne 0 ]; then
+      cat "$RECEIPT_DIR/windows-stage.path.stderr" >&2
       promotion_step "$CANDIDATE_ID" promote windows-generation failed \
-        "$RECEIPT_DIR/windows-stage.out"
+        "$RECEIPT_DIR/windows-stage.out" "$RECEIPT_DIR/windows-stage.path"
       die "the Windows candidate stage failed; the active generation is unchanged"
     fi
-    promotion_step "$CANDIDATE_ID" promote windows-generation completed "$WINDOWS_STAGE"
+    if ! read_output_path "$RECEIPT_DIR/windows-stage.path" WINDOWS_STAGE; then
+      promotion_step "$CANDIDATE_ID" promote windows-generation unknown \
+        "$RECEIPT_DIR/windows-stage.out" "$RECEIPT_DIR/windows-stage.path"
+      die "the Windows candidate stage returned no readable evidence path"
+    fi
+    promotion_step "$CANDIDATE_ID" promote windows-generation completed \
+      "$WINDOWS_STAGE" "$RECEIPT_DIR/windows-stage.path"
     # stage performs no schema DDL: the live database is only written by guarded windows -
     # the closed-admission reconcile route (which applies the staged objects before it
     # recovers through them) and promote's own schema-migration step - so a stage while the
@@ -2566,35 +2630,60 @@ PY
     resolve_release_file
     WINDOWS_PROMOTE=""
     WINDOWS_PROMOTE_STATUS=0
-    WINDOWS_PROMOTE="$(instance_lifecycle promote "$CANDIDATE_ID")" || WINDOWS_PROMOTE_STATUS=$?
+    instance_lifecycle promote "$CANDIDATE_ID" \
+      > "$RECEIPT_DIR/windows-promote.path" 2> "$RECEIPT_DIR/windows-promote.path.stderr" \
+      || WINDOWS_PROMOTE_STATUS=$?
+    if [ "$WINDOWS_PROMOTE_STATUS" = "0" ]; then
+      read_output_path "$RECEIPT_DIR/windows-promote.path" WINDOWS_PROMOTE \
+        || WINDOWS_PROMOTE_STATUS=2
+    fi
     if [ "$WINDOWS_PROMOTE_STATUS" = "2" ]; then
-      promotion_step "$CANDIDATE_ID" promote windows-switch unknown "$RECEIPT_DIR/windows-promote.out"
+      cat "$RECEIPT_DIR/windows-promote.path.stderr" >&2
+      promotion_step "$CANDIDATE_ID" promote windows-switch unknown \
+        "$RECEIPT_DIR/windows-promote.out" "$RECEIPT_DIR/windows-promote.path"
       die "the Windows switch outcome is unacknowledged (the admission stays closed); reconcile with: operatorctl rollback --config <platform.json> --install-id $CANDIDATE_ID"
     fi
     if [ "$WINDOWS_PROMOTE_STATUS" != "0" ]; then
-      promotion_step "$CANDIDATE_ID" promote windows-switch failed "$RECEIPT_DIR/windows-promote.out"
+      cat "$RECEIPT_DIR/windows-promote.path.stderr" >&2
+      promotion_step "$CANDIDATE_ID" promote windows-switch failed \
+        "$RECEIPT_DIR/windows-promote.out" "$RECEIPT_DIR/windows-promote.path"
       die "the Windows switch failed (the admission stays closed; the receipt records it)"
     fi
-    promotion_step "$CANDIDATE_ID" promote windows-switch completed "$WINDOWS_PROMOTE"
+    promotion_step "$CANDIDATE_ID" promote windows-switch completed \
+      "$WINDOWS_PROMOTE" "$RECEIPT_DIR/windows-promote.path"
     # 6. the endpoint identity is what the running endpoint reports through its own health
     #    relay; the canonical IF-09 validator decides it against the release manifest - never
     #    a handwritten declaration
-    if ! WINDOWS_HEALTH="$(instance_lifecycle_health "$CANDIDATE_ID" "$RELEASE_FILE")"; then
-      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed "$RECEIPT_DIR/windows-health.out"
+    WINDOWS_HEALTH_STATUS=0
+    instance_lifecycle_health "$CANDIDATE_ID" "$RELEASE_FILE" \
+      > "$RECEIPT_DIR/windows-health.path" 2> "$RECEIPT_DIR/windows-health.path.stderr" \
+      || WINDOWS_HEALTH_STATUS=$?
+    if [ "$WINDOWS_HEALTH_STATUS" -ne 0 ]; then
+      cat "$RECEIPT_DIR/windows-health.path.stderr" >&2
+      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed \
+        "$RECEIPT_DIR/windows-health.out" "$RECEIPT_DIR/windows-health.path"
       die "the running endpoint health did not pass (the admission stays closed)"
+    fi
+    if ! read_output_path "$RECEIPT_DIR/windows-health.path" WINDOWS_HEALTH; then
+      promotion_step "$CANDIDATE_ID" promote endpoint-identity unknown \
+        "$RECEIPT_DIR/windows-health.out" "$RECEIPT_DIR/windows-health.path"
+      die "the running endpoint health returned no readable evidence path"
     fi
     if ! promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/health.json" \
         > "$EVIDENCE_DIR/health-extract.out" 2>&1; then
-      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed "$EVIDENCE_DIR/health-extract.out"
+      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed \
+        "$EVIDENCE_DIR/health-extract.out" "$WINDOWS_HEALTH"
       die "the health relay did not carry a health object (the admission stays closed)"
     fi
     if ! "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/health.json" --release-file "$RELEASE_FILE" \
         --out "$EVIDENCE_DIR/endpoint-identity.json" > "$EVIDENCE_DIR/endpoint-identity.out" 2>&1; then
-      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed "$EVIDENCE_DIR/endpoint-identity.out"
+      promotion_step "$CANDIDATE_ID" promote endpoint-identity failed \
+        "$EVIDENCE_DIR/endpoint-identity.out" "$WINDOWS_HEALTH"
       die "the endpoint identity was refused (the admission stays closed)"
     fi
     promotion_step "$CANDIDATE_ID" promote endpoint-identity completed \
+      "$WINDOWS_HEALTH" "$RECEIPT_DIR/windows-health.path" \
       "$EVIDENCE_DIR/health.json" "$EVIDENCE_DIR/endpoint-identity.json"
     # 7. the Linux pointer switches exactly once: the rollback binding is the immutable
     #    generation file (with its digest) - never the mutable active pointer - and the journal
@@ -2670,17 +2759,28 @@ PY
     if ! {
       "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-active \
         --config "$CONFIG_FILE" --state-root "$STATE_ROOT" \
-      && WINDOWS_HEALTH="$(instance_lifecycle_health "$CANDIDATE_ID" "$RELEASE_FILE")" \
+      && {
+        WINDOWS_HEALTH_STATUS=0
+        instance_lifecycle_health "$CANDIDATE_ID" "$RELEASE_FILE" \
+          > "$EVIDENCE_DIR/windows-health.path" \
+          2> "$EVIDENCE_DIR/windows-health.path.stderr" || WINDOWS_HEALTH_STATUS=$?
+        [ "$WINDOWS_HEALTH_STATUS" -eq 0 ] \
+          && read_output_path "$EVIDENCE_DIR/windows-health.path" WINDOWS_HEALTH
+      } \
       && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/final-health.json" \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/final-health.json" --release-file "$RELEASE_FILE" \
         --record "$STATE_ROOT/install-record.json" --out "$EVIDENCE_DIR/final-identity.json" \
       && OPERATOR_STATE="$OPERATOR_STATE" bash "$HERE/health_gate.sh" "$EVIDENCE_DIR/linux-health-$(date -u +%Y%m%dT%H%M%SZ)"
     } > "$EVIDENCE_DIR/verify.out" 2>&1; then
-      promotion_step "$CANDIDATE_ID" promote verify failed "$EVIDENCE_DIR/verify.out"
+      promotion_step "$CANDIDATE_ID" promote verify failed \
+        "$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health.path" \
+        "$RECEIPT_DIR/windows-health.out"
       die "the switched ends did not verify (the admission stays closed)"
     fi
-    promotion_step "$CANDIDATE_ID" promote verify completed "$EVIDENCE_DIR/verify.out"
+    promotion_step "$CANDIDATE_ID" promote verify completed \
+      "$EVIDENCE_DIR/verify.out" "$EVIDENCE_DIR/windows-health.path" \
+      "$EVIDENCE_DIR/final-health.json" "$RECEIPT_DIR/windows-health.out"
     # 10. only now opens the admission
     if ! platform_open_admission > "$EVIDENCE_DIR/open-admission.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote open-admission failed "$EVIDENCE_DIR/open-admission.out"
@@ -2758,13 +2858,22 @@ except Exception:
       # An unacknowledged switch is reconciled from the endpoint's own recorded status; the
       # unknown switch itself is never resent.
       WINDOWS_STATUS_STATUS=0
-      WINDOWS_STATUS="$(instance_lifecycle_status "$ROLLBACK_ID")" \
+      instance_lifecycle_status "$ROLLBACK_ID" \
+        > "$RECEIPT_DIR/windows-status.path" 2> "$RECEIPT_DIR/windows-status.path.stderr" \
         || WINDOWS_STATUS_STATUS=$?
+      if [ "$WINDOWS_STATUS_STATUS" = "0" ]; then
+        read_output_path "$RECEIPT_DIR/windows-status.path" WINDOWS_STATUS \
+          || WINDOWS_STATUS_STATUS=2
+      fi
       if [ "$WINDOWS_STATUS_STATUS" != "0" ]; then
-        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-status.out"
+        cat "$RECEIPT_DIR/windows-status.path.stderr" >&2
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown \
+          "$RECEIPT_DIR/windows-status.out" "$RECEIPT_DIR/windows-status.path"
         die "the endpoint status is unreadable; the Windows end cannot be reconciled (the admission stays closed)"
       fi
-      RECONCILIATION="$("$CONTROL_PYTHON" - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" <<'PY'
+      RECONCILIATION_OUTPUT="$RECEIPT_DIR/windows-status.reconciliation.txt"
+      if ! "$CONTROL_PYTHON" - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" \
+          > "$RECONCILIATION_OUTPUT" <<'PY'
 import json
 import re
 import sys
@@ -2896,7 +3005,18 @@ else:
     # A foreign, unparseable or unbound launcher is never claimed as an unswitched source.
     print("unknown")
 PY
-)"
+      then
+        cat "$RECEIPT_DIR/windows-status.path.stderr" >&2
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown \
+          "$RECEIPT_DIR/windows-status.out" "$RECEIPT_DIR/windows-status.path"
+        die "the endpoint status could not be reconciled"
+      fi
+      if ! read_output_path "$RECONCILIATION_OUTPUT" RECONCILIATION; then
+        cat "$RECEIPT_DIR/windows-status.path.stderr" >&2
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown \
+          "$RECEIPT_DIR/windows-status.out" "$RECEIPT_DIR/windows-status.path"
+        die "the endpoint reconciliation result is not one token"
+      fi
       case "$RECONCILIATION" in
         before)
           PREVIOUS_GENERATION_DIR=""
@@ -2905,7 +3025,9 @@ PY
           PREVIOUS_GENERATION_DIR="$RECONCILIATION"
           ;;
         *)
-          promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-status.out"
+          cat "$RECEIPT_DIR/windows-status.path.stderr" >&2
+          promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown \
+            "$RECEIPT_DIR/windows-status.out" "$RECEIPT_DIR/windows-status.path"
           die "the endpoint state is not provably recoverable (the admission stays closed); the unacknowledged switch is never resent"
           ;;
       esac
@@ -2940,21 +3062,33 @@ PY
     if [ -n "$PREVIOUS_GENERATION_DIR" ]; then
       WINDOWS_ROLLBACK=""
       WINDOWS_ROLLBACK_STATUS=0
-      WINDOWS_ROLLBACK="$(WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \
-          instance_lifecycle rollback "$ROLLBACK_ID" "$PREVIOUS_GENERATION_DIR")" || WINDOWS_ROLLBACK_STATUS=$?
+      WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \
+        instance_lifecycle rollback "$ROLLBACK_ID" "$PREVIOUS_GENERATION_DIR" \
+        > "$RECEIPT_DIR/windows-rollback.path" 2> "$RECEIPT_DIR/windows-rollback.path.stderr" \
+        || WINDOWS_ROLLBACK_STATUS=$?
+      if [ "$WINDOWS_ROLLBACK_STATUS" = "0" ]; then
+        read_output_path "$RECEIPT_DIR/windows-rollback.path" WINDOWS_ROLLBACK \
+          || WINDOWS_ROLLBACK_STATUS=2
+      fi
       if [ "$WINDOWS_ROLLBACK_STATUS" = "2" ]; then
-        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown "$RECEIPT_DIR/windows-rollback.out"
+        cat "$RECEIPT_DIR/windows-rollback.path.stderr" >&2
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows unknown \
+          "$RECEIPT_DIR/windows-rollback.out" "$RECEIPT_DIR/windows-rollback.path"
         die "the Windows rollback outcome is unacknowledged (the admission stays closed)"
       fi
       if [ "$WINDOWS_ROLLBACK_STATUS" != "0" ]; then
-        promotion_step "$ROLLBACK_ID" rollback rollback-windows failed "$RECEIPT_DIR/windows-rollback.out"
+        cat "$RECEIPT_DIR/windows-rollback.path.stderr" >&2
+        promotion_step "$ROLLBACK_ID" rollback rollback-windows failed \
+          "$RECEIPT_DIR/windows-rollback.out" "$RECEIPT_DIR/windows-rollback.path"
         die "the Windows rollback failed; nothing further was moved"
       fi
-      promotion_step "$ROLLBACK_ID" rollback rollback-windows completed "$WINDOWS_ROLLBACK"
+      promotion_step "$ROLLBACK_ID" rollback rollback-windows completed \
+        "$WINDOWS_ROLLBACK" "$RECEIPT_DIR/windows-rollback.path"
     else
       # The endpoint's own status shows this maintenance never completed there: nothing to
       # restore on Windows, and the reconciliation is recorded with that relay as evidence.
-      promotion_step "$ROLLBACK_ID" rollback rollback-windows completed "$RECEIPT_DIR/windows-status.out"
+      promotion_step "$ROLLBACK_ID" rollback rollback-windows completed \
+        "$RECEIPT_DIR/windows-status.out" "$RECEIPT_DIR/windows-status.path"
     fi
     # The Linux end re-activates the recorded previous generation; no generation file is rewritten.
     if [ "$LINUX_SWITCHED" = "1" ]; then
@@ -3039,7 +3173,14 @@ PY
       && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-running \
         --state-root "$STATE_ROOT" \
-      && WINDOWS_HEALTH="$(instance_lifecycle_health "$ACTIVE_ID" "$STATE_ROOT/install-record.json")" \
+      && {
+        WINDOWS_HEALTH_STATUS=0
+        instance_lifecycle_health "$ACTIVE_ID" "$STATE_ROOT/install-record.json" \
+          > "$EVIDENCE_DIR/windows-health.path" \
+          2> "$EVIDENCE_DIR/windows-health.path.stderr" || WINDOWS_HEALTH_STATUS=$?
+        [ "$WINDOWS_HEALTH_STATUS" -eq 0 ] \
+          && read_output_path "$EVIDENCE_DIR/windows-health.path" WINDOWS_HEALTH
+      } \
       && promotion_extract_health "$WINDOWS_HEALTH" "$EVIDENCE_DIR/rollback-health.json" \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" endpoint-identity \
         --health "$EVIDENCE_DIR/rollback-health.json" --release-file "$RELEASE_FILE" \
@@ -3048,10 +3189,16 @@ PY
         "$OPERATOR_STATE/health-gate/rollback-$(date -u +%Y%m%dT%H%M%SZ)" \
       && airflow_restore_dag_state "$DAG_STATE_FILE"
     } > "$EVIDENCE_DIR/rollback-verify.out" 2>&1; then
-      promotion_step "$ROLLBACK_ID" rollback rollback-verify failed "$EVIDENCE_DIR/rollback-verify.out"
+      promotion_step "$ROLLBACK_ID" rollback rollback-verify failed \
+        "$EVIDENCE_DIR/rollback-verify.out" "$EVIDENCE_DIR/windows-health.path" \
+        "$EVIDENCE_DIR/rollback-health.json" \
+        "$OPERATOR_STATE/promotions/$ACTIVE_ID/windows-health.out"
       die "the restored ends did not verify (the admission stays closed)"
     fi
-    promotion_step "$ROLLBACK_ID" rollback rollback-verify completed "$EVIDENCE_DIR/rollback-verify.out"
+    promotion_step "$ROLLBACK_ID" rollback rollback-verify completed \
+      "$EVIDENCE_DIR/rollback-verify.out" "$EVIDENCE_DIR/windows-health.path" \
+      "$EVIDENCE_DIR/rollback-health.json" \
+      "$OPERATOR_STATE/promotions/$ACTIVE_ID/windows-health.out"
     echo "rollback complete: restored $(basename "$PREVIOUS_RECORD" .json) (the admission stays closed; run start after review)"
     ;;
   reconcile)

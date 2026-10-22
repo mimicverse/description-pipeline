@@ -1368,8 +1368,10 @@ class LifecycleTests(unittest.TestCase):
     def test_windows_reconciliation_requires_exact_python_module_action(self) -> None:
         control_text = CONTROL.read_text(encoding="utf-8")
         marker = (
-            'RECONCILIATION="$("$CONTROL_PYTHON" - "$RECEIPT_DIR/windows-binding.json" '
-            '"$WINDOWS_STATUS" <<\'PY\'\n'
+            'RECONCILIATION_OUTPUT="$RECEIPT_DIR/windows-status.reconciliation.txt"\n'
+            '      if ! "$CONTROL_PYTHON" - "$RECEIPT_DIR/windows-binding.json" '
+            '"$WINDOWS_STATUS" \\\n'
+            '          > "$RECONCILIATION_OUTPUT" <<\'PY\'\n'
         )
         start = control_text.index(marker) + len(marker)
         end = control_text.index("\nPY\n", start)

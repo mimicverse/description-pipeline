@@ -46,6 +46,14 @@ jobs:
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Static checks
         run: python -m ruff check src tests tools deploy
+      - name: Bash 5.1 function capture regression
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            --env LC_ALL=C \
+            ubuntu:22.04 \
+            bash tests/deploy/test_bash51_function_capture.sh
       - name: Install the pinned Node.js
         uses: actions/setup-node@v4
         with:
