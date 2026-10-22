@@ -88,7 +88,7 @@ def powershell_quote(value: str) -> str:
 
 
 script_path, binding_path, verb, stage_dir, previous = sys.argv[1:]
-if verb not in {"health", "resume", "stage", "promote", "rollback", "reconcile", "status"}:
+if verb not in {"health", "resume", "stage", "promote", "rollback", "status"}:
     raise SystemExit("operatorctl: invalid Windows lifecycle verb")
 arguments = ["-Verb", verb, "-Binding", powershell_quote(binding_path)]
 if stage_dir:

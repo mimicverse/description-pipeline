@@ -3,19 +3,26 @@
 # written; unrelated units in the same directory are left untouched.
 #
 #   render          write the description-* unit files (no systemctl; used by tests and for review)
-#   install         render + reload the user manager
 #   start           enable --now postgres (if configured), dag-processor, scheduler, api-server
 #   stop            disable --now every unit in reverse order (the full deployment stop)
 #   stop-executors  disable --now and prove stopped the execution units only (tunnel,
 #                   dag-processor, scheduler, api-server): the promotion window keeps the
 #                   shared PostgreSQL running and ready for its guarded migrations
-#   status          systemctl --user status for the units
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+usage() {
+  echo "usage: $0 render|start|stop|stop-executors" >&2
+  exit 2
+}
+[ "$#" -eq 1 ] || usage
+ACTION="$1"
+case "$ACTION" in
+  render|start|stop|stop-executors) ;;
+  *) usage ;;
+esac
 : "${AIRFLOW_VENV:?set AIRFLOW_VENV}"
 : "${AIRFLOW_HOME:?set AIRFLOW_HOME}"
 TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-ACTION="${1:-install}"
 
 # The execution units are the maintenance window's stop set: they must be down while the
 # candidate switches, and they must never take the shared database down with them. The
@@ -86,13 +93,10 @@ require_stopped() {
 
 case "$ACTION" in
   render) render_units ;;
-  install) render_units; systemctl --user daemon-reload ;;
   start) for u in "${UNITS[@]}"; do systemctl --user enable --now "$u"; done ;;
   stop) for ((i=${#UNITS[@]}-1; i>=0; i--)); do systemctl --user disable --now "${UNITS[$i]}"; done ;;
   stop-executors)
     for ((i=${#EXECUTORS[@]}-1; i>=0; i--)); do systemctl --user disable --now "${EXECUTORS[$i]}"; done
     for u in "${EXECUTORS[@]}"; do require_stopped "$u"; done
     ;;
-  status) systemctl --user status "${UNITS[@]}" --no-pager ;;
-  *) echo "usage: $0 render|install|start|stop|stop-executors|status" >&2; exit 2 ;;
 esac

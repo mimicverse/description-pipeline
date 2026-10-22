@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+DEPLOY = ROOT / "deploy"
 WINDOWS = ROOT / "deploy/windows"
 
 #: Schema ids outside the ``solidworks-to-urdf.*`` family are retired (XC-01); the two
@@ -31,6 +34,54 @@ def endpoint_template_targets_violations(root: Path) -> list[str]:
 
 
 class DeployMachineryTests(unittest.TestCase):
+    def run_script(self, path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        for name in ("AIRFLOW_VENV", "AIRFLOW_HOME", "PIPELINE_WHEEL"):
+            env.pop(name, None)
+        return subprocess.run(
+            ["bash", str(path), *arguments],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_services_cli_requires_one_explicit_live_verb(self) -> None:
+        services = DEPLOY / "airflow/services.sh"
+        for arguments in ((), ("install",), ("status",), ("render", "extra")):
+            result = self.run_script(services, *arguments)
+            self.assertEqual(result.returncode, 2, arguments)
+            self.assertIn("usage:", result.stderr)
+            self.assertIn("render|start|stop|stop-executors", result.stderr)
+
+        text = services.read_text(encoding="utf-8")
+        self.assertNotIn("install)", text)
+        self.assertNotIn("status)", text)
+        self.assertNotIn('ACTION="${1:-install}"', text)
+
+    def test_airflow_installer_refuses_arguments_before_migration(self) -> None:
+        installer = DEPLOY / "airflow/install.sh"
+        for arguments in (("unknown",), ("--stage", "extra"), ("--staging",)):
+            result = self.run_script(installer, *arguments)
+            self.assertEqual(result.returncode, 2, arguments)
+            self.assertIn("usage:", result.stderr)
+            self.assertNotIn("AIRFLOW_VENV", result.stderr)
+
+        for arguments in ((), ("--stage",)):
+            result = self.run_script(installer, *arguments)
+            self.assertEqual(result.returncode, 1, arguments)
+            self.assertIn("AIRFLOW_VENV", result.stderr)
+            self.assertNotIn("usage:", result.stderr)
+
+    def test_windows_wrapper_has_no_reconcile_verb(self) -> None:
+        control = (DEPLOY / "operator/operatorctl.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'if verb not in {"health", "resume", "stage", "promote", "rollback", "status"}:',
+            control,
+        )
+        self.assertNotIn('"rollback", "reconcile", "status"', control)
+
     def test_endpoint_templates_never_ask_for_targets(self) -> None:
         # A8 (6fffdfc): the endpoint configuration refuses a targets key, so no deploy template,
         # example or config may ship one again; the gate itself must discriminate.
