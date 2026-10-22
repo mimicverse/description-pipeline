@@ -44,7 +44,12 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from platform_config import atomic_write_once, extract_contract_closure, load_contract_owner  # noqa: E402  (single owners)
+from platform_config import (  # noqa: E402  (single owners)
+    atomic_write_once,
+    extract_contract_closure,
+    load_contract_owner,
+    valid_install_id,
+)
 from install_record import release_identity, wheel_binding  # noqa: E402  (single release/asset binding)
 from render_operator import PORT_DEFAULTS, encode_env_lines  # noqa: E402  (single deploy-layer owners, DEP-01)
 
@@ -164,7 +169,7 @@ def derive(
         snapshot = json.loads(snapshot_bytes)
     except ValueError as error:
         die(f"snapshot is not a valid JSON document: {error}")
-    require(bool(install_id) and all(character not in install_id for character in "\n\r/"), "install_id is malformed")
+    require(valid_install_id(install_id), "install_id is malformed")
     require(
         isinstance(release, dict) and "artifacts" in release,
         "the release identity is required to bind the consumed wheel",
