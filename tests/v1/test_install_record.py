@@ -116,6 +116,7 @@ def make_release(root: Path) -> Path:
         "pipeline_id": "solidworks-to-urdf",
         "version": "1.4.0",
         "source_commit": COMMIT,
+        "source_tree": "d" * 40,
         "source_sha256": SOURCE_SHA,
         "artifacts": {
             WHEEL_NAME: hashlib.sha256(wheel.read_bytes()).hexdigest(),
@@ -797,6 +798,11 @@ class InstallRecordTests(unittest.TestCase):
                 release_dag_sha256=hashlib.sha256(dag.read_bytes()).hexdigest(),
             )
             install_record.write_install_record(record, root / "state", owner)
+            self.assertNotIn("source_tree", record["release"])
+            old_manifest = root / "distribution" / "release.json"
+            old_document = json.loads(old_manifest.read_text())
+            old_document.pop("source_tree")
+            old_manifest.write_text(json.dumps(old_document))
             verified = install_record.verify_active_generation(config_path, root / "state")
             self.assertEqual(verified["install_id"], "gen-1")
 

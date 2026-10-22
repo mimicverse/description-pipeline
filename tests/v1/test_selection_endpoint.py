@@ -565,6 +565,7 @@ class SelectionEndpointTests(unittest.TestCase):
             "release": {
                 "schema_version": "solidworks-to-urdf.release/v1",
                 "pipeline_id": "solidworks-to-urdf",
+                "source_tree": "a" * 40,
                 **triple,
             },
         }

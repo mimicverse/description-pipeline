@@ -254,6 +254,7 @@ def build(root, output):
             "pipeline_id": bound.PIPELINE_ID,
             "version": bound.version,
             "source_commit": commit,
+            "source_tree": git(root, "rev-parse", f"{commit}^{{tree}}"),
             "source_sha256": bound.digest(files),
             "package_files": files,
             "test_files": test_files,

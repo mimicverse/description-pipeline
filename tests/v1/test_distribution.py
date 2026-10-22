@@ -34,6 +34,7 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
     identity.setdefault("version", VERSION)
     identity.setdefault("schema_version", "solidworks-to-urdf.release/v1")
     identity.setdefault("pipeline_id", "solidworks-to-urdf")
+    identity.setdefault("source_tree", "c" * 40)
     identity.setdefault("package_files", {})
     identity.setdefault("source_sha256", hashlib.sha256(b"wheel bytes").hexdigest())
     test_members = {"tests/v1/test_demo.py": b"def test_demo():\n    assert True\n"}
@@ -93,6 +94,22 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
 
 
 class DistributionTests(unittest.TestCase):
+    def test_release_tree_must_be_valid_and_bound_to_embedded_identity(self):
+        for value in (None, "bad", "A" * 40):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(value=value):
+                root = Path(directory)
+                identity = complete_release(root, identity={"source_tree": value, **release_domain_identity()})
+                with self.assertRaisesRegex(PipelineError, "source_tree"):
+                    verify_release(root, identity)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = complete_release(root)
+            manifest = json.loads((root / "release.json").read_text())
+            manifest["source_tree"] = "e" * 40
+            write_json(root / "release.json", manifest)
+            with self.assertRaisesRegex(PipelineError, "source identity"):
+                verify_release(root, identity)
+
     def test_hash_bearing_lock_lines_bind_the_package_version_only(self):
         self.assertEqual(
             _locked_pins(b"packaging==26.3 --hash=sha256:" + b"a" * 64 + b"\n"),

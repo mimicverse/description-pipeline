@@ -41,6 +41,7 @@ class ToolIdentityTests(unittest.TestCase):
                 "schema_version": "solidworks-to-urdf.release/v1",
                 "pipeline_id": PIPELINE_ID,
                 "version": __version__,
+                "source_tree": "a" * 40,
                 "source_sha256": digest(files),
                 "package_files": files,
             }

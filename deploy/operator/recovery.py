@@ -165,6 +165,8 @@ class BackupContext:
     install_record: dict
     snapshot: dict
     release_document: dict
+    archive_root: Path
+    archive_document: dict
     derived_env: dict[str, str]
     workspace_plan: dict
     source_code: dict
@@ -712,43 +714,48 @@ def clean_mode(mode: object) -> int:
     return mode
 
 
-def source_tree_identity(root: Path) -> dict:
-    root = Path(root)
+def archive_source_identity(root: Path, document: dict) -> dict:
+    """Bind source identity to the immutable release archive, never ambient Git."""
+    tree = document.get("source_tree")
     require(
-        root.is_dir(),
+        isinstance(tree, str) and bool(GIT_OBJECT.fullmatch(tree)),
         "recovery_release_missing",
-        f"producer source tree is missing: {root}",
+        "release source_tree is malformed",
     )
-
-    def git(*args: str) -> str:
-        try:
-            return subprocess.check_output(
-                ["git", "-C", str(root), *args],
-                text=True,
-                stderr=subprocess.PIPE,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError) as error:
-            raise RecoveryError(
-                "recovery_release_missing",
-                f"cannot establish producer source identity: {error}",
-                {"source_tree": str(root)},
-            ) from error
-
-    commit = git("rev-parse", "HEAD")
-    tree = git("rev-parse", "HEAD^{tree}")
-    status = git("status", "--porcelain=v1")
+    identity = install_record.release_identity(document)
+    for row in identity["artifacts"]:
+        path = root / confined_member(row["name"], "release artifact")
+        require_real_file(path, "release artifact", "recovery_release_missing")
+        require(sha256_file(path) == row["sha256"], "recovery_release_missing", "release artifact hash differs")
+    members = document.get("deployment_files")
     require(
-        bool(re.fullmatch(r"[0-9a-f]{40}", commit)) and bool(re.fullmatch(r"[0-9a-f]{40}", tree)),
-        "recovery_release_missing",
-        "producer source identity is malformed",
+        isinstance(members, dict) and bool(members),
+        "recovery_release_missing", "release deployment inventory is missing",
     )
+    for name, expected in members.items():
+        path = root / confined_member(name, "deployment member")
+        require_real_file(path, "deployment member", "recovery_release_missing")
+        require(sha256_file(path) == expected, "recovery_release_missing", f"release deployment member differs: {name}")
     require(
-        status == "",
-        "recovery_release_missing",
-        "producer source tree is not clean",
-        {"source_tree": str(root), "status": status.splitlines()[:20]},
+        members.get("deploy/operator/recovery.py") == sha256_file(Path(__file__)),
+        "recovery_release_missing", "running recovery script differs from the release",
     )
-    return {"commit": commit, "tree": tree, "worktree": "clean"}
+    wheels = [row for row in identity["artifacts"] if row["name"].endswith(".whl")]
+    require(len(wheels) == 1, "recovery_release_missing", "release must bind exactly one product wheel")
+    try:
+        with zipfile.ZipFile(root / wheels[0]["name"]) as archive:
+            embedded = json.loads(archive.read("description_pipeline/tool-release.json"))
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
+        raise RecoveryError("recovery_release_missing", "release wheel source identity is unreadable") from error
+    require(
+        isinstance(embedded, dict)
+        and all(
+            embedded.get(key) == document.get(key)
+            for key in ("version", "source_commit", "source_tree", "source_sha256")
+        ),
+        "recovery_release_missing", "release wheel source identity differs",
+    )
+    return {"commit": identity["source_commit"], "tree": tree, "worktree": "release-archive"}
 
 
 def load_backup_context(config_path: Path) -> BackupContext:
@@ -820,12 +827,16 @@ def load_backup_context(config_path: Path) -> BackupContext:
         "derived store root differs from the active snapshot",
     )
     release_root = Path(resolved["storage"]["release_root"])
-    release_path = release_root / "release.json"
+    archive_root = Path(__file__).resolve().parents[2]
+    release_path = archive_root / "release.json"
     require_real_file(release_path, "release identity", "recovery_release_missing")
-    release_document = install_record.release_identity(json.loads(release_path.read_text(encoding="utf-8")))
+    _, raw_release = strict_json_file(release_path, "release identity")
+    release_document = install_record.release_identity(raw_release)
     require(
         release_document["source_commit"] == record["release"]["source_commit"]
-        and release_document["source_sha256"] == record["release"]["source_sha256"],
+        and release_document["source_sha256"] == record["release"]["source_sha256"]
+        and release_document["version"] == record["release"]["version"]
+        and release_document["artifacts"] == record["release"]["artifacts"],
         "recovery_release_missing",
         "release.json differs from the active install record",
     )
@@ -850,7 +861,6 @@ def load_backup_context(config_path: Path) -> BackupContext:
         wheel=Path(derived_env["PIPELINE_WHEEL"]),
     )
     workspace_plan = workspace_reconstructible_plan(resolved)
-    project_root = Path(__file__).resolve().parents[2]
     postgres_root = Path(derived_env["POSTGRES_ROOT"])
     return BackupContext(
         config_path=config_path,
@@ -858,9 +868,11 @@ def load_backup_context(config_path: Path) -> BackupContext:
         install_record=record,
         snapshot=snapshot,
         release_document=release_document,
+        archive_root=archive_root,
+        archive_document=raw_release,
         derived_env=derived_env,
         workspace_plan=workspace_plan,
-        source_code=source_tree_identity(project_root),
+        source_code=archive_source_identity(archive_root, raw_release),
         host_id=socket.gethostname(),
         postgres_root=postgres_root,
     )
@@ -3157,15 +3169,15 @@ def verify_member_set(staging: Path, members: list[dict]) -> None:
 
 
 def copy_release_tree(context: BackupContext, staging: Path) -> dict:
-    release_root = Path(context.resolved["storage"]["release_root"])
+    archive_root = context.archive_root
     destination = staging / "release"
     destination.mkdir(parents=True, mode=0o700)
-    release_json = release_root / "release.json"
+    release_json = archive_root / "release.json"
     copy_required_file(release_json, destination / "release.json")
     artifacts = []
     for row in context.release_document["artifacts"]:
         name = confined_member(row["name"], "release artifact")
-        source = release_root / name
+        source = archive_root / name
         require_real_file(source, f"release artifact {name}", "recovery_release_missing")
         actual = sha256_file(source)
         require(
@@ -3186,7 +3198,7 @@ def copy_release_tree(context: BackupContext, staging: Path) -> dict:
         )
     return {
         "name": "release_root",
-        "path": str(release_root),
+        "path": context.resolved["storage"]["release_root"],
         "archive": "release",
         "class": "release",
         "required": True,
@@ -3386,7 +3398,7 @@ def derived_dump_member(staging: Path, name: str) -> dict:
 
 def backup_source_checks(context: BackupContext) -> list[dict]:
     state_root = Path(context.resolved["storage"]["state_root"])
-    release_root = Path(context.resolved["storage"]["release_root"])
+    archive_root = context.archive_root
     checks = [
         {"name": "install_records", "path": str(state_root / "install-records")},
         {"name": "snapshots", "path": str(state_root / "snapshots")},
@@ -3417,13 +3429,13 @@ def backup_source_checks(context: BackupContext) -> list[dict]:
             "name": "artifact_root",
             "path": context.resolved["storage"]["artifact_root"],
         },
-        {"name": "release_json", "path": str(release_root / "release.json")},
+        {"name": "release_json", "path": str(archive_root / "release.json")},
         {"name": "platform_config", "path": str(context.config_path)},
     ]
     checks.extend(
         {
             "name": f"release_artifact_{index}",
-            "path": str(release_root / row["name"]),
+            "path": str(archive_root / row["name"]),
         }
         for index, row in enumerate(context.release_document["artifacts"])
     )
@@ -5893,6 +5905,7 @@ def backup_command(
         )
     ]
     source_roots_for_key.extend(Path(value) for value in context.resolved["specifications"]["record_roots"])
+    source_roots_for_key.append(context.archive_root)
     for root in [out, *source_roots_for_key]:
         require(
             not key_file.resolve().is_relative_to(root.resolve()),
@@ -6118,7 +6131,7 @@ def _backup_command_claimed(
         )
         copy_required_file(context.config_path, staging / "config" / "platform.json")
         copy_required_file(
-            Path(context.resolved["storage"]["release_root"]) / "release.json",
+            context.archive_root / "release.json",
             staging / "config" / "release.json",
         )
         capture_checkpoint_store(
@@ -6569,7 +6582,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         and bool(GIT_OBJECT.fullmatch(source_code["commit"]))
         and isinstance(source_code["tree"], str)
         and bool(GIT_OBJECT.fullmatch(source_code["tree"]))
-        and source_code["worktree"] == "clean"
+        and source_code["worktree"] == "release-archive"
         and isinstance(source_code["script_sha256"], str)
         and bool(HEX64.fullmatch(source_code["script_sha256"])),
         "recovery_manifest_invalid",
@@ -6591,6 +6604,11 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         and bool(release["artifacts"]),
         "recovery_manifest_invalid",
         "release identity is malformed",
+    )
+    require(
+        source_code["commit"] == release["source_commit"],
+        "recovery_manifest_invalid",
+        "archive source commit differs from the release",
     )
     for index, row in enumerate(release["artifacts"]):
         _exact_keys(
@@ -9814,7 +9832,9 @@ def _release_contract(extracted: Path) -> dict:
         and document.get("schema_version") == "solidworks-to-urdf.release/v1"
         and isinstance(document.get("version"), str)
         and isinstance(document.get("source_sha256"), str)
-        and bool(HEX64.fullmatch(document["source_sha256"])),
+        and bool(HEX64.fullmatch(document["source_sha256"]))
+        and isinstance(document.get("source_tree"), str)
+        and bool(GIT_OBJECT.fullmatch(document["source_tree"])),
         "recovery_release_missing",
         "archived release identity is malformed",
     )
@@ -10338,6 +10358,16 @@ def verify_release_runtime(
         "recovered package directory is outside its virtual environment",
     )
     release_contract = _release_contract(extracted)
+    source = manifest.get("source_code", {})
+    require(
+        source.get("commit") == release_contract["source_commit"]
+        and source.get("tree") == release_contract["source_tree"]
+        and source.get("worktree") == "release-archive"
+        and isinstance(source.get("script_sha256"), str)
+        and source["script_sha256"] == release_contract["deployment_files"].get("deploy/operator/recovery.py"),
+        "recovery_release_missing",
+        "archived source tree differs from the recovery manifest",
+    )
     artifacts = _release_artifacts(manifest)
     _, linux_name, wheel_name = _release_role_archives(artifacts)
     wheel = release_root / "artifacts" / wheel_name
