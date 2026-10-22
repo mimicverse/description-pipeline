@@ -1596,6 +1596,30 @@ class NativeFinCaptureTests(unittest.TestCase):
         ):
             self.capture(body, extension, body_type=1)
 
+    def test_edge_fin_ids_are_canonicalized_after_native_read(self):
+        body, _face_10, _face_20, _edge, tessellation, extension = self.fixture()
+        tessellation.GetEdgeFins = lambda _edge: [200, 100]
+
+        captured = self.capture(body, extension)
+
+        self.assertEqual(captured["edges"][0]["fin_ids"], (100, 200))
+
+    def test_edge_fin_read_rejects_invalid_or_repeated_ids(self):
+        cases = (
+            ("boolean", [True], "invalid fin ID"),
+            ("float", [100.0], "invalid fin ID"),
+            ("outside", [999], "outside the captured facets"),
+            ("duplicate", [100, 100], "repeats a fin ID"),
+        )
+        for label, fin_ids, message in cases:
+            with self.subTest(label=label):
+                body, _face_10, _face_20, _edge, tessellation, extension = (
+                    self.fixture()
+                )
+                tessellation.GetEdgeFins = lambda _edge, value=fin_ids: value
+                with self.assertRaisesRegex(CadError, message):
+                    self.capture(body, extension)
+
     def test_one_tessellate_partitions_edge_and_internal_fins(self):
         body, face_10, face_20, edge, tessellation, extension = self.fixture()
 

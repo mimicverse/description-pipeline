@@ -75,7 +75,7 @@ def validate_native_edge_fin_relations(
     _require(
         all(type(fin_id) is int and fin_id >= 0 for fin_id in declared)
         and len(declared) == len(set(declared))
-        and declared == normalized_ids,
+        and set(declared) == set(normalized_ids),
         f"{component}: native edge fin_ids are not bidirectional",
         component=component,
         declared_fin_ids=list(declared),

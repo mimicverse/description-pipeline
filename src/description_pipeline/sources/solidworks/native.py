@@ -5875,6 +5875,7 @@ class SolidWorksBackend(CadBackend):
                 edge_index=edge_index,
             )
             normalized = []
+            seen = set()
             for fin_id in edge_fins:
                 if type(fin_id) is not int or fin_id < 0:
                     raise CadError(
@@ -5888,16 +5889,15 @@ class SolidWorksBackend(CadBackend):
                         "an edge returned a fin outside the captured facets",
                         {**base, "edge_index": edge_index, "fin_id": fin_id},
                     )
-                if fin_id in fin_ids_by_edge_index.get(
-                    edge_index,
-                    (),
-                ):
+                if fin_id in seen:
                     raise CadError(
                         "cad_native_tessellation_unreadable",
-                        "a fin belongs to multiple native edges",
+                        "a native edge repeats a fin ID",
                         {**base, "edge_index": edge_index, "fin_id": fin_id},
                     )
+                seen.add(fin_id)
                 normalized.append(fin_id)
+            normalized.sort()
             edge_row["fin_ids"] = tuple(normalized)
             fin_ids_by_edge_index[edge_index] = tuple(normalized)
             incidence = len(edge_row["face_indices"])

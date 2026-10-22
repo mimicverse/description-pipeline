@@ -1193,6 +1193,15 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             summarize_native_topology(tessellation, spans)
 
+    def test_parser_and_summary_accept_unsorted_declared_fin_ids(self):
+        tessellation, triangles = self.fixture()
+        tessellation["native_edges"][0]["fin_ids"].reverse()
+
+        spans = self.parse(tessellation, triangles)
+        summary = summarize_native_topology(tessellation, spans)
+
+        self.assertEqual(summary["status"], "evidence_complete")
+
     def test_topology_summary_rejects_invalid_face_sense_inventory(self):
         cases = (
             (
@@ -1321,6 +1330,122 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                 vertices_by_id=vertices,
             )
 
+    def test_shared_validator_accepts_unsorted_declared_fin_set(self):
+        def shared_fin(
+            fin_id,
+            *,
+            face_index,
+            cofin_id,
+            start_u,
+            end_u,
+            vertex_ids,
+        ):
+            return {
+                "fin_id": fin_id,
+                "facet_id": fin_id,
+                "face_index": face_index,
+                "cofin_raw_id": cofin_id,
+                "cofin_id": cofin_id,
+                "vertex_ids": vertex_ids,
+                "start_u": start_u,
+                "end_u": end_u,
+            }
+
+        fins = {
+            1186: shared_fin(
+                1186,
+                face_index=0,
+                cofin_id=1672,
+                start_u=0.0,
+                end_u=1.0,
+                vertex_ids=[1, 2],
+            ),
+            1672: shared_fin(
+                1672,
+                face_index=1,
+                cofin_id=1186,
+                start_u=1.0,
+                end_u=0.0,
+                vertex_ids=[2, 1],
+            ),
+        }
+        edge = {
+            "body_type": 0,
+            "face_indices": [0, 1],
+            "fin_ids": [1672, 1186],
+            "face_senses": [
+                {
+                    "face_index": 0,
+                    "EdgeInFaceSense": {"value": False, "error": None},
+                    "IEdgeInFaceSense2": {"value": False, "error": None},
+                },
+                {
+                    "face_index": 1,
+                    "EdgeInFaceSense": {"value": True, "error": None},
+                    "IEdgeInFaceSense2": {"value": True, "error": None},
+                },
+            ],
+        }
+        vertices = {
+            1: (0.0, 0.0, 0.0),
+            2: (1.0, 0.0, 0.0),
+        }
+
+        self.assertEqual(
+            validate_native_edge_fin_relations(
+                component="validator",
+                edge=edge,
+                edge_fins=[1186, 1672],
+                fins_by_id=fins,
+                vertices_by_id=vertices,
+            ),
+            {"fin_ids": (1186, 1672), "collapsed_pairs": []},
+        )
+
+        invalid_cases = (
+            ("missing", [1186], [1186, 1672], fins),
+            (
+                "extra",
+                [1186, 1672, 999],
+                [1186, 1672],
+                {**fins, 999: fins[1186]},
+            ),
+            ("duplicate", [1186, 1186, 1672], [1186, 1672], fins),
+            ("boolean", [False, 1672], [1186, 1672], fins),
+            ("float", [1186.0, 1672], [1186, 1672], fins),
+        )
+        for label, declared, actual, candidate_fins in invalid_cases:
+            with self.subTest(label=label), self.assertRaises(
+                NativeFinRelationError
+            ):
+                validate_native_edge_fin_relations(
+                    component="validator",
+                    edge={**edge, "fin_ids": declared},
+                    edge_fins=actual,
+                    fins_by_id=candidate_fins,
+                    vertices_by_id=vertices,
+                )
+
+        unknown_face_fins = {
+            **fins,
+            1672: shared_fin(
+                1672,
+                face_index=2,
+                cofin_id=1186,
+                start_u=1.0,
+                end_u=0.0,
+                vertex_ids=[2, 1],
+            ),
+        }
+        with self.assertRaisesRegex(NativeFinRelationError, "unrelated face"):
+            validate_native_edge_fin_relations(
+                component="validator",
+                edge=edge,
+                edge_fins=[1186, 1672],
+                fins_by_id=unknown_face_fins,
+                vertices_by_id=vertices,
+            )
+
     def test_parser_and_summary_reject_boolean_native_identity_fields(self):
         mutations = (
             (
@@ -1372,9 +1497,8 @@ class CurvedNativeEdgeFixtureTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     summarize_native_topology(tessellation, spans)
 
-    def test_topology_summary_rejects_inexact_declared_fin_ids(self):
+    def test_topology_summary_rejects_invalid_declared_fin_ids(self):
         mutations = (
-            ("unsorted", lambda fin_ids: list(reversed(fin_ids))),
             ("bool", lambda fin_ids: [True, *fin_ids[1:]]),
             ("float", lambda fin_ids: [float(fin_ids[0]), *fin_ids[1:]]),
         )
