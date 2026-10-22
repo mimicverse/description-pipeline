@@ -61,8 +61,10 @@ class DeployMachineryTests(unittest.TestCase):
             "'health'",
             "'status'",
             "Write-Utf8NoBom",
-            "description.exe",
+            "python.exe",
+            "-I -m description_pipeline",
             "serve --config",
+            "launch_contract",
             "stage-receipt.json",
         ):
             self.assertIn(marker, script)

@@ -461,6 +461,7 @@ airflow_require_no_readers() {
 airflow_record_dag() {
   python3 - "$1" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -1183,6 +1184,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
+WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
 config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 windows = config.get("windows")
@@ -1222,14 +1225,105 @@ $expected = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
 function Read-Json([string]$path) {{
   (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json
 }}
+function Normalize-PathIdentity([string]$path) {{
+  return (([string]$path).Replace('\', '/').TrimEnd('/'))
+}}
+function Get-LaunchContract([string]$generation) {{
+  $receipt = Join-Path $generation 'stage-receipt.json'
+  if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {{
+    throw 'the task generation has no stage receipt'
+  }}
+  $record = Read-Json $receipt
+  if ($record.passed -isnot [bool] -or $record.passed -ne $true) {{
+    throw 'the task generation stage receipt passed field is not JSON boolean true'
+  }}
+  if ($record.verb -isnot [string] -or $record.verb -cne 'stage') {{
+    throw 'the task generation stage receipt verb is not the exact JSON string stage'
+  }}
+  if ($record.generation -isnot [string] -or
+      (Normalize-PathIdentity $record.generation) -ne
+      (Normalize-PathIdentity $generation)) {{
+    throw 'the stage receipt generation is not an exact string for this generation'
+  }}
+  if ($record.version -isnot [string] -or
+      $record.source_commit -isnot [string] -or
+      $record.source_sha256 -isnot [string]) {{
+    throw 'the task generation launch contract carries no strict release identity strings'
+  }}
+  if ($record.PSObject.Properties.Name -contains 'launch_contract') {{
+    if ($record.launch_contract -isnot [string]) {{
+      throw 'the task generation launch_contract is not a JSON string'
+    }}
+    $contract = $record.launch_contract
+    if ($contract -cne 'python_module_v1') {{
+      throw "the task generation names an unsupported launch contract: $contract"
+    }}
+    if ($record.source_commit -ceq '55cdf8da178e37239d3ac199cd27fc50cf56540d') {{
+      throw 'the approved legacy release cannot declare the Python module launcher'
+    }}
+    return $contract
+  }}
+  if ($record.source_commit -cne '55cdf8da178e37239d3ac199cd27fc50cf56540d') {{
+    throw 'the contract-less task generation is not the approved legacy release'
+  }}
+  if ($record.version -cne '1.5.0' -or
+      $record.source_sha256 -cne '66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec') {{
+    throw 'the contract-less task generation does not carry the approved legacy release identity'
+  }}
+  return 'legacy_pip_launcher_v0'
+}}
+function Test-LaunchArguments([string]$arguments, [string]$generation, [string]$contract) {{
+  if ($contract -ceq 'python_module_v1') {{
+    $match = [regex]::Match(
+      $arguments,
+      '^(-I -m description_pipeline serve --config )"([^"]+)"$')
+    return (
+      $match.Success -and
+      $match.Groups[1].Value -ceq '-I -m description_pipeline serve --config ' -and
+      (Normalize-PathIdentity $match.Groups[2].Value) -eq
+      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
+    )
+  }}
+  if ($contract -ceq 'legacy_pip_launcher_v0') {{
+    $match = [regex]::Match($arguments, '^(serve --config )"([^"]+)"$')
+    return (
+      $match.Success -and
+      $match.Groups[1].Value -ceq 'serve --config ' -and
+      (Normalize-PathIdentity $match.Groups[2].Value) -eq
+      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))
+    )
+  }}
+  return $false
+}}
+function Test-LaunchAction([string]$execute, [string]$arguments, [string]$generation, [string]$contract) {{
+  if ($contract -ceq 'python_module_v1') {{
+    return (
+      (Normalize-PathIdentity $execute) -eq
+        (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\python.exe')) -and
+      (Test-LaunchArguments $arguments $generation $contract)
+    )
+  }}
+  return (
+    $contract -ceq 'legacy_pip_launcher_v0' -and
+    (Normalize-PathIdentity $execute) -eq
+      (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\description.exe')) -and
+    (Test-LaunchArguments $arguments $generation $contract)
+  )
+}}
 function Get-Sample {{
   $task = Get-ScheduledTask -TaskName $expected.task_name -ErrorAction Stop
   if ($task.State -ne 'Running') {{ throw "task state is $($task.State)" }}
+  if (@($task.Actions).Count -ne 1) {{ throw 'task action count differs from exactly one' }}
   $arguments = [string]$task.Actions[0].Arguments
   $match = [regex]::Match($arguments, 'serve --config\s+"?([^"]+)"?')
   if (-not $match.Success) {{ throw 'task action does not bind serve --config' }}
   $configPath = $match.Groups[1].Value
   $generation = Split-Path -Parent $configPath
+  $launchContract = Get-LaunchContract $generation
+  if (-not (Test-LaunchAction ([string]$task.Actions[0].Execute) `
+      ([string]$task.Actions[0].Arguments) $generation $launchContract)) {{
+    throw 'task action does not match its generation launch contract'
+  }}
   $python = Join-Path $generation 'runtime\Scripts\python.exe'
   if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {{
     throw 'task generation runtime Python is missing'
@@ -1244,6 +1338,10 @@ function Get-Sample {{
   $probe = ((& $python -I -c $program $configPath) | Select-Object -Last 1) |
     ConvertFrom-Json
   $config = Read-Json $configPath
+  if ((Normalize-PathIdentity ([string]$task.Actions[0].WorkingDirectory)) -ne
+      (Normalize-PathIdentity ([string]$config.state_root))) {{
+    throw 'task working directory differs from the endpoint state root'
+  }}
   $installId = (
     Get-Content -LiteralPath (Join-Path ([string]$probe.state_root) 'install-id') -Raw
   ).Trim()
@@ -1269,10 +1367,13 @@ function Get-Sample {{
   [ordered]@{{
     task_name = [string]$task.TaskName
     task_state = [string]$task.State
+    action_count = @($task.Actions).Count
     listener_pid = [int]$process.Id
     process_start_utc = $process.StartTime.ToUniversalTime().ToString('o')
     install_id = [string]$installId
     config_digest = [string]$probe.config_digest
+    launch_contract = [string]$launchContract
+    action_matches_generation = $true
     release = [ordered]@{{
       version = [string]$probe.release.version
       source_commit = [string]$embedded.source_commit
@@ -1367,12 +1468,17 @@ if (
     not isinstance(sample, dict)
     or sample.get("task_name") != task_name
     or sample.get("task_state") != "Running"
+    or type(sample.get("action_count")) is not int
+    or sample.get("action_count") != 1
     or sample.get("install_id") != identity["install_id"]
     or sample.get("config_digest") != identity["config_digest"]
     or sample.get("health_install_id") != identity["install_id"]
     or sample.get("health_config_digest") != identity["config_digest"]
     or sample.get("release") != identity["release"]
     or sample.get("health_release") != identity["release"]
+    or sample.get("action_matches_generation") is not True
+    or sample.get("launch_contract")
+    not in {WINDOWS_PYTHON_LAUNCH_CONTRACT, WINDOWS_LEGACY_LAUNCH_CONTRACT}
     or type(sample.get("listener_pid")) is not int
     or not isinstance(sample.get("process_start_utc"), str)
     or not sample["process_start_utc"]
@@ -1383,10 +1489,13 @@ print(
         {
             "task_name": task_name,
             "task_state": "Running",
+            "action_count": sample["action_count"],
             "listener_pid": sample["listener_pid"],
             "process_start_utc": sample["process_start_utc"],
             "install_id": sample["install_id"],
             "config_digest": sample["config_digest"],
+            "launch_contract": sample["launch_contract"],
+            "action_matches_generation": sample["action_matches_generation"],
         },
         sort_keys=True,
     )
@@ -2320,11 +2429,24 @@ except Exception:
       fi
       RECONCILIATION="$(python3 - "$RECEIPT_DIR/windows-binding.json" "$WINDOWS_STATUS" <<'PY'
 import json
+import re
 import sys
 
 
 def normalize(value):
     return str(value or "").replace("\\", "/").rstrip("/")
+
+
+def parse_arguments(value):
+    text = str(value or "").strip()
+    for pattern in (
+        r'^(-I -m description_pipeline serve --config )"([^"]+)"$',
+        r'^(serve --config )"([^"]+)"$',
+    ):
+        match = re.fullmatch(pattern, text)
+        if match:
+            return match.group(1), normalize(match.group(2)).lower()
+    return None
 
 
 binding = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -2337,6 +2459,14 @@ if not isinstance(live, dict):
 # The endpoint script owns task-config parsing; this side compares structured facts only.
 execute = normalize(live.get("execute")).lower()
 config = normalize(live.get("config")).lower()
+arguments = parse_arguments(live.get("arguments"))
+working_directory = normalize(live.get("working_directory")).lower()
+launch_contract = live.get("launch_contract")
+action_matches_generation = live.get("action_matches_generation") is True
+task_running = live.get("state") == "Running"
+exact_one_action = (
+    type(live.get("action_count")) is int and live.get("action_count") == 1
+)
 if not execute or not config:
     print("unknown")
     raise SystemExit(0)
@@ -2345,24 +2475,82 @@ record = next((row for row in records if normalize(row.get("generation")) == tar
 source = normalize(record.get("previous")) if record else ""
 source_launcher = normalize(record.get("source_launcher")).lower() if record else ""
 source_config = normalize(record.get("source_config")).lower() if record else ""
+has_source_arguments = isinstance(record, dict) and "source_arguments" in record
+has_source_working_directory = (
+    isinstance(record, dict) and "source_working_directory" in record
+)
+source_arguments = parse_arguments(record.get("source_arguments")) if record else None
+source_working_directory = normalize(record.get("source_working_directory")).lower() if record else ""
+source_generation = (
+    source_config[: -len("/endpoint.json")]
+    if source_config.endswith("/endpoint.json")
+    else ""
+)
 
 
 def runs(generation):
     # The single launch convention the endpoint script uses (Runtime-Launcher + Config-Path).
     return (
-        execute == (generation + "/runtime/scripts/description.exe").lower()
+        task_running
+        and exact_one_action
+        and action_matches_generation
+        and launch_contract == "python_module_v1"
+        and execute == (generation + "/runtime/scripts/python.exe").lower()
         and config == (generation + "/endpoint.json").lower()
+        and arguments
+        == (
+            '-I -m description_pipeline serve --config ',
+            normalize(generation + "/endpoint.json").lower(),
+        )
+        and working_directory == normalize(binding.get("state_root")).lower()
     )
 
 
 if runs(target):
     print(source if source else "unknown")
 elif (
-    source
+    task_running
+    and exact_one_action
+    and launch_contract == "legacy_pip_launcher_v0"
+    and action_matches_generation
+    and source
     and source_launcher
     and source_config
+    and source_generation
+    and source_launcher == source_generation + "/runtime/scripts/description.exe"
     and execute == source_launcher
     and config == source_config
+    and arguments == ("serve --config ", normalize(source_config).lower())
+    and working_directory == normalize(binding.get("state_root")).lower()
+    and not has_source_arguments
+    and not has_source_working_directory
+):
+    # Transitional pending receipts predate the full source-action fields. They are accepted
+    # only for the exact approved legacy action proven by the live generation contract.
+    print("before")
+elif (
+    task_running
+    and exact_one_action
+    and action_matches_generation
+    and source
+    and source_launcher
+    and source_config
+    and source_arguments
+    and source_working_directory
+    and execute == source_launcher
+    and config == source_config
+    and arguments == source_arguments
+    and working_directory == source_working_directory
+    and (
+        (
+            source_launcher.endswith("/runtime/scripts/description.exe")
+            and launch_contract == "legacy_pip_launcher_v0"
+        )
+        or (
+            source_launcher.endswith("/runtime/scripts/python.exe")
+            and launch_contract == "python_module_v1"
+        )
+    )
 ):
     # Positively the ACTUAL launcher and configuration this maintenance bound as its source.
     print("before")

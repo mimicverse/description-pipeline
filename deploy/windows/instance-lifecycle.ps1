@@ -97,12 +97,168 @@ function Write-Receipt([string]$path, [hashtable]$payload) {
   Write-Utf8NoBom $path (Emit $payload)
 }
 function Runtime-Python([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
-function Runtime-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\description.exe' }
+function Runtime-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
+function Runtime-LauncherArguments([string]$generation) {
+  '-I -m description_pipeline serve --config "' + (Config-Path $generation) + '"'
+}
 function Config-Path([string]$generation) { Join-Path $generation 'endpoint.json' }
+function Python-Module-LaunchContract { 'python_module_v1' }
+function Legacy-LaunchContract { 'legacy_pip_launcher_v0' }
+function Legacy-ReleaseCommit { '55cdf8da178e37239d3ac199cd27fc50cf56540d' }
+function Legacy-ReleaseSourceSha256 { '66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec' }
+function Legacy-ReleaseIdentitySha256 { '62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200' }
+function Legacy-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\description.exe' }
+function Legacy-LauncherArguments([string]$generation) {
+  'serve --config "' + (Config-Path $generation) + '"'
+}
+function New-LaunchContractFailure([string]$code, [string]$message) {
+  return @{passed=$false; code=$code; message=$message}
+}
+function Find-GenerationLaunchContract([string]$generation) {
+  try {
+    $receipt = Join-Path $generation 'stage-receipt.json'
+    if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {
+      return (New-LaunchContractFailure 'stage_receipt_missing' (
+        'the generation has no launch-contract receipt: ' + $generation))
+    }
+    $unsafe = Find-ReparseAncestor $receipt
+    if ($unsafe) {
+      return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+        'the stage receipt crosses a reparse point: ' + $unsafe))
+    }
+    $record = Read-Json $receipt
+    if ($record.passed -isnot [bool] -or $record.passed -ne $true) {
+      return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+        'the stage receipt passed field is not the JSON boolean true'))
+    }
+    if ($record.verb -isnot [string] -or $record.verb -cne 'stage') {
+      return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+        'the stage receipt verb is not the exact JSON string stage'))
+    }
+    if ($record.generation -isnot [string] -or
+        (Normalize-PathIdentity $record.generation) -ne
+        (Normalize-PathIdentity $generation)) {
+      return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+        'the stage receipt generation is not an exact string for this generation'))
+    }
+    if ($record.version -isnot [string] -or
+        $record.source_commit -isnot [string] -or
+        $record.source_sha256 -isnot [string]) {
+      return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+        'the generation launch contract carries no strict release identity strings'))
+    }
+    if ($record.PSObject.Properties.Name -contains 'launch_contract') {
+      if ($record.launch_contract -isnot [string]) {
+        return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+          'the stage receipt launch_contract is not a JSON string'))
+      }
+      $contract = $record.launch_contract
+      if ($contract -cne (Python-Module-LaunchContract)) {
+        return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+          'the stage receipt names an unsupported runtime launcher: ' + $contract))
+      }
+      if ($record.source_commit -ceq (Legacy-ReleaseCommit)) {
+        return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+          'the approved legacy release cannot declare the Python module launcher'))
+      }
+      return @{passed=$true; contract=$contract}
+    }
+    if ($record.source_commit -cne (Legacy-ReleaseCommit)) {
+      return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+        'a contract-less generation is not the approved legacy release'))
+    }
+    if ($record.version -cne '1.5.0' -or
+        $record.source_sha256 -cne (Legacy-ReleaseSourceSha256)) {
+      return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+        'a contract-less generation does not carry the approved legacy release identity'))
+    }
+    return @{passed=$true; contract=(Legacy-LaunchContract)}
+  } catch {
+    return (New-LaunchContractFailure 'stage_launch_contract_unsupported' (
+      'the generation launch contract is unreadable: ' + $_.Exception.Message))
+  }
+}
+function Get-GenerationLaunchContract([string]$generation) {
+  $lookup = Find-GenerationLaunchContract $generation
+  if (-not $lookup.passed) {
+    Die $lookup.code $lookup.message
+  }
+  return $lookup.contract
+}
+function Test-Runtime-LauncherArguments([string]$arguments, [string]$generation, [string]$contract) {
+  if ($contract -ceq (Python-Module-LaunchContract)) {
+    $match = [regex]::Match(
+      $arguments,
+      '^(-I -m description_pipeline serve --config )"([^"]+)"$')
+    return (
+      $match.Success -and
+      $match.Groups[1].Value -ceq '-I -m description_pipeline serve --config ' -and
+      (Normalize-PathIdentity $match.Groups[2].Value) -eq
+      (Normalize-PathIdentity (Config-Path $generation))
+    )
+  }
+  if ($contract -ceq (Legacy-LaunchContract)) {
+    $match = [regex]::Match($arguments, '^(serve --config )"([^"]+)"$')
+    return (
+      $match.Success -and
+      $match.Groups[1].Value -ceq 'serve --config ' -and
+      (Normalize-PathIdentity $match.Groups[2].Value) -eq
+      (Normalize-PathIdentity (Config-Path $generation))
+    )
+  }
+  return $false
+}
+function Test-Runtime-LauncherAction([string]$execute, [string]$arguments, [string]$generation, [string]$contract) {
+  if ($contract -ceq (Python-Module-LaunchContract)) {
+    return (
+      (Normalize-PathIdentity $execute) -eq (Normalize-PathIdentity (Runtime-Launcher $generation)) -and
+      (Test-Runtime-LauncherArguments $arguments $generation $contract)
+    )
+  }
+  return (
+    $contract -ceq (Legacy-LaunchContract) -and
+    (Normalize-PathIdentity $execute) -eq (Normalize-PathIdentity (Legacy-Launcher $generation)) -and
+    (Test-Runtime-LauncherArguments $arguments $generation $contract)
+  )
+}
+function Test-Runtime-Launcher([string]$execute, [string]$arguments, [string]$generation) {
+  $contract = Get-GenerationLaunchContract $generation
+  return (Test-Runtime-LauncherAction $execute $arguments $generation $contract)
+}
+function Resolve-RecoveryLaunchContract($identity) {
+  $contract = (Legacy-LaunchContract)
+  if ($identity.PSObject.Properties.Name -contains 'runtime_launch_contract') {
+    $contract = [string]$identity.runtime_launch_contract
+  } elseif ([string]$identity.release_identity_sha256 -ne (Legacy-ReleaseIdentitySha256)) {
+    Die 'windows_recovery_state_invalid' 'a contract-less Windows state is not the approved legacy release'
+  }
+  if ($contract -cnotin @((Python-Module-LaunchContract), (Legacy-LaunchContract))) {
+    Die 'windows_recovery_state_invalid' ('the Windows state names an unsupported launch contract: ' + $contract)
+  }
+  if ($contract -ceq (Legacy-LaunchContract) -and
+      [string]$identity.release_identity_sha256 -ne (Legacy-ReleaseIdentitySha256)) {
+    Die 'windows_recovery_state_invalid' 'the legacy launch contract is not bound to the approved release'
+  }
+  if ($contract -ceq (Python-Module-LaunchContract) -and
+      [string]$identity.release_identity_sha256 -eq (Legacy-ReleaseIdentitySha256)) {
+    Die 'windows_recovery_state_invalid' 'the approved legacy release cannot use the Python module launch contract'
+  }
+  return $contract
+}
 function Action-Config([object]$task) {
   $match = [regex]::Match([string]$task.Actions[0].Arguments, 'serve --config\s+"?([^"]+)"?')
   if (-not $match.Success) { Die 'task_ambiguous' 'the instance task does not run serve --config' }
   $match.Groups[1].Value
+}
+function Assert-Single-TaskAction([object]$task) {
+  if (@($task.Actions).Count -ne 1) {
+    Die 'task_ambiguous' 'the instance task must carry exactly one action'
+  }
+}
+function Assert-RunningTask([object]$task) {
+  if ([string]$task.State -cne 'Running') {
+    Die 'task_not_running' ('the instance task state is not Running: ' + $task.State)
+  }
 }
 function Health-Probe([string]$configPath, [object]$binding) {
   $config = Read-Json $configPath
@@ -356,7 +512,10 @@ function Get-PreviousGenerationBinding([string]$generation, [object]$binding) {
   $receipt = Join-Path $generation 'stage-receipt.json'
   if (-not (Test-Path -LiteralPath $receipt)) { return $null }
   try { $record = Read-Json $receipt } catch { return $null }
-  if (-not ($record.version -and $record.source_commit -and $record.source_sha256)) { return $null }
+  if ($record.passed -ne $true -or [string]$record.verb -cne 'stage' -or
+      -not ($record.version -and $record.source_commit -and $record.source_sha256)) { return $null }
+  $launch = Find-GenerationLaunchContract $generation
+  if (-not $launch.passed) { return $null }
   return @{ task_name=$binding.task_name; state_root=$binding.state_root; generation=$generation;
             port=$binding.port; version=$record.version; source_commit=$record.source_commit;
             source_sha256=$record.source_sha256 }
@@ -545,7 +704,14 @@ result = {
 print(json.dumps(result, sort_keys=True))
 '@
 }
-function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$previousConfig, [string]$stageDir, [string]$sourceLauncher) {
+function Restore-PreviousEndpoint(
+    [object]$binding,
+    [string]$previous,
+    [string]$previousConfig,
+    [string]$stageDir,
+    [string]$sourceLauncher,
+    [string]$sourceArguments,
+    [string]$sourceWorkingDirectory) {
   # The safe stop/restore every promote failure path runs: stop whatever now serves the task,
   # restore the task snapshot, then start the previous generation only on startable evidence
   # (lock free, no lock file, or refused with a proven-ended owner) - an unknown owner or a
@@ -573,6 +739,49 @@ function Restore-PreviousEndpoint([object]$binding, [string]$previous, [string]$
     } catch { $previousGeneration = '' }
   }
   $restore.previous_generation = [string]$previousGeneration
+  $restoredTask = $null
+  if ($restore.restored) {
+    try {
+      $restoredTask = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction Stop
+      Assert-Single-TaskAction $restoredTask
+    } catch {
+      $restore.started = $false
+      $restore.healthy = $null
+      if (-not $restore.error) { $restore.error = 'restored task: ' + $_.Exception.Message }
+      return $restore
+    }
+  }
+  if ($restore.restored -and -not $previousGeneration) {
+    $restore.error = 'the previous task action has no managed generation root'
+    return $restore
+  }
+  if ($restore.restored) {
+    try {
+      $launch = Find-GenerationLaunchContract $previousGeneration
+      if (-not $launch.passed) {
+        throw ($launch.code + ': ' + $launch.message)
+      }
+      $contract = [string]$launch.contract
+      $previousDocument = Read-Json $previousConfig
+      $restoredAction = $restoredTask.Actions[0]
+      if (-not (Test-Runtime-LauncherAction ([string]$restoredAction.Execute) `
+          ([string]$restoredAction.Arguments) $previousGeneration $contract) -or
+          (Normalize-PathIdentity ([string]$restoredAction.Execute)) -ne
+          (Normalize-PathIdentity $sourceLauncher) -or
+          [string]$restoredAction.Arguments -cne $sourceArguments -or
+          (Normalize-PathIdentity ([string]$restoredAction.WorkingDirectory)) -ne
+          (Normalize-PathIdentity $sourceWorkingDirectory) -or
+          (Normalize-PathIdentity $sourceWorkingDirectory) -ne
+          (Normalize-PathIdentity ([string]$previousDocument.state_root))) {
+        throw 'the previous task action does not match its generation launch contract'
+      }
+    } catch {
+      $restore.started = $false
+      $restore.healthy = $null
+      if (-not $restore.error) { $restore.error = 'launch contract: ' + $_.Exception.Message }
+      return $restore
+    }
+  }
   $gate = Get-OwnershipRefusalFacts $stageDir $binding
   $restore.start_gate = [string]$gate.state
   $restore.startable = ($gate.state -in @('lock_free', 'no_lock_file')) -or
@@ -1201,18 +1410,25 @@ function Get-TaskFilePath($Task) {
   }
   return $path
 }
-function Assert-NoReparseAncestor([string]$Path) {
+function Find-ReparseAncestor([string]$Path) {
   $current = [System.IO.Path]::GetFullPath($Path)
   while ($current) {
     if (Test-Path -LiteralPath $current) {
       $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
       if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-        Die 'windows_recovery_target_unsafe' ('recovery path crosses a reparse point: ' + $current)
+        return $current
       }
     }
     $parent = [System.IO.Path]::GetDirectoryName($current)
     if (-not $parent -or $parent -eq $current) { break }
     $current = $parent
+  }
+  return ''
+}
+function Assert-NoReparseAncestor([string]$Path) {
+  $unsafe = Find-ReparseAncestor $Path
+  if ($unsafe) {
+    Die 'windows_recovery_target_unsafe' ('recovery path crosses a reparse point: ' + $unsafe)
   }
 }
 function Register-ManagedTask(
@@ -1363,18 +1579,16 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
   $generation = Split-Path -Parent $runtime
   $stateRoot = [string]$configDocument.state_root
   $lifecycleRoot = Join-Path $stateRoot 'lifecycle'
+  $launchContract = Get-GenerationLaunchContract $generation
   foreach ($path in @($configPath, $execute, $generation, $stateRoot, $lifecycleRoot)) {
     Assert-NoReparseAncestor $path
   }
-  if ((Normalize-PathIdentity $execute) -ne
-      (Normalize-PathIdentity (Join-Path $generation 'runtime\Scripts\description.exe')) -or
+  if (-not (Test-Runtime-Launcher $execute ([string]$Task.Actions[0].Arguments) $generation) -or
       -not (Normalize-PathIdentity $generation).StartsWith(
         (Normalize-PathIdentity $lifecycleRoot) + '/',
         [System.StringComparison]::OrdinalIgnoreCase) -or
       (Normalize-PathIdentity $configPath) -ne
-      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json')) -or
-      [string]$Task.Actions[0].Arguments -ne
-      ('serve --config "' + (Config-Path $generation) + '"')) {
+      (Normalize-PathIdentity (Join-Path $generation 'endpoint.json'))) {
     Die 'windows_task_projection_mismatch' 'the task action does not bind the managed endpoint generation'
   }
   if (-not (Test-Path -LiteralPath (Runtime-Python $generation))) {
@@ -1447,6 +1661,7 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
         'non-administrative-runtime'
       }
     )
+    runtime_launch_contract = $launchContract
     endpoint_root = Normalize-PathIdentity $generation
     config_path = Normalize-PathIdentity $configPath
     config_sha256 = Sha256 $configPath
@@ -1670,6 +1885,7 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
       runtime_sid = $identity.runtime_sid
       runtime_administrator = $identity.runtime_administrator
       runtime_privilege_qualification = $identity.runtime_privilege_qualification
+      runtime_launch_contract = $identity.runtime_launch_contract
       endpoint_root = $identity.endpoint_root
       config_path = $identity.config_path
       config_sha256 = $identity.config_sha256
@@ -1908,6 +2124,14 @@ function Invoke-RecoveryRestore($Binding, [bool]$VerifyOnly) {
         $state.cad.ownership_sha256 -ne $expected.cad_ownership_sha256) {
       Die 'windows_recovery_state_invalid' 'the Windows recovery bundle differs from the target binding'
     }
+    $stateContract = Resolve-RecoveryLaunchContract $state.identity
+    if ($state.identity.PSObject.Properties.Name -notcontains 'runtime_launch_contract') {
+      $state.identity | Add-Member -NotePropertyName runtime_launch_contract -NotePropertyValue $stateContract
+    }
+    if (-not (Test-Runtime-LauncherAction ([string]$state.task.action.execute) `
+        ([string]$state.task.action.arguments) ([string]$state.identity.endpoint_root) $stateContract)) {
+      Die 'windows_recovery_state_invalid' 'the archived task action does not match the recovery launch contract'
+    }
     if ([string]$state.identity.operator_sid -ne
         [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
       Die 'windows_operator_principal_mismatch' 'the SSH account differs from the recovery principal'
@@ -2102,7 +2326,19 @@ $promotions = Join-Path $binding.state_root 'instance-promotions'
 
 if ($Verb -eq 'health') {
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
-  try { $probe = Health-Probe (Action-Config $task) $binding } catch { Die 'endpoint_unhealthy' $_.Exception.Message }
+  Assert-Single-TaskAction $task
+  Assert-RunningTask $task
+  $liveConfig = Action-Config $task
+  if (-not (Test-Runtime-Launcher ([string]$task.Actions[0].Execute) `
+      ([string]$task.Actions[0].Arguments) (Split-Path -Parent $liveConfig))) {
+    Die 'windows_task_projection_mismatch' 'the running task does not match its generation launch contract'
+  }
+  $liveDocument = Read-Json $liveConfig
+  if ((Normalize-PathIdentity ([string]$task.Actions[0].WorkingDirectory)) -ne
+      (Normalize-PathIdentity ([string]$liveDocument.state_root))) {
+    Die 'windows_task_projection_mismatch' 'the running task working directory differs from its endpoint state root'
+  }
+  try { $probe = Health-Probe $liveConfig $binding } catch { Die 'endpoint_unhealthy' $_.Exception.Message }
   Emit @{passed=$true; verb='health'; health=$probe}
   exit 0
 }
@@ -2113,9 +2349,30 @@ if ($Verb -eq 'status') {
   $live = $null
   if ($task) {
     $liveConfig = ''
-    try { $liveConfig = Action-Config $task } catch { }
-    $live = @{execute=$task.Actions[0].Execute; arguments=$task.Actions[0].Arguments;
-              config=$liveConfig; state=[string]$task.State}
+    $launchContract = $null
+    $actionMatches = $false
+    $actionCount = @($task.Actions).Count
+    if ($actionCount -eq 1) {
+      try { $liveConfig = Action-Config $task } catch { }
+      if ($liveConfig) {
+        try {
+          $liveGeneration = Split-Path -Parent $liveConfig
+          $launch = Find-GenerationLaunchContract $liveGeneration
+          if ($launch.passed) {
+            $launchContract = [string]$launch.contract
+            $actionMatches = Test-Runtime-LauncherAction ([string]$task.Actions[0].Execute) `
+              ([string]$task.Actions[0].Arguments) $liveGeneration $launchContract
+          }
+        } catch { }
+      }
+    }
+    $live = @{action_count=$actionCount;
+              execute=$(if ($actionCount -eq 1) { $task.Actions[0].Execute } else { $null });
+              arguments=$(if ($actionCount -eq 1) { $task.Actions[0].Arguments } else { $null });
+              working_directory=$(if ($actionCount -eq 1) { $task.Actions[0].WorkingDirectory } else { $null });
+              config=$liveConfig;
+              state=[string]$task.State; launch_contract=$launchContract;
+              action_matches_generation=[bool]$actionMatches}
   }
   $pending = $null
   $pendingPath = Join-Path $promotions 'pending-promotion.json'
@@ -2131,10 +2388,16 @@ if ($Verb -eq 'stage') {
   if (-not $StageDir) { Die 'stage_dir_required' 'stage needs -StageDir (the new generation directory)' }
   if (Test-Path -LiteralPath $StageDir) { Die 'stage_exists' "preserve the existing generation: $StageDir" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  Assert-Single-TaskAction $task
   # Early fail-closed scan: anything the endpoint schema does not define - `targets` among
   # them - or a duplicate key stops the stage here, before any heavy work, and is never
   # silently dropped.
   $runningConfig = Action-Config $task
+  $runningGeneration = Split-Path -Parent $runningConfig
+  if (-not (Test-Runtime-Launcher ([string]$task.Actions[0].Execute) `
+      ([string]$task.Actions[0].Arguments) $runningGeneration)) {
+    Die 'windows_task_projection_mismatch' 'the running task does not match its generation launch contract'
+  }
   $early = Get-EndpointConfigEarlyProblems $runningConfig
   if ($early.unreadable) {
     Die 'endpoint_config_unreadable' ('the running endpoint configuration cannot be parsed: ' +
@@ -2150,6 +2413,10 @@ if ($Verb -eq 'stage') {
       '; remove them under change control and re-run stage')
   }
   $runningDocument = Read-Json $runningConfig
+  if ((Normalize-PathIdentity ([string]$task.Actions[0].WorkingDirectory)) -ne
+      (Normalize-PathIdentity ([string]$runningDocument.state_root))) {
+    Die 'windows_task_projection_mismatch' 'the running task working directory differs from its endpoint state root'
+  }
   $serviceSid = Get-ManagedServiceSid $task
   $runningEndpointRoot = Split-Path -Parent $runningConfig
   $runningInstallIdPath = Join-Path ([string]$runningDocument.state_root) 'install-id'
@@ -2220,6 +2487,7 @@ if ($Verb -eq 'stage') {
     source_commit=$binding.source_commit; source_sha256=$binding.source_sha256}
   Write-Receipt (Join-Path $StageDir 'stage-receipt.json') @{
     passed=$true; verb='stage'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
+    launch_contract=(Python-Module-LaunchContract);
     version=$binding.version; source_commit=$binding.source_commit; source_sha256=$binding.source_sha256;
     pins=@{ endpoint_root=$StageDir; ownership=$pins.canonical }}
   Emit @{passed=$true; verb='stage'; generation=$StageDir; receipt=(Join-Path $StageDir 'stage-receipt.json')}
@@ -2244,11 +2512,24 @@ if ($Verb -eq 'promote') {
     Die 'candidate_config_mismatch' ('the staged candidate configuration differs from the staged digest: ' + (Config-Path $StageDir))
   }
   $previousConfig = Action-Config $task
+  $previousGeneration = Split-Path -Parent $previousConfig
+  if (-not (Test-Runtime-Launcher ([string]$task.Actions[0].Execute) `
+      ([string]$task.Actions[0].Arguments) $previousGeneration)) {
+    Die 'windows_task_projection_mismatch' 'the task being replaced does not match its generation launch contract'
+  }
   if (-not $candidate.source_config_sha256) {
     Die 'candidate_source_unrecorded' 'the staged generation records no source configuration digest; re-run stage with the release toolchain'
   }
   if ((Sha256 $previousConfig) -ne [string]$candidate.source_config_sha256) {
     Die 'candidate_source_mismatch' ('the staged candidate belongs to another running configuration: ' + $previousConfig)
+  }
+  $previousDocument = Read-Json $previousConfig
+  if ((Normalize-PathIdentity ([string]$task.Actions[0].WorkingDirectory)) -ne
+      (Normalize-PathIdentity ([string]$previousDocument.state_root))) {
+    Die 'windows_task_projection_mismatch' 'the task being replaced has a foreign working directory'
+  }
+  if ((Get-GenerationLaunchContract $StageDir) -cne (Python-Module-LaunchContract)) {
+    Die 'stage_launch_contract_unsupported' 'the staged candidate does not declare the Python module launcher contract'
   }
   # The equality check runs before any disruption: a pin that is not the canonical domain, or an
   # endpoint-root pin that does not restate the served generation, refuses the promotion.
@@ -2261,7 +2542,9 @@ if ($Verb -eq 'promote') {
     $installIdPath $taskFile
   Assert-ManagedEndpointAcls $candidateDocument $StageDir (Config-Path $StageDir) `
     $installIdPath $taskFile
-  $sourceExecute = $task.Actions[0].Execute
+  $sourceExecute = [string]$task.Actions[0].Execute
+  $sourceArguments = [string]$task.Actions[0].Arguments
+  $sourceWorkingDirectory = [string]$task.Actions[0].WorkingDirectory
   $sourceConfig = $previousConfig
   Stop-Endpoint $binding
   New-Item -ItemType Directory -Path $promotions -ErrorAction SilentlyContinue | Out-Null
@@ -2274,9 +2557,10 @@ if ($Verb -eq 'promote') {
   Write-Receipt (Join-Path $promotions 'pending-promotion.json') @{
     intent=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
     previous=$previous; task_before=(Join-Path $previous 'task.xml');
-    source_launcher=$sourceExecute; source_config=$sourceConfig}
+    source_launcher=$sourceExecute; source_arguments=$sourceArguments;
+    source_working_directory=$sourceWorkingDirectory; source_config=$sourceConfig}
   $action = New-ScheduledTaskAction -Execute (Runtime-Launcher $StageDir) `
-    -Argument ('serve --config "' + (Config-Path $StageDir) + '"') -WorkingDirectory $binding.state_root
+    -Argument (Runtime-LauncherArguments $StageDir) -WorkingDirectory $binding.state_root
   Set-ScheduledTask -TaskName $binding.task_name -Action $action | Out-Null
   # The service reads the pins at start: set them for the execution account before starting the
   # new generation; a failed promotion restores the previous values below.
@@ -2294,7 +2578,8 @@ if ($Verb -eq 'promote') {
     }
     $receipt = @{
       passed=$true; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
-      previous=$previous; source_launcher=$sourceExecute; source_config=$sourceConfig; health=$health;
+      previous=$previous; source_launcher=$sourceExecute; source_arguments=$sourceArguments;
+      source_working_directory=$sourceWorkingDirectory; source_config=$sourceConfig; health=$health;
       settled_seconds=$settled.settled_seconds; listener_pid=$settled.listener_pid}
     if ($lockRefusal) { $receipt['lock_refusal']=$lockRefusal; $receipt['retried']=@{after_s=$retriedAfter} }
     Write-Receipt (Join-Path $promotions 'last-promotion.json') $receipt
@@ -2303,7 +2588,8 @@ if ($Verb -eq 'promote') {
   } catch {
     Set-AccountEnvironment 'DESCRIPTION_ENDPOINT_ROOT' $pins.previous_root
     Set-AccountEnvironment 'DESCRIPTION_CAD_OWNERSHIP_FILE' $pins.previous_ownership
-    $restore = Restore-PreviousEndpoint $binding $previous $previousConfig $StageDir $sourceExecute
+    $restore = Restore-PreviousEndpoint $binding $previous $previousConfig $StageDir `
+      $sourceExecute $sourceArguments $sourceWorkingDirectory
     $failed = @{
       passed=$false; verb='promote'; at=(Get-Date).ToUniversalTime().ToString('o'); generation=$StageDir;
       message=$_.Exception.Message; restore=$restore}
@@ -2324,6 +2610,7 @@ if ($Verb -eq 'rollback') {
   if (-not $Previous) { Die 'previous_required' 'rollback needs -Previous (the bound previous generation directory)' }
   if (-not (Test-Path -LiteralPath (Join-Path $Previous 'task.xml'))) { Die 'previous_missing' "the bound previous generation carries no task snapshot: $Previous" }
   if (-not $task) { Die 'task_missing' 'the instance task is not registered' }
+  Assert-Single-TaskAction $task
   # The pin must restate the generation being served right now; the rollback then re-points the
   # pins to the restored generation - a legitimate switch, never a divergent override.
   $servingConfig = Action-Config $task
@@ -2334,10 +2621,20 @@ if ($Verb -eq 'rollback') {
   # The restored task names the previous generation's own configuration; that file is the one
   # the recorded endpoint-before.json replaces - the candidate generation stays untouched.
   $restored = Get-ScheduledTask -TaskName $binding.task_name
+  Assert-Single-TaskAction $restored
   $previousConfig = Action-Config $restored
+  $previousGeneration = Split-Path -Parent $previousConfig
+  if (-not (Test-Runtime-Launcher ([string]$restored.Actions[0].Execute) `
+      ([string]$restored.Actions[0].Arguments) $previousGeneration)) {
+    Die 'windows_task_projection_mismatch' 'the restored task does not match its generation launch contract'
+  }
   Copy-Item -LiteralPath (Join-Path $Previous 'endpoint-before.json') -Destination $previousConfig -Force
   $serviceSid = Get-ManagedServiceSid $restored
   $restoredDocument = Read-Json $previousConfig
+  if ((Normalize-PathIdentity ([string]$restored.Actions[0].WorkingDirectory)) -ne
+      (Normalize-PathIdentity ([string]$restoredDocument.state_root))) {
+    Die 'windows_task_projection_mismatch' 'the restored task working directory differs from its endpoint state root'
+  }
   $installIdPath = Join-Path ([string]$restoredDocument.state_root) 'install-id'
   $restoredTaskFile = Get-TaskFilePath $restored
   Set-ManagedEndpointAcls $restoredDocument (Split-Path -Parent $previousConfig) `
