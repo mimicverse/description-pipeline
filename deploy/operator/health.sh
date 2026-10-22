@@ -13,6 +13,18 @@ fi
 export CONTROL_PYTHON
 MODE="${1:-full}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AIRFLOW_HERE="$HERE/../airflow"
+if ! UNIT_MANIFEST="$(bash "$AIRFLOW_HERE/services.sh" units all)"; then
+  echo "health: could not read the managed systemd unit manifest" >&2
+  exit 1
+fi
+mapfile -t UNITS <<< "$UNIT_MANIFEST"
+[ "${#UNITS[@]}" -gt 0 ] || { echo "health: the managed systemd unit manifest is empty" >&2; exit 1; }
+if ! OPERATOR_UNIT_MANIFEST="$(bash "$AIRFLOW_HERE/services.sh" units operator)"; then
+  echo "health: could not read the operator systemd unit role" >&2
+  exit 1
+fi
+mapfile -t OPERATOR_UNITS <<< "$OPERATOR_UNIT_MANIFEST"
 : "${OPERATOR_STATE:?set OPERATOR_STATE (or run via operatorctl.sh health)}"
 FAILURES=0
 
@@ -73,8 +85,9 @@ else
 fi
 
 TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-for unit in description-portal.service description-operator-proxy.service; do
-  [ -f "$TARGET/$unit" ] && report PASS "unit rendered: $unit" || report FAIL "unit missing: $TARGET/$unit"
+for unit in "${OPERATOR_UNITS[@]}"; do
+  [ -f "$TARGET/$unit.service" ] && report PASS "unit rendered: $unit.service" \
+    || report FAIL "unit missing: $TARGET/$unit.service"
 done
 
 if [ "$MODE" = "--static" ]; then
@@ -195,14 +208,11 @@ else
 fi
 
 command -v systemctl >/dev/null 2>&1 || { report FAIL "systemctl unavailable"; exit 1; }
-for unit in description-postgres description-airflow-dag-processor description-airflow-scheduler \
-            description-airflow-api-server description-portal description-operator-proxy; do
-  state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
-  [ "$state" = "active" ] && report PASS "unit active: $unit" || report FAIL "unit is $state: $unit"
+for unit in "${UNITS[@]}"; do
+  state="$(systemctl --user is-active "$unit.service" 2>/dev/null || true)"
+  [ "$state" = "active" ] && report PASS "unit active: $unit.service" \
+    || report FAIL "unit is $state: $unit.service"
 done
-state="$(systemctl --user is-active description-solidworks-tunnel 2>/dev/null || true)"
-[ "$state" = "active" ] && report PASS "unit active: description-solidworks-tunnel" \
-  || report FAIL "unit is $state: description-solidworks-tunnel"
 
 if command -v curl >/dev/null 2>&1; then
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:${AIRFLOW_API_PORT}/" || true)"

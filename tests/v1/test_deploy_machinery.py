@@ -49,7 +49,7 @@ class DeployMachineryTests(unittest.TestCase):
 
     def test_services_cli_requires_one_explicit_live_verb(self) -> None:
         services = DEPLOY / "airflow/services.sh"
-        for arguments in ((), ("install",), ("status",), ("render", "extra")):
+        for arguments in ((), ("install",), ("status",), ("render", "extra"), ("units", "unknown")):
             result = self.run_script(services, *arguments)
             self.assertEqual(result.returncode, 2, arguments)
             self.assertIn("usage:", result.stderr)
@@ -59,6 +59,59 @@ class DeployMachineryTests(unittest.TestCase):
         self.assertNotIn("install)", text)
         self.assertNotIn("status)", text)
         self.assertNotIn('ACTION="${1:-install}"', text)
+
+    def test_systemd_unit_manifest_has_one_role_authority(self) -> None:
+        services = DEPLOY / "airflow/services.sh"
+        expected = {
+            "all": (
+                "description-postgres",
+                "description-solidworks-tunnel",
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+                "description-portal",
+                "description-operator-proxy",
+            ),
+            "services": (
+                "description-postgres",
+                "description-solidworks-tunnel",
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+            ),
+            "airflow": (
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+            ),
+            "executor": (
+                "description-solidworks-tunnel",
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+            ),
+            "database": ("description-postgres",),
+            "operator": ("description-portal", "description-operator-proxy"),
+        }
+        for role, units in expected.items():
+            result = self.run_script(services, "units", role)
+            self.assertEqual(result.returncode, 0, role)
+            self.assertEqual(tuple(result.stdout.splitlines()), units, role)
+
+        control = (DEPLOY / "operator/operatorctl.sh").read_text(encoding="utf-8")
+        self.assertIn('bash "$AIRFLOW_HERE/services.sh" units "$1"', control)
+        for variable, role in {
+            "UNITS": "all",
+            "AIRFLOW_UNITS": "airflow",
+            "EXECUTOR_UNITS": "executor",
+            "DATABASE_UNITS": "database",
+            "OPERATOR_UNITS": "operator",
+        }.items():
+            self.assertIn(f"load_unit_role {variable} {role}", control)
+        self.assertNotIn("UNITS=(description-postgres", control)
+        health = (DEPLOY / "operator/health.sh").read_text(encoding="utf-8")
+        self.assertIn('services.sh" units all', health)
+        self.assertIn('services.sh" units operator', health)
 
     def test_airflow_installer_refuses_arguments_before_migration(self) -> None:
         installer = DEPLOY / "airflow/install.sh"
