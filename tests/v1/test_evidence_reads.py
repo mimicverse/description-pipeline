@@ -68,7 +68,6 @@ class EvidenceReadTests(unittest.TestCase):
             "geometry": [{"component": "a", "faces": 1}],
             "mass_closure": {"top_level": {}, "component_context": {"instances": []}, "unassigned": []},
             "material_provenance": {"a": {"density": 1}},
-            "declared_masses": {"items": {}, "evidence": {}},
             "dependency_closure": {"declared_unresolved": [], "configuration": "Default"},
             "link_group_mass_properties": {"a": {"mass": 1}},
             "collection": {
@@ -99,7 +98,6 @@ class EvidenceReadTests(unittest.TestCase):
         self.assertEqual(ev.geometry(self.root)[0]["component"], "a")
         self.assertEqual(ev.mass_closure(self.root)["unassigned"], [])
         self.assertEqual(ev.material_provenance(self.root)["a"]["density"], 1)
-        self.assertEqual(ev.declared_masses(self.root)["items"], {})
         self.assertEqual(ev.dependency_closure(self.root)["configuration"], "Default")
         self.assertEqual(ev.link_group_mass_properties(self.root)["a"]["mass"], 1)
         self.assertEqual(ev.collection(self.root)["limits"]["native_cad"], True)

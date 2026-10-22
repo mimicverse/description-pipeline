@@ -9,6 +9,100 @@ export function purposeLabel(value) {
   return value === "engineering" || value === "inspection_preview" ? value : "not recorded";
 }
 
+function warningString(value) {
+  return typeof value === "string" && value ? value : "";
+}
+
+function warningFields(row, fallback) {
+  if (Array.isArray(row?.fields)) {
+    return row.fields.filter((value) => typeof value === "string" && value);
+  }
+  if (typeof row?.fields === "string" && row.fields) return [row.fields];
+  if (typeof row?.field === "string" && row.field) return [row.field];
+  if (Array.isArray(fallback?.fields)) {
+    return fallback.fields.filter((value) => typeof value === "string" && value);
+  }
+  const field = warningString(fallback?.fields) || warningString(fallback?.field);
+  return field ? [field] : [];
+}
+
+function copyWarningValue(row, fallback, key) {
+  if (row && Object.prototype.hasOwnProperty.call(row, key)) return row[key];
+  if (fallback && Object.prototype.hasOwnProperty.call(fallback, key)) return fallback[key];
+  return undefined;
+}
+
+function warningSortKey(row) {
+  return [
+    row.object_type,
+    row.object,
+    row.fields.join(","),
+    row.source,
+    row.rule_id,
+    row.rule_version,
+    row.reason,
+    JSON.stringify(row.original),
+    JSON.stringify(row.actual),
+  ]
+    .map((value) => (value === undefined || value === null ? "" : String(value)))
+    .join("\u0000");
+}
+
+// Project only documented object-level provenance fields across the display boundary.
+export function warningSourceRows(warning) {
+  if (!warning || typeof warning !== "object") return [];
+  const detail = warning.detail && typeof warning.detail === "object" ? warning.detail : {};
+  const candidates = Array.isArray(detail.objects)
+    ? detail.objects
+    : Array.isArray(warning.objects)
+      ? warning.objects
+      : [];
+  const rows = candidates.filter((item) => item && typeof item === "object");
+  if (!rows.length) {
+    if (!warning.object && !detail.object && !warning.field && !detail.field && !warning.fields && !detail.fields) {
+      return [];
+    }
+    rows.push({});
+  }
+  const seen = new Set();
+  return rows
+    .map((row) => {
+      const fields = warningFields(row, detail);
+      const normalized = {
+        code: warningString(warning.code),
+        object_type: warningString(row.object_type) || warningString(detail.object_type),
+        object: warningString(row.object) || warningString(detail.object) || warningString(warning.object),
+        fields,
+        original: copyWarningValue(row, detail, "original"),
+        actual: copyWarningValue(row, detail, "actual"),
+        source: warningString(row.source) || warningString(detail.source) || warningString(warning.source),
+        rule_id: warningString(row.rule_id) || warningString(detail.rule_id) || warningString(warning.rule_id),
+        rule_version:
+          warningString(row.rule_version) || warningString(detail.rule_version) || warningString(warning.rule_version),
+        reason: warningString(row.reason) || warningString(detail.reason) || warningString(warning.reason),
+      };
+      const key = warningSortKey(normalized);
+      if (seen.has(key)) return null;
+      seen.add(key);
+      return normalized;
+    })
+    .filter(Boolean)
+    .sort((left, right) => warningSortKey(left).localeCompare(warningSortKey(right), "en"));
+}
+
+// A verified delivery remains visible when it carries source warnings.
+export function previewDiagnosticState(preview) {
+  const warnings = Array.isArray(preview?.warnings)
+    ? preview.warnings.filter((warning) => warning && typeof warning === "object")
+    : [];
+  return {
+    visible: preview?.verified === false || warnings.length > 0,
+    unverified: preview?.verified === false,
+    warnings,
+    warnings_total: Number.isInteger(preview?.warnings_total) ? preview.warnings_total : warnings.length,
+  };
+}
+
 export function statusLabel(status) {
   return status === "unqualified"
     ? "unqualified"

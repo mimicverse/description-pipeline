@@ -1984,9 +1984,11 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         limits = None
         limit_evidence = None
         limit_source = None
+        default_policy = None
         native = group["limits"]
         native_limit_values = set()
         native_limit_errors = []
+        native_limit_invalid = []
         for mate_item in mates:
             mate_kind = str(mate_item.get("type") or "").strip().lower()
             if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
@@ -2005,20 +2007,27 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 )
                 continue
             if flag is not True:
+                if mate_item.get("native_limit") is not None:
+                    native_limit_invalid.append(
+                        {"mate": mate_item.get("name"), "reason": "native payload on a disabled limit"}
+                    )
                 continue
             if mate_kind not in {"limitdistance", "limitangle"}:
-                native_limit_errors.append(
+                native_limit_invalid.append(
                     {"mate": mate_item.get("name"), "reason": "advanced flag on a standard mate"}
                 )
                 continue
             try:
                 lower, upper, unit = validate_native_limit(mate_item, component_records)
-            except ValueError as error:
+            except NativeLimitReadError as error:
                 native_limit_errors.append({"mate": mate_item.get("name"), "reason": str(error)})
+                continue
+            except ValueError as error:
+                native_limit_invalid.append({"mate": mate_item.get("name"), "reason": str(error)})
                 continue
             expected_unit = "m" if joint_type == "prismatic" else "rad"
             if unit != expected_unit:
-                native_limit_errors.append(
+                native_limit_invalid.append(
                     {
                         "mate": mate_item.get("name"),
                         "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
@@ -2026,7 +2035,14 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 )
                 continue
             native_limit_values.add((lower, upper, unit))
-        if native_limit_errors:
+        if native_limit_invalid:
+            findings.append(_finding(
+                "discovery.joint_limits_invalid", obj,
+                "native position-limit evidence is readable but invalid", {"errors": native_limit_invalid},
+            ))
+            continue
+        default_allowed = settings.purpose == PURPOSE_ENGINEERING and joint_type == "revolute"
+        if native_limit_errors and (native_limit_values or isinstance(native, dict) or not default_allowed):
             findings.append(
                 _finding(
                     "discovery.joint_limits_unreadable",
@@ -2049,15 +2065,14 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         if native_limit_values:
             lower, upper, unit = next(iter(native_limit_values))
             native = {"lower": lower, "upper": upper, "unit": unit}
-        if joint_type == "continuous":
-            if isinstance(native, dict):
+        if isinstance(native, dict):
+            if joint_type == "continuous":
                 findings.append(
                     _finding(
                         "discovery.joint_limits_unexpected", obj, "a continuous joint carries native position limits"
                     )
                 )
                 continue
-        elif isinstance(native, dict):
             unit = native.get("unit")
             expected = "m" if joint_type == "prismatic" else "rad"
             if unit != expected:
@@ -2076,6 +2091,14 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 findings.append(
                     _finding("discovery.joint_limits_invalid", obj, "native mate limits are not finite numbers")
                 )
+                continue
+            if (
+                not all(type(native[key]) in (int, float) and math.isfinite(limits[key]) for key in ("lower", "upper"))
+                or limits["lower"] > limits["upper"]
+            ):
+                findings.append(_finding(
+                    "discovery.joint_limits_invalid", obj, "native mate limits must be finite and ordered", limits,
+                ))
                 continue
             limit_source = "native"
             native_record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
@@ -2111,14 +2134,45 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                         )
                         continue
                     limit_evidence = declared
-        else:
-            findings.append(
-                _finding(
-                    "discovery.joint_limits_missing",
-                    obj,
-                    "the active CAD constraints provide no native position range",
+        elif joint_type == "continuous":
+            declared_range = properties.get(f"{NAMESPACE}.joint.limits_record")
+            if _text(declared_range):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_unexpected",
+                        obj,
+                        "a continuous joint references a declared position range",
+                        {"record": declared_range},
+                    )
                 )
+                continue
+            # A continuous joint has no position field. Its drive values are
+            # attached below, independently of native/fallback position policy.
+            limits = None
+            limit_source = None
+        elif default_allowed:
+            default_policy = rotation_window_policy(
+                ENGINEERING_DEFAULT_POLICY_ID,
+                author_limits=None,
+                native_absence=(
+                    "complete_mate_inventory_no_enabled_limit"
+                    if native_limit_inventory_complete(raw_mates) and not native_limit_errors
+                    else "native_limit_observation_unreadable"
+                ),
+                native_errors=native_limit_errors,
             )
+            limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
+            limit_source = "default_policy"
+            findings.append(_finding(
+                "discovery.joint_default_policy", obj,
+                "engineering uses the versioned non-native default rotation window; the range is unqualified",
+                default_policy, blocking=False,
+            ))
+        else:
+            findings.append(_finding(
+                "discovery.joint_limits_missing", obj,
+                "the active CAD constraints provide no native position range",
+            ))
             continue
         if joint_type != "continuous" and limits is None:
             findings.append(
@@ -2158,6 +2212,8 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     )
                 )
                 continue
+            if default_policy is not None:
+                limits.update(effort=effort, velocity=velocity_value)
         joints.append(
             {
                 "mate": name,
@@ -2183,6 +2239,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "limits": limits,
                 "limit_evidence": limit_evidence,
                 "limit_source": limit_source,
+                **({"default_policy": default_policy} if default_policy is not None else {}),
                 "drive": drive,
                 "drive_source": drive_source,
                 "properties": dict(properties),
@@ -3372,7 +3429,25 @@ def _exporter_joint_facts(
                     )
                 )
                 continue
-            if native_values:
+            if kind == "continuous":
+                if native_values or (
+                    isinstance(limits, dict) and any(limits.get(key) is not None for key in ("lower", "upper"))
+                ):
+                    findings.append(_finding(
+                        "discovery.joint_limits_unexpected", obj,
+                        "a continuous joint cannot carry position limits",
+                        {"declared": limits, "native": sorted(native_values)},
+                    ))
+                    continue
+                if native_read_errors:
+                    findings.append(_finding(
+                        "discovery.joint_limits_unreadable", obj,
+                        "native position-limit evidence is incomplete or unreadable", {"errors": native_read_errors},
+                    ))
+                    continue
+                limits = {key: (limits or {}).get(key) for key in ("effort", "velocity")}
+                limit_source = "declared_author"
+            elif native_values:
                 if native_read_errors:
                     findings.append(
                         _finding(
@@ -5442,6 +5517,17 @@ def _derive_carriers(
     sealed definition.
     """
 
+    for mate in record.get("mates") or []:
+        if (
+            isinstance(mate, dict) and mate.get("suppressed") is False
+            and mate.get("native_limit") is not None
+            and str(mate.get("type") or "").lower() not in {"limitangle", "limitdistance"}
+        ):
+            findings.append(_finding(
+                "discovery.joint_limits_invalid", f"mate:{mate.get('name', '')}",
+                "a non-limit mate carries native position-limit evidence",
+            ))
+
     if exporter_declaration_present(record):
         declaration = _exporter_declaration(record, identity, findings)
         bodies, joints, derived_names = [], [], {}
@@ -5755,9 +5841,6 @@ def source_definition(
             }
             for frame in sorted(frames, key=lambda item: item["name"])
         ],
-        "material_source": "cad",
-        "documented_masses": {},
-        "mass_evidence": None,
         "geometry_exclusions": {},
         "expected_mass_kg": (checks or {}).get("expected_mass_kg"),
         "expected_extent_m": (checks or {}).get("expected_extent_m"),

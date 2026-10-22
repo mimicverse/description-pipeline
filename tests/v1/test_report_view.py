@@ -94,6 +94,36 @@ def passed_job() -> dict:
 
 
 class ReportViewTests(unittest.TestCase):
+    def test_source_warning_objects_and_rule_fields_survive_the_report_projection(self) -> None:
+        from description_pipeline.orchestration.report_view import _warning_row
+
+        objects = [
+            {
+                "object_type": "joint",
+                "object": "joint:left",
+                "field": "limits",
+                "original": {"lower": 0.0, "upper": 0.0},
+                "actual": {"lower": -3.141592653589793, "upper": 3.141592653589793},
+                "source": "engineering_rotation_default_window/v1",
+                "rule_id": "engineering_rotation_default_window/v1",
+                "rule_version": "v1",
+                "reason": "no usable authored range",
+            }
+        ]
+        row = _warning_row(
+            {"id": "verify", "name": "Independent verification"},
+            {
+                "code": "limits.default_policy",
+                "blocking": False,
+                "detail": {"objects": objects},
+            },
+        )
+        self.assertEqual(row["objects"], objects)
+        self.assertEqual(row["objects"][0]["rule_id"], "engineering_rotation_default_window/v1")
+        self.assertEqual(row["objects"][0]["rule_version"], "v1")
+        self.assertEqual(row["objects"][0]["source"], "engineering_rotation_default_window/v1")
+        self.assertEqual(row["objects"][0]["actual"], objects[0]["actual"])
+
     def test_passed_report_labels_counts_and_measured_values(self) -> None:
         report = build_report(passed_job())
         self.assertEqual(report["schema_version"], "solidworks-to-urdf.report/v1")

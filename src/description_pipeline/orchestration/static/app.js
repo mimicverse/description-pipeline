@@ -10,11 +10,13 @@ import {
   infoPanelRows,
   jointRows,
   linkRows,
+  previewDiagnosticState,
   previewExpansion,
   purposeLabel,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
+  warningSourceRows,
 } from "/static/preview_logic.js";
 
 const state = {
@@ -491,7 +493,7 @@ function clearPreview() {
   $("preview-meta").textContent = "";
   $("preview-info").textContent = "";
   $("preview-diagnostic").hidden = true;
-  $("preview-diagnostic").textContent = "";
+  $("preview-diagnostic").replaceChildren();
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
   $("preview-panels").querySelectorAll(".panel-table").forEach((node) => {
@@ -1054,12 +1056,24 @@ const WARNING_VALUE_KEYS = [
   "scope",
   "mass_kg",
   "masses",
+  "object_type",
+  "object",
+  "objects",
+  "fields",
+  "field",
+  "original",
+  "actual",
+  "source",
+  "rule_id",
+  "rule_version",
+  "reason",
   "qualification_blocker",
   "publication_blocker",
 ];
 
 function warningValueText(value) {
-  if (value === null || value === undefined) return "";
+  if (value === null) return "null";
+  if (value === undefined) return "";
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
@@ -1072,6 +1086,48 @@ function warningValueText(value) {
     return `${shown.join("; ")}${Object.keys(value).length > entries.length ? " ..." : ""}`;
   }
   return String(value);
+}
+
+const WARNING_SOURCE_KEYS = new Set([
+  "object_type",
+  "object",
+  "objects",
+  "fields",
+  "field",
+  "original",
+  "actual",
+  "source",
+  "rule_id",
+  "rule_version",
+  "reason",
+]);
+
+function warningSourceText(value) {
+  return value === undefined ? "not recorded" : warningValueText(value);
+}
+
+function appendWarningSourceRows(parent, warning) {
+  const rows = warningSourceRows(warning);
+  if (!rows.length) return false;
+  const details = expandable(parent, `Source values (${rows.length})`);
+  details.className = "warning-sources";
+  for (const row of rows) {
+    const line = document.createElement("p");
+    line.className = "warning-source";
+    const parts = [
+      row.object_type ? `${row.object_type}:${row.object || "unknown"}` : row.object,
+      row.fields.length ? `field=${row.fields.join(",")}` : "",
+      `source=${warningSourceText(row.source)}`,
+      `rule_id=${warningSourceText(row.rule_id)}`,
+      `rule_version=${warningSourceText(row.rule_version)}`,
+      `original=${warningSourceText(row.original)}`,
+      `actual=${warningSourceText(row.actual)}`,
+      `reason=${warningSourceText(row.reason)}`,
+    ].filter(Boolean);
+    line.textContent = parts.join("; ");
+    details.append(line);
+  }
+  return true;
 }
 
 function stageWarningRow(row) {
@@ -1109,7 +1165,13 @@ function stageWarningRow(row) {
     line.textContent = blockers.join("; ");
     item.append(line);
   }
-  const keys = WARNING_VALUE_KEYS.filter((key) => row[key] !== undefined && row[key] !== null);
+  const hasSourceRows = appendWarningSourceRows(item, row);
+  const keys = WARNING_VALUE_KEYS.filter(
+    (key) =>
+      row[key] !== undefined &&
+      row[key] !== null &&
+      !(hasSourceRows && WARNING_SOURCE_KEYS.has(key)),
+  );
   const residual = row.residual && typeof row.residual === "object" ? Object.entries(row.residual) : [];
   if (keys.length || residual.length) {
     const details = expandable(item, "Recorded values");
@@ -2390,42 +2452,68 @@ function renderRun(run) {
 
 function renderPreviewDiagnostic(preview) {
   const node = $("preview-diagnostic");
-  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
-  if (preview.verified !== false && !warnings.length) {
+  const diagnostic = previewDiagnosticState(preview);
+  if (!diagnostic.visible) {
     node.hidden = true;
-    node.textContent = "";
+    node.replaceChildren();
     return;
   }
-  const lines = [preview.verified === false
-    ? "Engineering verification failed: this delivery is diagnostic only and must not be published."
-    : "Verification passed with source warnings. Default ranges are not native mechanical limits or hardware qualifications."];
+  node.replaceChildren();
+  node.hidden = false;
+  if (diagnostic.unverified) {
+    const failure = document.createElement("p");
+    failure.className = "preview-failure";
+    failure.textContent = "Engineering verification failed: this delivery is diagnostic only and must not be published.";
+    node.append(failure);
+  }
   const checks = Array.isArray(preview.failing_checks) ? preview.failing_checks : [];
   const checksTotal = Number.isInteger(preview.failing_checks_total) ? preview.failing_checks_total : checks.length;
   if (checks.length) {
     const shown = checks.slice(0, 8).map((check) => `${check.id} (${check.message || "check failed"})`);
-    lines.push(`Failed checks: ${shown.join(", ")}${checksTotal > shown.length ? ` and ${checksTotal} total` : ""}`);
+    const line = document.createElement("p");
+    line.textContent =
+      `Failed checks: ${shown.join(", ")}` +
+      `${checksTotal > shown.length ? ` and ${checksTotal} total` : ""}`;
+    node.append(line);
   }
-  const warningsTotal = Number.isInteger(preview.warnings_total) ? preview.warnings_total : warnings.length;
-  if (warnings.length) {
-    for (const item of warnings) {
-      const objects = Array.isArray(item.objects) ? item.objects
-        : (Array.isArray(item.detail?.objects) ? item.detail.objects : []);
-      const scope = objects.length
-        ? objects.map((row) => `${row.object || "unknown object"}.${row.field || "unspecified field"}`).join(", ")
-        : (item.object || "");
-      lines.push(`${item.code || "warning"}${scope ? ` (${scope})` : ""}: ${item.message || "Source warning"}`);
-      for (const row of objects) {
-        const detail = Object.fromEntries(Object.entries(row).filter(([key]) => [
-          "object", "object_type", "field", "actual", "source", "rule_id", "rule_version",
-          "native_cad_ranges", "hardware_qualified", "engineering_position_range_qualified",
-        ].includes(key)));
-        lines.push(JSON.stringify(detail));
+  if (diagnostic.warnings.length) {
+    const warningDetails = expandable(node, `Source warnings (${diagnostic.warnings_total})`);
+    warningDetails.className = "preview-warning-sources";
+    const statement = document.createElement("p");
+    statement.className = "muted small";
+    statement.textContent =
+      "Recorded source warnings are neither passes nor publication evidence. " +
+      "Default ranges are not native mechanical limits or hardware qualifications.";
+    warningDetails.append(statement);
+    for (const warning of diagnostic.warnings) {
+      const group = document.createElement("div");
+      group.className = "preview-warning";
+      const heading = document.createElement("strong");
+      heading.textContent = `${warning.code || "warning"}${warning.object ? ` · ${warning.object}` : ""}`;
+      group.append(heading);
+      if (warning.message) {
+        const message = document.createElement("p");
+        message.className = "warning-message";
+        message.textContent = warning.message;
+        group.append(message);
       }
+      if (!appendWarningSourceRows(group, warning)) {
+        const recorded = document.createElement("p");
+        recorded.className = "warning-source muted small";
+        recorded.textContent = "No object-level source fields were recorded.";
+        group.append(recorded);
+      }
+      warningDetails.append(group);
     }
-    if (warningsTotal > warnings.length) lines.push(`${warningsTotal} warnings total; see the quality report for the complete list.`);
+    if (diagnostic.warnings_total > diagnostic.warnings.length) {
+      const more = document.createElement("p");
+      more.className = "muted small";
+      more.textContent =
+        `${diagnostic.warnings_total - diagnostic.warnings.length} more warning groups ` +
+        "are available in the report.";
+      warningDetails.append(more);
+    }
   }
-  node.textContent = lines.join("\n");
-  node.hidden = false;
 }
 
 async function loadPreview(dagRunId) {

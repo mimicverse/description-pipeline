@@ -358,10 +358,8 @@ class HermeticSixStageTests(unittest.TestCase):
             "reports/structural-team.json",
             "reports/structural-team.md",
             "reports/quality.json",
-            "reports/pr.json",
         ):
             self.assertTrue((output / relative).is_file(), relative)
-        self.assertEqual(json.loads((output / "reports/pr.json").read_text(encoding="utf-8")), failed["submission"])
         self.assertEqual(failed["stage_report"]["path"], "reports/stages.json")
         self.assertEqual(
             failed["stage_report"]["sha256"],

@@ -617,54 +617,36 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
     gate("physics.raw_inputs", lambda: {"occurrences": len(masses)})
     for name, record in masses.items():
         gate("physics.reading." + name, lambda n=name, r=record: _reading_summary(n, r))
-    declared = source.get("documented_masses") or {}
 
     def authority():
-        recorded = evidence.declared_masses(root)
-        _require(
-            recorded["items"] == declared and recorded["evidence"] == source.get("mass_evidence"),
-            "Captured mass decisions differ from author inputs",
-        )
-        mode = source["material_source"]
-        _require(mode in {"cad", "documented_table"}, "Unknown mass authority")
-        if mode == "documented_table":
-            _require(set(declared) == set(masses), "Documented masses must cover every occurrence exactly")
-            for name, entry in declared.items():
-                oracle._finite_positive(entry["mass_kg"], name + " declared mass")
-                _require(bool(entry["reason"]) and bool(entry["evidence"]), "Missing mass authority reason/evidence")
-        else:
-            _require(not declared, "CAD authority cannot carry replacement masses")
-            unverified: list[str] = []
-            for name, record in masses.items():
-                if record.get("mode") == "effective_instance":
-                    # An effective-instance reading (surface-only fallback or a native
-                    # override) carries no physical material claim; it is gated by
-                    # physics.effective_instances instead.
-                    continue
-                assignment = record["reference"]["material_assignment"]
-                _require(isinstance(assignment, dict), name + ": material assignment is not an object")
-                if "unverified_reason" in assignment:
-                    # A missing explicit physical assignment is a warnable engineering
-                    # deficiency: the native-measured mass properties stay authoritative
-                    # and the condition is recorded, never silently claimed as verified.
-                    # Only the recorded deficiency code is warnable; any other value is
-                    # an unreadable or hand-written reading and fails closed.
-                    _require(
-                        assignment.get("unverified_reason") == "cad_material_provenance_missing",
-                        name + ": unknown unverified material reason",
-                    )
-                    unverified.append(name)
-                    continue
-                _require(bool(assignment.get("bodies")), name + ": unverified material")
-                for body in assignment["bodies"]:
-                    selected = body["material"] if body["effective_source"] == "body" else assignment["part"]
-                    _require(
-                        bool(selected["name"]) and bool(selected["database"]), name + ": missing material assignment"
-                    )
+        unverified: list[str] = []
+        for name, record in masses.items():
+            if record.get("mode") == "effective_instance":
+                # An effective-instance reading (surface-only fallback or a native
+                # override) carries no physical material claim; it is gated by
+                # physics.effective_instances instead.
+                continue
+            assignment = record["reference"]["material_assignment"]
+            _require(isinstance(assignment, dict), name + ": material assignment is not an object")
+            if "unverified_reason" in assignment:
+                # A missing explicit physical assignment is a warnable engineering
+                # deficiency: the native-measured mass properties stay authoritative
+                # and the condition is recorded, never silently claimed as verified.
+                _require(
+                    assignment.get("unverified_reason") == "cad_material_provenance_missing",
+                    name + ": unknown unverified material reason",
+                )
+                unverified.append(name)
+                continue
+            _require(bool(assignment.get("bodies")), name + ": unverified material")
+            for body in assignment["bodies"]:
+                selected = body["material"] if body["effective_source"] == "body" else assignment["part"]
+                _require(
+                    bool(selected["name"]) and bool(selected["database"]), name + ": missing material assignment"
+                )
         return {
-            "mode": mode,
-            "inertia_model": "scaled_cad_uniform_density" if declared else "cad_mass_properties",
-            "unverified_material": sorted(unverified) if mode == "cad" else [],
+            "inertia_model": "cad_mass_properties",
+            "unverified_material": sorted(unverified),
         }
 
     gate("physics.authority", authority)
@@ -674,10 +656,6 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             record = evidence.material_provenance(root)
         except PipelineError:
             record = None
-        if source.get("material_source") != "cad":
-            # Only CAD-sourced masses depend on material provenance; documented
-            # tables carry their own bound evidence.
-            return {"recorded": record is not None, "unverified_material": []}
         affected = sorted(
             name
             for name, item in masses.items()
@@ -690,10 +668,6 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         _require(
             record.get("schema_version") == "solidworks-to-urdf.material-provenance/v1",
             "Material provenance schema changed",
-        )
-        _require(
-            record.get("material_source") == source.get("material_source"),
-            "Material provenance does not describe this capture's material source",
         )
         _require(record.get("measured_source") == "cad_api", "Material provenance measured source changed")
         # The frozen tree carries the capture identity once (collection block,
@@ -774,8 +748,6 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             record = evidence.effective_instances(root)
         except PipelineError:
             record = None
-        if source.get("material_source") != "cad":
-            return {"recorded": record is not None, "effective": []}
         _require(record is not None, "Effective instance record is missing from the CAD capture")
         identity = _capture_identity(root)
         _require(
@@ -1103,7 +1075,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
             name = body["name"]
             entry = ((direct["record"] or {}).get("links") or {}).get(name)
             _require(isinstance(entry, dict), name + ": the link group mass record carries no entry")
-            contributions = oracle._resolved_contributions(body, raw, masses, declared, effective)
+            contributions = oracle._resolved_contributions(body, raw, masses, effective)
             expected_selection = sorted(str(note["component"]) for *_rest, note in contributions)
             _require(
                 entry.get("selection") == expected_selection,
@@ -1191,7 +1163,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                 np.allclose(actual_tensor, expected_tensor, rtol=LINK_DIRECT_TENSOR_RTOL, atol=1e-15),
                 name + ": model inertia differs from the direct link group read",
             )
-            world = oracle._raw_world(body, raw, masses, declared)
+            world = oracle._raw_world(body, raw, masses)
             recombination_com = rotation.T @ (world["com"] - origin)
             recombination_tensor = rotation.T @ world["inertia"] @ rotation
             recombination_delta = float(np.max(np.abs(expected_tensor - recombination_tensor)))
@@ -1266,7 +1238,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         mine = _derive_closure(payload, raw, masses, source)
         _require(not mine["blockers"], "Effective substitution spans bodies")
         body = {"id": "assembly", "components": [row["name"] for row in raw["components"]]}
-        recombination = oracle._raw_world(body, raw, masses, {})
+        recombination = oracle._raw_world(body, raw, masses)
         expected_recombination = (recombination["mass"], recombination["com"], recombination["inertia"])
         _require(
             isinstance(direct["record"], dict),
@@ -1345,7 +1317,7 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         enriched = {"component_context": {**context, "instances": enriched_rows}}
         raw_masses = {name: float(row["mass"]) for name, row in masses.items()}
         details, error = oracle._component_context_findings(
-            enriched, "cad", top[0], raw_masses, covered=set(entry_names)
+            enriched, top[0], raw_masses, covered=set(entry_names)
         )
         _require(error is None, "Component context: " + str(error))
         return {
@@ -1497,10 +1469,10 @@ def _derive_closure(native: dict, raw_scene: dict, masses: dict, source: dict) -
     leaves = [row["name"] for row in raw_scene.get("components") or []]
     body = {"id": "assembly", "components": leaves}
     try:
-        leaf_total = oracle._raw_world(body, raw_scene, masses, {}, use_effective=False)
+        leaf_total = oracle._raw_world(body, raw_scene, masses, use_effective=False)
     except ValueError:
         leaf_total = None
-    effective_total = oracle._raw_world(body, raw_scene, masses, {})
+    effective_total = oracle._raw_world(body, raw_scene, masses)
     parents = sorted(
         name
         for name, value in oracle._notes_effective(raw_scene).items()

@@ -773,6 +773,19 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 native_complete = False
                 native_read_errors.append({"reason": "mate inventory is not a list"})
                 raw_mates = []
+            for observed in raw_mates:
+                if (
+                    isinstance(observed, dict)
+                    and observed.get("suppressed") is False
+                    and observed.get("native_limit") is not None
+                    and str(observed.get("type") or "").strip().lower()
+                    not in {"limitdistance", "limitangle"}
+                ):
+                    raise DeclarationError(
+                        "v14.native_limits_invalid",
+                        "a non-limit mate carries native position-limit evidence",
+                        {"joint": name, "mate": observed.get("name")},
+                    )
             limit_types = {"distance", "angle", "limitdistance", "limitangle"}
             for mate in raw_mates:
                 if not isinstance(mate, dict):
@@ -915,6 +928,19 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         "limits": {"lower": lower, "upper": upper, "unit": unit},
                     }
                 )
+        if joint["type"] == "continuous":
+            _require(
+                not native_invalid_errors,
+                "v14.native_limits_invalid",
+                "native position-limit evidence is readable but invalid",
+                joint=name, errors=native_invalid_errors,
+            )
+            _require(
+                native_complete,
+                "v14.native_limits_unreadable",
+                "native position-limit evidence is incomplete or unreadable",
+                joint=name, errors=native_read_errors,
+            )
         if joint["type"] in {"revolute", "prismatic"}:
             ranges = {
                 (float(item["limits"]["lower"]), float(item["limits"]["upper"]))

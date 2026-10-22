@@ -59,85 +59,14 @@ SOURCE_KEYS = {
     "groups",
     "axis_requests",
     "robot_name",
-    "material_source",
-    "documented_masses",
-    "mass_evidence",
     "geometry_exclusions",
     "expected_mass_kg",
     "expected_extent_m",
     "evidence_class",
-    "worker_url",
-    "allow_remote_worker",
-    "worker_http_timeout_seconds",
-    "worker_poll_seconds",
-    "worker_job_timeout_seconds",
-    "job_id",
 }
 EVIDENCE_CLASSES = ("cad", "fixture", "imported")
 FRAME_KEYS = {"xyz", "rpy", "coordinate_system"}
-DOCUMENTED_MASS_KEYS = {"mass_kg", "reason", "evidence"}
-MASS_EVIDENCE_KEYS = {"reference", "file", "sha256", "note"}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-
-
-def _mass_evidence_binding(value: Any, *, required: bool) -> dict[str, str] | str | None:
-    """Mass evidence must be archived in the model repository and bound by its content digest.
-
-    Contract (``required=True`` when ``documented_masses`` is non-empty):
-
-    * ``source.mass_evidence`` is an object with ``reference`` (human-readable note),
-      ``file`` (relative path in the model repository), and ``sha256`` (64 lowercase
-      hexadecimal digits); exactly these keys are accepted.
-    * Every ``documented_masses[].evidence`` value is an anchor inside that file; the
-      independent verifier confirms that the string occurs in the archived content.
-    * Without documented masses, a descriptive string is still accepted because the
-      material source is CAD rather than a declared value.
-
-    File existence, confinement, and digest matching are checked by the independent
-    verifier at the model-repository root. This function runs on the capture-side
-    Windows worker, where no model repository exists, so it validates shape only.
-    """
-
-    if value is None or value == "":
-        _require(
-            not required,
-            "documented masses require source.mass_evidence with file + sha256",
-            {"mass_evidence": value},
-        )
-        return None
-    if isinstance(value, str):
-        _require(
-            not required,
-            "source.mass_evidence must bind an archived file (file + sha256), not a bare string",
-            {"mass_evidence": value},
-        )
-        _require(value.strip() != "", "source.mass_evidence must be a non-empty reference when given", value)
-        return value
-    _require(isinstance(value, dict), "source.mass_evidence must be a mapping or a note string", value)
-    assert isinstance(value, dict)
-    unknown = sorted(set(value) - MASS_EVIDENCE_KEYS)
-    _require(not unknown, "source.mass_evidence has unknown fields", {"unknown": unknown})
-    reference = value.get("reference")
-    _require(
-        isinstance(reference, str) and reference.strip() != "",
-        "source.mass_evidence.reference must be a non-empty description",
-        {"reference": reference},
-    )
-    file = value.get("file")
-    _require(
-        isinstance(file, str) and file.strip() != "",
-        "source.mass_evidence.file must be a non-empty model-repo-relative path",
-        {"file": file},
-    )
-    checksum = value.get("sha256")
-    _require(
-        isinstance(checksum, str) and SHA256_RE.match(checksum) is not None,
-        "source.mass_evidence.sha256 must be a lowercase 64-hex digest",
-        {"sha256": checksum},
-    )
-    return {key: str(value[key]) for key in ("reference", "file", "sha256")} | (
-        {"note": str(value["note"])} if isinstance(value.get("note"), str) else {}
-    )
 
 
 def _shared_manifest_writer() -> Callable[..., dict[str, Any]]:
@@ -240,7 +169,7 @@ def validate_source_config(config: object) -> dict[str, Any]:
     _require(isinstance(config, dict), "source config must be a mapping")
     assert isinstance(config, dict)
     unknown = sorted(set(config) - SOURCE_KEYS)
-    _require(not unknown, "source config has unknown keys", unknown)
+    _require(not unknown, f"source config has unknown keys: {', '.join(unknown)}", unknown)
     _require(config.get("require_saved", True) is True, "source.require_saved cannot be disabled for a frozen snapshot")
     provider = str(config.get("provider") or SOURCE_KIND)
     _require(provider == SOURCE_KIND, f"this adapter only serves provider=solidworks, got {provider!r}")
@@ -285,83 +214,6 @@ def validate_source_config(config: object) -> dict[str, Any]:
         )
     coordinate_systems = config.get("coordinate_systems") or []
     _require(isinstance(coordinate_systems, list), "source.coordinate_systems must be a list of names")
-    material_source = str(config.get("material_source") or "cad")
-    _require(
-        material_source in ("cad", "documented_table"),
-        "source.material_source must be 'cad' or 'documented_table'",
-        material_source,
-    )
-    mass_evidence = _mass_evidence_binding(config.get("mass_evidence"), required=bool(config.get("documented_masses")))
-    raw_masses = config.get("documented_masses") or {}
-    _require(isinstance(raw_masses, dict), "source.documented_masses must be a mapping of component to kg")
-    documented: dict[str, dict] = {}
-    for name, value in raw_masses.items():
-        # A documented mass is an author decision: it needs a mass and a stated
-        # reason.  Bare numbers and misspelled keys are rejected instead of
-        # quietly turning into "declared by the model author" with no evidence.
-        _require(
-            isinstance(value, dict),
-            "each documented mass must be an object with mass_kg and reason",
-            {"component": name, "value": value},
-        )
-        assert isinstance(value, dict)
-        unknown_fields = sorted(set(value) - DOCUMENTED_MASS_KEYS)
-        _require(
-            not unknown_fields, "documented mass has unknown fields", {"component": name, "fields": unknown_fields}
-        )
-        mass: object = value.get("mass_kg")
-        _require(
-            isinstance(mass, (int, float)) and not isinstance(mass, bool) and float(mass) > 0.0,
-            "documented mass needs a positive mass_kg",
-            {"component": name, "value": mass},
-        )
-        assert isinstance(mass, (int, float)) and not isinstance(mass, bool)
-        reason = value.get("reason")
-        _require(
-            isinstance(reason, str) and reason.strip() != "",
-            "documented mass needs a stated reason",
-            {"component": name},
-        )
-        # The evidence file is bound by source.mass_evidence (file + sha256); every
-        # mass must provide an anchor that the independent verifier finds in the file.
-        evidence = value.get("evidence")
-        _require(
-            isinstance(evidence, str) and evidence.strip() != "",
-            "documented mass needs a non-empty evidence anchor inside the bound evidence file",
-            {"component": name, "evidence": evidence},
-        )
-        documented[str(name)] = {
-            "mass_kg": float(mass),
-            "reason": reason,
-            "evidence": evidence,
-        }
-    _require(
-        material_source != "documented_table" or bool(documented),
-        "material_source=documented_table requires a non-empty source.documented_masses table",
-    )
-    # Mass-mode contract at configuration time:
-    #  * every component with a declared mass must be included by a body;
-    #  * documented_table mode must provide a mass for every included component and
-    #    must never fall back to a CAD default-density placeholder.
-    if documented:
-        declared_groups = [item for item in (config.get("groups") or []) if isinstance(item, dict)]
-        included = {
-            str(component) for group in declared_groups for component in (group.get("components") or []) if component
-        }
-        if included:
-            unknown = sorted(set(documented) - included)
-            _require(
-                not unknown,
-                "documented_masses contains components that no body includes",
-                {"unknown": unknown[:20]},
-            )
-            missing = sorted(included - set(documented))
-            if material_source == "documented_table":
-                _require(
-                    not missing,
-                    "documented_table requires a mass for every included component",
-                    {"missing": missing[:20]},
-                )
     # Geometry exclusions already charged in the physics model must be objects with
     # component, reason, and structured evidence; bare strings cannot skip geometry.
     raw_exclusions = config.get("geometry_exclusions") or {}
@@ -435,9 +287,6 @@ def validate_source_config(config: object) -> dict[str, Any]:
         "groups": [dict(item) for item in (config.get("groups") or [])],
         "axis_requests": [dict(item) for item in (config.get("axis_requests") or [])],
         "robot_name": str(config.get("robot_name") or "robot"),
-        "material_source": material_source,
-        "documented_masses": documented,
-        "mass_evidence": mass_evidence,
         "geometry_exclusions": exclusions,
         "expected_mass_kg": expected_mass,
         "expected_extent_m": expected_extent,
@@ -1728,7 +1577,7 @@ def _capture_readings(
         document,
         cfg["coordinate_systems"],
         on_activity=activity.publish if activity is not None else None,
-        require_material=cfg["material_source"] == "cad",
+        require_material=True,
     )
     reported = str(getattr(scene, "document", "") or "")
     if not _same_document(reported, document):
@@ -1812,7 +1661,6 @@ def _material_provenance_record(scene: Any, cfg: dict[str, Any]) -> dict[str, An
         "schema_version": "solidworks-to-urdf.material-provenance/v1",
         "assembly": str(cfg.get("assembly") or ""),
         "configuration": str(cfg.get("configuration") or ""),
-        "material_source": str(cfg.get("material_source") or "cad"),
         "measured_source": "cad_api",
         "warnings": warnings,
     }
@@ -2485,9 +2333,6 @@ def _freeze_local(
 ) -> dict[str, Any]:
     """Capture ``config['assembly']`` into ``destination`` and return the manifest.
 
-    With ``source.worker_url`` set, the capture runs on a Windows worker over the
-    loopback tunnel instead of calling COM in this process.
-
     ``on_activity`` optionally observes best-effort capture progress records for
     the portal's live-activity view (component walk, per-instance reads, mesh
     export, closure and the pristine window); it never changes the snapshot or
@@ -2517,11 +2362,9 @@ def _freeze_local(
         "allowed_roots": cfg["allowed_roots"],
         "coordinate_systems": cfg["coordinate_systems"],
         "geometry": cfg["geometry"],
-        "material_source": cfg["material_source"],
         "require_saved": cfg["require_saved"],
         "bodies": len(cfg.get("groups") or []),
         "joints": len(cfg.get("axis_requests") or []),
-        "declared_masses": len(cfg.get("documented_masses") or {}),
     }
     from .native import ACTIVITY_KEEPALIVE_SECONDS, _ActivityEmitter
 
@@ -2605,17 +2448,6 @@ def _freeze_local(
             staging / "raw" / "effective_instances.json",
             _effective_instance_record(scene, cfg, backend_readings, cache_error),
         )
-        # Declared author decisions are recorded as declared input, never as CAD
-        # readings: freeze keeps the snapshot raw and load_scene applies them.
-        write_json(
-            staging / "raw" / "declared_masses.json",
-            {
-                "schema_version": "solidworks-to-urdf.declared-masses/v1",
-                "evidence": cfg.get("mass_evidence"),
-                "items": cfg["documented_masses"],
-            },
-        )
-
         geometry_entries: list[dict[str, Any]] = []
         if cfg["geometry"].get("enabled", True):
             stage = "geometry"
@@ -2725,7 +2557,6 @@ def _freeze_local(
                 "kinematics_defined_by": (
                     "source.groups/source.axis_requests" if cfg.get("axis_requests") else "not_defined"
                 ),
-                "material_source": cfg["material_source"],
             },
         )
         write_json(staging / "evidence" / "collection.json", evidence)
@@ -2817,11 +2648,9 @@ def freeze(
     worker_version: str = "unknown",
     on_activity=None,
 ) -> dict[str, Any]:
-    """Freeze from saved files in a job-owned STA session, or submit to its worker."""
+    """Freeze from saved files in a job-owned STA session."""
     from contextlib import nullcontext
 
-    if backend is None and isinstance(config, dict) and config.get("worker_url"):
-        raise ConfigError("Remote capture was removed; run the complete pipeline on the native Windows endpoint")
     if backend is None:
         from .native import SolidWorksBackend
 

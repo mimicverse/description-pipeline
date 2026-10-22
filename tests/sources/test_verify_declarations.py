@@ -563,7 +563,15 @@ class DeclarationConsumerTests(unittest.TestCase):
         source["source_revision_id"] = digest(source["identity"])
         support.write_target_delivery(
             package,
-            capture={"declared_masses": {"items": {}, "evidence": None}},
+            capture={
+                "material_provenance": {
+                    "schema_version": "solidworks-to-urdf.material-provenance/v1",
+                    "assembly": "robot.SLDASM",
+                    "configuration": "Default",
+                    "measured_source": "cad_api",
+                    "warnings": [],
+                }
+            },
             discovery=payload,
             source=source,
             originals={"robot.SLDASM": native.decode("utf-8")},
@@ -816,6 +824,29 @@ class NativeDeclarationsTests(unittest.TestCase):
         report = verify_declarations(raw, source_claims())
         self.assertTrue(report["passed"], report["errors"])
 
+    def test_continuous_without_position_limits_is_valid_in_both_purposes(self):
+        raw = fixture()
+        raw["exporter"]["raw_xml"] = raw["exporter"]["raw_xml"].replace(">revolute<", ">continuous<")
+
+        def clear_position(root):
+            for item in root.iter():
+                if item.get(Z_TAG + "Id") in {"joint_limit_LowerAttribute", "joint_limit_UpperAttribute"}:
+                    value = item.find(NS_TAG + "Value")
+                    value.attrib.clear()
+                    value.set("{http://www.w3.org/2001/XMLSchema-instance}nil", "true")
+                    value.text = None
+
+        rewrite(raw, clear_position)
+        raw["mates"] = []
+        for purpose in (PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW):
+            with self.subTest(purpose=purpose):
+                report = verify_declarations(raw, purpose=purpose)
+                self.assertTrue(report["passed"], report["errors"])
+                joint = report["carrier"]["joints"][0]
+                self.assertEqual(joint["limits"], {"effort": 5.0, "velocity": 2.0})
+                self.assertEqual(joint.get("limit_source", "declared_author"), "declared_author")
+                self.assertNotIn("default_policy", joint)
+
     def test_continuous_joint_with_native_position_limit_is_rejected(self):
         raw = fixture()
         raw["exporter"]["raw_xml"] = raw["exporter"]["raw_xml"].replace(">revolute<", ">continuous<")
@@ -823,6 +854,20 @@ class NativeDeclarationsTests(unittest.TestCase):
         report = verify_declarations(raw, source_claims())
         self.assertFalse(report["passed"])
         self.assertIn("v14.native_limits_unexpected", {item["code"] for item in report["errors"]})
+
+    def test_nonlimit_mate_with_native_limit_payload_is_rejected(self):
+        raw = fixture()
+        raw["mates"].append(
+            {
+                "name": "unexpected_native_payload",
+                "type": "lock",
+                "suppressed": False,
+                "native_limit": {"type_index": 6},
+            }
+        )
+        report = verify_declarations(raw, source_claims())
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_invalid", {item["code"] for item in report["errors"]})
 
     def test_continuous_crossing_native_limit_with_another_name_is_rejected(self):
         raw = fixture()

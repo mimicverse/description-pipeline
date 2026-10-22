@@ -163,7 +163,6 @@ class StructuralReportTests(unittest.TestCase):
             "schema_version": "solidworks-to-urdf.material-provenance/v1",
             "assembly": "robot.SLDASM",
             "configuration": "默认",
-            "material_source": "cad",
             "measured_source": "cad_api",
             "warnings": warnings,
         }

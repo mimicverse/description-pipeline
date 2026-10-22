@@ -1696,8 +1696,6 @@ def write_link_group_mass_record(bundle: Path, model: dict, source: dict) -> Non
     raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
     masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
     datums = _json.loads((evidence / "raw/coordinate_systems.json").read_text())
-    declared_path = evidence / "raw/declared_masses.json"
-    declared = (_json.loads(declared_path.read_text()).get("items") or {}) if declared_path.is_file() else {}
     effective = oracle.effective_math_map(masses, raw)
     links = {str(link["name"]): link for link in model.get("links", [])}
     payload = {
@@ -1712,7 +1710,7 @@ def write_link_group_mass_record(bundle: Path, model: dict, source: dict) -> Non
         name = str(body.get("name"))
         selection = sorted(
             str(note["component"])
-            for *_rest, note in oracle._resolved_contributions(body, raw, masses, declared, effective)
+            for *_rest, note in oracle._resolved_contributions(body, raw, masses, effective)
         )
         mass, com_link, tensor_link = oracle._canonical_in_link_frame(links[name])
         datum = _np.array(datums[body["frame"]["coordinate_system"]], dtype=float).reshape(4, 4)
@@ -1761,8 +1759,6 @@ def write_link_group_mass_record_from_recombination(bundle: Path, source: dict) 
     evidence = bundle / "evidence"
     raw = _json.loads((evidence / "raw/scene_raw.json").read_text())
     masses = _json.loads((evidence / "raw/mass_properties.json").read_text())
-    declared_path = evidence / "raw/declared_masses.json"
-    declared = (_json.loads(declared_path.read_text()).get("items") or {}) if declared_path.is_file() else {}
     effective = oracle.effective_math_map(masses, raw)
     payload = {
         "schema_version": "solidworks-to-urdf.link-group-mass-properties/v1",
@@ -1776,9 +1772,9 @@ def write_link_group_mass_record_from_recombination(bundle: Path, source: dict) 
         name = str(body.get("name"))
         selection = sorted(
             str(note["component"])
-            for *_rest, note in oracle._resolved_contributions(body, raw, masses, declared, effective)
+            for *_rest, note in oracle._resolved_contributions(body, raw, masses, effective)
         )
-        world = oracle._raw_world(body, raw, masses, declared)
+        world = oracle._raw_world(body, raw, masses)
         read = {
             "mass_kg": float(world["mass"]),
             "volume_m3": None,
@@ -1975,7 +1971,6 @@ def write_target_delivery(
             "schema_version": "solidworks-to-urdf.material-provenance/v1",
             "assembly": str((root / "input/cad" / str(selection["main_assembly"])).resolve()),
             "configuration": str(selection["configuration"]),
-            "material_source": "cad",
             "measured_source": "cad_api",
             "warnings": [],
         }
@@ -2183,17 +2178,14 @@ def compose_delivery_inputs(
     cad_files: dict[str, Path],
     records: dict[str, str] | None = None,
     record_keys: dict[str, str] | None = None,
-    material_source: str | None = None,
 ) -> None:
     """Compose the sealed inputs Linux consumers rebuild from (fixture plumbing).
 
     Copies the genuine CAD bytes into ``input/cad/<relative>``, writes the
     sealed discovery payload (with its raw native record) at
     ``evidence/discovery.json`` (including optional controlled-record files at
-    ``input/records/<name>`` carrying their payload entries), and, when a
-    material authority is given,
-    ensures the canonical provenance block exists in ``evidence/capture.json``.
-    Synthetic consumer-fixture inputs only: it must never feed the unchanged
+    ``input/records/<name>`` carrying their payload entries). Synthetic
+    consumer-fixture inputs only: it must never feed the unchanged
     canonical/E2E producers, which produce their own evidence.  Existing
     fixture blocks (warnings and readouts included) are preserved, and the
     provenance identity binds to the record's captured identity rather than a
@@ -2202,7 +2194,7 @@ def compose_delivery_inputs(
 
     import shutil
 
-    from description_pipeline.io import file_digest, read_data, write_json
+    from description_pipeline.io import file_digest, write_json
     from description_pipeline.sources.solidworks.discovery import DISCOVERY_SCHEMA
 
     write_fixture_request(Path(delivery), main_assembly=main_assembly)
@@ -2252,26 +2244,6 @@ def compose_delivery_inputs(
             "native_files": dict(sorted(native_files.items())),
         },
     )
-    if material_source is not None:
-        capture_path = evidence / "capture.json"
-        capture = read_data(capture_path) if capture_path.is_file() else {}
-        if not isinstance(capture, dict):
-            capture = {}
-        existing = capture.get("material_provenance")
-        if not isinstance(existing, dict):
-            captured_assembly = str(identity.get("main_assembly") or main_assembly)
-            captured_configuration = str(identity.get("delivery_configuration") or configuration)
-            capture["material_provenance"] = {
-                "schema_version": "solidworks-to-urdf.material-provenance/v1",
-                "assembly": captured_assembly,
-                "configuration": captured_configuration,
-                "material_source": material_source,
-                "measured_source": "cad_api",
-                "warnings": [],
-            }
-            write_json(capture_path, capture)
-
-
 # ---------------------------------------------------------------------------
 # Fixture plumbing: the small shared producer for consumer-fixture inputs.
 #

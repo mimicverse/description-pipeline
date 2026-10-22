@@ -100,21 +100,17 @@ class NormalizationOracleTests(unittest.TestCase):
     def test_strict_source_validation(self) -> None:
         from description_pipeline.sources.solidworks.errors import ConfigError
 
-        bad_number = dict(self.config, material_source="documented_table", documented_masses={"arm-1": 1.5})
-        with self.assertRaises(ConfigError) as raised:
-            validate_source_config(bad_number)
-        self.assertEqual(raised.exception.code, "invalid_config")
+        for overrides in (
+            {"material_source": "documented_table"},
+            {"documented_masses": {"arm-1": 1.5}},
+            {"mass_evidence": {"reference": "manual", "file": "table.json", "sha256": "0" * 64}},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ConfigError) as raised:
+                validate_source_config(dict(self.config, **overrides))
+            self.assertEqual(raised.exception.code, "invalid_config")
 
         bad_key = dict(self.config, assembly_typo=str(self.assembly))
         with self.assertRaises(ConfigError):
             validate_source_config(bad_key)
-
-        bad_field = dict(
-            self.config,
-            material_source="documented_table",
-            documented_masses={"arm-1": {"mass": 1.5, "reason": "typo"}},
-        )
-        with self.assertRaises(ConfigError):
-            validate_source_config(bad_field)
 
 

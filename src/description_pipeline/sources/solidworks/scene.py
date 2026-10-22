@@ -15,12 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ConfigError
-from .jsonio import read_json
 from .naming import (
     DISPLAY_MATERIAL_FALLBACK_NAME,
     DISPLAY_MATERIAL_FALLBACK_RGBA,
     DISPLAY_MATERIAL_FALLBACK_RULE,
     asset_namespace,
+    fixed_joint_name,
     mesh_path,
     visual_name,
 )
@@ -359,10 +359,9 @@ def material_unverified(payload: Any) -> bool:
     a per-entity material reading, while a missing assignment carries an
     ``unverified_reason`` such as ``cad_material_provenance_missing``. SolidWorks
     default density can produce a plausible-looking CAD mass, so such a reading is
-    not verified mass: in CAD mode ``build_scene`` preserves the value and records
-    a non-blocking warning; in documented-table mode the declared table must
-    replace it. Fixtures and historical readings without this block return False,
-    but declaration coverage rules still apply.
+    not verified mass: ``build_scene`` preserves the value and records a
+    non-blocking warning. Fixtures and historical readings without this block
+    return False.
     """
 
     reference = payload.get("reference") if isinstance(payload, dict) else None
@@ -370,34 +369,10 @@ def material_unverified(payload: Any) -> bool:
     return isinstance(assignment, dict) and bool(assignment.get("unverified_reason"))
 
 
-def check_mass_contract(cfg: dict[str, Any], included: Iterable[str], masses: dict[str, Any]) -> list[str]:
-    """Validate the mass-source contract against the components actually included.
+def unverified_mass_components(included: Iterable[str], masses: dict[str, Any]) -> list[str]:
+    """Return CAD mass readings whose material assignment is explicitly unverified."""
 
-    * ``documented_table`` requires a declared mass for every included component.
-    * Every mode refuses declared entries for components outside the included set;
-      silently ignoring a misspelled or renamed key would remove its effect.
-    * In ``cad`` mode an unverified material is a warning-level defect. Readings and
-      geometry remain unchanged, and the component names are returned for a
-      non-blocking warning that independent verification requires downstream.
-    """
-
-    documented = dict(cfg.get("documented_masses") or {})
     included_set = {str(name) for name in included}
-    unknown = sorted(set(documented) - included_set)
-    if unknown:
-        raise ConfigError(
-            "documented_masses contains components that are not included in any body",
-            {"unknown": unknown[:20]},
-        )
-    mode = str(cfg.get("material_source") or "cad")
-    if mode == "documented_table":
-        missing = sorted(included_set - set(documented))
-        if missing:
-            raise ConfigError(
-                "documented_table requires a mass for every included component",
-                {"missing": missing[:20]},
-            )
-        return []
     return sorted(name for name in included_set if material_unverified(masses.get(name)))
 
 
@@ -524,10 +499,9 @@ def build_scene(
         Path(str(cfg.get("assembly") or cfg.get("robot_name") or "robot")).name
     )
 
-    # Recheck the mass-mode contract against actual readings: documented_table must
-    # cover every included component; CAD readings remain unchanged but carry warnings.
+    # CAD readings remain unchanged and carry material-provenance warnings.
     included = {str(item) for body in bodies for item in (body.get("components") or [])}
-    unverified_material = check_mass_contract(cfg, included, masses)
+    unverified_material = unverified_mass_components(included, masses)
     # The direct one-shot link reads are the authoritative link inertials.  The
     # recombination below stays only as an audit block; a capture without the
     # record fails closed (one supported schema, no fallback path).
@@ -891,6 +865,7 @@ def _value_warnings(
 
     warnings: list[dict[str, Any]] = []
     mappings = []
+    frame_joint_names = []
     motion_unresolved = []
     direction_unresolved = []
     sign_reversals = []
@@ -1073,6 +1048,20 @@ def _value_warnings(
                     "reason": "CAD interface datum formatting",
                 }
             )
+        joint_name = fixed_joint_name(str(frame.get("parent") or ""), str(frame.get("name") or ""))
+        frame_joint_names.append(
+            {
+                "object_type": "joint",
+                "object": joint_name,
+                "field": "name",
+                "actual": joint_name,
+                "source": "normalized parent and frame identities",
+                "original": {"parent": frame.get("parent"), "child": frame.get("name")},
+                "rule_id": "naming.fixed_endpoint_pair",
+                "rule_version": "naming-v1",
+                "reason": "fixed auxiliary joint derived from its normalized parent and child endpoints",
+            }
+        )
     for link in links:
         for visual in link.get("visuals") or []:
             visuals.append(
@@ -1107,6 +1096,14 @@ def _value_warnings(
                 "code": "naming.formatted_interface",
                 "message": "Link, joint, and frame names are deterministic formatting of native CAD identities.",
                 "objects": mappings,
+            }
+        )
+    if frame_joint_names:
+        warnings.append(
+            {
+                "code": "naming.derived_frame_joint",
+                "message": "Auxiliary frame joints derive their names from normalized parent and child identities.",
+                "objects": frame_joint_names,
             }
         )
     if motion_unresolved:
@@ -1380,20 +1377,23 @@ def _build_frames(
                 "parent": parent,
                 "xyz": xyz,
                 "rpy": rpy,
-                "provenance": {"geometry": geometry},
+                "provenance": {
+                    "geometry": geometry,
+                    "derived_joint_name": fixed_joint_name(parent, str(frame.get("name") or frame_id)),
+                    "joint_name_rule": {
+                        "rule_id": "naming.fixed_endpoint_pair",
+                        "rule_version": "naming-v1",
+                        "parent": parent,
+                        "child": str(frame.get("name") or frame_id),
+                    },
+                },
             }
         )
     return frames
 
 
 def load_scene(snapshot_root: Path) -> dict[str, Any]:
-    """Verify a frozen snapshot and derive its scene on the portable host.
-
-    The snapshot itself stays raw.  Declared author decisions - currently the
-    documented mass table - are applied *here*: every applied value is recorded
-    per link with its raw reading, used value, reason and evidence, so a reader
-    can always tell a CAD reading from a declared replacement.
-    """
+    """Verify a frozen snapshot and derive its CAD-only scene on the portable host."""
 
     from ..snapshot import verify_snapshot
 
@@ -1406,9 +1406,6 @@ def load_scene(snapshot_root: Path) -> dict[str, Any]:
         raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
     if scene.get("units") != "SI":
         raise ConfigError("only SI scenes are supported", {"units": scene.get("units")})
-    declared = _read_declared_masses(root)
-    if declared:
-        _apply_declared_masses(scene, declared)
     provenance = dict(scene.get("provenance") or {})
     provenance["snapshot"] = {
         "kind": manifest.get("kind"),
@@ -1418,115 +1415,3 @@ def load_scene(snapshot_root: Path) -> dict[str, Any]:
     }
     scene["provenance"] = provenance
     return scene
-
-
-def _read_declared_masses(root: Path) -> dict[str, dict[str, Any]]:
-    path = root / "raw" / "declared_masses.json"
-    if not path.is_file():
-        return {}
-    payload = read_json(path)
-    if not isinstance(payload, dict):
-        raise ConfigError("declared mass table must be an object", {"path": str(path)})
-    items = payload.get("items") or {}
-    if not isinstance(items, dict):
-        raise ConfigError("declared mass table items must be an object", {"path": str(path)})
-    table: dict[str, dict[str, Any]] = {}
-    for name, entry in items.items():
-        if not isinstance(entry, dict) or "mass_kg" not in entry:
-            raise ConfigError("declared mass entries need mass_kg", {"component": name})
-        table[str(name)] = entry
-    return table
-
-
-def _apply_declared_masses(scene: dict[str, Any], declared: dict[str, dict[str, Any]]) -> None:
-    """Replace declared component masses and scale their inertia consistently."""
-
-    if declared:
-        known_parts = {
-            str(part.get("id"))
-            for link in scene.get("links") or []
-            for part in (link.get("provenance") or {}).get("parts") or []
-            if isinstance(part, dict)
-        }
-        unknown = sorted(set(declared) - known_parts)
-        if unknown:
-            raise ConfigError(
-                "declared mass table has entries that match no component (typo or renamed instance)",
-                {"unknown": unknown[:20]},
-            )
-    for link in scene.get("links") or []:
-        provenance = dict(link.get("provenance") or {})
-        if provenance.get("mass") == "source.documented_masses":
-            # Already normalized: applying the table twice must not scale twice.
-            continue
-        parts = provenance.get("parts")
-        if not isinstance(parts, list) or not parts:
-            continue
-        applied: list[dict[str, Any]] = []
-        records: list[dict[str, Any]] = []
-        sources: list[str] = []
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            entry = declared.get(str(part.get("id")))
-            raw_mass = float(part.get("mass_kg", 0.0))
-            scale = 1.0
-            used_mass = raw_mass
-            sources.append("documented" if entry is not None else "cad")
-            if entry is not None:
-                used_mass = float(entry["mass_kg"])
-                if raw_mass <= 0.0:
-                    raise ConfigError(
-                        "cannot scale inertia for a component whose CAD mass is not positive",
-                        {"component": part.get("id"), "raw_mass_kg": raw_mass},
-                    )
-                scale = used_mass / raw_mass
-                records.append(
-                    {
-                        "component": part.get("id"),
-                        "raw_mass_kg": raw_mass,
-                        "used_mass_kg": used_mass,
-                        "scale": scale,
-                        "reason": str(entry.get("reason") or "declared by the model author"),
-                        "evidence": entry.get("evidence"),
-                    }
-                )
-            inertia = [
-                [
-                    float(part["inertia_link"][0]) * scale,
-                    float(part["inertia_link"][1]) * scale,
-                    float(part["inertia_link"][2]) * scale,
-                ],
-                [
-                    float(part["inertia_link"][1]) * scale,
-                    float(part["inertia_link"][3]) * scale,
-                    float(part["inertia_link"][4]) * scale,
-                ],
-                [
-                    float(part["inertia_link"][2]) * scale,
-                    float(part["inertia_link"][4]) * scale,
-                    float(part["inertia_link"][5]) * scale,
-                ],
-            ]
-            applied.append({"mass": used_mass, "com": part.get("com_link_m"), "inertia": inertia})
-        if not applied:
-            continue
-        combined = combine_mass_properties(applied)
-        link["inertial"] = {
-            "mass": combined["mass"],
-            "xyz": list(combined["com"]),
-            "rpy": [0.0, 0.0, 0.0],
-            "inertia": _inertia6(combined["inertia"]),
-        }
-        if records:
-            provenance["mass"] = "source.documented_masses"
-            provenance["declared_masses"] = records
-            provenance["inertia_model"] = "scaled_cad_uniform_density"
-            provenance["inertia_model_scope"] = (
-                "Declared mass scales the CAD uniform-density tensor by used/raw mass; "
-                "this preserves the geometric shape assumption and is not measured inertia. "
-                "It is only an order-of-magnitude estimate for printed parts and does not "
-                "hold for catalog parts such as motors, batteries, or electronics."
-            )
-        provenance["mass_sources"] = sorted(set(sources))
-        link["provenance"] = provenance

@@ -43,11 +43,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 
-from ...io import PipelineError, _filesystem_path, artifact_path_parts, digest
+from ...io import PipelineError, _filesystem_path, digest
 from .handoff import MAX_HANDOFF_BYTES, _directory
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
@@ -59,7 +58,7 @@ from .session_artifacts import (
     session_root_pid,
     session_temp_root,
 )
-from .selection import MAX_SELECTION_FILES, SelectionError, validate_file_index
+from .selection import MAX_SELECTION_FILES, SelectionError, selection_path, validate_file_index
 
 __all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
 
@@ -93,18 +92,6 @@ IDENTITY_DECLARATIONS = (
     "dp.delivery_configuration",
 )
 OPTIONAL_DECLARATIONS = ("dp.robot_name", "dp.design_budget_record")
-
-
-def _path(value: object) -> str:
-    if not isinstance(value, str) or unicodedata.normalize("NFC", value) != value:
-        raise SelectionError("selection_path_invalid", "Selection paths must be canonical text", path=value)
-    try:
-        parts = artifact_path_parts(value)
-    except PipelineError as error:
-        raise SelectionError("selection_path_invalid", str(error), path=value) from error
-    if not parts or "/".join(parts) != value or any(part.startswith("~$") for part in parts):
-        raise SelectionError("selection_path_invalid", "Selection paths must be portable file names", path=value)
-    return value
 
 
 def _staged_sha256(path: Path, name: str) -> str:
@@ -940,7 +927,7 @@ class NativeSelectionReader:
 
         stage_root = _stage_root(stage)
         files = validate_file_index(upload_files)
-        main = _path(main_assembly)
+        main = selection_path(main_assembly)
         if not main.lower().endswith(".sldasm") or main not in files:
             raise SelectionError("selection_main_invalid", "Choose an indexed SolidWorks assembly", path=main)
         readings = self._walker(stage_root, main, files)

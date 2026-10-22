@@ -38,7 +38,7 @@ class SelectionError(PipelineError):
         self.detail = detail
 
 
-def _path(value: object) -> str:
+def selection_path(value: object) -> str:
     if not isinstance(value, str) or unicodedata.normalize("NFC", value) != value:
         raise SelectionError("selection_path_invalid", "Selection paths must be canonical text", path=value)
     try:
@@ -74,7 +74,7 @@ def validate_file_index(files: Mapping[str, str]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     directories: dict[str, str] = {}
     for name, checksum in files.items():
-        name = _path(name)
+        name = selection_path(name)
         if not isinstance(checksum, str) or _SHA.fullmatch(checksum) is None:
             raise SelectionError("selection_digest_invalid", "File identity requires a SHA-256 digest", path=name)
         folded = name.casefold()
@@ -167,7 +167,7 @@ def reachable_closure(graph: Mapping[str, dict], main_assembly: str) -> set[str]
     """Canonical upload-index names reachable from the main over resolved graph edges."""
 
     reachable: set[str] = set()
-    pending = [_path(main_assembly)]
+    pending = [selection_path(main_assembly)]
     while pending:
         name = pending.pop()
         if name in reachable:
@@ -200,7 +200,7 @@ def seal_closure_selection(
     if not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None:
         raise SelectionError("selection_reader_invalid", "Selection requires a pinned native reader identity")
     files = validate_file_index(upload_files)
-    main = _path(main_assembly)
+    main = selection_path(main_assembly)
     if not main.lower().endswith(".sldasm") or main not in files:
         raise SelectionError("selection_main_invalid", "Choose an indexed SolidWorks assembly", path=main)
     if not isinstance(closure, Mapping):
@@ -273,7 +273,7 @@ def seal_closure_selection(
         raise SelectionError("selection_closure_invalid", "Closure evidence must come from a sealed, closed session")
     checked: dict[str, dict] = {}
     for name, record in graph.items():
-        name = _path(name)
+        name = selection_path(name)
         if name not in files:
             raise SelectionError(
                 "selection_closure_invalid", "The resolved graph names a document outside the upload index", path=name
@@ -289,7 +289,7 @@ def seal_closure_selection(
             )
         edges: list[str] = []
         for reference in references:
-            reference = _path(reference)
+            reference = selection_path(reference)
             if reference not in files:
                 raise SelectionError(
                     "selection_closure_invalid",

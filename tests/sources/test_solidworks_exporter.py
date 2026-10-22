@@ -76,7 +76,8 @@ def wire_xml(limit_values=None) -> str:
         )
         limits = f'<URDFElement z:Id="{prefix}limit" i:type="Limit"><Attributes>'
         for key in ("lower", "upper", "effort", "velocity"):
-            limits += attribute(prefix + key, key, None if root else str((limit_values or {}).get(key, 0)), "s:double")
+            value = (limit_values or {}).get(key, 0)
+            limits += attribute(prefix + key, key, None if root or value is None else str(value), "s:double")
         limits += "</Attributes>"
         for key in ("lower", "upper", "effort", "velocity"):
             limits += f'<{key.title()}Attribute z:Ref="{prefix}{key}"/>'
@@ -294,11 +295,11 @@ class ExporterWireTests(unittest.TestCase):
 
 
 class ExporterDiscoveryTests(unittest.TestCase):
-    def derive(self, record):
+    def derive(self, record, *, purpose=PURPOSE_ENGINEERING):
         declaration = decode_exporter_v14(record["exporter"]["raw_xml"], 1.4)
         findings = []
         bodies, clusters = _exporter_memberships(record, declaration, findings)
-        joints = _exporter_joint_facts(record, declaration, bodies, findings)
+        joints = _exporter_joint_facts(record, declaration, bodies, findings, purpose=purpose)
         _exporter_constraint_checks(declaration, clusters, joints, findings)
         return bodies, joints, findings
 
@@ -378,6 +379,28 @@ class ExporterDiscoveryTests(unittest.TestCase):
         _, joints, _findings = self.derive(declared)
         self.assertEqual(joints[0]["limit_source"], "declared_author")
         self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
+
+    def test_continuous_joints_keep_only_drive_limits_for_both_purposes(self) -> None:
+        for purpose in (PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW):
+            for native, bounds in ((False, (None, None)), (True, (None, None)), (False, (0.0, 0.0))):
+                with self.subTest(purpose=purpose, native=native, bounds=bounds):
+                    raw = raw_record()
+                    raw["exporter"]["raw_xml"] = wire_xml({
+                        "lower": bounds[0], "upper": bounds[1], "effort": 0.0, "velocity": 0.0,
+                    }).replace(">revolute<", ">continuous<")
+                    raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(
+                        raw["exporter"]["raw_xml"].encode()
+                    ).hexdigest()
+                    raw["mates"] = [native_limit_mate(0.0, 0.0)] if native else []
+                    _, joints, findings = self.derive(raw, purpose=purpose)
+                    if native or bounds != (None, None):
+                        self.assertTrue(any(item["blocking"] for item in findings), findings)
+                    else:
+                        self.assertEqual(joints[0]["type"], "continuous")
+                        self.assertEqual(joints[0]["limits"], {"effort": 0.0, "velocity": 0.0})
+                        self.assertEqual(joints[0]["limit_source"], "declared_author")
+                        self.assertFalse(any(item["blocking"] for item in findings), findings)
+                        self.assertNotIn("discovery.joint_default_policy", {item["code"] for item in findings})
 
     def test_native_limits_replace_missing_author_position_bounds(self) -> None:
         for missing in (("lower",), ("upper",), ("lower", "upper")):

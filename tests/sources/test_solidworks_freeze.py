@@ -75,9 +75,7 @@ def _native_record(*, with_arm: bool, with_joint: bool, files: dict[str, str]) -
         mates = support.native_hinge_mates(
             "base-1", "arm-1", left_point=(0.0, 0.0, 0.2), right_point=(0.0, 0.0, 0.0), radius=0.006
         )
-        mates[0]["limits"] = {"lower": -1.0, "upper": 1.0, "unit": "rad"}
-        mates[0]["is_advanced_mate"] = True
-        mates[0]["native_limit"] = {"type_index": 6}
+        mates.append(support.native_limit_mate("base-1", "arm-1", point=(0.0, 0.0, 0.2)))
         joint_claims = support.native_joint_claims()
     return support.native_record(
         hardware_id="freeze_fixture",
@@ -1690,26 +1688,19 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(redacted["url"], "http://192.0.2.10:8765/jobs")
         self.assertEqual(redacted["assembly"], "C:/cad/robot.SLDASM")
 
-    def test_failed_capture_does_not_leak_source_credentials_into_the_record(self) -> None:
-        """The diagnostic record is committed evidence: it must not carry the source's secrets."""
-
+    def test_removed_worker_configuration_is_rejected_without_echoing_credentials(self) -> None:
         backend, config = self._two_component_backend()
         backend.scene_document_override = str(self.assembly)
         config = json.loads(json.dumps(config))
         config["worker_url"] = "http://user:secret@192.0.2.10:8765/jobs?token=abc"
 
-        with self.assertRaises(BridgeError):
+        with self.assertRaises(ConfigError) as raised:
             freeze(config, self.destination, backend=backend)
-
-        failure = self.destination.with_name(self.destination.name + ".failed-001")
-        payload = (failure / "failure.json").read_text(encoding="utf-8")
-        self.assertNotIn("secret", payload)
-        self.assertNotIn("token=abc", payload)
-        self.assertNotIn("user:", payload)
-        # The record still has to explain the failure.
-        record = json.loads(payload)
-        self.assertEqual(record["code"], "capture_source_mismatch")
-        self.assertEqual(record["request"]["assembly"], str(self.assembly))
+        message = str(raised.exception)
+        self.assertIn("worker_url", message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("token=abc", message)
+        self.assertFalse(self.destination.exists())
 
     def test_retained_failure_redacts_credentials_from_the_backend_detail(self) -> None:
         """A backend error may echo a URL; the retained detail must be redacted before it is written."""
@@ -1866,76 +1857,3 @@ class SharedModelContractTests(unittest.TestCase):
         self.assertEqual(scene["provenance"]["expected_entities"], ["arm-1", "base-1"])
         assigned = [entity for link in scene["links"] for entity in link["provenance"]["source_entities"]]
         self.assertEqual(sorted(assigned), ["arm-1", "base-1"])
-
-
-class DocumentedMassTests(unittest.TestCase):
-    """A documented mass table is an explicit input, and the evidence says so."""
-
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="sw-mass-"))
-        self.assembly = support.make_cad_tree(self.tmp / "cad")
-        self.backend = _Backend(
-            self.assembly,
-            [
-                {
-                    "name": "base-1",
-                    "transform": support.placement(),
-                    "mass": support.mass_payload(
-                        1.0, (0.01, 0.02, 0.0), [[0.004, 0.0, 0.0], [0.0, 0.002, 0.0], [0.0, 0.0, 0.002]]
-                    ),
-                }
-            ],
-            dependencies=[self.tmp / "cad" / "base.SLDPRT"],
-        )
-        self.config = {
-            "provider": "solidworks",
-            "assembly": str(self.assembly),
-            "configuration": "Default",
-            "allowed_roots": [str(self.tmp / "cad")],
-            "geometry": {"enabled": False},
-            "material_source": "documented_table",
-            "documented_masses": {"base-1": {"mass_kg": 2.5, "reason": "vendor drawing 12-3", "evidence": "base-1"}},
-            "mass_evidence": {
-                "reference": "vendor drawing 12-3 (fixture)",
-                "file": "docs/provenance/drawing-12-3.json",
-                "sha256": "0" * 64,
-            },
-            "bodies": [
-                {
-                    "id": "base",
-                    "name": "base_link",
-                    "components": ["base-1"],
-                    "frame": {"coordinate_system": "CS_base_link"},
-                }
-            ],
-            "joints": [],
-        }
-
-    def tearDown(self) -> None:
-        support.cleanup(self.tmp)
-
-    def test_documented_mass_is_applied_at_load_time_and_records_raw_used(self) -> None:
-        freeze(self.config, self.tmp / "snapshot", backend=self.backend)
-        _compose_scene_inputs(self.tmp / "snapshot", self.tmp / "cad", with_arm=False, with_joint=False)
-        raw_scene = json.loads((self.tmp / "snapshot" / "raw/scene_raw.json").read_text(encoding="utf-8"))
-        # the snapshot keeps the CAD reading: nothing is replaced on disk
-        self.assertAlmostEqual(raw_scene["mass_properties"]["base-1"]["mass"], 1.0, places=9)
-        self.assertFalse((self.tmp / "snapshot" / "scene.json").exists())
-
-        scene = load_scene(self.tmp / "snapshot")
-        link = scene["links"][0]
-        self.assertAlmostEqual(link["inertial"]["mass"], 2.5, places=9)
-        self.assertAlmostEqual(link["inertial"]["inertia"][0], 0.01, places=9)  # scaled with the mass
-        record = link["provenance"]["declared_masses"][0]
-        self.assertEqual(record["raw_mass_kg"], 1.0)
-        self.assertEqual(record["used_mass_kg"], 2.5)
-        self.assertEqual(record["scale"], 2.5)
-        self.assertTrue(record["reason"])
-        self.assertEqual(link["provenance"]["mass"], "source.documented_masses")
-
-    def test_documented_table_must_be_declared(self) -> None:
-        config = dict(self.config)
-        config["documented_masses"] = {}
-        with self.assertRaises(ConfigError) as raised:
-            freeze(config, self.tmp / "snapshot2", backend=self.backend)
-        self.assertEqual(raised.exception.code, "invalid_config")

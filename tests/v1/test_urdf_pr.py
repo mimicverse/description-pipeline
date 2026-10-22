@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -20,6 +21,136 @@ from description_pipeline.stages import CONTRACT
 
 BRANCH = "work/solidworks/m3.0/engineering"
 INSPECTION_BRANCH = "work/solidworks/m3.0/inspection_preview"
+BODY_SLUG = "example/m3.0"
+BODY_SHA256 = "c" * 64
+
+
+def render_body(
+    report: dict,
+    *,
+    subject: str = "a" * 64,
+    commit: str = "b" * 40,
+    purpose: str = "engineering",
+    slug: str = BODY_SLUG,
+    quality_sha256: str = BODY_SHA256,
+) -> str:
+    return urdf_pr._body(
+        subject,
+        commit,
+        report,
+        purpose,
+        slug=slug,
+        quality_sha256=quality_sha256,
+    )
+
+
+def representative_m3_quality_report() -> dict:
+    """A compact canonical report with the audited 24-link/23-joint shape."""
+
+    warning_row_counts = (
+        ("direction.semantics_unresolved", 23),
+        ("discovery.publication_metadata_incomplete", 0),
+        ("discovery.revision_absent", 0),
+        ("display.constant", 85),
+        ("geometry.derived_from_native", 47),
+        ("input.cad_revision_absent", 0),
+        ("limits.preview_policy", 23),
+        ("naming.content_addressed_mesh", 85),
+        ("naming.derived_material", 85),
+        ("naming.derived_visual", 85),
+        ("naming.formatted_interface", 46),
+        ("naming.formatted_robot_name", 1),
+        ("naming.motion_unresolved", 7),
+        ("physics.derived_from_native", 24),
+        ("units.si_conversion", 1),
+    )
+    diagnostics = []
+    for code, count in warning_row_counts:
+        objects = [
+            {
+                "object_type": "record",
+                "object": f"{code}:{index:03d}",
+                "field": "value",
+                "source": f"{code}.source",
+                "rule_id": f"{code}.rule",
+                "rule_version": "v1",
+                "original": index,
+                "actual": index + 1,
+                "reason": "Representative M3 warning",
+            }
+            for index in range(count)
+        ]
+        diagnostics.append(
+            {
+                "code": code,
+                "blocking": False,
+                "message": f"{code} recorded",
+                "detail": {"objects": objects} if objects else {"recorded": False},
+            }
+        )
+    for index in range(23):
+        diagnostics.append(
+            {
+                "code": "urdf.motion_unqualified",
+                "blocking": False,
+                "message": "Authored motion values are not qualified",
+                "detail": {
+                    "joint": f"joint_{index:02d}",
+                    "values": ["effort", "velocity"],
+                },
+            }
+        )
+
+    qualification_counts = (
+        *((fact_id, "established", 1) for fact_id in (
+            "bundle.subject",
+            "consumer.urdf",
+            "frames.components",
+            "frames.native",
+            "frames.references",
+            "geometry.assets",
+            "geometry.coverage",
+            "geometry.native_tessellation",
+            "input.valid",
+            "model.policy",
+            "model.schema",
+            "physics.independent",
+            "physics.mass_closure_equality",
+            "provenance.value_warnings",
+            "source.carrier_binding",
+            "source.coverage",
+            "source.dependencies",
+            "source.integrity",
+            "source.native",
+            "source.native_discovery",
+            "source.raw",
+            "tool.identity",
+            "urdf.syntax_names",
+            "urdf.topology",
+            "verification.complete",
+        )),
+        ("geometry.expected_extent", "out_of_scope", 1),
+        ("physics.expected_mass", "out_of_scope", 1),
+        ("geometry", "established", 24),
+        ("inertia", "established", 24),
+        ("joints", "established", 23),
+        ("motion", "established", 23),
+        ("shafts", "established", 23),
+        ("drive_sizing", "unqualified", 23),
+        ("engineering_position_range", "unqualified", 23),
+        ("machine_qualification", "unqualified", 1),
+    )
+    qualifications = [
+        {
+            "fact_id": fact_id,
+            "status": status,
+            "scope": "",
+            "object_id": f"{fact_id}:{index:03d}",
+        }
+        for fact_id, status, count in qualification_counts
+        for index in range(count)
+    ]
+    return {"checks": [], "diagnostics": diagnostics, "qualifications": qualifications}
 
 
 def _request_text(purpose: str = "engineering") -> str:
@@ -588,10 +719,26 @@ class PublishTests(unittest.TestCase):
         self.assertIn(f"subject: `{result['subject']}`", self.rest_payloads[-1]["body"])
         body = self.rest_payloads[-1]["body"]
         self.assertIn("- purpose: `engineering`", body)
-        self.assertIn("- engineering_position_range[arm-a]: established", body)
-        self.assertIn("- drive_sizing[arm-a]: established", body)
-        self.assertIn("- drive_sizing[arm-b]: unqualified (unqualified)", body)
-        self.assertIn("- machine_qualification: unqualified (unqualified)", body)
+        self.assertIn("`drive_sizing`[`established`]=1", body)
+        self.assertIn("`drive_sizing`[`unqualified`]=1", body)
+        self.assertIn("`machine_qualification`[`unqualified`]=1", body)
+        run("git", "fetch", "--quiet", "origin", BRANCH, cwd=self.fx.repo)
+        committed = subprocess.run(
+            ["git", "-C", str(self.fx.repo), "show", f"{result['commit']}:reports/quality.json"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        committed_report = json.loads(committed)
+        qualification_total = len(committed_report["qualifications"])
+        self.assertIn(
+            f"qualification object rows: total={qualification_total}; shown=0; omitted={qualification_total}",
+            body,
+        )
+        self.assertIn(
+            f"https://github.com/example/m3.0/blob/{result['commit']}/reports/quality.json",
+            body,
+        )
+        self.assertIn(f"`sha256:{hashlib.sha256(committed).hexdigest()}`", body)
         self.assertEqual(result["purpose"], "engineering")
         self.assertFalse(any(call[:2] == ("pr", "edit") for call in self.gh_calls))
 
@@ -955,72 +1102,208 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.fx.remote_head(INSPECTION_BRANCH), third["commit"])
         body = self.rest_payloads[-1]["body"]
         self.assertIn("- purpose: `inspection_preview`", body)
-        self.assertIn("- drive_sizing[arm-a]: unqualified (unqualified)", body)
-        self.assertIn("- machine_qualification: unqualified (unqualified)", body)
+        self.assertIn("`drive_sizing`[`unqualified`]=2", body)
+        self.assertIn("`machine_qualification`[`unqualified`]=1", body)
+        self.assertNotIn("- drive_sizing[arm-a]", body)
 
-    def test_pr_body_lists_each_qualification_identity_independent_of_order(self) -> None:
-        def qualification_lines(body: str) -> list[str]:
-            return [
-                line
-                for line in body.splitlines()
-                if line.startswith("- ") and not line.startswith(("- subject:", "- verified commit:", "- purpose:"))
-            ]
+    def test_pr_body_summarizes_qualification_rows_independent_of_order(self) -> None:
+        def qualification_summary(body: str) -> str:
+            return body[body.index("## Recorded qualifications") :]
 
         self.qualification_reversed = False
         self.submit()
         self.submit()
         forward = self.rest_payloads[-1]["body"]
-        self.assertIn("- drive_sizing[arm-a]: established", forward)
-        self.assertIn("- drive_sizing[arm-b]: unqualified (unqualified)", forward)
-        self.assertLess(forward.index("[arm-a]"), forward.index("[arm-b]"))
+        self.assertIn("`drive_sizing`[`established`]=1", forward)
+        self.assertIn("`drive_sizing`[`unqualified`]=1", forward)
         self.qualification_reversed = True
         result = self.submit()
         self.assertIn(result["state"], {"updated", "noop"})
         self.assertEqual(
-            qualification_lines(self.rest_payloads[-1]["body"]),
-            qualification_lines(forward),
+            qualification_summary(self.rest_payloads[-1]["body"]),
+            qualification_summary(forward),
         )
 
-    def test_pr_body_carries_object_level_author_sign_warning(self) -> None:
-        report = {
-            "checks": [
-                {
-                    "id": "provenance.value_warnings",
-                    "state": "passed",
-                    "details": {
-                        "codes": ["direction.author_sign_applied", "limits.default_policy"],
-                        "objects": 1,
-                        "direction_sign_warnings": [
-                            {
-                                "object": "arm_joint",
-                                "native_sign": -1,
-                                "original_axis_assembly": [0, 0, 1],
-                                "output_axis_assembly": [0, 0, -1],
-                                "actual_child_axis": [0, 0, -1],
-                                "original_frame": "assembly",
-                                "output_frame": "assembly",
-                                "model_frame": "child",
-                                "q_sign": 1,
-                                "range_transform": "not_applied",
-                                "limits_status": "present",
-                                "drive_status": "present",
-                                "rule_id": "direction.native_axis_sign",
-                                "rule_version": "v1",
-                                "reason": "author sign selects the undirected positive direction",
-                                "warning_does_not_replace_evidence": True,
-                            }
-                        ],
-                    },
-                }
-            ],
-            "qualifications": [],
-        }
-        body = urdf_pr._body("subject", "commit", report, "engineering")
-        self.assertIn("- direction author sign `arm_joint`", body)
-        self.assertIn("assembly `[0,0,1]` -> assembly `[0,0,-1]`", body)
-        self.assertIn("child `[0,0,-1]`", body)
-        self.assertIn("direction.native_axis_sign/v1", body)
-        self.assertIn("limits.default_policy", body)
+    def test_pr_body_summarizes_general_warning_codes_in_stable_safe_order(self) -> None:
+        def diagnostic(code: str, object_type: str, object_id: str, field: str) -> dict:
+            return {
+                "code": code,
+                "blocking": False,
+                "message": f"{code} recorded",
+                "detail": {
+                    "objects": [
+                        {
+                            "object_type": object_type,
+                            "object": object_id,
+                            "field": field,
+                            "original": "<script>alert(1)</script>",
+                            "actual": {"value": "<img src=x onerror=alert(1)>"},
+                            "source": f"{code}.source",
+                            "rule_id": f"{code}.rule",
+                            "rule_version": "v1",
+                            "reason": "Native value was unavailable; see report.",
+                        }
+                    ]
+                },
+            }
+
+        diagnostics = [
+            diagnostic("display.material_fallback", "visual", "shell", "material"),
+            diagnostic("naming.formatted_interface", "link", "base_link", "name"),
+            diagnostic("limits.default_policy", "joint", "waist", "limits"),
+        ]
+        report = {"checks": [], "qualifications": [], "diagnostics": diagnostics}
+        forward = render_body(report, subject="subject", commit="b" * 40)
+        report["diagnostics"] = list(reversed(diagnostics))
+        reverse = render_body(report, subject="subject", commit="b" * 40)
+
+        def warning_summary(body: str) -> str:
+            return body[body.index("## Recorded source warnings") :]
+
+        self.assertEqual(warning_summary(forward), warning_summary(reverse))
+        self.assertIn("## Recorded source warnings", forward)
+        for code in ("limits.default_policy", "naming.formatted_interface", "display.material_fallback"):
+            self.assertIn(f"`{code}` groups=1 rows=1", forward)
+        self.assertIn("warning groups: total=3; shown=0; omitted=3", forward)
+        self.assertIn("warning object rows: total=3; shown=0; omitted=3", forward)
+        self.assertIn("warning codes: total=3; shown=3; omitted=0", forward)
+        self.assertNotIn("- general warning ", forward)
+        self.assertNotIn("<script>", forward)
+        self.assertNotIn("<img ", forward)
+
+        empty = render_body(
+            {"checks": [], "qualifications": [], "diagnostics": []},
+            subject="subject",
+            commit="b" * 40,
+        )
+        self.assertNotIn("## Recorded source warnings", empty)
+        unknown = render_body(
+            {
+                "checks": [],
+                "qualifications": [],
+                "diagnostics": [
+                    {
+                        "code": "quality.unknown",
+                        "blocking": False,
+                        "detail": {"objects": [{"object": "safe", "unknown": {"nested": True}}]},
+                    }
+                ],
+            },
+            subject="subject",
+            commit="b" * 40,
+        )
+        self.assertIn("`quality.unknown` groups=1 rows=1", unknown)
+        self.assertNotIn("object=`safe`", unknown)
+        self.assertNotIn("nested", unknown)
+
+    def test_pr_body_bounds_large_warning_index_without_silent_loss(self) -> None:
+        diagnostics = [
+            {
+                "code": "limits.default_policy",
+                "blocking": False,
+                "detail": {
+                    "objects": [
+                        {
+                            "object_type": "joint",
+                            "object": f"joint_{index:04d}",
+                            "field": "limits",
+                            "original": {"lower": 0.0, "upper": 0.0},
+                            "actual": {
+                                "lower": -3.141592653589793,
+                                "upper": 3.141592653589793,
+                            },
+                            "source": "engineering_rotation_default_window/v1",
+                            "rule_id": "engineering_rotation_default_window/v1",
+                            "rule_version": "v1",
+                            "reason": "Native position limits were unavailable",
+                        }
+                    ]
+                },
+            }
+            for index in range(2000)
+        ]
+        report = {"checks": [], "qualifications": [], "diagnostics": diagnostics}
+        body = render_body(report)
+        self.assertLess(len(body), 20_000)
+        self.assertLess(len(body.encode("utf-8")), 20_000)
+        self.assertIn("warning groups: total=2000; shown=0; omitted=2000", body)
+        self.assertIn("warning object rows: total=2000; shown=0; omitted=2000", body)
+        self.assertIn("warning codes: total=1; shown=1; omitted=0", body)
+        self.assertIn("`limits.default_policy` groups=2000 rows=2000", body)
+        self.assertIn("complete candidate source: [reports/quality.json]", body)
+        self.assertIn("Warnings are recorded observations, never passes or publication evidence", body)
+        self.assertNotIn("- general warning `limits.default_policy`", body)
+
+        report["diagnostics"] = list(reversed(diagnostics))
+        reverse = render_body(report)
+
+        def warning_summary(value: str) -> str:
+            return value[value.index("## Recorded source warnings") :]
+
+        self.assertEqual(warning_summary(body), warning_summary(reverse))
+
+    def test_pr_body_bounds_large_qualification_summary_without_silent_loss(self) -> None:
+        qualifications = [
+            {
+                "fact_id": f"quality.fact_{index:04d}",
+                "status": "established",
+                "object_id": f"object_{index:04d}",
+            }
+            for index in range(2000)
+        ]
+        body = render_body(
+            {"checks": [], "qualifications": qualifications, "diagnostics": []},
+        )
+        self.assertLess(len(body), 20_000)
+        self.assertLess(len(body.encode("utf-8")), 20_000)
+        self.assertIn("qualification object rows: total=2000; shown=0; omitted=2000", body)
+        self.assertIn("qualification facts: total=2000; fact/status summaries shown=64; omitted=1936", body)
+        self.assertIn("`established`=2000", body)
+        self.assertNotIn("[object_0000]", body)
+
+    def test_pr_body_is_bounded_for_representative_m3_quality_shape(self) -> None:
+        report = representative_m3_quality_report()
+        warning_rows = urdf_pr._general_warning_rows(report)
+        warning_diagnostics = urdf_pr._warning_diagnostics(report)
+        qualification_rows = report["qualifications"]
+
+        self.assertEqual(len(warning_rows), 512)
+        self.assertEqual(len(warning_diagnostics), 38)
+        self.assertEqual(
+            len({diagnostic["code"] for diagnostic in warning_diagnostics}),
+            16,
+        )
+        self.assertEqual(len(qualification_rows), 191)
+
+        body = render_body(report)
+        self.assertLess(len(body), 32_768)
+        self.assertLess(len(body.encode("utf-8")), 32_768)
+        self.assertIn("warning groups: total=38; shown=0; omitted=38", body)
+        self.assertIn("warning object rows: total=512; shown=0; omitted=512", body)
+        self.assertIn("warning codes: total=16; shown=16; omitted=0", body)
+        self.assertIn("qualification object rows: total=191; shown=0; omitted=191", body)
+        self.assertIn(
+            "qualification facts: total=35; fact/status summaries shown=35; omitted=0",
+            body,
+        )
+        self.assertIn(
+            f"https://github.com/{BODY_SLUG}/blob/{'b' * 40}/reports/quality.json",
+            body,
+        )
+        self.assertIn(f"`sha256:{BODY_SHA256}`", body)
+        self.assertEqual(
+            body.count(
+                f"https://github.com/{BODY_SLUG}/blob/{'b' * 40}/reports/quality.json"
+            ),
+            1,
+        )
+        self.assertEqual(body.count("`sha256:"), 1)
+        self.assertEqual(body.count("## Recorded source warnings"), 1)
+        self.assertEqual(body.count("## Recorded qualifications"), 1)
+        self.assertNotIn("- general warning ", body)
+        self.assertNotIn("- engineering_position_range[", body)
+        self.assertNotIn("direction author sign", body)
+        self.assertNotIn("native scope identity", body)
 
 
 if __name__ == "__main__":

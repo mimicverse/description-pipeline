@@ -5,6 +5,7 @@ import struct
 import shutil
 import tempfile
 import unittest
+import copy
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -83,6 +84,57 @@ class UrdfNumericContractTests(unittest.TestCase):
 
 
 class UrdfWriterTests(unittest.TestCase):
+    def test_frame_joint_uses_canonical_parent_to_child_identity(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        frame = scene["frames"][0]
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(Robot.from_dict(scene), source, Path(temp), name="frame_name")
+            document = ET.parse(output).getroot()
+        node = next(
+            joint
+            for joint in document.findall("joint")
+            if joint.find("child").get("link") == frame["name"]
+        )
+        self.assertEqual(node.get("name"), f"{frame['parent']}_to_{frame['name']}_joint")
+        self.assertEqual(node.find("parent").get("link"), frame["parent"])
+        self.assertEqual(node.find("child").get("link"), frame["name"])
+
+    def test_frame_joint_name_collision_is_rejected_before_writing(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        duplicate = copy.deepcopy(scene["frames"][0])
+        duplicate.update({"id": "tool_2", "name": "tool_"})
+        duplicate["provenance"]["joint_name_rule"]["child"] = "tool_"
+        scene["frames"].append(duplicate)
+        robot = Robot.from_dict(scene)
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            self.assertRaisesRegex(PipelineError, "Frame fixed joint name collides"),
+        ):
+            generate_urdf(robot, source, Path(temp), name="frame_collision")
+
+    def test_authored_joint_cannot_reserve_the_derived_frame_joint_name(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        auxiliary = copy.deepcopy(next(link for link in scene["links"] if link["name"] == "arm_link"))
+        auxiliary.update({"id": "aux_link", "name": "aux_link"})
+        scene["links"].append(auxiliary)
+        scene["joints"].append(
+            {
+                "id": "arm_link_to_tool_joint",
+                "name": "arm_link_to_tool_joint",
+                "type": "fixed",
+                "parent": "base_link",
+                "child": "aux_link",
+                "xyz": [0.0, 0.0, 0.0],
+                "rpy": [0.0, 0.0, 0.0],
+                "provenance": {"fixture": True},
+            }
+        )
+        with self.assertRaisesRegex(PipelineError, "collide"):
+            Robot.from_dict(scene)
+
     def test_broken_joint_reference_is_rejected_before_writing(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         scene = read_data(source / "scene.json")

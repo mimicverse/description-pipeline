@@ -29,6 +29,7 @@ from ..geometry.native_u import (
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
+from ..sources.solidworks.naming import fixed_joint_name
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
 from ..sources.solidworks.native_limits import (
     ENGINEERING_DEFAULT_POLICY_ID,
@@ -238,39 +239,6 @@ def require_qualified_report(report, definition, root=None):
     return report
 
 
-def _frozen_source_config(root) -> dict:
-    """The sealed material authority, read from the canonical capture block.
-
-    The ``material_provenance`` block of the sealed ``capture.json`` states the
-    assembly, configuration and material source; it is the same authority the
-    physics gate consumes.  The verifier reads exactly that block: an unknown
-    schema, missing identity or an absent/unknown material source returns
-    nothing so the reconstruction and the gate fail closed.  Nothing is
-    inferred from mass dictionaries, no raw side copy is preferred over a
-    diverging canonical block, and no generator-side rebuild is invoked.
-    """
-
-    delivery = Path(root).resolve()
-    delivery = delivery.parent if delivery.name == "evidence" else delivery
-    evidence = delivery / "evidence"
-    if not (evidence / "capture.json").is_file():
-        return {}
-    capture = read_data(confined(evidence, "capture.json"))
-    record = capture.get("material_provenance") if isinstance(capture, dict) else None
-    if not isinstance(record, dict):
-        return {}
-    if record.get("schema_version") != "solidworks-to-urdf.material-provenance/v1":
-        return {}
-    if not isinstance(record.get("assembly"), str) or not record["assembly"].strip():
-        return {}
-    if not isinstance(record.get("configuration"), str) or not record["configuration"].strip():
-        return {}
-    source = record.get("material_source")
-    if source not in ("cad", "documented_table"):
-        return {}
-    return {"material_source": source}
-
-
 def rebuilt_definition(root) -> dict:
     """The independently rebuilt definition a quality report's inventory binds to."""
 
@@ -364,12 +332,6 @@ def _input(root, diagnostics=None):
         or discovery_record.get("robot_name_technical")
     )
     _require(isinstance(robot_name, str) and robot_name, "Discovery record carries no robot name")
-    declared = evidence.declared_masses(root)
-    material_source = _frozen_source_config(root).get("material_source")
-    _require(
-        isinstance(material_source, str) and material_source.strip() != "",
-        "The frozen source config carries no usable material_source",
-    )
     recorded = (handoff.get("input_receipt") or {}).get("inventory")
     if isinstance(recorded, dict) and recorded:
         archived = inventory(root / "input/cad")
@@ -414,9 +376,6 @@ def _input(root, diagnostics=None):
             "joints": joints,
             "carrier": carrier_snapshot,
             "frames": frames,
-            "material_source": material_source,
-            "documented_masses": declared.get("items") or {},
-            "mass_evidence": declared.get("evidence"),
         },
         "checks": checks,
     }
@@ -1055,7 +1014,7 @@ def _xml(root, definition, model):
     _require(all(_NAME.fullmatch(name) for name in link_names + joint_names), "URDF names must be snake_case")
     expected_links = {link["name"] for link in model["links"]} | {frame["name"] for frame in model["frames"]}
     expected_joints = {joint["name"] for joint in model["joints"]} | {
-        frame["name"] + "_fixed" for frame in model["frames"]
+        fixed_joint_name(str(frame["parent"]), str(frame["name"])) for frame in model["frames"]
     }
     _require(
         set(link_names) == expected_links and set(joint_names) == expected_joints,
@@ -2745,6 +2704,21 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
                     "reason": "CAD interface datum formatting",
                 },
             )
+        joint_name = fixed_joint_name(str(frame.get("parent") or ""), str(frame.get("name") or ""))
+        add(
+            "naming.derived_frame_joint",
+            {
+                "object_type": "joint",
+                "object": joint_name,
+                "field": "name",
+                "actual": joint_name,
+                "source": "normalized parent and frame identities",
+                "original": {"parent": frame.get("parent"), "child": frame.get("name")},
+                "rule_id": "naming.fixed_endpoint_pair",
+                "rule_version": "naming-v1",
+                "reason": "fixed auxiliary joint derived from its normalized parent and child endpoints",
+            },
+        )
     for link, shape in shapes:
         provenance = shape.get("provenance") if isinstance(shape.get("provenance"), dict) else {}
         native_component = str(provenance.get("native_component") or "")
@@ -2932,6 +2906,9 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
         "naming.formatted_interface": (
             "Link, joint, and frame names are deterministic formatting of native CAD identities."
         ),
+        "naming.derived_frame_joint": (
+            "Auxiliary frame joints derive their names from normalized parent and child identities."
+        ),
         "naming.motion_unresolved": "Joint names without a CAD motion classification retain a neutral name.",
         "direction.semantics_unresolved": "Authored CAD axes are preserved; functional positive motion is not proven.",
         "direction.author_sign_applied": (
@@ -2972,34 +2949,13 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
     return {
         "codes": sorted(actual),
         "objects": sum(len(rows) for rows in actual.values()),
-        "direction_sign_warnings": [
-            {
-                "object": row.get("object"),
-                "native_sign": row.get("native_sign"),
-                "original_axis_assembly": row.get("original_axis_assembly"),
-                "output_axis_assembly": row.get("output_axis_assembly"),
-                "actual_child_axis": row.get("actual_child_axis"),
-                "original_frame": row.get("original_frame"),
-                "output_frame": row.get("output_frame"),
-                "model_frame": row.get("model_frame"),
-                "q_sign": row.get("q_sign"),
-                "range_transform": row.get("range_transform"),
-                "limits_status": row.get("limits_status"),
-                "drive_status": row.get("drive_status"),
-                "rule_id": row.get("rule_id"),
-                "rule_version": row.get("rule_version"),
-                "reason": row.get("reason"),
-                "warning_does_not_replace_evidence": row.get("warning_does_not_replace_evidence"),
-            }
-            for row in expected.get("direction.author_sign_applied", [])
-        ],
     }
 
 
 def _frame(frame, model, joints, links, datums, body_datums):
     name = frame["name"]
     _require(not list(links[name]), "Reference frame must be massless and have no geometry")
-    node = joints[name + "_fixed"]
+    node = joints[fixed_joint_name(str(frame["parent"]), name)]
     _require(
         node.attrib["type"] == "fixed"
         and _one(node, "parent").attrib["link"] == frame["parent"]
@@ -3009,6 +2965,19 @@ def _frame(frame, model, joints, links, datums, body_datums):
     expected = np.linalg.inv(body_datums[frame["parent"]]) @ datums[frame["coordinate_system"]]
     _same_pose(_xml_pose(node), expected)
     canonical = next(item for item in model["frames"] if item["name"] == name)
+    provenance = canonical.get("provenance") if isinstance(canonical, dict) else {}
+    _require(
+        isinstance(provenance, dict)
+        and provenance.get("derived_joint_name") == node.get("name")
+        and provenance.get("joint_name_rule")
+        == {
+            "rule_id": "naming.fixed_endpoint_pair",
+            "rule_version": "naming-v1",
+            "parent": frame["parent"],
+            "child": name,
+        },
+        "Frame auxiliary joint name provenance is not the canonical endpoint rule",
+    )
     _same_pose(_pose(canonical["xyz"], canonical["rpy"]), expected)
     return {"parent": frame["parent"]}
 

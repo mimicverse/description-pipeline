@@ -529,10 +529,14 @@ class DiagnosticPreviewTests(unittest.TestCase):
         static = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         html = (static / "index.html").read_text(encoding="utf-8")
         app = (static / "app.js").read_text(encoding="utf-8")
-        self.assertIn('id="preview-diagnostic"', html)
+        self.assertIn('<div id="preview-diagnostic"', html)
         self.assertIn("renderPreviewDiagnostic(preview)", app)
-        self.assertIn("preview.verified !== false", app)
+        self.assertIn("previewDiagnosticState(preview)", app)
+        self.assertIn("Source warnings", app)
+        self.assertIn("appendWarningSourceRows", app)
+        self.assertIn("replaceChildren()", app)
         self.assertIn("must not be published", app)
+        self.assertNotIn("innerHTML", app)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from xml.etree import ElementTree as ET
 from ..io import PipelineError, confined, file_digest, format_number
 from ..geometry.stl import MESH_PART_TRIANGLES_MAX
 from ..model import Robot
-from ..sources.solidworks.naming import material_name, mesh_path, visual_name
+from ..sources.solidworks.naming import fixed_joint_name, material_name, mesh_path, visual_name
 
 #: Consumers reject a single display mesh above this many triangles, so larger
 #: native meshes are delivered as deterministic, lossless parts.
@@ -180,9 +180,26 @@ def generate_urdf(robot: Robot, source: Path, destination: Path, *, name: str) -
                 multiplier=_numbers([mimic["multiplier"]]),
                 offset=_numbers([mimic["offset"]]),
             )
+    joint_names = {joint["name"] for joint in data["joints"]}
     for frame in data["frames"]:
+        name = fixed_joint_name(str(frame["parent"]), str(frame["name"]))
+        provenance = frame.get("provenance") if isinstance(frame.get("provenance"), dict) else {}
+        if (
+            provenance.get("derived_joint_name") != name
+            or provenance.get("joint_name_rule")
+            != {
+                "rule_id": "naming.fixed_endpoint_pair",
+                "rule_version": "naming-v1",
+                "parent": frame["parent"],
+                "child": frame["name"],
+            }
+        ):
+            raise PipelineError(f"Frame auxiliary joint name provenance is invalid: {frame['name']}")
+        if name in joint_names:
+            raise PipelineError(f"Frame fixed joint name collides with another joint: {name}")
+        joint_names.add(name)
         ET.SubElement(document, "link", name=frame["name"])
-        node = ET.SubElement(document, "joint", name=frame["name"] + "_fixed", type="fixed")
+        node = ET.SubElement(document, "joint", name=name, type="fixed")
         ET.SubElement(node, "parent", link=frame["parent"])
         ET.SubElement(node, "child", link=frame["name"])
         _origin(node, frame)

@@ -1,10 +1,10 @@
 """Independent re-derivation of the normalized robot from raw CAD readings.
 
 The oracle deliberately shares no code with the normalization path: it reads the
-snapshot's raw component transforms and mass tensors again, applies the declared
-mass table itself, and recomputes sum(m), the combined COM and the full inertia
-tensor with plain numpy.  Agreement with the canonical model is therefore
-evidence about the numbers, not about the code path that produced them.
+snapshot's raw component transforms and mass tensors again and recomputes sum(m),
+the combined COM and the full inertia tensor with plain numpy. Agreement with the
+canonical model is therefore evidence about the numbers, not about the code path
+that produced them.
 """
 
 from __future__ import annotations
@@ -131,7 +131,6 @@ def _append_note(details: dict[str, Any], note: str) -> None:
 
 def _component_context_findings(
     payload: dict[str, Any],
-    material_source: str,
     assembly_mass: float | None,
     scene_masses: dict[str, float] | None,
     covered: set[str] | None = None,
@@ -164,7 +163,7 @@ def _component_context_findings(
                     "message": str(context.get("message") or ""),
                 }
             },
-            "the component mass context could not be read" if material_source != "documented_table" else None,
+            "the component mass context could not be read",
         )
     if status not in {"recorded", "partial"}:
         return {}, f"component mass context status is {status!r}"
@@ -352,40 +351,37 @@ def _component_context_findings(
         if coverage["missing_parent_rows"]:
             incomplete.append(f"{len(coverage['missing_parent_rows'])} node row(s) whose parent row is absent")
     covered_names = {str(name) for name in (covered or set())}
-    if material_source != "documented_table":
-        if any_overridden and not set(any_overridden) <= covered_names:
-            return details, (
-                "the CAD assembly carries component-level overrides "
-                f"({len(any_overridden)} instance(s): {len(mass_overridden)} mass, "
-                f"{len(com_overridden)} center of mass, {len(inertia_overridden)} inertia) that the "
-                "part-document readings do not include; a pure-CAD (material_source=cad) model "
-                "cannot represent them.  Record the effective properties with matching evidence — "
-                "a documented mass only rescales the CAD tensor at an unchanged center of mass — or "
-                "remove the overrides in CAD"
-            )
-        def _explained_by_cover(name: str) -> bool:
-            """An overridden/effective instance at, inside or above the node explains its divergence."""
+    if any_overridden and not set(any_overridden) <= covered_names:
+        return details, (
+            "the CAD assembly carries component-level overrides "
+            f"({len(any_overridden)} instance(s): {len(mass_overridden)} mass, "
+            f"{len(com_overridden)} center of mass, {len(inertia_overridden)} inertia) that the "
+            "part-document readings do not include; a CAD model cannot represent them. "
+            "Correct the effective CAD material or override readings"
+        )
 
-            return any(
-                covered == name or name.startswith(covered + "/") or covered.startswith(name + "/")
-                for covered in covered_names
-            )
+    def _explained_by_cover(name: str) -> bool:
+        """An overridden/effective instance at, inside or above the node explains its divergence."""
 
-        mismatches = [row for row in equivalence if not _explained_by_cover(str(row.get("name")))]
-        if isinstance(coverage, dict) and mismatches:
-            examples = mismatches[:3]
-            return details, (
-                "the assembly context's effective mass differs from the selected part-document "
-                f"reading for {len(mismatches)} node(s) with no recorded override "
-                f"(examples: {examples}); a pure-CAD (material_source=cad) model cannot claim "
-                "source equivalence — record the effective masses through source.documented_masses"
-            )
-        if incomplete:
-            return details, (
-                "the component mass context is incomplete (" + "; ".join(incomplete) + "), so a "
-                "pure-CAD (material_source=cad) model cannot prove its part-document masses are the "
-                "effective ones"
-            )
+        return any(
+            covered == name or name.startswith(covered + "/") or covered.startswith(name + "/")
+            for covered in covered_names
+        )
+
+    mismatches = [row for row in equivalence if not _explained_by_cover(str(row.get("name")))]
+    if isinstance(coverage, dict) and mismatches:
+        examples = mismatches[:3]
+        return details, (
+            "the assembly context's effective mass differs from the selected part-document "
+            f"reading for {len(mismatches)} node(s) with no recorded override "
+            f"(examples: {examples}); the CAD model cannot claim source equivalence; "
+            "correct the effective CAD material/override readings"
+        )
+    if incomplete:
+        return details, (
+            "the component mass context is incomplete (" + "; ".join(incomplete) + "), so a "
+            "CAD model cannot prove its part-document masses are the effective ones"
+        )
     if any_overridden:
         top_level_overridden = sum(1 for entry in top_level if any(entry["overrides"].values()))
         _append_note(
@@ -465,26 +461,13 @@ def _raw_tensor(component: str, payload: dict) -> np.ndarray:
     return matrix
 
 
-def _component_mass(
-    component: str, payload: dict, declared: dict[str, dict]
-) -> tuple[float, np.ndarray, np.ndarray, dict]:
+def _component_mass(component: str, payload: dict) -> tuple[float, np.ndarray, np.ndarray, dict]:
     """Return (mass, com_part, inertia_part, provenance) independently of the builder."""
 
     mass = float(payload["mass"])
     com = np.array([float(value) for value in payload["com"]], dtype=float)
     inertia = _raw_tensor(component, payload)
     note = {"component": component, "raw_mass_kg": mass, "used_mass_kg": mass, "scale": 1.0}
-    entry = declared.get(component)
-    if entry is not None:
-        used = float(entry["mass_kg"])
-        if mass <= 0.0:
-            raise ValueError(f"component {component} has no positive CAD mass to scale from")
-        scale = used / mass
-        inertia = inertia * scale
-        note.update(
-            {"used_mass_kg": used, "scale": scale, "reason": entry.get("reason"), "evidence": entry.get("evidence")}
-        )
-        mass = used
     return mass, com, inertia, note
 
 
@@ -566,7 +549,7 @@ def _effective_ancestors(name: str) -> list[str]:
     return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
 
 
-def _resolved_contributions(body, raw_scene, masses, declared, effective):
+def _resolved_contributions(body, raw_scene, masses, effective):
     """One contribution per authored occurrence, after top-down substitution.
 
     A native effective instance replaces its whole subtree (SolidWorks uses the
@@ -585,7 +568,7 @@ def _resolved_contributions(body, raw_scene, masses, declared, effective):
         provider = next((ancestor for ancestor in _effective_ancestors(component) if ancestor in effective), None)
         if provider is None:
             rotation, translation = _transform(placements[component])
-            mass, com_part, inertia_part, note = _component_mass(component, masses[component], declared)
+            mass, com_part, inertia_part, note = _component_mass(component, masses[component])
             contributions.append((rotation, translation, mass, com_part, inertia_part, note))
             continue
         if provider in claimed:
@@ -596,8 +579,6 @@ def _resolved_contributions(body, raw_scene, masses, declared, effective):
             raise ValueError(
                 f"effective instance {provider!r} spans several bodies; its delta cannot be distributed"
             )
-        if declared.get(component):
-            raise ValueError(f"declared mass table cannot scale an effective instance: {component!r}")
         payload = effective[provider]
         mass = float(payload["mass"])
         placement = placements.get(provider)
@@ -644,7 +625,7 @@ def _canonical_in_link_frame(link: dict) -> tuple[float, np.ndarray, np.ndarray]
     )
 
 
-def _raw_world(body: dict, raw_scene: dict, masses: dict, declared: dict, *, use_effective: bool = True) -> dict:
+def _raw_world(body: dict, raw_scene: dict, masses: dict, *, use_effective: bool = True) -> dict:
     """COM and tensor in *assembly* axes, computed without any link frame.
 
     This is the frame-independent view: it uses only the raw component
@@ -663,7 +644,7 @@ def _raw_world(body: dict, raw_scene: dict, masses: dict, declared: dict, *, use
     weighted = np.zeros(3)
     parts = []
     for rotation, translation, mass, com_part, inertia_part, _note in _resolved_contributions(
-        body, raw_scene, masses, declared, effective
+        body, raw_scene, masses, effective
     ):
         com_world = rotation @ com_part + translation
         inertia_world = rotation @ inertia_part @ rotation.T

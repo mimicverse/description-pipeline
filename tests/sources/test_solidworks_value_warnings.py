@@ -707,8 +707,27 @@ class ValueWarningTests(unittest.TestCase):
                 ],
             }
         )
+        warnings.append(
+            {
+                "code": "naming.derived_frame_joint",
+                "message": "Auxiliary frame joints derive their names from normalized parent and child identities.",
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "base_link_to_tool_tcp_joint",
+                        "field": "name",
+                        "actual": "base_link_to_tool_tcp_joint",
+                        "source": "normalized parent and frame identities",
+                        "original": {"parent": "base_link", "child": "tool_tcp"},
+                        "rule_id": "naming.fixed_endpoint_pair",
+                        "rule_version": "naming-v1",
+                        "reason": "fixed auxiliary joint derived from its normalized parent and child endpoints",
+                    }
+                ],
+            }
+        )
         result = _value_warning_gate(self.root, source, model)
-        self.assertEqual(result["objects"], 11)
+        self.assertEqual(result["objects"], 12)
 
     def test_unclassified_joint_has_a_direct_warning_fixture(self):
         source = copy.deepcopy(self.source)
@@ -773,8 +792,27 @@ class ValueWarningTests(unittest.TestCase):
                 "source": "native_derived",
             }
         )
+        model["provenance"]["value_warnings"].append(
+            {
+                "code": "naming.derived_frame_joint",
+                "message": "Auxiliary frame joints derive their names from normalized parent and child identities.",
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "base_link_to_tool_tcp_joint",
+                        "field": "name",
+                        "actual": "base_link_to_tool_tcp_joint",
+                        "source": "normalized parent and frame identities",
+                        "original": {"parent": "base_link", "child": "tool_tcp"},
+                        "rule_id": "naming.fixed_endpoint_pair",
+                        "rule_version": "naming-v1",
+                        "reason": "fixed auxiliary joint derived from its normalized parent and child endpoints",
+                    }
+                ],
+            }
+        )
         result = _value_warning_gate(self.root, source, model)
-        self.assertEqual(result["objects"], 9)
+        self.assertEqual(result["objects"], 10)
         formatted = next(
             item
             for item in model["provenance"]["value_warnings"]

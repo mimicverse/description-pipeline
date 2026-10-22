@@ -4,7 +4,15 @@
       "id": "tool",
       "name": "tool",
       "parent": "arm_link",
-      "provenance": {},
+      "provenance": {
+        "derived_joint_name": "arm_link_to_tool_joint",
+        "joint_name_rule": {
+          "child": "tool",
+          "parent": "arm_link",
+          "rule_id": "naming.fixed_endpoint_pair",
+          "rule_version": "naming-v1"
+        }
+      },
       "rpy": [
         0.0,
         0.0,
@@ -233,7 +241,29 @@
       "arm"
     ],
     "fixture": true,
-    "note": "hand-written mesh fixture (binary STL), not CAD evidence"
+    "note": "hand-written mesh fixture (binary STL), not CAD evidence",
+    "value_warnings": [
+      {
+        "code": "naming.derived_frame_joint",
+        "message": "Auxiliary frame joints derive their names from normalized parent and child identities.",
+        "objects": [
+          {
+            "actual": "arm_link_to_tool_joint",
+            "field": "name",
+            "object": "arm_link_to_tool_joint",
+            "object_type": "joint",
+            "original": {
+              "child": "tool",
+              "parent": "arm_link"
+            },
+            "reason": "fixed auxiliary joint derived from its normalized parent and child endpoints",
+            "rule_id": "naming.fixed_endpoint_pair",
+            "rule_version": "naming-v1",
+            "source": "normalized parent and frame identities"
+          }
+        ]
+      }
+    ]
   },
   "schema_version": "solidworks-to-urdf.scene/v1",
   "units": "SI"
