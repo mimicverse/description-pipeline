@@ -1430,6 +1430,7 @@ function Get-ManagedEndpointAclRows(
   }
   foreach ($rule in $rules) {
     $normalized = (Normalize-PathIdentity ([string]$rule.path)).TrimEnd('/')
+    Assert-NoReparseAncestor $normalized
     $key = $normalized.ToLowerInvariant()
     if (-not $seen.ContainsKey($key)) {
       $seen[$key] = $rule
@@ -1450,6 +1451,7 @@ function Assert-ManagedRuntimeLeafAcl(
   [string]$ParentPath,
   [string]$ServiceSid) {
   # Atomic runtime writes inherit the verified state directory's exact DACL.
+  Assert-NoReparseAncestor $Path
   Assert-ManagedAcl $ParentPath $true $ServiceSid
   $parent = Get-Item -LiteralPath $ParentPath -Force -ErrorAction Stop
   $leaf = Get-Item -LiteralPath $Path -Force -ErrorAction Stop

@@ -466,7 +466,7 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   function Assert-RuntimeLeafRejected([string]$Name, [string]$Path = $ownershipPath) {
     $rejected = $false
     try { Assert-ManagedRuntimeLeafAcl $Path $stateRoot $serviceSid } catch {
-      $rejected = $_.Exception.Message -match 'windows_managed_acl_(invalid|unsafe)'
+      $rejected = $_.Exception.Message -match 'windows_managed_acl_(invalid|unsafe)|windows_recovery_target_unsafe'
     }
     Check ('windows_acl.runtime_refuses_' + $Name) $rejected
   }
@@ -509,6 +509,30 @@ if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
   Assert-RuntimeLeafRejected 'reparse' $linkPath
   Remove-Item -LiteralPath $linkPath -Force
   Set-ManagedAcl $ownershipPath $true $serviceSid
+  $outsideState = Join-Path $siblingRoot 'escaped-state'
+  $null = New-Item -ItemType Directory -Path $outsideState
+  $outsideSentinel = Join-Path $outsideState 'sentinel.txt'
+  [System.IO.File]::WriteAllText($outsideSentinel, 'outside-must-not-change')
+  $outsideAclBefore = Get-AclProjection $outsideState
+  $outsideFileAclBefore = Get-AclProjection $outsideSentinel
+  $outsideHashBefore = Sha256 $outsideSentinel
+  $junctionRoot = Join-Path $aclRoot 'outside-junction'
+  $null = New-Item -ItemType Junction -Path $junctionRoot -Target $siblingRoot -ErrorAction Stop
+  $junctionConfig = [pscustomobject]@{
+    package_root=$packageRoot
+    output_root=$outputRoot
+    state_root=(Join-Path $junctionRoot 'escaped-state')
+    token_file=$tokenPath
+  }
+  $junctionRejected = $false
+  try { Set-ManagedEndpointAcls $junctionConfig $endpointRoot $configPath $installIdPath $taskFile } catch {
+    $junctionRejected = $_.Exception.Message -match 'windows_recovery_target_unsafe'
+  }
+  Check 'windows_acl.ancestor_junction_refused_before_write' ($junctionRejected -and
+    (Get-AclProjection $outsideState).projection_sha256 -eq $outsideAclBefore.projection_sha256 -and
+    (Get-AclProjection $outsideSentinel).projection_sha256 -eq $outsideFileAclBefore.projection_sha256 -and
+    (Sha256 $outsideSentinel) -eq $outsideHashBefore)
+  [System.IO.Directory]::Delete($junctionRoot)
   $bootstrapSource = Get-Content -LiteralPath $bootstrapScript -Raw
   Check 'windows_acl.bootstrap_transaction_source' (
     $bootstrapSource.Contains('PostflightScript') -and
