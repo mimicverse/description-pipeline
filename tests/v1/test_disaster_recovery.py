@@ -1579,9 +1579,6 @@ class WindowsEnvironmentPinTests(unittest.TestCase):
         for label, transform in (
             ("forward", lambda value: value),
             ("backslash", lambda value: value.replace("/", "\\")),
-            ("case", str.swapcase),
-            ("trailing", lambda value: value + "/"),
-            ("combined", lambda value: value.replace("/", "\\").swapcase() + "\\"),
         ):
             with self.subTest(label=label):
                 state = copy.deepcopy(self.state)
@@ -1591,6 +1588,22 @@ class WindowsEnvironmentPinTests(unittest.TestCase):
                 original = recovery.canonical_json(pins)
                 validated = recovery._validate_windows_recovery_state(state)
                 self.assertEqual(recovery.canonical_json(validated["identity"]["domain_environment"]), original)
+
+        state = copy.deepcopy(self.state)
+        endpoint = state["identity"]["domain_environment"]["DESCRIPTION_ENDPOINT_ROOT"]
+        state["identity"]["domain_environment"]["DESCRIPTION_ENDPOINT_ROOT"] = endpoint + "\\"
+        original = recovery.canonical_json(state["identity"]["domain_environment"])
+        validated = recovery._validate_windows_recovery_state(state)
+        self.assertEqual(recovery.canonical_json(validated["identity"]["domain_environment"]), original)
+
+    def test_file_pin_rejects_trailing_separator(self) -> None:
+        for marker in ("/", "\\"):
+            with self.subTest(marker=marker):
+                state = copy.deepcopy(self.state)
+                ownership = state["identity"]["domain_environment"]["DESCRIPTION_CAD_OWNERSHIP_FILE"]
+                state["identity"]["domain_environment"]["DESCRIPTION_CAD_OWNERSHIP_FILE"] = ownership + marker
+                with self.assertRaises(recovery.RecoveryError):
+                    recovery._validate_windows_recovery_state(state)
 
     def test_invalid_or_different_pins_are_rejected(self) -> None:
         for field in ("DESCRIPTION_ENDPOINT_ROOT", "DESCRIPTION_CAD_OWNERSHIP_FILE"):
@@ -1622,19 +1635,45 @@ class WindowsEnvironmentPinTests(unittest.TestCase):
             recovery._validate_windows_recovery_state(state)
 
     def test_device_basenames_are_not_filesystem_pins(self) -> None:
-        for name in ("CON", "NUL", "PRN", "AUX", "COM1", "LPT1", "COM9", "LPT9", "CONIN$", "CONOUT$"):
+        for name in (
+            "CON",
+            "NUL",
+            "PRN",
+            "AUX",
+            "COM1",
+            "LPT1",
+            "COM9",
+            "LPT9",
+            "COM¹",
+            "COM²",
+            "COM³",
+            "LPT¹",
+            "LPT²",
+            "LPT³",
+            "CONIN$",
+            "CONOUT$",
+        ):
             for suffix in ("", ".txt", " .txt"):
                 with self.subTest(name=name, suffix=suffix):
-                    self.assertIsNone(recovery._canonical_windows_pin("C:/data/" + name + suffix))
+                    self.assertIsNone(
+                        recovery._canonical_windows_pin(
+                            "C:/data/" + name + suffix,
+                            directory=False,
+                        )
+                    )
 
     def test_unicode_case_expansion_is_not_a_windows_path_identity(self) -> None:
-        self.assertEqual(
-            recovery._canonical_windows_pin("C:/data/STRASSE"),
-            recovery._canonical_windows_pin("C:/data/strasse"),
+        self.assertNotEqual(
+            recovery._canonical_windows_pin("C:/data/STRASSE", directory=True),
+            recovery._canonical_windows_pin("C:/data/strasse", directory=True),
         )
         self.assertNotEqual(
-            recovery._canonical_windows_pin("C:/data/Straße"),
-            recovery._canonical_windows_pin("C:/data/STRASSE"),
+            recovery._canonical_windows_pin("C:/data/Straße", directory=True),
+            recovery._canonical_windows_pin("C:/data/STRASSE", directory=True),
+        )
+        self.assertNotEqual(
+            recovery._canonical_windows_pin("C:/data/İ", directory=True),
+            recovery._canonical_windows_pin("C:/data/i\u0307", directory=True),
         )
 
 

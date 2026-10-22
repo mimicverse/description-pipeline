@@ -5767,11 +5767,20 @@ def _validate_windows_runtime_leaf_acl_policy(projection: dict, parent: dict, *,
     )
 
 
-def _canonical_windows_pin(value: object) -> str | None:
-    """Compare local absolute Windows pins without changing their recorded bytes."""
+def _canonical_windows_pin(value: object, *, directory: bool) -> str | None:
+    """Compare local absolute Windows pins without changing their recorded bytes.
+
+    Path case is preserved because a Windows directory can be case-sensitive.
+    The observed recovery defect was only separator spelling, so accepting
+    additional case or Unicode equivalences would weaken object identity.
+    """
     if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
         return None
-    path = value.replace("\\", "/").rstrip("/")
+    path = value.replace("\\", "/")
+    trimmed = path.rstrip("/")
+    if not directory and trimmed != path:
+        return None
+    path = trimmed
     if not re.match(r"^[A-Za-z]:/", path):
         return None
     parts = path[3:].split("/")
@@ -5779,15 +5788,13 @@ def _canonical_windows_pin(value: object) -> str | None:
         not part or part in {".", ".."} or part.endswith((" ", "."))
         or any(char in '<>:"|?*' for char in part)
         or re.fullmatch(
-            r"con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$",
+            r"con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$|conout\$",
             part.split(".", 1)[0].rstrip(" ").casefold(),
         )
         for part in parts
     ):
         return None
-    # Windows path comparison uses its one-to-one ordinal case folding, not
-    # Unicode casefold expansion (for example, ``ß`` must not equal ``ss``).
-    return ntpath.normcase(path)
+    return path
 
 
 def _validate_windows_recovery_state(document: object) -> dict:
@@ -6099,15 +6106,29 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "windows_recovery_state_invalid",
         "Windows endpoint port is malformed",
     )
+    environment = identity["domain_environment"]
+    environment_endpoint = _canonical_windows_pin(
+        environment.get("DESCRIPTION_ENDPOINT_ROOT"),
+        directory=True,
+    )
+    expected_endpoint = _canonical_windows_pin(
+        identity["endpoint_root"],
+        directory=True,
+    )
+    environment_ownership = _canonical_windows_pin(
+        environment.get("DESCRIPTION_CAD_OWNERSHIP_FILE"),
+        directory=False,
+    )
+    expected_ownership = _canonical_windows_pin(
+        normalized["state_root"] + "/cad-ownership.json",
+        directory=False,
+    )
     require(
-        isinstance(identity["domain_environment"], dict)
-        and identity["domain_environment"].get("scope") == "user"
-        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_ENDPOINT_ROOT")) is not None
-        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_ENDPOINT_ROOT"))
-        == _canonical_windows_pin(identity["endpoint_root"])
-        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE")) is not None
-        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE"))
-        == _canonical_windows_pin(normalized["state_root"] + "/cad-ownership.json"),
+        environment.get("scope") == "user"
+        and environment_endpoint is not None
+        and environment_endpoint == expected_endpoint
+        and environment_ownership is not None
+        and environment_ownership == expected_ownership,
         "windows_recovery_state_invalid",
         "Windows account environment pins are not canonical",
     )
