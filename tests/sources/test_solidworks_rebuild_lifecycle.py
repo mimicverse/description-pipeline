@@ -1,8 +1,8 @@
-"""Hermetic regression: force-rebuild must refresh the model-document handle.
+"""Hermetic regression: capture rebuild must refresh the model-document handle.
 
 Self-contained (no Windows, no COM): the doubles below mimic the observed
-late-bound behaviour where ``ForceRebuild3`` revokes the document automation
-handle, while the same owned session can re-resolve it by path.
+late-bound behaviour where ``IModelDocExtension.Rebuild`` revokes the document
+automation handle, while the same owned session can re-resolve it by path.
 """
 
 from __future__ import annotations
@@ -38,9 +38,19 @@ class _Extension:
     def NeedsRebuild2(self):
         return self._doc.needs_rebuild2
 
+    def Rebuild(self, options):
+        self._doc.rebuild_calls += 1
+        if self._doc._rebuild_exception is not None:
+            raise self._doc._rebuild_exception
+        if self._doc._revoke:
+            self._doc._revoked = True
+        elif self._doc._rebuild_clears:
+            self._doc.needs_rebuild2 = 0
+        return self._doc._rebuild_result
+
 
 class _Doc:
-    """Mimics the observed COM behaviour: ForceRebuild3 revokes later members."""
+    """Mimics the observed COM behaviour: Rebuild revokes later members."""
 
     def __init__(
         self,
@@ -51,6 +61,9 @@ class _Doc:
         needs_rebuild2=0,
         configuration_needs_rebuild=False,
         read_only=True,
+        rebuild_clears=True,
+        rebuild_result=True,
+        rebuild_exception=None,
     ):
         self._path = path
         self._revoked = False
@@ -58,8 +71,12 @@ class _Doc:
         self._configuration_needs_rebuild = configuration_needs_rebuild
         self._read_only = read_only
         self._revoke = revoke
+        self._rebuild_clears = rebuild_clears
+        self._rebuild_result = rebuild_result
+        self._rebuild_exception = rebuild_exception
         self.needs_rebuild2 = needs_rebuild2
         self.rebuild_calls = 0
+        self.force_rebuild_calls = 0
 
     @property
     def Extension(self):
@@ -86,12 +103,8 @@ class _Doc:
         )
 
     def ForceRebuild3(self, flag):
-        self.rebuild_calls += 1
-        if self._revoke:
-            self._revoked = True
-        else:
-            self.needs_rebuild2 = 0
-        return True
+        self.force_rebuild_calls += 1
+        raise AssertionError("capture rebuild must use IModelDocExtension.Rebuild")
 
 
 class _Backend(SolidWorksBackend):
@@ -126,8 +139,12 @@ class _UnreadableConfigurationDoc(_Doc):
 
 
 class _RaisingRebuildDoc(_Doc):
-    def ForceRebuild3(self, flag):
-        raise RuntimeError("rebuild native failure")
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            rebuild_exception=RuntimeError("rebuild native failure"),
+            **kwargs,
+        )
 
 
 class RebuildDocumentLifecycleTests(unittest.TestCase):
@@ -143,6 +160,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertIs(refreshed_doc, refreshed)
         self.assertIsInstance(preparation, dict)
         self.assertEqual(doc.rebuild_calls, 1)
+        self.assertEqual(doc.force_rebuild_calls, 0)
         self.assertEqual(backend.refresh_calls, [PATH])
         self.assertEqual(preparation["document"], PATH)
         self.assertEqual(preparation["configuration"], "默认")
@@ -150,6 +168,12 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertIs(preparation["rebuild_performed"], True)
         self.assertEqual(preparation["needs_rebuild2_before"], 1)
         self.assertEqual(preparation["needs_rebuild2_after"], 0)
+        self.assertEqual(
+            preparation["used_api"],
+            "IModelDocExtension.NeedsRebuild2/"
+            "IConfiguration.NeedsRebuild/"
+            "IModelDocExtension.Rebuild(swForceRebuildAll=2)",
+        )
         self.assertIs(preparation["save_flag_after"], False)
 
     def test_missing_document_after_rebuild_fails_closed_without_reopen(self):
@@ -327,8 +351,18 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertEqual(doc.rebuild_calls, 0)
 
     def test_rebuild_must_end_fully_rebuilt(self):
-        backend = _Backend(lambda: _Doc(PATH, needs_rebuild2=1))
-        doc = _Doc(PATH, needs_rebuild2=1)
+        backend = _Backend(
+            lambda: _Doc(
+                PATH,
+                needs_rebuild2=1,
+                rebuild_clears=False,
+            )
+        )
+        doc = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_clears=False,
+        )
         with patch(
             "description_pipeline.sources.solidworks.native._hash",
             return_value="f" * 64,
@@ -336,6 +370,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             backend._rebuild_capture_copy(doc, PATH)
         self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
         self.assertEqual(doc.rebuild_calls, 1)
+        self.assertEqual(doc.force_rebuild_calls, 0)
         self.assertEqual(backend.refresh_calls, [PATH])
 
     def test_native_rebuild_exception_preserves_phase_and_state(self):

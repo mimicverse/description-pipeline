@@ -351,6 +351,10 @@ class _Extension:
             raise RuntimeError("fixture entity has no persistent reference")
         return list(reference)
 
+    def Rebuild(self, options):
+        self.NeedsRebuild2 = 0
+        return True
+
 
 class _ConfigurationManager:
     """Reflects the document's *currently shown* configuration at each read."""

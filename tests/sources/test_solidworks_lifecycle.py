@@ -87,7 +87,10 @@ class SessionTests(unittest.TestCase):
     def test_capture_rebuild_is_in_memory_and_failure_blocks_measurement(self):
         backend = SolidWorksBackend()
         backend._capture_roots = [normalize_document_path("/snapshot/source")]
-        state = SimpleNamespace(NeedsRebuild2=1)
+        extension = SimpleNamespace(
+            NeedsRebuild2=1,
+            Rebuild=Mock(spec=["__call__"], return_value=True),
+        )
         configuration = SimpleNamespace(
             Name="Default",
             NeedsRebuild=False,
@@ -96,7 +99,7 @@ class SessionTests(unittest.TestCase):
             ConfigurationManager=SimpleNamespace(
                 ActiveConfiguration=configuration,
             ),
-            Extension=state,
+            Extension=extension,
             GetSaveFlag=False,
             GetPathName="/snapshot/source/robot.SLDASM",
             IsOpenedReadOnly=True,
@@ -104,11 +107,11 @@ class SessionTests(unittest.TestCase):
             ForceRebuild3=Mock(spec=["__call__"], return_value=True),
         )
 
-        def rebuild(_force):
-            state.NeedsRebuild2 = 0
+        def rebuild(_options):
+            extension.NeedsRebuild2 = 0
             return True
 
-        doc.ForceRebuild3.side_effect = rebuild
+        extension.Rebuild.side_effect = rebuild
         refreshed = []
 
         def refresh(path):
@@ -126,12 +129,13 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(result["saved_to_disk"])
         self.assertTrue(result["read_only"])
         self.assertTrue(result["rebuild_performed"])
-        doc.ForceRebuild3.assert_called_once_with(False)
+        extension.Rebuild.assert_called_once_with(2)
+        doc.ForceRebuild3.assert_not_called()
         doc.Save.assert_not_called()
         self.assertEqual(refreshed, [doc.GetPathName])
-        state.NeedsRebuild2 = 1
-        doc.ForceRebuild3.side_effect = None
-        doc.ForceRebuild3.return_value = False
+        extension.NeedsRebuild2 = 1
+        extension.Rebuild.side_effect = None
+        extension.Rebuild.return_value = False
         with patch(
             "description_pipeline.sources.solidworks.native._hash",
             return_value="a" * 64,
