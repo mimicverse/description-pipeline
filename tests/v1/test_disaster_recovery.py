@@ -2802,9 +2802,26 @@ class RecoveryControlFlowTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             ["ssh", "windows-fixture"],
             0,
-            "Running",
+            "Disabled",
             "",
         )
+        completed.transport = {
+            "encoding": "base64(gzip(utf-8))",
+            "script_sha256": "a" * 64,
+            "script_bytes": 100,
+            "payload_sha256": "b" * 64,
+            "payload_bytes": 80,
+            "launcher_sha256": "c" * 64,
+            "launcher_bytes": 70,
+        }
+        evidence["stdout_sha256"] = hashlib.sha256(b"Disabled").hexdigest()
+        evidence["transport"] = dict(completed.transport)
+
+        def run_windows(*, commands, **kwargs):
+            del kwargs
+            commands.append(dict(evidence))
+            return completed
+
         with (
             mock.patch.object(
                 recovery,
@@ -2813,8 +2830,8 @@ class RecoveryControlFlowTests(unittest.TestCase):
             ),
             mock.patch.object(
                 recovery,
-                "_run_maintenance_command",
-                return_value=(completed, evidence),
+                "_run_windows_powershell",
+                side_effect=run_windows,
             ),
             self.assertRaises(recovery.RecoveryError) as raised,
         ):
@@ -3432,23 +3449,31 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
     def test_windows_localized_stderr_bytes_do_not_break_transport_decoding(self) -> None:
         process = subprocess.CompletedProcess(
-            ["ssh", "windows-fixture"],
+            ["ssh", "windows-fixture", "-EncodedCommand", "fixed-launcher"],
             2,
             b'{"passed":false,"code":"fixture","message":"refused"}\n',
             " localized PowerShell error".encode("gb18030"),
         )
-        with mock.patch.object(recovery, "subprocess") as subprocess_module:
-            subprocess_module.run.return_value = process
-            subprocess_module.CompletedProcess = subprocess.CompletedProcess
-            subprocess_module.SubprocessError = subprocess.SubprocessError
+        process.transport = {
+            "encoding": "base64(gzip(utf-8))",
+            "script_sha256": "a" * 64,
+            "script_bytes": 7,
+            "payload_sha256": "b" * 64,
+            "payload_bytes": 11,
+            "launcher_sha256": "c" * 64,
+            "launcher_bytes": 12,
+        }
+        commands: list[dict] = []
+        with mock.patch.object(recovery, "_transport_powershell", return_value=process):
             completed = recovery._run_windows_powershell(
                 ssh_host="windows-fixture",
                 script="fixture",
                 timeout=5,
-                commands=[],
+                commands=commands,
             )
         self.assertEqual(completed.returncode, 2)
         self.assertIn("localized PowerShell error", completed.stderr)
+        self.assertEqual(commands[-1]["transport"]["encoding"], "base64(gzip(utf-8))")
 
     def test_windows_failure_receipt_with_expected_verb_is_definite(self) -> None:
         cleanup = {

@@ -41,6 +41,36 @@ GENERATION_ENV_REQUIRED=(
 )
 
 die() { echo "operatorctl: $*" >&2; exit 1; }
+windows_transport() {
+  python3 "$HERE/windows_transport.py" --host "$SOLIDWORKS_SSH_HOST" --timeout "${1:-60}"
+}
+windows_lifecycle() {
+  local output="$1" script_path="$2" binding_path="$3" verb="$4"
+  local stage_dir="${5:-}" previous="${6:-}"
+  python3 - "$script_path" "$binding_path" "$verb" "$stage_dir" "$previous" <<'PY' \
+    | windows_transport 60 > "$output"
+import sys
+
+
+def powershell_path(value: str) -> str:
+    return value.replace("/", "\\")
+
+
+def powershell_quote(value: str) -> str:
+    return "'" + powershell_path(value).replace("'", "''") + "'"
+
+
+script_path, binding_path, verb, stage_dir, previous = sys.argv[1:]
+if verb not in {"health", "resume", "stage", "promote", "rollback", "reconcile", "status"}:
+    raise SystemExit("operatorctl: invalid Windows lifecycle verb")
+arguments = ["-Verb", verb, "-Binding", powershell_quote(binding_path)]
+if stage_dir:
+    arguments.extend(["-StageDir", powershell_quote(stage_dir)])
+if previous:
+    arguments.extend(["-Previous", powershell_quote(previous)])
+print("& " + powershell_quote(script_path) + " " + " ".join(arguments))
+PY
+}
 usage() {
   cat >&2 <<'USAGE'
 usage: operatorctl.sh <validate|install|start|drain|stop|status|health|reconcile|stage|promote|rollback> --config FILE
@@ -805,9 +835,19 @@ PY
   archive_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$binding")"
   expected_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' "$binding")"
   remote_archive_state="$(
-    ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
-      "powershell.exe -NoProfile -Command \"if (Test-Path -LiteralPath '$remote/$archive_name') { \$item=Get-Item -LiteralPath '$remote/$archive_name'; Write-Output ('{0}|{1}' -f \$item.Length, (Get-FileHash -LiteralPath '$remote/$archive_name' -Algorithm SHA256).Hash.ToLower()) } else { Write-Output 'absent' }\"" \
+    python3 - "$remote/$archive_name" <<'PY' | windows_transport 60 \
       2>/dev/null | tr -d '\r' | tail -1
+import sys
+
+path = sys.argv[1].replace("/", "\\").replace("'", "''")
+print(
+    "if (Test-Path -LiteralPath '" + path + "') {"
+    "$item=Get-Item -LiteralPath '" + path + "';"
+    "Write-Output ('{0}|{1}' -f $item.Length,"
+    "(Get-FileHash -LiteralPath '" + path + "' -Algorithm SHA256).Hash.ToLower())"
+    "} else { Write-Output 'absent' }"
+)
+PY
   )" || { echo "instance_lifecycle: could not inspect the health archive on $SOLIDWORKS_SSH_HOST" >&2; return 2; }
   case "$remote_archive_state" in
     *"|$expected_hash") ;;
@@ -827,9 +867,9 @@ PY
     return 2
   fi
   local remote_rc=0
-  ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
-    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote/instance-lifecycle.ps1\" -Verb health -Binding \"$remote/windows-health-binding.json\"" \
-    > "$output" || remote_rc=$?
+  windows_lifecycle \
+    "$output" "$remote/instance-lifecycle.ps1" "$remote/windows-health-binding.json" health \
+    || remote_rc=$?
   if ! printf '%s\n' "$remote_rc" > "$output.ssh-rc"; then
     echo "instance_lifecycle: could not persist the health SSH exit status in $dir" >&2
     return 2
@@ -924,25 +964,23 @@ PY
     "$binding" "$generation-$stamp")"
   remote_script="$remote/instance-lifecycle.ps1"
   remote_binding="$remote/windows-resume-binding.json"
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST" \
-    "powershell.exe -NoProfile -NonInteractive -EncodedCommand $(python3 - "$remote" <<'PY'
-import base64
+  python3 - "$remote" <<'PY' | windows_transport 60 \
+    || { echo "instance_lifecycle_resume: could not create $remote" >&2; return 1; }
 import sys
 
 path = sys.argv[1].replace("/", "\\").replace("'", "''")
-script = "$ErrorActionPreference='Stop';New-Item -ItemType Directory -Path '" + path + "' -ErrorAction Stop | Out-Null"
-print(base64.b64encode(script.encode("utf-16le")).decode("ascii"))
+print(
+    "$ErrorActionPreference='Stop';"
+    "New-Item -ItemType Directory -Path '" + path + "' -ErrorAction Stop | Out-Null"
+)
 PY
-)" || { echo "instance_lifecycle_resume: could not create $remote" >&2; return 1; }
   scp -q -p -o BatchMode=yes -o StrictHostKeyChecking=yes \
     "$HERE/../windows/instance-lifecycle.ps1" "$binding" \
     "$SOLIDWORKS_SSH_HOST:\"$remote/\"" \
     || { echo "instance_lifecycle_resume: could not transfer the resume binding" >&2; return 1; }
   local remote_rc=0
   : > "$output"
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST" \
-    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote_script\" -Verb resume -Binding \"$remote_binding\"" \
-    > "$output" || remote_rc=$?
+  windows_lifecycle "$output" "$remote_script" "$remote_binding" resume || remote_rc=$?
   local parse_rc=0
   python3 - "$output" "$remote_rc" <<'PY' || parse_rc=$?
 import json
@@ -1037,16 +1075,30 @@ PY
     || { echo "instance_lifecycle: could not size the native archive: $archive_local" >&2; return 1; }
   # The generation directory exists first (private, under the instance state root); the archive
   # travels with the binding and the script, and the script consumes exactly the transferred file.
-  ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
-    "powershell.exe -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '$remote' | Out-Null\"" \
+  python3 - "$remote" <<'PY' | windows_transport 60 \
     || { echo "instance_lifecycle: could not create $remote on $SOLIDWORKS_SSH_HOST" >&2; return 1; }
+import sys
+
+path = sys.argv[1].replace("/", "\\").replace("'", "''")
+print("New-Item -ItemType Directory -Force -Path '" + path + "' | Out-Null")
+PY
   # Stage creates the archive once. Promote, rollback and reconcile reuse that
   # immutable staged copy when its remote size and digest still match the
   # binding. A present-but-different archive is a refusal, never an overwrite.
   remote_archive_state="$(
-    ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
-      "powershell.exe -NoProfile -Command \"if (Test-Path -LiteralPath '$remote/$archive_name') { \$item=Get-Item -LiteralPath '$remote/$archive_name'; Write-Output ('{0}|{1}' -f \$item.Length, (Get-FileHash -LiteralPath '$remote/$archive_name' -Algorithm SHA256).Hash.ToLower()) } else { Write-Output 'absent' }\"" \
+    python3 - "$remote/$archive_name" <<'PY' | windows_transport 60 \
       2>/dev/null | tr -d '\r' | tail -1
+import sys
+
+path = sys.argv[1].replace("/", "\\").replace("'", "''")
+print(
+    "if (Test-Path -LiteralPath '" + path + "') {"
+    "$item=Get-Item -LiteralPath '" + path + "';"
+    "Write-Output ('{0}|{1}' -f $item.Length,"
+    "(Get-FileHash -LiteralPath '" + path + "' -Algorithm SHA256).Hash.ToLower())"
+    "} else { Write-Output 'absent' }"
+)
+PY
   )" || { echo "instance_lifecycle: could not inspect the staged archive on $SOLIDWORKS_SSH_HOST" >&2; return 1; }
   local -a transfer_inputs=("$binding" "$HERE/../windows/instance-lifecycle.ps1")
   case "$remote_archive_state" in
@@ -1062,12 +1114,10 @@ PY
   esac
   scp -q -o BatchMode=yes "${transfer_inputs[@]}" "$SOLIDWORKS_SSH_HOST:$remote/" \
     || { echo "instance_lifecycle: could not transfer the lifecycle inputs to $SOLIDWORKS_SSH_HOST" >&2; return 1; }
-  local stage_argument=""
+  local stage_dir=""
   case "$verb" in
-    stage|promote) stage_argument=" -StageDir \"$remote/generation\"" ;;
+    stage|promote) stage_dir="$remote/generation" ;;
   esac
-  local previous_argument=""
-  [ -z "$previous" ] || previous_argument=" -Previous \"$previous\""
   # Initialise both evidence files before the remote call. A failed redirection must never
   # leave an older valid refusal in place for this invocation to parse as fresh evidence.
   if ! { : > "$output" && : > "$output.ssh-rc"; }; then
@@ -1075,9 +1125,9 @@ PY
     return 2
   fi
   local remote_rc=0
-  ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST" \
-    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$remote/instance-lifecycle.ps1\" -Verb $verb -Binding \"$remote/windows-binding.json\"$stage_argument$previous_argument" \
-    > "$output" || remote_rc=$?
+  windows_lifecycle \
+    "$output" "$remote/instance-lifecycle.ps1" "$remote/windows-binding.json" \
+    "$verb" "$stage_dir" "$previous" || remote_rc=$?
   if ! printf '%s\n' "$remote_rc" > "$output.ssh-rc"; then
     echo "instance_lifecycle: could not persist the $verb SSH exit status in $dir" >&2
     return 2
@@ -1175,9 +1225,8 @@ PY
 }
 
 windows_status_check() {
-  python3 - "$CONFIG_FILE" "$OPERATOR_STATE_DIR/install-record.json" <<'PY'
+  python3 - "$CONFIG_FILE" "$OPERATOR_STATE_DIR/install-record.json" "$HERE" <<'PY'
 import base64
-import gzip
 import json
 import os
 import subprocess
@@ -1186,6 +1235,10 @@ from pathlib import Path
 
 WINDOWS_PYTHON_LAUNCH_CONTRACT = "python_module_v1"
 WINDOWS_LEGACY_LAUNCH_CONTRACT = "legacy_pip_launcher_v0"
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[3])
+from windows_transport import decode_output, run_powershell
+
 config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 windows = config.get("windows")
@@ -1412,48 +1465,23 @@ try {{
 }}
 """
 ssh_bin = os.environ.get("SOLIDWORKS_SSH_BIN", "ssh")
-payload = base64.b64encode(gzip.compress(script.encode("utf-8"), mtime=0)).decode("ascii")
-launcher = (
-    "$p=[Convert]::FromBase64String('" + payload + "');"
-    "$m=New-Object System.IO.MemoryStream(,$p);"
-    "$g=New-Object System.IO.Compression.GZipStream($m,"
-    "[System.IO.Compression.CompressionMode]::Decompress);"
-    "$r=New-Object System.IO.StreamReader($g,[System.Text.Encoding]::UTF8);"
-    "$s=$r.ReadToEnd();$r.Dispose();$g.Dispose();$m.Dispose();"
-    "Invoke-Expression $s"
-)
-encoded_command = base64.b64encode(launcher.encode("utf-16le")).decode("ascii")
 try:
-    completed = subprocess.run(
-        [
-            ssh_bin,
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            host,
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            encoded_command,
-        ],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
+    completed = run_powershell(
+        ssh_host=host,
+        script=script,
         timeout=60,
+        ssh_bin=ssh_bin,
     )
 except (OSError, subprocess.TimeoutExpired) as error:
     raise SystemExit(f"operatorctl status: Windows probe failed: {error}") from error
 if completed.returncode != 0:
-    stderr_text = completed.stderr.decode("utf-8", errors="replace").strip()
-    stdout_text = completed.stdout.decode("utf-8", errors="replace").strip()
+    stderr_text = decode_output(completed.stderr).strip()
+    stdout_text = decode_output(completed.stdout).strip()
     raise SystemExit(
         "operatorctl status: Windows probe failed: "
         + (stderr_text or stdout_text or "unknown failure")[:1000]
     )
-stdout_text = completed.stdout.decode("utf-8", errors="replace")
+stdout_text = decode_output(completed.stdout)
 try:
     result = json.loads(stdout_text.strip().splitlines()[-1])
 except (IndexError, ValueError) as error:
@@ -1496,6 +1524,7 @@ print(
             "config_digest": sample["config_digest"],
             "launch_contract": sample["launch_contract"],
             "action_matches_generation": sample["action_matches_generation"],
+            "transport": getattr(completed, "transport", {}),
         },
         sort_keys=True,
     )

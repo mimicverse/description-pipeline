@@ -61,11 +61,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+sys.dont_write_bytecode = True
+
 try:
     import backup
     import install_record
     import platform_config
     import render_operator
+    from windows_transport import decode_output as _decode_windows_output
+    from windows_transport import run_powershell as _transport_powershell
 except ImportError as error:  # pragma: no cover - exercised by deployment layout
     raise SystemExit(
         f"recovery: deploy/operator must be importable next to recovery.py (missing dependency: {error})"
@@ -3865,12 +3869,16 @@ def _command_evidence(
     argv: list[str | Path],
     completed: subprocess.CompletedProcess,
 ) -> dict:
-    return {
+    evidence = {
         "argv": [str(value) for value in argv],
         "returncode": completed.returncode,
         "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
         "stderr_sha256": hashlib.sha256(completed.stderr.encode("utf-8")).hexdigest(),
     }
+    transport = getattr(completed, "transport", None)
+    if isinstance(transport, dict):
+        evidence["transport"] = dict(transport)
+    return evidence
 
 
 def _run_maintenance_command(
@@ -3996,16 +4004,6 @@ def _linux_unit_states(*, timeout: int) -> list[dict]:
     return states
 
 
-def _powershell_script(script: str) -> str:
-    prelude = (
-        "$ProgressPreference='SilentlyContinue';"
-        "$utf8=New-Object System.Text.UTF8Encoding($false);"
-        "$OutputEncoding=$utf8;"
-        "[Console]::OutputEncoding=$utf8;"
-    )
-    return base64.b64encode((prelude + script).encode("utf-16le")).decode("ascii")
-
-
 def _windows_script_path() -> Path:
     path = Path(__file__).resolve().parent.parent / "windows" / "instance-lifecycle.ps1"
     require_real_file(path, "Windows instance lifecycle", "recovery_release_missing")
@@ -4021,17 +4019,6 @@ def _powershell_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _decode_windows_output(payload: bytes) -> str:
-    if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return payload.decode("utf-16")
-    for encoding in ("utf-8-sig", "gb18030"):
-        try:
-            return payload.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return payload.decode("utf-8", errors="replace")
-
-
 def _run_windows_powershell(
     *,
     ssh_host: str,
@@ -4039,27 +4026,11 @@ def _run_windows_powershell(
     timeout: int,
     commands: list[dict],
 ) -> subprocess.CompletedProcess:
-    argv = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        f"ConnectTimeout={min(timeout, 30)}",
-        ssh_host,
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        _powershell_script(script),
-    ]
     try:
-        process = subprocess.run(
-            argv,
-            capture_output=True,
+        process = _transport_powershell(
+            ssh_host=ssh_host,
+            script=script,
             timeout=timeout,
-            check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise RecoveryError(
@@ -4068,12 +4039,15 @@ def _run_windows_powershell(
             {"error": str(error)},
         ) from error
     completed = subprocess.CompletedProcess(
-        argv,
+        process.args,
         process.returncode,
         _decode_windows_output(process.stdout),
         _decode_windows_output(process.stderr),
     )
-    commands.append(_command_evidence(argv, completed))
+    transport = getattr(process, "transport", None)
+    if isinstance(transport, dict):
+        completed.transport = dict(transport)
+    commands.append(_command_evidence(process.args, completed))
     return completed
 
 
@@ -5603,20 +5577,14 @@ def _windows_task_state(
     script = (
         f"$ErrorActionPreference='Stop';$task=Get-ScheduledTask -TaskName '{escaped}';[Console]::Out.Write($task.State)"
     )
-    argv = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={min(timeout, 30)}",
-        ssh_host,
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        _powershell_script(script),
-    ]
-    completed, evidence = _run_maintenance_command(argv, timeout=min(timeout, 60))
+    commands: list[dict] = []
+    completed = _run_windows_powershell(
+        ssh_host=ssh_host,
+        script=script,
+        timeout=min(timeout, 60),
+        commands=commands,
+    )
+    evidence = commands[-1]
     state = completed.stdout.strip()
     require(
         state in {"Disabled", "Ready", "Queued", "Running"},
@@ -5651,24 +5619,19 @@ def _disable_windows_task(
             f"Disable-ScheduledTask -TaskName '{escaped}' -ErrorAction Stop | Out-Null;"
             "[Console]::Out.Write('Disabled')"
         )
-        argv = [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            f"ConnectTimeout={min(timeout, 30)}",
-            ssh_host,
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            _powershell_script(script),
-        ]
-        _, disable_evidence = _run_maintenance_command(
-            argv,
+        disable_commands: list[dict] = []
+        completed = _run_windows_powershell(
+            ssh_host=ssh_host,
+            script=script,
             timeout=min(timeout, 60),
+            commands=disable_commands,
         )
-        evidence.append(disable_evidence)
+        require(
+            completed.returncode == 0 and completed.stdout.strip() == "Disabled",
+            "recovery_maintenance_not_exclusive",
+            "the Windows native writer task could not be disabled",
+        )
+        evidence.append(disable_commands[-1])
     final_state, final_evidence = _windows_task_state(
         ssh_host=ssh_host,
         task_name=task_name,

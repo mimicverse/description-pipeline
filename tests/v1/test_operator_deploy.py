@@ -268,7 +268,8 @@ def platform_fixture(
         fixture_ssh,
         r'''#!/usr/bin/env bash
 root="$(cd "$(dirname "$0")/.." && pwd)"
-stdin_script="$(cat)"
+stdin_script="$(cat; printf x)"
+stdin_script="${stdin_script%x}"
 python3 - "$root" "$stdin_script" "$@" <<'PY'
 import base64
 import gzip
@@ -293,10 +294,11 @@ script = stdin_script
 if "-EncodedCommand" in arguments:
     encoded = arguments[arguments.index("-EncodedCommand") + 1]
     launcher = base64.b64decode(encoded).decode("utf-16le")
-    match = re.search(r"FromBase64String\('([^']+)'\)", launcher)
-    if match is None or "GZipStream" not in launcher:
+    if "Console]::In.ReadLine" not in launcher or "FromBase64String('" in launcher:
         raise SystemExit(0)
-    script = gzip.decompress(base64.b64decode(match.group(1))).decode("utf-8")
+    if stdin_script.count("\n") != 1 or not stdin_script.endswith("\n"):
+        raise SystemExit(3)
+    script = gzip.decompress(base64.b64decode(stdin_script)).decode("utf-8")
 match = re.search(r"FromBase64String\('([^']+)'\)", script)
 if match is None:
     raise SystemExit(2)
@@ -879,8 +881,19 @@ class LifecycleTests(unittest.TestCase):
         )
         write_stub(
             bindir / "ssh",
-            '#!/bin/bash\necho "ssh $*" >> "$ORDER_LOG"\n'
-            'case "$*" in\n'
+            '#!/bin/bash\n'
+            'stdin_payload="$(cat; printf x)"\n'
+            'stdin_payload="${stdin_payload%x}"\n'
+            'decoded_script="$(printf "%s" "$stdin_payload" | python3 -c \''
+            'import base64,gzip,sys\n'
+            'raw=sys.stdin.buffer.read()\n'
+            'if raw and (raw.count(b"\\n") != 1 or not raw.endswith(b"\\n")): raise SystemExit(3)\n'
+            'd=raw.strip()\n'
+            'print(gzip.decompress(base64.b64decode(d)).decode("utf-8")'
+            '.replace(chr(92), chr(47)) if d else "")'
+            '\' 2>/dev/null || true)"\n'
+            'echo "ssh $* $(printf "%s" "$decoded_script" | tr "\\n" " ")" >> "$ORDER_LOG"\n'
+            'case "$* $decoded_script" in\n'
             '  *"Get-FileHash"*)\n'
             '    if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -f "$FIXTURE_REMOTE_ARCHIVE" ]; then\n'
             '      printf "%s|%s\\n" "$(stat -c %s "$FIXTURE_REMOTE_ARCHIVE")" \\\n'
@@ -905,7 +918,7 @@ class LifecycleTests(unittest.TestCase):
             '    fi\n'
             "    echo '{\"passed\":true,\"verb\":\"promote\",\"generation\":\"gen-2\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
-            "  *\"-Verb status\"*|*\"-EncodedCommand JABwAD0A\"*)\n"
+            "  *\"-Verb status\"*|*\"two status probes returned different\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
@@ -953,7 +966,7 @@ class LifecycleTests(unittest.TestCase):
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*)\n"
-            '    case "$*" in\n'
+            '    case "$* $decoded_script" in\n'
             '      *"/lifecycle/gen-1/windows-health-binding.json"*)\n'
             '        cat "${FIXTURE_HEALTH_FILE_PREVIOUS:-$FIXTURE_HEALTH_FILE}" ;;\n'
             '      *"/lifecycle/gen-2/windows-health-binding.json"*)\n'
@@ -1959,7 +1972,13 @@ class LifecycleTests(unittest.TestCase):
 
     def test_windows_status_probe_uses_encoded_command_and_rejects_bad_transport(self) -> None:
         control = CONTROL.read_text(encoding="utf-8")
-        self.assertIn('"-EncodedCommand"', control)
+        transport = (OPERATOR / "windows_transport.py").read_text(encoding="utf-8")
+        self.assertIn('"-EncodedCommand"', transport)
+        self.assertIn("windows_transport.py", control)
+        self.assertIn("windows_lifecycle()", control)
+        self.assertNotIn("gzip.compress(script", control)
+        self.assertNotIn('ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST"', control)
+        self.assertNotIn('ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST"', control)
         self.assertNotIn('"-Command",\n            "-",', control)
         self.assertIn("$task.Actions).Count -ne 1", control)
         self.assertIn("$record.passed -isnot [bool]", control)
@@ -1981,6 +2000,19 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
             baseline_sample = json.loads(baseline.stdout.strip().splitlines()[-1])
             self.assertEqual(baseline_sample["task_state"], "Running")
+            self.assertEqual(
+                baseline_sample["transport"]["encoding"],
+                "base64(gzip(utf-8))",
+            )
+            self.assertGreater(baseline_sample["transport"]["script_bytes"], 0)
+            self.assertLess(
+                baseline_sample["transport"]["launcher_bytes"],
+                4_096,
+            )
+            self.assertEqual(
+                len(baseline_sample["transport"]["payload_sha256"]),
+                64,
+            )
             expected = json.loads((state / "install-record.json").read_text(encoding="utf-8"))["ends"]["windows"]
             raw_sample = {
                 "task_name": baseline_sample["task_name"],
@@ -2511,6 +2543,10 @@ class InstallOrderingTests(unittest.TestCase):
             "runtime_dag.py",
         ):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
+        for item in OPERATOR.iterdir():
+            destination = release / "operator" / item.name
+            if item.is_file() and not destination.exists():
+                shutil.copyfile(item, destination)
         write_stub(
             release / "operator" / "runtime_dag.py",
             "#!/usr/bin/env python3\n"
@@ -3000,12 +3036,23 @@ class InstallOrderingTests(unittest.TestCase):
         )
         write_stub(
             bindir / "ssh",
-            '#!/usr/bin/env bash\necho "ssh $*" >> "$ORDER_LOG"\n'
-            'case "$*" in\n'
+            '#!/usr/bin/env bash\n'
+            'stdin_payload="$(cat; printf x)"\n'
+            'stdin_payload="${stdin_payload%x}"\n'
+            'decoded_script="$(printf "%s" "$stdin_payload" | python3 -c \''
+            'import base64,gzip,sys\n'
+            'raw=sys.stdin.buffer.read()\n'
+            'if raw and (raw.count(b"\\n") != 1 or not raw.endswith(b"\\n")): raise SystemExit(3)\n'
+            'd=raw.strip()\n'
+            'print(gzip.decompress(base64.b64decode(d)).decode("utf-8")'
+            '.replace(chr(92), chr(47)) if d else "")'
+            '\' 2>/dev/null || true)"\n'
+            'echo "ssh $* $(printf "%s" "$decoded_script" | tr "\\n" " ")" >> "$ORDER_LOG"\n'
+            'case "$* $decoded_script" in\n'
             '  *"Get-FileHash"*)\n'
             '    file="${FIXTURE_REMOTE_ARCHIVE:-}"\n'
             '    gen=""\n'
-            '    case "$*" in\n'
+            '    case "$* $decoded_script" in\n'
             '      *"/lifecycle/gen-1/"*) gen="gen-1"; file="${FIXTURE_REMOTE_ARCHIVE_GEN1:-$file}" ;;\n'
             '      *"/lifecycle/gen-2/"*) gen="gen-2"; file="${FIXTURE_REMOTE_ARCHIVE_GEN2:-$file}" ;;\n'
             '    esac\n'
@@ -3032,14 +3079,14 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*)\n"
-            '    case "$*" in\n'
+            '    case "$* $decoded_script" in\n'
             '      *"/lifecycle/gen-1/windows-health-binding.json"*)\n'
             '        cat "${FIXTURE_HEALTH_FILE_PREVIOUS:-$FIXTURE_HEALTH_FILE}" ;;\n'
             '      *"/lifecycle/gen-2/windows-health-binding.json"*)\n'
             '        cat "${FIXTURE_HEALTH_FILE_CANDIDATE:-$FIXTURE_HEALTH_FILE}" ;;\n'
             '      *) cat "$FIXTURE_HEALTH_FILE" ;;\n'
             "    esac ;;\n"
-            "  *\"-Verb status\"*|*\"-EncodedCommand JABwAD0A\"*)\n"
+            "  *\"-Verb status\"*|*\"two status probes returned different\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
