@@ -90,6 +90,7 @@ def run(cmd: list[str], env: dict[str, str], cwd: Path = ROOT) -> subprocess.Com
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(Path.home()),
         "PYTHONPATH": str(ROOT / "src"),
+        "CONTROL_PYTHON": sys.executable,
     }
     merged.update(env)
     return subprocess.run(cmd, capture_output=True, text=True, env=merged, cwd=str(cwd))
@@ -268,7 +269,8 @@ def platform_fixture(
         fixture_ssh,
         r'''#!/usr/bin/env bash
 root="$(cd "$(dirname "$0")/.." && pwd)"
-stdin_script="$(cat)"
+stdin_script="$(cat; printf x)"
+stdin_script="${stdin_script%x}"
 python3 - "$root" "$stdin_script" "$@" <<'PY'
 import base64
 import gzip
@@ -293,10 +295,17 @@ script = stdin_script
 if "-EncodedCommand" in arguments:
     encoded = arguments[arguments.index("-EncodedCommand") + 1]
     launcher = base64.b64decode(encoded).decode("utf-16le")
-    match = re.search(r"FromBase64String\('([^']+)'\)", launcher)
-    if match is None or "GZipStream" not in launcher:
+    if (
+        "System.Byte[] 8192" not in launcher
+        or ".Read($buffer,0,$buffer.Length)" not in launcher
+        or "$chunk.IndexOf([char]10)" not in launcher
+        or "ReadLine()" in launcher
+        or "FromBase64String('" in launcher
+    ):
         raise SystemExit(0)
-    script = gzip.decompress(base64.b64decode(match.group(1))).decode("utf-8")
+    if stdin_script.count("\n") != 1 or not stdin_script.endswith("\n"):
+        raise SystemExit(3)
+    script = gzip.decompress(base64.b64decode(stdin_script)).decode("utf-8")
 match = re.search(r"FromBase64String\('([^']+)'\)", script)
 if match is None:
     raise SystemExit(2)
@@ -879,8 +888,48 @@ class LifecycleTests(unittest.TestCase):
         )
         write_stub(
             bindir / "ssh",
-            '#!/bin/bash\necho "ssh $*" >> "$ORDER_LOG"\n'
-            'case "$*" in\n'
+            '#!/bin/bash\n'
+            'stdin_payload="$(cat; printf x)"\n'
+            'stdin_payload="${stdin_payload%x}"\n'
+            'decoded_script="$(printf "%s" "$stdin_payload" | python3 -c \''
+            'import base64,gzip,sys\n'
+            'raw=sys.stdin.buffer.read()\n'
+            'if raw and (raw.count(b"\\n") != 1 or not raw.endswith(b"\\n")): raise SystemExit(3)\n'
+            'd=raw.strip()\n'
+            'print(gzip.decompress(base64.b64decode(d)).decode("utf-8")'
+            '.replace(chr(92), chr(47)) if d else "")'
+            '\' 2>/dev/null || true)"\n'
+            'echo "ssh $* $(printf "%s" "$decoded_script" | tr "\\n" " ")" >> "$ORDER_LOG"\n'
+            'case "$* $decoded_script" in\n'
+            '  *"two status probes returned different"*)\n'
+            '    python3 - "$FIXTURE_OPERATOR_STATE/install-record.json" <<\'PY\'\n'
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "record = json.load(open(sys.argv[1], encoding='utf-8'))\n"
+            "identity = record['ends']['windows']\n"
+            "release = identity['release']\n"
+            "sample = {\n"
+            "    'task_name': 'description-e2e-endpoint',\n"
+            "    'task_state': 'Running',\n"
+            "    'action_count': 1,\n"
+            "    'listener_pid': 4242,\n"
+            "    'process_start_utc': '2026-10-21T00:00:00Z',\n"
+            "    'install_id': identity['install_id'],\n"
+            "    'config_digest': identity['config_digest'],\n"
+            "    'release': release,\n"
+            "    'health_install_id': identity['install_id'],\n"
+            "    'health_config_digest': identity['config_digest'],\n"
+            "    'health_release': release,\n"
+            "    'launch_contract': 'python_module_v1',\n"
+            "    'action_matches_generation': True,\n"
+            "}\n"
+            "if os.environ.get('FIXTURE_STATUS') == 'foreign':\n"
+            "    sample['install_id'] = 'win-' + 'f' * 32\n"
+            "    sample['health_install_id'] = sample['install_id']\n"
+            "print(json.dumps({'passed': True, 'sample': sample}, sort_keys=True))\n"
+            "PY\n"
+            "    ;;\n"
             '  *"Get-FileHash"*)\n'
             '    if [ -n "${FIXTURE_REMOTE_ARCHIVE:-}" ] && [ -f "$FIXTURE_REMOTE_ARCHIVE" ]; then\n'
             '      printf "%s|%s\\n" "$(stat -c %s "$FIXTURE_REMOTE_ARCHIVE")" \\\n'
@@ -905,7 +954,7 @@ class LifecycleTests(unittest.TestCase):
             '    fi\n'
             "    echo '{\"passed\":true,\"verb\":\"promote\",\"generation\":\"gen-2\","
             "\"previous\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
-            "  *\"-Verb status\"*|*\"-EncodedCommand JABwAD0A\"*)\n"
+            "  *\"-Verb status\"*|*\"two status probes returned different\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
@@ -934,7 +983,7 @@ class LifecycleTests(unittest.TestCase):
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -m description_pipeline serve --config "
+            "\"arguments\":\"-I -B -m description_pipeline serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
             "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
@@ -953,7 +1002,7 @@ class LifecycleTests(unittest.TestCase):
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*)\n"
-            '    case "$*" in\n'
+            '    case "$* $decoded_script" in\n'
             '      *"/lifecycle/gen-1/windows-health-binding.json"*)\n'
             '        cat "${FIXTURE_HEALTH_FILE_PREVIOUS:-$FIXTURE_HEALTH_FILE}" ;;\n'
             '      *"/lifecycle/gen-2/windows-health-binding.json"*)\n'
@@ -1104,6 +1153,7 @@ class LifecycleTests(unittest.TestCase):
             "EXPECTED_OPERATOR_STATE": derived_env["OPERATOR_STATE"],
             "EXPECTED_PLATFORM_CONFIG_DIGEST": derived_env["PLATFORM_CONFIG_DIGEST"],
             "FIXTURE_HEALTH_FILE": str(health_file),
+            "FIXTURE_OPERATOR_STATE": str(tmp / "state"),
         }
         control = self._control_tree(tmp)
         return config_path, env, admission, order, control
@@ -1318,7 +1368,7 @@ class LifecycleTests(unittest.TestCase):
     def test_windows_reconciliation_requires_exact_python_module_action(self) -> None:
         control_text = CONTROL.read_text(encoding="utf-8")
         marker = (
-            'RECONCILIATION="$(python3 - "$RECEIPT_DIR/windows-binding.json" '
+            'RECONCILIATION="$("$CONTROL_PYTHON" - "$RECEIPT_DIR/windows-binding.json" '
             '"$WINDOWS_STATUS" <<\'PY\'\n'
         )
         start = control_text.index(marker) + len(marker)
@@ -1327,7 +1377,7 @@ class LifecycleTests(unittest.TestCase):
         target = "C:/description-e2e/state/lifecycle/gen-2/generation"
         previous = "C:/description-e2e/state/instance-promotions/previous-0001"
         exact_arguments = (
-            '-I -m description_pipeline serve --config "' + target + '/endpoint.json"'
+            '-I -B -m description_pipeline serve --config "' + target + '/endpoint.json"'
         )
         binding = {
             "dir": "C:/description-e2e/state/lifecycle/gen-2",
@@ -1404,6 +1454,29 @@ class LifecycleTests(unittest.TestCase):
             "action_matches_generation": True,
         }
         self.assertEqual(reconcile(source_status), "before")
+        python_source = "C:/description-e2e/state/lifecycle/gen-1/generation"
+        python_source_status = copy.deepcopy(status)
+        python_source_status["live_task"] = {
+            "execute": python_source + "/runtime/Scripts/python.exe",
+            "arguments": '-I -m description_pipeline serve --config "'
+            + python_source
+            + '/endpoint.json"',
+            "working_directory": binding["state_root"],
+            "config": python_source + "/endpoint.json",
+            "state": "Running",
+            "action_count": 1,
+            "launch_contract": "python_module_v1",
+            "action_matches_generation": True,
+        }
+        python_source_status["pending"].update(
+            source_launcher=python_source + "/runtime/Scripts/python.exe",
+            source_arguments='-I -m description_pipeline serve --config "'
+            + python_source
+            + '/endpoint.json"',
+            source_working_directory=binding["state_root"],
+            source_config=python_source + "/endpoint.json",
+        )
+        self.assertEqual(reconcile(python_source_status), "before")
         source_near_match = copy.deepcopy(source_status)
         source_near_match["live_task"]["arguments"] += " --foreign"
         self.assertEqual(reconcile(source_near_match), "unknown")
@@ -1456,7 +1529,7 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(reconcile(changed), "unknown")
         python_source_missing_fields = copy.deepcopy(legacy_pending)
         python_arguments = (
-            '-I -m description_pipeline serve --config "C:/old/endpoint.json"'
+            '-I -B -m description_pipeline serve --config "C:/old/endpoint.json"'
         )
         python_source_missing_fields["live_task"].update(
             execute="C:/old/runtime/Scripts/python.exe",
@@ -1469,6 +1542,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(reconcile(python_source_missing_fields), "unknown")
         for label, arguments in (
             ("additional-token", exact_arguments + " --foreign"),
+            ("bytecode-flag-missing", exact_arguments.replace("-I -B ", "-I ", 1)),
             ("interactive-flag", exact_arguments.replace("-I ", "-i ", 1)),
             ("module-case", exact_arguments.replace("description_pipeline", "Description_Pipeline")),
         ):
@@ -1490,6 +1564,320 @@ class LifecycleTests(unittest.TestCase):
                 changed = copy.deepcopy(status)
                 changed["live_task"].update(changes)
                 self.assertEqual(reconcile(changed), "unknown")
+
+    def test_promotion_replay_fresh_requires_both_stage_steps(self) -> None:
+        promotion = OPERATOR / "promotion.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            source = root / "source.json"
+            target = root / "target.json"
+            release = root / "release.json"
+            source.write_text('{"install_id":"gen-1"}\n', encoding="utf-8")
+            target.write_text('{"install_id":"gen-2"}\n', encoding="utf-8")
+            release.write_text('{"version":"1.5.0"}\n', encoding="utf-8")
+
+            def init(install_id: str) -> None:
+                target.write_text(
+                    json.dumps({"install_id": install_id}) + "\n",
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(promotion),
+                        "init",
+                        "--state-root",
+                        str(state),
+                        "--install-id",
+                        install_id,
+                        "--from",
+                        str(source),
+                        "--to",
+                        str(target),
+                        "--release-file",
+                        str(release),
+                        "--plan",
+                        "linux-generation,windows-generation,close-admission",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            def step(install_id: str, name: str) -> None:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(promotion),
+                        "step",
+                        "--state-root",
+                        str(state),
+                        "--install-id",
+                        install_id,
+                        "--verb",
+                        "promote",
+                        "--step",
+                        name,
+                        "--status",
+                        "completed",
+                        "--evidence",
+                        str(source),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            def replay(install_id: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        str(promotion),
+                        "replay",
+                        "--state-root",
+                        str(state),
+                        "--install-id",
+                        install_id,
+                        "--verb",
+                        "promote",
+                        "--active-record",
+                        str(source),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+
+            init("linux-only")
+            step("linux-only", "linux-generation")
+            self.assertEqual(replay("linux-only").returncode, 11)
+            init("empty-promote")
+            self.assertEqual(replay("empty-promote").returncode, 11)
+            init("windows-only")
+            step("windows-only", "windows-generation")
+            self.assertEqual(replay("windows-only").returncode, 11)
+            init("both-stage-steps")
+            step("both-stage-steps", "linux-generation")
+            step("both-stage-steps", "windows-generation")
+            duplicate = subprocess.run(
+                [
+                    sys.executable,
+                    str(promotion),
+                    "step",
+                    "--state-root",
+                    str(state),
+                    "--install-id",
+                    "both-stage-steps",
+                    "--verb",
+                    "promote",
+                    "--step",
+                    "linux-generation",
+                    "--status",
+                    "completed",
+                    "--evidence",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(duplicate.returncode, 0)
+            self.assertIn("already recorded", duplicate.stderr)
+            result = replay("both-stage-steps")
+            self.assertEqual(result.returncode, 10)
+            self.assertEqual(result.stdout.strip(), "replay=fresh")
+            stage_receipt = state / "promotions" / "both-stage-steps" / "receipt.json"
+            stage_document = json.loads(stage_receipt.read_text(encoding="utf-8"))
+            stage_document["steps"].append(
+                {
+                    "seq": len(stage_document["steps"]) + 1,
+                    "verb": "promote",
+                    "step": "close-admission",
+                    "status": "failed",
+                    "at": "2026-10-22T00:00:00Z",
+                    "evidence": [str(source)],
+                    "evidence_digests": [
+                        {
+                            "path": str(source),
+                            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        }
+                    ],
+                }
+            )
+            stage_receipt.write_text(json.dumps(stage_document), encoding="utf-8")
+            self.assertEqual(replay("both-stage-steps").returncode, 11)
+
+            init("fresh-rollback")
+            for active_record in (source, target):
+                rollback_fresh = subprocess.run(
+                    [
+                        sys.executable,
+                        str(promotion),
+                        "replay",
+                        "--state-root",
+                        str(state),
+                        "--install-id",
+                        "fresh-rollback",
+                        "--verb",
+                        "rollback",
+                        "--active-record",
+                        str(active_record),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(rollback_fresh.returncode, 10, rollback_fresh.stderr)
+                self.assertEqual(rollback_fresh.stdout.strip(), "replay=fresh")
+            unrelated = root / "unrelated.json"
+            unrelated.write_text('{"install_id":"gen-9"}\n', encoding="utf-8")
+            rollback_fresh = subprocess.run(
+                [
+                    sys.executable,
+                    str(promotion),
+                    "replay",
+                    "--state-root",
+                    str(state),
+                    "--install-id",
+                    "fresh-rollback",
+                    "--verb",
+                    "rollback",
+                    "--active-record",
+                    str(unrelated),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rollback_fresh.returncode, 11)
+
+            rollback_receipt = state / "promotions" / "rollback-complete" / "receipt.json"
+            rollback_receipt.parent.mkdir(parents=True)
+            target.write_text(
+                json.dumps({"install_id": "rollback-complete"}) + "\n",
+                encoding="utf-8",
+            )
+            rollback_steps = (
+                "rollback-close",
+                "rollback-drain",
+                "rollback-stop",
+                "rollback-windows",
+                "rollback-linux",
+                "rollback-config-reference",
+                "rollback-verify",
+            )
+            rollback_receipt.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "solidworks-to-urdf.promotion/v1",
+                        "install_id": "rollback-complete",
+                        "from": str(source),
+                        "from_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "to": str(target),
+                        "to_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                        "plan": list(rollback_steps),
+                        "steps": [
+                            {
+                                "seq": index,
+                                "verb": "rollback",
+                                "step": name,
+                                "status": "completed",
+                                "at": "2026-10-22T00:00:00Z",
+                                "evidence": [str(source)],
+                                "evidence_digests": [
+                                    {
+                                        "path": str(source),
+                                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                                    }
+                                ],
+                            }
+                            for index, name in enumerate(rollback_steps, 1)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rollback_replay = subprocess.run(
+                [
+                    sys.executable,
+                    str(promotion),
+                    "replay",
+                    "--state-root",
+                    str(state),
+                    "--install-id",
+                    "rollback-complete",
+                    "--verb",
+                    "rollback",
+                    "--active-record",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rollback_replay.returncode, 0, rollback_replay.stderr)
+            rollback_bytes = rollback_receipt.read_bytes()
+            rollback_document = json.loads(rollback_bytes)
+            rollback_document["install_id"] = "misbound-generation"
+            rollback_receipt.write_text(json.dumps(rollback_document), encoding="utf-8")
+            rollback_replay = subprocess.run(
+                [
+                    sys.executable,
+                    str(promotion),
+                    "replay",
+                    "--state-root",
+                    str(state),
+                    "--install-id",
+                    "rollback-complete",
+                    "--verb",
+                    "rollback",
+                    "--active-record",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rollback_replay.returncode, 11)
+            rollback_receipt.write_bytes(rollback_bytes)
+            tampered_document = json.loads(rollback_bytes)
+            tampered_document["steps"][0]["evidence_digests"][0]["sha256"] = "0" * 64
+            rollback_receipt.write_text(json.dumps(tampered_document), encoding="utf-8")
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(promotion),
+                        "replay",
+                        "--state-root",
+                        str(state),
+                        "--install-id",
+                        "rollback-complete",
+                        "--verb",
+                        "rollback",
+                        "--active-record",
+                        str(source),
+                    ],
+                    capture_output=True,
+                    text=True,
+                ).returncode,
+                11,
+            )
+            rollback_receipt.write_bytes(rollback_bytes)
+            source.write_text('{"install_id":"gen-1"} \n', encoding="utf-8")
+            rollback_replay = subprocess.run(
+                [
+                    sys.executable,
+                    str(promotion),
+                    "replay",
+                    "--state-root",
+                    str(state),
+                    "--install-id",
+                    "rollback-complete",
+                    "--verb",
+                    "rollback",
+                    "--active-record",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rollback_replay.returncode, 11)
 
     def test_resume_failure_keeps_scheduling_and_admission_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1959,7 +2347,27 @@ class LifecycleTests(unittest.TestCase):
 
     def test_windows_status_probe_uses_encoded_command_and_rejects_bad_transport(self) -> None:
         control = CONTROL.read_text(encoding="utf-8")
-        self.assertIn('"-EncodedCommand"', control)
+        self.assertIn("export PYTHONDONTWRITEBYTECODE=1", control)
+        self.assertIn('CONTROL_PYTHON="${CONTROL_PYTHON:-python3}"', control)
+        self.assertIn("sys.implementation.name", control)
+        self.assertIn("sys.version_info[:2] == (3, 12)", control)
+        self.assertEqual(control.count("python3"), 1)
+        transport = (OPERATOR / "windows_transport.py").read_text(encoding="utf-8")
+        self.assertIn('"-EncodedCommand"', transport)
+        self.assertIn("windows_transport.py", control)
+        self.assertIn("windows_lifecycle()", control)
+        self.assertIn("WINDOWS_LIFECYCLE_TIMEOUT=480", control)
+        self.assertIn('windows_transport "$WINDOWS_LIFECYCLE_TIMEOUT"', control)
+        self.assertIn('"$output.transport.json"', control)
+        self.assertIn('2> "$output.stderr"', control)
+        self.assertIn('[ "$status" != "completed" ]', control)
+        self.assertIn("$python -I -B -c $program $configPath", control)
+        self.assertIn("Test-Bytecode-TransitionGeneration", control)
+        self.assertIn("Test-Transition-LaunchArguments", control)
+        self.assertIn("140d39e51be5f0c39c32d7cfea9ca25fe642c273", control)
+        self.assertNotIn("gzip.compress(script", control)
+        self.assertNotIn('ssh -o BatchMode=yes "$SOLIDWORKS_SSH_HOST"', control)
+        self.assertNotIn('ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST"', control)
         self.assertNotIn('"-Command",\n            "-",', control)
         self.assertIn("$task.Actions).Count -ne 1", control)
         self.assertIn("$record.passed -isnot [bool]", control)
@@ -1981,6 +2389,36 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
             baseline_sample = json.loads(baseline.stdout.strip().splitlines()[-1])
             self.assertEqual(baseline_sample["task_state"], "Running")
+            self.assertEqual(
+                baseline_sample["transport"]["encoding"],
+                "base64(gzip(utf-8))",
+            )
+            self.assertGreater(baseline_sample["transport"]["script_bytes"], 0)
+            self.assertLess(
+                baseline_sample["transport"]["launcher_bytes"],
+                8_192,
+            )
+            self.assertEqual(
+                len(baseline_sample["transport"]["payload_sha256"]),
+                64,
+            )
+            status_evidence = baseline_sample["evidence"]
+            for path in status_evidence.values():
+                self.assertTrue(Path(path).is_file())
+            status_metadata = json.loads(
+                Path(status_evidence["metadata"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                status_metadata["schema_version"],
+                "solidworks-to-urdf.windows-transport/v1",
+            )
+            self.assertEqual(status_metadata["returncode"], 0)
+            self.assertGreater(status_metadata["stdout"]["bytes"], 0)
+            self.assertEqual(len(status_metadata["stdout"]["sha256"]), 64)
+            self.assertEqual(
+                status_metadata["transport"]["framing"],
+                "single-line-lf",
+            )
             expected = json.loads((state / "install-record.json").read_text(encoding="utf-8"))["ends"]["windows"]
             raw_sample = {
                 "task_name": baseline_sample["task_name"],
@@ -2015,10 +2453,25 @@ class LifecycleTests(unittest.TestCase):
                 ("truncated", '{"passed":true\n', "Windows probe returned no JSON"),
             ):
                 with self.subTest(name=name):
+                    evidence_before = set(
+                        (state / "health-gate").glob("windows-status-*.transport.json")
+                    )
                     status_path.write_text(content, encoding="utf-8")
                     result = status()
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(expected, result.stderr)
+                    evidence_after = set(
+                        (state / "health-gate").glob("windows-status-*.transport.json")
+                    )
+                    self.assertEqual(len(evidence_after - evidence_before), 1)
+                    failed_metadata = json.loads(
+                        next(iter(evidence_after - evidence_before)).read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertEqual(failed_metadata["status"], "error")
+                    self.assertEqual(failed_metadata["error_type"], "InvalidJson")
+                    self.assertEqual(failed_metadata["returncode"], 0)
 
             status_path.write_text(raw_transport + "\n", encoding="utf-8")
             stderr_path.write_bytes(b"\xd5\n")
@@ -2511,6 +2964,10 @@ class InstallOrderingTests(unittest.TestCase):
             "runtime_dag.py",
         ):
             (release / "operator" / module).write_bytes((OPERATOR / module).read_bytes())
+        for item in OPERATOR.iterdir():
+            destination = release / "operator" / item.name
+            if item.is_file() and not destination.exists():
+                shutil.copyfile(item, destination)
         write_stub(
             release / "operator" / "runtime_dag.py",
             "#!/usr/bin/env python3\n"
@@ -3000,12 +3457,52 @@ class InstallOrderingTests(unittest.TestCase):
         )
         write_stub(
             bindir / "ssh",
-            '#!/usr/bin/env bash\necho "ssh $*" >> "$ORDER_LOG"\n'
-            'case "$*" in\n'
+            '#!/usr/bin/env bash\n'
+            'stdin_payload="$(cat; printf x)"\n'
+            'stdin_payload="${stdin_payload%x}"\n'
+            'decoded_script="$(printf "%s" "$stdin_payload" | python3 -c \''
+            'import base64,gzip,sys\n'
+            'raw=sys.stdin.buffer.read()\n'
+            'if raw and (raw.count(b"\\n") != 1 or not raw.endswith(b"\\n")): raise SystemExit(3)\n'
+            'd=raw.strip()\n'
+            'print(gzip.decompress(base64.b64decode(d)).decode("utf-8")'
+            '.replace(chr(92), chr(47)) if d else "")'
+            '\' 2>/dev/null || true)"\n'
+            'echo "ssh $* $(printf "%s" "$decoded_script" | tr "\\n" " ")" >> "$ORDER_LOG"\n'
+            'case "$* $decoded_script" in\n'
+            '  *"two status probes returned different"*)\n'
+            '    python3 - "$FIXTURE_OPERATOR_STATE/install-record.json" <<\'PY\'\n'
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "record = json.load(open(sys.argv[1], encoding='utf-8'))\n"
+            "identity = record['ends']['windows']\n"
+            "release = identity['release']\n"
+            "sample = {\n"
+            "    'task_name': 'description-e2e-endpoint',\n"
+            "    'task_state': 'Running',\n"
+            "    'action_count': 1,\n"
+            "    'listener_pid': 4242,\n"
+            "    'process_start_utc': '2026-10-21T00:00:00Z',\n"
+            "    'install_id': identity['install_id'],\n"
+            "    'config_digest': identity['config_digest'],\n"
+            "    'release': release,\n"
+            "    'health_install_id': identity['install_id'],\n"
+            "    'health_config_digest': identity['config_digest'],\n"
+            "    'health_release': release,\n"
+            "    'launch_contract': 'python_module_v1',\n"
+            "    'action_matches_generation': True,\n"
+            "}\n"
+            "if os.environ.get('FIXTURE_STATUS') == 'foreign':\n"
+            "    sample['install_id'] = 'win-' + 'f' * 32\n"
+            "    sample['health_install_id'] = sample['install_id']\n"
+            "print(json.dumps({'passed': True, 'sample': sample}, sort_keys=True))\n"
+            "PY\n"
+            "    ;;\n"
             '  *"Get-FileHash"*)\n'
             '    file="${FIXTURE_REMOTE_ARCHIVE:-}"\n'
             '    gen=""\n'
-            '    case "$*" in\n'
+            '    case "$* $decoded_script" in\n'
             '      *"/lifecycle/gen-1/"*) gen="gen-1"; file="${FIXTURE_REMOTE_ARCHIVE_GEN1:-$file}" ;;\n'
             '      *"/lifecycle/gen-2/"*) gen="gen-2"; file="${FIXTURE_REMOTE_ARCHIVE_GEN2:-$file}" ;;\n'
             '    esac\n'
@@ -3032,14 +3529,14 @@ class InstallOrderingTests(unittest.TestCase):
             "  *\"-Verb rollback\"*) echo '{\"passed\":true,\"verb\":\"rollback\","
             "\"restored_from\":\"C:/description-e2e/state/instance-promotions/previous-0001\"}' ;;\n"
             "  *\"-Verb health\"*)\n"
-            '    case "$*" in\n'
+            '    case "$* $decoded_script" in\n'
             '      *"/lifecycle/gen-1/windows-health-binding.json"*)\n'
             '        cat "${FIXTURE_HEALTH_FILE_PREVIOUS:-$FIXTURE_HEALTH_FILE}" ;;\n'
             '      *"/lifecycle/gen-2/windows-health-binding.json"*)\n'
             '        cat "${FIXTURE_HEALTH_FILE_CANDIDATE:-$FIXTURE_HEALTH_FILE}" ;;\n'
             '      *) cat "$FIXTURE_HEALTH_FILE" ;;\n'
             "    esac ;;\n"
-            "  *\"-Verb status\"*|*\"-EncodedCommand JABwAD0A\"*)\n"
+            "  *\"-Verb status\"*|*\"two status probes returned different\"*)\n"
             '    if [ "${FIXTURE_STATUS:-switched}" = "before" ]; then\n'
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/original-install with spaces/runtime/Scripts/description.exe\","
@@ -3068,7 +3565,7 @@ class InstallOrderingTests(unittest.TestCase):
             "    else\n"
             "      echo '{\"passed\":true,\"verb\":\"status\",\"live_task\":"
             "{\"execute\":\"C:/description-e2e/state/lifecycle/gen-2/generation/runtime/Scripts/python.exe\","
-            "\"arguments\":\"-I -m description_pipeline serve --config "
+            "\"arguments\":\"-I -B -m description_pipeline serve --config "
             "\\\"C:/description-e2e/state/lifecycle/gen-2/generation/endpoint.json\\\"\","
             "\"working_directory\":\"C:/description-e2e/state\","
             "\"action_count\":1,\"launch_contract\":\"python_module_v1\","
@@ -3109,6 +3606,7 @@ class InstallOrderingTests(unittest.TestCase):
             "PAUSE_RC": "0",
             "FIXTURE_REMOTE_ARCHIVE_DIR": str(tmp / "remote-archives"),
             "FIXTURE_STUB_PYTHON": str(tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python"),
+            "FIXTURE_OPERATOR_STATE": str(tmp / "state"),
             "PROJECTION_FILE": str(tmp / "projection.json"),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
         }
@@ -3249,7 +3747,7 @@ class InstallOrderingTests(unittest.TestCase):
             for verb, expect_failure in (("status", True), ("health", True)):
                 with self.subTest(verb=verb):
                     order.write_text("", encoding="utf-8")
-                    before = tree_state(work)
+                    before = tree_state(release)
                     result = run([*operatorctl, verb, "--config", config], control_env)
                     if expect_failure:
                         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -3262,7 +3760,11 @@ class InstallOrderingTests(unittest.TestCase):
                             f"FAIL     managed nginx binary missing or not executable: {binary}",
                             result.stdout,
                         )
-                    self.assertEqual(before, tree_state(work), f"{verb} wrote into the deployment tree")
+                    self.assertEqual(
+                        before,
+                        tree_state(release),
+                        f"{verb} wrote into the deployment tree",
+                    )
                     self.assertEqual(
                         list((scratch / "tmp").iterdir()), [], f"{verb} left temporary files behind"
                     )
@@ -3270,6 +3772,40 @@ class InstallOrderingTests(unittest.TestCase):
                     self.assertNotIn("proxy-installer-invoked", calls, f"{verb} ran the installer")
                     self.assertNotIn("proxy-prepare-invoked", calls, f"{verb} ran the preparation")
                     self.assertFalse(binary.exists(), f"{verb} recreated the removed binary")
+
+    def test_early_windows_stage_failure_creates_hashed_receipt_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (release.parent / "description-1.4.0-windows-cp312-x86_64.zip").unlink()
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertNotEqual(staged.returncode, 0)
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            windows_failure = next(
+                row
+                for row in receipt["steps"]
+                if row["verb"] == "promote" and row["step"] == "windows-generation"
+            )
+            self.assertEqual(windows_failure["status"], "failed")
+            self.assertTrue(windows_failure["evidence"])
+            for entry in windows_failure["evidence_digests"]:
+                path = Path(entry["path"])
+                self.assertTrue(path.is_file())
+                self.assertEqual(
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    entry["sha256"],
+                )
 
     def test_stage_builds_both_candidate_generations_without_switching(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3879,6 +4415,19 @@ class InstallOrderingTests(unittest.TestCase):
                 candidate_env = state / "derived" / "gen-2" / "operator.env"
                 if explicit_port is not None:
                     replace_env_value(candidate_env, "AIRFLOW_API_PORT", explicit_port)
+                    receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    candidate_env_digest = hashlib.sha256(
+                        candidate_env.read_bytes()
+                    ).hexdigest()
+                    for row in receipt["steps"]:
+                        for entry in row.get("evidence_digests", []):
+                            if entry["path"] == str(candidate_env):
+                                entry["sha256"] = candidate_env_digest
+                    receipt_path.write_text(
+                        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
                 self._clone_generation_stubs(state)
                 candidate_venv = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV"))
                 candidate_python = candidate_venv / "bin" / "python"
@@ -5245,6 +5794,21 @@ class InstallOrderingTests(unittest.TestCase):
                 "gen-2",
             )
             self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
+            self.assertTrue(
+                (state / "promotions" / "gen-2" / "windows-status.out.transport.json").is_file()
+            )
+            self.assertTrue(
+                (state / "promotions" / "gen-2" / "windows-status.out.stderr").is_file()
+            )
+            transport_metadata = json.loads(
+                (state / "promotions" / "gen-2" / "windows-status.out.transport.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(transport_metadata["timeout_seconds"], 480)
+            self.assertEqual(transport_metadata["transport"]["framing"], "single-line-lf")
+            self.assertEqual(len(transport_metadata["transport"]["script_sha256"]), 64)
+            self.assertEqual(len(transport_metadata["transport"]["payload_sha256"]), 64)
             self.assertEqual(
                 json.loads((state / "install-record.json").read_text(encoding="utf-8"))["install_id"], "gen-1"
             )
@@ -5261,6 +5825,34 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn("previous-0001", rollback_calls[0])
             self.assertEqual(
                 len([line for line in lines if line.startswith("ssh ") and "-Verb status" in line]), 1
+            )
+            rollback_linux = next(
+                row
+                for row in final["steps"]
+                if row["verb"] == "rollback" and row["step"] == "rollback-linux"
+            )
+            for entry in rollback_linux["evidence_digests"]:
+                path = Path(entry["path"])
+                self.assertTrue(path.is_file())
+                self.assertEqual(
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    entry["sha256"],
+                )
+            receipt_before_replay = (
+                state / "promotions" / "gen-2" / "receipt.json"
+            ).read_bytes()
+            self._stop_runtime_processes(Path(tmp))
+            replayed = self._maintenance(
+                release,
+                dict(control_env, FIXTURE_RUNTIME_PROCESS="1"),
+                "rollback",
+                "gen-2",
+            )
+            self.assertEqual(replayed.returncode, 0, replayed.stdout + replayed.stderr)
+            self.assertIn("replay complete", replayed.stdout)
+            self.assertEqual(
+                (state / "promotions" / "gen-2" / "receipt.json").read_bytes(),
+                receipt_before_replay,
             )
 
     def test_foreign_live_launcher_stays_unknown(self) -> None:
@@ -5329,6 +5921,101 @@ class InstallOrderingTests(unittest.TestCase):
                 {},
             )
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
+    def test_completed_promote_and_rollback_replays_are_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode,
+                0,
+            )
+            stage_receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            windows_generation = next(
+                row
+                for row in stage_receipt["steps"]
+                if row["verb"] == "promote" and row["step"] == "windows-generation"
+            )
+            self.assertTrue(
+                any(path.endswith(".transport.json") for path in windows_generation["evidence"])
+            )
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            receipt_before = receipt_path.read_bytes()
+            receipt_document = json.loads(receipt_before)
+            windows_step = next(
+                row
+                for row in receipt_document["steps"]
+                if row["verb"] == "promote" and row["step"] == "windows-switch"
+            )
+            self.assertTrue(
+                any(path.endswith(".transport.json") for path in windows_step["evidence"])
+            )
+            self.assertTrue(any(path.endswith(".stderr") for path in windows_step["evidence"]))
+            before_promote_replay = order.read_text(encoding="utf-8").splitlines()
+            drift = self._maintenance(
+                release,
+                dict(control_env, FIXTURE_STATUS="foreign"),
+                "promote",
+                "gen-2",
+            )
+            self.assertNotEqual(drift.returncode, 0)
+            self.assertIn("replay verification failed", drift.stderr)
+            self.assertEqual(receipt_path.read_bytes(), receipt_before)
+            self._stop_runtime_processes(Path(tmp))
+            replayed = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(replayed.returncode, 0, replayed.stdout + replayed.stderr)
+            self.assertIn("replay complete", replayed.stdout)
+            self.assertEqual(receipt_path.read_bytes(), receipt_before)
+            after_promote_replay = order.read_text(encoding="utf-8").splitlines()
+            for marker in ("platform close_admission", "platform open_admission", "pg_dump"):
+                self.assertEqual(
+                    sum(marker in line for line in after_promote_replay),
+                    sum(marker in line for line in before_promote_replay),
+                    marker,
+                )
+
+            rolled = self._maintenance(
+                release,
+                dict(control_env, FIXTURE_RUNTIME_PROCESS="1"),
+                "rollback",
+                "gen-2",
+            )
+            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            receipt_before = receipt_path.read_bytes()
+            before_rollback_replay = order.read_text(encoding="utf-8").splitlines()
+            self._stop_runtime_processes(Path(tmp))
+            replayed = self._maintenance(
+                release,
+                dict(control_env, FIXTURE_RUNTIME_PROCESS="1"),
+                "rollback",
+                "gen-2",
+            )
+            self.assertEqual(replayed.returncode, 0, replayed.stdout + replayed.stderr)
+            self.assertIn("replay complete", replayed.stdout)
+            self.assertEqual(receipt_path.read_bytes(), receipt_before)
+            after_rollback_replay = order.read_text(encoding="utf-8").splitlines()
+            for marker in ("platform close_admission", "platform open_admission", "pg_dump"):
+                self.assertEqual(
+                    sum(marker in line for line in after_rollback_replay),
+                    sum(marker in line for line in before_rollback_replay),
+                    marker,
+                )
 
     def test_ack_loss_with_live_before_state_records_never_switched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

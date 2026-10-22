@@ -26,6 +26,32 @@ from pathlib import Path
 RECEIPT_SCHEMA = "solidworks-to-urdf.promotion/v1"
 VERBS = ("stage", "reconcile", "promote", "rollback")
 STATUSES = ("completed", "failed", "unknown")
+PROMOTE_STEPS = (
+    "linux-generation",
+    "windows-generation",
+    "close-admission",
+    "drain",
+    "backup",
+    "stop-services",
+    "schema-migration",
+    "windows-switch",
+    "endpoint-identity",
+    "switch-pointer",
+    "config-reference",
+    "start-services",
+    "verify",
+    "open-admission",
+)
+ROLLBACK_STEPS = (
+    "rollback-close",
+    "rollback-drain",
+    "rollback-stop",
+    "rollback-windows",
+    "rollback-linux",
+    "rollback-config-reference",
+    "rollback-verify",
+)
+STAGE_OWNED_STEPS = frozenset({"linux-generation", "windows-generation"})
 
 
 def die(message: str) -> None:
@@ -86,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     show = subparsers.add_parser("show")
     show.add_argument("--state-root", type=Path, required=True)
     show.add_argument("--install-id", required=True)
+    replay = subparsers.add_parser("replay")
+    replay.add_argument("--state-root", type=Path, required=True)
+    replay.add_argument("--install-id", required=True)
+    replay.add_argument("--verb", choices=("promote", "rollback"), required=True)
+    replay.add_argument("--active-record", type=Path, required=True)
     verify_release = subparsers.add_parser("verify-release")
     verify_release.add_argument("--state-root", type=Path, required=True)
     verify_release.add_argument("--install-id", required=True)
@@ -97,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         require(not path.exists(), f"preserve the existing promotion receipt: {path}")
         plan = [name for name in args.plan.split(",") if name]
         require(plan, "the promotion plan is empty")
+        require(len(plan) == len(set(plan)), "the promotion plan repeats a step")
         require(args.source.is_file(), f"the bound source generation is missing: {args.source}")
         require(args.target.is_file(), f"the bound target generation is missing: {args.target}")
         require(args.release_file.is_file(), f"the bound release manifest is missing: {args.release_file}")
@@ -127,6 +159,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         evidence = [str(item) for item in args.evidence]
         require(all(item for item in evidence), "every journal step needs non-empty evidence")
+        evidence_paths = [Path(item) for item in evidence]
+        require(
+            all(item.is_file() for item in evidence_paths),
+            "every journal step evidence must reference an existing file",
+        )
+        evidence_digests = [
+            {
+                "path": str(item),
+                "sha256": hashlib.sha256(item.read_bytes()).hexdigest(),
+            }
+            for item in evidence_paths
+        ]
+        require(
+            not any(
+                row.get("verb") == args.verb and row.get("step") == args.step
+                for row in document["steps"]
+                if isinstance(row, dict)
+            ),
+            f"promotion step is already recorded: {args.verb}/{args.step}",
+        )
         document["steps"].append(
             {
                 "seq": len(document["steps"]) + 1,
@@ -135,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": args.status,
                 "at": args.at or utc_now(),
                 "evidence": evidence,
+                "evidence_digests": evidence_digests,
             }
         )
         save_receipt(path, document)
@@ -145,6 +198,102 @@ def main(argv: list[str] | None = None) -> int:
         print(f"receipt={path}")
         print(f"steps={len(document['steps'])} plan={','.join(document['plan'])}")
         return 0
+    if args.action == "replay":
+        document = load_receipt(path)
+        if document.get("install_id") != args.install_id:
+            print("replay=drift")
+            return 11
+        required = PROMOTE_STEPS if args.verb == "promote" else ROLLBACK_STEPS
+        verb_rows = [
+            row
+            for row in document["steps"]
+            if isinstance(row, dict) and row.get("verb") == args.verb
+        ]
+        names = [row.get("step") for row in verb_rows]
+        if len(names) != len(set(names)):
+            print("replay=partial")
+            return 11
+        by_name = {row["step"]: row for row in verb_rows}
+
+        def evidence_valid(row: dict) -> bool:
+            evidence = row.get("evidence")
+            digests = row.get("evidence_digests")
+            if (
+                not isinstance(evidence, list)
+                or not evidence
+                or not isinstance(digests, list)
+                or len(digests) != len(evidence)
+            ):
+                return False
+            digest_paths = []
+            for entry in digests:
+                if (
+                    not isinstance(entry, dict)
+                    or set(entry) != {"path", "sha256"}
+                    or not isinstance(entry["path"], str)
+                    or not isinstance(entry["sha256"], str)
+                ):
+                    return False
+                path = Path(entry["path"])
+                if not path.is_file():
+                    return False
+                if hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+                    return False
+                digest_paths.append(entry["path"])
+            return digest_paths == evidence
+
+        completed = all(
+            by_name.get(name, {}).get("status") == "completed" for name in required
+        ) and set(names) == set(required) and all(evidence_valid(row) for row in verb_rows)
+        fresh = (
+            args.verb == "rollback" and not verb_rows
+        ) or (
+            args.verb == "promote"
+            and {row.get("step") for row in verb_rows} == STAGE_OWNED_STEPS
+            and all(row.get("status") == "completed" for row in verb_rows)
+            and all(evidence_valid(row) for row in verb_rows)
+        )
+        if not completed and not fresh:
+            print("replay=partial")
+            return 11
+        if not args.active_record.is_file():
+            print("replay=drift")
+            return 11
+        try:
+            active = json.loads(args.active_record.read_text(encoding="utf-8"))
+            source_path = Path(document["from"])
+            target_path = Path(document["to"])
+            source = json.loads(source_path.read_text(encoding="utf-8"))
+            target = json.loads(target_path.read_text(encoding="utf-8"))
+        except (KeyError, OSError, TypeError, ValueError):
+            print("replay=drift")
+            return 11
+        if (
+            hashlib.sha256(source_path.read_bytes()).hexdigest()
+            != document.get("from_sha256")
+            or hashlib.sha256(target_path.read_bytes()).hexdigest()
+            != document.get("to_sha256")
+            or target.get("install_id") != document["install_id"]
+        ):
+            print("replay=drift")
+            return 11
+        source_id = source.get("install_id")
+        target_id = target.get("install_id")
+        if args.verb == "promote":
+            expected_install_id = target_id if completed else source_id
+        else:
+            expected_install_id = source_id if completed else target_id
+        active_install_id = active.get("install_id")
+        fresh_rollback_pointer = (
+            args.verb == "rollback"
+            and not completed
+            and active_install_id in {source_id, target_id}
+        )
+        if not fresh_rollback_pointer and active_install_id != expected_install_id:
+            print("replay=drift")
+            return 11
+        print("replay=completed" if completed else "replay=fresh")
+        return 0 if completed else 10
     if args.action == "verify-release":
         document = load_receipt(path)
         binding = document.get("release_manifest")

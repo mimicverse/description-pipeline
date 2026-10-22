@@ -70,6 +70,7 @@ if ($Scenario -eq 'stage_acl_boundary') {
   archive=$archiveName; artifact_sha256=$archiveSha; port=8765; package_root=$Root; output_root=$Root;
   version='1.5.0'; source_commit=('b' * 40); source_sha256=('b' * 64)} |
   ConvertTo-Json | Set-Content -LiteralPath $bindingPath
+Copy-Item -LiteralPath $bindingPath -Destination (Join-Path $Root 'windows-binding.json')
 if ($Scenario -notlike 'stage_*') {
   $candidateSha = (Get-FileHash -LiteralPath $newConfig -Algorithm SHA256).Hash.ToLower()
   $sourceSha = (Get-FileHash -LiteralPath $oldConfig -Algorithm SHA256).Hash.ToLower()
@@ -155,6 +156,13 @@ function Set-ManagedAcl {
     ':non-inheriting=' + [string][bool]$NonInheriting +
     ':recurse=' + [string][bool]$Recurse)
 }
+function Assert-ManagedArchive {
+  param([string]$Path, [string]$ExpectedSha256, [string]$ServiceSid)
+  $script:Calls.Add(
+    'managed-archive:' + $Path +
+    ':sha256=' + $ExpectedSha256 +
+    ':service-sid=' + $ServiceSid)
+}
 function Set-ManagedEndpointAcls {
   param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$TaskFile)
   $script:Calls.Add('managed-endpoint-acl:' + $EndpointRoot)
@@ -163,6 +171,10 @@ function Assert-ManagedEndpointAcls {
   param($Config, [string]$EndpointRoot, [string]$ConfigPath, [string]$InstallIdPath, [string]$TaskFile)
 }
 function Assert-DomainPins { param([string]$StateRoot, [string]$ServedGeneration) return @() }
+function Wait-Settled {
+  param([string]$configPath, [object]$binding)
+  throw 'the offline harness did not enter the sustained settle window'
+}
 if ($Scenario -eq 'stage_acl_boundary') {
   function Expand-Archive {
     param([string]$LiteralPath, [string]$DestinationPath)

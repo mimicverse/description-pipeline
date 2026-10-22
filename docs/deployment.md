@@ -98,7 +98,9 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 校验 Windows 离线运行档案与发行清单摘要，由受支持的 `stage` 在新安装代目录建立运行环境并安装 hash-locked 依赖，再通过 `promote` 切换既有受管任务。禁止向活动运行目录直接安装依赖或手工替换代码。`doctor` 验证安装身份、最小角色依赖及 SolidWorks/COM 就绪；实际作业仍须检查文件和会话。端点令牌的两端副本受控保存，原生端点只绑定 loopback：
 
-Windows 端点的新 generation 只使用解释器入口 `runtime\Scripts\python.exe`，参数固定为 `-I -m description_pipeline serve --config "<generation>\endpoint.json"`。stage receipt 必须声明 `launch_contract=python_module_v1`，promote 必须拒绝缺失或不同契约的候选。不得依赖 pip 生成的 `description.exe` launcher；该 launcher 的代码完整性身份可能被主机 Device Guard/WDAC 策略拒绝，不能通过关闭策略、添加例外或复制旧可执行文件绕过。为完成从既有 generation 的一次性安全回滚，恢复只可接受无该契约历史 generation 的精确 `description.exe + serve --config "<generation>\endpoint.json"` 形式，并须记录 `legacy_pip_launcher_v0`；该过渡形式不得用于新 stage 或 promote。
+Windows 端点的新 generation 只使用解释器入口 `runtime\Scripts\python.exe`，参数固定为 `-I -B -m description_pipeline serve --config "<generation>\endpoint.json"`；其中 `-B` 禁止解释器向受管 generation 写入字节码缓存。stage receipt 必须声明 `launch_contract=python_module_v1`，promote 必须拒绝缺失或不同契约的候选。为完成从已部署 `140d39e5` generation 的一次性安全迁移，验证只可接受该固定 source commit 与 version 1.5.0 的精确旧形式 `-I -m description_pipeline serve --config "<generation>\endpoint.json"`；该兼容不得扩展到新 generation、其他来源或其他 action。不得依赖 pip 生成的 `description.exe` launcher；该 launcher 的代码完整性身份可能被主机 Device Guard/WDAC 策略拒绝，不能通过关闭策略、添加例外或复制旧可执行文件绕过。为完成从更早 generation 的一次性安全回滚，恢复只可接受无该契约历史 generation 的精确 `description.exe + serve --config "<generation>\endpoint.json"` 形式，并须记录 `legacy_pip_launcher_v0`；该过渡形式不得用于新 stage 或 promote。
+
+Windows 的 canonical release archive 是不可变 lifecycle 输入，不进入可变 recovery snapshot/state。恢复只重建 runtime、配置和任务身份；archive 缺失、摘要漂移或 ReadOnly/protected ACL 不成立时必须从同一固定 release 重建并重新 stage，promote/rollback 复用前重新核验 ReadOnly、受保护 ACL 与摘要，不能静默恢复成可写归档。
 
 ```json
 {

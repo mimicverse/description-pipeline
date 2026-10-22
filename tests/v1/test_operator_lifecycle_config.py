@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,7 +47,11 @@ def run(
     env: dict[str, str] | None = None,
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess:
-    merged = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home())}
+    merged = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(Path.home()),
+        "CONTROL_PYTHON": sys.executable,
+    }
     merged.update(env or {})
     return subprocess.run(
         ["bash", str(CONTROL), *args],
@@ -96,6 +101,31 @@ def platform_document(root: Path) -> dict:
 
 
 class OperatorctlSurfaceTests(unittest.TestCase):
+    def test_control_python_guard_fails_before_config_or_state_writes(self) -> None:
+        result = run(
+            ["validate", "--config", "/nonexistent/platform.json"],
+            env={"CONTROL_PYTHON": "/bin/false"},
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("CONTROL_PYTHON must be CPython 3.12", result.stderr)
+        self.assertNotIn("config file not found", result.stderr)
+
+    def test_health_uses_the_same_control_python_guard(self) -> None:
+        result = subprocess.run(
+            ["bash", str(OPERATOR / "health.sh"), "--static"],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(Path.home()),
+                "CONTROL_PYTHON": "/bin/false",
+                "OPERATOR_STATE": "/nonexistent",
+            },
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("health: CONTROL_PYTHON must be CPython 3.12", result.stderr)
+        self.assertNotIn("missing /nonexistent/resolved.env", result.stdout)
+
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="operatorctl-config-")
         self.root = Path(self._temporary.name)
@@ -179,14 +209,36 @@ class OperatorctlSurfaceTests(unittest.TestCase):
     def test_private_windows_resume_uses_authenticated_identity_and_health(self):
         source = CONTROL.read_text(encoding="utf-8")
         resume = source.split("instance_lifecycle_resume() {", 1)[1].split("\n# The Windows end of the unified", 1)[0]
+        transport = (OPERATOR / "windows_transport.py").read_text(encoding="utf-8")
         self.assertIn('"release_identity_sha256": hashlib.sha256', resume)
         self.assertIn('"install_id": end["install_id"]', resume)
         self.assertIn('"config_digest": end["config_digest"]', resume)
         self.assertIn('"script_sha256": hashlib.sha256', resume)
         self.assertIn("-o StrictHostKeyChecking=yes", resume)
-        self.assertIn("-Verb resume -Binding", resume)
+        self.assertIn(
+            'windows_lifecycle "$output" "$remote_script" "$remote_binding" resume',
+            resume,
+        )
+        self.assertIn('windows_transport "$WINDOWS_LIFECYCLE_TIMEOUT"', source)
+        self.assertNotIn('ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SOLIDWORKS_SSH_HOST"', resume)
+        self.assertNotIn('powershell.exe -NoProfile -ExecutionPolicy Bypass -File', resume)
+        self.assertIn('"framing": "single-line-lf"', transport)
+        self.assertIn("input=payload", transport)
+        self.assertNotIn("input=script", transport)
         self.assertNotIn("endpoint.token", resume)
         self.assertNotIn("password", resume.lower())
+
+    def test_rollback_status_is_a_read_only_existing_generation_probe(self):
+        source = CONTROL.read_text(encoding="utf-8")
+        status = source.split("instance_lifecycle_status() {", 1)[1].split("\ninstance_lifecycle() {", 1)[0]
+        self.assertIn(
+            'windows_lifecycle "$output" "$remote_script" "$remote_binding" status',
+            status,
+        )
+        self.assertIn('"$output.transport.json"', source)
+        self.assertNotIn("scp ", status)
+        self.assertNotIn("New-Item", status)
+        self.assertIn('WINDOWS_STATUS="$(instance_lifecycle_status "$ROLLBACK_ID")"', source)
 
     def test_start_refuses_while_the_shared_maintenance_lock_is_held(self):
         state_root = self.root / "state"

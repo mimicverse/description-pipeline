@@ -3,6 +3,14 @@
 #   health.sh --static   validate rendered config, permissions, units and nginx syntax
 #   health.sh            static checks plus systemd/HTTP/TLS checks (does not restart anything)
 set -uo pipefail
+CONTROL_PYTHON="${CONTROL_PYTHON:-python3}"
+if ! "$CONTROL_PYTHON" -I -B -c \
+    'import sys; raise SystemExit(0 if sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12) else 1)' \
+    2>/dev/null; then
+  echo "health: CONTROL_PYTHON must be CPython 3.12" >&2
+  exit 1
+fi
+export CONTROL_PYTHON
 MODE="${1:-full}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OPERATOR_STATE:?set OPERATOR_STATE (or run via operatorctl.sh health)}"
@@ -255,7 +263,7 @@ fi
 
 # The Feishu auth manager must answer with its JSON contract, and an explicitly unconfigured
 # manager is NOT READY: preparation may run without credentials, commissioning may not.
-if FEISHU_DIAG="$(python3 - "$OPERATOR_HTTPS_PORT" <<'PY'
+if FEISHU_DIAG="$("$CONTROL_PYTHON" - "$OPERATOR_HTTPS_PORT" <<'PY'
 import json, ssl, sys, urllib.error, urllib.request
 
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

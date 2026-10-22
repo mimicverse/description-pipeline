@@ -5,7 +5,7 @@
 #           generation's own minimal endpoint.json and records its expected config digest
 #   promote stops the old endpoint (no listener AND no writer residue under the generation or
 #           state root), switches the task to the generation runtime + config, starts it and
-#           settles it for >=180s (task Running + listener PID constant + token-authenticated
+#           settles it for >=184s (task Running + listener PID constant + token-authenticated
 #           /health ready); a start refused by the ownership lock is recorded together with the
 #           lock owner's process facts, and the >=60s-later retry happens exactly once and only
 #           after the owner is PROVEN ended.  Owner state and lock probe are three-valued
@@ -99,7 +99,7 @@ function Write-Receipt([string]$path, [hashtable]$payload) {
 function Runtime-Python([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
 function Runtime-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\python.exe' }
 function Runtime-LauncherArguments([string]$generation) {
-  '-I -m description_pipeline serve --config "' + (Config-Path $generation) + '"'
+  '-I -B -m description_pipeline serve --config "' + (Config-Path $generation) + '"'
 }
 function Config-Path([string]$generation) { Join-Path $generation 'endpoint.json' }
 function Python-Module-LaunchContract { 'python_module_v1' }
@@ -107,6 +107,8 @@ function Legacy-LaunchContract { 'legacy_pip_launcher_v0' }
 function Legacy-ReleaseCommit { '55cdf8da178e37239d3ac199cd27fc50cf56540d' }
 function Legacy-ReleaseSourceSha256 { '66e2223de93b23131e652ea403525de16a21cea0b8facecd5c782b7ad6e2e3ec' }
 function Legacy-ReleaseIdentitySha256 { '62e5d64eb92416d25290b371236aea69b0b179c2d569b20ae5a4969a08ee0200' }
+function Bytecode-Transition-ReleaseCommit { '140d39e51be5f0c39c32d7cfea9ca25fe642c273' }
+function Bytecode-Transition-ReleaseSourceSha256 { '351ac7e46deef54fec17cdf1a0ea1592aa6becc45994e3a6efd7906c0414bcec' }
 function Legacy-Launcher([string]$generation) { Join-Path $generation 'runtime\Scripts\description.exe' }
 function Legacy-LauncherArguments([string]$generation) {
   'serve --config "' + (Config-Path $generation) + '"'
@@ -185,17 +187,46 @@ function Get-GenerationLaunchContract([string]$generation) {
   }
   return $lookup.contract
 }
+function Test-Bytecode-TransitionGeneration([string]$generation) {
+  $receiptPath = Join-Path $generation 'stage-receipt.json'
+  if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { return $false }
+  try { $record = Read-Json $receiptPath } catch { return $false }
+  return (
+    $record.passed -eq $true -and
+    $record.verb -ceq 'stage' -and
+    $record.PSObject.Properties.Name -contains 'launch_contract' -and
+    $record.launch_contract -ceq (Python-Module-LaunchContract) -and
+    (Normalize-PathIdentity $record.generation) -eq
+      (Normalize-PathIdentity $generation) -and
+    $record.version -ceq '1.5.0' -and
+    $record.source_commit -ceq (Bytecode-Transition-ReleaseCommit) -and
+    $record.source_sha256 -ceq (Bytecode-Transition-ReleaseSourceSha256)
+  )
+}
+function Test-Python-Module-LauncherArguments([string]$arguments, [string]$generation) {
+  $current = [regex]::Match(
+    $arguments,
+    '^(-I -B -m description_pipeline serve --config )"([^"]+)"$')
+  if (
+    $current.Success -and
+    $current.Groups[1].Value -ceq '-I -B -m description_pipeline serve --config ' -and
+    (Normalize-PathIdentity $current.Groups[2].Value) -eq
+      (Normalize-PathIdentity (Config-Path $generation))
+  ) { return $true }
+  $transition = [regex]::Match(
+    $arguments,
+    '^(-I -m description_pipeline serve --config )"([^"]+)"$')
+  return (
+    $transition.Success -and
+    $transition.Groups[1].Value -ceq '-I -m description_pipeline serve --config ' -and
+    (Normalize-PathIdentity $transition.Groups[2].Value) -eq
+      (Normalize-PathIdentity (Config-Path $generation)) -and
+    (Test-Bytecode-TransitionGeneration $generation)
+  )
+}
 function Test-Runtime-LauncherArguments([string]$arguments, [string]$generation, [string]$contract) {
   if ($contract -ceq (Python-Module-LaunchContract)) {
-    $match = [regex]::Match(
-      $arguments,
-      '^(-I -m description_pipeline serve --config )"([^"]+)"$')
-    return (
-      $match.Success -and
-      $match.Groups[1].Value -ceq '-I -m description_pipeline serve --config ' -and
-      (Normalize-PathIdentity $match.Groups[2].Value) -eq
-      (Normalize-PathIdentity (Config-Path $generation))
-    )
+    return (Test-Python-Module-LauncherArguments $arguments $generation)
   }
   if ($contract -ceq (Legacy-LaunchContract)) {
     $match = [regex]::Match($arguments, '^(serve --config )"([^"]+)"$')
@@ -289,11 +320,7 @@ function Get-ListenerProcess([int]$port) {
   if ($connection) { return [int]$connection.OwningProcess }
   return $null
 }
-function Wait-Settled([string]$configPath, [object]$binding) {
-  # The settle window the deployment contract promises: for at least 180 seconds the task is
-  # Running, the listener PID on the bound port never changes, and the token-authenticated
-  # /health stays ready.  A flapping endpoint can no longer be declared switched inside a
-  # 30-second peek: any sample that breaks one of the three conditions fails the promotion.
+function Wait-StartupHealthy([string]$configPath, [object]$binding) {
   $config = Read-Json $configPath
   $token = (Get-Content -LiteralPath $config.token_file -Raw).Trim()
   # Startup grace: the endpoint may need a moment to bind; the sustained window starts at the
@@ -302,11 +329,15 @@ function Wait-Settled([string]$configPath, [object]$binding) {
   $listenerPid = $null
   while ($true) {
     $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
-    if (-not $taskNow -or [string]$taskNow.State -ne 'Running') {
-      throw ('the settle window observed task state ' + $(if ($taskNow) { [string]$taskNow.State } else { 'missing' }))
+    if (-not $taskNow -or [string]$taskNow.State -notin @('Queued','Ready','Running')) {
+      throw ('the settle startup window observed task state ' +
+        $(if ($taskNow) { [string]$taskNow.State } else { 'missing' }))
     }
-    $pidNow = Get-ListenerProcess $config.port
+    $pidNow = $null
     $ready = $false
+    if ([string]$taskNow.State -eq 'Running') {
+      $pidNow = Get-ListenerProcess $config.port
+    }
     if ($null -ne $pidNow) {
       try {
         $probe = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $config.port + "/health") `
@@ -319,8 +350,19 @@ function Wait-Settled([string]$configPath, [object]$binding) {
     if ((Get-Date) -ge $startupDeadline) { throw 'the endpoint did not answer /health within the startup window' }
     Start-Sleep -Milliseconds 500
   }
+  return @{listener_pid=$listenerPid}
+}
+function Wait-Settled([string]$configPath, [object]$binding) {
+  # The settle window the deployment contract promises: for at least 184 seconds the task is
+  # Running, the listener PID on the bound port never changes, and the token-authenticated
+  # /health stays ready.  A flapping endpoint can no longer be declared switched inside a
+  # 30-second peek: any sample that breaks one of the three conditions fails the promotion.
+  $config = Read-Json $configPath
+  $token = (Get-Content -LiteralPath $config.token_file -Raw).Trim()
+  $startup = Wait-StartupHealthy $configPath $binding
+  $listenerPid = [int]$startup.listener_pid
   $timer = [System.Diagnostics.Stopwatch]::StartNew()
-  $settleDeadline = (Get-Date).AddSeconds(180)
+  $settleDeadline = (Get-Date).AddSeconds(184)
   while ((Get-Date) -lt $settleDeadline) {
     $taskNow = Get-ScheduledTask -TaskName $binding.task_name -ErrorAction SilentlyContinue
     if (-not $taskNow -or [string]$taskNow.State -ne 'Running') {
@@ -403,7 +445,7 @@ sys.exit(0)
   $output = ''
   $exitCode = -1
   try {
-    $output = [string]((cmd /c "`"$(Runtime-Python $generation)`" -I `"$probePath`" `"$lockPath`" 2>nul") | Out-String)
+    $output = [string]((cmd /c "`"$(Runtime-Python $generation)`" -I -B `"$probePath`" `"$lockPath`" 2>nul") | Out-String)
     $exitCode = [int]$LASTEXITCODE
   } catch {
     $output = ''
@@ -618,7 +660,7 @@ function Get-EndpointConfigEarlyProblems([string]$configPath) {
   $scanRc = 1
   $scanOutput = @()
   try {
-    $scanOutput = & $python.executable @($python.prefix) -I $programPath $configPath 2>&1
+    $scanOutput = & $python.executable @($python.prefix) -I -B $programPath $configPath 2>&1
     $scanRc = $LASTEXITCODE
   } finally {
     Remove-Item -LiteralPath $programPath -Force -ErrorAction SilentlyContinue
@@ -852,7 +894,7 @@ function Get-ServedStateRoot([string]$configPath) {
   $runtime = Runtime-Python $generation
   $program = "import json,sys;from description_pipeline.orchestration import windows;" +
     "config=windows.read_config(sys.argv[1]);print(json.dumps({'state_root':str(config['state_root'])}))"
-  $output = & $runtime -I -c $program $configPath
+  $output = & $runtime -I -B -c $program $configPath
   if ($LASTEXITCODE -ne 0) {
     Die 'served_config_unreadable' ('the served endpoint configuration cannot be read officially: ' + $configPath)
   }
@@ -1071,11 +1113,6 @@ function Assert-ManagedAcl(
   } else {
     $ServiceSid = Resolve-Sid $ServiceSid
   }
-  $expectedRights = @{
-    $systemSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
-    $administratorsSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
-    $ServiceSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
-  }
   while ($pending.Count -gt 0) {
     $current = $pending.Pop()
     $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
@@ -1083,6 +1120,18 @@ function Assert-ManagedAcl(
       Die 'windows_managed_acl_unsafe' ('a managed ACL path is a reparse point: ' + $current)
     }
     $projection = Get-AclProjection $current
+    $expectedServiceRights =
+      if (-not $item.PSIsContainer -and
+          (($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0)) {
+        [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+      } else {
+        [System.Security.AccessControl.FileSystemRights]::FullControl
+      }
+    $expectedRights = @{
+      $systemSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
+      $administratorsSid = [long][System.Security.AccessControl.FileSystemRights]::FullControl
+      $ServiceSid = [long]$expectedServiceRights
+    }
     $expectedInheritance = if ($item.PSIsContainer -and -not $NonInheriting) {
       [int](
         [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
@@ -1098,10 +1147,19 @@ function Assert-ManagedAcl(
     $seenRuleSids = @{}
     foreach ($rule in $rules) {
       $ruleSid = [string]$rule.sid
+      $rightsMatch = $false
+      if ($expectedRights.ContainsKey($ruleSid)) {
+        $expectedRuleRights = [long]$expectedRights[$ruleSid]
+        $actualRuleRights = [long]$rule.rights
+        $synchronize = [long][System.Security.AccessControl.FileSystemRights]::Synchronize
+        $rightsMatch = $actualRuleRights -eq $expectedRuleRights -or
+          ($expectedRuleRights -eq [long][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -and
+           $actualRuleRights -eq ($expectedRuleRights -bor $synchronize))
+      }
       if ($rule.access_type -ne 'Allow' -or
           $seenRuleSids.ContainsKey($ruleSid) -or
           -not $expectedRights.ContainsKey($ruleSid) -or
-          [long]$rule.rights -ne [long]$expectedRights[$ruleSid] -or
+          -not $rightsMatch -or
           [int]$rule.inheritance -ne $expectedInheritance -or
           [int]$rule.propagation -ne 0 -or
           ($Protected -and [bool]$rule.inherited) -or
@@ -1177,12 +1235,18 @@ function Set-ManagedAcl(
       $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
     }
     if ($Protected) {
+      $serviceRights =
+        if (-not $item.PSIsContainer -and
+            (($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0)) {
+          [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+        } else {
+          [System.Security.AccessControl.FileSystemRights]::FullControl
+        }
       [void]$acl.AddAccessRule((New-ManagedAccessRule $systemSid (
         [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
       [void]$acl.AddAccessRule((New-ManagedAccessRule $administratorsSid (
         [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
-      [void]$acl.AddAccessRule((New-ManagedAccessRule $ServiceSid (
-        [System.Security.AccessControl.FileSystemRights]::FullControl) $inheritance))
+      [void]$acl.AddAccessRule((New-ManagedAccessRule $ServiceSid $serviceRights $inheritance))
     }
     Set-Acl -LiteralPath $current -AclObject $acl -ErrorAction Stop
     Assert-ManagedAcl $current $Protected $ServiceSid -NonInheriting:$NonInheriting
@@ -1191,6 +1255,39 @@ function Set-ManagedAcl(
         $pending.Push($child.FullName)
       }
     }
+  }
+}
+function Protect-ManagedArchive(
+  [string]$Path,
+  [string]$ExpectedSha256,
+  [string]$ServiceSid) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    Die 'archive_missing' ('the managed archive is missing: ' + $Path)
+  }
+  Set-ItemProperty -LiteralPath $Path -Name IsReadOnly -Value $true -ErrorAction Stop
+  Set-ManagedAcl $Path $true $ServiceSid -NonInheriting
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if (-not $item.IsReadOnly) {
+    Die 'archive_read_only_failed' ('the managed archive is not read-only: ' + $Path)
+  }
+  if ((Sha256 $Path) -ne $ExpectedSha256) {
+    Die 'archive_mismatch' ('the managed archive digest differs after read-only protection: ' + $Path)
+  }
+}
+function Assert-ManagedArchive(
+  [string]$Path,
+  [string]$ExpectedSha256,
+  [string]$ServiceSid) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    Die 'archive_missing' ('the managed archive is missing: ' + $Path)
+  }
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if (-not $item.IsReadOnly) {
+    Die 'archive_read_only_failed' ('the managed archive is not read-only: ' + $Path)
+  }
+  Assert-ManagedAcl $Path $true $ServiceSid -NonInheriting
+  if ((Sha256 $Path) -ne $ExpectedSha256) {
+    Die 'archive_mismatch' ('the managed archive digest differs from the release binding: ' + $Path)
   }
 }
 function Test-ManagedPathWithin([string]$Path, [string]$Root) {
@@ -1609,7 +1706,7 @@ function Get-RecoveryIdentity($Task, $TaskProjection, [string]$SshHost) {
     "print(json.dumps({'config_digest':c['config_digest'],'package_root':str(c['package_root'])," +
     "'output_root':str(c['output_root']),'state_root':str(c['state_root']),'port':c['port']," +
     "'release':tool_record(role='native')},sort_keys=True))"
-  $output = & $python -I -c $program $configPath
+  $output = & $python -I -B -c $program $configPath
   if ($LASTEXITCODE -ne 0) {
     Die 'windows_recovery_identity_unreadable' 'the installed endpoint runtime could not identify itself'
   }
@@ -1711,7 +1808,7 @@ function Get-RecoveryCadState($Identity) {
       "from description_pipeline.sources.solidworks import isolation;" +
       "print(json.dumps({'facts':isolation.cad_session_facts(isolation.registered_executable())," +
       "'lease':isolation.domain_lease_facts()},sort_keys=True))"
-    $output = & (Runtime-Python ([string]$Identity.endpoint_root)) -I -c $program
+    $output = & (Runtime-Python ([string]$Identity.endpoint_root)) -I -B -c $program
     if ($LASTEXITCODE -ne 0) {
       DieUnknown 'windows_cad_ownership_unknown' 'the read-only CAD ownership probe failed'
     }
@@ -1864,6 +1961,9 @@ function Get-RecoveryCurrentState([string]$SshHost, [string]$TaskPath = '', [str
       endpoint_root = $aclByRole['endpoint_root']
     }
   }
+  # The canonical release archive is immutable lifecycle input, not mutable recovery state.
+  # It stays outside this bundle and is revalidated as ReadOnly+ACL+digest before every
+  # promote/rollback reuse; recovery restores runtime/configuration state only.
   $state = [ordered]@{
     schema_version = 'solidworks-to-urdf.windows-recovery/v1'
     ssh_host = $SshHost
@@ -2426,8 +2526,17 @@ if ($Verb -eq 'stage') {
   # The canonical domain pins are validated now (an existing pin may only restate the canonical
   # path and the served generation); stage only plans them - promote performs the switch.
   $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $runningConfig)
+  $runningBindingPath = Join-Path (Split-Path -Parent $runningGeneration) 'windows-binding.json'
+  if (Test-Path -LiteralPath $runningBindingPath -PathType Leaf) {
+    $runningBinding = Read-Json $runningBindingPath
+    $runningArchive = Join-Path ([string]$runningBinding.dir) ([string]$runningBinding.archive)
+    Protect-ManagedArchive $runningArchive ([string]$runningBinding.artifact_sha256) $serviceSid
+  } else {
+    Die 'archive_binding_missing' 'the running generation carries no archive binding for read-only protection'
+  }
   $archive = Join-Path $binding.dir $binding.archive
   if ((Sha256 $archive) -ne $binding.artifact_sha256) { Die 'archive_mismatch' 'the transferred archive digest differs from the release manifest' }
+  Protect-ManagedArchive $archive $binding.artifact_sha256 $serviceSid
   New-Item -ItemType Directory -Path $StageDir | Out-Null
   Set-ManagedAcl $StageDir $true -Recurse
   Expand-Archive -LiteralPath $archive -DestinationPath $StageDir
@@ -2438,9 +2547,9 @@ if ($Verb -eq 'stage') {
   & py -3.12 -m venv (Join-Path $StageDir 'runtime')
   if ($LASTEXITCODE -ne 0) { Die 'venv_failed' 'python -m venv failed' }
   $runtime = Runtime-Python $StageDir
-  & $runtime -I -m pip install --no-index --require-hashes --find-links (Join-Path $StageDir 'wheels') -r (Join-Path $StageDir 'requirements.lock')
+  & $runtime -I -B -m pip install --no-index --require-hashes --find-links (Join-Path $StageDir 'wheels') -r (Join-Path $StageDir 'requirements.lock')
   if ($LASTEXITCODE -ne 0) { Die 'pip_failed' 'the hash-locked install failed' }
-  $doctor = & $runtime -I -c "import json;from description_pipeline.runtime import tool_record;from description_pipeline.solidworks import doctor;print(json.dumps({'tool':tool_record(),'doctor':doctor()}))"
+  $doctor = & $runtime -I -B -c "import json;from description_pipeline.runtime import tool_record;from description_pipeline.solidworks import doctor;print(json.dumps({'tool':tool_record(),'doctor':doctor()}))"
   if ($LASTEXITCODE -ne 0) { Die 'doctor_failed' 'the installed runtime refused doctor' }
   $identity = $doctor | ConvertFrom-Json
   if ($identity.tool.version -ne $binding.version -or $identity.tool.source_sha256 -ne $binding.source_sha256 -or $identity.tool.release.source_commit -ne $binding.source_commit -or -not $identity.doctor.passed) {
@@ -2456,7 +2565,7 @@ if ($Verb -eq 'stage') {
   $candidateRc = 1
   $candidateOutput = @()
   try {
-    $candidateOutput = & $runtime -I $candidatePath $runningConfig (Config-Path $StageDir)
+    $candidateOutput = & $runtime -I -B $candidatePath $runningConfig (Config-Path $StageDir)
     $candidateRc = $LASTEXITCODE
   } finally {
     Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue
@@ -2535,6 +2644,8 @@ if ($Verb -eq 'promote') {
   # endpoint-root pin that does not restate the served generation, refuses the promotion.
   $pins = Assert-DomainPins $binding.state_root (Split-Path -Parent $previousConfig)
   $serviceSid = Get-ManagedServiceSid $task
+  Assert-ManagedArchive (Join-Path $binding.dir $binding.archive) `
+    $binding.artifact_sha256 $serviceSid
   $candidateDocument = Read-Json (Config-Path $StageDir)
   $installIdPath = Join-Path ([string]$candidateDocument.state_root) 'install-id'
   $taskFile = Get-TaskFilePath $task
