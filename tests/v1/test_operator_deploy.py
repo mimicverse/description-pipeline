@@ -1651,6 +1651,8 @@ class LifecycleTests(unittest.TestCase):
             init("linux-only")
             step("linux-only", "linux-generation")
             self.assertEqual(replay("linux-only").returncode, 11)
+            init("empty-promote")
+            self.assertEqual(replay("empty-promote").returncode, 11)
             init("windows-only")
             step("windows-only", "windows-generation")
             self.assertEqual(replay("windows-only").returncode, 11)
@@ -1683,6 +1685,26 @@ class LifecycleTests(unittest.TestCase):
             result = replay("both-stage-steps")
             self.assertEqual(result.returncode, 10)
             self.assertEqual(result.stdout.strip(), "replay=fresh")
+            stage_receipt = state / "promotions" / "both-stage-steps" / "receipt.json"
+            stage_document = json.loads(stage_receipt.read_text(encoding="utf-8"))
+            stage_document["steps"].append(
+                {
+                    "seq": len(stage_document["steps"]) + 1,
+                    "verb": "promote",
+                    "step": "close-admission",
+                    "status": "failed",
+                    "at": "2026-10-22T00:00:00Z",
+                    "evidence": [str(source)],
+                    "evidence_digests": [
+                        {
+                            "path": str(source),
+                            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        }
+                    ],
+                }
+            )
+            stage_receipt.write_text(json.dumps(stage_document), encoding="utf-8")
+            self.assertEqual(replay("both-stage-steps").returncode, 11)
 
             init("fresh-rollback")
             for active_record in (source, target):
@@ -1759,6 +1781,12 @@ class LifecycleTests(unittest.TestCase):
                                 "status": "completed",
                                 "at": "2026-10-22T00:00:00Z",
                                 "evidence": [str(source)],
+                                "evidence_digests": [
+                                    {
+                                        "path": str(source),
+                                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                                    }
+                                ],
                             }
                             for index, name in enumerate(rollback_steps, 1)
                         ],
@@ -1806,6 +1834,30 @@ class LifecycleTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(rollback_replay.returncode, 11)
+            rollback_receipt.write_bytes(rollback_bytes)
+            tampered_document = json.loads(rollback_bytes)
+            tampered_document["steps"][0]["evidence_digests"][0]["sha256"] = "0" * 64
+            rollback_receipt.write_text(json.dumps(tampered_document), encoding="utf-8")
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(promotion),
+                        "replay",
+                        "--state-root",
+                        str(state),
+                        "--install-id",
+                        "rollback-complete",
+                        "--verb",
+                        "rollback",
+                        "--active-record",
+                        str(source),
+                    ],
+                    capture_output=True,
+                    text=True,
+                ).returncode,
+                11,
+            )
             rollback_receipt.write_bytes(rollback_bytes)
             source.write_text('{"install_id":"gen-1"} \n', encoding="utf-8")
             rollback_replay = subprocess.run(
@@ -2308,6 +2360,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('windows_transport "$WINDOWS_LIFECYCLE_TIMEOUT"', control)
         self.assertIn('"$output.transport.json"', control)
         self.assertIn('2> "$output.stderr"', control)
+        self.assertIn('[ "$status" != "completed" ]', control)
         self.assertIn("$python -I -B -c $program $configPath", control)
         self.assertIn("Test-Bytecode-TransitionGeneration", control)
         self.assertIn("Test-Transition-LaunchArguments", control)
@@ -3720,6 +3773,40 @@ class InstallOrderingTests(unittest.TestCase):
                     self.assertNotIn("proxy-prepare-invoked", calls, f"{verb} ran the preparation")
                     self.assertFalse(binary.exists(), f"{verb} recreated the removed binary")
 
+    def test_early_windows_stage_failure_creates_hashed_receipt_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, _ = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
+            self.assertEqual(self._install(release, control_env).returncode, 0)
+            state = Path(tmp) / "state"
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (release.parent / "description-1.4.0-windows-cp312-x86_64.zip").unlink()
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertNotEqual(staged.returncode, 0)
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            windows_failure = next(
+                row
+                for row in receipt["steps"]
+                if row["verb"] == "promote" and row["step"] == "windows-generation"
+            )
+            self.assertEqual(windows_failure["status"], "failed")
+            self.assertTrue(windows_failure["evidence"])
+            for entry in windows_failure["evidence_digests"]:
+                path = Path(entry["path"])
+                self.assertTrue(path.is_file())
+                self.assertEqual(
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    entry["sha256"],
+                )
+
     def test_stage_builds_both_candidate_generations_without_switching(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
@@ -4328,6 +4415,19 @@ class InstallOrderingTests(unittest.TestCase):
                 candidate_env = state / "derived" / "gen-2" / "operator.env"
                 if explicit_port is not None:
                     replace_env_value(candidate_env, "AIRFLOW_API_PORT", explicit_port)
+                    receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    candidate_env_digest = hashlib.sha256(
+                        candidate_env.read_bytes()
+                    ).hexdigest()
+                    for row in receipt["steps"]:
+                        for entry in row.get("evidence_digests", []):
+                            if entry["path"] == str(candidate_env):
+                                entry["sha256"] = candidate_env_digest
+                    receipt_path.write_text(
+                        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
                 self._clone_generation_stubs(state)
                 candidate_venv = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV"))
                 candidate_python = candidate_venv / "bin" / "python"
@@ -5726,6 +5826,34 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(
                 len([line for line in lines if line.startswith("ssh ") and "-Verb status" in line]), 1
             )
+            rollback_linux = next(
+                row
+                for row in final["steps"]
+                if row["verb"] == "rollback" and row["step"] == "rollback-linux"
+            )
+            for entry in rollback_linux["evidence_digests"]:
+                path = Path(entry["path"])
+                self.assertTrue(path.is_file())
+                self.assertEqual(
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    entry["sha256"],
+                )
+            receipt_before_replay = (
+                state / "promotions" / "gen-2" / "receipt.json"
+            ).read_bytes()
+            self._stop_runtime_processes(Path(tmp))
+            replayed = self._maintenance(
+                release,
+                dict(control_env, FIXTURE_RUNTIME_PROCESS="1"),
+                "rollback",
+                "gen-2",
+            )
+            self.assertEqual(replayed.returncode, 0, replayed.stdout + replayed.stderr)
+            self.assertIn("replay complete", replayed.stdout)
+            self.assertEqual(
+                (state / "promotions" / "gen-2" / "receipt.json").read_bytes(),
+                receipt_before_replay,
+            )
 
     def test_foreign_live_launcher_stays_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5809,6 +5937,19 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(
                 self._maintenance(release, control_env, "stage", "gen-2").returncode,
                 0,
+            )
+            stage_receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            windows_generation = next(
+                row
+                for row in stage_receipt["steps"]
+                if row["verb"] == "promote" and row["step"] == "windows-generation"
+            )
+            self.assertTrue(
+                any(path.endswith(".transport.json") for path in windows_generation["evidence"])
             )
             self._clone_generation_stubs(state)
             self._linux_health_double(release)

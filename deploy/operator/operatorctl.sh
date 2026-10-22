@@ -1256,6 +1256,12 @@ promotion_step() {
   local arguments=(--state-root "$OPERATOR_STATE" --install-id "$generation" --verb "$verb" --step "$step" --status "$status")
   local item sibling
   for item in "$@"; do
+    if [ ! -e "$item" ]; then
+      [ "$status" != "completed" ] \
+        || die "completed $verb/$step evidence is missing: $item"
+      mkdir -p "$(dirname "$item")"
+      printf 'evidence path was not produced by the lifecycle call\n' > "$item"
+    fi
     arguments+=(--evidence "$item")
     for sibling in "$item.transport.json" "$item.stderr" "$item.ssh-rc"; do
       [ -f "$sibling" ] && arguments+=(--evidence "$sibling")
@@ -2300,24 +2306,19 @@ PY
     ENV_FILE="$CANDIDATE_ENV"
     load_generation_env
     if bash "$AIRFLOW_HERE/install.sh" --stage > "$RECEIPT_DIR/linux-generation.out" 2>&1; then
-      "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
-        --verb promote --step linux-generation --status completed \
-        --evidence "$SNAPSHOT_PATH" --evidence "$CANDIDATE_ENV" --evidence "$RECEIPT_DIR/linux-generation.out" \
-        >/dev/null
+      promotion_step "$CANDIDATE_ID" promote linux-generation completed \
+        "$SNAPSHOT_PATH" "$CANDIDATE_ENV" "$RECEIPT_DIR/linux-generation.out"
     else
-      "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
-        --verb promote --step linux-generation --status failed \
-        --evidence "$RECEIPT_DIR/linux-generation.out" >/dev/null
+      promotion_step "$CANDIDATE_ID" promote linux-generation failed \
+        "$RECEIPT_DIR/linux-generation.out"
       die "the candidate runtime failed to stage; the active generation is unchanged"
     fi
     if ! WINDOWS_STAGE="$(instance_lifecycle stage "$CANDIDATE_ID")"; then
-      "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
-        --verb promote --step windows-generation --status failed \
-        --evidence "$RECEIPT_DIR/windows-stage.out" >/dev/null
+      promotion_step "$CANDIDATE_ID" promote windows-generation failed \
+        "$RECEIPT_DIR/windows-stage.out"
       die "the Windows candidate stage failed; the active generation is unchanged"
     fi
-    "$CONTROL_PYTHON" "$HERE/promotion.py" step --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
-      --verb promote --step windows-generation --status completed --evidence "$WINDOWS_STAGE" >/dev/null
+    promotion_step "$CANDIDATE_ID" promote windows-generation completed "$WINDOWS_STAGE"
     # stage performs no schema DDL: the live database is only written by guarded windows -
     # the closed-admission reconcile route (which applies the staged objects before it
     # recovers through them) and promote's own schema-migration step - so a stage while the
@@ -2966,8 +2967,10 @@ PY
       promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$EVIDENCE_DIR/rollback-linux.out"
     else
       # The pointer never moved (receipt source == active generation); the reconciliation is
-      # recorded with the receipt itself as evidence.
-      promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$RECEIPT_DIR/receipt.json"
+      # recorded with a stable copy, never the mutable receipt that this step will replace.
+      ROLLBACK_LINUX_EVIDENCE="$EVIDENCE_DIR/rollback-linux-noop.json"
+      cp -p "$RECEIPT_DIR/receipt.json" "$ROLLBACK_LINUX_EVIDENCE"
+      promotion_step "$ROLLBACK_ID" rollback rollback-linux completed "$ROLLBACK_LINUX_EVIDENCE"
     fi
     # The previous generation's exact Connection row is restored from the private capture
     # already sealed in this promotion's backup.  The capture must still match the original

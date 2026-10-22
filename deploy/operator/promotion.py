@@ -128,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         require(not path.exists(), f"preserve the existing promotion receipt: {path}")
         plan = [name for name in args.plan.split(",") if name]
         require(plan, "the promotion plan is empty")
+        require(len(plan) == len(set(plan)), "the promotion plan repeats a step")
         require(args.source.is_file(), f"the bound source generation is missing: {args.source}")
         require(args.target.is_file(), f"the bound target generation is missing: {args.target}")
         require(args.release_file.is_file(), f"the bound release manifest is missing: {args.release_file}")
@@ -158,6 +159,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         evidence = [str(item) for item in args.evidence]
         require(all(item for item in evidence), "every journal step needs non-empty evidence")
+        evidence_paths = [Path(item) for item in evidence]
+        require(
+            all(item.is_file() for item in evidence_paths),
+            "every journal step evidence must reference an existing file",
+        )
+        evidence_digests = [
+            {
+                "path": str(item),
+                "sha256": hashlib.sha256(item.read_bytes()).hexdigest(),
+            }
+            for item in evidence_paths
+        ]
         require(
             not any(
                 row.get("verb") == args.verb and row.get("step") == args.step
@@ -174,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": args.status,
                 "at": args.at or utc_now(),
                 "evidence": evidence,
+                "evidence_digests": evidence_digests,
             }
         )
         save_receipt(path, document)
@@ -200,13 +214,44 @@ def main(argv: list[str] | None = None) -> int:
             print("replay=partial")
             return 11
         by_name = {row["step"]: row for row in verb_rows}
+
+        def evidence_valid(row: dict) -> bool:
+            evidence = row.get("evidence")
+            digests = row.get("evidence_digests")
+            if (
+                not isinstance(evidence, list)
+                or not evidence
+                or not isinstance(digests, list)
+                or len(digests) != len(evidence)
+            ):
+                return False
+            digest_paths = []
+            for entry in digests:
+                if (
+                    not isinstance(entry, dict)
+                    or set(entry) != {"path", "sha256"}
+                    or not isinstance(entry["path"], str)
+                    or not isinstance(entry["sha256"], str)
+                ):
+                    return False
+                path = Path(entry["path"])
+                if not path.is_file():
+                    return False
+                if hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+                    return False
+                digest_paths.append(entry["path"])
+            return digest_paths == evidence
+
         completed = all(
             by_name.get(name, {}).get("status") == "completed" for name in required
-        )
-        fresh = not verb_rows or (
+        ) and set(names) == set(required) and all(evidence_valid(row) for row in verb_rows)
+        fresh = (
+            args.verb == "rollback" and not verb_rows
+        ) or (
             args.verb == "promote"
             and {row.get("step") for row in verb_rows} == STAGE_OWNED_STEPS
             and all(row.get("status") == "completed" for row in verb_rows)
+            and all(evidence_valid(row) for row in verb_rows)
         )
         if not completed and not fresh:
             print("replay=partial")

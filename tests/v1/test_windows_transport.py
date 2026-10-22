@@ -78,6 +78,7 @@ class WindowsTransportTests(unittest.TestCase):
             self.assertIn(".Read($buffer,0,$buffer.Length)", launcher)
             self.assertIn("$chunk.IndexOf([char]10)", launcher)
             self.assertIn("forbidden CR framing", launcher)
+            self.assertIn("previousWasCR", launcher)
             self.assertIn("payload has trailing bytes", launcher)
             self.assertIn("script is too large", launcher)
             self.assertNotIn("ReadLine()", launcher)
