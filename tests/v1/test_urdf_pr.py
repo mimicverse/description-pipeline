@@ -988,7 +988,7 @@ class PublishTests(unittest.TestCase):
                     "id": "provenance.value_warnings",
                     "state": "passed",
                     "details": {
-                        "codes": ["direction.author_sign_applied"],
+                        "codes": ["direction.author_sign_applied", "limits.default_policy"],
                         "objects": 1,
                         "direction_sign_warnings": [
                             {
@@ -1020,6 +1020,7 @@ class PublishTests(unittest.TestCase):
         self.assertIn("assembly `[0,0,1]` -> assembly `[0,0,-1]`", body)
         self.assertIn("child `[0,0,-1]`", body)
         self.assertIn("direction.native_axis_sign/v1", body)
+        self.assertIn("limits.default_policy", body)
 
 
 if __name__ == "__main__":

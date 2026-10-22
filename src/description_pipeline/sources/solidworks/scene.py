@@ -24,7 +24,7 @@ from .naming import (
     mesh_path,
     visual_name,
 )
-from .native_limits import PREVIEW_POLICY_ID
+from .native_limits import ENGINEERING_DEFAULT_POLICY_ID, PREVIEW_POLICY_ID
 from ...schemas import LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 SCENE_SCHEMA = "solidworks-to-urdf.scene/v1"
@@ -845,6 +845,9 @@ def _build_joints(
         preview_policy = joint.get("preview_policy")
         if isinstance(preview_policy, dict):
             entry["provenance"]["preview_policy"] = dict(preview_policy)
+        default_policy = joint.get("default_policy")
+        if isinstance(default_policy, dict):
+            entry["provenance"]["default_policy"] = dict(default_policy)
         if movable:
             entry["axis"] = [float(value) for value in axis]
             axis_provenance = joint.get("axis_provenance")
@@ -892,6 +895,7 @@ def _value_warnings(
     direction_unresolved = []
     sign_reversals = []
     preview_limits = []
+    default_limits = []
     visuals = []
     mesh_paths = []
     for body in bodies:
@@ -1029,6 +1033,29 @@ def _value_warnings(
                     "hardware_qualified": False,
                 }
             )
+        elif source_joint.get("limit_source") == "default_policy":
+            policy = source_joint.get("default_policy") or {}
+            default_limits.append(
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "limits",
+                    "actual": joint["limits"],
+                    "source": "engineering default rotation window policy",
+                    "original": policy.get("author_limits"),
+                    "rule_id": ENGINEERING_DEFAULT_POLICY_ID,
+                    "rule_version": "v1",
+                    "reason": (
+                        "engineering analysis default window; no native mechanical range or engineering "
+                        "position-range qualification is claimed"
+                    ),
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
+                    "engineering_position_range_qualified": False,
+                    "native_absence": policy.get("native_absence"),
+                    "native_observation_errors": policy.get("native_observation_errors"),
+                }
+            )
     for frame in cfg.get("frames") or []:
         source_name = str(frame.get("source_name") or "")
         native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
@@ -1118,6 +1145,17 @@ def _value_warnings(
                     "no native mechanical range is claimed."
                 ),
                 "objects": preview_limits,
+            }
+        )
+    if default_limits:
+        warnings.append(
+            {
+                "code": "limits.default_policy",
+                "message": (
+                    "Engineering uses a versioned default rotation window because no usable native "
+                    "or authored position range was read; the engineering position range is unqualified."
+                ),
+                "objects": default_limits,
             }
         )
     if visuals:

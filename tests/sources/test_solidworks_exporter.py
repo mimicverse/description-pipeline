@@ -22,6 +22,7 @@ from description_pipeline.sources.solidworks.discovery import (
     _exporter_memberships,
     _exporter_native_pairs,
     prepare_native_package,
+    source_definition,
 )
 from description_pipeline.sources.solidworks.exporter import (
     ARRAYS,
@@ -33,6 +34,7 @@ from description_pipeline.sources.solidworks.exporter import (
     decode_exporter_v14,
 )
 from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
+from description_pipeline.request_evidence import build_request_evidence, request_evidence_bytes
 
 
 def wire_xml(limit_values=None) -> str:
@@ -188,6 +190,37 @@ def raw_record() -> dict:
     }
 
 
+def native_limit_mate(lower: float, upper: float) -> dict:
+    return {
+        "name": "hinge__limit",
+        "scope": "",
+        "type": "limitangle",
+        "suppressed": False,
+        "is_advanced_mate": True,
+        "is_advanced_mate_error": None,
+        "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
+        "native_limit": support.native_limit_observation(6, nominal=0.0, lower=lower, upper=upper),
+        "error_code": 0,
+        "entities": [
+            {
+                "entity_index": 0,
+                "component": "base-1",
+                "reference_configuration": "Default",
+                "feature": "LimitPlane1",
+                "mate_entity_reference": {"error": None, "geometry": None},
+            },
+            {
+                "entity_index": 1,
+                "component": "arm-1",
+                "reference_configuration": "Default",
+                "feature": "LimitPlane2",
+                "mate_entity_reference": {"error": None, "geometry": None},
+            },
+        ],
+        "limits": {"unit": "rad", "lower": lower, "upper": upper},
+    }
+
+
 class ExporterWireTests(unittest.TestCase):
     def test_exact_references_and_individual_byte_arrays_preserve_root_and_zero_values(self):
         parsed = decode_exporter_v14(wire_xml(), 1.4)
@@ -281,7 +314,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual([item["code"] for item in findings], ["direction.semantics_unresolved"])
         self.assertFalse(findings[0]["blocking"])
 
-    def test_preview_policy_only_applies_to_inspection_with_no_native_or_author_range(self):
+    def test_rotation_window_policy_uses_purpose_specific_rules(self):
         record = raw_record()
         record["exporter"]["raw_xml"] = wire_xml(
             {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
@@ -308,20 +341,78 @@ class ExporterDiscoveryTests(unittest.TestCase):
             joints[0]["preview_policy"]["rule_id"], "inspection_rotation_full_turn/v1"
         )
         engineering_findings = []
+        engineering = _exporter_joint_facts(
+            record,
+            declaration,
+            bodies,
+            engineering_findings,
+            purpose=PURPOSE_ENGINEERING,
+        )
+        self.assertEqual(engineering[0]["limit_source"], "default_policy")
         self.assertEqual(
-            _exporter_joint_facts(
-                record,
-                declaration,
-                bodies,
-                engineering_findings,
-                purpose=PURPOSE_ENGINEERING,
-            ),
-            [],
+            engineering[0]["limits"],
+            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
         )
-        self.assertIn(
-            "discovery.joint_limits_missing",
-            [item["code"] for item in engineering_findings],
+        self.assertEqual(
+            engineering[0]["default_policy"]["rule_id"],
+            "engineering_rotation_default_window/v1",
         )
+        self.assertIs(engineering[0]["default_policy"]["engineering_position_range_qualified"], False)
+        self.assertEqual(
+            [item["code"] for item in engineering_findings if item["code"] == "discovery.joint_default_policy"],
+            ["discovery.joint_default_policy"],
+        )
+        self.assertFalse(
+            next(item for item in engineering_findings if item["code"] == "discovery.joint_default_policy")["blocking"]
+        )
+
+    def test_engineering_prefers_native_then_nonzero_author_range(self) -> None:
+        native = raw_record()
+        native["mates"] = [native_limit_mate(-1.0, 1.0)]
+        _, joints, _findings = self.derive(native)
+        self.assertEqual(joints[0]["limit_source"], "native")
+        self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
+
+        declared = raw_record()
+        declared["mates"] = []
+        _, joints, _findings = self.derive(declared)
+        self.assertEqual(joints[0]["limit_source"], "declared_author")
+        self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
+
+    def test_engineering_unreadable_native_limit_uses_default_and_retains_errors(self) -> None:
+        record = raw_record()
+        record["exporter"]["raw_xml"] = wire_xml({"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0})
+        record["exporter"]["raw_xml_sha256"] = hashlib.sha256(record["exporter"]["raw_xml"].encode()).hexdigest()
+        record["mates"] = [
+            {
+                "name": "hinge__limit",
+                "type": "limitangle",
+                "suppressed": False,
+                "error_code": 0,
+                "is_advanced_mate": None,
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": None,
+                "native_limit": None,
+                "limits": None,
+                "entities": [],
+            }
+        ]
+        _bodies, joints, findings = self.derive(record)
+        self.assertEqual(joints[0]["limit_source"], "default_policy")
+        policy = joints[0]["default_policy"]
+        self.assertEqual(policy["native_absence"], "native_limit_observation_unreadable")
+        self.assertEqual(
+            policy["native_observation_errors"],
+            [
+                {
+                    "mate": "hinge__limit",
+                    "reason": "native limit entities do not span the declared parent/child subtrees",
+                }
+            ],
+        )
+        warning = next(item for item in findings if item["code"] == "discovery.joint_default_policy")
+        self.assertFalse(warning["blocking"])
+        self.assertEqual(warning["detail"]["native_observation_errors"], policy["native_observation_errors"])
 
     def test_equal_bounds_and_zero_drives_are_preserved_as_stage_warnings(self):
         for values, expected in (
@@ -341,18 +432,32 @@ class ExporterDiscoveryTests(unittest.TestCase):
             self.assertFalse(findings[1]["blocking"])
             self.assertIn("qualification_blocker", findings[1]["detail"])
 
-    def test_exporter_zero_placeholder_without_native_range_blocks(self):
+    def test_exporter_zero_placeholder_without_native_range_uses_engineering_default(self):
         raw = raw_record()
         raw["exporter"]["raw_xml"] = wire_xml()
         raw["exporter"]["raw_xml_sha256"] = hashlib.sha256(raw["exporter"]["raw_xml"].encode()).hexdigest()
         _bodies, joints, findings = self.derive(raw)
-        self.assertEqual(joints, [])
-        item = next(item for item in findings if item["code"] == "discovery.joint_limits_missing")
-        self.assertTrue(item["blocking"])
+        self.assertEqual(joints[0]["limit_source"], "default_policy")
+        self.assertEqual(joints[0]["default_policy"]["rule_id"], "engineering_rotation_default_window/v1")
+        item = next(item for item in findings if item["code"] == "discovery.joint_default_policy")
+        self.assertFalse(item["blocking"])
 
-    def test_missing_nonfinite_negative_drive_and_reversed_bounds_still_block(self):
+    def test_missing_bounds_default_while_invalid_values_still_block(self):
+        raw = raw_record()
+        declaration = decode_exporter_v14(raw["exporter"]["raw_xml"], 1.4)
+        bodies, _ = _exporter_memberships(raw, declaration, [])
+        declaration["links"][1]["joint"]["limits"] = {
+            "lower": None,
+            "upper": 1,
+            "effort": 2,
+            "velocity": 3,
+        }
+        missing_findings = []
+        missing = _exporter_joint_facts(raw, declaration, bodies, missing_findings)
+        self.assertEqual(missing[0]["limit_source"], "default_policy")
+        self.assertNotIn("discovery.joint_limits_invalid", {item["code"] for item in missing_findings})
+
         for changes, code in (
-            ({"lower": None}, "discovery.joint_limits_invalid"),
             ({"upper": float("nan")}, "discovery.joint_limits_invalid"),
             ({"lower": 2, "upper": 1}, "discovery.joint_limits_invalid"),
             ({"effort": None}, "discovery.joint_drive_invalid"),
@@ -673,37 +778,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
 
     def test_conflicting_native_limits_block_without_replacing_the_declared_range(self):
         raw = raw_record()
-        limits = {"unit": "rad", "lower": -2, "upper": 2}
-        raw["mates"] = [
-            {
-                "name": "hinge__limit",
-                "scope": "",
-                "type": "limitangle",
-                "suppressed": False,
-                "is_advanced_mate": True,
-                "is_advanced_mate_error": None,
-                "is_advanced_mate_api": "IAngleMateFeatureData.IsAdvancedMate",
-                "native_limit": support.native_limit_observation(6, nominal=0.0, lower=-2.0, upper=2.0),
-                "error_code": 0,
-                "entities": [
-                    {
-                        "entity_index": 0,
-                        "component": "base-1",
-                        "reference_configuration": "Default",
-                        "feature": "LimitPlane1",
-                        "mate_entity_reference": {"error": None, "geometry": None},
-                    },
-                    {
-                        "entity_index": 1,
-                        "component": "arm-1",
-                        "reference_configuration": "Default",
-                        "feature": "LimitPlane2",
-                        "mate_entity_reference": {"error": None, "geometry": None},
-                    },
-                ],
-                "limits": limits,
-            }
-        ]
+        raw["mates"] = [native_limit_mate(-2.0, 2.0)]
         _, joints, findings = self.derive(raw)
         observed = next(item for item in findings if item["code"] == "discovery.joint_limits_conflict")
         self.assertEqual(observed["detail"]["native"], [-2.0, 2.0])
@@ -786,6 +861,37 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertFalse(owner["blocking"])
         self.assertEqual(owner["detail"]["publication_blocker"], "owner")
         self.assertFalse([item for item in result.findings if item["blocking"]])
+
+    def test_prepared_engineering_source_carries_the_default_policy(self):
+        raw = raw_record()
+        xml = wire_xml({"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0})
+        raw["exporter"].update(raw_xml=xml, raw_xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input"
+            source.mkdir()
+            for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT"):
+                (source / name).write_bytes(b"native-file-test")
+            prepared = Path(directory) / "prepared"
+            result = prepare_native_package(source, prepared, "default-policy", backend=FakeBackend(raw))
+            self.assertTrue(result.passed, result.findings)
+            request = build_request_evidence(
+                purpose=PURPOSE_ENGINEERING,
+                request_id="default-policy",
+                target_hardware="wire_test",
+                change_summary="default policy",
+                main_assembly="robot.SLDASM",
+                handoff_digest="a" * 64,
+                platform_config_digest="b" * 64,
+            )
+            request_path = prepared / "input/request.json"
+            request_path.parent.mkdir(parents=True)
+            request_path.write_bytes(request_evidence_bytes(request))
+            definition = source_definition(prepared)
+        joint = definition["joints"][0]
+        self.assertEqual(joint["limit_source"], "default_policy")
+        self.assertEqual(joint["limits"], {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0})
+        self.assertEqual(joint["default_policy"]["rule_id"], "engineering_rotation_default_window/v1")
+        self.assertEqual(joint["default_policy"]["native_observation_errors"], [])
 
     def test_non_snake_native_interfaces_are_normalized_without_blocking(self):
         raw = raw_record()

@@ -30,7 +30,11 @@ from ..geometry.native_u import (
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
 from ..sources.solidworks.revision import NATIVE_SUFFIXES
-from ..sources.solidworks.native_limits import PREVIEW_POLICY_ID, PREVIEW_WINDOW_RAD
+from ..sources.solidworks.native_limits import (
+    ENGINEERING_DEFAULT_POLICY_ID,
+    PREVIEW_POLICY_ID,
+    PREVIEW_WINDOW_RAD,
+)
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
@@ -1119,7 +1123,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
     limit_source = authored.get("limit_source")
     _require(
-        limit_source in {"native", "declared_author", "preview_policy"},
+        limit_source in {"native", "declared_author", "preview_policy", "default_policy"},
         "Moving joint limits are not bound to a CAD native or author declaration",
     )
     if limit_source == "preview_policy":
@@ -1138,6 +1142,33 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         _require(
             limits.get("lower") == -PREVIEW_WINDOW_RAD and limits.get("upper") == PREVIEW_WINDOW_RAD,
             "The inspection-preview window does not equal the frozen full-turn radius",
+        )
+    elif limit_source == "default_policy":
+        policy = authored.get("default_policy")
+        _require(
+            not preview and authored["type"] == "revolute" and isinstance(policy, dict),
+            "The engineering default window is not allowed for this purpose or joint type",
+        )
+        _require(
+            policy.get("rule_id") == ENGINEERING_DEFAULT_POLICY_ID
+            and policy.get("rule_version") == "v1"
+            and policy.get("native_cad_ranges") is False
+            and policy.get("hardware_qualified") is False
+            and policy.get("engineering_position_range_qualified") is False,
+            "The engineering default window has another rule or qualification",
+        )
+        _require(
+            policy.get("native_absence")
+            in {"complete_mate_inventory_no_enabled_limit", "native_limit_observation_unreadable"},
+            "The engineering default window has no native-absence evidence",
+        )
+        _require(
+            isinstance(policy.get("native_observation_errors"), list),
+            "The engineering default window hid native observation errors",
+        )
+        _require(
+            limits.get("lower") == -PREVIEW_WINDOW_RAD and limits.get("upper") == PREVIEW_WINDOW_RAD,
+            "The engineering default window does not equal the frozen full-turn radius",
         )
     unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
     if authored["type"] in {"revolute", "prismatic"} and limits["lower"] == limits["upper"]:
@@ -2668,6 +2699,30 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
                     "hardware_qualified": False,
                 },
             )
+        elif joint.get("limit_source") == "default_policy":
+            policy = joint.get("default_policy") or {}
+            add(
+                "limits.default_policy",
+                {
+                    "object_type": "joint",
+                    "object": joint["name"],
+                    "field": "limits",
+                    "actual": joint["limits"],
+                    "source": "engineering default rotation window policy",
+                    "original": policy.get("author_limits"),
+                    "rule_id": ENGINEERING_DEFAULT_POLICY_ID,
+                    "rule_version": "v1",
+                    "reason": (
+                        "engineering analysis default window; no native mechanical range or engineering "
+                        "position-range qualification is claimed"
+                    ),
+                    "native_cad_ranges": False,
+                    "hardware_qualified": False,
+                    "engineering_position_range_qualified": False,
+                    "native_absence": policy.get("native_absence"),
+                    "native_observation_errors": policy.get("native_observation_errors"),
+                },
+            )
     for frame in source.get("frames", []):
         source_name = str(frame.get("source_name") or "")
         native_suffix = str(frame.get("coordinate_system") or "").partition("_")[2]
@@ -2884,6 +2939,10 @@ def _value_warning_gate(root, source, model, carrier=None, *, native_geometry_ro
         "limits.preview_policy": (
             "Inspection preview uses a versioned full-turn rotation window; "
             "no native mechanical range is claimed."
+        ),
+        "limits.default_policy": (
+            "Engineering uses a versioned default rotation window because no usable native "
+            "or authored position range was read; the engineering position range is unqualified."
         ),
         "naming.formatted_robot_name": "The robot name is formatted from the native top-assembly filename.",
         "physics.derived_from_native": (

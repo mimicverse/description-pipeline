@@ -1040,8 +1040,17 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertEqual(report["carrier"]["joints"][0]["limit_source"], "preview_policy")
 
         engineering = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
-        self.assertFalse(engineering["passed"])
-        self.assertIn("v14.native_limits_missing", {item["code"] for item in engineering["errors"]})
+        self.assertTrue(engineering["passed"], engineering["errors"])
+        joint = engineering["carrier"]["joints"][0]
+        self.assertEqual(joint["limit_source"], "default_policy")
+        self.assertEqual(
+            joint["limits"],
+            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
+        )
+        self.assertEqual(joint["default_policy"]["rule_id"], "engineering_rotation_default_window/v1")
+        self.assertIs(joint["default_policy"]["engineering_position_range_qualified"], False)
+        self.assertEqual(joint["default_policy"]["native_observation_errors"], [])
+        self.assertIn("v14.default_policy", {item["code"] for item in engineering["diagnostics"]})
 
         native = copy.deepcopy(raw)
         native["mates"] = [
@@ -1091,7 +1100,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertFalse(incomplete_report["passed"])
         self.assertNotIn("limit_source", incomplete_report["carrier"]["joints"][0])
 
-    def test_preview_policy_requires_complete_inventory_and_inspection_purpose(self):
+    def test_preview_policy_requires_complete_inventory_and_engineering_uses_its_default(self):
         raw = zero_limit_values(fixture())
         raw["mates"] = []
         preview = verify_declarations(raw, preview_claims(), purpose=PURPOSE_INSPECTION_PREVIEW)
@@ -1104,9 +1113,13 @@ class NativeDeclarationsTests(unittest.TestCase):
         )
         self.assertEqual(joint["preview_policy"]["rule_id"], "inspection_rotation_full_turn/v1")
 
-        engineering = verify_declarations(raw, preview_claims(), purpose=PURPOSE_ENGINEERING)
-        self.assertFalse(engineering["passed"])
-        self.assertIn("v14.native_limits_missing", {item["code"] for item in engineering["errors"]})
+        engineering = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+        self.assertTrue(engineering["passed"], engineering["errors"])
+        self.assertEqual(engineering["carrier"]["joints"][0]["limit_source"], "default_policy")
+        self.assertEqual(
+            engineering["carrier"]["joints"][0]["default_policy"]["rule_id"],
+            "engineering_rotation_default_window/v1",
+        )
 
         incomplete = copy.deepcopy(raw)
         incomplete["mates"] = [{"name": "incomplete", "type": "distance"}]
@@ -1120,6 +1133,77 @@ class NativeDeclarationsTests(unittest.TestCase):
             "v14.native_limits_unreadable",
             {item["code"] for item in incomplete_report["errors"]},
         )
+
+    def test_engineering_limits_prefer_native_then_declared_author(self) -> None:
+        native = verify_declarations(fixture(), purpose=PURPOSE_ENGINEERING)
+        self.assertTrue(native["passed"], native["errors"])
+        native_joint = native["carrier"]["joints"][0]
+        self.assertEqual(native_joint["limit_source"], "native")
+        self.assertEqual(native_joint["limits"]["lower"], -1.5)
+        self.assertEqual(native_joint["limits"]["upper"], 1.5)
+
+        declared = fixture()
+        declared["mates"] = []
+        declared_report = verify_declarations(declared, purpose=PURPOSE_ENGINEERING)
+        self.assertTrue(declared_report["passed"], declared_report["errors"])
+        declared_joint = declared_report["carrier"]["joints"][0]
+        self.assertEqual(declared_joint["limit_source"], "declared_author")
+        self.assertEqual(declared_joint["limits"], {"lower": -1.5, "upper": 1.5, "effort": 5.0, "velocity": 2.0})
+
+    def test_engineering_native_limit_conflict_stays_blocking(self) -> None:
+        raw = fixture()
+        raw["mates"][0]["limits"] = {"lower": -2.0, "upper": 2.0, "unit": "rad"}
+        raw["mates"][0]["native_limit"] = support.native_limit_observation(6, nominal=0.0, lower=-2.0, upper=2.0)
+        report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_conflict", {item["code"] for item in report["errors"]})
+
+    def test_engineering_unreadable_native_limit_defaults_and_retains_errors(self) -> None:
+        raw = zero_limit_values(fixture())
+        raw["mates"] = [
+            {
+                **lock("base_part", "module-1/tool_part", kind="limitangle"),
+                "limits": None,
+                "native_limit": None,
+                "is_advanced_mate": None,
+                "is_advanced_mate_error": None,
+                "is_advanced_mate_api": None,
+            }
+        ]
+        report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+        self.assertTrue(report["passed"], report["errors"])
+        joint = report["carrier"]["joints"][0]
+        self.assertEqual(joint["limit_source"], "default_policy")
+        self.assertEqual(
+            joint["limits"],
+            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
+        )
+        policy = joint["default_policy"]
+        self.assertEqual(policy["native_absence"], "native_limit_observation_unreadable")
+        self.assertEqual(
+            policy["native_observation_errors"],
+            [{"mate": "native_lock", "reason": "IsAdvancedMate is missing or unreadable"}],
+        )
+
+    def test_engineering_missing_author_bounds_use_the_default_policy(self) -> None:
+        raw = zero_limit_values(fixture())
+
+        def clear_lower(root):
+            for item in root.iter():
+                if item.get(Z_TAG + "Id") == "joint_limit_LowerAttribute":
+                    value = item.find(NS_TAG + "Value")
+                    value.attrib.clear()
+                    value.set("{http://www.w3.org/2001/XMLSchema-instance}nil", "true")
+                    value.text = None
+
+        rewrite(raw, clear_lower)
+        raw["mates"] = []
+        report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+        self.assertTrue(report["passed"], report["errors"])
+        joint = report["carrier"]["joints"][0]
+        self.assertEqual(joint["limit_source"], "default_policy")
+        self.assertEqual(joint["default_policy"]["author_limits"]["lower"], None)
+        self.assertEqual(joint["default_policy"]["author_limits"]["upper"], 0.0)
 
     def test_preview_policy_rejects_incomplete_or_conflicting_mate_inventory(self):
         def complete_mate():

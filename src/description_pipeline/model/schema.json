@@ -467,7 +467,8 @@
             "enum": [
               "native",
               "declared_author",
-              "preview_policy"
+              "preview_policy",
+              "default_policy"
             ]
           },
           "dynamics": {

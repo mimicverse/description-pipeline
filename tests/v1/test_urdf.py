@@ -103,6 +103,36 @@ class UrdfWriterTests(unittest.TestCase):
                 joint["limits"],
             )
 
+    def test_engineering_default_policy_and_warning_reach_the_urdf(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        joint = next(row for row in scene["joints"] if row["type"] == "revolute")
+        joint["limit_source"] = "default_policy"
+        joint["limits"] = {"lower": -math.pi, "upper": math.pi, "effort": 1.0, "velocity": 1.0}
+        joint["provenance"]["default_policy"] = {"rule_id": "engineering_rotation_default_window/v1"}
+        scene["provenance"].setdefault("value_warnings", []).append(
+            {
+                "code": "limits.default_policy",
+                "message": (
+                    "Engineering uses a versioned default rotation window because no usable native "
+                    "or authored position range was read; the engineering position range is unqualified."
+                ),
+                "objects": [{"object": joint["name"], "field": "limits"}],
+            }
+        )
+        robot = Robot.from_dict(scene)
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(robot, source, Path(temp), name="default_policy_arm")
+            parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+            document = ET.fromstring(output.read_bytes(), parser=parser)
+        node = next(row for row in document.findall("joint") if row.get("name") == joint["name"])
+        self.assertEqual(
+            {key: float(value) for key, value in node.find("limit").attrib.items()},
+            joint["limits"],
+        )
+        comments = [child.text or "" for child in document if child.tag is ET.Comment]
+        self.assertTrue(any("WARNING limits.default_policy:" in text for text in comments))
+
     def test_mesh_delivery_is_self_contained_and_deterministic(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         robot = Robot.from_dict(read_data(source / "scene.json"))

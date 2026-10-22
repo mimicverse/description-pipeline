@@ -56,8 +56,40 @@ _LIMIT_TYPES = {
     },
 }
 
-PREVIEW_POLICY_ID = "inspection_rotation_full_turn/v1"
-PREVIEW_WINDOW_RAD = math.pi
+INSPECTION_PREVIEW_POLICY_ID = "inspection_rotation_full_turn/v1"
+ENGINEERING_DEFAULT_POLICY_ID = "engineering_rotation_default_window/v1"
+ROTATION_WINDOW_RAD = math.pi
+
+# Existing consumers and persisted evidence use these inspection names.
+PREVIEW_POLICY_ID = INSPECTION_PREVIEW_POLICY_ID
+PREVIEW_WINDOW_RAD = ROTATION_WINDOW_RAD
+
+
+def rotation_window_policy(
+    rule_id: str,
+    *,
+    author_limits: object,
+    native_absence: str,
+    native_errors: list[dict] | None = None,
+) -> dict:
+    """Build the one versioned rotation-window policy used by both purposes."""
+
+    if rule_id not in {INSPECTION_PREVIEW_POLICY_ID, ENGINEERING_DEFAULT_POLICY_ID}:
+        raise ValueError("unknown rotation-window policy")
+    policy = {
+        "rule_id": rule_id,
+        "rule_version": "v1",
+        "window_rad": [-ROTATION_WINDOW_RAD, ROTATION_WINDOW_RAD],
+        "native_cad_ranges": False,
+        "hardware_qualified": False,
+        "author_limits": dict(author_limits) if isinstance(author_limits, Mapping) else author_limits,
+        "native_absence": native_absence,
+    }
+    if rule_id == ENGINEERING_DEFAULT_POLICY_ID:
+        policy["engineering_position_range_qualified"] = False
+    if native_errors is not None:
+        policy["native_observation_errors"] = [dict(item) for item in native_errors]
+    return policy
 
 
 def native_limit_inventory_complete(mates) -> bool:

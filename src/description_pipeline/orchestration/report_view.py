@@ -82,6 +82,12 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.interface_motion_unresolved": "CAD joint motion is unclassified; a neutral name is retained",
     "direction.semantics_unresolved": "Authored CAD axis is preserved; functional positive motion is not proven",
     "limits.preview_policy": "Inspection preview full-turn window; no native mechanical range is claimed",
+    "limits.default_policy": (
+        "Engineering default rotation window; no native mechanical range or engineering qualification is claimed"
+    ),
+    "discovery.joint_default_policy": (
+        "Engineering default rotation window; no usable native or authored range was read"
+    ),
     "direction.reference_frame_missing": "The local parent mechanical reference frame is missing",
     "direction.reference_frame_invalid": "The local parent mechanical reference frame is invalid",
     "direction.invalid": "Positive-motion semantics could not be evaluated",
@@ -115,6 +121,7 @@ _DIAGNOSTIC_CODE_LABELS = {
     "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
     "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
+    "v14.default_policy": "Engineering default rotation window (diagnostic)",
     "v14.mate_inference_unavailable": "Mate inference unavailable (diagnostic)",
     "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",
     "v14.membership_unread": "Link membership not read (diagnostic)",

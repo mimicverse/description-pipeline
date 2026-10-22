@@ -75,10 +75,13 @@ from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .native_limits import (
+    ENGINEERING_DEFAULT_POLICY_ID,
     PREVIEW_POLICY_ID,
     PREVIEW_WINDOW_RAD,
+    ROTATION_WINDOW_RAD,
     limit_mate_scope,
     native_limit_inventory_complete,
+    rotation_window_policy,
     validate_native_limit,
 )
 from .direction import canonicalize_axis
@@ -3210,15 +3213,22 @@ def _exporter_joint_facts(
         limits = declared["limits"]
         limit_source = "declared_author" if isinstance(limits, dict) else None
         preview_policy = None
+        default_policy = None
         if kind != "fixed":
 
             def valid(value):
                 return type(value) in (int, float) and math.isfinite(value)
 
+            bounds_usable = (
+                kind != "continuous"
+                and isinstance(limits, dict)
+                and all(valid(limits.get(key)) for key in ("lower", "upper"))
+            )
+            bounds_present = [limits.get(key) for key in ("lower", "upper")] if isinstance(limits, dict) else []
+            invalid_bounds = any(value is not None and not valid(value) for value in bounds_present)
+            ordered_conflict = bounds_usable and limits["lower"] > limits["upper"]
             if kind != "continuous" and (
-                not isinstance(limits, dict)
-                or not all(valid(limits.get(key)) for key in ("lower", "upper"))
-                or limits["lower"] > limits["upper"]
+                invalid_bounds or ordered_conflict or (purpose != PURPOSE_ENGINEERING and not bounds_usable)
             ):
                 findings.append(
                     _finding(
@@ -3293,16 +3303,6 @@ def _exporter_joint_facts(
                     )
                     continue
                 native_values.add((lower, upper))
-            if native_errors:
-                findings.append(
-                    _finding(
-                        "discovery.joint_limits_unreadable",
-                        obj,
-                        "native position-limit evidence is incomplete or unreadable",
-                        {"errors": native_errors},
-                    )
-                )
-                continue
             if len(native_values) > 1:
                 findings.append(
                     _finding(
@@ -3314,6 +3314,16 @@ def _exporter_joint_facts(
                 )
                 continue
             if native_values:
+                if native_errors:
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_unreadable",
+                            obj,
+                            "native position-limit evidence is incomplete or unreadable",
+                            {"errors": native_errors},
+                        )
+                    )
+                    continue
                 native_lower, native_upper = next(iter(native_values))
                 declared_values = (
                     (float(limits.get("lower")), float(limits.get("upper")))
@@ -3337,32 +3347,64 @@ def _exporter_joint_facts(
                     "velocity": (limits or {}).get("velocity"),
                 }
                 limit_source = "native"
-            elif kind != "continuous" and isinstance(limits, dict) and (
-                valid(limits.get("lower"))
-                and valid(limits.get("upper"))
-                and float(limits["lower"]) == 0.0
-                and float(limits["upper"]) == 0.0
-            ):
-                if kind == "revolute" and preview_allowed:
-                    author_limits = dict(limits)
-                    preview_limits = {
+            else:
+                author_limits = dict(limits) if isinstance(limits, dict) else None
+                author_nonzero = bounds_usable and (float(limits["lower"]) != 0.0 or float(limits["upper"]) != 0.0)
+                author_zero = bounds_usable and float(limits["lower"]) == 0.0 and float(limits["upper"]) == 0.0
+                native_inventory_complete = native_limit_inventory_complete(record.get("mates"))
+                if author_nonzero:
+                    limit_source = "declared_author"
+                elif kind == "revolute" and purpose == PURPOSE_ENGINEERING:
+                    default_policy = rotation_window_policy(
+                        ENGINEERING_DEFAULT_POLICY_ID,
+                        author_limits=author_limits,
+                        native_absence=(
+                            "complete_mate_inventory_no_enabled_limit"
+                            if native_inventory_complete and not native_errors
+                            else "native_limit_observation_unreadable"
+                        ),
+                        native_errors=native_errors,
+                    )
+                    limits = {
+                        "lower": -ROTATION_WINDOW_RAD,
+                        "upper": ROTATION_WINDOW_RAD,
+                    }
+                    for key in ("effort", "velocity"):
+                        if (
+                            isinstance(author_limits, dict)
+                            and valid(author_limits.get(key))
+                            and author_limits[key] >= 0
+                        ):
+                            limits[key] = author_limits[key]
+                    limit_source = "default_policy"
+                    findings.append(
+                        _finding(
+                            "discovery.joint_default_policy",
+                            obj,
+                            "engineering uses the versioned default rotation window because no usable native "
+                            "or authored position range was read; the range remains unqualified",
+                            default_policy,
+                            blocking=False,
+                        )
+                    )
+                elif kind == "revolute" and preview_allowed and author_zero and not native_errors:
+                    preview_policy = rotation_window_policy(
+                        PREVIEW_POLICY_ID,
+                        author_limits=author_limits,
+                        native_absence="complete_mate_inventory_no_enabled_limit",
+                    )
+                    limits = {
                         "lower": -PREVIEW_WINDOW_RAD,
                         "upper": PREVIEW_WINDOW_RAD,
                     }
                     for key in ("effort", "velocity"):
-                        if valid(author_limits.get(key)) and author_limits[key] >= 0:
-                            preview_limits[key] = author_limits[key]
-                    limits = preview_limits
+                        if (
+                            isinstance(author_limits, dict)
+                            and valid(author_limits.get(key))
+                            and author_limits[key] >= 0
+                        ):
+                            limits[key] = author_limits[key]
                     limit_source = "preview_policy"
-                    preview_policy = {
-                        "rule_id": PREVIEW_POLICY_ID,
-                        "rule_version": "v1",
-                        "window_rad": [-PREVIEW_WINDOW_RAD, PREVIEW_WINDOW_RAD],
-                        "native_cad_ranges": False,
-                        "hardware_qualified": False,
-                        "author_limits": author_limits,
-                        "native_absence": "complete_mate_inventory_no_enabled_limit",
-                    }
                     findings.append(
                         _finding(
                             "discovery.joint_preview_policy",
@@ -3373,6 +3415,16 @@ def _exporter_joint_facts(
                             blocking=False,
                         )
                     )
+                elif native_errors:
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_unreadable",
+                            obj,
+                            "native position-limit evidence is incomplete or unreadable",
+                            {"errors": native_errors},
+                        )
+                    )
+                    continue
                 else:
                     findings.append(
                         _finding(
@@ -3452,6 +3504,7 @@ def _exporter_joint_facts(
                 "limit_source": limit_source,
                 "limit_evidence": None,
                 "preview_policy": preview_policy,
+                "default_policy": default_policy,
                 "drive": None,
             }
         )
@@ -5531,13 +5584,16 @@ def source_definition(
         }
         if isinstance(joint.get("name_rule"), dict):
             entry["name_rule"] = dict(joint["name_rule"])
-        if isinstance(joint.get("preview_policy"), dict):
-            entry["limits"] = {
-                key: float(value)
-                for key, value in joint["limits"].items()
-                if value is not None
-            }
-            entry["preview_policy"] = dict(joint["preview_policy"])
+        policy_field = (
+            "preview_policy"
+            if isinstance(joint.get("preview_policy"), dict)
+            else "default_policy"
+            if isinstance(joint.get("default_policy"), dict)
+            else None
+        )
+        if policy_field is not None:
+            entry["limits"] = {key: float(value) for key, value in joint["limits"].items() if value is not None}
+            entry[policy_field] = dict(joint[policy_field])
         elif joint["axis"].get("source") == "exporter":
             entry["limits"] = {
                 key: float(joint["limits"][key])

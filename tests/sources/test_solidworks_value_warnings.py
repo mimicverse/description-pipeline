@@ -878,6 +878,53 @@ class ValueWarningTests(unittest.TestCase):
         self.assertFalse(row["native_cad_ranges"])
         self.assertFalse(row["hardware_qualified"])
 
+    def test_engineering_default_policy_warning_is_field_level(self):
+        policy = {
+            "rule_id": "engineering_rotation_default_window/v1",
+            "rule_version": "v1",
+            "window_rad": [-math.pi, math.pi],
+            "native_cad_ranges": False,
+            "hardware_qualified": False,
+            "engineering_position_range_qualified": False,
+            "author_limits": {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0},
+            "native_absence": "complete_mate_inventory_no_enabled_limit",
+            "native_observation_errors": [],
+        }
+        cfg = {
+            "joints": [
+                {
+                    "name": "hinge",
+                    "source_name": "hinge",
+                    "type": "revolute",
+                    "limit_source": "default_policy",
+                    "default_policy": policy,
+                }
+            ],
+            "frames": [],
+        }
+        joints = [
+            {
+                "name": "hinge",
+                "limits": {
+                    "lower": -math.pi,
+                    "upper": math.pi,
+                    "effort": 0.0,
+                    "velocity": 0.0,
+                },
+            }
+        ]
+        warnings = _value_warnings(cfg, [], [], joints, [])
+        warning = next(item for item in warnings if item["code"] == "limits.default_policy")
+        row = warning["objects"][0]
+        self.assertEqual(row["field"], "limits")
+        self.assertEqual(row["rule_id"], "engineering_rotation_default_window/v1")
+        self.assertEqual(row["actual"], joints[0]["limits"])
+        self.assertEqual(row["original"], policy["author_limits"])
+        self.assertFalse(row["native_cad_ranges"])
+        self.assertFalse(row["hardware_qualified"])
+        self.assertFalse(row["engineering_position_range_qualified"])
+        self.assertEqual(row["native_observation_errors"], [])
+
     def test_preview_policy_warning_gate_accepts_the_policy(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)
@@ -940,6 +987,76 @@ class ValueWarningTests(unittest.TestCase):
         result = _value_warning_gate(self.root, source, model)
         self.assertGreaterEqual(result["objects"], 1)
 
+    def test_engineering_default_policy_warning_gate_accepts_the_policy(self):
+        source = copy.deepcopy(self.source)
+        model = copy.deepcopy(self.model)
+        policy = {
+            "rule_id": "engineering_rotation_default_window/v1",
+            "rule_version": "v1",
+            "window_rad": [-math.pi, math.pi],
+            "native_cad_ranges": False,
+            "hardware_qualified": False,
+            "engineering_position_range_qualified": False,
+            "author_limits": {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0},
+            "native_absence": "complete_mate_inventory_no_enabled_limit",
+            "native_observation_errors": [],
+        }
+        limits = {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0}
+        source["joints"] = [
+            {
+                "name": "right_elbow_pitch_joint",
+                "source_name": "right_elbow_pitch_joint",
+                "type": "revolute",
+                "limit_source": "default_policy",
+                "default_policy": policy,
+                "limits": limits,
+            }
+        ]
+        model["joints"] = [{"name": "right_elbow_pitch_joint", "limits": limits}]
+        next(item for item in model["provenance"]["value_warnings"] if item["code"] == "geometry.derived_from_native")[
+            "objects"
+        ].append(
+            {
+                "object_type": "joint",
+                "object": "right_elbow_pitch_joint",
+                "fields": ["xyz", "rpy", "axis"],
+                "actual": "derived from native coordinate systems and axis declarations",
+                "source": "native_derived",
+            }
+        )
+        model["provenance"]["value_warnings"].append(
+            {
+                "code": "limits.default_policy",
+                "message": (
+                    "Engineering uses a versioned default rotation window because no usable native "
+                    "or authored position range was read; the engineering position range is unqualified."
+                ),
+                "objects": [
+                    {
+                        "object_type": "joint",
+                        "object": "right_elbow_pitch_joint",
+                        "field": "limits",
+                        "actual": limits,
+                        "source": "engineering default rotation window policy",
+                        "original": policy["author_limits"],
+                        "rule_id": "engineering_rotation_default_window/v1",
+                        "rule_version": "v1",
+                        "reason": (
+                            "engineering analysis default window; no native mechanical range or engineering "
+                            "position-range qualification is claimed"
+                        ),
+                        "native_cad_ranges": False,
+                        "hardware_qualified": False,
+                        "engineering_position_range_qualified": False,
+                        "native_absence": policy["native_absence"],
+                        "native_observation_errors": [],
+                    }
+                ],
+            }
+        )
+        result = _value_warning_gate(self.root, source, model)
+        self.assertGreaterEqual(result["objects"], 1)
+
     def test_preview_policy_joint_gate_requires_inspection_and_the_exact_window(self):
         node = ET.fromstring(
             "<joint name='hinge' type='revolute'>"
@@ -977,6 +1094,53 @@ class ValueWarningTests(unittest.TestCase):
         )
         with self.assertRaises(PipelineError):
             _joint(node, authored, canonical, {}, body_datums, [], preview=False)
+
+    def test_engineering_default_policy_joint_gate_requires_engineering_and_exact_qualification(self):
+        node = ET.fromstring(
+            "<joint name='hinge' type='revolute'>"
+            "<parent link='base'/><child link='tool'/>"
+            "<origin xyz='0 0 0' rpy='0 0 0'/><axis xyz='0 0 1'/>"
+            "<limit lower='-3.141592653589793' upper='3.141592653589793' effort='0' velocity='0'/>"
+            "</joint>"
+        )
+        limits = {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0}
+        policy = {
+            "rule_id": "engineering_rotation_default_window/v1",
+            "rule_version": "v1",
+            "native_cad_ranges": False,
+            "hardware_qualified": False,
+            "engineering_position_range_qualified": False,
+            "native_absence": "complete_mate_inventory_no_enabled_limit",
+            "native_observation_errors": [],
+        }
+        authored = {
+            "name": "hinge",
+            "type": "revolute",
+            "parent": "base",
+            "child": "tool",
+            "axis": [0.0, 0.0, 1.0],
+            "limits": limits,
+            "limit_source": "default_policy",
+            "default_policy": policy,
+        }
+        canonical = {
+            **authored,
+            "xyz": [0.0, 0.0, 0.0],
+            "rpy": [0.0, 0.0, 0.0],
+        }
+        body_datums = {"base": np.eye(4), "tool": np.eye(4)}
+        self.assertEqual(
+            _joint(node, authored, canonical, {}, body_datums, [], preview=False)["limits"],
+            limits,
+        )
+        with self.assertRaises(PipelineError):
+            _joint(node, authored, canonical, {}, body_datums, [], preview=True)
+        forged = copy.deepcopy(authored)
+        forged["default_policy"]["engineering_position_range_qualified"] = True
+        forged_canonical = copy.deepcopy(canonical)
+        forged_canonical["default_policy"] = forged["default_policy"]
+        with self.assertRaises(PipelineError):
+            _joint(node, forged, forged_canonical, {}, body_datums, [], preview=False)
 
 
 if __name__ == "__main__":
