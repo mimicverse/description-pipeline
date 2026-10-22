@@ -111,7 +111,12 @@ def journal_row_fixture(evidence: list[str]) -> dict:
 
 
 class CheckpointTreeVerificationTests(unittest.TestCase):
-    def checkpoint_fixture(self, root: Path) -> tuple[Path, dict]:
+    def checkpoint_fixture(
+        self,
+        root: Path,
+        *,
+        subject_files: dict[str, bytes] | None = None,
+    ) -> tuple[Path, dict]:
         from description_pipeline.delivery import SUBJECT_DIRECTORIES, write_delivery_manifest
         from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
         from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
@@ -120,6 +125,8 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         for name in SUBJECT_DIRECTORIES:
             (tree / name).mkdir(parents=True, exist_ok=True)
         write(tree / "tool.json", "{}")
+        for name, payload in (subject_files or {}).items():
+            write(tree / name, payload)
         manifest = write_delivery_manifest(
             tree,
             contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
@@ -127,12 +134,12 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
         )
         return tree, {"artifacts": manifest["subject"]["files"]}
 
-    def rewrite_delivery_manifest(self, tree: Path) -> None:
+    def rewrite_delivery_manifest(self, tree: Path) -> dict:
         from description_pipeline.delivery import write_delivery_manifest
         from description_pipeline.interface_records import CHECK_POLICY_SCHEMA, check_policy_digest
         from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
-        write_delivery_manifest(
+        return write_delivery_manifest(
             tree,
             contract={"schema_version": CONTRACT["schema_version"], "digest": CONTRACT_SHA256},
             policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": check_policy_digest()},
@@ -144,6 +151,291 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
             recovery.inventory_tree(tree),
             receipt=receipt,
         )
+
+    def legacy_discovery_fixture(self, root: Path) -> tuple[Path, dict, dict]:
+        from description_pipeline import interface_records as ir
+        from description_pipeline.delivery import PIPELINE_ID
+        from description_pipeline.io import canonical
+        from description_pipeline.sources.solidworks.discovery import (
+            DISCOVERY_SCHEMA,
+            FINDING_SCHEMA,
+            IDENTITY_SCHEMA,
+        )
+        from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
+
+        run_id = "run"
+        handoff_sha256 = "a" * 64
+        discovery = {
+            "schema_version": DISCOVERY_SCHEMA,
+            "run_id": run_id,
+            "handoff_sha256": handoff_sha256,
+            "findings": [{"code": "legacy.finding", "object": "assembly"}],
+            "identity": {
+                "hardware_id": "m3.0",
+                "parent_revision": None,
+                "revision": "A.3",
+            },
+        }
+        tree, receipt = self.checkpoint_fixture(
+            root,
+            subject_files={"evidence/discovery.json": canonical(discovery)},
+        )
+        findings_bytes = canonical(
+            {
+                "schema_version": FINDING_SCHEMA,
+                "findings": discovery["findings"],
+            }
+        )
+        identity = {
+            "schema_version": IDENTITY_SCHEMA,
+            "run_id": run_id,
+            "handoff_sha256": handoff_sha256,
+            "hardware_id": "m3.0",
+            "parent_revision": None,
+            "revision": "A.3",
+            "sources": [],
+        }
+        write(tree / "discovery/findings.json", findings_bytes)
+        write(tree / "discovery/identity-resolution.json", canonical(identity))
+        manifest_path = tree / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["policy"]["digest"] = next(iter(ir.RECOVERY_HISTORICAL_POLICY_DIGESTS))
+        manifest_path.write_text(json.dumps(manifest))
+
+        aliases = {
+            "input/discovery/native-discovery.json": hashlib.sha256(
+                (tree / "evidence/discovery.json").read_bytes()
+            ).hexdigest(),
+            "input/discovery/findings.json": hashlib.sha256(findings_bytes).hexdigest(),
+            "input/discovery/identity-resolution.json": hashlib.sha256(canonical(identity)).hexdigest(),
+        }
+        rows = [
+            {"id": stage["id"], "state": "not_run", "in_scope": False, "input_qc": [], "output_qc": []}
+            for stage in CONTRACT["stages"]
+        ]
+        by_id = {row["id"]: row for row in rows}
+        discover_definition = next(stage for stage in CONTRACT["stages"] if stage["id"] == "discover")
+        by_id["discover"].update(
+            state="completed",
+            in_scope=True,
+            input_qc=[
+                {"id": item["id"], "state": "passed", "details": {"passed": True}}
+                for item in discover_definition["input_qc"]
+            ],
+            output_qc=[
+                {"id": item["id"], "state": "passed", "details": {"passed": True}}
+                for item in discover_definition["output_qc"]
+            ],
+        )
+        by_id["discover"]["output_qc"][1]["details"]["files"] = dict(aliases)
+        by_id["capture"].update(state="failed", in_scope=True)
+        by_id["verify"]["inputs"] = [{"files": dict(aliases)}]
+        by_id["publish"]["inputs"] = [{"files": dict(aliases)}]
+        view = {
+            "schema_version": "solidworks-to-urdf.stages/v1",
+            "pipeline_id": PIPELINE_ID,
+            "contract_sha256": CONTRACT_SHA256,
+            "run_id": run_id,
+            "handoff_sha256": handoff_sha256,
+            "execution_scope": ["discover", "capture"],
+            "stages": rows,
+        }
+        native_stages = write(tree / "reports/native-stages.json", canonical(view))
+        native_stages_sha256 = hashlib.sha256(native_stages.read_bytes()).hexdigest()
+        receipt = {
+            **receipt,
+            "run_id": "receipt-run-which-is-not-the-producer",
+            "stage": "discover",
+            "state": "discovered",
+            "passed": False,
+            "native_stages_sha256": native_stages_sha256,
+        }
+        receipt["artifacts"] = [
+            *receipt["artifacts"],
+            {
+                "path": "reports/native-stages.json",
+                "bytes": native_stages.stat().st_size,
+                "sha256": native_stages_sha256,
+            },
+        ]
+        return tree, receipt, view
+
+    def rewrite_native_stages(self, tree: Path, receipt: dict, view: dict) -> dict:
+        from description_pipeline.io import canonical
+
+        path = tree / "reports/native-stages.json"
+        path.write_bytes(canonical(view))
+        updated = copy.deepcopy(receipt)
+        row = next(item for item in updated["artifacts"] if item["path"] == "reports/native-stages.json")
+        row["bytes"] = path.stat().st_size
+        row["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        updated["native_stages_sha256"] = row["sha256"]
+        return updated
+
+    def copy_checkpoint_tree(self, source: Path, destination: Path) -> Path:
+        copied = destination / source.parent.name / source.name
+        copied.parent.mkdir(parents=True)
+        shutil.copytree(source, copied)
+        return copied
+
+    def test_legacy_discovery_sidecars_are_bound_by_native_stage_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tree, receipt, _view = self.legacy_discovery_fixture(Path(directory))
+            self.verify(tree, receipt)
+
+    def test_legacy_discovery_sidecars_reject_tamper_unbound_unknown_and_third_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, view = self.legacy_discovery_fixture(base / "base")
+
+            tampered = self.copy_checkpoint_tree(tree, base / "tampered")
+            write(tampered / "discovery/identity-resolution.json", "{}")
+            with self.assertRaisesRegex(recovery.RecoveryError, "alias SHA-256 differs"):
+                self.verify(tampered, receipt)
+
+            unbound = self.copy_checkpoint_tree(tree, base / "unbound")
+            unbound_view = copy.deepcopy(view)
+
+            def strip_aliases(value: object) -> None:
+                if isinstance(value, dict):
+                    for key in tuple(value):
+                        if isinstance(key, str) and key.startswith("input/discovery/"):
+                            value.pop(key)
+                        else:
+                            strip_aliases(value[key])
+                elif isinstance(value, list):
+                    for item in value:
+                        strip_aliases(item)
+
+            strip_aliases(unbound_view)
+            with self.assertRaisesRegex(recovery.RecoveryError, "not declared at every exact stage position"):
+                self.verify(unbound, self.rewrite_native_stages(unbound, receipt, unbound_view))
+
+            unknown = self.copy_checkpoint_tree(tree, base / "unknown")
+            unknown_view = copy.deepcopy(view)
+            unknown_view["stages"][4]["inputs"][0]["files"]["input/discovery/other.json"] = "b" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "unknown discovery sidecar alias"):
+                self.verify(unknown, self.rewrite_native_stages(unknown, receipt, unknown_view))
+
+            misplaced = self.copy_checkpoint_tree(tree, base / "misplaced")
+            misplaced_view = copy.deepcopy(view)
+            misplaced_view["unexpected"] = {
+                "input/discovery/findings.json": hashlib.sha256(
+                    (misplaced / "discovery/findings.json").read_bytes()
+                ).hexdigest()
+            }
+            with self.assertRaisesRegex(recovery.RecoveryError, "outside a stage file map"):
+                self.verify(misplaced, self.rewrite_native_stages(misplaced, receipt, misplaced_view))
+
+            third = self.copy_checkpoint_tree(tree, base / "third")
+            write(third / "discovery/unexpected.json", "{}")
+            with self.assertRaisesRegex(recovery.RecoveryError, "unregistered files"):
+                self.verify(third, receipt)
+
+            partial = self.copy_checkpoint_tree(tree, base / "partial")
+            (partial / "discovery/findings.json").unlink()
+            with self.assertRaisesRegex(recovery.RecoveryError, "exact pair"):
+                self.verify(partial, receipt)
+
+            current_policy = self.copy_checkpoint_tree(tree, base / "current-policy")
+            from description_pipeline import interface_records as ir
+
+            manifest_path = current_policy / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["policy"]["digest"] = ir.check_policy_digest()
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(recovery.RecoveryError, "exact historical policy"):
+                self.verify(current_policy, receipt)
+
+    def test_legacy_discovery_sidecars_reject_conflicts_and_bad_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, view = self.legacy_discovery_fixture(base / "base")
+
+            conflict = self.copy_checkpoint_tree(tree, base / "conflict")
+            conflict_view = copy.deepcopy(view)
+            conflict_view["stages"][4]["inputs"][0]["files"]["input/discovery/findings.json"] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "alias SHA-256 differs"):
+                self.verify(conflict, self.rewrite_native_stages(conflict, receipt, conflict_view))
+
+            native_conflict = self.copy_checkpoint_tree(tree, base / "native-conflict")
+            native_conflict_view = copy.deepcopy(view)
+            native_conflict_view["stages"][4]["inputs"][0]["files"][
+                "input/discovery/native-discovery.json"
+            ] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "alias SHA-256 differs"):
+                self.verify(
+                    native_conflict,
+                    self.rewrite_native_stages(native_conflict, receipt, native_conflict_view),
+                )
+
+            projection = self.copy_checkpoint_tree(tree, base / "projection")
+            from description_pipeline.io import canonical
+            from description_pipeline.sources.solidworks.discovery import FINDING_SCHEMA
+
+            changed = canonical({"schema_version": FINDING_SCHEMA, "findings": []})
+            findings_path = write(projection / "discovery/findings.json", changed)
+            projection_view = copy.deepcopy(view)
+            changed_sha256 = hashlib.sha256(findings_path.read_bytes()).hexdigest()
+
+            def update_findings(value: object) -> None:
+                if isinstance(value, dict):
+                    for key, item in tuple(value.items()):
+                        if key == "input/discovery/findings.json":
+                            value[key] = changed_sha256
+                        else:
+                            update_findings(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        update_findings(item)
+
+            update_findings(projection_view)
+            with self.assertRaisesRegex(recovery.RecoveryError, "canonical discovery projection"):
+                self.verify(projection, self.rewrite_native_stages(projection, receipt, projection_view))
+
+            malformed_identity = self.copy_checkpoint_tree(tree, base / "malformed-identity")
+            malformed_bytes = b"[]"
+            identity_path = write(malformed_identity / "discovery/identity-resolution.json", malformed_bytes)
+            malformed_view = copy.deepcopy(view)
+            malformed_sha256 = hashlib.sha256(identity_path.read_bytes()).hexdigest()
+
+            def update_identity(value: object) -> None:
+                if isinstance(value, dict):
+                    for key, item in tuple(value.items()):
+                        if key == "input/discovery/identity-resolution.json":
+                            value[key] = malformed_sha256
+                        else:
+                            update_identity(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        update_identity(item)
+
+            update_identity(malformed_view)
+            with self.assertRaisesRegex(recovery.RecoveryError, "identity resolution differs"):
+                self.verify(
+                    malformed_identity,
+                    self.rewrite_native_stages(malformed_identity, receipt, malformed_view),
+                )
+
+    def test_legacy_discovery_sidecars_reject_receipt_and_stage_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tree, receipt, view = self.legacy_discovery_fixture(base / "base")
+
+            receipt_drift = self.copy_checkpoint_tree(tree, base / "receipt-drift")
+            changed_receipt = copy.deepcopy(receipt)
+            changed_receipt["native_stages_sha256"] = "f" * 64
+            with self.assertRaisesRegex(recovery.RecoveryError, "receipt native-stage digest"):
+                self.verify(receipt_drift, changed_receipt)
+
+            stage_drift = self.copy_checkpoint_tree(tree, base / "stage-drift")
+            changed_view = copy.deepcopy(view)
+            changed_view["run_id"] = "another-run"
+            with self.assertRaisesRegex(recovery.RecoveryError, "invalid native stage view"):
+                self.verify(
+                    stage_drift,
+                    self.rewrite_native_stages(stage_drift, receipt, changed_view),
+                )
 
     def test_discover_input_records_empty_directory_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

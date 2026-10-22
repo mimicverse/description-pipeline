@@ -2483,6 +2483,237 @@ def inventory_tree(root: Path) -> list[dict]:
     return records
 
 
+DISCOVERY_ALIAS_FILES = {
+    "input/discovery/native-discovery.json": "evidence/discovery.json",
+    "input/discovery/findings.json": "discovery/findings.json",
+    "input/discovery/identity-resolution.json": "discovery/identity-resolution.json",
+}
+LEGACY_DISCOVERY_SIDECARS = frozenset(
+    {
+        "discovery/findings.json",
+        "discovery/identity-resolution.json",
+    }
+)
+NATIVE_STAGES_MEMBER = "reports/native-stages.json"
+
+
+def _legacy_discovery_sidecars(
+    tree: Path,
+    files: list[dict],
+    receipt: dict,
+    artifact_paths: set[str],
+    policy_digest: str,
+) -> set[str]:
+    actual_paths = {row["path"] for row in files if row["type"] == "file"}
+    candidates = {
+        path
+        for path in LEGACY_DISCOVERY_SIDECARS
+        if path in actual_paths and path not in artifact_paths
+    }
+    if not candidates:
+        return set()
+    from description_pipeline.interface_records import RECOVERY_HISTORICAL_POLICY_DIGESTS
+
+    require(
+        policy_digest in RECOVERY_HISTORICAL_POLICY_DIGESTS,
+        "recovery_member_hash_mismatch",
+        "legacy discovery sidecars require an exact historical policy",
+    )
+    require(
+        candidates == LEGACY_DISCOVERY_SIDECARS,
+        "recovery_member_hash_mismatch",
+        "legacy discovery sidecars must be present as an exact pair",
+    )
+    if receipt.get("stage") != "discover":
+        require(
+            False,
+            "recovery_member_hash_mismatch",
+            "legacy discovery sidecars appear outside a discover checkpoint",
+        )
+    if NATIVE_STAGES_MEMBER not in artifact_paths:
+        require(
+            False,
+            "recovery_member_hash_mismatch",
+            "legacy discovery sidecars have no receipt-bound native stage view",
+        )
+    native_stages_sha256 = sha256_file(tree / NATIVE_STAGES_MEMBER)
+    require(
+        receipt.get("native_stages_sha256") == native_stages_sha256,
+        "recovery_member_hash_mismatch",
+        "legacy discovery sidecars are not bound by the receipt native-stage digest",
+    )
+
+    from description_pipeline.io import PipelineError, canonical
+    from description_pipeline.platform.native_recovery import validate_native_discovery_stage
+    from description_pipeline.sources.solidworks.discovery import (
+        DISCOVERY_SCHEMA,
+        FINDING_SCHEMA,
+        IDENTITY_SCHEMA,
+    )
+
+    try:
+        _, native_stages = strict_json_file(tree / NATIVE_STAGES_MEMBER, "native stage view")
+        require(
+            isinstance(native_stages, dict),
+            "recovery_member_hash_mismatch",
+            "native stage view is not an object",
+        )
+        producer_run_id = tree.parent.name
+        require(
+            isinstance(producer_run_id, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}", producer_run_id) is not None,
+            "recovery_member_hash_mismatch",
+            "discover checkpoint tree has no safe producer run identity",
+        )
+        validate_native_discovery_stage(
+            native_stages,
+            run_id=producer_run_id,
+            handoff_sha256=native_stages.get("handoff_sha256"),
+        )
+    except (PipelineError, RecoveryError) as error:
+        raise RecoveryError(
+            "recovery_member_hash_mismatch",
+            "legacy discovery sidecars carry an invalid native stage view",
+        ) from error
+
+    references = {path: [] for path in DISCOVERY_ALIAS_FILES.values()}
+    try:
+        stages = native_stages["stages"]
+        allowed_positions = [
+            stages[1]["output_qc"][1]["details"]["files"],
+            stages[4]["inputs"][0]["files"],
+            stages[5]["inputs"][0]["files"],
+        ]
+    except (IndexError, KeyError, TypeError) as error:
+        raise RecoveryError(
+            "recovery_member_hash_mismatch",
+            "legacy discovery alias stage positions are missing",
+        ) from error
+    require(
+        all(isinstance(files, dict) for files in allowed_positions),
+        "recovery_member_hash_mismatch",
+        "legacy discovery alias stage position is not a file map",
+    )
+    require(
+        all(set(DISCOVERY_ALIAS_FILES) <= set(files) for files in allowed_positions),
+        "recovery_member_hash_mismatch",
+        "legacy discover aliases are not declared at every exact stage position",
+    )
+    allowed_file_maps = {id(files) for files in allowed_positions}
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(key, str) and key.startswith("input/discovery/"):
+                    require(
+                        id(value) in allowed_file_maps,
+                        "recovery_member_hash_mismatch",
+                        f"discovery alias appears outside a stage file map: {key}",
+                    )
+                    path = DISCOVERY_ALIAS_FILES.get(key)
+                    require(
+                        path is not None,
+                        "recovery_member_hash_mismatch",
+                        f"unknown discovery sidecar alias: {key}",
+                    )
+                    require(
+                        isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) is not None,
+                        "recovery_member_hash_mismatch",
+                        f"discovery sidecar alias has no SHA-256: {key}",
+                    )
+                    references[path].append(item)
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(native_stages)
+    for alias, path in DISCOVERY_ALIAS_FILES.items():
+        present = path in actual_paths
+        bound = references[path]
+        if not present and not bound:
+            continue
+        require(
+            present and bound,
+            "recovery_member_hash_mismatch",
+            f"discovery alias and its native-stage references differ: {alias}",
+        )
+        actual_sha256 = sha256_file(tree / path)
+        require(
+            all(value == actual_sha256 for value in bound),
+            "recovery_member_hash_mismatch",
+            f"discovery alias SHA-256 differs: {alias}",
+        )
+
+    handoff_sha256 = native_stages.get("handoff_sha256")
+    require(
+        isinstance(handoff_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", handoff_sha256) is not None,
+        "recovery_member_hash_mismatch",
+        "native stage view has no handoff SHA-256",
+    )
+    if "discovery/identity-resolution.json" in candidates:
+        try:
+            _, identity = strict_json_file(
+                tree / "discovery/identity-resolution.json",
+                "legacy identity resolution",
+            )
+        except RecoveryError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                "legacy identity resolution is unreadable",
+            ) from error
+        require(
+            "evidence/discovery.json" in artifact_paths,
+            "recovery_member_hash_mismatch",
+            "legacy findings has no receipt-bound discovery evidence",
+        )
+        try:
+            _, discovery = strict_json_file(tree / "evidence/discovery.json", "discovery evidence")
+        except RecoveryError as error:
+            raise RecoveryError(
+                "recovery_member_hash_mismatch",
+                "receipt-bound discovery evidence is unreadable",
+            ) from error
+        require(
+            isinstance(discovery, dict)
+            and discovery.get("schema_version") == DISCOVERY_SCHEMA
+            and discovery.get("run_id") == producer_run_id
+            and discovery.get("handoff_sha256") == handoff_sha256
+            and isinstance(discovery.get("findings"), list),
+            "recovery_member_hash_mismatch",
+            "receipt-bound discovery evidence differs from the native stage view",
+        )
+        identity_document = discovery.get("identity")
+        require(
+            isinstance(identity_document, dict),
+            "recovery_member_hash_mismatch",
+            "receipt-bound discovery evidence has no identity",
+        )
+        require(
+            isinstance(identity, dict)
+            and identity.get("schema_version") == IDENTITY_SCHEMA
+            and identity.get("run_id") == producer_run_id
+            and identity.get("handoff_sha256") == handoff_sha256
+            and identity.get("hardware_id") == identity_document.get("hardware_id")
+            and identity.get("parent_revision") == identity_document.get("parent_revision")
+            and identity.get("revision") == identity_document.get("revision"),
+            "recovery_member_hash_mismatch",
+            "legacy identity resolution differs from discovery identity",
+        )
+        expected = canonical(
+            {
+                "schema_version": FINDING_SCHEMA,
+                "findings": discovery["findings"],
+            }
+        )
+        require(
+            (tree / "discovery/findings.json").read_bytes() == expected,
+            "recovery_member_hash_mismatch",
+            "legacy findings differ from the canonical discovery projection",
+        )
+    return candidates
+
+
 def verify_checkpoint_tree(
     tree: Path,
     files: list[dict],
@@ -2535,6 +2766,13 @@ def verify_checkpoint_tree(
             )
         sidecars = {name for name in STAMPED_EXTRA if name != "reports" and (tree / name).is_file()}
         expected_files = artifact_paths | {"manifest.json"} | sidecars
+        expected_files |= _legacy_discovery_sidecars(
+            tree,
+            files,
+            receipt,
+            artifact_paths,
+            delivery["policy"]["digest"],
+        )
         require(
             {row["path"] for row in files if row["type"] == "file"} == expected_files,
             "recovery_member_hash_mismatch",
