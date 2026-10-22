@@ -1634,6 +1634,15 @@ class WindowsEnvironmentPinTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery._validate_windows_recovery_state(state)
 
+    def test_domain_environment_must_be_an_object(self) -> None:
+        for value in (None, [], "", 1):
+            with self.subTest(value=value):
+                state = copy.deepcopy(self.state)
+                state["identity"]["domain_environment"] = value
+                with self.assertRaises(recovery.RecoveryError) as caught:
+                    recovery._validate_windows_recovery_state(state)
+                self.assertEqual(caught.exception.code, "windows_recovery_state_invalid")
+
     def test_device_basenames_are_not_filesystem_pins(self) -> None:
         for name in (
             "CON",

@@ -6107,6 +6107,11 @@ def _validate_windows_recovery_state(document: object) -> dict:
         "Windows endpoint port is malformed",
     )
     environment = identity["domain_environment"]
+    require(
+        isinstance(environment, dict),
+        "windows_recovery_state_invalid",
+        "Windows account environment pins are not canonical",
+    )
     environment_endpoint = _canonical_windows_pin(
         environment.get("DESCRIPTION_ENDPOINT_ROOT"),
         directory=True,
