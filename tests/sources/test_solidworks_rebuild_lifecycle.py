@@ -399,6 +399,7 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
             _, preparation = backend._rebuild_capture_copy(doc, PATH)
         self.assertEqual(doc.rebuild_calls, 1)
         self.assertEqual(doc.save_calls, 0)
+        self.assertEqual(refreshed.save_calls, 0)
         self.assertIs(preparation["save_flag_before"], False)
         self.assertIs(preparation["save_flag_after"], True)
         self.assertEqual(preparation["source_sha256_before"], "f" * 64)
