@@ -442,8 +442,7 @@ class _Doc:
         return os.path.basename(self._path)
 
     def ForceRebuild3(self, _force):
-        self.Extension.NeedsRebuild2 = 0
-        return True
+        raise AssertionError("capture rebuild must use IModelDocExtension.Rebuild")
 
     def GetType(self):
         return self._doc_type

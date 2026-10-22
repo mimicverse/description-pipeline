@@ -46,6 +46,8 @@ class _Extension:
             self._doc._revoked = True
         elif self._doc._rebuild_clears:
             self._doc.needs_rebuild2 = 0
+        if self._doc._rebuild_marks_dirty:
+            self._doc._save_flag = True
         return self._doc._rebuild_result
 
 
@@ -64,6 +66,7 @@ class _Doc:
         rebuild_clears=True,
         rebuild_result=True,
         rebuild_exception=None,
+        rebuild_marks_dirty=False,
     ):
         self._path = path
         self._revoked = False
@@ -74,9 +77,12 @@ class _Doc:
         self._rebuild_clears = rebuild_clears
         self._rebuild_result = rebuild_result
         self._rebuild_exception = rebuild_exception
+        self._rebuild_marks_dirty = rebuild_marks_dirty
+        self._save_flag = False
         self.needs_rebuild2 = needs_rebuild2
         self.rebuild_calls = 0
         self.force_rebuild_calls = 0
+        self.save_calls = 0
 
     @property
     def Extension(self):
@@ -89,7 +95,11 @@ class _Doc:
         return self._path
 
     def GetSaveFlag(self):
-        return False
+        return self._save_flag
+
+    def Save(self):
+        self.save_calls += 1
+        return True
 
     @property
     def IsOpenedReadOnly(self):
@@ -372,6 +382,55 @@ class RebuildDocumentLifecycleTests(unittest.TestCase):
         self.assertEqual(doc.rebuild_calls, 1)
         self.assertEqual(doc.force_rebuild_calls, 0)
         self.assertEqual(backend.refresh_calls, [PATH])
+
+    def test_rebuild_can_dirty_memory_without_saving_source(self):
+        refreshed = _Doc(PATH)
+        refreshed._save_flag = True
+        backend = _Backend(lambda: refreshed)
+        doc = _Doc(
+            PATH,
+            needs_rebuild2=1,
+            rebuild_marks_dirty=True,
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ):
+            _, preparation = backend._rebuild_capture_copy(doc, PATH)
+        self.assertEqual(doc.rebuild_calls, 1)
+        self.assertEqual(doc.save_calls, 0)
+        self.assertIs(preparation["save_flag_before"], False)
+        self.assertIs(preparation["save_flag_after"], True)
+        self.assertEqual(preparation["source_sha256_before"], "f" * 64)
+        self.assertEqual(preparation["source_sha256_after"], "f" * 64)
+
+    def test_rebuild_must_end_read_only(self):
+        backend = _Backend(lambda: _Doc(PATH, read_only=False))
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(_Doc(PATH, needs_rebuild2=1), PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertEqual(caught.exception.detail["state"]["read_only"], False)
+
+    def test_rebuild_must_end_with_a_clean_configuration(self):
+        backend = _Backend(
+            lambda: _Doc(
+                PATH,
+                configuration_needs_rebuild=True,
+            )
+        )
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="f" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(_Doc(PATH, needs_rebuild2=1), PATH)
+        self.assertEqual(caught.exception.code, "cad_rebuild_incomplete")
+        self.assertIs(
+            caught.exception.detail["state"]["configuration_needs_rebuild"],
+            True,
+        )
 
     def test_native_rebuild_exception_preserves_phase_and_state(self):
         backend = _Backend(lambda: _Doc(PATH))

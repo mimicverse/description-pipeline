@@ -146,6 +146,33 @@ class SessionTests(unittest.TestCase):
         self.assertIs(caught.exception.detail["result"], False)
         self.assertEqual(refreshed, [doc.GetPathName])
 
+    def test_capture_rebuild_rejects_truthy_non_boolean_result(self):
+        backend = SolidWorksBackend()
+        backend._capture_roots = [normalize_document_path("/snapshot/source")]
+        extension = SimpleNamespace(
+            NeedsRebuild2=1,
+            Rebuild=Mock(spec=["__call__"], return_value=1),
+        )
+        configuration = SimpleNamespace(Name="Default", NeedsRebuild=False)
+        doc = SimpleNamespace(
+            ConfigurationManager=SimpleNamespace(
+                ActiveConfiguration=configuration,
+            ),
+            Extension=extension,
+            GetSaveFlag=False,
+            GetPathName="/snapshot/source/robot.SLDASM",
+            IsOpenedReadOnly=True,
+        )
+        backend._document_by_path = Mock(return_value=doc)
+        with patch(
+            "description_pipeline.sources.solidworks.native._hash",
+            return_value="a" * 64,
+        ), self.assertRaises(CadError) as caught:
+            backend._rebuild_capture_copy(doc, doc.GetPathName)
+        self.assertEqual(caught.exception.code, "cad_rebuild_failed")
+        self.assertEqual(caught.exception.detail["result"], 1)
+        backend._document_by_path.assert_not_called()
+
     def test_loaded_references_must_also_be_read_only(self):
         doc = SimpleNamespace(IsOpenedReadOnly=False, GetPathName="part.SLDPRT")
         calls = []
