@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from cryptography.fernet import Fernet
+from description_pipeline.schemas import INSTALL_RECORD_SCHEMA
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
@@ -50,7 +51,7 @@ def install_record_fixture(state: Path, install_id: str, snapshot: Path) -> dict
     triple = {"version": "1.0.0", "source_commit": "a" * 40, "source_sha256": "b" * 64}
     snapshot_sha = recovery.sha256_file(snapshot)
     return {
-        "schema_version": "solidworks-to-urdf.install-record/v1",
+        "schema_version": INSTALL_RECORD_SCHEMA,
         "install_id": install_id,
         "timestamp": "2026-10-22T00:00:00Z",
         "snapshot": {"path": str(snapshot), "digest": snapshot_sha, "install_id": install_id},
