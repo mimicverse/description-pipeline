@@ -943,7 +943,11 @@ class LifecycleTests(unittest.TestCase):
             "      echo '{\"passed\":false,\"verb\":\"resume\",\"code\":\"settle-timeout\",\"message\":\"refused\"}'\n"
             '      exit "${FIXTURE_RESUME_RC}"\n'
             '    fi ;;\n'
-            "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
+            "  *\"-Verb stage\"*)\n"
+            '    if [ -n "${FIXTURE_STAGE_OUTPUT:-}" ]; then\n'
+            '      cat "$FIXTURE_STAGE_OUTPUT"; exit "${FIXTURE_STAGE_RC:-0}"\n'
+            '    fi\n'
+            "    echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
             '    if [ -n "${FIXTURE_PROMOTE_OUTPUT:-}" ]; then\n'
@@ -3990,7 +3994,11 @@ class InstallOrderingTests(unittest.TestCase):
             '      printf "%s|%s\\n" "$(stat -c %s "$file")" \\\n'
             '        "$(sha256sum "$file" | cut -d" " -f1)"\n'
             '    else echo absent; fi ;;\n'
-            "  *\"-Verb stage\"*) echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
+            "  *\"-Verb stage\"*)\n"
+            '    if [ -n "${FIXTURE_STAGE_OUTPUT:-}" ]; then\n'
+            '      cat "$FIXTURE_STAGE_OUTPUT"; exit "${FIXTURE_STAGE_RC:-0}"\n'
+            '    fi\n'
+            "    echo '{\"passed\":true,\"verb\":\"stage\"}' ;;\n"
             "  *\"-Verb promote\"*)\n"
             '    if [ "${FIXTURE_ACK_LOSS:-0}" = "1" ]; then exit 255; fi\n'
             '    if [ -n "${FIXTURE_PROMOTE_OUTPUT:-}" ]; then\n'
@@ -6353,6 +6361,7 @@ class InstallOrderingTests(unittest.TestCase):
 
     def test_windows_lost_or_contradictory_results_stay_unknown(self) -> None:
         cases = (
+            ("structured-unknown", 2, '{"passed":false,"code":"instance_lifecycle_exception","verb":"promote"}\r\n'),
             ("lost-transport", 255, CAPTURED_WINDOWS_CANDIDATE_CONFIG_MISMATCH),
             ("malformed", 1, "not-json\r\n"),
             ("empty", 1, ""),
@@ -6406,6 +6415,40 @@ class InstallOrderingTests(unittest.TestCase):
                     f"{remote_rc}\n",
                     label,
                 )
+
+    def test_stage_acl_exceptions_are_definite_and_raw_evidence_is_preserved(self) -> None:
+        for operation, remote_rc in (("set", 1), ("assert", 1), ("set", 0), ("assert", 2)):
+            with self.subTest(operation=operation, remote_rc=remote_rc), tempfile.TemporaryDirectory() as tmp:
+                release, env, _ = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+                self.assertEqual(self._install(release, env).returncode, 0)
+                state = Path(tmp) / "state"
+                before = (state / "install-record.json").read_bytes()
+                output = Path(tmp) / "stage-exception.out"
+                document = {
+                    "passed": False, "code": "instance_lifecycle_exception", "verb": "stage",
+                    "phase": "stage-acl-" + operation, "role": "endpoint_config", "operation": operation,
+                    "hresult": -2147024891, "error_id": "UnauthorizedAccessException",
+                }
+                raw = ("pip succeeded\n" + json.dumps(document) + "\n").encode()
+                output.write_bytes(raw)
+                result = self._maintenance(
+                    release, dict(env, FIXTURE_STAGE_OUTPUT=str(output), FIXTURE_STAGE_RC=str(remote_rc)),
+                    "stage", "gen-2",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                expected = "unknown" if remote_rc == 2 else "failed"
+                if remote_rc != 2:
+                    self.assertIn("definite refusal", result.stderr)
+                    self.assertNotIn("unacknowledged", result.stderr)
+                else:
+                    self.assertIn("unacknowledged", result.stderr)
+                self.assertEqual((state / "install-record.json").read_bytes(), before)
+                promotion = state / "promotions" / "gen-2"
+                self.assertEqual((promotion / "windows-stage.out").read_bytes(), raw)
+                self.assertEqual((promotion / "windows-stage.out.ssh-rc").read_text().strip(), str(remote_rc))
+                receipt = json.loads((promotion / "receipt.json").read_text())
+                step = next(row for row in receipt["steps"] if row["step"] == "windows-generation")
+                self.assertEqual(step["status"], expected)
 
     def test_unwritable_existing_lifecycle_output_is_not_read_as_fresh_evidence(self) -> None:
         if os.geteuid() == 0:
