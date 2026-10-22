@@ -13,12 +13,17 @@
 #
 #   install.sh --stage:  build and verify the generation's runtime only (venv, hash-locked
 #                        dependencies, doctor); no configuration switch and no migration -
-#                        the stage half of the promote protocol.  Other arguments are ignored.
+#                        the stage half of the promote protocol.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODE="${1:-}"
 
 die() { echo "install.sh: $*" >&2; exit 1; }
+
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--stage" ]; }; then
+  echo "usage: $0 [--stage]" >&2
+  exit 2
+fi
+MODE="${1:-}"
 
 : "${AIRFLOW_VENV:?set AIRFLOW_VENV to the private venv path}"
 : "${AIRFLOW_HOME:?set AIRFLOW_HOME to the Airflow home directory}"

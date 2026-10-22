@@ -35,7 +35,6 @@ class WorkflowTests(unittest.TestCase):
                 "robot_name": "arm",
                 "assembly": "assembly.SLDASM",
                 "configuration": "Default",
-                "material_source": "cad",
                 "bodies": [
                     {
                         "id": "base",

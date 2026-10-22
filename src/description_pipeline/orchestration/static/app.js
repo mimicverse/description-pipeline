@@ -10,11 +10,14 @@ import {
   infoPanelRows,
   jointRows,
   linkRows,
+  previewDiagnosticState,
   previewExpansion,
   purposeLabel,
+  registeredQualityArtifact,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
+  warningSourceRows,
 } from "/static/preview_logic.js";
 
 const state = {
@@ -491,7 +494,7 @@ function clearPreview() {
   $("preview-meta").textContent = "";
   $("preview-info").textContent = "";
   $("preview-diagnostic").hidden = true;
-  $("preview-diagnostic").textContent = "";
+  $("preview-diagnostic").replaceChildren();
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
   $("preview-panels").querySelectorAll(".panel-table").forEach((node) => {
@@ -1054,12 +1057,24 @@ const WARNING_VALUE_KEYS = [
   "scope",
   "mass_kg",
   "masses",
+  "object_type",
+  "object",
+  "objects",
+  "fields",
+  "field",
+  "original",
+  "actual",
+  "source",
+  "rule_id",
+  "rule_version",
+  "reason",
   "qualification_blocker",
   "publication_blocker",
 ];
 
 function warningValueText(value) {
-  if (value === null || value === undefined) return "";
+  if (value === null) return "null";
+  if (value === undefined) return "";
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
@@ -1072,6 +1087,62 @@ function warningValueText(value) {
     return `${shown.join("; ")}${Object.keys(value).length > entries.length ? " ..." : ""}`;
   }
   return String(value);
+}
+
+const WARNING_SOURCE_KEYS = new Set([
+  "object_type",
+  "object",
+  "objects",
+  "fields",
+  "field",
+  "original",
+  "actual",
+  "source",
+  "rule_id",
+  "rule_version",
+  "reason",
+  "file",
+  "sha256",
+  "anchor",
+  "key",
+  "reference",
+  "native_observation_errors",
+]);
+
+function warningSourceText(value) {
+  return value === undefined ? "not recorded" : warningValueText(value);
+}
+
+function appendWarningSourceRows(parent, warning) {
+  const rows = warningSourceRows(warning);
+  if (!rows.length) return false;
+  const details = expandable(parent, `Source values (${rows.length})`);
+  details.className = "warning-sources";
+  for (const row of rows) {
+    const line = document.createElement("p");
+    line.className = "warning-source";
+    const parts = [
+      row.object_type ? `${row.object_type}:${row.object || "unknown"}` : row.object,
+      row.fields.length ? `field=${row.fields.join(",")}` : "",
+      `source=${warningSourceText(row.source)}`,
+      `rule_id=${warningSourceText(row.rule_id)}`,
+      `rule_version=${warningSourceText(row.rule_version)}`,
+      `original=${warningSourceText(row.original)}`,
+      `actual=${warningSourceText(row.actual)}`,
+      `reason=${warningSourceText(row.reason)}`,
+      row.file ? `file=${row.file}` : "",
+      row.sha256 ? `sha256=${row.sha256}` : "",
+      row.anchor ? `anchor=${row.anchor}` : "",
+      row.key ? `key=${row.key}` : "",
+      row.reference ? `reference=${row.reference}` : "",
+      row.native_observation_errors.length
+        ? `native_observation_errors=${warningSourceText(row.native_observation_errors)}`
+        : "",
+    ].filter(Boolean);
+    line.textContent = parts.join("; ");
+    details.append(line);
+  }
+  return true;
 }
 
 function stageWarningRow(row) {
@@ -1109,7 +1180,13 @@ function stageWarningRow(row) {
     line.textContent = blockers.join("; ");
     item.append(line);
   }
-  const keys = WARNING_VALUE_KEYS.filter((key) => row[key] !== undefined && row[key] !== null);
+  const hasSourceRows = appendWarningSourceRows(item, row);
+  const keys = WARNING_VALUE_KEYS.filter(
+    (key) =>
+      row[key] !== undefined &&
+      row[key] !== null &&
+      !(hasSourceRows && WARNING_SOURCE_KEYS.has(key)),
+  );
   const residual = row.residual && typeof row.residual === "object" ? Object.entries(row.residual) : [];
   if (keys.length || residual.length) {
     const details = expandable(item, "Recorded values");
@@ -1542,7 +1619,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   const data = {
     robot: await loadPreviewArtifactJson(artifactUrl, preview.files, "model/robot.json", signal),
     tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal),
-    quality: await loadPreviewArtifactJson(artifactUrl, preview.files, "reports/quality.json", signal),
+    quality: await loadPreviewArtifactJson(artifactUrl, preview.report_files, "reports/quality.json", signal),
   };
   state.previewData = data;
   const identity = summaryIdentity({ runId: state.dagRunId, subjectSha256: preview.subject_sha256 });
@@ -2390,26 +2467,78 @@ function renderRun(run) {
 
 function renderPreviewDiagnostic(preview) {
   const node = $("preview-diagnostic");
-  if (preview.verified !== false) {
+  const diagnostic = previewDiagnosticState(preview);
+  if (!diagnostic.visible) {
     node.hidden = true;
-    node.textContent = "";
+    node.replaceChildren();
     return;
   }
-  const lines = ["Engineering verification failed: this delivery is diagnostic only and must not be published."];
+  node.replaceChildren();
+  node.hidden = false;
+  if (diagnostic.unverified) {
+    const failure = document.createElement("p");
+    failure.className = "preview-failure";
+    failure.textContent = "Engineering verification failed: this delivery is diagnostic only and must not be published.";
+    node.append(failure);
+  }
   const checks = Array.isArray(preview.failing_checks) ? preview.failing_checks : [];
   const checksTotal = Number.isInteger(preview.failing_checks_total) ? preview.failing_checks_total : checks.length;
   if (checks.length) {
     const shown = checks.slice(0, 8).map((check) => `${check.id} (${check.message || "check failed"})`);
-    lines.push(`Failed checks: ${shown.join(", ")}${checksTotal > shown.length ? ` and ${checksTotal} total` : ""}`);
+    const line = document.createElement("p");
+    line.textContent =
+      `Failed checks: ${shown.join(", ")}` +
+      `${checksTotal > shown.length ? ` and ${checksTotal} total` : ""}`;
+    node.append(line);
   }
-  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
-  const warningsTotal = Number.isInteger(preview.warnings_total) ? preview.warnings_total : warnings.length;
-  if (warnings.length) {
-    const shown = warnings.slice(0, 6).map((item) => `${item.code || "warning"}${item.object ? ` (${item.object})` : ""}`);
-    lines.push(`Warnings: ${shown.join(", ")}${warningsTotal > shown.length ? ` and ${warningsTotal} total` : ""}`);
+  if (diagnostic.warnings.length) {
+    const warningDetails = expandable(node, `Source warnings (${diagnostic.warnings_total})`);
+    warningDetails.className = "preview-warning-sources";
+    const statement = document.createElement("p");
+    statement.className = "muted small";
+    statement.textContent =
+      "Recorded source warnings are neither passes nor publication evidence. " +
+      "Default ranges are not native mechanical limits or hardware qualifications.";
+    warningDetails.append(statement);
+    const qualityArtifact = registeredQualityArtifact(preview, state.dagRunId);
+    if (qualityArtifact) {
+      const link = document.createElement("a");
+      link.href = qualityArtifact.href;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.dataset.sha256 = qualityArtifact.sha256;
+      link.textContent = "Open registered quality report (reports/quality.json)";
+      warningDetails.append(link);
+    }
+    for (const warning of diagnostic.warnings) {
+      const group = document.createElement("div");
+      group.className = "preview-warning";
+      const heading = document.createElement("strong");
+      heading.textContent = `${warning.code || "warning"}${warning.object ? ` · ${warning.object}` : ""}`;
+      group.append(heading);
+      if (warning.message) {
+        const message = document.createElement("p");
+        message.className = "warning-message";
+        message.textContent = warning.message;
+        group.append(message);
+      }
+      if (!appendWarningSourceRows(group, warning)) {
+        const recorded = document.createElement("p");
+        recorded.className = "warning-source muted small";
+        recorded.textContent = "No object-level source fields were recorded.";
+        group.append(recorded);
+      }
+      warningDetails.append(group);
+    }
+    if (diagnostic.warnings_total > diagnostic.warnings.length) {
+      const more = document.createElement("p");
+      more.className = "muted small";
+      more.textContent =
+        `${diagnostic.warnings_total - diagnostic.warnings.length} more warning groups ` +
+        "are available in the report.";
+      warningDetails.append(more);
+    }
   }
-  node.textContent = lines.join("\n");
-  node.hidden = false;
 }
 
 async function loadPreview(dagRunId) {

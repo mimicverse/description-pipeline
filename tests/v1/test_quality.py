@@ -34,7 +34,6 @@ class PhysicsTests(unittest.TestCase):
         second = np.array([[0, -1, 0, -0.2], [1, 0, 0, 0.1], [0, 0, 1, 0.3], [0, 0, 0, 1]], dtype=float)
         datum = np.array([[0, -1, 0, 0.05], [1, 0, 0, -0.03], [0, 0, 1, 0.1], [0, 0, 0, 1]], dtype=float)
         self.source = {
-            "material_source": "cad",
             "assembly": "robot.SLDASM",
             "configuration": "Default",
             "bodies": [
@@ -183,7 +182,7 @@ class PhysicsTests(unittest.TestCase):
         selection = sorted(
             str(note["component"])
             for *_rest, note in oracle._resolved_contributions(
-                self.source["bodies"][0], self.raw, self.masses, {}, effective
+                self.source["bodies"][0], self.raw, self.masses, effective
             )
         )
         read = {
@@ -242,7 +241,6 @@ class PhysicsTests(unittest.TestCase):
                 for name, matrix in self.raw["coordinate_systems"].items()
             ],
             "link_group_mass_properties": copy.deepcopy(self.link_direct),
-            "declared_masses": {"items": {}, "evidence": None},
             "mass_closure": native,
             "collection": {
                 "kind": "solidworks",
@@ -523,47 +521,14 @@ class PhysicsTests(unittest.TestCase):
         ):
             return quality.rebuilt_definition(self.bundle)["source"]
 
-    def test_rebuilt_source_binds_material_source_and_passes_authority(self):
-        # The material authority is the sealed capture config's own value; with
-        # the CAD table empty and the evidence absent the authority gate passes
-        # (the historical None -> {} coercion failed exactly here).
+    def test_rebuilt_source_has_no_external_mass_authority(self):
         self._record_clean_provenance()
         self.write()
         source = self._rebuilt_source()
-        self.assertEqual(source["material_source"], "cad")
-        self.assertIsNone(source["mass_evidence"])
+        self.assertNotIn("documented_masses", source)
+        self.assertNotIn("mass_evidence", source)
         checks = {check["id"]: check for check in verify_physics(self.root, source, self.model)}
         self.assertTrue(checks["physics.authority"]["passed"], checks["physics.authority"])
-
-    def test_rebuilt_source_missing_material_source_fails_closed_without_a_default(self):
-        self._record_clean_provenance()
-        self.write()
-        # The negative mutates the actual bound authority the verifier consumes:
-        # the sealed capture provenance block loses its declared material source.
-        self.store_block(
-            "material_provenance",
-            {
-                "schema_version": "solidworks-to-urdf.material-provenance/v1",
-                "assembly": self.captured_identity["assembly"],
-                "configuration": self.source["configuration"],
-                "measured_source": "cad_api",
-                "warnings": [],
-            },
-        )
-        with self.assertRaises(PipelineError) as raised:
-            self._rebuilt_source()
-        self.assertIn("material_source", str(raised.exception))
-        self.assertNotIsInstance(raised.exception, KeyError)
-
-    def test_rebuilt_mass_evidence_fidelity_keeps_null_and_dicts_verbatim(self):
-        # No ``or {}`` upgrade: null stays absent and a recorded binding is
-        # passed through byte-for-byte to the authority comparison.
-        self._record_clean_provenance()
-        self.write()
-        self.assertIsNone(self._rebuilt_source()["mass_evidence"])
-        binding = {"reference": "vendor table", "file": "docs/masses.json", "sha256": "0" * 64}
-        self.store_block("declared_masses", {"items": {}, "evidence": binding})
-        self.assertEqual(self._rebuilt_source()["mass_evidence"], binding)
 
     def _record_clean_provenance(self) -> None:
         """The canonical records a current CAD capture seals with every material verified."""
@@ -574,7 +539,6 @@ class PhysicsTests(unittest.TestCase):
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
                 "assembly": self.captured_identity["assembly"],
                 "configuration": self.source["configuration"],
-                "material_source": "cad",
                 "measured_source": "cad_api",
                 "warnings": [],
             },
@@ -626,7 +590,6 @@ class PhysicsTests(unittest.TestCase):
                 "schema_version": "solidworks-to-urdf.material-provenance/v1",
                 "assembly": self.captured_identity["assembly"],
                 "configuration": self.source["configuration"],
-                "material_source": "cad",
                 "measured_source": "cad_api",
                 "warnings": [
                     {
@@ -829,12 +792,6 @@ class PhysicsTests(unittest.TestCase):
             payload["configuration"] = "Other"
             store(payload)
 
-        def changed_material_source() -> None:
-            self._record_unverified_material()
-            payload = load()
-            payload["material_source"] = "documented_table"
-            store(payload)
-
         def changed_measured_source() -> None:
             self._record_unverified_material()
             payload = load()
@@ -867,7 +824,6 @@ class PhysicsTests(unittest.TestCase):
             ("changed_assembly", changed_assembly),
             ("changed_captured_assembly", changed_captured_assembly),
             ("changed_record_configuration", changed_record_configuration),
-            ("changed_material_source", changed_material_source),
             ("changed_measured_source", changed_measured_source),
         ):
             with self.subTest(case=label):
@@ -1150,12 +1106,12 @@ class PhysicsTests(unittest.TestCase):
             "q": {"mass": 1.0, "com": [0.0, 0.0, 0.0], "inertia": np.diag([0.004, 0.005, 0.006]).tolist(),
                   "reference": {"scope": "part_document", "product_convention": "solidworks_standard"}},
         }
-        world = oracle._raw_world({"id": "x", "components": ["p/a", "p/b", "q"]}, raw, masses, {})
+        world = oracle._raw_world({"id": "x", "components": ["p/a", "p/b", "q"]}, raw, masses)
         self.assertAlmostEqual(world["mass"], 5.0, places=12)
         expected_com = (4.0 * np.array([-1.0, -1.05, -0.9]) + 1.0 * np.array([0.5, -0.25, 0.75])) / 5.0
         self.assertTrue(np.allclose(world["com"], expected_com, atol=1e-12))
         with self.assertRaises(ValueError):
-            oracle._raw_world({"id": "x", "components": ["p/a"]}, raw, masses, {})
+            oracle._raw_world({"id": "x", "components": ["p/a"]}, raw, masses)
 
     def _mark_instance_measurement(self) -> None:
         """a's part row stays the diagnostic; the assembly singleton is authoritative."""

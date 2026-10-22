@@ -53,7 +53,16 @@ from ..sources.solidworks.session_artifacts import (
     session_materialization_under_root,
     session_root_pid,
 )
-from ..sources.solidworks.native_limits import limit_entity_owners, validate_native_limit
+from ..sources.solidworks.native_limits import (
+    ENGINEERING_DEFAULT_POLICY_ID,
+    ROTATION_WINDOW_RAD,
+    NativeLimitInvalidError,
+    NativeLimitReadError,
+    limit_entity_owners,
+    native_limit_inventory_complete,
+    rotation_window_policy,
+    validate_native_limit,
+)
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
 DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
@@ -2367,54 +2376,78 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         limits: dict | None = None
         limit_evidence = None
         limit_source = None
+        default_policy = None
         native_limits = group["limits"]
         validated_native = set()
+        native_read_errors = []
+        for observed in mates:
+            observed_kind = str(observed.get("type") or "").strip().lower()
+            _require(
+                observed.get("native_limit") is None
+                or observed_kind in {"limitdistance", "limitangle"},
+                "discovery.joint_limits_invalid",
+                "a non-limit mate carries native position-limit evidence",
+                {"pair": [left, right], "mate": observed.get("name")},
+            )
         for mate_item in mates:
             mate_kind = str(mate_item.get("type") or "").strip().lower()
             if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                if mate_item.get("suppressed") is True:
+                    continue
+                if mate_item.get("is_advanced_mate_error") is not None:
+                    native_read_errors.append(
+                        {"mate": mate_item.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                    )
                 continue
             if mate_item.get("suppressed") is True:
                 continue
-            _require(
-                mate_item.get("suppressed") is False and mate_item.get("error_code") == 0,
-                "discovery.joint_limits_unreadable",
-                "native limit suppression or solve state is not clean",
-                {"pair": [left, right], "mate": mate_item.get("name")},
-            )
+            if mate_item.get("suppressed") is not False or mate_item.get("error_code") != 0:
+                native_read_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "suppression or solve state is not clean"}
+                )
+                continue
             flag = mate_item.get("is_advanced_mate")
-            _require(
-                type(flag) is bool and mate_item.get("is_advanced_mate_error") is None,
-                "discovery.joint_limits_unreadable",
-                "IsAdvancedMate is missing or unreadable",
-                {"pair": [left, right], "mate": mate_item.get("name")},
-            )
+            if type(flag) is not bool or mate_item.get("is_advanced_mate_error") is not None:
+                native_read_errors.append(
+                    {"mate": mate_item.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                )
+                continue
             if flag is not True:
+                _require(
+                    mate_item.get("native_limit") is None,
+                    "discovery.joint_limits_invalid",
+                    "a disabled limit mate carries native position-limit evidence",
+                    {"pair": [left, right], "mate": mate_item.get("name")},
+                )
                 continue
             _require(
                 mate_kind in {"limitdistance", "limitangle"},
-                "discovery.joint_limits_unreadable",
+                "discovery.joint_limits_invalid",
                 "advanced flag is attached to a standard mate",
                 {"pair": [left, right], "mate": mate_item.get("name")},
             )
             try:
                 lower, upper, unit = validate_native_limit(mate_item, component_records)
-            except ValueError as error:
+            except NativeLimitReadError as error:
+                native_read_errors.append({"mate": mate_item.get("name"), "reason": str(error)})
+                continue
+            except (NativeLimitInvalidError, ValueError) as error:
                 raise _Failure(
-                    "discovery.joint_limits_unreadable",
+                    "discovery.joint_limits_invalid",
                     str(error),
                     {"pair": [left, right], "mate": mate_item.get("name")},
                 ) from error
             expected_unit = "m" if joint_type == "prismatic" else "rad"
             _require(
                 unit == expected_unit,
-                "discovery.joint_limits_unreadable",
+                "discovery.joint_limits_invalid",
                 "native limit unit does not match the joint type",
                 {"pair": [left, right], "unit": unit, "expected": expected_unit},
             )
             owners = limit_entity_owners(mate_item, owner_for, assembly_owner=assembly_owner)
             _require(
                 owners is not None and set(owners) == {left_body, right_body},
-                "discovery.joint_limits_unreadable",
+                "discovery.joint_limits_invalid",
                 "native limit entities do not bind the declared joint bodies",
                 {"pair": [left, right], "mate": mate_item.get("name"), "owners": owners},
             )
@@ -2425,14 +2458,76 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             "native position-limit observations disagree for one joint",
             {"pair": [left, right], "ranges": sorted(validated_native)},
         )
+        author_limits = None
+        author_evidence = None
+        author_reference = properties.get(f"{namespace}.joint.limits_record")
+        if isinstance(author_reference, str) and author_reference.strip():
+            entry = _find_record_entry(payload, author_reference)
+            value = _record_value(package, entry["entry"], entry["key"])
+            _require(
+                isinstance(entry["entry"].get("anchor"), str)
+                and bool(entry["entry"]["anchor"]),
+                "discovery.joint_limits_invalid",
+                "controlled limits record lacks an embedded anchor",
+                {"pair": [left, right], "reference": author_reference},
+            )
+            _require(
+                isinstance(value, dict),
+                "discovery.joint_limits_invalid",
+                "controlled limits record must contain an object",
+                {"pair": [left, right], "reference": author_reference},
+            )
+            author_lower = _number(value.get("lower"))
+            author_upper = _number(value.get("upper"))
+            if author_lower is None or author_upper is None:
+                raise _Failure(
+                    "discovery.joint_limits_invalid",
+                    "controlled limits record lacks finite lower/upper values",
+                    {"pair": [left, right], "reference": author_reference},
+                ) from None
+            _require(
+                math.isfinite(author_lower)
+                and math.isfinite(author_upper)
+                and author_lower <= author_upper,
+                "discovery.joint_limits_invalid",
+                "controlled position limits must be finite and ordered",
+                {"pair": [left, right], "lower": author_lower, "upper": author_upper},
+            )
+            author_limits = (author_lower, author_upper)
+            author_evidence = {
+                "kind": "controlled_record",
+                "file": entry["entry"].get("package_file"),
+                "sha256": entry["entry"].get("sha256"),
+                "anchor": entry["entry"].get("anchor"),
+                "key": str(entry["entry"].get("key") or entry["key"]),
+                "reference": str(entry["entry"].get("reference") or author_reference),
+                "declared_values": {
+                    key: value[key]
+                    for key in ("lower", "upper", "effort", "velocity")
+                    if key in value
+                },
+                "native_observation_errors": list(native_read_errors),
+            }
+        if native_read_errors and (validated_native or isinstance(native_limits, dict)):
+            raise _Failure(
+                "discovery.joint_limits_unreadable",
+                "native position-limit evidence is incomplete or unreadable",
+                {"pair": [left, right], "errors": native_read_errors},
+            )
         if validated_native:
             lower, upper, unit = next(iter(validated_native))
             native_limits = {"lower": lower, "upper": upper, "unit": unit}
         if joint_type == "continuous":
             _require(
                 not isinstance(native_limits, dict),
-                "discovery.joint_rebuild",
+                "discovery.joint_limits_unexpected",
                 "a continuous joint carries native position limits",
+                {"pair": [left, right]},
+            )
+            _require(
+                author_limits is None,
+                "discovery.joint_limits_unexpected",
+                "a continuous joint declares an author position range",
                 {"pair": [left, right]},
             )
         elif isinstance(native_limits, dict):
@@ -2444,7 +2539,37 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 {"pair": [left, right], "unit": native_limits.get("unit")},
             )
             limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
+            if author_limits not in {None, (0.0, 0.0), (limits["lower"], limits["upper"])}:
+                raise _Failure(
+                    "discovery.joint_limits_conflict",
+                    "native range disagrees with the saved author declaration",
+                    {"pair": [left, right], "native": limits, "declared": author_limits},
+                )
+            limit_evidence = author_evidence
             limit_source = "native"
+        elif author_limits is not None:
+            limits = {"lower": author_limits[0], "upper": author_limits[1]}
+            limit_source = "declared_author"
+            limit_evidence = author_evidence
+        elif purpose == "engineering" and joint_type == "revolute":
+            default_policy = rotation_window_policy(
+                ENGINEERING_DEFAULT_POLICY_ID,
+                author_limits=None,
+                native_absence=(
+                    "complete_mate_inventory_no_enabled_limit"
+                    if native_limit_inventory_complete(raw_mates) and not native_read_errors
+                    else "native_limit_observation_unreadable"
+                ),
+                native_errors=native_read_errors,
+            )
+            limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
+            limit_source = "default_policy"
+        elif native_read_errors:
+            raise _Failure(
+                "discovery.joint_limits_unreadable",
+                "native position-limit evidence is incomplete or unreadable",
+                {"pair": [left, right], "errors": native_read_errors},
+            )
         else:
             raise _Failure(
                 "discovery.joint_rebuild",
@@ -2453,19 +2578,26 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             )
         drive_reference = properties.get(f"{namespace}.joint.drive_record")
         drive = None
+        drive_evidence = None
         if isinstance(drive_reference, str) and drive_reference.strip():
             entry = _find_record_entry(payload, drive_reference)
             value = _record_value(package, entry["entry"], entry["key"])
+            _require(
+                isinstance(entry["entry"].get("anchor"), str)
+                and bool(entry["entry"]["anchor"]),
+                "discovery.joint_rebuild",
+                "controlled drive record lacks an embedded anchor",
+                {"pair": [left, right], "reference": drive_reference},
+            )
             _require(
                 isinstance(value, dict),
                 "discovery.joint_rebuild",
                 "drive record must contain an object",
                 {"pair": [left, right]},
             )
-            try:
-                effort = float(value["effort"])
-                velocity_limit = float(value["velocity"])
-            except (KeyError, TypeError, ValueError):
+            effort = _number(value.get("effort"))
+            velocity_limit = _number(value.get("velocity"))
+            if effort is None or velocity_limit is None:
                 raise _Failure(
                     "discovery.joint_rebuild",
                     "drive record lacks finite effort/velocity",
@@ -2486,6 +2618,19 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "anchor": entry["entry"].get("anchor"),
                 "value": value,
             }
+            drive_evidence = {
+                "kind": "controlled_record",
+                "file": entry["entry"].get("package_file"),
+                "sha256": entry["entry"].get("sha256"),
+                "anchor": entry["entry"].get("anchor"),
+                "key": str(entry["entry"].get("key") or entry["key"]),
+                "reference": str(entry["entry"].get("reference") or drive_reference),
+                "declared_values": {
+                    key: value[key]
+                    for key in ("effort", "velocity")
+                    if key in value
+                },
+            }
         facts.append(
             {
                 "nodes": (left_body, right_body),
@@ -2500,8 +2645,10 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                     "axis_reference": axis_reference,
                     "limits": limits,
                     "drive": drive,
+                "drive_evidence": drive_evidence,
                     "limit_evidence": limit_evidence,
                     "limit_source": limit_source,
+                    **({"default_policy": default_policy} if default_policy is not None else {}),
                 },
             }
         )
@@ -3439,6 +3586,11 @@ def verify_discovery(package: Path) -> dict:
                 {"mate": mate.get("name")},
             )
             kind = str(mate.get("type") or "").strip().lower()
+            _require(
+                mate.get("native_limit") is None or kind in {"limitdistance", "limitangle"},
+                "discovery.graph", "a non-limit mate carries native position-limit evidence",
+                {"mate": mate.get("name")},
+            )
             limits = mate["limits"]
             if kind in {"limitdistance", "limitangle"}:
                 unit = "m" if kind == "limitdistance" else "rad"
@@ -4081,6 +4233,43 @@ def verify_discovery(package: Path) -> dict:
                     "the joint limits differ from the native mate",
                     {"joint": joint.get("name")},
                 )
+            elif joint.get("limit_source") == "default_policy" and expected_type == "revolute":
+                policy = joint.get("default_policy")
+                _require(
+                    isinstance(policy, dict)
+                    and policy.get("rule_id") == ENGINEERING_DEFAULT_POLICY_ID
+                    and policy.get("rule_version") == "v1"
+                    and policy.get("native_cad_ranges") is False
+                    and policy.get("hardware_qualified") is False
+                    and policy.get("engineering_position_range_qualified") is False
+                    and _close(
+                        [limits.get("lower"), limits.get("upper")],
+                        [-ROTATION_WINDOW_RAD, ROTATION_WINDOW_RAD],
+                        1e-12,
+                    ),
+                    "discovery.joints",
+                    "the engineering default window is not its exact versioned contract",
+                    {"joint": joint.get("name")},
+                )
+            elif joint.get("limit_source") == "declared_author" and expected_type in {"revolute", "prismatic"}:
+                _require(
+                    group["limits"] is None,
+                    "discovery.joints",
+                    "a declared author range cannot replace readable native limits",
+                    {"joint": joint.get("name")},
+                )
+                _require(
+                    isinstance(limits.get("lower"), (int, float))
+                    and not isinstance(limits.get("lower"), bool)
+                    and isinstance(limits.get("upper"), (int, float))
+                    and not isinstance(limits.get("upper"), bool)
+                    and math.isfinite(float(limits["lower"]))
+                    and math.isfinite(float(limits["upper"]))
+                    and limits["lower"] <= limits["upper"],
+                    "discovery.joints",
+                    "a declared author range is not finite and ordered",
+                    {"joint": joint.get("name"), "limits": limits},
+                )
             else:
                 _require(
                     False,
@@ -4465,18 +4654,22 @@ def verify_discovery(package: Path) -> dict:
 
 def _find_record_entry(payload: dict, reference: str) -> dict:
     relative, _, key = str(reference).partition("#")
-    for entry in payload.get("records") or []:
+    matches = [
+        entry
+        for entry in payload.get("records") or []
         if (
             isinstance(entry, dict)
             and str(entry.get("file")) == relative.replace("\\", "/")
             and str(entry.get("key") or "") == key
-        ):
-            return {"entry": entry, "key": key}
-    raise _Failure(
+        )
+    ]
+    _require(
+        len(matches) == 1,
         "discovery.record",
-        "the referenced controlled record was not embedded in the package",
-        {"reference": reference},
+        "the referenced controlled record must identify exactly one embedded entry",
+        {"reference": reference, "matches": len(matches)},
     )
+    return {"entry": matches[0], "key": key}
 
 
 def _source_record_identity(records) -> list[dict]:
@@ -4567,10 +4760,6 @@ def mass_closure(root) -> dict:
 
 def material_provenance(root) -> dict:
     return block(root, "material_provenance")
-
-
-def declared_masses(root) -> dict:
-    return block(root, "declared_masses")
 
 
 def dependency_closure(root) -> dict:

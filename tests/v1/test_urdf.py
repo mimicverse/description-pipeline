@@ -5,6 +5,7 @@ import struct
 import shutil
 import tempfile
 import unittest
+import copy
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -12,6 +13,7 @@ from description_pipeline.backends.urdf import MESH_PART_TRIANGLE_LIMIT, generat
 from description_pipeline.io import PipelineError, file_digest, read_data
 from description_pipeline.model import Robot
 from description_pipeline.sources.solidworks.naming import material_name, mesh_path
+from description_pipeline.verification.solidworks_urdf import _xml
 
 
 def _binary_stl(triangles: int) -> bytes:
@@ -82,6 +84,57 @@ class UrdfNumericContractTests(unittest.TestCase):
 
 
 class UrdfWriterTests(unittest.TestCase):
+    def test_frame_joint_uses_canonical_parent_to_child_identity(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        frame = scene["frames"][0]
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(Robot.from_dict(scene), source, Path(temp), name="frame_name")
+            document = ET.parse(output).getroot()
+        node = next(
+            joint
+            for joint in document.findall("joint")
+            if joint.find("child").get("link") == frame["name"]
+        )
+        self.assertEqual(node.get("name"), f"{frame['parent']}_to_{frame['name']}_joint")
+        self.assertEqual(node.find("parent").get("link"), frame["parent"])
+        self.assertEqual(node.find("child").get("link"), frame["name"])
+
+    def test_frame_joint_name_collision_is_rejected_before_writing(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        duplicate = copy.deepcopy(scene["frames"][0])
+        duplicate.update({"id": "tool_2", "name": "tool_"})
+        duplicate["provenance"]["joint_name_rule"]["child"] = "tool_"
+        scene["frames"].append(duplicate)
+        robot = Robot.from_dict(scene)
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            self.assertRaisesRegex(PipelineError, "Frame fixed joint name collides"),
+        ):
+            generate_urdf(robot, source, Path(temp), name="frame_collision")
+
+    def test_authored_joint_cannot_reserve_the_derived_frame_joint_name(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        auxiliary = copy.deepcopy(next(link for link in scene["links"] if link["name"] == "arm_link"))
+        auxiliary.update({"id": "aux_link", "name": "aux_link"})
+        scene["links"].append(auxiliary)
+        scene["joints"].append(
+            {
+                "id": "arm_link_to_tool_joint",
+                "name": "arm_link_to_tool_joint",
+                "type": "fixed",
+                "parent": "base_link",
+                "child": "aux_link",
+                "xyz": [0.0, 0.0, 0.0],
+                "rpy": [0.0, 0.0, 0.0],
+                "provenance": {"fixture": True},
+            }
+        )
+        with self.assertRaisesRegex(PipelineError, "collide"):
+            Robot.from_dict(scene)
+
     def test_broken_joint_reference_is_rejected_before_writing(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
         scene = read_data(source / "scene.json")
@@ -102,6 +155,89 @@ class UrdfWriterTests(unittest.TestCase):
                 {key: float(value) for key, value in node.find("limit").attrib.items()},
                 joint["limits"],
             )
+
+    def test_engineering_default_policy_and_warning_reach_the_urdf(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        joint = next(row for row in scene["joints"] if row["type"] == "revolute")
+        joint["limit_source"] = "default_policy"
+        joint["limits"] = {"lower": -math.pi, "upper": math.pi, "effort": 1.0, "velocity": 1.0}
+        joint["provenance"]["default_policy"] = {"rule_id": "engineering_rotation_default_window/v1"}
+        scene["provenance"].setdefault("value_warnings", []).append(
+            {
+                "code": "limits.default_policy",
+                "message": (
+                    "Engineering uses a versioned default rotation window because no usable native "
+                    "or authored position range was read; the engineering position range is unqualified."
+                ),
+                "objects": [{"object": joint["name"], "field": "limits"}],
+            }
+        )
+        robot = Robot.from_dict(scene)
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(robot, source, Path(temp), name="default_policy_arm")
+            parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+            document = ET.fromstring(output.read_bytes(), parser=parser)
+        node = next(row for row in document.findall("joint") if row.get("name") == joint["name"])
+        self.assertEqual(
+            {key: float(value) for key, value in node.find("limit").attrib.items()},
+            joint["limits"],
+        )
+        comments = [child.text or "" for child in document if child.tag is ET.Comment]
+        self.assertTrue(any("WARNING limits.default_policy:" in text for text in comments))
+        self.assertTrue(any(
+            f'"object": "{joint["name"]}"' in text and '"field": "limits"' in text for text in comments
+        ))
+
+    def test_warning_comments_keep_every_object_and_escape_xml_terminators(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        scene["provenance"]["value_warnings"] = [{
+            "code": "limits.default_policy",
+            "message": "Non-native default -- unqualified",
+            "objects": [{"object": name, "field": "limits", "native_cad_ranges": False}
+                        for name in ("joint:left", "joint:right--special")],
+        }]
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(Robot.from_dict(scene), source, Path(temp), name="warning_test")
+            parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+            document = ET.fromstring(output.read_bytes(), parser=parser)
+        comments = [child.text or "" for child in document if child.tag is ET.Comment]
+        self.assertEqual(len(comments), 2)
+        self.assertIn('"object": "joint:left"', comments[0])
+        self.assertIn(r'"object": "joint:right\u002d\u002dspecial"', comments[1])
+        for text in comments:
+            self.assertIn('"field": "limits"', text)
+            self.assertIn('"native_cad_ranges": false', text)
+
+    def test_independent_xml_gate_rejects_changed_warning_scope_or_qualification(self):
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        scene["provenance"]["value_warnings"] = [{
+            "code": "limits.default_policy", "message": "Unqualified default range",
+            "objects": [{"object": name, "field": "limits", "hardware_qualified": False}
+                        for name in ("joint:left", "joint:right")],
+        }]
+        robot = Robot.from_dict(scene)
+        with tempfile.TemporaryDirectory() as temp:
+            output = generate_urdf(robot, source, Path(temp), name="warning_test")
+            original = output.read_bytes()
+            definition = {"source": {"robot_name": "warning_test"}}
+            _xml(Path(temp), definition, robot.to_dict())
+            for old, new in (
+                (b'"object": "joint:left"', b'"object": "joint:wrong"'),
+                (b'"field": "limits"', b'"field": "mass"'),
+                (b'"hardware_qualified": false', b'"hardware_qualified": true'),
+            ):
+                with self.subTest(change=new):
+                    output.write_bytes(original.replace(old, new, 1))
+                    with self.assertRaisesRegex(PipelineError, "value-provenance warnings differ"):
+                        _xml(Path(temp), definition, robot.to_dict())
+            start = original.index(b"<!--")
+            end = original.index(b"-->", start) + 3
+            output.write_bytes(original[:start] + original[end:])
+            with self.assertRaisesRegex(PipelineError, "value-provenance warnings differ"):
+                _xml(Path(temp), definition, robot.to_dict())
 
     def test_mesh_delivery_is_self_contained_and_deterministic(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"

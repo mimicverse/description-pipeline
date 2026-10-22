@@ -16,7 +16,6 @@ import numpy as np
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.io import file_digest  # noqa: E402
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.freeze import freeze as _freeze  # noqa: E402
 from description_pipeline.sources.solidworks.scene import load_scene  # noqa: E402
@@ -208,31 +207,6 @@ class ProductConventionTests(unittest.TestCase):
 
         raw = json.loads((snapshot / "raw" / "mass_properties.json").read_text(encoding="utf-8"))
         self.assertLess(raw["base-1"]["inertia"][0][1], 0.0)  # Signed raw cross terms remain unchanged
-
-    def test_declared_mass_scales_the_tensor_once(self) -> None:
-        evidence = self.tmp / "spec.json"
-        evidence.write_text(json.dumps({"components": {"base-1": {"material": "steel"}}}), encoding="utf-8")
-        config = dict(
-            self.config,
-            material_source="documented_table",
-            mass_evidence={
-                "reference": "vendor spec",
-                "file": "docs/provenance/spec.json",
-                "sha256": file_digest(evidence),
-            },
-            documented_masses={"base-1": {"mass_kg": 2.9952, "reason": "2x benchmark mass", "evidence": "components"}},
-        )
-        snapshot = self.tmp / "scaled"
-        freeze(config, snapshot, backend=self.backend)
-        _compose_scene_inputs(snapshot, self.tmp / "cad")
-        scene = load_scene(snapshot)
-        inertia = scene["links"][0]["inertial"]["inertia"]
-        expected = BENCHMARK["base-1"]["tensor"] * 2.0
-        six = np.array([expected[0, 0], expected[0, 1], expected[0, 2], expected[1, 1], expected[1, 2], expected[2, 2]])
-        self.assertLess(float(np.abs(np.array(inertia) - six).max()), 1e-14)
-        # 再规范化一次不得重复缩放或重复转换
-        scene_again = load_scene(snapshot)
-        self.assertEqual(scene_again["links"][0]["inertial"]["inertia"], inertia)
 
     def test_native_reading_without_a_convention_is_refused(self) -> None:
         self.backend.components[0]["mass"] = self._benchmark_payload("base-1", convention=None)

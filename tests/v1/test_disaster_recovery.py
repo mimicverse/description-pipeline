@@ -40,6 +40,29 @@ import windows_transport  # noqa: E402
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
 
+class UnitInventoryTests(unittest.TestCase):
+    def test_maintenance_units_are_bound_to_the_receipt_schema_role(self) -> None:
+        self.assertEqual(recovery.MAINTENANCE_RECEIPT_SCHEMA, "solidworks-to-urdf.recovery-maintenance/v1")
+        self.assertEqual(recovery.MAINTENANCE_ROLE, "maintenance-v1")
+        self.assertEqual(
+            recovery.MAINTENANCE_UNITS,
+            recovery.systemd_units.units_for_role(recovery.MAINTENANCE_ROLE),
+        )
+        self.assertEqual(
+            recovery.MAINTENANCE_UNITS,
+            (
+                "description-solidworks-tunnel",
+                "description-airflow-dag-processor",
+                "description-airflow-scheduler",
+                "description-airflow-api-server",
+                "description-operator-proxy",
+                "description-portal",
+            ),
+        )
+        source = (DEPLOY / "recovery.py").read_text(encoding="utf-8")
+        self.assertNotIn("MAINTENANCE_UNITS = (\n", source)
+
+
 def write(path: Path, payload: str | bytes, mode: int = 0o600) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_bytes(payload.encode() if isinstance(payload, str) else payload)

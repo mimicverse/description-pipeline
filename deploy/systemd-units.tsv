@@ -1,0 +1,7 @@
+description-postgres	database,services	-
+description-solidworks-tunnel	executor,services,maintenance-v1	1
+description-airflow-dag-processor	airflow,executor,services,maintenance-v1	2
+description-airflow-scheduler	airflow,executor,services,maintenance-v1	3
+description-airflow-api-server	airflow,executor,services,maintenance-v1	4
+description-portal	operator,maintenance-v1	6
+description-operator-proxy	operator,maintenance-v1	5

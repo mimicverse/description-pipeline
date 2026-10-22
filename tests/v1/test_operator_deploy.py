@@ -3476,9 +3476,18 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "operator" / "scripts" / "check_proxy_binary.sh").write_bytes(
             (OPERATOR / "scripts" / "check_proxy_binary.sh").read_bytes()
         )
+        (release / "airflow" / "services.sh.real").write_bytes(
+            (ROOT / "deploy" / "airflow" / "services.sh").read_bytes()
+        )
+        (release / "systemd-units.tsv").write_bytes(
+            (ROOT / "deploy" / "systemd-units.tsv").read_bytes()
+        )
         write_stub(
             release / "airflow" / "services.sh",
             "#!/usr/bin/env bash\n"
+            'if [ "${1:-}" = "units" ]; then\n'
+            '  exec bash "$(dirname "$0")/services.sh.real" "$@"\n'
+            "fi\n"
             'echo "services_$1" >> "$ORDER_LOG"\n'
             'mkdir -p "$SYSTEMCTL_STATE_DIR"\n'
             'execution_units=(\n'
@@ -6539,7 +6548,7 @@ class InstallOrderingTests(unittest.TestCase):
         real.write_bytes((ROOT / "deploy" / "airflow" / "services.sh").read_bytes())
         (release / "airflow" / "services.sh").write_text(
             "#!/usr/bin/env bash\n"
-            'if [ "${1:-}" = "stop-executors" ] || [ "${1:-}" = "stop" ]; then\n'
+            'if [ "${1:-}" = "units" ] || [ "${1:-}" = "stop-executors" ] || [ "${1:-}" = "stop" ]; then\n'
             '  exec bash "$(dirname "$0")/services.sh.real" "$@"\n'
             "fi\n"
             'echo "services_$1" >> "$ORDER_LOG"\n'

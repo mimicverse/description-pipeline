@@ -119,7 +119,7 @@ _FINDING_LISTS = {"findings", "warnings", "errors", "problems", "diagnostics", "
 #: The single canonical material-provenance record (producer: 71f489a): written for every
 #: capture under ``evidence/raw/material_provenance.json``, bound by the snapshot manifest.
 _MATERIAL_SCHEMA = "solidworks-to-urdf.material-provenance/v1"
-_MATERIAL_TOP_KEYS = ("schema_version", "assembly", "configuration", "material_source", "measured_source")
+_MATERIAL_TOP_KEYS = ("schema_version", "assembly", "configuration", "measured_source")
 _MATERIAL_ENTRY_KEYS = (
     "code",
     "message",

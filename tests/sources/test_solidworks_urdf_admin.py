@@ -88,7 +88,7 @@ class InputSealReadinessTests(unittest.TestCase):
         )
         return support.write_target_delivery(
             root,
-            capture={"declared_masses": {"items": {}, "evidence": None}},
+            capture={},
             discovery=record,
             source=source,
             originals={"robot.SLDASM": content.decode("utf-8")},
@@ -180,8 +180,10 @@ class UrdfRobotLabelTests(unittest.TestCase):
         definition = {"hardware_id": None, "source": {"robot_name": "robot"}}
         exact = (
             '<robot name="robot">'
-            "<!--WARNING units.si_conversion: Delivered values use SI units. "
-            "See reports/quality.json for object and field details.-->"
+            "<!--WARNING units.si_conversion: "
+            '{"message": "Delivered values use SI units.", '
+            '"provenance": {"field": "units", "object": "robot", "source": "native_derived"}} '
+            "See reports/quality.json.-->"
             '<link name="base"/></robot>'
         )
         with tempfile.TemporaryDirectory() as directory:

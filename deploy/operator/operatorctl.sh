@@ -39,9 +39,39 @@ export CONTROL_PYTHON
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AIRFLOW_HERE="$HERE/../airflow"
 RELEASE_ROOT="$(cd "$HERE/../.." && pwd -P)"
-UNITS=(description-postgres description-solidworks-tunnel description-airflow-dag-processor
-       description-airflow-scheduler description-airflow-api-server description-portal
-       description-operator-proxy)
+die() { echo "operatorctl: $*" >&2; exit 1; }
+unit_manifest() {
+  bash "$AIRFLOW_HERE/services.sh" units "$1"
+}
+load_unit_role() {
+  local variable="$1" role="$2" output
+  if ! output="$(unit_manifest "$role")" || [ -z "$output" ]; then
+    die "could not read the managed systemd unit role: $role"
+  fi
+  mapfile -t "$variable" <<< "$output"
+}
+load_unit_role UNITS all
+load_unit_role AIRFLOW_UNITS airflow
+load_unit_role EXECUTOR_UNITS executor
+load_unit_role DATABASE_UNITS database
+load_unit_role OPERATOR_UNITS operator
+[ "${#DATABASE_UNITS[@]}" -eq 1 ] || die "the managed systemd database role must name exactly one unit"
+OPERATOR_UNIT_FILES=()
+for unit in "${OPERATOR_UNITS[@]}"; do OPERATOR_UNIT_FILES+=("$unit.service"); done
+operator_units_enable() {
+  systemctl --user enable --now "${OPERATOR_UNIT_FILES[@]}"
+}
+operator_units_active() {
+  systemctl --user is-active --quiet "${OPERATOR_UNIT_FILES[@]}"
+}
+operator_units_disable() {
+  local index
+  local -a reversed=()
+  for ((index=${#OPERATOR_UNIT_FILES[@]}-1; index>=0; index--)); do
+    reversed+=("${OPERATOR_UNIT_FILES[$index]}")
+  done
+  systemctl --user disable --now "${reversed[@]}"
+}
 GENERATION_ENV_REQUIRED=(
   AIRFLOW_DB_URL AIRFLOW_HOME AIRFLOW_RUNTIME_DB_URL AIRFLOW_VENV
   OPERATOR_STATE PIPELINE_STORE_ROOT PIPELINE_WHEEL PLATFORM_CONFIG_DIGEST
@@ -49,8 +79,6 @@ GENERATION_ENV_REQUIRED=(
   SOLIDWORKS_HANDOFF_ROOT SOLIDWORKS_SSH_HOST
 )
 WINDOWS_LIFECYCLE_TIMEOUT=480
-
-die() { echo "operatorctl: $*" >&2; exit 1; }
 
 CONFIG_SNAPSHOT_DIR=""
 CONFIG_FILE=""
@@ -88,7 +116,7 @@ def powershell_quote(value: str) -> str:
 
 
 script_path, binding_path, verb, stage_dir, previous = sys.argv[1:]
-if verb not in {"health", "resume", "stage", "promote", "rollback", "reconcile", "status"}:
+if verb not in {"health", "resume", "stage", "promote", "rollback", "status"}:
     raise SystemExit("operatorctl: invalid Windows lifecycle verb")
 arguments = ["-Verb", verb, "-Binding", powershell_quote(binding_path)]
 if stage_dir:
@@ -520,11 +548,12 @@ check_proxy_binary() {
 # begin by bringing that database up and confirming its socket.  The cluster identity never
 # runs here; this is the same managed unit the installation created.
 ensure_postgres_ready() {
+  local database_unit="${DATABASE_UNITS[0]}"
   PG_BIN="$POSTGRES_ROOT/root/usr/lib/postgresql/${POSTGRES_MAJOR:-14}/bin"
   export LD_LIBRARY_PATH="$POSTGRES_ROOT/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
   systemctl --user daemon-reload
-  systemctl --user start description-postgres.service \
-    || die "description-postgres.service failed to start"
+  systemctl --user start "$database_unit.service" \
+    || die "$database_unit.service failed to start"
   local ready=0
   for _ in $(seq 1 20); do
     if "$PG_BIN/pg_isready" -q -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT"; then ready=1; break; fi
@@ -549,9 +578,8 @@ airflow_render() {
 
 airflow_units_match_generation() {
   local unit unit_file
-  for unit in description-airflow-dag-processor.service \
-      description-airflow-scheduler.service description-airflow-api-server.service; do
-    unit_file="$TARGET/$unit"
+  for unit in "${AIRFLOW_UNITS[@]}"; do
+    unit_file="$TARGET/$unit.service"
     [ -f "$unit_file" ] && [ ! -L "$unit_file" ] \
       || die "the restored unit is missing or a link: $unit_file"
     grep -Fq "ExecStart=$AIRFLOW_VENV/" "$unit_file" \
@@ -566,8 +594,7 @@ airflow_units_match_generation() {
 
 airflow_require_no_readers() {
   local unit state
-  for unit in description-solidworks-tunnel description-airflow-dag-processor \
-      description-airflow-scheduler description-airflow-api-server; do
+  for unit in "${EXECUTOR_UNITS[@]}"; do
     state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
     case "$state" in
       inactive|failed) ;;
@@ -794,10 +821,9 @@ airflow_runtime_matches_generation() {
   local unit pid state restored_maps candidate_maps cmdline ready
   for ((attempt = 1; attempt <= 60; attempt++)); do
     ready=1
-    for unit in description-airflow-dag-processor.service \
-        description-airflow-scheduler.service description-airflow-api-server.service; do
-      state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
-      pid="$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null || true)"
+    for unit in "${AIRFLOW_UNITS[@]}"; do
+      state="$(systemctl --user is-active "$unit.service" 2>/dev/null || true)"
+      pid="$(systemctl --user show -p MainPID --value "$unit.service" 2>/dev/null || true)"
       restored_maps=0
       candidate_maps=0
       cmdline=""
@@ -808,7 +834,7 @@ airflow_runtime_matches_generation() {
         cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
       fi
       printf '%s state=%s mainpid=%s restored_maps=%s candidate_maps=%s cmdline=%s\n' \
-        "$unit" "$state" "$pid" "$restored_maps" "$candidate_maps" "$cmdline"
+        "$unit.service" "$state" "$pid" "$restored_maps" "$candidate_maps" "$cmdline"
       if [ "$state" != "active" ] || [ -z "$pid" ] || [ "$pid" = "0" ] \
           || [ "$restored_maps" -lt 1 ] || [ "$candidate_maps" != "0" ]; then
         ready=0
@@ -2308,9 +2334,9 @@ case "$ACTION" in
     # unpause and the platform open are the two state transitions of a plain start, and the
     # flagged start skips both (services up, admission closed; a later plain start re-verifies
     # and opens).  A failure above this point never opens anything.
-    systemctl --user enable --now description-portal.service description-operator-proxy.service \
+    operator_units_enable \
       || die "ingress services failed to start; the platform admission stays closed"
-    systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
+    operator_units_active \
       || die "ingress services are not active; the platform admission stays closed"
     instance_lifecycle_resume "$ACTIVE_ID" "$STATE_ROOT/install-record.json" \
       || die "the Windows endpoint did not resume under the active install identity; admission stays closed"
@@ -2364,12 +2390,12 @@ case "$ACTION" in
       }
     echo "$projection"
     drift_check || true
-    systemctl --user disable --now description-operator-proxy.service description-portal.service || true
+    operator_units_disable || true
     ADMISSION_RC=0
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf || ADMISSION_RC=$?
     if [ -n "$KEEP_DATABASE" ]; then
       airflow_lifecycle stop-executors
-      state="$(systemctl --user is-active description-postgres.service 2>/dev/null || true)"
+      state="$(systemctl --user is-active "${DATABASE_UNITS[0]}.service" 2>/dev/null || true)"
       [ "$state" = "active" ] \
         || die "the managed PostgreSQL unit is ${state:-unknown}; --keep-database refused"
       echo "stop complete: supported writers are stopped; PostgreSQL remains active"
@@ -2699,12 +2725,12 @@ PY
     #    step and stops the run before any migration or pointer movement.
     if ! {
       airflow_lifecycle stop-executors \
-      && systemctl --user disable --now description-operator-proxy.service description-portal.service
+      && operator_units_disable
     } > "$EVIDENCE_DIR/stop-services.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote stop-services failed "$EVIDENCE_DIR/stop-services.out"
       die "the execution services did not stop (the admission stays closed)"
     fi
-    for unit in description-portal.service description-operator-proxy.service; do
+    for unit in "${OPERATOR_UNIT_FILES[@]}"; do
       state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
       case "$state" in
         inactive|failed)
@@ -2873,8 +2899,8 @@ PY
       && airflow_lifecycle start \
       && airflow_wait_dag_identity \
       && airflow_unpause_dag \
-      && systemctl --user enable --now description-portal.service description-operator-proxy.service \
-      && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service
+      && operator_units_enable \
+      && operator_units_active
     } > "$EVIDENCE_DIR/start-services.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote start-services failed "$EVIDENCE_DIR/start-services.out"
       die "the switched generation did not start (the admission stays closed)"
@@ -3199,7 +3225,7 @@ PY
     promotion_step "$ROLLBACK_ID" rollback rollback-drain completed "$EVIDENCE_DIR/rollback-drain.out"
     if ! {
       airflow_lifecycle stop-executors \
-      && systemctl --user disable --now description-operator-proxy.service description-portal.service
+      && operator_units_disable
     } > "$EVIDENCE_DIR/rollback-stop.out" 2>&1; then
       promotion_step "$ROLLBACK_ID" rollback rollback-stop failed "$EVIDENCE_DIR/rollback-stop.out"
       die "the execution services did not stop (the admission stays closed)"
@@ -3319,8 +3345,8 @@ PY
       && airflow_lifecycle start \
       && airflow_wait_dag_identity \
       && airflow_runtime_matches_generation "$CANDIDATE_VENV" \
-      && systemctl --user enable --now description-portal.service description-operator-proxy.service \
-      && systemctl --user is-active --quiet description-portal.service description-operator-proxy.service \
+      && operator_units_enable \
+      && operator_units_active \
       && "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" verify-running \
         --state-root "$STATE_ROOT" \
       && {

@@ -130,10 +130,6 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "Unregistered"):
             check_layout(self.root)
         (self.root / "README.md").unlink()
-        (self.root / "reports/pr.json").write_text('{"url": "https://example.invalid/1"}')
-        with self.assertRaisesRegex(PipelineError, "Unregistered"):
-            check_layout(self.root)
-        (self.root / "reports/pr.json").unlink()
         check_layout(self.root)
 
     def test_source_record_reader_validates_content_identity(self):

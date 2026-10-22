@@ -13,6 +13,7 @@ downloaded package, and a failing ``apt-get`` stub covers the refusal path).
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -27,6 +28,15 @@ ENSURE = SCRIPTS / "ensure_proxy_binary.sh"
 CHECK = SCRIPTS / "check_proxy_binary.sh"
 RENDER = OPERATOR / "render_operator.py"
 HEALTH = OPERATOR / "health.sh"
+SYSTEMD_UNITS = OPERATOR / "systemd_units.py"
+
+
+def load_systemd_units():
+    spec = importlib.util.spec_from_file_location("systemd_units_under_test", SYSTEMD_UNITS)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def run(cmd: list, env: dict[str, str], cwd: Path = ROOT) -> subprocess.CompletedProcess:
@@ -215,6 +225,10 @@ class RenderClosureTests(unittest.TestCase):
             self.assertIn(f"NGINX_BIN={binary}\n", resolved)
             proxy = (units / "description-operator-proxy.service").read_text(encoding="utf-8")
             self.assertIn(str(binary), proxy)
+            self.assertEqual(
+                {path.name.removesuffix(".service") for path in units.iterdir() if path.is_file()},
+                set(load_systemd_units().units_for_role("operator")),
+            )
             health = HEALTH.read_text(encoding="utf-8")
             self.assertIn("managed nginx binary missing or not executable", health)
 

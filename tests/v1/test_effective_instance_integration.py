@@ -81,7 +81,6 @@ def _capture_from_raw(evidence: Path, *, identity: dict) -> dict:
             for name, matrix in (scene.get("coordinate_systems") or {}).items()
         ],
         "mass_closure": read("mass_closure.json"),
-        "declared_masses": read("declared_masses.json"),
         "material_provenance": read("material_provenance.json"),
         "effective_instances": read("effective_instances.json"),
         "link_group_mass_properties": read("link_group_mass_properties.json"),
@@ -319,7 +318,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             "provider": "solidworks",
             "assembly": ORIGINAL,
             "configuration": "Default",
-            "material_source": "cad",
             "bodies": [
                 {
                     "id": "base",
@@ -467,7 +465,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
         (raw / "coordinate_systems.json").write_text(json.dumps(self.raw_scene["coordinate_systems"]), encoding="utf-8")
         (raw / "material_provenance.json").write_text(
             json.dumps(
@@ -475,7 +472,6 @@ class EffectiveInstanceIntegrationTests(unittest.TestCase):
                     "schema_version": "solidworks-to-urdf.material-provenance/v1",
                     "assembly": ORIGINAL,
                     "configuration": "Default",
-                    "material_source": "cad",
                     "measured_source": "cad_api",
                     "warnings": [],
                 }
@@ -808,7 +804,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             "provider": "solidworks",
             "assembly": ORIGINAL,
             "configuration": "Default",
-            "material_source": "cad",
             "bodies": [
                 {
                     "id": "base",
@@ -907,7 +902,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (raw / "declared_masses.json").write_text(json.dumps({"items": {}, "evidence": None}), encoding="utf-8")
         (raw / "coordinate_systems.json").write_text(json.dumps(scene_payload["coordinate_systems"]), encoding="utf-8")
         (raw / "material_provenance.json").write_text(
             json.dumps(
@@ -915,7 +909,6 @@ class InstanceMeasurementIntegrationTests(unittest.TestCase):
                     "schema_version": "solidworks-to-urdf.material-provenance/v1",
                     "assembly": ORIGINAL,
                     "configuration": "Default",
-                    "material_source": "cad",
                     "measured_source": "cad_api",
                     "warnings": [],
                 }

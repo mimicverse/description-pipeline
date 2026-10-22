@@ -82,6 +82,15 @@ _DISCOVERY_CODE_LABELS = {
     "discovery.interface_motion_unresolved": "CAD joint motion is unclassified; a neutral name is retained",
     "direction.semantics_unresolved": "Authored CAD axis is preserved; functional positive motion is not proven",
     "limits.preview_policy": "Inspection preview full-turn window; no native mechanical range is claimed",
+    "limits.default_policy": (
+        "Engineering default rotation window; no native mechanical range or engineering qualification is claimed"
+    ),
+    "limits.declared_author": "Controlled author limits are preserved but are not native CAD readings",
+    "drive.declared_author": "Controlled author drive values are preserved but are not native CAD readings",
+    "drive.unqualified": "Zero effort or velocity is retained but drive sizing remains unqualified",
+    "discovery.joint_default_policy": (
+        "Engineering default rotation window; no usable native or authored range was read"
+    ),
     "direction.reference_frame_missing": "The local parent mechanical reference frame is missing",
     "direction.reference_frame_invalid": "The local parent mechanical reference frame is invalid",
     "direction.invalid": "Positive-motion semantics could not be evaluated",
@@ -115,6 +124,7 @@ _DIAGNOSTIC_CODE_LABELS = {
     "naming.formatted_interface": "Interface name normalized from CAD identity (diagnostic)",
     "naming.motion_unresolved": "Joint motion classification unavailable; neutral name retained (diagnostic)",
     "v14.saved_pose_restriction": "Saved-pose restriction (diagnostic)",
+    "v14.default_policy": "Engineering default rotation window (diagnostic)",
     "v14.mate_inference_unavailable": "Mate inference unavailable (diagnostic)",
     "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",
     "v14.membership_unread": "Link membership not read (diagnostic)",
@@ -131,7 +141,6 @@ _FILE_PATH_LABELS = {
     "input/ + evidence/ + model/ + urdf/ + meshes/": "Raw evidence and generated artifacts",
     "reports/quality.json": "Deterministic per-object quality report",
     "urdf/ + meshes/ + reports/quality.json": "Verified delivery and configured model repository",
-    "reports/pr.json": "Candidate commit and review receipt",
     "reports/structural-team.md": "Structural-team report (readable Markdown)",
     "reports/structural-team.json": "Structural-team report (structured findings and parameters)",
 }
@@ -210,7 +219,7 @@ def _first_text(*values: object) -> str | None:
     return None
 
 
-def _failure_object(raw_type: str, message: str, raw_detail: dict | None) -> str | None:
+def _failure_object(raw_type: str, message: str, raw_detail: dict | str | None) -> str | None:
     """Basename of the failing document, only when safely parsed; never invented."""
     if isinstance(raw_detail, dict):
         candidate = raw_detail.get("document") or raw_detail.get("object")
@@ -561,7 +570,7 @@ def _failure(job: dict, stage: dict) -> dict:
     raw_type, _, message = raw_error.partition(": ")
     error_code = _first_text(stage.get("error_code"))
     diagnostic = stage.get("diagnostic")
-    raw_detail = diagnostic if isinstance(diagnostic, dict) and diagnostic else None
+    raw_detail = diagnostic if isinstance(diagnostic, (dict, str)) and diagnostic else None
     codes = None
     kind = "unknown"
     structured_groups = None
@@ -609,7 +618,7 @@ def _failure(job: dict, stage: dict) -> dict:
             "object, cause, and evidence; an unsupported pattern does not mean the design is wrong."
         )
         kind = "definition"
-    elif raw_type == "CadError" and raw_detail and {"errors", "warnings"} <= set(raw_detail):
+    elif raw_type == "CadError" and isinstance(raw_detail, dict) and {"errors", "warnings"} <= set(raw_detail):
         kind = "runtime"
         codes = {"errors": raw_detail.get("errors"), "warnings": raw_detail.get("warnings")}
         if raw_detail.get("errors") == 2:
@@ -677,6 +686,8 @@ def _failure(job: dict, stage: dict) -> dict:
         failure["finding_samples"] = structured_samples
     failed_object = _failure_object(raw_type, message, raw_detail)
     activity = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else {}
+    if (activity.get("stage") or activity.get("phase")) != stage.get("id"):
+        activity = {}
     if error_code is not None and failed_object is None:
         candidate = _first_text(
             raw_detail.get("path") if isinstance(raw_detail, dict) else None,
@@ -711,8 +722,8 @@ def _failure(job: dict, stage: dict) -> dict:
         if phase:
             failure["phase"] = phase
 
-        detail_cause = raw_detail.get("cause") if isinstance(raw_detail, dict) else None
-        cause = _first_text(detail_cause, raw_error)
+        detail_cause = raw_detail.get("cause") if isinstance(raw_detail, dict) else raw_detail
+        cause = detail_cause if isinstance(detail_cause, str) and detail_cause.strip() else _first_text(raw_error)
         if cause:
             failure["cause"] = cause
 
@@ -819,7 +830,20 @@ _WARNING_DETAIL_KEYS = (
     "body_index",
     "owner_scope_key",
     "object_indices",
+    "object_type",
     "field",
+    "fields",
+    "original",
+    "actual",
+    "source",
+    "file",
+    "sha256",
+    "anchor",
+    "key",
+    "reference",
+    "rule_id",
+    "rule_version",
+    "reason",
     "native_reference_sha256",
     "mapping_source_part_document_sha256",
     "mapping_source_body_reference_sha256",

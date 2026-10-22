@@ -252,7 +252,7 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="registered-failure-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def _failed_platform(self, stage: str) -> tuple[RegisteredPlatform, str]:
+    def _failed_platform(self, stage: str, **failure_fields) -> tuple[RegisteredPlatform, str]:
         platform = RegisteredPlatform(self.tmp / f"failure-{stage}")
         platform.admit(WSGI_RUN)
         original = f"RuntimeError: registered {stage} failure before products"
@@ -270,6 +270,7 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
                 "error": original,
                 "error_code": "fixture",
                 "detail": {"where": stage},
+                **failure_fields,
             },
         )
         # The convergence registers every later stage blocked after the failure: the trailing
@@ -330,6 +331,21 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
                         stage,
                         "the registered failed stage owns the error; a later blocked event never does",
                     )
+
+    def test_registered_failure_preserves_string_detail_and_diagnostic_identity(self) -> None:
+        diagnostic = {"path": "diagnostic.json", "sha256": "d" * 64}
+        platform, _ = self._failed_platform(
+            "publish", detail="remote: denied", diagnostic_path="failure/retained",
+            failure_diagnostics=diagnostic,
+        )
+        status, body = self._get(platform, _Endpoint(None))
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["job"]["detail"], "remote: denied")
+        self.assertEqual(payload["job"]["diagnostic_path"], "failure/retained")
+        self.assertEqual(payload["job"]["failure_diagnostics"], diagnostic)
+        self.assertEqual(payload["report"]["failure"]["evidence_path"], "failure/retained")
+        self.assertEqual(payload["report"]["failure"]["cause"], "remote: denied")
 
     def test_a_registered_success_keeps_its_closure_and_observes_the_native_error(self) -> None:
         platform = RegisteredPlatform(self.tmp / "success")

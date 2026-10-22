@@ -181,6 +181,16 @@ class NamedFrameTests(unittest.TestCase):
         self.assertAlmostEqual(entry["xyz"][2], 0.3)
         self.assertAlmostEqual(entry["rpy"][2], math.pi / 2)
         self.assertEqual(entry["provenance"]["geometry"], "cad_coordinate_system:tool_datum")
+        self.assertEqual(entry["provenance"]["derived_joint_name"], "upper_link_to_tool_frame_joint")
+        self.assertEqual(
+            entry["provenance"]["joint_name_rule"],
+            {
+                "rule_id": "naming.fixed_endpoint_pair",
+                "rule_version": "naming-v1",
+                "parent": "upper_link",
+                "child": "tool_frame",
+            },
+        )
 
     def test_parent_rotation_and_translation_are_removed(self):
         raw_scene = SimpleNamespace(coordinate_systems={"tool_datum": _array(identity_matrix(), (1.0, 1.0, 0.5))})

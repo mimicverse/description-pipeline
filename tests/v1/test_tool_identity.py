@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from description_pipeline import __version__, runtime, steps
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import PipelineError, digest, inventory, read_data, write_json
+from description_pipeline.io import PipelineError, digest, inventory, write_json
 
 
 class ToolIdentityTests(unittest.TestCase):
@@ -169,4 +169,3 @@ class ToolIdentityTests(unittest.TestCase):
             self.assertEqual(publish.call_args.kwargs["branch"], "work/solidworks/arm/engineering")
             self.assertTrue(result["passed"])
             self.assertEqual(result["subject_sha256"], "a" * 64)
-            self.assertEqual(read_data(bundle / "reports/pr.json")["url"], submission["url"])

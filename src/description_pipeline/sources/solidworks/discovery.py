@@ -75,10 +75,15 @@ from .jsonio import write_json
 from .errors import CadError
 from .exporter import ExporterDeclarationError, decode_exporter_v14
 from .native_limits import (
+    ENGINEERING_DEFAULT_POLICY_ID,
+    NativeLimitInvalidError,
+    NativeLimitReadError,
     PREVIEW_POLICY_ID,
     PREVIEW_WINDOW_RAD,
+    ROTATION_WINDOW_RAD,
     limit_mate_scope,
     native_limit_inventory_complete,
+    rotation_window_policy,
     validate_native_limit,
 )
 from .direction import canonicalize_axis
@@ -509,6 +514,14 @@ def _finite_vector(value: Any, length: int) -> list[float] | None:
             return None
         numbers.append(number)
     return numbers
+
+
+def _controlled_number(value: Any) -> float | None:
+    """A finite JSON number from a controlled record; booleans and strings fail."""
+    if type(value) not in (int, float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _unit_vector(value: Any) -> list[float] | None:
@@ -1979,12 +1992,24 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         limits = None
         limit_evidence = None
         limit_source = None
+        default_policy = None
         native = group["limits"]
         native_limit_values = set()
         native_limit_errors = []
+        native_limit_invalid = []
         for mate_item in mates:
             mate_kind = str(mate_item.get("type") or "").strip().lower()
             if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                if mate_item.get("suppressed") is True:
+                    continue
+                if mate_item.get("is_advanced_mate_error") is not None:
+                    native_limit_errors.append(
+                        {"mate": mate_item.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
+                    )
+                elif mate_item.get("native_limit") is not None:
+                    native_limit_invalid.append(
+                        {"mate": mate_item.get("name"), "reason": "native evidence is attached to another mate type"}
+                    )
                 continue
             if mate_item.get("suppressed") is True:
                 continue
@@ -2000,20 +2025,27 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 )
                 continue
             if flag is not True:
+                if mate_item.get("native_limit") is not None:
+                    native_limit_invalid.append(
+                        {"mate": mate_item.get("name"), "reason": "native payload on a disabled limit"}
+                    )
                 continue
             if mate_kind not in {"limitdistance", "limitangle"}:
-                native_limit_errors.append(
+                native_limit_invalid.append(
                     {"mate": mate_item.get("name"), "reason": "advanced flag on a standard mate"}
                 )
                 continue
             try:
                 lower, upper, unit = validate_native_limit(mate_item, component_records)
-            except ValueError as error:
+            except NativeLimitReadError as error:
                 native_limit_errors.append({"mate": mate_item.get("name"), "reason": str(error)})
+                continue
+            except ValueError as error:
+                native_limit_invalid.append({"mate": mate_item.get("name"), "reason": str(error)})
                 continue
             expected_unit = "m" if joint_type == "prismatic" else "rad"
             if unit != expected_unit:
-                native_limit_errors.append(
+                native_limit_invalid.append(
                     {
                         "mate": mate_item.get("name"),
                         "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
@@ -2021,7 +2053,48 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 )
                 continue
             native_limit_values.add((lower, upper, unit))
-        if native_limit_errors:
+        if native_limit_invalid:
+            findings.append(_finding(
+                "discovery.joint_limits_invalid", obj,
+                "native position-limit evidence is readable but invalid", {"errors": native_limit_invalid},
+            ))
+            continue
+        declared_limit = None
+        declared_bounds = None
+        declared_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
+        if _text(declared_ref):
+            declared_limit = _resolve_record(settings, str(declared_ref), findings, obj)
+            if declared_limit is None:
+                continue
+            value = declared_limit.get("value")
+            declared_lower = _controlled_number(value.get("lower")) if isinstance(value, dict) else None
+            declared_upper = _controlled_number(value.get("upper")) if isinstance(value, dict) else None
+            if declared_lower is None or declared_upper is None:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "controlled record lacks finite lower/upper limits",
+                        {"file": declared_limit["file"]},
+                    )
+                )
+                continue
+            if (
+                not (math.isfinite(declared_lower) and math.isfinite(declared_upper))
+                or declared_lower > declared_upper
+            ):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "controlled position limits must be finite and ordered",
+                        {"file": declared_limit["file"], "lower": declared_lower, "upper": declared_upper},
+                    )
+                )
+                continue
+            declared_bounds = (declared_lower, declared_upper)
+        default_allowed = settings.purpose == PURPOSE_ENGINEERING and joint_type == "revolute"
+        if native_limit_errors and (native_limit_values or isinstance(native, dict)):
             findings.append(
                 _finding(
                     "discovery.joint_limits_unreadable",
@@ -2044,15 +2117,14 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         if native_limit_values:
             lower, upper, unit = next(iter(native_limit_values))
             native = {"lower": lower, "upper": upper, "unit": unit}
-        if joint_type == "continuous":
-            if isinstance(native, dict):
+        if isinstance(native, dict):
+            if joint_type == "continuous":
                 findings.append(
                     _finding(
                         "discovery.joint_limits_unexpected", obj, "a continuous joint carries native position limits"
                     )
                 )
                 continue
-        elif isinstance(native, dict):
             unit = native.get("unit")
             expected = "m" if joint_type == "prismatic" else "rad"
             if unit != expected:
@@ -2072,48 +2144,80 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     _finding("discovery.joint_limits_invalid", obj, "native mate limits are not finite numbers")
                 )
                 continue
+            if (
+                not all(type(native[key]) in (int, float) and math.isfinite(limits[key]) for key in ("lower", "upper"))
+                or limits["lower"] > limits["upper"]
+            ):
+                findings.append(_finding(
+                    "discovery.joint_limits_invalid", obj, "native mate limits must be finite and ordered", limits,
+                ))
+                continue
             limit_source = "native"
-            native_record_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
-            if _text(native_record_ref):
-                declared = _resolve_record(settings, str(native_record_ref), findings, obj)
-                if declared is not None:
-                    try:
-                        lower = float(declared["value"]["lower"])
-                        upper = float(declared["value"]["upper"])
-                    except (KeyError, TypeError, ValueError):
-                        findings.append(
-                            _finding(
-                                "discovery.joint_limits_invalid",
-                                obj,
-                                "controlled record lacks finite lower/upper limits",
-                                {"file": declared["file"]},
-                            )
-                        )
-                        continue
-                    if not (math.isfinite(lower) and math.isfinite(upper)):
-                        findings.append(
-                            _finding("discovery.joint_limits_invalid", obj, "controlled position limits must be finite")
-                        )
-                        continue
-                    if abs(lower - limits["lower"]) > 1e-12 or abs(upper - limits["upper"]) > 1e-12:
+            if declared_bounds is not None:
+                declared_lower, declared_upper = declared_bounds
+                if declared_bounds not in {(0.0, 0.0), (limits["lower"], limits["upper"])}:
                         findings.append(
                             _finding(
                                 "discovery.joint_limits_conflict",
                                 obj,
                                 "native mate limits and the controlled record disagree",
-                                {"native": limits, "record": {"lower": lower, "upper": upper}},
+                                {"native": limits, "record": {"lower": declared_lower, "upper": declared_upper}},
                             )
                         )
                         continue
-                    limit_evidence = declared
-        else:
+                limit_evidence = declared_limit
+        elif joint_type == "continuous":
+            if declared_bounds is not None:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_unexpected",
+                        obj,
+                        "a continuous joint references a declared position range",
+                        {"record": declared_ref},
+                    )
+                )
+                continue
+            # A continuous joint has no position field. Its drive values are
+            # attached below, independently of native/fallback position policy.
+            limits = None
+            limit_source = None
+        elif declared_bounds is not None:
+            limits = {"lower": declared_bounds[0], "upper": declared_bounds[1]}
+            limit_source = "declared_author"
+            limit_evidence = declared_limit
+        elif default_allowed:
+            default_policy = rotation_window_policy(
+                ENGINEERING_DEFAULT_POLICY_ID,
+                author_limits=None,
+                native_absence=(
+                    "complete_mate_inventory_no_enabled_limit"
+                    if native_limit_inventory_complete(raw_mates) and not native_limit_errors
+                    else "native_limit_observation_unreadable"
+                ),
+                native_errors=native_limit_errors,
+            )
+            limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
+            limit_source = "default_policy"
+            findings.append(_finding(
+                "discovery.joint_default_policy", obj,
+                "engineering uses the versioned non-native default rotation window; the range is unqualified",
+                default_policy, blocking=False,
+            ))
+        elif native_limit_errors:
             findings.append(
                 _finding(
-                    "discovery.joint_limits_missing",
+                    "discovery.joint_limits_unreadable",
                     obj,
-                    "the active CAD constraints provide no native position range",
+                    "native position-limit evidence is incomplete or unreadable",
+                    {"errors": native_limit_errors},
                 )
             )
+            continue
+        else:
+            findings.append(_finding(
+                "discovery.joint_limits_missing", obj,
+                "the active CAD constraints provide no native position range",
+            ))
             continue
         if joint_type != "continuous" and limits is None:
             findings.append(
@@ -2130,10 +2234,9 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             drive_source = "controlled"
         if drive is not None:
             spec = drive["value"]
-            try:
-                effort = float(spec["effort"])
-                velocity_value = float(spec["velocity"])
-            except (KeyError, TypeError, ValueError):
+            effort = _controlled_number(spec.get("effort")) if isinstance(spec, dict) else None
+            velocity_value = _controlled_number(spec.get("velocity")) if isinstance(spec, dict) else None
+            if effort is None or velocity_value is None:
                 findings.append(
                     _finding(
                         "discovery.joint_drive_invalid",
@@ -2143,16 +2246,31 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     )
                 )
                 continue
-            if not (math.isfinite(effort) and math.isfinite(velocity_value)) or effort <= 0.0 or velocity_value <= 0.0:
+            if effort < 0.0 or velocity_value < 0.0:
                 findings.append(
                     _finding(
                         "discovery.joint_drive_invalid",
                         obj,
-                        "drive record effort/velocity must be finite and positive",
+                        "drive record effort/velocity must be finite and nonnegative",
                         {"file": drive["file"]},
                     )
                 )
                 continue
+            if isinstance(limits, dict):
+                limits.update(effort=effort, velocity=velocity_value)
+            elif joint_type == "continuous":
+                limits = {"effort": effort, "velocity": velocity_value}
+        if joint_type != "continuous" and limits is not None and limits["lower"] == limits["upper"]:
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_degenerate",
+                    obj,
+                    "equal authored position bounds are retained for capture and generation; "
+                    "a usable joint range is not qualified",
+                    {"limits": limits, "qualification_blocker": "usable_joint_range"},
+                    blocking=False,
+                )
+            )
         joints.append(
             {
                 "mate": name,
@@ -2178,6 +2296,10 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "limits": limits,
                 "limit_evidence": limit_evidence,
                 "limit_source": limit_source,
+                "native_observation_errors": (
+                    list(native_limit_errors) if limit_source == "declared_author" else []
+                ),
+                **({"default_policy": default_policy} if default_policy is not None else {}),
                 "drive": drive,
                 "drive_source": drive_source,
                 "properties": dict(properties),
@@ -3210,15 +3332,22 @@ def _exporter_joint_facts(
         limits = declared["limits"]
         limit_source = "declared_author" if isinstance(limits, dict) else None
         preview_policy = None
+        default_policy = None
         if kind != "fixed":
 
             def valid(value):
-                return type(value) in (int, float) and math.isfinite(value)
+                return _controlled_number(value) is not None
 
+            bounds_usable = (
+                kind != "continuous"
+                and isinstance(limits, dict)
+                and all(valid(limits.get(key)) for key in ("lower", "upper"))
+            )
+            bounds_present = [limits.get(key) for key in ("lower", "upper")] if isinstance(limits, dict) else []
+            invalid_bounds = any(value is not None and not valid(value) for value in bounds_present)
+            ordered_conflict = bounds_usable and limits["lower"] > limits["upper"]
             if kind != "continuous" and (
-                not isinstance(limits, dict)
-                or not all(valid(limits.get(key)) for key in ("lower", "upper"))
-                or limits["lower"] > limits["upper"]
+                invalid_bounds or ordered_conflict or (purpose != PURPOSE_ENGINEERING and not bounds_usable)
             ):
                 findings.append(
                     _finding(
@@ -3229,12 +3358,21 @@ def _exporter_joint_facts(
                     )
                 )
             native_values = set()
-            native_errors = []
+            native_read_errors = []
+            native_invalid_errors = []
             for mate in record.get("mates") or []:
                 if not isinstance(mate, dict):
                     continue
                 mate_kind = str(mate.get("type") or "").strip().lower()
-                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                carries_limit_evidence = (
+                    mate.get("native_limit") is not None
+                    or mate.get("limits") is not None
+                    or mate.get("is_advanced_mate") is True
+                )
+                if (
+                    mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}
+                    and not carries_limit_evidence
+                ):
                     continue
                 if mate.get("suppressed") is True:
                     continue
@@ -3248,8 +3386,40 @@ def _exporter_joint_facts(
                 )
                 if scope == "unrelated":
                     continue
-                if scope in {"claimed_unreadable", "claimed_same_side"}:
-                    native_errors.append(
+                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}:
+                    native_invalid_errors.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": "native limit evidence is attached to an unsupported mate type",
+                        }
+                    )
+                    continue
+                if scope == "claimed_unreadable":
+                    entities = mate.get("entities")
+                    wrong_owner = (
+                        isinstance(entities, list)
+                        and any(
+                            isinstance(entity, dict)
+                            and isinstance(entity.get("component"), str)
+                            and entity["component"]
+                            and owner_for(entity["component"]) is None
+                            for entity in entities
+                        )
+                    )
+                    target = native_invalid_errors if wrong_owner else native_read_errors
+                    target.append(
+                        {
+                            "mate": mate.get("name"),
+                            "reason": (
+                                "native limit entities bind unknown or ambiguous components"
+                                if wrong_owner
+                                else "native limit entities are not readable"
+                            ),
+                        }
+                    )
+                    continue
+                if scope == "claimed_same_side":
+                    native_invalid_errors.append(
                         {
                             "mate": mate.get("name"),
                             "reason": "native limit entities do not span the declared parent/child subtrees",
@@ -3257,35 +3427,41 @@ def _exporter_joint_facts(
                     )
                     continue
                 if mate.get("suppressed") is not False or mate.get("error_code") != 0:
-                    native_errors.append(
+                    native_read_errors.append(
                         {"mate": mate.get("name"), "reason": "suppression or solve state is not clean"}
                     )
                     continue
                 flag = mate.get("is_advanced_mate")
                 if type(flag) is not bool or mate.get("is_advanced_mate_error") is not None:
-                    native_errors.append(
+                    native_read_errors.append(
                         {"mate": mate.get("name"), "reason": "IsAdvancedMate is missing or unreadable"}
                     )
                     continue
                 if flag is not True:
-                    if mate.get("limits") is not None:
-                        native_errors.append(
+                    if mate.get("limits") is not None or mate.get("native_limit") is not None:
+                        native_invalid_errors.append(
                             {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
                         )
                     continue
                 if mate_kind not in {"limitdistance", "limitangle"}:
-                    native_errors.append(
+                    native_invalid_errors.append(
                         {"mate": mate.get("name"), "reason": "advanced flag on a standard mate"}
                     )
                     continue
                 try:
                     lower, upper, unit = validate_native_limit(mate, component_records)
+                except NativeLimitReadError as error:
+                    native_read_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
+                except NativeLimitInvalidError as error:
+                    native_invalid_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    continue
                 except ValueError as error:
-                    native_errors.append({"mate": mate.get("name"), "reason": str(error)})
+                    native_invalid_errors.append({"mate": mate.get("name"), "reason": str(error)})
                     continue
                 expected_unit = "m" if kind == "prismatic" else "rad"
                 if unit != expected_unit:
-                    native_errors.append(
+                    native_invalid_errors.append(
                         {
                             "mate": mate.get("name"),
                             "reason": f"native limit unit is {unit!r}, expected {expected_unit!r}",
@@ -3293,16 +3469,6 @@ def _exporter_joint_facts(
                     )
                     continue
                 native_values.add((lower, upper))
-            if native_errors:
-                findings.append(
-                    _finding(
-                        "discovery.joint_limits_unreadable",
-                        obj,
-                        "native position-limit evidence is incomplete or unreadable",
-                        {"errors": native_errors},
-                    )
-                )
-                continue
             if len(native_values) > 1:
                 findings.append(
                     _finding(
@@ -3313,11 +3479,49 @@ def _exporter_joint_facts(
                     )
                 )
                 continue
-            if native_values:
+            if native_invalid_errors:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "native position-limit evidence is readable but invalid",
+                        {"errors": native_invalid_errors},
+                    )
+                )
+                continue
+            if kind == "continuous":
+                if native_values or (
+                    isinstance(limits, dict) and any(limits.get(key) is not None for key in ("lower", "upper"))
+                ):
+                    findings.append(_finding(
+                        "discovery.joint_limits_unexpected", obj,
+                        "a continuous joint cannot carry position limits",
+                        {"declared": limits, "native": sorted(native_values)},
+                    ))
+                    continue
+                if native_read_errors:
+                    findings.append(_finding(
+                        "discovery.joint_limits_unreadable", obj,
+                        "native position-limit evidence is incomplete or unreadable", {"errors": native_read_errors},
+                    ))
+                    continue
+                limits = {key: (limits or {}).get(key) for key in ("effort", "velocity")}
+                limit_source = "declared_author"
+            elif native_values:
+                if native_read_errors:
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_unreadable",
+                            obj,
+                            "native position-limit evidence is incomplete or unreadable",
+                            {"errors": native_read_errors},
+                        )
+                    )
+                    continue
                 native_lower, native_upper = next(iter(native_values))
                 declared_values = (
                     (float(limits.get("lower")), float(limits.get("upper")))
-                    if isinstance(limits, dict)
+                    if bounds_usable
                     else None
                 )
                 if declared_values not in {None, (0.0, 0.0), (native_lower, native_upper)}:
@@ -3337,32 +3541,64 @@ def _exporter_joint_facts(
                     "velocity": (limits or {}).get("velocity"),
                 }
                 limit_source = "native"
-            elif kind != "continuous" and isinstance(limits, dict) and (
-                valid(limits.get("lower"))
-                and valid(limits.get("upper"))
-                and float(limits["lower"]) == 0.0
-                and float(limits["upper"]) == 0.0
-            ):
-                if kind == "revolute" and preview_allowed:
-                    author_limits = dict(limits)
-                    preview_limits = {
+            else:
+                author_limits = dict(limits) if isinstance(limits, dict) else None
+                author_nonzero = bounds_usable and (float(limits["lower"]) != 0.0 or float(limits["upper"]) != 0.0)
+                author_zero = bounds_usable and float(limits["lower"]) == 0.0 and float(limits["upper"]) == 0.0
+                native_inventory_complete = native_limit_inventory_complete(record.get("mates"))
+                if author_nonzero:
+                    limit_source = "declared_author"
+                elif kind == "revolute" and purpose == PURPOSE_ENGINEERING:
+                    default_policy = rotation_window_policy(
+                        ENGINEERING_DEFAULT_POLICY_ID,
+                        author_limits=author_limits,
+                        native_absence=(
+                            "complete_mate_inventory_no_enabled_limit"
+                            if native_inventory_complete and not native_read_errors
+                            else "native_limit_observation_unreadable"
+                        ),
+                        native_errors=native_read_errors,
+                    )
+                    limits = {
+                        "lower": -ROTATION_WINDOW_RAD,
+                        "upper": ROTATION_WINDOW_RAD,
+                    }
+                    for key in ("effort", "velocity"):
+                        if (
+                            isinstance(author_limits, dict)
+                            and valid(author_limits.get(key))
+                            and author_limits[key] >= 0
+                        ):
+                            limits[key] = author_limits[key]
+                    limit_source = "default_policy"
+                    findings.append(
+                        _finding(
+                            "discovery.joint_default_policy",
+                            obj,
+                            "engineering uses the versioned default rotation window because no usable native "
+                            "or authored position range was read; the range remains unqualified",
+                            default_policy,
+                            blocking=False,
+                        )
+                    )
+                elif kind == "revolute" and preview_allowed and author_zero and not native_read_errors:
+                    preview_policy = rotation_window_policy(
+                        PREVIEW_POLICY_ID,
+                        author_limits=author_limits,
+                        native_absence="complete_mate_inventory_no_enabled_limit",
+                    )
+                    limits = {
                         "lower": -PREVIEW_WINDOW_RAD,
                         "upper": PREVIEW_WINDOW_RAD,
                     }
                     for key in ("effort", "velocity"):
-                        if valid(author_limits.get(key)) and author_limits[key] >= 0:
-                            preview_limits[key] = author_limits[key]
-                    limits = preview_limits
+                        if (
+                            isinstance(author_limits, dict)
+                            and valid(author_limits.get(key))
+                            and author_limits[key] >= 0
+                        ):
+                            limits[key] = author_limits[key]
                     limit_source = "preview_policy"
-                    preview_policy = {
-                        "rule_id": PREVIEW_POLICY_ID,
-                        "rule_version": "v1",
-                        "window_rad": [-PREVIEW_WINDOW_RAD, PREVIEW_WINDOW_RAD],
-                        "native_cad_ranges": False,
-                        "hardware_qualified": False,
-                        "author_limits": author_limits,
-                        "native_absence": "complete_mate_inventory_no_enabled_limit",
-                    }
                     findings.append(
                         _finding(
                             "discovery.joint_preview_policy",
@@ -3373,6 +3609,16 @@ def _exporter_joint_facts(
                             blocking=False,
                         )
                     )
+                elif native_read_errors:
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_unreadable",
+                            obj,
+                            "native position-limit evidence is incomplete or unreadable",
+                            {"errors": native_read_errors},
+                        )
+                    )
+                    continue
                 else:
                     findings.append(
                         _finding(
@@ -3447,11 +3693,13 @@ def _exporter_joint_facts(
                 "axis": axis,
                 "declared_axis": declared_axis,
                 "delivered_axis": delivered_axis,
+                "declared_limits": dict(limits) if isinstance(limits, dict) else None,
                 "axis_reference": selector,
                 "limits": limits,
                 "limit_source": limit_source,
                 "limit_evidence": None,
                 "preview_policy": preview_policy,
+                "default_policy": default_policy,
                 "drive": None,
             }
         )
@@ -4573,6 +4821,25 @@ def _embed_record(output: Path, resolved: dict, records: list[dict]) -> dict:
     return entry
 
 
+def _evidence_summary(resolved: dict, embedded: dict) -> dict[str, Any]:
+    """Stable controlled-record provenance for delivery warnings and verification."""
+
+    value = resolved.get("value") if isinstance(resolved.get("value"), dict) else {}
+    return {
+        "kind": "controlled_record",
+        "file": str(embedded.get("package_file") or ""),
+        "sha256": str(embedded.get("sha256") or ""),
+        "anchor": embedded.get("anchor"),
+        "key": str(embedded.get("key") or ""),
+        "reference": str(embedded.get("reference") or ""),
+        "declared_values": {
+            key: value[key]
+            for key in ("lower", "upper", "effort", "velocity")
+            if key in value
+        },
+    }
+
+
 def _copy_tree(source: Path, output: Path, files: Mapping[str, str]) -> None:
     for name in sorted(files):
         original = confined(source, name)
@@ -5330,6 +5597,17 @@ def _derive_carriers(
     sealed definition.
     """
 
+    for mate in record.get("mates") or []:
+        if (
+            isinstance(mate, dict) and mate.get("suppressed") is False
+            and mate.get("native_limit") is not None
+            and str(mate.get("type") or "").lower() not in {"limitangle", "limitdistance"}
+        ):
+            findings.append(_finding(
+                "discovery.joint_limits_invalid", f"mate:{mate.get('name', '')}",
+                "a non-limit mate carries native position-limit evidence",
+            ))
+
     if exporter_declaration_present(record):
         declaration = _exporter_declaration(record, identity, findings)
         bodies, joints, derived_names = [], [], {}
@@ -5531,13 +5809,16 @@ def source_definition(
         }
         if isinstance(joint.get("name_rule"), dict):
             entry["name_rule"] = dict(joint["name_rule"])
-        if isinstance(joint.get("preview_policy"), dict):
-            entry["limits"] = {
-                key: float(value)
-                for key, value in joint["limits"].items()
-                if value is not None
-            }
-            entry["preview_policy"] = dict(joint["preview_policy"])
+        policy_field = (
+            "preview_policy"
+            if isinstance(joint.get("preview_policy"), dict)
+            else "default_policy"
+            if isinstance(joint.get("default_policy"), dict)
+            else None
+        )
+        if policy_field is not None:
+            entry["limits"] = {key: float(value) for key, value in joint["limits"].items() if value is not None}
+            entry[policy_field] = dict(joint[policy_field])
         elif joint["axis"].get("source") == "exporter":
             entry["limits"] = {
                 key: float(joint["limits"][key])
@@ -5547,15 +5828,42 @@ def source_definition(
                     else ("lower", "upper", "effort", "velocity")
                 )
             }
-            entry["limit_evidence"] = {
+            raw_limits = joint.get("declared_limits")
+            declared_values = {}
+            if isinstance(raw_limits, dict):
+                for field in ("lower", "upper", "effort", "velocity"):
+                    if field not in raw_limits:
+                        continue
+                    value = _controlled_number(raw_limits[field])
+                    if value is None:
+                        raise PipelineError(
+                            f"joint {joint['name']!r} exporter declaration has an invalid {field}"
+                        )
+                    declared_values[field] = value
+            common_evidence = {
+                "kind": "native_declaration",
                 "file": discovery_name,
                 "sha256": discovery_sha256,
                 "anchor": raw["exporter"]["raw_xml_sha256"],
+                "key": "raw.exporter.raw_xml",
+                "reference": f"{discovery_name}#raw.exporter.raw_xml",
             }
-            if isinstance(joint.get("declared_limits"), dict):
-                entry["limit_evidence"].update(
-                    {f"declared_{key}": str(value) for key, value in joint["declared_limits"].items()}
-                )
+            if joint.get("limit_source") == "declared_author" and joint["type"] != "continuous":
+                entry["limit_evidence"] = {
+                    **common_evidence,
+                    "declared_values": {
+                        field: declared_values[field] for field in ("lower", "upper")
+                    },
+                    "native_observation_errors": [],
+                }
+            if all(field in declared_values for field in ("effort", "velocity")):
+                entry["drive_evidence"] = {
+                    **common_evidence,
+                    "declared_values": {
+                        field: declared_values[field] for field in ("effort", "velocity")
+                    },
+                }
+                entry["drive_source"] = "controlled"
         elif joint["type"] == "continuous":
             if joint.get("drive") is not None:
                 entry["limits"] = {
@@ -5570,22 +5878,42 @@ def source_definition(
             if joint.get("drive") is not None:
                 entry["limits"]["effort"] = float(joint["drive"]["value"]["effort"])
                 entry["limits"]["velocity"] = float(joint["drive"]["value"]["velocity"])
-        if joint.get("limit_evidence") is not None:
+        limit_evidence = joint.get("limit_evidence")
+        if isinstance(limit_evidence, dict):
             embedded = next(
                 (
                     item
                     for item in records
-                    if item["file"] == str(joint["limit_evidence"]["file"]).replace("\\", "/")
-                    and item["key"] == str(joint["limit_evidence"].get("key") or "")
+                    if item["file"] == str(limit_evidence["file"]).replace("\\", "/")
+                    and item["key"] == str(limit_evidence.get("key") or "")
                 ),
                 None,
             )
-            if embedded is not None and embedded.get("anchor"):
-                entry["limit_evidence"] = {
-                    "file": embedded["package_file"],
-                    "sha256": embedded["sha256"],
-                    "anchor": embedded["anchor"],
-                }
+            if embedded is None:
+                raise PipelineError(
+                    f"joint {joint['name']!r} limit evidence is not in the embedded record index"
+                )
+            entry["limit_evidence"] = _evidence_summary(limit_evidence, embedded)
+            entry["limit_evidence"]["native_observation_errors"] = list(
+                joint.get("native_observation_errors") or []
+            )
+        drive_evidence = joint.get("drive")
+        if isinstance(drive_evidence, dict):
+            embedded = next(
+                (
+                    item
+                    for item in records
+                    if item["file"] == str(drive_evidence["file"]).replace("\\", "/")
+                    and item["key"] == str(drive_evidence.get("key") or "")
+                ),
+                None,
+            )
+            if embedded is None:
+                raise PipelineError(
+                    f"joint {joint['name']!r} drive evidence is not in the embedded record index"
+                )
+            entry["drive_evidence"] = _evidence_summary(drive_evidence, embedded)
+            entry["drive_source"] = "controlled"
         if joint.get("limit_source") is not None:
             entry["limit_source"] = str(joint["limit_source"])
         joints_out.append(entry)
@@ -5640,9 +5968,6 @@ def source_definition(
             }
             for frame in sorted(frames, key=lambda item: item["name"])
         ],
-        "material_source": "cad",
-        "documented_masses": {},
-        "mass_evidence": None,
         "geometry_exclusions": {},
         "expected_mass_kg": (checks or {}).get("expected_mass_kg"),
         "expected_extent_m": (checks or {}).get("expected_extent_m"),

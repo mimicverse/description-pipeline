@@ -12,6 +12,7 @@ import jsonschema
 import numpy as np
 
 from ..io import PipelineError, read_data
+from ..sources.solidworks.naming import fixed_joint_name
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,10 @@ class Robot:
         links = {link["name"]: link for link in data["links"]}
         frame_names = {frame["name"] for frame in data["frames"]}
         joint_names = {joint["name"] for joint in data["joints"]}
-        if frame_names & links.keys() or {name + "_fixed" for name in frame_names} & joint_names:
+        generated_frame_joints = {
+            fixed_joint_name(str(frame["parent"]), str(frame["name"])) for frame in data["frames"]
+        }
+        if frame_names & links.keys() or generated_frame_joints & joint_names:
             raise PipelineError("Frame names collide with generated URDF links/joints")
         children = set()
         for link in links.values():

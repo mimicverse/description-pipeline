@@ -56,8 +56,48 @@ _LIMIT_TYPES = {
     },
 }
 
-PREVIEW_POLICY_ID = "inspection_rotation_full_turn/v1"
-PREVIEW_WINDOW_RAD = math.pi
+INSPECTION_PREVIEW_POLICY_ID = "inspection_rotation_full_turn/v1"
+ENGINEERING_DEFAULT_POLICY_ID = "engineering_rotation_default_window/v1"
+ROTATION_WINDOW_RAD = math.pi
+
+# Existing consumers and persisted evidence use these inspection names.
+PREVIEW_POLICY_ID = INSPECTION_PREVIEW_POLICY_ID
+PREVIEW_WINDOW_RAD = ROTATION_WINDOW_RAD
+
+
+class NativeLimitReadError(ValueError):
+    """The native limit value was not available to read."""
+
+
+class NativeLimitInvalidError(ValueError):
+    """A readable native limit contradicts the required contract."""
+
+
+def rotation_window_policy(
+    rule_id: str,
+    *,
+    author_limits: object,
+    native_absence: str,
+    native_errors: list[dict] | None = None,
+) -> dict:
+    """Build the one versioned rotation-window policy used by both purposes."""
+
+    if rule_id not in {INSPECTION_PREVIEW_POLICY_ID, ENGINEERING_DEFAULT_POLICY_ID}:
+        raise ValueError("unknown rotation-window policy")
+    policy = {
+        "rule_id": rule_id,
+        "rule_version": "v1",
+        "window_rad": [-ROTATION_WINDOW_RAD, ROTATION_WINDOW_RAD],
+        "native_cad_ranges": False,
+        "hardware_qualified": False,
+        "author_limits": dict(author_limits) if isinstance(author_limits, Mapping) else author_limits,
+        "native_absence": native_absence,
+    }
+    if rule_id == ENGINEERING_DEFAULT_POLICY_ID:
+        policy["engineering_position_range_qualified"] = False
+    if native_errors is not None:
+        policy["native_observation_errors"] = [dict(item) for item in native_errors]
+    return policy
 
 
 def native_limit_inventory_complete(mates) -> bool:
@@ -104,39 +144,47 @@ def native_limit_inventory_complete(mates) -> bool:
 
 def _finite(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("native limit number is not numeric")
+        raise NativeLimitInvalidError("native limit number is not numeric")
     number = float(value)
     if not math.isfinite(number):
-        raise ValueError("native limit number is not finite")
+        raise NativeLimitInvalidError("native limit number is not finite")
     return number
 
 
 def _value_record(record, key: str, expected_api: str, unit: str) -> float:
-    if not isinstance(record, Mapping) or set(record) != _VALUE_KEYS:
-        raise ValueError(f"{key} has an invalid native value record")
-    if record.get("api") != expected_api or record.get("unit") != unit:
-        raise ValueError(f"{key} has another API or unit")
+    if not isinstance(record, Mapping) or not set(record) >= _VALUE_KEYS:
+        raise NativeLimitReadError(f"{key} has no complete readable native value record")
+    if set(record) != _VALUE_KEYS:
+        raise NativeLimitInvalidError(f"{key} has unexpected native value fields")
+    if record.get("api") != expected_api:
+        raise NativeLimitInvalidError(f"{key} came from another API")
+    if record.get("unit") != unit:
+        raise NativeLimitInvalidError(f"{key} uses the wrong unit")
     return _finite(record.get("value"))
 
 
 def _binding(entity, index: int) -> tuple[str, str | None, int | None]:
-    if not isinstance(entity, Mapping) or entity.get("entity_index") != index:
-        raise ValueError("limit mate entity order is not a complete two-entity binding")
+    if not isinstance(entity, Mapping) or "entity_index" not in entity:
+        raise NativeLimitReadError("limit mate entity has no readable order")
+    if type(entity["entity_index"]) is not int or entity["entity_index"] != index:
+        raise NativeLimitInvalidError("limit mate entity order is invalid")
     component = entity.get("component")
     if not isinstance(component, str):
-        raise ValueError("limit mate entity has no component identity")
+        raise NativeLimitReadError("limit mate entity has no readable component identity")
     if component == "":
         if entity.get("assembly_frame") is not True:
-            raise ValueError("an empty component identity is not a proven assembly frame")
+            raise NativeLimitInvalidError("an empty component identity is not a proven assembly frame")
     elif not isinstance(entity.get("reference_configuration"), str) or not entity["reference_configuration"]:
-        raise ValueError("limit mate entity has no referenced configuration")
+        raise NativeLimitReadError("limit mate entity has no readable referenced configuration")
     reference = entity.get("mate_entity_reference")
-    if not isinstance(reference, Mapping) or reference.get("error") is not None:
-        raise ValueError("limit mate entity has no complete native entity reference")
+    if not isinstance(reference, Mapping):
+        raise NativeLimitReadError("limit mate entity has no readable native entity reference")
+    if reference.get("error") is not None:
+        raise NativeLimitReadError("limit mate entity reference could not be read")
     feature = entity.get("feature")
     face_index = entity.get("face_index")
     if not ((isinstance(feature, str) and feature) or type(face_index) is int):
-        raise ValueError("limit mate entity has no feature or face selector")
+        raise NativeLimitReadError("limit mate entity has no readable feature or face selector")
     return (
         component,
         feature if isinstance(feature, str) and feature else None,
@@ -236,24 +284,33 @@ def validate_native_limit(
     """
 
     if not isinstance(mate, Mapping):
-        raise ValueError("native limit mate is not an object")
+        raise NativeLimitReadError("native limit mate is not a readable object")
     native_limit = mate.get("native_limit")
-    type_index = native_limit.get("type_index") if isinstance(native_limit, Mapping) else None
+    if not isinstance(native_limit, Mapping):
+        raise NativeLimitReadError("native limit values are not readable")
+    type_index = native_limit.get("type_index")
     spec = _LIMIT_TYPES.get(type_index)
-    if spec is None or mate.get("type") != spec["kind"]:
-        raise ValueError("native limit type and type_index do not agree")
-    if mate.get("is_advanced_mate") is not True or mate.get("is_advanced_mate_error") is not None:
-        raise ValueError("native limit flag is not a clean true reading")
+    if type(type_index) is not int or spec is None:
+        raise NativeLimitReadError("native limit type_index is not readable")
+    if mate.get("type") != spec["kind"]:
+        raise NativeLimitInvalidError("native limit type and type_index do not agree")
+    if type(mate.get("is_advanced_mate")) is not bool or mate.get("is_advanced_mate_error") is not None:
+        raise NativeLimitReadError("native limit flag is not a clean readable value")
+    if mate.get("is_advanced_mate") is not True:
+        raise NativeLimitInvalidError("native limit evidence has an advanced-mate false flag")
     if mate.get("is_advanced_mate_api") != f"{spec['interface']}.IsAdvancedMate":
-        raise ValueError("native limit flag came from another interface")
+        raise NativeLimitInvalidError("native limit flag came from another interface")
     native = mate["native_limit"]
+    missing = NATIVE_LIMIT_KEYS - set(native)
+    if missing:
+        raise NativeLimitReadError(f"native limit evidence is missing {sorted(missing)}")
     if set(native) != NATIVE_LIMIT_KEYS:
-        raise ValueError("native limit evidence is incomplete")
+        raise NativeLimitInvalidError("native limit evidence has unexpected fields")
     if (
         native.get("definition_interface") != spec["interface"]
         or native.get("definition_interface_iid") != spec["iid"]
     ):
-        raise ValueError("native limit definition interface does not match its type")
+        raise NativeLimitInvalidError("native limit definition interface does not match its type")
     unit = spec["unit"]
     nominal = _value_record(
         native["nominal_dimension"],
@@ -274,32 +331,36 @@ def validate_native_limit(
         native["maximum_limit"], "maximum_limit", f"{spec['interface']}.{spec['maximum']}", unit
     )
     if abs(nominal + minimum_variation - minimum) > 1e-12:
-        raise ValueError("minimum variation does not reconstruct the minimum limit")
+        raise NativeLimitInvalidError("minimum variation does not reconstruct the minimum limit")
     if abs(nominal + maximum_variation - maximum) > 1e-12:
-        raise ValueError("maximum variation does not reconstruct the maximum limit")
+        raise NativeLimitInvalidError("maximum variation does not reconstruct the maximum limit")
     if maximum < minimum:
-        raise ValueError("native limit bounds are inverted")
+        raise NativeLimitInvalidError("native limit bounds are inverted")
     limits = mate.get("limits")
+    expected_limit_keys = {"lower", "upper", "unit"}
+    if not isinstance(limits, Mapping) or not expected_limit_keys <= set(limits):
+        raise NativeLimitReadError("native limit bounds have no complete readable mirror")
     if (
-        not isinstance(limits, Mapping)
-        or set(limits) != {"lower", "upper", "unit"}
+        set(limits) != expected_limit_keys
         or limits.get("unit") != unit
         or _finite(limits.get("lower")) != minimum
         or _finite(limits.get("upper")) != maximum
     ):
-        raise ValueError("legacy limits do not equal the validated native limit")
+        raise NativeLimitInvalidError("legacy limits do not equal the validated native limit")
     entities = mate.get("entities")
     if not isinstance(entities, list) or len(entities) != 2:
-        raise ValueError("native limit must bind exactly two mate entities")
+        raise NativeLimitReadError("native limit has no complete two-entity binding")
     bindings = [_binding(entity, index) for index, entity in enumerate(entities)]
     if len(set(bindings)) != 2:
-        raise ValueError("native limit repeats one mate entity binding")
+        raise NativeLimitInvalidError("native limit repeats one mate entity binding")
     if components is not None:
         for entity in entities:
             component = entity.get("component")
-            if component and (
-                component not in components
-                or components[component].get("configuration") != entity.get("reference_configuration")
-            ):
-                raise ValueError("limit mate entity configuration does not match its component")
+            if not component:
+                continue
+            bound_component = components.get(component)
+            if not isinstance(bound_component, Mapping):
+                raise NativeLimitInvalidError("limit mate entity binds an unknown component")
+            if bound_component.get("configuration") != entity.get("reference_configuration"):
+                raise NativeLimitInvalidError("limit mate entity configuration does not match its component")
     return minimum, maximum, unit

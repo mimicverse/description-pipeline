@@ -7,11 +7,13 @@ import io
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
 import zipfile
+from fnmatch import fnmatch
 from pathlib import Path
 
 from description_pipeline.interface_records import release_domain_identity
@@ -94,6 +96,28 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
 
 
 class DistributionTests(unittest.TestCase):
+    def test_manifest_covers_every_tracked_deploy_file(self):
+        deploy_line = next(
+            line.strip()
+            for line in (ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("recursive-include deploy ")
+        )
+        patterns = deploy_line.split()[2:]
+        tracked = sorted(
+            subprocess.run(
+                ["git", "-C", str(ROOT), "ls-files", "deploy"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+        )
+        self.assertTrue(tracked)
+        missing = [
+            path for path in tracked if not any(fnmatch(path.rsplit("/", 1)[-1], pattern) for pattern in patterns)
+        ]
+        self.assertEqual(missing, [])
+        self.assertIn("deploy/systemd-units.tsv", tracked)
+
     def test_release_tree_must_be_valid_and_bound_to_embedded_identity(self):
         for value in (None, "bad", "A" * 40):
             with tempfile.TemporaryDirectory() as directory, self.subTest(value=value):

@@ -347,6 +347,34 @@ class HermeticSixStageTests(unittest.TestCase):
             raise subprocess.CalledProcessError(1, ["gh", *args], stderr="GitHub submission unavailable")
         raise AssertionError(f"unexpected GitHub command: {args}")
 
+    def _assert_failed_publish_evidence(self, failed: dict, subject: str) -> Path:
+        output = Path(failed["output"])
+        self.assertEqual(read_delivery_manifest(output)["subject"]["digest"], subject)
+        for relative in (
+            "transfer-manifest.json",
+            "reports/native-tool.json",
+            "reports/native-stages.json",
+            "reports/stages.json",
+            "reports/structural-team.json",
+            "reports/structural-team.md",
+            "reports/quality.json",
+        ):
+            self.assertTrue((output / relative).is_file(), relative)
+        self.assertEqual(failed["stage_report"]["path"], "reports/stages.json")
+        self.assertEqual(
+            failed["stage_report"]["sha256"],
+            hashlib.sha256((output / "reports/stages.json").read_bytes()).hexdigest(),
+        )
+        return output
+
+    def _portable_publish_failure(self, receipt: dict) -> BaseException:
+        from tests.v1.test_failure_boundary_fields import _module
+
+        module = _module()
+        with self.assertRaises(module.AirflowFailException) as caught:
+            module._portable_summary(receipt, stage="publish")
+        return caught.exception
+
     def _generate_and_verify(self) -> tuple[dict, dict, dict]:
         original_handoff = _tree_bytes(self.handoff)
         capture, native = self._prepare_and_capture()
@@ -408,6 +436,9 @@ class HermeticSixStageTests(unittest.TestCase):
         self.assertIs(published["passed"], True)
         self.assertEqual(published["subject_sha256"], generated_subject)
         self.assertEqual(published["submission"]["subject"], generated_subject)
+        self.assertNotIn("error", published)
+        self.assertNotIn("error_code", published)
+        self.assertNotIn("detail", published)
         self.assertEqual(read_delivery_manifest(self.root / "publish")["subject"]["digest"], generated_subject)
         self.assertEqual(
             _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").split()[0],
@@ -486,32 +517,69 @@ class HermeticSixStageTests(unittest.TestCase):
 
         self.assertEqual(failed["state"], "gh_failed_after_push")
         self.assertIs(failed["passed"], False)
+        self.assertEqual(failed["error"], "github_failed")
+        self.assertEqual(failed["error_code"], "github_failed")
         self.assertEqual(failed["submission"]["error"], "github_failed")
         self.assertEqual(failed["subject_sha256"], subject)
         self.assertEqual(failed["quality"]["passed"], True)
-        output = self.root / "publish"
-        self.assertEqual(failed["output"], str(output))
-        self.assertEqual(read_delivery_manifest(output)["subject"]["digest"], subject)
-        for relative in (
-            "transfer-manifest.json",
-            "reports/native-tool.json",
-            "reports/native-stages.json",
-            "reports/stages.json",
-            "reports/structural-team.json",
-            "reports/structural-team.md",
-            "reports/quality.json",
-            "reports/pr.json",
-        ):
-            self.assertTrue((output / relative).is_file(), relative)
-        self.assertEqual(json.loads((output / "reports/pr.json").read_text(encoding="utf-8")), failed["submission"])
-        self.assertEqual(failed["stage_report"]["path"], "reports/stages.json")
-        self.assertEqual(
-            failed["stage_report"]["sha256"],
-            hashlib.sha256((output / "reports/stages.json").read_bytes()).hexdigest(),
-        )
+        self._assert_failed_publish_evidence(failed, subject)
+        boundary_failure = self._portable_publish_failure(failed)
+        self.assertEqual(getattr(boundary_failure, "code", None), "github_failed")
         self.assertTrue(
             _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
             "the local Git push completed before GitHub failed",
+        )
+        self.assertEqual(_tree_bytes(self.root / "verify"), verified_bytes)
+
+    def test_failed_git_submission_preserves_the_verified_delivery(self) -> None:
+        _original_handoff, native, verified = self._generate_and_verify()
+        subject = verified["subject_sha256"]
+        verified_bytes = _tree_bytes(self.root / "verify")
+        repository = self._repository()
+        real_git = urdf_pr._git
+        stderr = "pre-push submission rejected"
+
+        def git_with_failed_push(target, *args: str, **kwargs):
+            if args[:1] == ("push",):
+                raise subprocess.CalledProcessError(128, ["git", *args], stderr=stderr)
+            return real_git(target, *args, **kwargs)
+
+        release = {"schema_version": "solidworks-to-urdf.release/v1", "version": solidworks.__version__}
+        tool = {**tool_record("portable"), "release": release}
+        with (
+            patch.object(steps, "tool_record", return_value=tool),
+            patch.object(urdf_pr, "_origin_slug", return_value="example/nd_fixture"),
+            patch.object(urdf_pr, "_gh", side_effect=self._github),
+            patch.object(urdf_pr, "_git", side_effect=git_with_failed_push),
+        ):
+            failed = solidworks.publish(
+                self.root / "verify",
+                self.root / "publish",
+                run_id=RUN_ID,
+                expected_subject=subject,
+                repository=repository,
+                base=BASE_BRANCH,
+                handoff_sha256=native["capture"]["handoff_sha256"],
+                prior_events=self.events,
+                on_event=self._record,
+            )
+
+        self.assertEqual(failed["state"], "failed")
+        self.assertIs(failed["passed"], False)
+        self.assertEqual(failed["error"], "git_failed")
+        self.assertEqual(failed["error_code"], "git_failed")
+        self.assertEqual(failed["detail"], stderr)
+        self.assertEqual(failed["submission"]["error"], "git_failed")
+        self.assertEqual(failed["submission"]["detail"], stderr)
+        self.assertEqual(failed["subject_sha256"], subject)
+        self.assertEqual(failed["quality"]["passed"], True)
+        self._assert_failed_publish_evidence(failed, subject)
+        boundary_failure = self._portable_publish_failure(failed)
+        self.assertEqual(getattr(boundary_failure, "code", None), "git_failed")
+        self.assertEqual(getattr(boundary_failure, "detail", None), stderr)
+        self.assertEqual(
+            _git("ls-remote", str(self.root / "remote.git"), f"refs/heads/{REVIEW_BRANCH}").strip(),
+            "",
         )
         self.assertEqual(_tree_bytes(self.root / "verify"), verified_bytes)
 

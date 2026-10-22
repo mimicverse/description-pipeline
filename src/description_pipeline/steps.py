@@ -332,7 +332,6 @@ def _rehome_evidence(staging: Path, package: Path) -> None:
         "scene": "raw/scene_raw.json",
         "mass_closure": "raw/mass_closure.json",
         "material_provenance": "raw/material_provenance.json",
-        "declared_masses": "raw/declared_masses.json",
         "dependency_closure": "raw/dependency_closure.json",
         "link_group_mass_properties": "raw/link_group_mass_properties.json",
         "effective_instances": "raw/effective_instances.json",
@@ -779,7 +778,6 @@ def capture_evidence(
             "document_suffixes": [".sldasm", ".sldprt"],
             "geometry": {"enabled": True, "format": "stl_binary"},
             "coordinate_systems": [str(name) for name in plan["datums"]],
-            "material_source": "cad",
             "allowed_roots": [str(package.resolve())],
             "groups": plan["groups"],
             "axis_requests": plan["axis_requests"],
@@ -968,6 +966,5 @@ def publish_model(
         "passed": bool(result.get("url")) and result.get("state") in {"published", "updated", "noop"},
     }
 
-    write_json(Path(bundle) / "reports/pr.json", result)
     _state(on_event, "publish", "completed" if result["passed"] else "failed", error=result.get("error"))
     return result

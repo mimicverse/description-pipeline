@@ -39,7 +39,7 @@ from ..geometry.native_u import (
     native_scope_warning_details_match,
 )
 from ..interface_records import REQUEST_PURPOSES, validate_source_record
-from ..io import PipelineError, acquire_process_lock, confined, file_digest
+from ..io import PipelineError, acquire_process_lock, canonical_json_value, confined, file_digest
 from ..request_evidence import read_request_evidence
 from ..stages import record_check
 
@@ -382,7 +382,7 @@ def _reverify(root: Path, subject: str) -> None:
         raise PrError("reverification_binding_mismatch", None)
 
 
-def _verify_committed(repository: Path, commit: str, subject: str) -> None:
+def _verify_committed(repository: Path, commit: str, subject: str) -> str:
     """Verify Git blob bytes, including changes made by clean filters."""
     tree = subprocess.run(
         ["git", "-C", str(repository), "ls-tree", "-rz", commit, "--", *GOVERNED_PATHS], check=True, capture_output=True
@@ -409,6 +409,7 @@ def _verify_committed(repository: Path, commit: str, subject: str) -> None:
         if not attributes.is_file() or attributes.read_bytes() != GIT_ATTRIBUTES:
             raise PrError("committed_git_metadata_mismatch", ".gitattributes")
         _reverify(root, subject)
+        return file_digest(root / "reports/quality.json")
 
 
 def _lock(repository: Path):
@@ -560,69 +561,273 @@ def _native_scope_warning_rows(report: dict) -> list[dict]:
     return rows
 
 
-def _body(subject: str, commit: str, report: dict, purpose: str) -> str:
-    checks = report.get("checks") or []
-    # Every (fact_id, scope, object_id) identity prints independently in a stable
-    # order (object_id, then fact_id): a two-joint fact never collapses to one
-    # line, so flipping the report order cannot flip a conclusion.
+_SUMMARY_GROUP_LIMIT = 64
+_SUMMARY_STATUS_LIMIT = 32
+_SUMMARY_LABEL_LIMIT = 96
+_PR_BODY_SAFE_LIMIT = 60_000
+_WARNING_ROW_EXTRA_KEYS = (
+    "motion",
+    "native_joint_identity",
+    "native_sign",
+    "sign_reversal",
+    "sign_warning",
+    "original_axis_assembly",
+    "output_axis_assembly",
+    "actual_child_axis",
+    "original_frame",
+    "output_frame",
+    "model_frame",
+    "q_sign",
+    "range_transform",
+    "limits_before",
+    "limits_after",
+    "drive_before",
+    "drive_after",
+    "limits_status",
+    "drive_status",
+    "warning_does_not_authorize",
+    "warning_does_not_replace_evidence",
+    "object_indices",
+    "persistent",
+    "native_cad_ranges",
+    "hardware_qualified",
+    "engineering_position_range_qualified",
+    "window_rad",
+    "native_absence",
+    "native_observation_errors",
+    "file",
+    "sha256",
+    "anchor",
+    "key",
+    "reference",
+)
+
+
+def _body_inline(value: object, limit: int = _SUMMARY_LABEL_LIMIT) -> str:
+    """Escape and bound one untrusted value for a Markdown inline-code span."""
+
+    text = value if isinstance(value, str) else canonical_json_value(value)
+    if len(text) > limit:
+        omitted = len(text) - limit
+        text = f"{text[:limit]}... [{omitted} characters omitted; see reports/quality.json]"
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("`", "&#96;")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+
+
+def _warning_value(
+    object_row: dict,
+    diagnostic: dict,
+    detail: dict,
+    key: str,
+) -> tuple[bool, object]:
+    """Read one documented source field and preserve an explicit JSON null."""
+
+    for row in (object_row, detail, diagnostic):
+        if key in row:
+            return True, row[key]
+    return False, None
+
+
+def _normalized_warning_row(
+    code: str,
+    object_row: dict,
+    diagnostic: dict,
+    detail: dict,
+) -> dict:
+    """One canonical warning row with every documented source field."""
+
+    fields = object_row.get("fields")
+    if not isinstance(fields, list):
+        object_field = object_row.get("field")
+        fields = [object_field] if isinstance(object_field, str) and object_field else None
+    if not isinstance(fields, list):
+        fields = detail.get("fields")
+    if not isinstance(fields, list):
+        _, field = _warning_value({}, diagnostic, detail, "field")
+        fields = [field] if isinstance(field, str) and field else []
+    row = {
+        "code": code,
+        "object_type": _warning_value(object_row, diagnostic, detail, "object_type")[1],
+        "object": _warning_value(object_row, diagnostic, detail, "object")[1],
+        "fields": [str(field) for field in fields if isinstance(field, str) and field],
+        "source": _warning_value(object_row, diagnostic, detail, "source")[1],
+        "rule_id": _warning_value(object_row, diagnostic, detail, "rule_id")[1],
+        "rule_version": _warning_value(object_row, diagnostic, detail, "rule_version")[1],
+        "original": _warning_value(object_row, diagnostic, detail, "original")[1],
+        "actual": _warning_value(object_row, diagnostic, detail, "actual")[1],
+        "reason": _warning_value(object_row, diagnostic, detail, "reason")[1],
+    }
+    for key in _WARNING_ROW_EXTRA_KEYS:
+        present, value = _warning_value(object_row, diagnostic, detail, key)
+        if present:
+            row[key] = value
+    return row
+
+
+def _warning_diagnostics(report: dict) -> list[dict]:
+    """Every non-blocking diagnostic group with a stable code."""
+
+    diagnostics = report.get("diagnostics", [])
+    if not isinstance(diagnostics, list):
+        raise PipelineError("Quality diagnostics are malformed")
+    return [
+        diagnostic
+        for diagnostic in diagnostics
+        if isinstance(diagnostic, dict)
+        and diagnostic.get("blocking") is False
+        and isinstance(diagnostic.get("code"), str)
+        and diagnostic["code"]
+    ]
+
+
+def _general_warning_rows(report: dict) -> list[dict]:
+    """The deduplicated canonical object-level warning index."""
+
+    rows: list[dict] = []
+    for diagnostic in _warning_diagnostics(report):
+        code = diagnostic["code"]
+        detail = diagnostic.get("detail") if isinstance(diagnostic.get("detail"), dict) else {}
+        candidates = detail.get("objects")
+        if not isinstance(candidates, list):
+            candidates = diagnostic.get("objects")
+        objects = [item for item in candidates if isinstance(item, dict)] if isinstance(candidates, list) else []
+        if not objects:
+            documented = {
+                key
+                for key in ("object", "object_type", "field", "fields", "source", "rule_id", "rule_version")
+                if key in detail or key in diagnostic
+            }
+            if not documented:
+                continue
+            objects = [{}]
+        rows.extend(_normalized_warning_row(code, row, diagnostic, detail) for row in objects)
+    unique = {canonical_json_value(row): row for row in rows}
+    return [unique[key] for key in sorted(unique)]
+
+
+def _quality_source_line(*, slug: str, commit: str, quality_sha256: str) -> str:
+    """The one fixed candidate-commit binding to the complete quality report."""
+
+    if (
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug) is None
+        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or re.fullmatch(r"[0-9a-f]{64}", quality_sha256) is None
+    ):
+        raise PipelineError("Quality source binding is invalid")
+    url = f"https://github.com/{slug}/blob/{commit}/reports/quality.json"
+    return (
+        f"- complete candidate source: [reports/quality.json]({url}) "
+        f"at commit `{commit}` (`sha256:{quality_sha256}`)\n"
+    )
+
+
+def _warning_index_lines(report: dict) -> str:
+    """A bounded code/count index bound to the complete quality report."""
+
+    diagnostics = _warning_diagnostics(report)
+    if not diagnostics:
+        return ""
+    rows = _general_warning_rows(report)
+    group_counts: dict[str, int] = {}
+    for diagnostic in diagnostics:
+        code = str(diagnostic["code"])
+        group_counts[code] = group_counts.get(code, 0) + 1
+    row_counts: dict[str, int] = {}
+    for row in rows:
+        code = str(row["code"])
+        row_counts[code] = row_counts.get(code, 0) + 1
+    codes = sorted(group_counts)
+    shown_codes = codes[:_SUMMARY_GROUP_LIMIT]
+    omitted_codes = len(codes) - len(shown_codes)
+    code_text = "; ".join(
+        f"`{_body_inline(code)}` groups={group_counts[code]} rows={row_counts.get(code, 0)}" for code in shown_codes
+    )
+    if omitted_codes:
+        code_text += f"; {omitted_codes} code groups omitted"
+    return (
+        "\n## Recorded source warnings\n"
+        f"- warning groups: total={len(diagnostics)}; shown=0; omitted={len(diagnostics)}.\n"
+        f"- warning object rows: total={len(rows)}; shown=0; omitted={len(rows)}.\n"
+        f"- warning codes: total={len(codes)}; shown={len(shown_codes)}; omitted={omitted_codes}; "
+        f"groups/rows: {code_text}.\n"
+        "- Warning and qualification object details are not duplicated in this body; "
+        "the complete candidate source above is the sole detailed authority.\n"
+        "- Warnings are recorded observations, never passes or publication evidence.\n"
+    )
+
+
+def _qualification_summary_lines(report: dict) -> str:
+    """A bounded fact/status index bound to the complete quality report."""
+
     qualifications = sorted(
-        (
-            str(item.get("object_id") or ""),
-            str(item.get("fact_id") or ""),
-            str(item.get("status") or ""),
-        )
+        (str(item.get("fact_id") or ""), str(item.get("status") or ""))
         for item in (report.get("qualifications") or [])
         if isinstance(item, dict)
     )
-    qualification_lines = "".join(
-        f"- {fact_id}{f'[{object_id}]' if object_id else ''}: {status}"
-        f"{' (unqualified)' if status == 'unqualified' else ''}\n"
-        for object_id, fact_id, status in qualifications
+    if not qualifications:
+        return ""
+    status_counts: dict[str, int] = {}
+    group_counts: dict[tuple[str, str], int] = {}
+    for fact_id, status in qualifications:
+        status_counts[status] = status_counts.get(status, 0) + 1
+        group_counts[(fact_id, status)] = group_counts.get((fact_id, status), 0) + 1
+    statuses = sorted(status_counts)
+    shown_statuses = statuses[:_SUMMARY_STATUS_LIMIT]
+    omitted_statuses = len(statuses) - len(shown_statuses)
+    status_text = "; ".join(f"`{_body_inline(status)}`={status_counts[status]}" for status in shown_statuses)
+    if omitted_statuses:
+        status_text += f"; {omitted_statuses} status groups omitted"
+    groups = sorted(group_counts)
+    shown_groups = groups[:_SUMMARY_GROUP_LIMIT]
+    omitted_groups = len(groups) - len(shown_groups)
+    group_text = "; ".join(
+        f"`{_body_inline(fact_id)}`[`{_body_inline(status)}`]={group_counts[(fact_id, status)]}"
+        for fact_id, status in shown_groups
     )
-    provenance = next(
-        (
-            check.get("details")
-            for check in checks
-            if check.get("id") == "provenance.value_warnings" and check.get("state") == "passed"
-        ),
-        {},
-    )
-    provenance_line = (
-        f"- value provenance: {provenance.get('objects')} non-native field/object warnings; "
-        f"codes: {', '.join(provenance.get('codes') or [])}\n"
-        if isinstance(provenance, dict) and provenance.get("codes")
-        else ""
-    )
-    sign_lines = "".join(
-        f"- direction author sign `{row.get('object')}`: "
-        f"{row.get('original_frame')} `{json.dumps(row.get('original_axis_assembly'), separators=(',', ':'))}` -> "
-        f"{row.get('output_frame')} `{json.dumps(row.get('output_axis_assembly'), separators=(',', ':'))}`; "
-        f"{row.get('model_frame')} `{json.dumps(row.get('actual_child_axis'), separators=(',', ':'))}`; "
-        f"native_sign={row.get('native_sign')}, q_sign={row.get('q_sign')}, "
-        f"range_transform={row.get('range_transform')}, "
-        f"limits={row.get('limits_status')}, drive={row.get('drive_status')}, "
-        f"({row.get('rule_id')}/{row.get('rule_version')}); {row.get('reason')}; "
-        f"warning_does_not_replace_evidence={row.get('warning_does_not_replace_evidence')}\n"
-        for row in (provenance.get("direction_sign_warnings") or [])
-        if isinstance(row, dict)
-    )
-    native_scope_lines = "".join(
-        f"- native scope identity `{row['code']}`: object `{row['object']}`; "
-        f"object_indices={json.dumps(row['detail']['object_indices'], separators=(',', ':'))}; "
-        f"field=`{row['detail']['field']}`; rule=`{row['detail']['rule_version']}`; "
-        "persistent=false\n"
-        for row in _native_scope_warning_rows(report)
-    )
+    if omitted_groups:
+        group_text += f"; {omitted_groups} fact/status groups omitted"
     return (
+        "\n## Recorded qualifications\n"
+        f"- qualification object rows: total={len(qualifications)}; shown=0; omitted={len(qualifications)}.\n"
+        f"- qualification facts: total={len({fact_id for fact_id, _ in groups})}; "
+        f"fact/status summaries shown={len(shown_groups)}; omitted={omitted_groups}; "
+        f"counts: {group_text}.\n"
+        f"- qualification statuses: total={len(statuses)}; shown={len(shown_statuses)}; "
+        f"omitted={omitted_statuses}; counts: {status_text}.\n"
+    )
+
+
+def _body(
+    subject: str,
+    commit: str,
+    report: dict,
+    purpose: str,
+    *,
+    slug: str,
+    quality_sha256: str,
+) -> str:
+    checks = report.get("checks") or []
+    _native_scope_warning_rows(report)
+    warning_lines = _warning_index_lines(report)
+    qualification_lines = _qualification_summary_lines(report)
+    body = (
         f"Automatic SolidWorks-to-URDF publication.\n\n"
         f"- subject: `{subject}`\n- verified commit: `{commit}`\n"
         f"- purpose: `{purpose}`\n"
         f"- verifier: recomputed, passed ({len(checks)} checks)\n"
-        f"{provenance_line}"
-        f"{sign_lines}"
-        f"{native_scope_lines}"
+        f"{_quality_source_line(slug=slug, commit=commit, quality_sha256=quality_sha256)}"
+        f"{warning_lines}"
         f"{qualification_lines}"
     )
+    if len(body) > _PR_BODY_SAFE_LIMIT or len(body.encode("utf-8")) > _PR_BODY_SAFE_LIMIT:
+        raise PipelineError("PR body exceeds the safe GitHub body limit")
+    return body
 
 
 def _open_pr_matches(
@@ -675,13 +880,21 @@ def _pr(
     commit: str,
     report: dict,
     purpose: str,
+    quality_sha256: str,
     message: str | None,
 ) -> tuple[str, str]:
     matches = _open_pr_matches(repository, slug, base, branch)
     if len(matches) > 1:
         raise PrError("pr_ambiguous", matches)
     title = message.splitlines()[0] if message else f"SolidWorks-to-URDF bundle ({commit[:12]})"
-    body = _body(subject, commit, report, purpose)
+    body = _body(
+        subject,
+        commit,
+        report,
+        purpose,
+        slug=slug,
+        quality_sha256=quality_sha256,
+    )
     with tempfile.NamedTemporaryFile(
         "w", suffix=".json" if matches else ".md", delete=False, encoding="utf-8"
     ) as handle:
@@ -776,6 +989,7 @@ def submit_bundle(
     pushed = ""
     subject = ""
     slug = ""
+    quality_sha256 = ""
     phase = "publication.inputs"
 
     def observed(identifier, state, details):
@@ -837,7 +1051,7 @@ def submit_bundle(
                 bundle, worktree, subject, message or f"feat({hardware}): publish SolidWorks-to-URDF bundle"
             )
             _reverify(worktree, subject)
-            _verify_committed(worktree, commit, subject)
+            quality_sha256 = _verify_committed(worktree, commit, subject)
             observed(
                 "publication.git",
                 "passed",
@@ -948,7 +1162,18 @@ def submit_bundle(
             shutil.rmtree(staging, ignore_errors=True)
         if _remote_ref(repository, f"refs/heads/{branch}") != pushed:
             raise PrError("remote_head_mismatch", {"expected": pushed})
-        state, url = _pr(repository, slug, base, branch, subject, pushed, report, purpose, message)
+        state, url = _pr(
+            repository,
+            slug,
+            base,
+            branch,
+            subject,
+            pushed,
+            report,
+            purpose,
+            quality_sha256,
+            message,
+        )
         # Final confirmation: the baseline must still be the one this candidate
         # was planned and merged against.  When it moved after the candidate
         # write, the write is retained and the receipt stays unresolved for

@@ -96,6 +96,24 @@ PREVIEW_LIMIT_WARNING = {
         ]
     },
 }
+ENGINEERING_DEFAULT_POLICY_WARNING = {
+    "code": "limits.default_policy",
+    "object": "joint:r_elbow",
+    "blocking": False,
+    "message": "engineering default rotation window; engineering position range remains unqualified",
+    "detail": {
+        "objects": [
+            {
+                "object": "joint:r_elbow",
+                "object_type": "joint",
+                "field": "limits",
+                "source": "engineering default rotation window policy",
+                "rule_id": "engineering_rotation_default_window/v1",
+                "engineering_position_range_qualified": False,
+            }
+        ]
+    },
+}
 BLOCKING_QUALITY_DIAGNOSTIC = {
     "code": "quality.required_failure",
     "object": "joint:r_elbow",
@@ -188,6 +206,27 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertEqual(preview["warnings"][0]["code"], "limits.preview_policy")
         self.assertEqual(preview["warnings"][0]["object"], "joint:r_elbow")
         self.assertEqual(preview["warnings"][0]["detail"], PREVIEW_LIMIT_WARNING["detail"])
+
+    def test_verified_preview_includes_engineering_default_policy_warning(self) -> None:
+        platform = self._registered_failed_verify(
+            passed=True,
+            state="completed",
+            diagnostics=[ENGINEERING_DEFAULT_POLICY_WARNING],
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                endpoint=lambda: _DownEndpoint(),
+                platform_store=platform.store,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, DAG_RUN_ID)
+
+        self.assertIs(preview["verified"], True)
+        self.assertEqual(preview["warnings_total"], 1)
+        self.assertEqual(preview["warnings"][0]["code"], "limits.default_policy")
+        self.assertEqual(preview["warnings"][0]["detail"], ENGINEERING_DEFAULT_POLICY_WARNING["detail"])
 
     def test_failed_preview_merges_and_deduplicates_quality_warnings(self) -> None:
         duplicate = {
@@ -490,10 +529,14 @@ class DiagnosticPreviewTests(unittest.TestCase):
         static = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         html = (static / "index.html").read_text(encoding="utf-8")
         app = (static / "app.js").read_text(encoding="utf-8")
-        self.assertIn('id="preview-diagnostic"', html)
+        self.assertIn('<div id="preview-diagnostic"', html)
         self.assertIn("renderPreviewDiagnostic(preview)", app)
-        self.assertIn("preview.verified !== false", app)
+        self.assertIn("previewDiagnosticState(preview)", app)
+        self.assertIn("Source warnings", app)
+        self.assertIn("appendWarningSourceRows", app)
+        self.assertIn("replaceChildren()", app)
         self.assertIn("must not be published", app)
+        self.assertNotIn("innerHTML", app)
 
 
 if __name__ == "__main__":

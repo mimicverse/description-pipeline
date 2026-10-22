@@ -471,13 +471,13 @@ class OperatorctlSurfaceTests(unittest.TestCase):
         )[0]
         self.assertIn("airflow_lifecycle stop-executors", branch)
         self.assertNotIn("airflow_lifecycle stop\n", branch)
-        self.assertIn("description-postgres.service", branch)
+        self.assertIn('"${DATABASE_UNITS[0]}.service"', branch)
         self.assertIn("PostgreSQL remains active", branch)
 
     def test_start_resumes_windows_after_linux_and_before_admission(self):
         source = CONTROL.read_text(encoding="utf-8")
         start_branch = source.rsplit("  start)\n", 1)[1].split("  drain)\n", 1)[0]
-        linux_services = start_branch.index("systemctl --user enable --now")
+        linux_services = start_branch.index("operator_units_enable")
         windows_resume = start_branch.index('instance_lifecycle_resume "$ACTIVE_ID" "$STATE_ROOT/install-record.json"')
         dag_unpause = start_branch.index("airflow_unpause_dag")
         admission_open = start_branch.index("platform_open_admission")

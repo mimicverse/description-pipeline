@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import copy
+import math
 import unittest
 
 from description_pipeline.sources.solidworks.native_limits import (
+    ENGINEERING_DEFAULT_POLICY_ID,
+    INSPECTION_PREVIEW_POLICY_ID,
+    NativeLimitInvalidError,
+    NativeLimitReadError,
+    rotation_window_policy,
     limit_mate_scope,
     validate_limit_entity_topology,
     validate_native_limit,
@@ -15,6 +21,28 @@ from . import support
 
 
 class NativeLimitValidationTests(unittest.TestCase):
+    def test_rotation_windows_share_one_value_with_distinct_purpose_rules(self) -> None:
+        author_limits = {"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0}
+        preview = rotation_window_policy(
+            INSPECTION_PREVIEW_POLICY_ID,
+            author_limits=author_limits,
+            native_absence="complete_mate_inventory_no_enabled_limit",
+        )
+        engineering = rotation_window_policy(
+            ENGINEERING_DEFAULT_POLICY_ID,
+            author_limits=author_limits,
+            native_absence="native_limit_observation_unreadable",
+            native_errors=[{"mate": "limit", "reason": "unreadable"}],
+        )
+        self.assertEqual(preview["window_rad"], [-math.pi, math.pi])
+        self.assertEqual(engineering["window_rad"], preview["window_rad"])
+        self.assertNotEqual(preview["rule_id"], engineering["rule_id"])
+        self.assertIs(engineering["engineering_position_range_qualified"], False)
+        self.assertEqual(
+            engineering["native_observation_errors"],
+            [{"mate": "limit", "reason": "unreadable"}],
+        )
+
     def test_complete_nonzero_nominal_observation(self) -> None:
         mate = support.native_limit_mate("base-1", "arm-1", lower=-0.01, upper=0.02)
         mate["limits"] = {"lower": 0.29, "upper": 0.32, "unit": "rad"}
@@ -48,6 +76,41 @@ class NativeLimitValidationTests(unittest.TestCase):
                 mutate(candidate)
                 with self.assertRaises(ValueError):
                     validate_native_limit(candidate)
+
+    def test_read_unavailability_is_distinct_from_invalid_native_evidence(self) -> None:
+        readable = support.native_limit_mate("base-1", "arm-1")
+
+        missing = copy.deepcopy(readable)
+        missing["native_limit"].pop("minimum_variation")
+        with self.assertRaises(NativeLimitReadError):
+            validate_native_limit(missing)
+
+        cases = []
+        variation = copy.deepcopy(readable)
+        variation["native_limit"]["minimum_variation"]["value"] = -2.0
+        cases.append(variation)
+        inverted = support.native_limit_mate("base-1", "arm-1", lower=1.0, upper=-1.0)
+        cases.append(inverted)
+        wrong_unit = copy.deepcopy(readable)
+        wrong_unit["native_limit"]["minimum_limit"]["unit"] = "m"
+        cases.append(wrong_unit)
+        wrong_order = copy.deepcopy(readable)
+        wrong_order["entities"][1]["entity_index"] = 0
+        cases.append(wrong_order)
+        wrong_components = {
+            "base-1": {"configuration": "Default"},
+            "arm-1": {"configuration": "Other"},
+        }
+        cases.append((copy.deepcopy(readable), wrong_components))
+
+        for candidate in cases:
+            with self.subTest(candidate=candidate):
+                if isinstance(candidate, tuple):
+                    mate, components = candidate
+                else:
+                    mate, components = candidate, None
+                with self.assertRaises(NativeLimitInvalidError):
+                    validate_native_limit(mate, components)
 
     def test_wrong_interface_and_legacy_limits_are_refused(self) -> None:
         mate = support.native_limit_mate("base-1", "arm-1")

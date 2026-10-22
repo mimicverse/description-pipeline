@@ -46,7 +46,7 @@ class ComponentContextCoverageTests(unittest.TestCase):
     def test_divergence_explained_by_effective_cover_is_not_an_error(self):
         payload, scene = self._fixture()
         details, error = oracle._component_context_findings(
-            payload, "cad", 0.1, scene, covered={"board-1", "head/leaf"}
+            payload, 0.1, scene, covered={"board-1", "head/leaf"}
         )
         self.assertIsNone(error)
         self.assertEqual(details["component_context"]["effective_vs_document_mismatches"], 3)
@@ -55,7 +55,7 @@ class ComponentContextCoverageTests(unittest.TestCase):
         payload, scene = self._fixture()
         # board-1's own override is covered, so the surviving mismatch must be the
         # head subtree that no covered instance explains.
-        _, error = oracle._component_context_findings(payload, "cad", 0.1, scene, covered={"board-1"})
+        _, error = oracle._component_context_findings(payload, 0.1, scene, covered={"board-1"})
         self.assertIsNotNone(error)
         self.assertIn("head", error)
 
@@ -65,7 +65,7 @@ class ComponentContextCoverageTests(unittest.TestCase):
         )
         scene["other/x"] = 0.01
         _, error = oracle._component_context_findings(
-            payload, "cad", 0.1, scene, covered={"board-1", "head/leaf"}
+            payload, 0.1, scene, covered={"board-1", "head/leaf"}
         )
         self.assertIsNotNone(error)
         self.assertIn("other/x", error)
