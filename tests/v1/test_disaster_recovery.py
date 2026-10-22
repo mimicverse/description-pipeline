@@ -2109,6 +2109,40 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "recovery_snapshot_worker_failed")
         self.assertFalse((self.root / "recovery/backup/state/runs").exists())
 
+    def test_target_generator_derives_v3_from_v6_without_external_closure_override(self):
+        out, manifest = self.backup()
+        manifest_path = out / "recovery-manifest.json"
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
+        fixture_plan = json.loads(self.target_plan(recovery.sha256_file(manifest_path), roots).read_text())
+        generated = recovery.build_target_plan(
+            manifest,
+            recovery.sha256_file(manifest_path),
+            host_id="target-generation-fixture",
+            postgres=fixture_plan["postgres"],
+        )
+        self.assertEqual(generated["schema_version"], recovery.TARGET_SCHEMA)
+        self.assertEqual(generated["closure"], manifest["closure"])
+        self.assertEqual(generated["roots"], roots)
+        self.assertEqual(generated["windows"], recovery._windows_target_from_state(manifest["windows"]["state"]))
+        postgres = write(self.root / "target-postgres.json", json.dumps(fixture_plan["postgres"]))
+        target = self.root / "generated-target.json"
+        arguments = [
+            "target-plan",
+            "--manifest",
+            str(manifest_path),
+            "--host-id",
+            "generated-fixture",
+            "--postgres-config",
+            str(postgres),
+            "--out",
+            str(target),
+        ]
+        self.assertEqual(recovery.main(arguments), 0)
+        self.assertEqual(json.loads(target.read_text())["closure"], manifest["closure"])
+        original = target.read_bytes()
+        self.assertEqual(recovery.main(arguments), 1)
+        self.assertEqual(target.read_bytes(), original)
+
     def test_manifest_rejects_extra_source_member_and_moved_state_scope(self):
         _out, manifest = self.backup()
         changed = copy.deepcopy(manifest)

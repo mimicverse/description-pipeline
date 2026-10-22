@@ -8542,6 +8542,23 @@ def validate_target_plan(
     return plan, payload
 
 
+def build_target_plan(manifest: dict, manifest_sha: str, *, host_id: str, postgres: dict) -> dict:
+    """Derive only from a validated manifest; callers supply target execution authority."""
+    validate_manifest(manifest, expected_manifest_sha=manifest_sha)
+    plan = {
+        "schema_version": TARGET_SCHEMA,
+        "backup_manifest_sha256": manifest_sha,
+        "closure": copy.deepcopy(manifest["closure"]),
+        "mode": "exact_path",
+        "host_id": host_id,
+        "postgres": copy.deepcopy(postgres),
+        "roots": {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row},
+        "windows": _windows_target_from_state(manifest["windows"]["state"]),
+    }
+    validate_target_plan(plan, manifest, manifest_sha)
+    return plan
+
+
 def path_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
@@ -11811,6 +11828,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--status-dir", type=Path, required=True)
     worker_parser = subparsers.add_parser("snapshot-worker")
     worker_parser.add_argument("--request", type=Path, required=True)
+    plan_parser = subparsers.add_parser("target-plan")
+    plan_parser.add_argument("--manifest", type=Path, required=True)
+    plan_parser.add_argument("--host-id", required=True)
+    plan_parser.add_argument("--postgres-config", type=Path, required=True)
+    plan_parser.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -11933,6 +11955,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "snapshot-worker":
             return _snapshot_worker(args.request)
+        if args.action == "target-plan":
+            manifest, _, digest = load_recovery_manifest(args.manifest)
+            _, postgres = strict_json_file(args.postgres_config, "target PostgreSQL settings")
+            plan = build_target_plan(manifest, digest, host_id=args.host_id, postgres=postgres)
+            write_json_once(args.out, plan)
+            print(f"target_plan={args.out}")
+            print(f"target_plan_sha256={sha256_file(args.out)}")
+            return 0
         if args.action == "backup":
             result = backup_command(
                 config_path=args.config,
