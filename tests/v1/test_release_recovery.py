@@ -129,7 +129,14 @@ class ReleaseRecoveryTests(unittest.TestCase):
         install_id = "gen-release-rollback"
         source = root / "install-record.json"
         source.write_text(
-            json.dumps({"release": args_release(restore)}),
+            json.dumps({
+                "release": args_release(restore),
+                "ends": {"windows": {
+                    "install_id": "win-" + "a" * 32,
+                    "config_digest": "a" * 64,
+                    "release": {**args_release(restore), "role": "native"},
+                }},
+            }),
             encoding="utf-8",
         )
         code_rollback = state_root / "promotions" / install_id / "receipt.json"
@@ -628,7 +635,7 @@ class ReleaseRecoveryTests(unittest.TestCase):
                                     "task_state": "Running",
                                     "listener_pid": 42,
                                     "process_start_utc": "2026-10-21T00:00:00Z",
-                                    "install_id": args.install_id,
+                                    "install_id": "win-" + "a" * 32,
                                     "config_digest": "a" * 64,
                                 }
                             )
@@ -667,6 +674,15 @@ class ReleaseRecoveryTests(unittest.TestCase):
             before = len(calls)
             self.assertEqual(release_recovery.finalize(args), 0)
             self.assertEqual(len(calls), before)
+            for field, value in (("install_id", args.install_id), ("config_digest", "f" * 64), ("task_state", "Ready")):
+                with self.subTest(cached_identity_field=field):
+                    gate_path = status / release_recovery.FINALIZE_RECEIPT
+                    changed = json.loads(gate_path.read_text())
+                    changed["operator_identity"][field] = value
+                    gate_path.write_text(json.dumps(changed), encoding="utf-8")
+                    before = len(calls)
+                    self.assertEqual(release_recovery.finalize(args), 0)
+                    self.assertEqual(len(calls), before + 3)
 
     def test_code_rollback_accepts_phase_history_and_latest_completion(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -725,6 +741,58 @@ class ReleaseRecoveryTests(unittest.TestCase):
                 release_recovery.validate_code_rollback(
                     path, args.install_id, {**args_release(args), "source_commit": "c" * 40}
                 )
+
+    def test_finalize_rejects_crosswired_windows_identity(self):
+        for use_generation_id in (True, False):
+            with self.subTest(use_generation_id=use_generation_id), tempfile.TemporaryDirectory() as directory:
+                args = self.completed_finalize_inputs(Path(directory))
+                calls = []
+
+                def runner(argv, calls=calls, args=args, use_generation_id=use_generation_id, **_kwargs):
+                    action = argv[1]
+                    calls.append(action)
+                    if action == "status":
+                        return Result(stdout=json.dumps({
+                            "task_state": "Running", "listener_pid": 42,
+                            "process_start_utc": "2026-10-22T00:00:00Z",
+                            "install_id": args.install_id if use_generation_id else "win-" + "a" * 32,
+                            "config_digest": "a" * 64 if use_generation_id else "b" * 64,
+                        }))
+                    return Result(stdout="admission open\n")
+
+                args.runner = runner
+                with self.assertRaisesRegex(release_recovery.GateError, "active Windows identity"):
+                    release_recovery.finalize(args)
+                self.assertNotIn("health", calls)
+
+    def test_finalize_rejects_malformed_source_windows_identity_before_start(self):
+        mutations = {
+            "missing_ends": lambda d: d.pop("ends"),
+            "nonobject_ends": lambda d: d.update(ends=[]),
+            "missing_windows": lambda d: d["ends"].pop("windows"),
+            "nonobject_windows": lambda d: d["ends"].update(windows=[]),
+            "nonstring_id": lambda d: d["ends"]["windows"].update(install_id=1),
+            "empty_id": lambda d: d["ends"]["windows"].update(install_id=""),
+            "bad_digest": lambda d: d["ends"]["windows"].update(config_digest="short"),
+            "nonstring_digest": lambda d: d["ends"]["windows"].update(config_digest=1),
+            "wrong_release": lambda d: d["ends"]["windows"]["release"].update(source_commit="c" * 40),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                args = self.completed_finalize_inputs(Path(directory))
+                rollback_path = Path(args.code_rollback_receipt)
+                rollback = json.loads(rollback_path.read_text())
+                source_path = Path(rollback["from"])
+                source = json.loads(source_path.read_text())
+                mutate(source)
+                source_path.write_text(json.dumps(source), encoding="utf-8")
+                rollback["from_sha256"] = digest(source_path.read_bytes())
+                rollback_path.write_text(json.dumps(rollback), encoding="utf-8")
+                calls = []
+                args.runner = lambda argv, calls=calls, **_kwargs: calls.append(argv) or Result()
+                with self.assertRaisesRegex(release_recovery.GateError, "source Windows identity"):
+                    release_recovery.finalize(args)
+                self.assertEqual(calls, [])
 
     def test_finalize_refuses_verify_only_gate_before_start(self):
         with tempfile.TemporaryDirectory() as directory:

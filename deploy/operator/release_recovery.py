@@ -284,7 +284,20 @@ def validate_code_rollback(receipt_path: Path, install_id: str, identity: dict) 
     return receipt
 
 
-def status_identity(stdout: str, install_id: str) -> dict:
+def _status_identity_matches(value: object, install_id: str, config_digest: str) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("task_state") == "Running"
+        and value.get("install_id") == install_id
+        and value.get("config_digest") == config_digest
+        and type(value.get("listener_pid")) is int
+        and value["listener_pid"] > 0
+        and isinstance(value.get("process_start_utc"), str)
+        and bool(value["process_start_utc"])
+    )
+
+
+def status_identity(stdout: str, install_id: str, config_digest: str) -> dict:
     for line in reversed(stdout.splitlines()):
         try:
             value = json.loads(line)
@@ -292,15 +305,7 @@ def status_identity(stdout: str, install_id: str) -> dict:
             continue
         if not isinstance(value, dict):
             continue
-        if (
-            value.get("task_state") == "Running"
-            and value.get("install_id") == install_id
-            and isinstance(value.get("config_digest"), str)
-            and value["config_digest"]
-            and type(value.get("listener_pid")) is int
-            and isinstance(value.get("process_start_utc"), str)
-            and value["process_start_utc"]
-        ):
+        if _status_identity_matches(value, install_id, config_digest):
             return value
         break
     raise GateError(
@@ -622,7 +627,22 @@ def finalize(args) -> int:
             f"restore {key} authority hash",
             sha256_file(path),
         )
-    validate_code_rollback(code_rollback_path, args.install_id, identity)
+    rollback = validate_code_rollback(code_rollback_path, args.install_id, identity)
+    source_path = require_file(Path(rollback["from"]), "rollback source install record")
+    source_record = load_json(source_path)
+    if sha256_file(source_path) != rollback["from_sha256"]:
+        raise GateError("release_recovery_gate_invalid", "rollback source install record changed")
+    source_ends = source_record.get("ends")
+    windows_identity = source_ends.get("windows") if isinstance(source_ends, dict) else None
+    if (
+        not isinstance(windows_identity, dict)
+        or not isinstance(windows_identity.get("install_id"), str)
+        or not windows_identity["install_id"]
+        or not isinstance(windows_identity.get("config_digest"), str)
+        or not HEX64.fullmatch(windows_identity["config_digest"])
+        or windows_identity.get("release") != {**identity, "role": "native"}
+    ):
+        raise GateError("release_recovery_identity_unverified", "rollback source Windows identity is invalid")
     receipt = status_dir / FINALIZE_RECEIPT
     inputs = {
         "restore_gate_sha256": sha256_file(restore_gate_path),
@@ -649,6 +669,9 @@ def finalize(args) -> int:
             and prior.get("windows_verified") is True
             and prior.get("health") == "PASS"
             and prior.get("operator_status") == "PASS"
+            and _status_identity_matches(
+                prior.get("operator_identity"), windows_identity["install_id"], windows_identity["config_digest"]
+            )
         ):
             print(
                 json.dumps(
@@ -690,7 +713,9 @@ def finalize(args) -> int:
         )
         (run_dir / "finalize-status.out").write_text(status_result.stdout, encoding="utf-8")
         outputs["status"] = sha256_file(run_dir / "finalize-status.out")
-        status_value = status_identity(status_result.stdout, args.install_id)
+        status_value = status_identity(
+            status_result.stdout, windows_identity["install_id"], windows_identity["config_digest"]
+        )
         health_result = run(
             [str(operatorctl), "health", "--config", str(config)],
             timeout=timeout,
