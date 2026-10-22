@@ -1860,6 +1860,159 @@ class RecoveryControlFlowTests(unittest.TestCase):
             recovery._workspace_verify(repository, row)
         self.assertEqual(raised.exception.code, "recovery_workspace_mismatch")
 
+    def attribute_row(self, repository: Path) -> dict:
+        head_symref, refs, symrefs = recovery._workspace_refs(repository)
+        return {
+            "repository_slug": "owner/model", "path": str(repository),
+            "origin": recovery._git_output(repository, "remote", "get-url", "origin"),
+            "head": recovery._git_output(repository, "rev-parse", "HEAD"),
+            "tree": recovery._git_output(repository, "rev-parse", "HEAD^{tree}"),
+            "head_symref": head_symref, "refs": refs, "symrefs": symrefs,
+            "bases": ["main"], "status": "clean",
+            "bundle_member": "reconstruct/workspaces/fixture.bundle", "bundle_sha256": "0" * 64,
+        }
+
+    def commit_attributes(self, repository: Path, attributes: str) -> dict:
+        write(repository / ".gitattributes", attributes, mode=0o644)
+        subprocess.run(["git", "-C", str(repository), "add", ".gitattributes"], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-qm", "Set test attributes"], check=True)
+        return self.attribute_row(repository)
+
+    def test_workspace_attributes_use_git_234_compatible_cached_query(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.attribute_row(repository)
+        original = subprocess.check_output
+        observed = []
+
+        def git_234(arguments, *args, **kwargs):
+            if "check-attr" in arguments:
+                observed.append(arguments)
+                self.assertIn("--cached", arguments)
+                for required in ("-z", "filter", "working-tree-encoding", "--stdin"):
+                    self.assertIn(required, arguments)
+                if any(str(value).startswith("--source") for value in arguments):
+                    raise subprocess.CalledProcessError(129, arguments, stderr=b"unknown option source")
+            return original(arguments, *args, **kwargs)
+
+        with mock.patch.object(recovery.subprocess, "check_output", side_effect=git_234):
+            recovery._workspace_verify(repository, row)
+        self.assertEqual(len(observed), 1)
+
+    def test_workspace_tracked_unset_and_unspecified_attributes_pass(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        for attributes in ("# Attributes are unspecified\n", "tracked.txt -filter -working-tree-encoding\n"):
+            with self.subTest(attributes=attributes):
+                row = self.commit_attributes(repository, attributes)
+                recovery._workspace_verify(repository, row)
+
+    def test_workspace_tracked_filter_and_encoding_are_rejected(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        for attributes in ("tracked.txt filter=custom\n", "tracked.txt working-tree-encoding=UTF-16\n"):
+            with self.subTest(attributes=attributes):
+                row = self.commit_attributes(repository, attributes)
+                with self.assertRaisesRegex(recovery.RecoveryError, "attribute is unsupported"):
+                    recovery._workspace_verify(repository, row)
+
+    def test_workspace_local_attributes_remain_rejected(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.attribute_row(repository)
+        write(repository / ".git/info/attributes", "tracked.txt -filter\n")
+        with self.assertRaisesRegex(recovery.RecoveryError, "local attribute overrides"):
+            recovery._workspace_verify(repository, row)
+
+    def test_workspace_index_drift_is_rejected_before_attributes(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.attribute_row(repository)
+        write(repository / "tracked.txt", "staged drift\n", mode=0o644)
+        subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+        original = subprocess.check_output
+
+        def no_attribute_query(arguments, *args, **kwargs):
+            self.assertNotIn("check-attr", arguments)
+            return original(arguments, *args, **kwargs)
+
+        with (
+            mock.patch.object(recovery.subprocess, "check_output", side_effect=no_attribute_query),
+            self.assertRaises(recovery.RecoveryError),
+        ):
+            recovery._workspace_verify(repository, row)
+
+    def test_workspace_materialize_uses_cached_bound_tree_without_checkout(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.commit_attributes(repository, "tracked.txt -filter -working-tree-encoding\n")
+        bundle = self.root / "attributes.bundle"
+        subprocess.run(["git", "-C", str(repository), "bundle", "create", str(bundle), "--all"], check=True)
+        target = self.root / "materialized-attributes"
+        original = subprocess.check_output
+        observed = []
+
+        def git_234(arguments, *args, **kwargs):
+            if "check-attr" in arguments:
+                self.assertFalse(any(str(value).startswith("--source") for value in arguments))
+                self.assertIn("--cached", arguments)
+                observed.append(arguments)
+                if len(observed) == 1:
+                    self.assertFalse((target / "tracked.txt").exists())
+                    self.assertEqual(
+                        original(["git", "-C", str(target), "write-tree"], text=True).strip(), row["tree"]
+                    )
+            return original(arguments, *args, **kwargs)
+
+        with mock.patch.object(recovery.subprocess, "check_output", side_effect=git_234):
+            recovery._materialize_workspace(bundle, target, row)
+        self.assertTrue(observed)
+        self.assertEqual((target / "tracked.txt").read_text(), "restored\n")
+
+    def test_workspace_materialize_rejects_attributes_before_checkout(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        cases = ("tracked.txt filter=custom\n", "tracked.txt working-tree-encoding=UTF-16\n")
+        for number, attributes in enumerate(cases):
+            with self.subTest(attributes=attributes):
+                row = self.commit_attributes(repository, attributes)
+                bundle = self.root / f"unsafe-attributes-{number}.bundle"
+                subprocess.run(["git", "-C", str(repository), "bundle", "create", str(bundle), "--all"], check=True)
+                target = self.root / f"unsafe-materialized-{number}"
+                with self.assertRaisesRegex(recovery.RecoveryError, "attribute is unsupported"):
+                    recovery._materialize_workspace(bundle, target, row)
+                self.assertFalse((target / "tracked.txt").exists())
+
+    def test_workspace_attribute_index_read_failure_has_stable_error(self) -> None:
+        repository, _, head, tree = self.workspace_fixture()
+        original = subprocess.run
+
+        def fail_read_tree(arguments, *args, **kwargs):
+            if "read-tree" in arguments:
+                raise subprocess.CalledProcessError(128, arguments, stderr=b"read failure")
+            return original(arguments, *args, **kwargs)
+
+        with (
+            mock.patch.object(recovery.subprocess, "run", side_effect=fail_read_tree),
+            self.assertRaisesRegex(recovery.RecoveryError, "cannot populate workspace attribute index") as raised,
+        ):
+            recovery._workspace_attributes_safe(repository, head, tree)
+        self.assertEqual(raised.exception.code, "recovery_workspace_missing")
+
+    def test_workspace_attribute_index_mismatch_prevents_checkout(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.attribute_row(repository)
+        bundle = self.root / "index-mismatch.bundle"
+        subprocess.run(["git", "-C", str(repository), "bundle", "create", str(bundle), "--all"], check=True)
+        target = self.root / "index-mismatch-target"
+        original = subprocess.check_output
+
+        def wrong_index(arguments, *args, **kwargs):
+            self.assertNotIn("check-attr", arguments)
+            if "write-tree" in arguments:
+                return "0" * 40 + "\n"
+            return original(arguments, *args, **kwargs)
+
+        with (
+            mock.patch.object(recovery.subprocess, "check_output", side_effect=wrong_index),
+            self.assertRaisesRegex(recovery.RecoveryError, "index differs from the bound tree"),
+        ):
+            recovery._materialize_workspace(bundle, target, row)
+        self.assertFalse((target / "tracked.txt").exists())
+
     def test_workspace_verify_detects_a_staged_change(self) -> None:
         repository, origin, head, tree = self.workspace_fixture()
         head_bytes = (repository / "tracked.txt").read_bytes()

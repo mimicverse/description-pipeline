@@ -9035,6 +9035,7 @@ def _workspace_verify(path: Path, row: dict) -> None:
                 f"workspace index carries an assume-unchanged or skip-worktree flag: {path}",
             )
 
+    # The index already matches HEAD exactly, so cached attributes use that same tree.
     attribute_input = b"\0".join(
         os.fsencode(relative) for relative in sorted(expected)
     ) + b"\0"
@@ -9045,8 +9046,7 @@ def _workspace_verify(path: Path, row: dict) -> None:
                 "-C",
                 str(path),
                 "check-attr",
-            "--cached",
-            "--source=HEAD",
+                "--cached",
                 "-z",
                 "filter",
                 "working-tree-encoding",
@@ -9249,9 +9249,32 @@ def _apply_workspace_modes(path: Path) -> None:
         target.chmod(0o755 if mode_text == "100755" else 0o644)
 
 
-def _workspace_attributes_safe(path: Path) -> None:
+def _workspace_attributes_safe(path: Path, head: str, tree: str) -> None:
+    # Populate only the index; checking out first could already invoke unsafe filters.
+    try:
+        subprocess.run(
+            ["git", "-C", str(path), "read-tree", head],
+            capture_output=True,
+            check=True,
+            env=_git_environment(),
+        )
+        indexed_tree = subprocess.check_output(
+            ["git", "-C", str(path), "write-tree"],
+            text=True,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RecoveryError(
+            "recovery_workspace_missing",
+            f"cannot populate workspace attribute index: {path}",
+        ) from error
+    require(
+        indexed_tree == tree,
+        "recovery_workspace_mismatch", "workspace attribute index differs from the bound tree",
+    )
     tree_output = subprocess.check_output(
-        ["git", "-C", str(path), "ls-tree", "-r", "-z", "HEAD"],
+        ["git", "-C", str(path), "ls-tree", "-r", "-z", head],
         stderr=subprocess.PIPE,
         env=_git_environment(),
     )
@@ -9267,7 +9290,6 @@ def _workspace_attributes_safe(path: Path) -> None:
             str(path),
             "check-attr",
             "--cached",
-            "--source=HEAD",
             "-z",
             "filter",
             "working-tree-encoding",
@@ -9350,7 +9372,7 @@ def _materialize_workspace(bundle: Path, target: Path, row: dict) -> None:
         f"cannot clone workspace bundle: {row['repository_slug']}",
         {"stderr": clone.stderr[-2000:]},
     )
-    _workspace_attributes_safe(target)
+    _workspace_attributes_safe(target, row["head"], row["tree"])
     if "refs" in row:
         current_refs = set(
             subprocess.check_output(
