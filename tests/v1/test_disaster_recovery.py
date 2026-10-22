@@ -1912,7 +1912,29 @@ class RecoveryControlFlowTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
         subprocess.run(["git", "-C", str(repository), "commit", "-qm", "Track executable mode"], check=True)
         row = self.attribute_row(repository)
-        recovery._workspace_verify(repository, row)
+        for mode in (0o700, 0o750, 0o755):
+            with self.subTest(mode=oct(mode)):
+                (repository / "tracked.txt").chmod(mode)
+                recovery._workspace_verify(repository, row)
+
+    def test_workspace_nonexecutable_rejects_group_or_other_write(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        row = self.attribute_row(repository)
+        for mode in (0o664, 0o666, 0o620, 0o602):
+            with self.subTest(mode=oct(mode)):
+                (repository / "tracked.txt").chmod(mode)
+                with self.assertRaisesRegex(recovery.RecoveryError, "writable by group or others"):
+                    recovery._workspace_verify(repository, row)
+
+    def test_workspace_executable_rejects_group_write(self) -> None:
+        repository, _, _, _ = self.workspace_fixture()
+        (repository / "tracked.txt").chmod(0o700)
+        subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-qm", "Track executable mode"], check=True)
+        row = self.attribute_row(repository)
+        (repository / "tracked.txt").chmod(0o775)
+        with self.assertRaisesRegex(recovery.RecoveryError, "writable by group or others"):
+            recovery._workspace_verify(repository, row)
 
     def test_workspace_nonexecutable_rejects_untracked_execute_bit(self) -> None:
         repository, _, _, _ = self.workspace_fixture()
