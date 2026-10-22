@@ -1569,6 +1569,65 @@ class RecoverySelectionTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "windows_recovery_bundle_invalid")
 
 
+class WindowsEnvironmentPinTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        _, self.state = windows_recovery_fixture(None, Path(self.temporary.name))
+
+    def test_equivalent_absolute_pins_preserve_raw_values(self) -> None:
+        for label, transform in (
+            ("forward", lambda value: value),
+            ("backslash", lambda value: value.replace("/", "\\")),
+            ("case", str.swapcase),
+            ("trailing", lambda value: value + "/"),
+            ("combined", lambda value: value.replace("/", "\\").swapcase() + "\\"),
+        ):
+            with self.subTest(label=label):
+                state = copy.deepcopy(self.state)
+                pins = state["identity"]["domain_environment"]
+                for field in ("DESCRIPTION_ENDPOINT_ROOT", "DESCRIPTION_CAD_OWNERSHIP_FILE"):
+                    pins[field] = transform(pins[field])
+                original = recovery.canonical_json(pins)
+                validated = recovery._validate_windows_recovery_state(state)
+                self.assertEqual(recovery.canonical_json(validated["identity"]["domain_environment"]), original)
+
+    def test_invalid_or_different_pins_are_rejected(self) -> None:
+        for field in ("DESCRIPTION_ENDPOINT_ROOT", "DESCRIPTION_CAD_OWNERSHIP_FILE"):
+            for value in (
+                None, "", True, [], "relative/path", "C:relative", "/rooted/path",
+                "\\\\server\\share\\path", "//server/share/path", "\\\\?\\C:\\path", "\\\\.\\C:\\path",
+                "C:/path/../other", "C:/path/./other",
+                "C:/path//other", "C:/path/other ", "C:/path/other.", "C:/path/file:stream",
+                "C:/path/\x00other", "C:/description/state/lifecycle/old-generation/generation",
+                "C:/description/state/wrong-ownership.json",
+            ):
+                with self.subTest(field=field, value=value):
+                    state = copy.deepcopy(self.state)
+                    state["identity"]["domain_environment"][field] = value
+                    with self.assertRaises(recovery.RecoveryError) as caught:
+                        recovery._validate_windows_recovery_state(state)
+                    self.assertEqual(caught.exception.code, "windows_recovery_state_invalid")
+
+    def test_missing_pins_and_wrong_scope_are_rejected(self) -> None:
+        for field in ("DESCRIPTION_ENDPOINT_ROOT", "DESCRIPTION_CAD_OWNERSHIP_FILE", "scope"):
+            with self.subTest(field=field):
+                state = copy.deepcopy(self.state)
+                del state["identity"]["domain_environment"][field]
+                with self.assertRaises(recovery.RecoveryError):
+                    recovery._validate_windows_recovery_state(state)
+        state = copy.deepcopy(self.state)
+        state["identity"]["domain_environment"]["scope"] = "process"
+        with self.assertRaises(recovery.RecoveryError):
+            recovery._validate_windows_recovery_state(state)
+
+    def test_device_basenames_are_not_filesystem_pins(self) -> None:
+        for name in ("CON", "NUL", "PRN", "AUX", "COM1", "LPT1", "COM9", "LPT9", "CONIN$", "CONOUT$"):
+            for suffix in ("", ".txt", " .txt"):
+                with self.subTest(name=name, suffix=suffix):
+                    self.assertIsNone(recovery._canonical_windows_pin("C:/data/" + name + suffix))
+
+
 class WindowsAclPolicyTests(unittest.TestCase):
     def test_service_principal_must_be_distinct_and_present(self) -> None:
         fixture = json.loads((REPOSITORY / "tests" / "fixtures" / "windows_acl_policy.json").read_text())

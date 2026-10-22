@@ -5767,6 +5767,27 @@ def _validate_windows_runtime_leaf_acl_policy(projection: dict, parent: dict, *,
     )
 
 
+def _canonical_windows_pin(value: object) -> str | None:
+    """Compare local absolute Windows pins without changing their recorded bytes."""
+    if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
+        return None
+    path = value.replace("\\", "/").rstrip("/")
+    if not re.match(r"^[A-Za-z]:/", path):
+        return None
+    parts = path[3:].split("/")
+    if any(
+        not part or part in {".", ".."} or part.endswith((" ", "."))
+        or any(char in '<>:"|?*' for char in part)
+        or re.fullmatch(
+            r"con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$",
+            part.split(".", 1)[0].rstrip(" ").casefold(),
+        )
+        for part in parts
+    ):
+        return None
+    return path.casefold()
+
+
 def _validate_windows_recovery_state(document: object) -> dict:
     state = _exact_keys(
         document,
@@ -6079,9 +6100,12 @@ def _validate_windows_recovery_state(document: object) -> dict:
     require(
         isinstance(identity["domain_environment"], dict)
         and identity["domain_environment"].get("scope") == "user"
-        and identity["domain_environment"].get("DESCRIPTION_ENDPOINT_ROOT") == identity["endpoint_root"]
-        and identity["domain_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE")
-        == Path(identity["state_root"]).as_posix() + "/cad-ownership.json",
+        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_ENDPOINT_ROOT")) is not None
+        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_ENDPOINT_ROOT"))
+        == _canonical_windows_pin(identity["endpoint_root"])
+        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE")) is not None
+        and _canonical_windows_pin(identity["domain_environment"].get("DESCRIPTION_CAD_OWNERSHIP_FILE"))
+        == _canonical_windows_pin(normalized["state_root"] + "/cad-ownership.json"),
         "windows_recovery_state_invalid",
         "Windows account environment pins are not canonical",
     )
