@@ -488,6 +488,7 @@ def native_tessellation_fixture(
                             "end_u": None,
                             "start_evidence": None,
                             "end_evidence": None,
+                            "cofin_raw_id": None,
                             "cofin_id": None,
                         }
                     )
@@ -571,8 +572,8 @@ def native_tessellation_fixture(
         ]
         paths_by_face = {}
         if active_faces:
-            if len(active_faces) != 2:
-                raise ValueError("native edge fixture requires exactly two active cofaces")
+            if len(active_faces) not in (1, 2):
+                raise ValueError("native edge fixture requires one or two active cofaces")
             source = body["vertex_ids_by_point"].get(_binary32_point(edge["start_point_m"]))
             target = body["vertex_ids_by_point"].get(_binary32_point(edge["end_point_m"]))
             if source is None or target is None or source == target:
@@ -618,7 +619,8 @@ def native_tessellation_fixture(
         edge_fin_ids = []
         path_senses = {}
         if active_faces:
-            first_face, second_face = active_faces
+            first_face = active_faces[0]
+            second_face = active_faces[1] if len(active_faces) == 2 else None
             source = body["vertex_ids_by_point"][_binary32_point(edge["start_point_m"])]
             first_path = paths_by_face[first_face]
             if first_path[0]["vertex_ids"][0] != source:
@@ -639,35 +641,22 @@ def native_tessellation_fixture(
                 current = segment[1]
             if current != body["vertex_ids_by_point"][_binary32_point(edge["end_point_m"])]:
                 raise ValueError("native edge face path does not reach its endpoint")
-            second_path = paths_by_face[second_face]
-            path_senses[second_face] = second_path[0]["vertex_ids"][0] == body[
-                "vertex_ids_by_point"
-            ][_binary32_point(edge["start_point_m"])]
-            second_by_segment = {}
-            for fin in second_path:
-                key = frozenset(fin["vertex_ids"])
-                if key in second_by_segment:
-                    raise ValueError("native edge coface has duplicate segment fins")
-                second_by_segment[key] = fin
-            if len(canonical_segments) != len(second_path):
-                raise ValueError("native edge cofaces have different segment counts")
-            step = (u_max - u_min) / len(canonical_segments)
-            for index, (segment, first_fin) in enumerate(canonical_segments):
-                second_fin = second_by_segment.get(frozenset(segment))
-                if second_fin is None:
-                    raise ValueError("native edge cofaces do not share segment endpoints")
-                if tuple(second_fin["vertex_ids"]) != tuple(
-                    reversed(first_fin["vertex_ids"])
-                ):
-                    raise ValueError("native edge coface fins run in the same direction")
-                low = u_min + step * index
-                high = u_min + step * (index + 1)
-                first_reversed = first_fin["vertex_ids"][0] != segment[0]
-                second_reversed = second_fin["vertex_ids"][0] != segment[0]
-                first_start_u = high if first_reversed else low
-                first_end_u = low if first_reversed else high
-                second_start_u = high if second_reversed else low
-                second_end_u = low if second_reversed else high
+            if len(active_faces) == 1:
+                if len(canonical_segments) != 1:
+                    raise ValueError(
+                        "open native edge fixture requires exactly one boundary fin"
+                    )
+                _segment, first_fin = canonical_segments[0]
+                first_start_u = (
+                    u_max
+                    if first_fin["vertex_ids"][0] != source
+                    else u_min
+                )
+                first_end_u = (
+                    u_min
+                    if first_fin["vertex_ids"][0] != source
+                    else u_max
+                )
                 first_fin.update(
                     {
                         "edge_reference_sha256": edge["edge_reference_sha256"],
@@ -690,38 +679,98 @@ def native_tessellation_fixture(
                             curve_start=_binary32_point(edge["start_point_m"]),
                             curve_end=_binary32_point(edge["end_point_m"]),
                         ),
-                        "cofin_id": second_fin["fin_id"],
+                        "cofin_raw_id": -1,
+                        "cofin_id": None,
                     }
                 )
-                second_fin.update(
-                    {
-                        "edge_reference_sha256": edge["edge_reference_sha256"],
-                        "classification": "native_edge",
-                        "start_u": second_start_u,
-                        "end_u": second_end_u,
-                        "start_evidence": _u_evidence(
-                            second_start_u,
-                            body["points_by_vertex_id"][second_fin["vertex_ids"][0]],
-                            domain_lower=u_min,
-                            domain_upper=u_max,
-                            curve_start=_binary32_point(edge["start_point_m"]),
-                            curve_end=_binary32_point(edge["end_point_m"]),
-                        ),
-                        "end_evidence": _u_evidence(
-                            second_end_u,
-                            body["points_by_vertex_id"][second_fin["vertex_ids"][1]],
-                            domain_lower=u_min,
-                            domain_upper=u_max,
-                            curve_start=_binary32_point(edge["start_point_m"]),
-                            curve_end=_binary32_point(edge["end_point_m"]),
-                        ),
-                        "cofin_id": first_fin["fin_id"],
-                    }
-                )
-                body["assigned_fin_ids"].update(
-                    {first_fin["fin_id"], second_fin["fin_id"]}
-                )
-                edge_fin_ids.extend((first_fin["fin_id"], second_fin["fin_id"]))
+                body["assigned_fin_ids"].add(first_fin["fin_id"])
+                edge_fin_ids.append(first_fin["fin_id"])
+            else:
+                second_path = paths_by_face[second_face]
+                path_senses[second_face] = second_path[0]["vertex_ids"][0] == body[
+                    "vertex_ids_by_point"
+                ][_binary32_point(edge["start_point_m"])]
+                second_by_segment = {}
+                for fin in second_path:
+                    key = frozenset(fin["vertex_ids"])
+                    if key in second_by_segment:
+                        raise ValueError("native edge coface has duplicate segment fins")
+                    second_by_segment[key] = fin
+                if len(canonical_segments) != len(second_path):
+                    raise ValueError("native edge cofaces have different segment counts")
+                step = (u_max - u_min) / len(canonical_segments)
+                for index, (segment, first_fin) in enumerate(canonical_segments):
+                    second_fin = second_by_segment.get(frozenset(segment))
+                    if second_fin is None:
+                        raise ValueError("native edge cofaces do not share segment endpoints")
+                    if tuple(second_fin["vertex_ids"]) != tuple(
+                        reversed(first_fin["vertex_ids"])
+                    ):
+                        raise ValueError("native edge coface fins run in the same direction")
+                    low = u_min + step * index
+                    high = u_min + step * (index + 1)
+                    first_reversed = first_fin["vertex_ids"][0] != segment[0]
+                    second_reversed = second_fin["vertex_ids"][0] != segment[0]
+                    first_start_u = high if first_reversed else low
+                    first_end_u = low if first_reversed else high
+                    second_start_u = high if second_reversed else low
+                    second_end_u = low if second_reversed else high
+                    first_fin.update(
+                        {
+                            "edge_reference_sha256": edge["edge_reference_sha256"],
+                            "classification": "native_edge",
+                            "start_u": first_start_u,
+                            "end_u": first_end_u,
+                            "start_evidence": _u_evidence(
+                                first_start_u,
+                                body["points_by_vertex_id"][first_fin["vertex_ids"][0]],
+                                domain_lower=u_min,
+                                domain_upper=u_max,
+                                curve_start=_binary32_point(edge["start_point_m"]),
+                                curve_end=_binary32_point(edge["end_point_m"]),
+                            ),
+                            "end_evidence": _u_evidence(
+                                first_end_u,
+                                body["points_by_vertex_id"][first_fin["vertex_ids"][1]],
+                                domain_lower=u_min,
+                                domain_upper=u_max,
+                                curve_start=_binary32_point(edge["start_point_m"]),
+                                curve_end=_binary32_point(edge["end_point_m"]),
+                            ),
+                            "cofin_raw_id": second_fin["fin_id"],
+                            "cofin_id": second_fin["fin_id"],
+                        }
+                    )
+                    second_fin.update(
+                        {
+                            "edge_reference_sha256": edge["edge_reference_sha256"],
+                            "classification": "native_edge",
+                            "start_u": second_start_u,
+                            "end_u": second_end_u,
+                            "start_evidence": _u_evidence(
+                                second_start_u,
+                                body["points_by_vertex_id"][second_fin["vertex_ids"][0]],
+                                domain_lower=u_min,
+                                domain_upper=u_max,
+                                curve_start=_binary32_point(edge["start_point_m"]),
+                                curve_end=_binary32_point(edge["end_point_m"]),
+                            ),
+                            "end_evidence": _u_evidence(
+                                second_end_u,
+                                body["points_by_vertex_id"][second_fin["vertex_ids"][1]],
+                                domain_lower=u_min,
+                                domain_upper=u_max,
+                                curve_start=_binary32_point(edge["start_point_m"]),
+                                curve_end=_binary32_point(edge["end_point_m"]),
+                            ),
+                            "cofin_raw_id": first_fin["fin_id"],
+                            "cofin_id": first_fin["fin_id"],
+                        }
+                    )
+                    body["assigned_fin_ids"].update(
+                        {first_fin["fin_id"], second_fin["fin_id"]}
+                    )
+                    edge_fin_ids.extend((first_fin["fin_id"], second_fin["fin_id"]))
 
         senses = {
             face_index: path_senses.get(face_index, index % 2 == 1)

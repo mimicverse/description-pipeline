@@ -57,6 +57,10 @@ from ...geometry.native_u import (
     native_u_intervals_cover,
     native_curve_domain_transform,
 )
+from ...geometry.native_fin_topology import (
+    NativeFinRelationError,
+    validate_native_edge_fin_relations,
+)
 from ...schemas import NATIVE_TESSELLATION_SCHEMA
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend, RawComponent, RawScene
@@ -5887,6 +5891,35 @@ class SolidWorksBackend(CadBackend):
                 normalized.append(fin_id)
             edge_row["fin_ids"] = tuple(normalized)
             fin_ids_by_edge_index[edge_index] = tuple(normalized)
+            incidence = len(edge_row["face_indices"])
+            if incidence not in (1, 2):
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "a native edge has more than two adjacent faces",
+                    {
+                        **base,
+                        "edge_index": edge_index,
+                        "face_indices": tuple(edge_row["face_indices"]),
+                    },
+                )
+            if incidence == 1 and body_type != 1:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "an open native edge is valid only on a sheet body",
+                    {
+                        **base,
+                        "edge_index": edge_index,
+                    },
+                )
+            if not normalized:
+                raise CadError(
+                    "cad_native_tessellation_unreadable",
+                    "a native edge did not return any fins",
+                    {
+                        **base,
+                        "edge_index": edge_index,
+                    },
+                )
         try:
             fin_to_edge_row = _fin_edge_row_map(
                 edge_rows,
@@ -6650,6 +6683,7 @@ class SolidWorksBackend(CadBackend):
                         "end_u": None,
                         "start_evidence": None,
                         "end_evidence": None,
+                        "cofin_raw_id": None,
                         "cofin_id": None,
                     }
                 )
@@ -6694,29 +6728,102 @@ class SolidWorksBackend(CadBackend):
                     lambda fin=fin_id: _method(tessellation, "GetFinCoFin", fin),
                     fin_id=fin_id,
                 )
-                if type(cofin_id) is not int or cofin_id < 0:
+                if type(cofin_id) is not int or cofin_id < -1:
                     raise CadError(
                         "cad_native_tessellation_unreadable",
-                        "GetFinCoFin did not return a non-negative integer",
-                        {**base, "fin_id": fin_id},
+                        "GetFinCoFin did not return an integer boundary or cofin ID",
+                        {
+                            **base,
+                            "fin_id": fin_id,
+                            "raw_value": repr(cofin_id)[:60],
+                            "raw_type": type(cofin_id).__name__,
+                        },
                     )
-                row["cofin_id"] = cofin_id
+                incidence = len(edge_row["face_indices"])
+                if incidence == 1:
+                    if cofin_id != -1:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "an open-edge fin did not report the boundary sentinel",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "cofin_raw_id": cofin_id,
+                            },
+                        )
+                    row["cofin_raw_id"] = -1
+                    row["cofin_id"] = None
+                elif incidence == 2:
+                    if cofin_id < 0:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "a shared-edge fin did not report a cofin ID",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "cofin_raw_id": cofin_id,
+                            },
+                        )
+                    if cofin_id not in edge_row["fin_ids"]:
+                        raise CadError(
+                            "cad_native_tessellation_unreadable",
+                            "a shared-edge cofin is outside the same edge",
+                            {
+                                **base,
+                                "edge_index": edge_row["index"],
+                                "fin_id": fin_id,
+                                "cofin_id": cofin_id,
+                                "fin_ids": tuple(edge_row["fin_ids"]),
+                            },
+                        )
+                    row["cofin_raw_id"] = cofin_id
+                    row["cofin_id"] = cofin_id
+                else:
+                    raise CadError(
+                        "cad_native_tessellation_unreadable",
+                        "a native edge has more than two adjacent faces",
+                        {
+                            **base,
+                            "edge_index": edge_row["index"],
+                            "face_indices": tuple(edge_row["face_indices"]),
+                        },
+                    )
         for edge_row in edge_rows:
-            fin_faces = {
-                facets[fins_by_id[fin_id]["facet_id"]]["face_index"]
+            incidence = len(edge_row["face_indices"])
+            relation_fins = {
+                fin_id: {
+                    **fins_by_id[fin_id],
+                    "face_index": facets[fins_by_id[fin_id]["facet_id"]][
+                        "face_index"
+                    ],
+                }
                 for fin_id in edge_row["fin_ids"]
             }
-            if not fin_faces <= set(edge_row["face_indices"]):
+            try:
+                validate_native_edge_fin_relations(
+                    component=component,
+                    edge={
+                        "body_type": body_type,
+                        "face_indices": edge_row["face_indices"],
+                        "fin_ids": edge_row["fin_ids"],
+                        "face_senses": edge_row["face_senses"],
+                    },
+                    edge_fins=edge_row["fin_ids"],
+                    fins_by_id=relation_fins,
+                    vertices_by_id=vertex_points_binary64,
+                )
+            except NativeFinRelationError as error:
                 raise CadError(
                     "cad_native_tessellation_unreadable",
-                    "an edge fin disagrees with native edge face incidence",
+                    error.message,
                     {
                         **base,
                         "edge_index": edge_row["index"],
-                        "fin_faces": tuple(sorted(fin_faces)),
-                        "edge_faces": edge_row["face_indices"],
+                        **error.detail,
                     },
-                )
+                ) from error
             if edge_row["fin_ids"]:
                 intervals_by_face = {}
                 for fin_id in edge_row["fin_ids"]:
@@ -6766,27 +6873,6 @@ class SolidWorksBackend(CadBackend):
                                 "face_index": face_index,
                             },
                         )
-                for fin_id in edge_row["fin_ids"]:
-                    fin = fins_by_id[fin_id]
-                    cofin = fins_by_id.get(fin["cofin_id"])
-                    if (
-                        cofin is None
-                        or cofin["cofin_id"] != fin_id
-                        or facets[cofin["facet_id"]]["face_index"]
-                        == facets[fin["facet_id"]]["face_index"]
-                        or not native_u_equal(fin["start_u"], cofin["end_u"])
-                        or not native_u_equal(fin["end_u"], cofin["start_u"])
-                    ):
-                        raise CadError(
-                            "cad_native_tessellation_unreadable",
-                            "native cofin U intervals do not correspond",
-                            {
-                                **base,
-                                "edge_index": edge_row["index"],
-                                "fin_id": fin_id,
-                            },
-                        )
-
         triangle_records = []
         for face_row in face_rows:
             face_index = face_row["index"]
@@ -6922,6 +7008,7 @@ class SolidWorksBackend(CadBackend):
                         "end_u": fin["end_u"],
                         "start_evidence": fin["start_evidence"],
                         "end_evidence": fin["end_evidence"],
+                        "cofin_raw_id": fin["cofin_raw_id"],
                         "cofin_id": fin["cofin_id"],
                     }
                     for fin_id, fin in sorted(fins_by_id.items())
